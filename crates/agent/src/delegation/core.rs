@@ -1915,8 +1915,12 @@ mod tests {
         CancelNotification, Error, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
         NewSessionResponse, PromptRequest, PromptResponse,
     };
+    use crate::agent::agent_config::AgentConfig;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::{McpToolState, SessionRuntime};
     use crate::agent::handle::AgentHandle;
     use crate::agent::remote::SessionActorRef;
+    use crate::agent::session_actor::SessionActor;
     use crate::event_fanout::EventFanout;
     use crate::event_sink::EventSink;
     use crate::events::EventEnvelope;
@@ -1925,10 +1929,12 @@ mod tests {
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::MockSessionStore;
     use async_trait::async_trait;
+    use kameo::actor::Spawn;
+    use querymt::LLMParams;
 
     #[cfg(feature = "remote")]
-    #[test]
-    fn model_override_preserves_routed_provider_node_when_unspecified() {
+    #[tokio::test]
+    async fn model_override_preserves_routed_provider_node_when_unspecified() {
         let parsed = crate::agent::remote::NodeId::from_peer_id(
             libp2p::identity::Keypair::generate_ed25519()
                 .public()
@@ -1936,15 +1942,131 @@ mod tests {
         )
         .to_string();
 
-        assert_eq!(
-            resolve_delegate_provider_node(None, Some(parsed.clone())).unwrap(),
-            Some(parsed.clone())
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
         );
-        assert_eq!(
-            resolve_delegate_provider_node(Some(&parsed), Some("other".to_string())).unwrap(),
-            Some(parsed)
+        let parent = storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .expect("parent session");
+        let llm = LLMParams::new().provider("mock").model("parent-model");
+        let llm_config = storage
+            .session_store()
+            .create_or_get_llm_config(&llm)
+            .await
+            .expect("parent LLM config");
+        storage
+            .session_store()
+            .set_session_llm_config(&parent.public_id, llm_config.id)
+            .await
+            .expect("parent LLM config binding");
+
+        let config = Arc::new(
+            AgentConfigBuilder::new(
+                Arc::new(querymt::plugin::host::PluginRegistry::empty()),
+                storage.clone(),
+                llm,
+            )
+            .build(),
         );
-        assert!(resolve_delegate_provider_node(Some("not-a-node"), None).is_err());
+        let target = StubAgentHandle::with_session_backend("coder", storage.clone(), config);
+
+        storage
+            .session_store()
+            .set_delegate_assignment(
+                &parent.public_id,
+                "coder",
+                Some(crate::delegation::DelegateModelOverride {
+                    model_id: "remote/worker-model".to_string(),
+                    node_id: None,
+                }),
+                None,
+            )
+            .await
+            .expect("delegate model override");
+
+        let snapshot = crate::agent::remote::new_routing_snapshot_handle();
+        let routing_actor = crate::agent::remote::RoutingActor::spawn(
+            crate::agent::remote::RoutingActor::new(snapshot.clone()),
+        );
+        routing_actor
+            .ask(crate::agent::remote::SetProviderTarget {
+                agent_id: "coder".to_string(),
+                target: crate::agent::remote::RouteTarget::Peer("gpu".to_string()),
+            })
+            .await
+            .expect("set provider route");
+        routing_actor
+            .ask(crate::agent::remote::ResolvePeer {
+                peer_name: "gpu".to_string(),
+                node_id: parsed.clone(),
+            })
+            .await
+            .expect("resolve provider route");
+
+        let delegation = storage
+            .create_delegation(Delegation {
+                id: 0,
+                public_id: String::new(),
+                session_id: parent.id,
+                task_id: None,
+                target_agent_id: "coder".to_string(),
+                objective: "route the delegate model".to_string(),
+                objective_hash: crate::hash::RapidHash::new(b"route the delegate model"),
+                context: None,
+                constraints: None,
+                expected_output: None,
+                verification_spec: None,
+                planning_summary: None,
+                status: DelegationStatus::Running,
+                retry_count: 0,
+                created_at: time::OffsetDateTime::now_utc(),
+                completed_at: None,
+            })
+            .await
+            .expect("delegation");
+        let event_sink = Arc::new(EventSink::new(
+            storage.event_journal(),
+            Arc::new(EventFanout::new()),
+        ));
+        let active_delegations = Arc::new(Mutex::new(HashMap::new()));
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+
+        execute_delegation(
+            DelegationContext {
+                delegator: StubAgentHandle::new("delegator"),
+                event_sink,
+                store: storage.session_store(),
+                tool_registry: Arc::new(ToolRegistry::new()),
+                config: DelegationOrchestratorConfig::new(None),
+                hooks: Hooks::default(),
+                active_delegations,
+                delegation_summarizer: None,
+                delegate_model_overrides: crate::delegation::DelegateModelOverrideStore::default(),
+                profile_id: None,
+                routing_snapshot: Some(snapshot),
+            },
+            target.clone(),
+            parent.public_id,
+            delegation,
+            cancel_token,
+        )
+        .await;
+
+        let child_ref = target.last_session_ref().await.expect("child session ref");
+        let control = child_ref
+            .get_session_control()
+            .await
+            .expect("child session control");
+        assert_eq!(
+            control.effective_model.provider_node_id.as_deref(),
+            Some(parsed.as_str())
+        );
+        child_ref.shutdown().await.expect("shut down child session");
     }
 
     #[tokio::test]
@@ -2017,9 +2139,16 @@ mod tests {
 
     // ── Minimal stub AgentHandle ──────────────────────────────────────────────
 
+    struct StubSessionBackend {
+        storage: Arc<SqliteStorage>,
+        config: Arc<AgentConfig>,
+        last_session_ref: Arc<Mutex<Option<SessionActorRef>>>,
+    }
+
     struct StubAgentHandle {
         name: String,
         event_fanout: Arc<EventFanout>,
+        session_backend: Option<Arc<StubSessionBackend>>,
     }
 
     impl StubAgentHandle {
@@ -2027,7 +2156,33 @@ mod tests {
             Arc::new(Self {
                 name: name.to_string(),
                 event_fanout: Arc::new(EventFanout::new()),
+                session_backend: None,
             })
+        }
+
+        fn with_session_backend(
+            name: &str,
+            storage: Arc<SqliteStorage>,
+            config: Arc<AgentConfig>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                event_fanout: Arc::new(EventFanout::new()),
+                session_backend: Some(Arc::new(StubSessionBackend {
+                    storage,
+                    config,
+                    last_session_ref: Arc::new(Mutex::new(None)),
+                })),
+            })
+        }
+
+        async fn last_session_ref(&self) -> Option<SessionActorRef> {
+            self.session_backend
+                .as_ref()?
+                .last_session_ref
+                .lock()
+                .await
+                .clone()
         }
     }
 
@@ -2059,10 +2214,44 @@ mod tests {
 
         async fn create_delegation_session(
             &self,
-            _cwd: Option<String>,
-            _parent_session_id: String,
+            cwd: Option<String>,
+            parent_session_id: String,
         ) -> std::result::Result<(String, SessionActorRef), Error> {
-            Err(Error::internal_error().data("stub: not implemented"))
+            let Some(backend) = &self.session_backend else {
+                return Err(Error::internal_error().data("stub: not implemented"));
+            };
+            let session = backend
+                .storage
+                .session_store()
+                .create_session(
+                    None,
+                    cwd.map(std::path::PathBuf::from),
+                    Some(parent_session_id),
+                    Some(ForkOrigin::Delegation),
+                )
+                .await
+                .map_err(|error| Error::internal_error().data(error.to_string()))?;
+            let llm_config = backend
+                .storage
+                .session_store()
+                .create_or_get_llm_config(
+                    &LLMParams::new().provider("mock").model("delegate-model"),
+                )
+                .await
+                .map_err(|error| Error::internal_error().data(error.to_string()))?;
+            backend
+                .storage
+                .session_store()
+                .set_session_llm_config(&session.public_id, llm_config.id)
+                .await
+                .map_err(|error| Error::internal_error().data(error.to_string()))?;
+
+            let runtime = SessionRuntime::new(None, HashMap::new(), McpToolState::empty());
+            let actor =
+                SessionActor::new(backend.config.clone(), session.public_id.clone(), runtime);
+            let session_ref = SessionActorRef::Local(SessionActor::spawn(actor));
+            *backend.last_session_ref.lock().await = Some(session_ref.clone());
+            Ok((session.public_id, session_ref))
         }
 
         fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventEnvelope> {
