@@ -231,6 +231,7 @@ fn queued_prompt_capacity_error(session_id: &str) -> AgentError {
 struct QueuedPrompt {
     input_id: String,
     req: crate::acp::protocol::PromptRequest,
+    bridge: Option<ClientBridgeSender>,
     reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
 }
 
@@ -338,9 +339,34 @@ impl SessionActor {
         });
     }
 
+    fn prompt_execution(
+        &self,
+        req: crate::acp::protocol::PromptRequest,
+        bridge: Option<ClientBridgeSender>,
+        run_id: String,
+        steering: Arc<crate::agent::turn_control::SteeringInbox>,
+        phase_reporter: tokio::sync::mpsc::UnboundedSender<RunPhase>,
+    ) -> DetachedPromptExecution {
+        DetachedPromptExecution {
+            req,
+            session_id: self.session_id.clone(),
+            runtime: self.runtime.clone(),
+            config: self.config.clone(),
+            cancel_token: self.turn_state.token.clone(),
+            bridge,
+            mode: self.mode,
+            tool_config: self.tool_config.clone(),
+            execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
+            run_id,
+            steering,
+            phase_reporter,
+        }
+    }
+
     fn launch_prompt(
         &mut self,
         req: crate::acp::protocol::PromptRequest,
+        bridge: Option<ClientBridgeSender>,
         reply: oneshot::Sender<Result<PromptResponse, AgentError>>,
         actor_ref: kameo::actor::ActorRef<SessionActor>,
         queued_input_id: Option<String>,
@@ -390,20 +416,7 @@ impl SessionActor {
             }
         });
 
-        let exec = DetachedPromptExecution {
-            req,
-            session_id: self.session_id.clone(),
-            runtime: self.runtime.clone(),
-            config: self.config.clone(),
-            cancel_token: self.turn_state.token.clone(),
-            bridge: self.bridge.clone(),
-            mode: self.mode,
-            tool_config: self.tool_config.clone(),
-            execution_origin: crate::agent::execution_context::ExecutionOrigin::Interactive,
-            run_id: run_id.clone(),
-            steering,
-            phase_reporter: phase_tx,
-        };
+        let exec = self.prompt_execution(req, bridge, run_id.clone(), steering, phase_tx);
         let completion_token = self.turn_state.token.clone();
         tokio::spawn(async move {
             let result = execute_prompt_detached(exec).await;
@@ -545,6 +558,7 @@ impl Message<PromptFinished> for SessionActor {
         if let Some(queued) = self.queued_prompts.pop_front() {
             self.launch_prompt(
                 queued.req,
+                queued.bridge,
                 queued.reply,
                 ctx.actor_ref().clone(),
                 Some(queued.input_id),
@@ -1263,6 +1277,41 @@ impl Message<SetBridge> for SessionActor {
     }
 }
 
+#[cfg(test)]
+impl Message<GetBridge> for SessionActor {
+    type Reply = Option<ClientBridgeSender>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetBridge,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        self.bridge.clone()
+    }
+}
+
+impl Message<ClearBridge> for SessionActor {
+    type Reply = bool;
+
+    async fn handle(
+        &mut self,
+        msg: ClearBridge,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if self
+            .bridge
+            .as_ref()
+            .and_then(ClientBridgeSender::connection_id)
+            == Some(msg.connection_id.as_ref())
+        {
+            self.bridge = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 impl Message<Shutdown> for SessionActor {
     type Reply = ();
 
@@ -1785,7 +1834,13 @@ impl Message<SubmitSessionInput> for SessionActor {
                     }
                 });
                 if self.active_run.is_none() {
-                    self.launch_prompt(req, reply, ctx.actor_ref().clone(), Some(input_id.clone()));
+                    self.launch_prompt(
+                        req,
+                        self.bridge.clone(),
+                        reply,
+                        ctx.actor_ref().clone(),
+                        Some(input_id.clone()),
+                    );
                     let run_id = self
                         .active_run
                         .as_ref()
@@ -1799,6 +1854,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     self.queued_prompts.push_back(QueuedPrompt {
                         input_id: input_id.clone(),
                         req,
+                        bridge: self.bridge.clone(),
                         reply,
                     });
                     let position = crate::agent::utils::u32_from_usize(
@@ -1840,6 +1896,7 @@ impl Message<Prompt> for SessionActor {
             self.queued_prompts.push_back(QueuedPrompt {
                 input_id: input_id.clone(),
                 req: msg.req,
+                bridge: msg.bridge,
                 reply,
             });
             self.config.emit_event(
@@ -1854,7 +1911,7 @@ impl Message<Prompt> for SessionActor {
                 },
             );
         } else {
-            self.launch_prompt(msg.req, reply, ctx.actor_ref().clone(), None);
+            self.launch_prompt(msg.req, msg.bridge, reply, ctx.actor_ref().clone(), None);
         }
         ctx.spawn(async move {
             receiver.await.unwrap_or_else(|_| {
@@ -2718,6 +2775,29 @@ mod tests {
     };
 
     // ── Shared fixture ───────────────────────────────────────────────────────
+
+    struct GetQueuedPromptBridgeIds;
+
+    impl Message<GetQueuedPromptBridgeIds> for SessionActor {
+        type Reply = Vec<Option<String>>;
+
+        async fn handle(
+            &mut self,
+            _msg: GetQueuedPromptBridgeIds,
+            _ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            self.queued_prompts
+                .iter()
+                .map(|queued| {
+                    queued
+                        .bridge
+                        .as_ref()
+                        .and_then(ClientBridgeSender::connection_id)
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+    }
 
     struct ActorFixture {
         config: Arc<AgentConfig>,
@@ -3724,6 +3804,68 @@ mod tests {
             .await
             .expect("ask GetMode after potential bridge set");
         assert_eq!(mode, AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn launched_and_queued_prompts_retain_admitted_bridges() {
+        let fixture = ActorFixture::new().await;
+        let mut actor = SessionActor::new(
+            fixture.config,
+            "test-session".to_string(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        let (bridge_a_tx, _bridge_a_rx) = tokio::sync::mpsc::channel(4);
+        let bridge_a = ClientBridgeSender::for_connection(bridge_a_tx, "conn-a");
+        let (bridge_b_tx, _bridge_b_rx) = tokio::sync::mpsc::channel(4);
+        let bridge_b = ClientBridgeSender::for_connection(bridge_b_tx, "conn-b");
+        actor.bridge = Some(bridge_a);
+
+        let immediate = actor.prompt_execution(
+            crate::acp::protocol::PromptRequest::new(
+                "test-session",
+                vec![crate::acp::protocol::ContentBlock::from("immediate")],
+            ),
+            Some(bridge_b.clone()),
+            "immediate-run".to_string(),
+            Arc::new(crate::agent::turn_control::SteeringInbox::new(
+                "immediate-run".to_string(),
+            )),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        assert_eq!(
+            immediate
+                .bridge
+                .as_ref()
+                .and_then(ClientBridgeSender::connection_id),
+            Some("conn-b")
+        );
+
+        actor.active_run = Some(ActiveRun::new(
+            "running".to_string(),
+            1,
+            CancellationToken::new(),
+        ));
+        let actor_ref = SessionActor::spawn(actor);
+        actor_ref
+            .tell(Prompt {
+                req: crate::acp::protocol::PromptRequest::new(
+                    "test-session",
+                    vec![crate::acp::protocol::ContentBlock::from("queued")],
+                ),
+                bridge: Some(bridge_b),
+            })
+            .await
+            .expect("queue prompt");
+        let queued_bridges = actor_ref
+            .ask(GetQueuedPromptBridgeIds)
+            .await
+            .expect("inspect queued prompt bridges");
+        assert_eq!(queued_bridges, vec![Some("conn-b".to_string())]);
+        actor_ref.tell(Shutdown).await.expect("shutdown actor");
     }
 
     #[tokio::test]

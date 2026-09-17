@@ -874,24 +874,6 @@ impl QuorumBuilder {
             planner_handle.set_mesh(mesh.clone());
             planner_handle.ensure_mesh_published(None).await?;
 
-            // Wire peer delegates: set mesh handle on each for connectivity.
-            // Routing is handled by the RoutingActor (populated above).
-            for (delegate_id, _peer_name) in &self.peer_delegates {
-                let handle = match quorum.delegate(delegate_id) {
-                    Some(h) => h,
-                    None => {
-                        log::warn!(
-                            "peer_delegate '{}' not found in quorum — skipping mesh wiring",
-                            delegate_id
-                        );
-                        continue;
-                    }
-                };
-
-                // Always set the mesh handle so the delegate can reach the mesh.
-                handle.set_mesh_handle(mesh.clone());
-            }
-
             // Subscribe the RoutingActor to PeerEvent for eager resolution / failover.
             if let Some(ref actor_ref) = routing_actor_ref {
                 let peer_delegates = self.peer_delegates.clone();
@@ -1386,6 +1368,8 @@ fn apply_middleware_from_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "remote")]
+    use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::config::McpServerConfig;
     use crate::test_utils::helpers::empty_plugin_registry;
 
@@ -1652,6 +1636,62 @@ include_external = false
                 .find(crate::skills::SkillTool::NAME)
                 .is_none()
         );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn quorum_shares_mesh_with_ordinary_delegate_for_explicit_model_route() {
+        let (plugin_registry, _registry_dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
+        );
+        let infra = super::super::agent::AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        };
+        let agent = QuorumBuilder::new()
+            .infra(infra)
+            .planner(|planner| planner.provider("test", "planner-model"))
+            .delegate("coder", |delegate| delegate.provider("test", "coder-model"))
+            .build()
+            .await
+            .expect("quorum should build");
+        agent.handle().set_mesh(get_test_mesh().await.clone());
+        let delegate = agent.delegate("coder").expect("coder delegate");
+        let delegate = delegate
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local delegate");
+        let provider_node_id = random_node_id();
+
+        delegate
+            .config
+            .provider
+            .build_provider(
+                crate::session::provider::ProviderRequest::new("remote", "worker-model")
+                    .with_provider_node_id(Some(&provider_node_id)),
+            )
+            .await
+            .expect("ordinary delegate should build an explicit mesh provider");
+
+        agent.handle().clear_mesh();
+        let error = match delegate
+            .config
+            .provider
+            .build_provider(
+                crate::session::provider::ProviderRequest::new("remote", "worker-model")
+                    .with_provider_node_id(Some(&provider_node_id)),
+            )
+            .await
+        {
+            Ok(_) => panic!("clearing the planner mesh should clear delegate mesh access"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("no mesh handle available"));
     }
 
     #[tokio::test]

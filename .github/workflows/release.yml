@@ -16,6 +16,8 @@ jobs:
     with:
       version_name: ${{ github.ref_name }}
       is_nightly: false
+      # Pin the querymt-desktop release commit here when dashboard-ng is ready for stable builds.
+      dashboard_ng_revision: ''
 
   release:
     name: Create GitHub Release

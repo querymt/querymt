@@ -23,6 +23,7 @@ use querymt::chat::ReasoningEffort;
 use querymt_remote::{
     classify_infallible_remote_send_error, classify_remote_send_error_with_timeout_message,
 };
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Location-transparent reference to a `SessionActor`.
@@ -173,43 +174,69 @@ impl SessionActorRef {
         )
     )]
     pub async fn prompt_agent(&self, req: PromptRequest) -> Result<PromptResponse, AgentError> {
+        self.prompt_agent_with_bridge(req, None).await
+    }
+
+    pub async fn prompt_agent_with_bridge(
+        &self,
+        req: PromptRequest,
+        bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+    ) -> Result<PromptResponse, AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::Prompt { req })
+                .ask(messages::Prompt { req, bridge })
                 .await
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::Prompt { req })
-                .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::Span::current().record(
-                        "timed_out",
-                        matches!(e, kameo::error::RemoteSendError::ReplyTimeout),
-                    );
-                    // Reply loss stays ambiguous (`delivery=unknown`); legacy Prompt
-                    // must never be auto-replayed after such a failure.
-                    match classify_remote_send_error_with_timeout_message(
-                        e,
-                        format!(
-                            "Remote prompt timed out (mailbox={}s, reply={}s)",
-                            Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
-                            Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
-                        ),
-                    ) {
-                        Ok(failure) => AgentError::from_transport_failure(failure),
-                        Err(handler_error) => handler_error,
-                    }
-                }),
+            Self::Remote { actor_ref, .. } => {
+                if bridge.is_some() {
+                    return Err(AgentError::Internal(
+                        "client bridges are not supported for remote session prompts".to_string(),
+                    ));
+                }
+
+                actor_ref
+                    .ask(&messages::Prompt { bridge: None, req })
+                    .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
+                    .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        tracing::Span::current().record(
+                            "timed_out",
+                            matches!(e, kameo::error::RemoteSendError::ReplyTimeout),
+                        );
+                        // Reply loss stays ambiguous (`delivery=unknown`); legacy Prompt
+                        // must never be auto-replayed after such a failure.
+                        match classify_remote_send_error_with_timeout_message(
+                            e,
+                            format!(
+                                "Remote prompt timed out (mailbox={}s, reply={}s)",
+                                Self::REMOTE_PROMPT_MAILBOX_TIMEOUT.as_secs(),
+                                Self::REMOTE_PROMPT_REPLY_TIMEOUT.as_secs()
+                            ),
+                        ) {
+                            Ok(failure) => AgentError::from_transport_failure(failure),
+                            Err(handler_error) => handler_error,
+                        }
+                    })
+            }
         }
     }
 
     pub async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, AcpError> {
         self.prompt_agent(req).await.map_err(AcpError::from)
+    }
+
+    pub async fn prompt_with_bridge(
+        &self,
+        req: PromptRequest,
+        bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+    ) -> Result<PromptResponse, AcpError> {
+        self.prompt_agent_with_bridge(req, bridge)
+            .await
+            .map_err(AcpError::from)
     }
 
     pub async fn submit_input(
@@ -780,6 +807,18 @@ impl SessionActorRef {
                 log::debug!("set_bridge called on remote SessionActorRef — ignored");
                 Ok(())
             }
+        }
+    }
+
+    pub async fn clear_bridge(&self, connection_id: Arc<str>) -> Result<bool, AgentError> {
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(messages::ClearBridge { connection_id })
+                .await
+                .map_err(|error| AgentError::RemoteActor(error.to_string())),
+
+            #[cfg(feature = "remote")]
+            Self::Remote { .. } => Ok(false),
         }
     }
 

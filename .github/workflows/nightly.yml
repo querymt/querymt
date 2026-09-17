@@ -17,37 +17,54 @@ jobs:
       has_changes: ${{ steps.check.outputs.has_changes }}
       last_commit: ${{ steps.check.outputs.last_commit }}
       version_name: ${{ steps.version.outputs.name }}
+      dashboard_ng_revision: ${{ steps.desktop.outputs.sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0  # Need full history to compare
       
+      - name: Resolve latest Desktop main
+        id: desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DESKTOP_SHA=$(gh api repos/querymt/querymt-desktop/commits/main --jq '.sha')
+          test -n "$DESKTOP_SHA"
+          echo "sha=$DESKTOP_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Check for changes
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          CURRENT_DESKTOP_SHA: ${{ steps.desktop.outputs.sha }}
         run: |
-          # Get the commit SHA from the last nightly release
+          # Compare both repositories against the revisions recorded by the last nightly.
           LAST_NIGHTLY_SHA=$(gh release view nightly --json targetCommitish --jq '.targetCommitish' 2>/dev/null || echo "")
-          
+          LAST_DESKTOP_SHA=$(
+            gh release view nightly --json body --jq '.body' 2>/dev/null \
+              | sed -n "s/^Desktop UI: \`\([0-9a-f]\{40\}\)\`$/\1/p" \
+              | head -n 1 \
+              || true
+          )
           CURRENT_SHA=$(git rev-parse HEAD)
-          
-          # If no previous nightly exists, or SHAs differ, we have changes
-          if [ -z "$LAST_NIGHTLY_SHA" ] || [ "$LAST_NIGHTLY_SHA" != "$CURRENT_SHA" ]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "Changes detected or first nightly build"
+
+          if [ -z "$LAST_NIGHTLY_SHA" ] \
+            || [ "$LAST_NIGHTLY_SHA" != "$CURRENT_SHA" ] \
+            || [ "$LAST_DESKTOP_SHA" != "$CURRENT_DESKTOP_SHA" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            echo "QueryMT or Desktop UI changed, or this is the first nightly build"
           else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "No changes since last nightly build ($LAST_NIGHTLY_SHA)"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No QueryMT or Desktop UI changes since the last nightly"
           fi
-          
-          echo "last_commit=$LAST_NIGHTLY_SHA" >> $GITHUB_OUTPUT
+
+          echo "last_commit=$LAST_NIGHTLY_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Generate version string
         id: version
         shell: bash
-        run: echo "name=nightly-$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+        run: echo "name=nightly-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build Nightly Binaries
@@ -57,6 +74,7 @@ jobs:
     with:
       version_name: ${{ needs.check-changes.outputs.version_name }}
       is_nightly: true
+      dashboard_ng_revision: ${{ needs.check-changes.outputs.dashboard_ng_revision }}
 
   release:
     name: Create Nightly GitHub Release
@@ -95,7 +113,8 @@ jobs:
 
           It is not intended for production use.
 
-          Commit: \`${{ github.sha }}\`" \
+          Commit: \`${{ github.sha }}\`
+          Desktop UI: \`${{ needs.check-changes.outputs.dashboard_ng_revision }}\`" \
             --prerelease \
             --target "${{ github.sha }}" \
             artifacts/*

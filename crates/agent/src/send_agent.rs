@@ -18,6 +18,7 @@
 /// - `new_session`: Session creation with CWD and MCP servers
 /// - `prompt`: The main interaction method
 /// - `cancel`: Cancellation support
+use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{
     AuthenticateRequest, AuthenticateResponse, CancelNotification, CloseSessionRequest,
     CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse, Error, ExtNotification,
@@ -64,6 +65,15 @@ pub trait SendAgent: Send + Sync + Any {
     /// This is the core method for agent interaction. The agent processes the prompt,
     /// potentially calling tools, and returns a response when the turn is complete.
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error>;
+
+    /// Execute a prompt with the client bridge selected when it was admitted.
+    async fn prompt_with_bridge(
+        &self,
+        req: PromptRequest,
+        _bridge: Option<ClientBridgeSender>,
+    ) -> Result<PromptResponse, Error> {
+        self.prompt(req).await
+    }
 
     /// Cancel an ongoing prompt.
     ///

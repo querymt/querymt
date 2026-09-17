@@ -19,6 +19,7 @@ use crate::test_utils::{
     MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestPluginLoader,
     TestProviderFactory, mock_querymt_tool_call,
 };
+use kameo::actor::Spawn;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::FinishReason;
@@ -591,6 +592,174 @@ fn agent_info(id: &str) -> AgentInfo {
 }
 
 // Helper functions moved to crate::test_utils::helpers
+
+#[tokio::test]
+async fn delegate_session_inherits_parent_connection_bridge() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let bridge_handle = crate::agent::LocalAgentHandle::from_config(harness.config.clone());
+    let parent_runtime = crate::agent::core::SessionRuntime::new(
+        None,
+        HashMap::new(),
+        crate::agent::core::McpToolState::empty(),
+    );
+    let parent_actor = crate::agent::SessionActor::new(
+        harness.config.clone(),
+        harness.exec_ctx.session_id.clone(),
+        parent_runtime,
+    );
+    let parent_actor = crate::agent::SessionActor::spawn(parent_actor);
+    bridge_handle
+        .registry
+        .lock()
+        .await
+        .insert(harness.exec_ctx.session_id.clone(), parent_actor);
+    let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(4);
+    let bridge = crate::acp::client_bridge::ClientBridgeSender::for_connection(bridge_tx, "conn");
+    bridge_handle
+        .set_session_bridge(&harness.exec_ctx.session_id, bridge)
+        .await
+        .expect("set parent bridge");
+
+    harness.run_single_delegation().await;
+    let child_session_id = harness
+        .child_sessions()
+        .await
+        .into_iter()
+        .next()
+        .expect("child session");
+    let target = harness
+        .config
+        .agent_registry
+        .get_handle("agent")
+        .expect("delegate handle");
+    let target = target
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local delegate");
+    let child = target
+        .registry
+        .lock()
+        .await
+        .get(&child_session_id)
+        .cloned()
+        .expect("child actor");
+    #[cfg(feature = "remote")]
+    let crate::agent::remote::SessionActorRef::Local(child) = child else {
+        panic!("expected local child actor");
+    };
+    #[cfg(not(feature = "remote"))]
+    let crate::agent::remote::SessionActorRef::Local(child) = child;
+    let inherited = child
+        .ask(crate::agent::messages::GetBridge)
+        .await
+        .expect("query child bridge")
+        .expect("child bridge");
+    assert_eq!(inherited.connection_id(), Some("conn"));
+    let routed_child = target
+        .config
+        .session_bridges
+        .lock()
+        .expect("child bridge routes")
+        .get(&child_session_id)
+        .cloned()
+        .expect("child bridge route");
+    assert_eq!(routed_child.bridge.connection_id(), Some("conn"));
+
+    target.registry.lock().await.remove(&child_session_id);
+    child
+        .tell(crate::agent::messages::Shutdown)
+        .await
+        .expect("stop child actor");
+    child.wait_for_shutdown().await;
+    assert!(
+        bridge_handle
+            .clear_session_bridge(&child_session_id, Arc::from("conn"))
+            .await,
+        "disconnect cleanup should release a route for a stopped child actor"
+    );
+    assert!(
+        target
+            .config
+            .session_bridges
+            .lock()
+            .expect("child bridge routes")
+            .get(&child_session_id)
+            .is_none(),
+        "disconnect cleanup should remove the inherited child actor route"
+    );
+}
+
+#[tokio::test]
+async fn delegate_setup_failure_removes_inherited_bridge_route() {
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    let bridge_handle = crate::agent::LocalAgentHandle::from_config(harness.config.clone());
+    let parent_actor = crate::agent::SessionActor::spawn(crate::agent::SessionActor::new(
+        harness.config.clone(),
+        harness.exec_ctx.session_id.clone(),
+        crate::agent::core::SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        ),
+    ));
+    bridge_handle
+        .registry
+        .lock()
+        .await
+        .insert(harness.exec_ctx.session_id.clone(), parent_actor);
+    let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(4);
+    bridge_handle
+        .set_session_bridge(
+            &harness.exec_ctx.session_id,
+            crate::acp::client_bridge::ClientBridgeSender::for_connection(bridge_tx, "conn"),
+        )
+        .await
+        .expect("set parent bridge");
+    harness
+        .config
+        .provider
+        .history_store()
+        .set_delegate_assignment(
+            &harness.exec_ctx.session_id,
+            "agent",
+            Some(crate::delegation::DelegateModelOverride {
+                model_id: "missing/override-model".into(),
+                node_id: None,
+            }),
+            Some(0),
+        )
+        .await
+        .expect("set failing model override");
+
+    let outcome = harness.run_single_delegation().await;
+    assert_eq!(outcome, CycleOutcome::Completed);
+
+    let child_session_id = harness
+        .child_sessions()
+        .await
+        .into_iter()
+        .next()
+        .expect("child session");
+    let target = harness
+        .config
+        .agent_registry
+        .get_handle("agent")
+        .expect("delegate handle");
+    let target = target
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .expect("local delegate");
+    assert!(
+        target
+            .config
+            .session_bridges
+            .lock()
+            .expect("child bridge routes")
+            .get(&child_session_id)
+            .is_none(),
+        "failed delegate setup should remove the inherited bridge route"
+    );
+}
 
 #[tokio::test]
 async fn duplicate_orchestrators_create_one_child_for_one_request() {

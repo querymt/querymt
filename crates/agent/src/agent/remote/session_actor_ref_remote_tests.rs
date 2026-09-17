@@ -265,8 +265,43 @@ mod session_actor_ref_remote_tests {
     // ── E.11 ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_remote_ref_clone_both_work() {
+    async fn test_remote_ref_rejects_prompt_with_client_bridge() {
         let (session_ref, _local) = remote_session_ref("e11").await;
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let bridge = crate::acp::client_bridge::ClientBridgeSender::new(tx);
+        let req = crate::acp::protocol::PromptRequest::new(
+            "remote-e-e11",
+            vec![crate::acp::protocol::ContentBlock::from("hello")],
+        );
+
+        let error = session_ref
+            .prompt_agent_with_bridge(req, Some(bridge))
+            .await
+            .expect_err("remote prompt with a client bridge must be rejected");
+
+        assert!(
+            matches!(
+                error,
+                crate::error::AgentError::Internal(ref message)
+                    if message == "client bridges are not supported for remote session prompts"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(
+            session_ref
+                .get_history()
+                .await
+                .expect("get history after rejected prompt")
+                .is_empty(),
+            "rejected prompt must not execute remotely"
+        );
+    }
+
+    // ── E.12 ─────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_remote_ref_clone_both_work() {
+        let (session_ref, _local) = remote_session_ref("e12").await;
         let cloned = session_ref.clone();
 
         let m1 = session_ref.get_mode().await.expect("original get_mode");

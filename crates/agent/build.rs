@@ -8,9 +8,10 @@ use std::process::Command;
 fn main() {
     emit_build_version();
 
-    // Only build UI when dashboard feature is enabled
     #[cfg(feature = "dashboard")]
     build_ui();
+    #[cfg(feature = "dashboard-ng")]
+    prepare_dashboard_ng();
 }
 
 fn emit_build_version() {
@@ -133,4 +134,51 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "dashboard-ng")]
+fn prepare_dashboard_ng() {
+    const ENV_NAME: &str = "QMT_DASHBOARD_NG_DIST";
+    println!("cargo:rerun-if-env-changed={ENV_NAME}");
+
+    let dist_path = std::env::var(ENV_NAME)
+        .unwrap_or_else(|_| panic!("{ENV_NAME} must point to a prebuilt embedded dashboard"));
+    let dist_src = Path::new(&dist_path);
+    if !dist_src.is_dir() {
+        panic!("{ENV_NAME} is not a directory: {dist_path}");
+    }
+    validate_dashboard_ng_manifest(dist_src);
+
+    let dist_dst = Path::new("ui/dashboard-ng-dist");
+    if dist_dst.exists() {
+        fs::remove_dir_all(dist_dst)
+            .unwrap_or_else(|err| panic!("Failed to remove existing dashboard-ng assets: {err}"));
+    }
+    copy_dir_all(dist_src, dist_dst)
+        .unwrap_or_else(|err| panic!("Failed to copy dashboard-ng assets: {err}"));
+    println!("cargo:warning=Using prebuilt dashboard-ng from {ENV_NAME}");
+}
+
+#[cfg(feature = "dashboard-ng")]
+fn validate_dashboard_ng_manifest(dist: &Path) {
+    if !dist.join("index.html").is_file() {
+        panic!("QMT_DASHBOARD_NG_DIST must contain index.html");
+    }
+
+    let manifest_path = dist.join("querymt-ui.json");
+    let manifest = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("Failed to read {}: {err}", manifest_path.display()));
+    let manifest: serde_json::Value = serde_json::from_str(&manifest)
+        .unwrap_or_else(|err| panic!("Invalid {}: {err}", manifest_path.display()));
+
+    let target = manifest.get("target").and_then(serde_json::Value::as_str);
+    if target != Some("embedded") {
+        panic!("querymt-ui.json target must be 'embedded', got {target:?}");
+    }
+    let acp_path = manifest
+        .get("acpWebSocketPath")
+        .and_then(serde_json::Value::as_str);
+    if acp_path != Some("/acp/ws") {
+        panic!("querymt-ui.json acpWebSocketPath must be '/acp/ws', got {acp_path:?}");
+    }
 }
