@@ -658,6 +658,52 @@ async fn test_profile_bound_delegate_session_resolves_delegate_actor() {
 }
 
 #[tokio::test]
+async fn test_clear_session_bridge_finds_profile_route_after_binding_is_forgotten() {
+    let (f, _profile_dir) =
+        profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;
+    let profiles = f.handle.profiles().expect("profiles configured");
+    let runtime = profiles
+        .runtime_for_profile("quorum")
+        .await
+        .expect("quorum runtime");
+    let session_id = "delegate-bridge-session";
+    register_profile_bound_delegate_session(&f, &runtime, session_id).await;
+    let (bridge_tx, _bridge_rx) = tokio::sync::mpsc::channel(4);
+    f.handle
+        .set_session_bridge(
+            session_id,
+            crate::acp::client_bridge::ClientBridgeSender::for_connection(bridge_tx, "conn"),
+        )
+        .await
+        .expect("set session bridge");
+    profiles.forget_session_binding(session_id).await;
+
+    assert!(
+        f.handle
+            .clear_session_bridge(session_id, Arc::from("conn"))
+            .await,
+        "materialized profile runtime should retain enough routing state to clear the bridge"
+    );
+    let delegate_handle = runtime
+        .agent()
+        .delegate("coder")
+        .expect("coder delegate")
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .expect("local delegate")
+        .config
+        .clone();
+    assert!(
+        !delegate_handle
+            .session_bridges
+            .lock()
+            .expect("bridge routes lock")
+            .contains_key(session_id),
+        "profile delegate bridge route should be removed"
+    );
+}
+
+#[tokio::test]
 async fn test_close_profile_bound_delegate_session_stops_delegate_actor() {
     let (f, _profile_dir) =
         profile_fixture_with_files(&[("quorum.toml", QUORUM_PROFILE_TOML)]).await;

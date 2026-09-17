@@ -17,8 +17,11 @@ on:
       - 'Cargo.lock'
       - '.github/workflows/test-agent.yml'
 
+permissions:
+  contents: read
+
 env:
-  features: 'dashboard,oauth,remote'
+  features: 'dashboard-ng,oauth,remote'
 
 jobs:
   # Job 1: Check formatting (fast, fails first)
@@ -49,11 +52,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
       
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
         with:
           key: agent-clippy
+
+      - name: Prepare embedded dashboard fixture
+        run: |
+          mkdir -p "$RUNNER_TEMP/dashboard-ng-ui"
+          printf '<!doctype html><title>QueryMT</title>\n' > "$RUNNER_TEMP/dashboard-ng-ui/index.html"
+          printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > "$RUNNER_TEMP/dashboard-ng-ui/querymt-ui.json"
+          echo "QMT_DASHBOARD_NG_DIST=$RUNNER_TEMP/dashboard-ng-ui" >> "$GITHUB_ENV"
       
       - name: Run Clippy
         run: cargo clippy --package querymt-agent --all-targets --features "${features}" -- -D warnings
@@ -70,11 +83,21 @@ jobs:
       
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
       
       - name: Cache Cargo dependencies
         uses: swatinem/rust-cache@v2
         with:
           key: agent-test
+
+      - name: Prepare embedded dashboard fixture
+        run: |
+          mkdir -p "$RUNNER_TEMP/dashboard-ng-ui"
+          printf '<!doctype html><title>QueryMT</title>\n' > "$RUNNER_TEMP/dashboard-ng-ui/index.html"
+          printf '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}\n' > "$RUNNER_TEMP/dashboard-ng-ui/querymt-ui.json"
+          echo "QMT_DASHBOARD_NG_DIST=$RUNNER_TEMP/dashboard-ng-ui" >> "$GITHUB_ENV"
       
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov

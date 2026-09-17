@@ -36,8 +36,9 @@ impl LocalAgentHandle {
         // Propagate to the session materializer for mesh-aware session creation
         self.session_materializer.set_mesh(mesh.clone());
 
-        // Propagate to the model inventory for remote model enumeration
-        self.model_inventory.set_mesh(mesh);
+        // Propagate to the model inventory for remote model enumeration.
+        self.model_inventory.set_mesh(mesh.clone());
+        self.ensure_remote_node_cache_invalidation_task(&mesh);
     }
 
     #[cfg(feature = "remote")]
@@ -366,6 +367,7 @@ impl LocalAgentHandle {
 
         let mut rx = mesh.subscribe_peer_events();
         let cache = Arc::clone(&self.remote_node_cache);
+        let model_inventory = self.model_inventory.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
@@ -373,6 +375,7 @@ impl LocalAgentHandle {
                     | Ok(crate::agent::remote::mesh::PeerEvent::Expired(peer_id)) => {
                         let key = format!("peer:{peer_id}");
                         cache.by_label.write().remove(&key);
+                        model_inventory.invalidate_remote().await;
                     }
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

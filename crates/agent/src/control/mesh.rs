@@ -206,14 +206,27 @@ pub async fn join(
             })?;
         }
 
-        Ok(MeshJoinInfo {
+        let response = MeshJoinInfo {
             joined: true,
             peer_id: runtime.peer_id().to_string(),
             mesh_id,
             mesh_name: invite.grant.mesh_name,
             inviter_peer_id: invite.grant.inviter_peer_id.to_string(),
             already_joined,
-        })
+        };
+        let params = serde_json::value::RawValue::from_string(
+            serde_json::to_string(&crate::control::notifications::MeshJoinedNotification {
+                peer_id: response.peer_id.clone(),
+                transport: "iroh".to_string(),
+            })
+            .map_err(|error| Error::internal_error().data(error.to_string()))?,
+        )
+        .map_err(|error| Error::internal_error().data(error.to_string()))?;
+        agent.broadcast_ext_notification(crate::acp::protocol::ExtNotification::new(
+            crate::acp::shared::QMT_NOTIFICATION_MESH_JOINED,
+            std::sync::Arc::from(params),
+        ));
+        Ok(response)
     }
 
     #[cfg(not(feature = "remote"))]

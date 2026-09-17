@@ -24,8 +24,31 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-/// Type alias for session ownership mapping (session_id -> connection_id)
-pub type SessionOwnerMap = Arc<Mutex<HashMap<String, String>>>;
+/// Session subscriptions keyed by session id.
+///
+/// Multiple connections may subscribe to the same session so browser tabs do not
+/// steal live updates from one another.
+pub type SessionOwnerMap = Arc<Mutex<HashMap<String, HashSet<String>>>>;
+
+async fn subscribe_connection(session_owners: &SessionOwnerMap, session_id: String, conn_id: &str) {
+    session_owners
+        .lock()
+        .await
+        .entry(session_id)
+        .or_default()
+        .insert(conn_id.to_string());
+}
+
+async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &str, conn_id: &str) {
+    let mut owners = session_owners.lock().await;
+    let remove_session = owners.get_mut(session_id).is_some_and(|subscribers| {
+        subscribers.remove(conn_id);
+        subscribers.is_empty()
+    });
+    if remove_session {
+        owners.remove(session_id);
+    }
+}
 
 /// Type alias for pending permission requests (tool_call_id -> response sender)
 pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>;
@@ -139,13 +162,52 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
     request: RpcMessage,
     tx: mpsc::Sender<String>,
 ) {
-    let output = handle_rpc_message(
+    dispatch_rpc_message_with_context(
+        RpcDispatchState {
+            agent,
+            session_owners,
+            pending_permissions,
+            pending_elicitations,
+            conn_id,
+            tx,
+        },
+        request,
+        RpcDispatchContext::default(),
+    )
+    .await;
+}
+
+#[derive(Clone)]
+pub(crate) struct RpcDispatchState<S> {
+    pub agent: Arc<S>,
+    pub session_owners: SessionOwnerMap,
+    pub pending_permissions: PermissionMap,
+    pub pending_elicitations: PendingElicitationMap,
+    pub conn_id: String,
+    pub tx: mpsc::Sender<String>,
+}
+
+pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
+    state: RpcDispatchState<S>,
+    request: RpcMessage,
+    context: RpcDispatchContext,
+) {
+    let RpcDispatchState {
+        agent,
+        session_owners,
+        pending_permissions,
+        pending_elicitations,
+        conn_id,
+        tx,
+    } = state;
+    let output = handle_rpc_message_with_context(
         agent.as_ref(),
         &session_owners,
         &pending_permissions,
         &pending_elicitations,
         &conn_id,
         request,
+        context,
     )
     .await;
 
@@ -178,10 +240,67 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
 #[derive(Clone, Default)]
 pub struct RpcDispatchContext {
     pub session_hooks: Option<Arc<dyn AcpSessionHooks>>,
+    pub session_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+}
+
+async fn attach_rpc_session<S: SendAgent>(
+    agent: &S,
+    session_owners: &SessionOwnerMap,
+    conn_id: &str,
+    context: &RpcDispatchContext,
+    session_id: &str,
+    bridge_required: bool,
+) -> Result<(), Error> {
+    let connection_state = context
+        .session_bridge
+        .as_ref()
+        .and_then(crate::acp::client_bridge::ClientBridgeSender::connection_state);
+    let _attachment_guard = match connection_state.as_ref() {
+        Some(state) => Some(state.lock_attachment().await),
+        None => None,
+    };
+    if connection_state
+        .as_ref()
+        .is_some_and(|state| !state.is_active())
+    {
+        return if bridge_required {
+            Err(Error::from(crate::error::AgentError::ClientBridgeClosed))
+        } else {
+            Ok(())
+        };
+    }
+
+    subscribe_connection(session_owners, session_id.to_string(), conn_id).await;
+    let Some(local_agent) = agent.as_any().downcast_ref::<AgentHandle>() else {
+        return Ok(());
+    };
+    if let Some(bridge) = context.session_bridge.as_ref()
+        && let Err(error) = local_agent
+            .set_session_bridge(session_id, bridge.clone())
+            .await
+    {
+        if bridge_required {
+            unsubscribe_connection(session_owners, session_id, conn_id).await;
+            return Err(error);
+        }
+        log::warn!("Failed to attach ACP bridge for session {session_id}: {error}");
+    }
+    if let Some(hooks) = context.session_hooks.as_ref() {
+        hooks.on_session_attached(local_agent, session_id).await?;
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
 pub trait AcpSessionHooks: Send + Sync {
+    async fn on_session_attached(
+        &self,
+        _agent: &AgentHandle,
+        _session_id: &str,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+
     async fn on_session_loaded(
         &self,
         _agent: &AgentHandle,
@@ -790,8 +909,8 @@ pub async fn is_event_owned(
         && matches!(origin, ForkOrigin::Delegation)
     {
         let mut owners = session_owners.lock().await;
-        if let Some(owner) = owners.get(parent_session_id).cloned() {
-            owners.insert(child_session_id.clone(), owner);
+        if let Some(subscribers) = owners.get(parent_session_id).cloned() {
+            owners.insert(child_session_id.clone(), subscribers);
         }
     }
 
@@ -799,8 +918,7 @@ pub async fn is_event_owned(
     let owners = session_owners.lock().await;
     owners
         .get(event.session_id())
-        .map(|owner| owner == conn_id)
-        .unwrap_or(false)
+        .is_some_and(|subscribers| subscribers.contains(conn_id))
 }
 
 /// Collect EventFanout sources from agent and all delegate agents.
@@ -910,9 +1028,15 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             match response {
                                 Ok(r) => {
                                     let session_id = r.session_id.to_string();
-                                    let mut owners = session_owners.lock().await;
-                                    owners.insert(session_id.clone(), conn_id.to_string());
-                                    drop(owners);
+                                    attach_rpc_session(
+                                        agent,
+                                        session_owners,
+                                        conn_id,
+                                        &context,
+                                        &session_id,
+                                        false,
+                                    )
+                                    .await?;
                                     if let Some(notification) =
                                         available_commands_session_update(agent, &session_id).await
                                     {
@@ -929,11 +1053,23 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     }
                 }
                 m if m == AGENT_METHOD_NAMES.session_prompt => {
-                    match serde_json::from_value(req.params) {
-                        Ok(params) => agent
-                            .prompt(params)
-                            .await
-                            .map(|r| serde_json::to_value(r).unwrap()),
+                    match serde_json::from_value::<crate::acp::protocol::PromptRequest>(req.params) {
+                        Ok(params) => {
+                            let session_id = params.session_id.to_string();
+                            attach_rpc_session(
+                                agent,
+                                session_owners,
+                                conn_id,
+                                &context,
+                                &session_id,
+                                true,
+                            )
+                            .await?;
+                            agent
+                                .prompt_with_bridge(params, context.session_bridge.clone())
+                                .await
+                                .map(|r| serde_json::to_value(r).unwrap())
+                        }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -977,10 +1113,15 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let response = agent.load_session(params).await;
                             match response {
                                 Ok(r) => {
-                                    let mut owners = session_owners.lock().await;
-                                    owners.insert(session_id.clone(), conn_id.to_string());
-                                    drop(owners);
-
+                                    attach_rpc_session(
+                                        agent,
+                                        session_owners,
+                                        conn_id,
+                                        &context,
+                                        &session_id,
+                                        false,
+                                    )
+                                    .await?;
                                     let mut value = serde_json::to_value(r).unwrap();
                                     if let (Some(hooks), Some(local_agent)) = (
                                         context.session_hooks.as_ref(),
@@ -1014,9 +1155,15 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let response = agent.resume_session(params).await;
                             match response {
                                 Ok(r) => {
-                                    let mut owners = session_owners.lock().await;
-                                    owners.insert(session_id.clone(), conn_id.to_string());
-                                    drop(owners);
+                                    attach_rpc_session(
+                                        agent,
+                                        session_owners,
+                                        conn_id,
+                                        &context,
+                                        &session_id,
+                                        false,
+                                    )
+                                    .await?;
                                     if let Some(notification) =
                                         available_commands_session_update(agent, &session_id).await
                                     {
@@ -1210,9 +1357,15 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let session_id = session_id_for_owner
                                 .or_else(|| querymt_session_id_from_response(ext_method, &value));
                             if let Some(session_id) = session_id {
-                                let mut owners = session_owners.lock().await;
-                                owners.insert(session_id.clone(), conn_id.to_string());
-                                drop(owners);
+                                attach_rpc_session(
+                                    agent,
+                                    session_owners,
+                                    conn_id,
+                                    &context,
+                                    &session_id,
+                                    false,
+                                )
+                                .await?;
 
                                 if let (Some(hooks), Some(local_agent)) = (
                                     context.session_hooks.as_ref(),
@@ -1375,11 +1528,44 @@ mod tests {
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
     use crate::test_utils::DelegateTestFixture;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tokio::sync::oneshot;
     use tokio::sync::{Mutex, Notify};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn session_subscriptions_support_multiple_connections_and_cleanup() {
+        let subscriptions: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        subscribe_connection(&subscriptions, "session".to_string(), "conn-a").await;
+        subscribe_connection(&subscriptions, "session".to_string(), "conn-b").await;
+
+        let event = EventEnvelope::Durable(DurableEvent {
+            event_id: "event".into(),
+            stream_seq: 1,
+            session_id: "session".into(),
+            timestamp: 1,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        });
+        assert!(is_event_owned(&subscriptions, "conn-a", &event).await);
+        assert!(is_event_owned(&subscriptions, "conn-b", &event).await);
+
+        {
+            let mut subscriptions = subscriptions.lock().await;
+            subscriptions
+                .get_mut("session")
+                .expect("session subscriptions")
+                .remove("conn-b");
+        }
+        assert!(is_event_owned(&subscriptions, "conn-a", &event).await);
+        assert!(!is_event_owned(&subscriptions, "conn-b", &event).await);
+        assert_eq!(
+            subscriptions.lock().await.get("session"),
+            Some(&HashSet::from(["conn-a".to_string()]))
+        );
+    }
 
     #[test]
     fn delegate_assignment_ext_requests_register_session_ownership() {
@@ -2066,6 +2252,7 @@ mod tests {
         prompt_started: Option<Arc<Notify>>,
         release_prompt: Option<Arc<Notify>>,
         cancel_seen: Option<Arc<Notify>>,
+        local_handle: Option<Arc<AgentHandle>>,
     }
 
     #[async_trait::async_trait]
@@ -2086,7 +2273,7 @@ mod tests {
             &self,
             _: crate::acp::protocol::NewSessionRequest,
         ) -> Result<crate::acp::protocol::NewSessionResponse, Error> {
-            unreachable!()
+            Ok(crate::acp::protocol::NewSessionResponse::new("s-lifecycle"))
         }
         async fn prompt(
             &self,
@@ -2167,7 +2354,9 @@ mod tests {
             unreachable!()
         }
         fn as_any(&self) -> &dyn std::any::Any {
-            self
+            self.local_handle
+                .as_deref()
+                .map_or(self as &dyn std::any::Any, |handle| handle)
         }
     }
 
@@ -2179,6 +2368,7 @@ mod tests {
                 prompt_started: None,
                 release_prompt: None,
                 cancel_seen: None,
+                local_handle: None,
             },
             cancelled_session,
         )
@@ -2204,6 +2394,7 @@ mod tests {
             release_prompt: Some(release_prompt.clone()),
             cancel_seen: Some(cancel_seen.clone()),
             cancelled_session: cancelled_session.clone(),
+            local_handle: None,
         });
         let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
@@ -2285,6 +2476,110 @@ mod tests {
 
         assert!(output.response.is_none());
         assert_eq!(cancelled_session.lock().await.as_deref(), Some("s-cancel"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_response_survives_bridge_attachment_failure() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let (bridge_tx, _bridge_rx) = mpsc::channel(1);
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+        };
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let output = handle_rpc_message_with_context(
+            &agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-lifecycle",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_new.to_string(),
+                params: serde_json::json!({"cwd": "/tmp", "mcpServers": []}),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                session_hooks: None,
+                session_bridge: Some(
+                    crate::acp::client_bridge::ClientBridgeSender::for_connection(
+                        bridge_tx,
+                        "conn-lifecycle",
+                    ),
+                ),
+            },
+        )
+        .await;
+
+        let response = output.response.expect("request should produce response");
+        assert!(response.error.is_none());
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({"sessionId": "s-lifecycle"}))
+        );
+        assert_eq!(
+            session_owners.lock().await.get("s-lifecycle").cloned(),
+            Some(HashSet::from(["conn-lifecycle".to_string()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_rejects_bridge_attachment_failure_before_execution() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let prompt_started = Arc::new(Notify::new());
+        let (bridge_tx, _bridge_rx) = mpsc::channel(1);
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: Some(prompt_started.clone()),
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+        };
+        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let output = handle_rpc_message_with_context(
+            &agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-prompt",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_prompt.to_string(),
+                params: serde_json::json!({
+                    "sessionId": "s-missing",
+                    "prompt": [{"type": "text", "text": "must not run"}]
+                }),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                session_hooks: None,
+                session_bridge: Some(
+                    crate::acp::client_bridge::ClientBridgeSender::for_connection(
+                        bridge_tx,
+                        "conn-prompt",
+                    ),
+                ),
+            },
+        )
+        .await;
+
+        let response = output.response.expect("request should produce response");
+        assert!(response.result.is_none());
+        assert!(response.error.is_some());
+        assert!(!session_owners.lock().await.contains_key("s-missing"));
+        assert!(
+            timeout(Duration::from_millis(50), prompt_started.notified())
+                .await
+                .is_err(),
+            "prompt must not execute after bridge attachment fails"
+        );
     }
 
     #[tokio::test]
@@ -2400,6 +2695,7 @@ mod tests {
             },
             RpcDispatchContext {
                 session_hooks: None,
+                session_bridge: None,
             },
         )
         .await;
@@ -2465,6 +2761,7 @@ mod tests {
             },
             RpcDispatchContext {
                 session_hooks: None,
+                session_bridge: None,
             },
         )
         .await
@@ -2690,7 +2987,7 @@ mod tests {
         assert!(response.error.is_none());
         assert_eq!(
             session_owners.lock().await.get("s-remote").cloned(),
-            Some("conn-9".to_string())
+            Some(HashSet::from(["conn-9".to_string()]))
         );
     }
 
@@ -2817,7 +3114,7 @@ mod tests {
         assert!(response.error.is_none());
         assert_eq!(
             session_owners.lock().await.get("s-cr").cloned(),
-            Some("conn-9".to_string())
+            Some(HashSet::from(["conn-9".to_string()]))
         );
     }
 
@@ -2944,7 +3241,7 @@ mod tests {
         assert!(response.error.is_none());
         assert_eq!(
             session_owners.lock().await.get("s-load").cloned(),
-            Some("conn-load".to_string())
+            Some(HashSet::from(["conn-load".to_string()]))
         );
     }
 

@@ -20,6 +20,9 @@ agent-tracing = ["querymt/tracing"]
 # Locally, the build script uses bun (or npm fallback) to build UI assets.
 # Packagers can bypass runtime installs by setting QMT_UI_DIST to a prebuilt dist/.
 dashboard = ["api", "plugin-loaders"]
+# Adds the embedded querymt-desktop Svelte dashboard while retaining the React dashboard.
+# QMT_DASHBOARD_NG_DIST must point to a prebuilt embedded frontend artifact.
+dashboard-ng = ["dashboard"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth"]
 
@@ -146,6 +149,9 @@ libc = "0.2"
 name = "querymt_agent"
 path = "src/lib.rs"
 
+[build-dependencies]
+serde_json.workspace = true
+
 [dev-dependencies]
 mockall = "0.15"
 env_logger = "0.11"
@@ -156,6 +162,7 @@ tracing-log = "0.2"
 criterion = { version = "0.8", features = ["async_tokio"] }
 http.workspace = true
 jsonschema = "0.56"
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "agent_startup"

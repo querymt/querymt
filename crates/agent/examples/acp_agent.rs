@@ -38,7 +38,7 @@
 //! cargo run --example acp_agent ws://127.0.0.1:3030
 //!
 //! # Terminal 2: Connect with wscat
-//! wscat -c ws://127.0.0.1:3030/ws
+//! wscat -c ws://127.0.0.1:3030/acp/ws
 //! > {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1","clientInfo":{"name":"test","version":"0.1"}}}
 //! ```
 //!

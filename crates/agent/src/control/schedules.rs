@@ -118,23 +118,24 @@ async fn emit_schedule_changed_notification(
     agent: &LocalAgentHandle,
     notification: crate::control::notifications::SchedulesChangedNotification,
 ) {
-    let Some(bridge) = agent.bridge.lock().ok().and_then(|guard| guard.clone()) else {
-        return;
-    };
-
     let params = match serde_json::value::RawValue::from_string(
         serde_json::to_string(&notification).unwrap_or_else(|_| "null".to_string()),
     ) {
         Ok(raw) => std::sync::Arc::from(raw),
         Err(_) => return,
     };
+    let notification = crate::acp::protocol::ExtNotification::new(
+        crate::acp::shared::QMT_NOTIFICATION_SCHEDULES_CHANGED,
+        params,
+    );
+    agent.broadcast_ext_notification(notification.clone());
 
-    let _ = bridge
-        .notify_ext(crate::acp::protocol::ExtNotification::new(
-            crate::acp::shared::QMT_NOTIFICATION_SCHEDULES_CHANGED,
-            params,
-        ))
-        .await;
+    let bridge = agent.bridge.lock().ok().and_then(|guard| guard.clone());
+    if let Some(bridge) = bridge
+        && let Err(error) = bridge.notify_ext(notification).await
+    {
+        log::warn!("Failed to send schedules-changed notification: {error}");
+    }
 }
 
 pub async fn create_schedule(

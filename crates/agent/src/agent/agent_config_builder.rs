@@ -204,6 +204,7 @@ impl AgentConfigBuilder {
             agent_registry: self.agent_registry,
             delegate_model_overrides: self.delegate_model_overrides,
             workspace_manager_actor: self.workspace_manager_actor,
+            session_bridges: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             default_mode: self.default_mode,
             default_reasoning_effort: Arc::new(ArcSwap::from_pointee(None)),
             tool_config: self.tool_config,

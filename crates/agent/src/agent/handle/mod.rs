@@ -189,6 +189,7 @@ pub struct LocalAgentHandle {
     // Connection-level mutable state
     pub client_state: Arc<StdMutex<Option<ClientState>>>,
     pub bridge: Arc<StdMutex<Option<ClientBridgeSender>>>,
+    ext_notifications: broadcast::Sender<ExtNotification>,
 
     // Mutable default mode (UI "set agent mode" → affects new sessions)
     pub default_mode: StdMutex<AgentMode>,
