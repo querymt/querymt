@@ -679,6 +679,21 @@ async fn teardown_failed_delegate_session(
 /// This creates sessions via `AgentHandle::create_delegation_session()`. History and
 /// planning context are exchanged via kameo messages (`GetHistory`,
 /// `SetPlanningContext`), so this path works for both local and remote sessions.
+#[cfg(feature = "remote")]
+fn resolve_delegate_provider_node(
+    override_node_id: Option<&str>,
+    routed_node_id: Option<String>,
+) -> Result<Option<String>, String> {
+    match override_node_id {
+        Some(node_id) => crate::agent::remote::NodeId::parse(node_id)
+            .map(|node_id| Some(node_id.to_string()))
+            .map_err(|err| {
+                format!("Invalid provider node '{node_id}' for delegate model override: {err}")
+            }),
+        None => Ok(routed_node_id),
+    }
+}
+
 fn reasoning_effort_from_llm_config(
     config: &crate::session::store::LLMConfig,
 ) -> Result<Option<ReasoningEffort>, serde_json::Error> {
@@ -961,6 +976,8 @@ async fn execute_delegation(
     //     When provider_target = Peer(name) and the peer is resolved,
     //     write the node_id to the session's DB row so SessionProvider
     //     constructs a MeshChatProvider for this session.
+    #[cfg(feature = "remote")]
+    let mut routed_provider_node_id: Option<String> = None;
     if let Some(ref snap_handle) = ctx.routing_snapshot {
         let routing_span = tracing::info_span!(
             "delegation.apply_routing",
@@ -974,6 +991,10 @@ async fn execute_delegation(
                     && let Some(ref node_id) = policy.resolved_provider_node_id
                 {
                     tracing::Span::current().record("provider_node_id", node_id.as_str());
+                    #[cfg(feature = "remote")]
+                    {
+                        routed_provider_node_id = Some(node_id.clone());
+                    }
                     if let Err(e) = ctx
                         .store
                         .set_session_provider_node_id(&child_session_id, Some(node_id.as_str()))
@@ -1037,44 +1058,38 @@ async fn execute_delegation(
     };
     if let Some(model_override) = route_overrides.model {
         #[cfg(feature = "remote")]
-        let provider_node_id = match model_override.node_id.as_deref() {
-            Some(node_id) => match crate::agent::remote::NodeId::parse(node_id) {
-                Ok(node_id) => Some(node_id),
-                Err(err) => {
-                    let error_message = format!(
-                        "Invalid provider node '{}' for delegate model override: {err}",
-                        node_id
-                    );
-                    teardown_failed_delegate_session(
-                        &target,
-                        &child_session_id,
-                        &session_ref,
-                        child_bridge_connection_id.as_ref(),
-                    )
-                    .await;
-                    fail_delegation(
-                        DelegationFailureContext {
-                            event_sink: &ctx.event_sink,
-                            delegator: &ctx.delegator,
-                            store: &ctx.store,
-                            hooks: Some(&ctx.hooks),
-                            config: &ctx.config,
-                            parent_session_id: &parent_session_id,
-                            delegation_id: &delegation.public_id,
-                            target_agent_id: Some(&delegation.target_agent_id),
-                            objective: Some(&delegation.objective),
-                        },
-                        &error_message,
-                    )
-                    .await;
-                    ctx.active_delegations.lock().await.remove(&delegation_id);
-                    return;
-                }
-            },
-            None => None,
+        let provider_node_id = match resolve_delegate_provider_node(
+            model_override.node_id.as_deref(),
+            routed_provider_node_id,
+        ) {
+            Ok(provider_node_id) => provider_node_id,
+            Err(error_message) => {
+                teardown_failed_delegate_session(
+                    &target,
+                    &child_session_id,
+                    &session_ref,
+                    child_bridge_connection_id.as_ref(),
+                )
+                .await;
+                fail_delegation(
+                    DelegationFailureContext {
+                        event_sink: &ctx.event_sink,
+                        delegator: &ctx.delegator,
+                        store: &ctx.store,
+                        hooks: Some(&ctx.hooks),
+                        config: &ctx.config,
+                        parent_session_id: &parent_session_id,
+                        delegation_id: &delegation.public_id,
+                        target_agent_id: Some(&delegation.target_agent_id),
+                        objective: Some(&delegation.objective),
+                    },
+                    &error_message,
+                )
+                .await;
+                ctx.active_delegations.lock().await.remove(&delegation_id);
+                return;
+            }
         };
-        #[cfg(feature = "remote")]
-        let provider_node_id = provider_node_id.map(|node_id| node_id.to_string());
         #[cfg(not(feature = "remote"))]
         let provider_node_id = None;
         let model_selection = crate::agent::session_control::SessionModelSelection {
@@ -1999,6 +2014,51 @@ mod tests {
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::MockSessionStore;
     use async_trait::async_trait;
+
+    #[cfg(feature = "remote")]
+    fn random_provider_node_id() -> String {
+        crate::agent::remote::NodeId::from_peer_id(
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id(),
+        )
+        .to_string()
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn model_override_preserves_routed_provider_node_when_unspecified() {
+        let routed_node_id = random_provider_node_id();
+
+        assert_eq!(
+            resolve_delegate_provider_node(None, Some(routed_node_id.clone())),
+            Ok(Some(routed_node_id))
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn model_override_prefers_explicit_provider_node_over_route() {
+        let explicit_node_id = random_provider_node_id();
+        let routed_node_id = random_provider_node_id();
+
+        assert_eq!(
+            resolve_delegate_provider_node(Some(explicit_node_id.as_str()), Some(routed_node_id),),
+            Ok(Some(explicit_node_id))
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn model_override_rejects_invalid_explicit_provider_node() {
+        let error = resolve_delegate_provider_node(
+            Some("not-a-provider-node"),
+            Some(random_provider_node_id()),
+        )
+        .expect_err("invalid explicit provider node must fail");
+
+        assert!(error.contains("Invalid provider node 'not-a-provider-node'"));
+    }
 
     #[tokio::test]
     async fn locked_profile_delegation_persists_restorable_provider_lock() {
