@@ -63,17 +63,17 @@ pub(crate) struct WsServerState {
     pub(crate) session_owners: SessionOwnerMap,
     pub(crate) connection_bridges: Arc<Mutex<HashMap<String, ClientBridgeSender>>>,
     session_reconciliation_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
-    required_origin_scheme: Option<Arc<str>>,
+    require_same_origin: bool,
 }
 
 impl WsServerState {
     pub(crate) fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
-        Self::with_origin_scheme(agent, None)
+        Self::with_same_origin(agent, false)
     }
 
-    fn with_origin_scheme(
+    fn with_same_origin(
         agent: Arc<crate::agent::LocalAgentHandle>,
-        required_origin_scheme: Option<Arc<str>>,
+        require_same_origin: bool,
     ) -> Self {
         Self {
             event_sources: collect_event_sources(&agent),
@@ -82,7 +82,7 @@ impl WsServerState {
             session_owners: Arc::new(Mutex::new(HashMap::new())),
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
             session_reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
-            required_origin_scheme,
+            require_same_origin,
             agent,
         }
     }
@@ -514,16 +514,10 @@ pub(crate) fn router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
 }
 
 #[cfg(feature = "dashboard-ng")]
-pub(crate) fn same_origin_router(
-    agent: Arc<crate::agent::LocalAgentHandle>,
-    origin_scheme: Arc<str>,
-) -> Router {
+pub(crate) fn same_origin_router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
     Router::new().nest(
         "/acp",
-        websocket_router(WsServerState::with_origin_scheme(
-            agent,
-            Some(origin_scheme),
-        )),
+        websocket_router(WsServerState::with_same_origin(agent, true)),
     )
 }
 
@@ -538,16 +532,14 @@ async fn websocket_handler(
     State(state): State<WsServerState>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(required_scheme) = state.required_origin_scheme.as_deref()
-        && !has_allowed_websocket_origin(&headers, required_scheme)
-    {
+    if state.require_same_origin && !has_allowed_websocket_origin(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
     ws.on_upgrade(|socket| handle_websocket_connection(socket, state))
         .into_response()
 }
 
-pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap, required_scheme: &str) -> bool {
+pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN) else {
         // Non-browser ACP clients do not send Origin.
         return true;
@@ -564,7 +556,6 @@ pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap, required_scheme:
         return false;
     };
     matches!(origin.scheme_str(), Some("http" | "https"))
-        && origin.scheme_str() == Some(required_scheme)
         && origin
             .authority()
             .is_some_and(|authority| authority.as_str().eq_ignore_ascii_case(host))

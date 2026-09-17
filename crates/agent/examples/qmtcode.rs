@@ -139,11 +139,6 @@ struct Cli {
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     dashboard_ng: Option<String>,
 
-    /// External dashboard scheme used for same-origin WebSocket checks
-    #[cfg(feature = "dashboard-ng")]
-    #[arg(long, value_parser = ["http", "https"], default_value = "http")]
-    dashboard_ng_origin_scheme: String,
-
     /// Enable mesh networking for cross-machine sessions.
     ///
     /// Starts LAN discovery/listening and also reconnects any previously joined
@@ -717,16 +712,8 @@ async fn run(
         #[cfg(feature = "dashboard-ng")]
         {
             let addr = cli.dashboard_ng.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
-            log::info!(
-                "Starting next-generation dashboard on http://{} (external origin scheme: {})",
-                addr,
-                cli.dashboard_ng_origin_scheme
-            );
-            runner
-                .server()
-                .with_dashboard_ng_origin_scheme(cli.dashboard_ng_origin_scheme.clone())
-                .run(addr, ServerMode::DashboardNg)
-                .await?;
+            log::info!("Starting next-generation dashboard at http://{}", addr);
+            runner.server().run(addr, ServerMode::DashboardNg).await?;
         }
         #[cfg(not(feature = "dashboard-ng"))]
         {
@@ -959,27 +946,6 @@ system = "inline"
         let cli =
             Cli::try_parse_from(["qmtcode", "--dashboard-ng"]).expect("CLI args should parse");
         assert_eq!(cli.dashboard_ng.as_deref(), Some(DEFAULT_SERVER_ADDR));
-        assert_eq!(cli.dashboard_ng_origin_scheme, "http");
-    }
-
-    #[cfg(feature = "dashboard-ng")]
-    #[test]
-    fn dashboard_ng_origin_scheme_accepts_https_and_rejects_unknown_values() {
-        let cli = Cli::try_parse_from([
-            "qmtcode",
-            "--dashboard-ng",
-            "--dashboard-ng-origin-scheme=https",
-        ])
-        .expect("HTTPS origin scheme should parse");
-        assert_eq!(cli.dashboard_ng_origin_scheme, "https");
-        assert!(
-            Cli::try_parse_from([
-                "qmtcode",
-                "--dashboard-ng",
-                "--dashboard-ng-origin-scheme=ftp",
-            ])
-            .is_err()
-        );
     }
 
     #[cfg(feature = "dashboard-ng")]

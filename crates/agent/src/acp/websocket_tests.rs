@@ -50,30 +50,28 @@ async fn standalone_websocket_uses_canonical_acp_path() {
 }
 
 #[test]
-fn dashboard_websocket_origin_must_match_scheme_and_host() {
+fn dashboard_websocket_origin_must_match_host() {
     let mut headers = HeaderMap::new();
     headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:3000"));
-    assert!(has_allowed_websocket_origin(&headers, "http"));
+    assert!(has_allowed_websocket_origin(&headers));
 
     headers.insert(
         header::ORIGIN,
         HeaderValue::from_static("http://127.0.0.1:3000"),
     );
-    assert!(has_allowed_websocket_origin(&headers, "http"));
-    assert!(!has_allowed_websocket_origin(&headers, "https"));
+    assert!(has_allowed_websocket_origin(&headers));
 
     headers.insert(
         header::ORIGIN,
         HeaderValue::from_static("https://127.0.0.1:3000"),
     );
-    assert!(!has_allowed_websocket_origin(&headers, "http"));
-    assert!(has_allowed_websocket_origin(&headers, "https"));
+    assert!(has_allowed_websocket_origin(&headers));
 
     headers.insert(
         header::ORIGIN,
-        HeaderValue::from_static("http://attacker.example"),
+        HeaderValue::from_static("https://attacker.example"),
     );
-    assert!(!has_allowed_websocket_origin(&headers, "http"));
+    assert!(!has_allowed_websocket_origin(&headers));
 }
 
 fn elicitation_event(session_id: &str, elicitation_id: &str) -> EventEnvelope {
