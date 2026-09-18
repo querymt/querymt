@@ -27,12 +27,12 @@ log.workspace = true
 tracing-log = "0.2"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["logs"] }
-opentelemetry-otlp = { version = "0.32", features = ["metrics", "grpc-tonic", "logs", "tls-ring", "tls-webpki-roots"] }
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["logs"] }
+opentelemetry-otlp = { version = "0.33", features = ["metrics", "grpc-tonic", "logs", "tls-ring", "tls-webpki-roots"] }
 tonic = { version = "0.14", default-features = false, features = ["tls-webpki-roots"] }
-opentelemetry-appender-tracing = { version = "0.32", features = ["log"] }
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-appender-tracing = { version = "0.33", features = ["log"] }
+opentelemetry-semantic-conventions = "0.33"
 
 # Secret store dependencies (optional, behind secret-store feature)
 keyring-core = { version = "1.0", optional = true }
