@@ -1888,11 +1888,13 @@ mod tests {
 
     #[test]
     fn drained_usage_merges_fieldwise_without_double_counting() {
-        let mut output = ChatOutput::default();
-        output.usage = Some(Usage {
-            input_tokens: 10,
-            ..Usage::default()
-        });
+        let output = ChatOutput {
+            usage: Some(Usage {
+                input_tokens: 10,
+                ..Usage::default()
+            }),
+            ..ChatOutput::default()
+        };
         let merged = merge_drained_usage(
             output,
             Some(Usage {

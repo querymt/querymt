@@ -1545,8 +1545,8 @@ mod tests {
                 annotations: Vec::new(),
                 extensions: querymt::chat::Extensions::new(),
             },
-            ChatMessagePart::Media(inline),
-            ChatMessagePart::Media(file),
+            ChatMessagePart::Media(Box::new(inline)),
+            ChatMessagePart::Media(Box::new(file)),
         ]);
 
         let req = provider
@@ -1615,7 +1615,7 @@ mod tests {
         )
         .unwrap();
 
-        let message = tagged_assistant_turn(vec![ChatMessagePart::Media(url_media)]);
+        let message = tagged_assistant_turn(vec![ChatMessagePart::Media(Box::new(url_media))]);
         let req = provider.chat_request(&[message], None).unwrap();
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         assert_eq!(
@@ -1646,7 +1646,7 @@ mod tests {
         )
         .unwrap();
 
-        let message = tagged_assistant_turn(vec![ChatMessagePart::Media(reference)]);
+        let message = tagged_assistant_turn(vec![ChatMessagePart::Media(Box::new(reference))]);
         let error = provider
             .chat_request(&[message], None)
             .expect_err("cross-origin provider reference must not be forwarded as a URL");

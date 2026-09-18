@@ -510,7 +510,7 @@ fn append_legacy_reasoning(items: &mut Vec<ChatOutputItem>, delta: &str) {
     }));
 }
 
-fn append_legacy_signature(items: &mut Vec<ChatOutputItem>, signature: &str) {
+fn append_legacy_signature(items: &mut [ChatOutputItem], signature: &str) {
     if let Some(reasoning) = items.iter_mut().rev().find_map(|item| match item {
         ChatOutputItem::Reasoning(reasoning) => Some(reasoning),
         _ => None,

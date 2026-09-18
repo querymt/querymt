@@ -413,8 +413,8 @@ async fn structured_output_media_round_trips_through_sqlite_reload() {
                     phase: None,
                     status: None,
                     parts: vec![
-                        ChatMessagePart::Media(inline.clone()),
-                        ChatMessagePart::Media(reference.clone()),
+                        ChatMessagePart::Media(Box::new(inline.clone())),
+                        ChatMessagePart::Media(Box::new(reference.clone())),
                     ],
                     extensions: Default::default(),
                 })],
@@ -446,7 +446,7 @@ async fn structured_output_media_round_trips_through_sqlite_reload() {
     let ChatMessagePart::Media(reloaded_inline) = &item.parts[0] else {
         panic!("expected inline media");
     };
-    assert_eq!(reloaded_inline, &inline);
+    assert_eq!(**reloaded_inline, inline);
     let media_type = reloaded_inline.media_type.as_ref().unwrap();
     assert_eq!(media_type.type_(), "application");
     assert_eq!(media_type.subtype(), "pdf");
@@ -455,7 +455,7 @@ async fn structured_output_media_round_trips_through_sqlite_reload() {
     let ChatMessagePart::Media(reloaded_reference) = &item.parts[1] else {
         panic!("expected provider reference media");
     };
-    assert_eq!(reloaded_reference, &reference);
+    assert_eq!(**reloaded_reference, reference);
     assert!(matches!(
         &reloaded_reference.source,
         MediaSource::ProviderFile { file_id, origin: o } if file_id == "file_abc" && o == &origin
