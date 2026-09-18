@@ -160,8 +160,7 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
 
                     // Check for delegate tool calls (legacy parts or canonical output)
                     for tool_call in last_msg.function_calls() {
-                        if tool_call.function.name == "delegate"
-                        {
+                        if tool_call.function.name == "delegate" {
                             // Parse the delegation arguments
                             if let Ok(args) = serde_json::from_str::<serde_json::Value>(
                                 &tool_call.function.arguments,

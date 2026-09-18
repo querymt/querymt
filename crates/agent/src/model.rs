@@ -1343,21 +1343,24 @@ mod tests {
 
         // Structured turn: calls live in the canonical output part.
         let mut output = structured_output();
-        output.items.push(ChatOutputItem::FunctionCall(
-            ChatFunctionCallItem {
+        output
+            .items
+            .push(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
                 item_id: Some("item_2".into()),
                 call_id: "call_1".into(), // duplicate identity of item_1
                 name: "lookup".into(),
                 arguments: "{}".into(),
                 status: None,
                 extensions: Default::default(),
-            },
-        ));
+            }));
         let structured = output_message(output);
         let calls = structured.function_calls();
         assert_eq!(calls.len(), 1, "duplicate call identity collapses");
         assert_eq!(calls[0].id, "call_1");
-        assert_eq!(calls[0].function.arguments, "{\"query\":\"rust\",\"raw\": 1 }");
+        assert_eq!(
+            calls[0].function.arguments,
+            "{\"query\":\"rust\",\"raw\": 1 }"
+        );
 
         // Mixed legacy + structured in one message never duplicates identities.
         let mut mixed = structured;
@@ -1373,7 +1376,8 @@ mod tests {
     }
 
     #[test]
-    fn output_part_serde_round_trip_preserves_opaque_and_raw_data() {        let part = MessagePart::Output {
+    fn output_part_serde_round_trip_preserves_opaque_and_raw_data() {
+        let part = MessagePart::Output {
             output: structured_output(),
         };
         let encoded = serde_json::to_string(&part).unwrap();
@@ -1427,17 +1431,26 @@ mod tests {
 
         assert_eq!(text_blocks, 1);
         assert_eq!(tool_use_blocks, 1);
-        assert!(chat.content.iter().any(|block| block.as_text() == Some("final answer")));
-        match chat.content.iter().find(|block| matches!(block, Content::ToolUse { .. })) {
-            Some(Content::ToolUse { id, name, arguments }) => {
+        assert!(
+            chat.content
+                .iter()
+                .any(|block| block.as_text() == Some("final answer"))
+        );
+        match chat
+            .content
+            .iter()
+            .find(|block| matches!(block, Content::ToolUse { .. }))
+        {
+            Some(Content::ToolUse {
+                id,
+                name,
+                arguments,
+            }) => {
                 assert_eq!(id, "call_1");
                 assert_eq!(name, "lookup");
                 // Raw arguments round-trip through the projection as the same
                 // JSON value (semantically lossless, not whitespace-identical).
-                assert_eq!(
-                    arguments,
-                    &serde_json::json!({"query": "rust", "raw": 1})
-                );
+                assert_eq!(arguments, &serde_json::json!({"query": "rust", "raw": 1}));
             }
             other => panic!("expected tool use block, got {other:?}"),
         }
@@ -1446,16 +1459,16 @@ mod tests {
     #[test]
     fn output_part_never_projects_invalid_arguments_or_opaque_execution() {
         let mut output = structured_output();
-        output.items.push(ChatOutputItem::FunctionCall(
-            ChatFunctionCallItem {
+        output
+            .items
+            .push(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
                 item_id: Some("item_2".into()),
                 call_id: "call_2".into(),
                 name: "lookup".into(),
                 arguments: "{invalid".into(),
                 status: None,
                 extensions: Default::default(),
-            },
-        ));
+            }));
         let msg = output_message(output);
 
         let chat = msg.to_chat_message().unwrap();
@@ -1505,7 +1518,10 @@ mod tests {
             .unwrap();
         assert!(switched.content.iter().all(|block| !matches!(
             block,
-            Content::Thinking { signature: Some(_), .. }
+            Content::Thinking {
+                signature: Some(_),
+                ..
+            }
         )));
         assert!(
             !serde_json::to_string(&switched)
@@ -1543,7 +1559,10 @@ mod tests {
         )));
         assert!(!switched.content.iter().any(|block| matches!(
             block,
-            Content::Thinking { signature: Some(_), .. }
+            Content::Thinking {
+                signature: Some(_),
+                ..
+            }
         )));
     }
 }

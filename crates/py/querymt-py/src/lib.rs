@@ -727,8 +727,10 @@ fn py_message_to_rust(message: &Bound<'_, PyDict>) -> Result<ChatMessage> {
     let output = match message.get_item("output")? {
         Some(value) if !value.is_none() => {
             let json = python_to_json(&value)?;
-            Some(serde_json::from_value::<::querymt::chat::ChatOutput>(json)
-                .map_err(|e| anyhow!("message.output is not valid structured output: {e}"))?)
+            Some(
+                serde_json::from_value::<::querymt::chat::ChatOutput>(json)
+                    .map_err(|e| anyhow!("message.output is not valid structured output: {e}"))?,
+            )
         }
         _ => None,
     };

@@ -135,7 +135,11 @@ async fn canonical_output_part_round_trips_through_sqlite_reload() {
 
     let history = storage.get_history(&session.public_id).await.unwrap();
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].parts.len(), 1, "one canonical part, no duplicates");
+    assert_eq!(
+        history[0].parts.len(),
+        1,
+        "one canonical part, no duplicates"
+    );
 
     let MessagePart::Output { output: reloaded } = &history[0].parts[0] else {
         panic!("expected canonical Output part after reload");
@@ -342,7 +346,10 @@ async fn pruning_keeps_call_result_mapping_for_structured_turns() {
     match placeholder {
         querymt::chat::Content::ToolResult { id, content, .. } => {
             assert_eq!(id, "call_1");
-            assert_eq!(content[0].as_text(), Some("[Old tool result content cleared]"));
+            assert_eq!(
+                content[0].as_text(),
+                Some("[Old tool result content cleared]")
+            );
         }
         other => panic!("expected tool result, got {other:?}"),
     }
@@ -425,7 +432,10 @@ async fn structured_output_media_round_trips_through_sqlite_reload() {
         .unwrap();
 
     let history = storage.get_history(&session.public_id).await.unwrap();
-    assert_eq!(history[0].parts, message.parts, "media survives reload exactly");
+    assert_eq!(
+        history[0].parts, message.parts,
+        "media survives reload exactly"
+    );
 
     let MessagePart::Output { output } = &history[0].parts[0] else {
         panic!("expected canonical output part");
@@ -592,7 +602,10 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
     let ChatOutputItem::FunctionCall(call) = &reloaded.items[2] else {
         panic!("expected function call item");
     };
-    assert_eq!(call.arguments, raw_arguments, "raw arguments reload byte-exact");
+    assert_eq!(
+        call.arguments, raw_arguments,
+        "raw arguments reload byte-exact"
+    );
     assert_eq!(call.call_id, "call_e2e");
     assert_eq!(call.item_id.as_deref(), Some("fc_item_e2e"));
 
@@ -801,7 +814,10 @@ async fn a_b_a_replay_scopes_opaque_state_to_its_origin() {
     let a1_pos = back_json.find("call_a1").unwrap();
     let b1_pos = back_json.find("call_b1").unwrap();
     let a2_pos = back_json.find("call_a2").unwrap();
-    assert!(a1_pos < b1_pos && b1_pos < a2_pos, "chronological order holds");
+    assert!(
+        a1_pos < b1_pos && b1_pos < a2_pos,
+        "chronological order holds"
+    );
 
     // Stored originals are byte-identical and still hold the excluded
     // continuation state after projecting to other targets.
@@ -812,9 +828,14 @@ async fn a_b_a_replay_scopes_opaque_state_to_its_origin() {
         .iter()
         .map(|m| serde_json::to_string(m).unwrap())
         .collect();
-    assert_eq!(stored_before, stored_after, "projection never mutates storage");
+    assert_eq!(
+        stored_before, stored_after,
+        "projection never mutates storage"
+    );
     assert!(
-        stored_after.join("\n").contains("provider-a-encrypted-continuation"),
+        stored_after
+            .join("\n")
+            .contains("provider-a-encrypted-continuation"),
         "authorized storage retains A continuation for native replay"
     );
 }

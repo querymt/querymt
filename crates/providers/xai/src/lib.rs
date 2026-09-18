@@ -20,8 +20,8 @@ use querymt::{
     auth::ApiKeyResolver,
     chat::{
         ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputRepresentation,
-        ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk, StructuredOutputFormat, Tool,
-        ToolChoice,
+        ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk, StructuredOutputFormat,
+        Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -603,7 +603,9 @@ struct XaiResponsesReasoning {
     effort: &'static str,
 }
 
-fn to_xai_responses_input(messages: &[ChatMessage]) -> Result<Vec<XaiResponsesInputItem<'_>>, LLMError> {
+fn to_xai_responses_input(
+    messages: &[ChatMessage],
+) -> Result<Vec<XaiResponsesInputItem<'_>>, LLMError> {
     let mut inputs = Vec::with_capacity(messages.len());
 
     for msg in messages {
@@ -1480,18 +1482,12 @@ mod tests {
             input[1]["encrypted_content"],
             Value::String("enc_payload".to_string())
         );
-        assert_eq!(
-            input[3]["call_id"],
-            Value::String("call_1".to_string())
-        );
+        assert_eq!(input[3]["call_id"], Value::String("call_1".to_string()));
         assert_eq!(
             input[3]["arguments"],
             Value::String(r#"{"path":"a.txt"}"#.to_string())
         );
-        assert_eq!(
-            input[4]["call_id"],
-            Value::String("call_1".to_string())
-        );
+        assert_eq!(input[4]["call_id"], Value::String("call_1".to_string()));
     }
 
     #[test]
