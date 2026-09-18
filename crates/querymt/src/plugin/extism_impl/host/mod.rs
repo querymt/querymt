@@ -630,9 +630,7 @@ impl ExtismProvider {
         Self::ensure_item_aware_contract_version(Self::probe_item_aware_contract_version(plug)?)
     }
 
-    fn ensure_item_aware_contract_version(
-        version: Option<u32>,
-    ) -> Result<Option<u32>, LLMError> {
+    fn ensure_item_aware_contract_version(version: Option<u32>) -> Result<Option<u32>, LLMError> {
         if version != Some(ITEM_AWARE_CHAT_CONTRACT_VERSION) {
             return Err(LLMError::InvalidRequest(format!(
                 "Extism plugin does not support item-aware chat contract version {}; advertised version: {}",

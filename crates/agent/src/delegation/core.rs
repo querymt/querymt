@@ -1873,9 +1873,7 @@ pub fn extract_session_summary_from_history(history: &[AgentMessage]) -> String 
                 {
                     agent_responses.push(content.clone());
                 }
-                MessagePart::Output { output }
-                    if message.role == ChatRole::Assistant =>
-                {
+                MessagePart::Output { output } if message.role == ChatRole::Assistant => {
                     // Structured turn: the visible assistant text lives in the
                     // canonical output; project it the same way
                     // DelegationSummarizer::format_conversation does.
