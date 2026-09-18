@@ -1310,7 +1310,28 @@ fn convert_chat_messages_to_responses<'a>(
                         output: responses_function_output(id, parts)?,
                     });
                 }
-                Content::Pdf { .. } | Content::Audio { .. } | Content::ResourceLink { .. } => {}
+                Content::Pdf { data } => {
+                    content.push(OpenAIResponsesInputContent::InputFile {
+                        filename: None,
+                        file_data: Some(Cow::Owned(format!(
+                            "data:application/pdf;base64,{}",
+                            base64::engine::general_purpose::STANDARD.encode(data)
+                        ))),
+                        file_url: None,
+                    });
+                }
+                Content::Audio { mime_type, .. } => {
+                    return Err(LLMError::InvalidRequest(format!(
+                        "unsupported Responses message media: audio '{mime_type}' has no \
+                         protocol-valid input representation"
+                    )));
+                }
+                Content::ResourceLink { uri, .. } => {
+                    return Err(LLMError::InvalidRequest(format!(
+                        "unsupported Responses message content: resource link '{uri}' has no \
+                         protocol-valid input representation"
+                    )));
+                }
             }
         }
 
@@ -1633,9 +1654,12 @@ fn validate_responses_strict_schema(name: &str, schema: &Value) -> Result<(), LL
             for (key, value) in &properties {
                 check(&format!("{name}.{key}"), value)?;
             }
-            if let Some(items) = object.get("items") {
-                check(&format!("{name}[]"), items)?;
-            }
+        }
+
+        // Array item schemas are validated independently of the parent type so
+        // objects nested inside arrays cannot escape strict validation.
+        if let Some(items) = object.get("items") {
+            check(&format!("{name}[]"), items)?;
         }
 
         Ok(())

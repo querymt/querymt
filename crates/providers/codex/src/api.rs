@@ -822,24 +822,33 @@ fn convert_structured_output_to_codex<'a>(
                     ChatRole::User => "user",
                     ChatRole::Assistant => "assistant",
                 };
-                let content: Vec<CodexInputContent<'a>> = message
-                    .parts
-                    .iter()
-                    .filter_map(|part| match part {
+                let mut content: Vec<CodexInputContent<'a>> = Vec::new();
+                for part in &message.parts {
+                    match part {
                         ChatMessagePart::Text { text, .. } if !text.is_empty() => {
-                            Some(CodexInputContent::OutputText {
+                            content.push(CodexInputContent::OutputText {
                                 text: Cow::Borrowed(text.as_str()),
-                            })
+                            });
                         }
                         ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
-                            Some(CodexInputContent::OutputText {
+                            content.push(CodexInputContent::OutputText {
                                 text: Cow::Borrowed(refusal.as_str()),
-                            })
+                            });
                         }
-                        // Media/opaque parts keep their existing Codex handling.
-                        _ => None,
-                    })
-                    .collect();
+                        // Empty text/refusal parts carry no content and are skipped.
+                        ChatMessagePart::Text { .. } | ChatMessagePart::Refusal { .. } => {}
+                        // Media/opaque parts have no validated Codex input
+                        // representation; fail the continuation rather than
+                        // silently dropping authoritative output.
+                        ChatMessagePart::Media(_) | ChatMessagePart::Opaque(_) => {
+                            return Err(LLMError::InvalidRequest(
+                                "unsupported Responses continuation: structured message contains \
+                                 a media or opaque part with no Codex input representation"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
                 if !content.is_empty() {
                     out.push(CodexInputItem::Message {
                         role: Cow::Borrowed(role),
@@ -1595,14 +1604,15 @@ mod tests {
     use super::{
         CodexChatResponse, CodexToolUseState, chatgpt_account_id, classify_codex_http_error,
         codex_chat_body_json, codex_chat_request, codex_parse_chat_with_state,
-        codex_parse_stream_chunk_with_state,
+        codex_parse_stream_chunk_with_state, convert_structured_output_to_codex,
     };
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use http::{Response, header::AUTHORIZATION};
     use querymt::{
         chat::{
-            ChatMessage, ChatOutput, ChatOutputItem, ChatResponse, ChatRole, Content, FinishReason,
-            StreamChunk,
+            ChatMessage, ChatMessageItem, ChatMessagePart, ChatOpaquePart, ChatOutput,
+            ChatOutputItem, ChatOutputRepresentation, ChatResponse, ChatRole, Content,
+            FinishReason, StreamChunk,
         },
         error::{LLMError, ProviderErrorKind},
     };
@@ -1642,6 +1652,31 @@ mod tests {
         });
         let payload_b64 = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
         format!("eyJ.{}.sig", payload_b64)
+    }
+
+    #[test]
+    fn structured_message_with_unsupported_part_fails_replay() {
+        let output = ChatOutput {
+            representation: ChatOutputRepresentation::Structured,
+            items: vec![ChatOutputItem::Message(ChatMessageItem {
+                id: None,
+                role: ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![ChatMessagePart::Opaque(ChatOpaquePart {
+                    original_type: "custom_tool_call".to_string(),
+                    payload: serde_json::json!({}),
+                })],
+                extensions: Default::default(),
+            })],
+            ..Default::default()
+        };
+
+        let mut inputs = Vec::new();
+        let err = convert_structured_output_to_codex(&output, &mut inputs)
+            .expect_err("unsupported message part must fail the replay");
+        assert!(matches!(err, LLMError::InvalidRequest(_)));
+        assert!(inputs.is_empty());
     }
 
     #[test]

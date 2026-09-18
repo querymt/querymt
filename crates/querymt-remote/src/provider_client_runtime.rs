@@ -127,10 +127,14 @@ where
             .transport
             .get_contract_info(host, GetProviderContractInfo)
             .await
-            .map_err(|error| {
-                LLMError::InvalidRequest(format!(
+            .map_err(|error| match error {
+                // Transport failures keep their classification so upstream
+                // retry policies still treat them as retryable connection
+                // errors rather than contract problems.
+                err @ LLMError::Transport { .. } => err,
+                error => LLMError::InvalidRequest(format!(
                     "remote provider peer cannot advertise item-aware chat contract version {required_version}: {error}"
-                ))
+                )),
             })?;
         if info.item_aware_chat_version != Some(required_version) {
             return Err(LLMError::InvalidRequest(format!(
