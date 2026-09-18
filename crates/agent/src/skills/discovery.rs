@@ -43,7 +43,7 @@ pub fn discover_from_source(source: &SkillSource) -> Result<Vec<Skill>> {
         SkillSource::Remote { cached_at, .. } => cached_at,
     };
 
-    if !base_path.exists() {
+    if !base_path.try_exists()? {
         return Ok(vec![]);
     }
 

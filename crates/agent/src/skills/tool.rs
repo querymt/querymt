@@ -74,6 +74,39 @@ impl SkillTool {
         }
     }
 
+    /// Async variant of [`Self::refresh_registry`] for the tool-call path:
+    /// discovery runs off the Tokio worker via `spawn_blocking`, and the
+    /// registry lock is only held to publish the results.
+    async fn refresh_registry_async(&self) -> anyhow::Result<()> {
+        let sources = self.sources.clone();
+        let include_external = self.include_external;
+        let discovery_fn = Arc::clone(&self.discovery_fn);
+
+        let discovered =
+            tokio::task::spawn_blocking(move || (discovery_fn)(&sources, include_external))
+                .await
+                .map_err(|e| anyhow::anyhow!("skill discovery task failed: {e}"))?;
+
+        let skills = match discovered {
+            Ok(skills) => skills,
+            Err(error) => {
+                log::warn!(
+                    "Failed to refresh skills: {}. Retaining previously discovered skills.",
+                    error
+                );
+                return Err(error);
+            }
+        };
+
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+        let count = registry.reload_with(skills);
+        log::debug!("Skill registry refreshed: {count} skills available");
+        Ok(())
+    }
+
     /// Look up a skill by callable ID.
     fn lookup_skill(&self, id: &str) -> Result<Option<Arc<Skill>>, ToolError> {
         let registry = self
@@ -235,7 +268,7 @@ impl Tool for SkillTool {
         // loaded.
         let mut skill = self.lookup_skill(name)?;
         if skill.is_none() {
-            if let Err(error) = self.refresh_registry() {
+            if let Err(error) = self.refresh_registry_async().await {
                 log::warn!(
                     "Skill '{}' is not registered and the refresh failed: {}",
                     name,
