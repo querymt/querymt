@@ -88,11 +88,12 @@ pub use provider_host_support::{
     params_for_remote_provider,
 };
 pub use provider_protocol::{
-    CancelProviderStreamRequest, GenericProviderStreamRequest, GetProviderStreamStatus,
-    ProviderChatRequest, ProviderChatResponse, ProviderStreamPhase, ProviderStreamRequest,
+    CancelProviderStreamRequest, GenericProviderStreamRequest, GetProviderContractInfo,
+    GetProviderStreamStatus, ITEM_AWARE_CHAT_CONTRACT_VERSION, ProviderChatRequest,
+    ProviderChatResponse, ProviderContractInfo, ProviderStreamPhase, ProviderStreamRequest,
     ProviderStreamStatus, RenewProviderStreamLease, StreamChunkRelay, StreamRelayMessage,
     default_stream_heartbeat_secs, default_stream_lease_ttl_secs, keep_stream_message_buffered,
-    relay_message_is_terminal, should_ack_relay_message,
+    messages_require_item_aware_contract, relay_message_is_terminal, should_ack_relay_message,
 };
 pub use provider_share::ProviderShare;
 pub use provider_stream_router::{

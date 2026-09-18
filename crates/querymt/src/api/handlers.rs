@@ -82,6 +82,7 @@ pub async fn handle_chat(
             },
             content: vec![Content::text(msg.content)],
             cache: None,
+            output: None,
         })
         .collect();
 

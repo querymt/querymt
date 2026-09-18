@@ -62,6 +62,7 @@ impl ToolTrait for ReadTool {
                     },
                     "required": ["path"]
                 }),
+                strict: None,
             },
         }
     }

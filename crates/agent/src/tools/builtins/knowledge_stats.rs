@@ -41,6 +41,7 @@ impl ToolTrait for KnowledgeStatsTool {
                     },
                     "required": []
                 }),
+                strict: None,
             },
         }
     }

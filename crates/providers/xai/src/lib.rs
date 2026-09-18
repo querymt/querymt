@@ -19,8 +19,9 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk,
-        StructuredOutputFormat, Tool, ToolChoice,
+        ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputRepresentation,
+        ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk, StructuredOutputFormat, Tool,
+        ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -471,6 +472,17 @@ enum XaiResponsesInputItem<'a> {
         role: &'a str,
         content: Vec<XaiResponsesInputContent<'a>>,
     },
+    /// Continuation-safe reasoning replay, sharing the Responses codec semantics
+    /// without importing OpenAI-only endpoint options.
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<&'a str>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<XaiResponsesReasoningSummary<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<&'a str>,
+    },
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: &'a str,
@@ -482,6 +494,19 @@ enum XaiResponsesInputItem<'a> {
         call_id: &'a str,
         output: XaiResponsesFunctionOutput<'a>,
     },
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum XaiResponsesReasoningSummaryKind {
+    SummaryText,
+}
+
+#[derive(Serialize, Debug)]
+struct XaiResponsesReasoningSummary<'a> {
+    #[serde(rename = "type")]
+    summary_type: XaiResponsesReasoningSummaryKind,
+    text: &'a str,
 }
 
 #[derive(Serialize, Debug)]
@@ -578,10 +603,21 @@ struct XaiResponsesReasoning {
     effort: &'static str,
 }
 
-fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem<'_>> {
+fn to_xai_responses_input(messages: &[ChatMessage]) -> Result<Vec<XaiResponsesInputItem<'_>>, LLMError> {
     let mut inputs = Vec::with_capacity(messages.len());
 
     for msg in messages {
+        // When a turn carries authoritative structured output, replay it in
+        // order through the shared codec semantics rather than the lossy
+        // portable projection.
+        if msg.role == ChatRole::Assistant
+            && let Some(output) = &msg.output
+            && output.representation == ChatOutputRepresentation::Structured
+        {
+            convert_structured_output_to_xai(output, &mut inputs)?;
+            continue;
+        }
+
         let is_user = matches!(msg.role, ChatRole::User);
         let mut content_blocks = Vec::new();
 
@@ -695,7 +731,78 @@ fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem
         }
     }
 
-    inputs
+    Ok(inputs)
+}
+
+/// Replay authoritative structured output as ordered xAI Responses input items.
+///
+/// Shares the Responses codec's item semantics (ordered reasoning/message/call
+/// items; opaque items fail rather than being dropped) while xAI keeps its own
+/// endpoint, headers, supported options, and OpenAI-only-option exclusions.
+fn convert_structured_output_to_xai<'a>(
+    output: &'a ChatOutput,
+    out: &mut Vec<XaiResponsesInputItem<'a>>,
+) -> Result<(), LLMError> {
+    for item in &output.items {
+        match item {
+            ChatOutputItem::Reasoning(reasoning) => {
+                out.push(XaiResponsesInputItem::Reasoning {
+                    id: reasoning.id.as_deref(),
+                    summary: reasoning
+                        .summary
+                        .iter()
+                        .chain(&reasoning.content)
+                        .filter(|part| !part.text.is_empty())
+                        .map(|part| XaiResponsesReasoningSummary {
+                            summary_type: XaiResponsesReasoningSummaryKind::SummaryText,
+                            text: part.text.as_str(),
+                        })
+                        .collect(),
+                    encrypted_content: reasoning.encrypted_content.as_deref(),
+                });
+            }
+            ChatOutputItem::Message(message) => {
+                let role = match message.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+                let content: Vec<XaiResponsesInputContent<'a>> = message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ChatMessagePart::Text { text, .. } if !text.is_empty() => {
+                            Some(XaiResponsesInputContent::OutputText { text })
+                        }
+                        ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
+                            Some(XaiResponsesInputContent::OutputText { text: refusal })
+                        }
+                        // Media/opaque parts keep their existing xAI handling.
+                        _ => None,
+                    })
+                    .collect();
+                if !content.is_empty() {
+                    out.push(XaiResponsesInputItem::Message { role, content });
+                }
+            }
+            ChatOutputItem::FunctionCall(call) => {
+                out.push(XaiResponsesInputItem::FunctionCall {
+                    call_id: call.call_id.as_str(),
+                    name: call.name.as_str(),
+                    // Exact provider argument text is replayed byte-exact.
+                    arguments: call.arguments.clone(),
+                });
+            }
+            ChatOutputItem::Opaque(opaque) => {
+                return Err(LLMError::InvalidRequest(format!(
+                    "unsupported Responses continuation: output item type '{}' has no validated \
+                     input representation",
+                    opaque.original_type
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn to_xai_responses_tools(tools: &[Tool]) -> Vec<XaiResponsesTool<'_>> {
@@ -806,7 +913,7 @@ fn xai_responses_chat_request<C: qmt_openai::api::OpenAIProviderConfig>(
     let instructions = cfg.system().join("\n");
     let body = XaiResponsesRequest {
         model: cfg.model(),
-        input: to_xai_responses_input(messages),
+        input: to_xai_responses_input(messages)?,
         instructions: instructions.as_str(),
         store: false,
         stream: true,
@@ -1140,6 +1247,7 @@ mod tests {
                     "required": ["pattern", "format"],
                     "format": "json-schema"
                 }),
+                strict: None,
             },
         }];
 
@@ -1219,26 +1327,129 @@ mod tests {
     }
 
     #[test]
-    fn responses_request_serializes_reasoning_only_for_effort_capable_models() {
-        let messages = vec![ChatMessage::user().text("hello").build()];
+    fn responses_request_replays_structured_output_items_in_order() {
+        use querymt::chat::{
+            ChatFunctionCallItem, ChatMessageItem, ChatOutput, ChatOutputItem,
+            ChatOutputRepresentation, ChatReasoningItem, ChatReasoningPart, Extensions,
+        };
 
-        let mut capable = test_xai("xai-key");
-        capable.model = "x-ai/grok-3-mini-fast".to_string();
-        capable.reasoning_effort = Some(ReasoningEffort::Max);
-        let req = capable
-            .chat_request(&messages, None)
-            .expect("responses request should build");
-        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
-        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        let xai = test_xai("xai-key");
 
-        let mut unsupported = test_xai("xai-key");
-        unsupported.model = "grok-code-fast-1".to_string();
-        unsupported.reasoning_effort = Some(ReasoningEffort::High);
-        let req = unsupported
+        let output = ChatOutput {
+            items: vec![
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("rs_1".to_string()),
+                    summary: vec![ChatReasoningPart::text("thinking")],
+                    content: Vec::new(),
+                    encrypted_content: Some("enc_payload".to_string()),
+                    signature: None,
+                    status: None,
+                    extensions: Extensions::new(),
+                }),
+                ChatOutputItem::Message(ChatMessageItem {
+                    id: Some("msg_1".to_string()),
+                    role: ChatRole::Assistant,
+                    phase: None,
+                    status: None,
+                    parts: vec![querymt::chat::ChatMessagePart::Text {
+                        text: "calling".to_string(),
+                        annotations: Vec::new(),
+                        extensions: Extensions::new(),
+                    }],
+                    extensions: Extensions::new(),
+                }),
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("fc_item_1".to_string()),
+                    call_id: "call_1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: r#"{"path":"a.txt"}"#.to_string(),
+                    status: None,
+                    extensions: Extensions::new(),
+                }),
+            ],
+            ..ChatOutput::default()
+        };
+        assert_eq!(output.representation, ChatOutputRepresentation::Structured);
+
+        let mut assistant = ChatMessage::from_assistant(output.portable_content());
+        assistant
+            .replace_output(output)
+            .expect("projection must match structured output");
+
+        let messages = vec![
+            ChatMessage::user().text("read a.txt").build(),
+            assistant,
+            ChatMessage::user()
+                .tool_result(
+                    "call_1".to_string(),
+                    None,
+                    false,
+                    vec![Content::text("body")],
+                )
+                .build(),
+        ];
+
+        let req = xai
             .chat_request(&messages, None)
-            .expect("responses request should build");
-        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
-        assert!(body.get("reasoning").is_none());
+            .expect("structured replay should build");
+        let body: Value = serde_json::from_slice(req.body()).unwrap();
+        let input = body["input"].as_array().unwrap();
+
+        let types: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "reasoning",
+                "message",
+                "function_call",
+                "function_call_output"
+            ],
+            "structured replay must retain item order: {types:?}"
+        );
+        assert_eq!(input[1]["id"], Value::String("rs_1".to_string()));
+        assert_eq!(
+            input[1]["encrypted_content"],
+            Value::String("enc_payload".to_string())
+        );
+        assert_eq!(
+            input[3]["call_id"],
+            Value::String("call_1".to_string())
+        );
+        assert_eq!(
+            input[3]["arguments"],
+            Value::String(r#"{"path":"a.txt"}"#.to_string())
+        );
+        assert_eq!(
+            input[4]["call_id"],
+            Value::String("call_1".to_string())
+        );
+    }
+
+    #[test]
+    fn responses_request_rejects_unsupported_structured_continuation() {
+        use querymt::chat::{ChatOpaqueItem, ChatOutput, ChatOutputItem};
+
+        let xai = test_xai("xai-key");
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::Opaque(ChatOpaqueItem {
+                original_type: "image_generation_call".to_string(),
+                payload: serde_json::json!({"id": "ig_1"}),
+            })],
+            ..ChatOutput::default()
+        };
+        let mut assistant = ChatMessage::from_assistant(Vec::new());
+        assistant.replace_output(output).unwrap();
+
+        let messages = vec![ChatMessage::user().text("go").build(), assistant];
+        let error = xai
+            .chat_request(&messages, None)
+            .expect_err("unsupported continuation must fail, not silently drop");
+        assert!(
+            matches!(error, LLMError::InvalidRequest(ref msg)
+                if msg.contains("image_generation_call")),
+            "expected explicit unsupported-continuation error, got {error:?}"
+        );
     }
 
     #[test]

@@ -286,6 +286,7 @@ impl KimiCode {
                         role,
                         content: supplemental,
                         cache,
+                        output: None,
                     });
                 }
             } else {

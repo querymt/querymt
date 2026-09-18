@@ -83,6 +83,7 @@ impl Tool for FindSymbolReferencesTool {
                     },
                     "required": ["paths", "symbols"]
                 }),
+                strict: None,
             },
         }
     }

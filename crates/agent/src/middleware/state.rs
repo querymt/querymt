@@ -1,4 +1,4 @@
-use querymt::chat::{ChatMessage, ChatRole, Content, FinishReason};
+use querymt::chat::{ChatMessage, ChatOutput, ChatRole, Content, FinishReason};
 use std::sync::Arc;
 
 use crate::events::StopType;
@@ -167,6 +167,7 @@ impl ConversationContext {
             role: ChatRole::User,
             content: vec![Content::text(content)],
             cache: None,
+            output: None,
         };
 
         messages.push(injected_msg);
@@ -223,6 +224,7 @@ impl ConversationContext {
                 role: ChatRole::User,
                 content: vec![Content::text(fragment.content.clone())],
                 cache: None,
+                output: None,
             })
             .collect()
     }
@@ -283,6 +285,11 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<querymt::Usage>,
     pub finish_reason: Option<FinishReason>,
+    /// Canonical ordered output items from the generation attempt.
+    ///
+    /// This is the source of truth for item-aware turns; `content`, `thinking`,
+    /// and `tool_calls` are compatibility projections of it.
+    pub output: Option<ChatOutput>,
     /// Pre-allocated message UUID from the streaming path.
     /// When set, `transition_after_llm` will use this ID so the final
     /// `AssistantMessageStored` event matches the delta events already sent to the UI.
@@ -303,8 +310,15 @@ impl LlmResponse {
             tool_calls,
             usage,
             finish_reason,
+            output: None,
             message_id: None,
         }
+    }
+
+    /// Set the canonical structured output (builder-style).
+    pub fn with_output(mut self, output: Option<ChatOutput>) -> Self {
+        self.output = output;
+        self
     }
 
     /// Set the pre-allocated message ID (builder-style).
@@ -527,6 +541,7 @@ mod tests {
             role: ChatRole::User,
             content: vec![Content::text("Delegation completed")],
             cache: None,
+            output: None,
         };
         let context = ConversationContext::new(
             Arc::from("session"),
@@ -556,6 +571,7 @@ mod tests {
                 vec![Content::text("result")],
             )],
             cache: None,
+            output: None,
         };
         let context = ConversationContext::new(
             Arc::from("session"),

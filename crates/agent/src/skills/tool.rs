@@ -93,6 +93,7 @@ impl Tool for SkillTool {
                     },
                     "required": ["name"]
                 }),
+                strict: None,
             },
         }
     }

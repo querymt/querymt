@@ -52,6 +52,7 @@ impl ToolTrait for WriteFileTool {
                     },
                     "required": ["path", "content"]
                 }),
+                strict: None,
             },
         }
     }

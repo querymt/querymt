@@ -456,6 +456,7 @@ mod tests {
                         "properties": {},
                         "additionalProperties": false,
                     }),
+                    strict: None,
                 },
             }
         }

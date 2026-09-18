@@ -51,6 +51,7 @@ impl ToolTrait for UseRemoteProviderTool {
                     },
                     "required": ["agent_id"]
                 }),
+                strict: None,
             },
         }
     }

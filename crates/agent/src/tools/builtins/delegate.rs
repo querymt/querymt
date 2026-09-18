@@ -63,6 +63,7 @@ impl ToolTrait for DelegateTool {
                     },
                     "required": ["target_agent_id", "objective"]
                 }),
+                strict: None,
             },
         }
     }

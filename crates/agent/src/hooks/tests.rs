@@ -570,6 +570,7 @@ async fn context_replacement_is_request_only_and_chained() {
         role: querymt::chat::ChatRole::User,
         content: vec![querymt::chat::Content::text("stored")],
         cache: None,
+        output: None,
     }];
     let result = Hooks::new(config)
         .unwrap()

@@ -1,9 +1,10 @@
 use crate::provider_host_error::RemoteProviderHostError;
 use crate::provider_protocol::{
-    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
-    ProviderChatResponse, ProviderStreamPhase, ProviderStreamRequest, ProviderStreamStatus,
+    CancelProviderStreamRequest, GetProviderContractInfo, GetProviderStreamStatus,
+    ITEM_AWARE_CHAT_CONTRACT_VERSION, ProviderChatRequest, ProviderChatResponse,
+    ProviderContractInfo, ProviderStreamPhase, ProviderStreamRequest, ProviderStreamStatus,
     RenewProviderStreamLease, StreamRelayMessage, keep_stream_message_buffered,
-    relay_message_is_terminal, should_ack_relay_message,
+    messages_require_item_aware_contract, relay_message_is_terminal, should_ack_relay_message,
 };
 use crate::stream_router_protocol::RoutedStreamRelayMessage;
 use crate::{RemoteProviderBackend, build_provider_for_request};
@@ -35,8 +36,29 @@ fn remove_active_stream(
     session_id: &str,
     request_id: &str,
 ) {
-    let key = (session_id.to_string(), request_id.to_string());
-    active_streams.lock().remove(&key);
+    active_streams
+        .lock()
+        .remove(&(session_id.to_string(), request_id.to_string()));
+}
+
+fn validate_item_aware_request(
+    messages: &[querymt::chat::ChatMessage],
+    advertised_version: Option<u32>,
+) -> Result<(), RemoteProviderHostError> {
+    if !messages_require_item_aware_contract(messages) {
+        return Ok(());
+    }
+    if advertised_version != Some(ITEM_AWARE_CHAT_CONTRACT_VERSION) {
+        return Err(RemoteProviderHostError::ProviderChat {
+            operation: "contract_check".to_string(),
+            reason: format!(
+                "item-aware history requires contract version {}; request advertised {}",
+                ITEM_AWARE_CHAT_CONTRACT_VERSION,
+                advertised_version.map_or_else(|| "none".to_string(), |value| value.to_string())
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -146,6 +168,20 @@ impl ProviderHostActor {
     }
 }
 
+impl Message<GetProviderContractInfo> for ProviderHostActor {
+    type Reply = Result<ProviderContractInfo, RemoteProviderHostError>;
+
+    async fn handle(
+        &mut self,
+        _msg: GetProviderContractInfo,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(ProviderContractInfo {
+            item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+        })
+    }
+}
+
 impl Message<ProviderChatRequest> for ProviderHostActor {
     type Reply =
         kameo::reply::DelegatedReply<Result<ProviderChatResponse, RemoteProviderHostError>>;
@@ -171,6 +207,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
         let backend = Arc::clone(&self.backend);
 
         ctx.spawn(async move {
+            validate_item_aware_request(&msg.messages, msg.item_aware_contract_version)?;
             let provider = build_provider_for_request(
                 backend.as_ref(),
                 &msg.provider,
@@ -202,6 +239,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
                 tool_calls,
                 usage: response.usage(),
                 finish_reason,
+                output: response.output().cloned(),
             })
         })
     }
@@ -281,6 +319,7 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
             let stream_router_ref = msg.stream_router_ref;
 
             let setup_result: Result<_, RemoteProviderHostError> = async {
+                validate_item_aware_request(&msg.messages, msg.item_aware_contract_version)?;
                 let provider = build_provider_for_request(
                     backend.as_ref(),
                     &msg.provider,
@@ -781,6 +820,12 @@ macro_rules! remote_provider_msg_impl {
     };
 }
 
+remote_provider_msg_impl!(
+    ProviderHostActor,
+    GetProviderContractInfo,
+    "querymt::GetProviderContractInfo.v1",
+    REG_GET_PROVIDER_CONTRACT_INFO
+);
 remote_provider_msg_impl!(
     ProviderHostActor,
     ProviderChatRequest,

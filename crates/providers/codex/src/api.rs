@@ -10,8 +10,9 @@ use log::debug;
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
-        Tool, ToolChoice,
+        ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputRepresentation,
+        ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk, Tool,
+        ToolChoice,
     },
     error::{
         LLMError, ProviderErrorKind, ProviderFailure, extract_retry_after_from_json,
@@ -142,6 +143,16 @@ enum CodexInputItem<'a> {
         role: Cow<'a, str>,
         content: Vec<CodexInputContent<'a>>,
     },
+    /// Continuation-safe reasoning replay, mirroring the shared Responses codec.
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<Cow<'a, str>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<CodexReasoningSummaryInput<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<Cow<'a, str>>,
+    },
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: Cow<'a, str>,
@@ -153,6 +164,19 @@ enum CodexInputItem<'a> {
         call_id: Cow<'a, str>,
         output: CodexFunctionCallOutput<'a>,
     },
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum CodexReasoningSummaryKind {
+    SummaryText,
+}
+
+#[derive(Serialize, Debug)]
+struct CodexReasoningSummaryInput<'a> {
+    #[serde(rename = "type")]
+    summary_type: CodexReasoningSummaryKind,
+    text: Cow<'a, str>,
 }
 
 #[derive(Serialize, Debug)]
@@ -534,8 +558,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
     tools: Option<&[Tool]>,
 ) -> Result<Vec<u8>, LLMError> {
     let instructions = resolve_instructions(cfg.model(), cfg.instructions())?;
-    let mut inputs = Vec::with_capacity(messages.len() + 1);
-    if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
+    let mut inputs = Vec::with_capacity(messages.len() + 1);    if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
         let text = format!(
             "# AGENTS.md instructions for {directory}\n\n<INSTRUCTIONS>\n{system}\n</INSTRUCTIONS>",
             directory = DEFAULT_INSTRUCTIONS_DIRECTORY
@@ -548,6 +571,18 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
         });
     }
     for msg in messages {
+        // When a turn carries authoritative structured output, replay it in
+        // order through the shared Responses codec and ignore the portable
+        // `content` projection to avoid duplicate items. Codex keeps its own
+        // authentication, instructions, streaming requirement, and error policy.
+        if msg.role == ChatRole::Assistant
+            && let Some(output) = &msg.output
+            && output.representation == ChatOutputRepresentation::Structured
+        {
+            convert_structured_output_to_codex(output, &mut inputs)?;
+            continue;
+        }
+
         let is_user = matches!(msg.role, ChatRole::User);
 
         // ── Pass 1: collect regular content blocks into a single message item ──
@@ -751,6 +786,85 @@ fn to_codex_tools(tools: &[Tool]) -> Vec<CodexTool<'_>> {
             strict: false,
         })
         .collect()
+}
+
+/// Replay authoritative structured output as ordered Codex input items.
+///
+/// Shares the Responses codec's item semantics (ordered message, reasoning,
+/// function call/output items; opaque items fail rather than being dropped)
+/// while Codex keeps its own authentication, instructions, streaming
+/// requirement, and error policy.
+fn convert_structured_output_to_codex<'a>(
+    output: &'a ChatOutput,
+    out: &mut Vec<CodexInputItem<'a>>,
+) -> Result<(), LLMError> {
+    for item in &output.items {
+        match item {
+            ChatOutputItem::Reasoning(reasoning) => {
+                out.push(CodexInputItem::Reasoning {
+                    id: reasoning.id.as_deref().map(Cow::Borrowed),
+                    summary: reasoning
+                        .summary
+                        .iter()
+                        .chain(&reasoning.content)
+                        .filter(|part| !part.text.is_empty())
+                        .map(|part| CodexReasoningSummaryInput {
+                            summary_type: CodexReasoningSummaryKind::SummaryText,
+                            text: Cow::Borrowed(part.text.as_str()),
+                        })
+                        .collect(),
+                    encrypted_content: reasoning.encrypted_content.as_deref().map(Cow::Borrowed),
+                });
+            }
+            ChatOutputItem::Message(message) => {
+                let role = match message.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+                let content: Vec<CodexInputContent<'a>> = message
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        ChatMessagePart::Text { text, .. } if !text.is_empty() => {
+                            Some(CodexInputContent::OutputText {
+                                text: Cow::Borrowed(text.as_str()),
+                            })
+                        }
+                        ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
+                            Some(CodexInputContent::OutputText {
+                                text: Cow::Borrowed(refusal.as_str()),
+                            })
+                        }
+                        // Media/opaque parts keep their existing Codex handling.
+                        _ => None,
+                    })
+                    .collect();
+                if !content.is_empty() {
+                    out.push(CodexInputItem::Message {
+                        role: Cow::Borrowed(role),
+                        content,
+                    });
+                }
+            }
+            ChatOutputItem::FunctionCall(call) => {
+                out.push(CodexInputItem::FunctionCall {
+                    call_id: Cow::Borrowed(call.call_id.as_str()),
+                    name: Cow::Borrowed(call.name.as_str()),
+                    // Exact provider argument text is replayed byte-exact.
+                    arguments: Cow::Borrowed(call.arguments.as_str()),
+                });
+            }
+            ChatOutputItem::Opaque(opaque) => {
+                return Err(LLMError::InvalidRequest(format!(
+                    "unsupported Responses continuation: output item type '{}' has no validated \
+                     input representation",
+                    opaque.original_type
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn codex_parse_chat_with_state(
@@ -1485,7 +1599,10 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use http::{Response, header::AUTHORIZATION};
     use querymt::{
-        chat::{ChatMessage, ChatResponse, ChatRole, Content, FinishReason, StreamChunk},
+        chat::{
+            ChatMessage, ChatOutput, ChatOutputItem, ChatResponse, ChatRole, Content, FinishReason,
+            StreamChunk,
+        },
         error::{LLMError, ProviderErrorKind},
     };
     use serde_json::Value;
@@ -1583,6 +1700,7 @@ mod tests {
                 content: inner,
             }],
             cache: None,
+            output: None,
         }
     }
 
@@ -1606,6 +1724,130 @@ mod tests {
                 .expect("chat body should serialize"),
         )
         .expect("chat body should be valid json")
+    }
+
+    fn structured_assistant_turn(items: Vec<ChatOutputItem>) -> ChatMessage {
+        let output = ChatOutput {
+            items,
+            ..ChatOutput::default()
+        };
+        let mut message = ChatMessage::from_assistant(output.portable_content());
+        message
+            .replace_output(output)
+            .expect("projection must match structured output");
+        message
+    }
+
+    #[test]
+    fn codex_replays_structured_output_items_in_order() {
+        use querymt::chat::{
+            ChatFunctionCallItem, ChatMessageItem, ChatOutputItem, ChatReasoningItem,
+            ChatReasoningPart, Extensions,
+        };
+
+        let cfg = test_codex("test-token");
+        let turn = structured_assistant_turn(vec![
+            ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("rs_1".to_string()),
+                summary: vec![ChatReasoningPart::text("thinking")],
+                content: Vec::new(),
+                encrypted_content: Some("enc_payload".to_string()),
+                signature: None,
+                status: None,
+                extensions: Extensions::new(),
+            }),
+            ChatOutputItem::Message(ChatMessageItem {
+                id: Some("msg_1".to_string()),
+                role: ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![querymt::chat::ChatMessagePart::Text {
+                    text: "calling".to_string(),
+                    annotations: Vec::new(),
+                    extensions: Extensions::new(),
+                }],
+                extensions: Extensions::new(),
+            }),
+            ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("fc_item_1".to_string()),
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"a.txt"}"#.to_string(),
+                status: None,
+                extensions: Extensions::new(),
+            }),
+        ]);
+
+        let messages = vec![
+            ChatMessage::user().text("read a.txt").build(),
+            turn,
+            tool_result_msg("call_1", vec![Content::text("body")]),
+        ];
+
+        let body: Value =
+            serde_json::from_slice(&codex_chat_body_json(&cfg, &messages, None).unwrap()).unwrap();
+        let input = body["input"].as_array().unwrap();
+
+        let types: Vec<&str> = input.iter().map(|i| i["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "message",
+                "reasoning",
+                "message",
+                "function_call",
+                "function_call_output"
+            ],
+            "structured replay must retain item order: {types:?}"
+        );
+
+        // Encrypted continuation stays separate from the visible summary.
+        assert_eq!(input[1]["id"], Value::String("rs_1".to_string()));
+        assert_eq!(
+            input[1]["encrypted_content"],
+            Value::String("enc_payload".to_string())
+        );
+        assert_eq!(
+            input[1]["summary"][0]["text"],
+            Value::String("thinking".to_string())
+        );
+
+        // Call correlation and byte-exact arguments.
+        assert_eq!(input[3]["call_id"], Value::String("call_1".to_string()));
+        assert_eq!(
+            input[3]["arguments"],
+            Value::String(r#"{"path":"a.txt"}"#.to_string())
+        );
+        assert_eq!(input[4]["call_id"], Value::String("call_1".to_string()));
+    }
+
+    #[test]
+    fn codex_rejects_unsupported_structured_continuation() {
+        use querymt::chat::{ChatOpaqueItem, ChatOutputItem};
+
+        let cfg = test_codex("test-token");
+        let turn = structured_assistant_turn(vec![ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: "image_generation_call".to_string(),
+            payload: serde_json::json!({"id": "ig_1"}),
+        })]);
+
+        let messages = vec![ChatMessage::user().text("go").build(), turn];
+        let error = codex_chat_body_json(&cfg, &messages, None)
+            .expect_err("unsupported continuation must fail, not silently drop");
+        assert!(
+            matches!(error, LLMError::InvalidRequest(ref msg)
+                if msg.contains("image_generation_call")),
+            "expected explicit unsupported-continuation error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn codex_keeps_streaming_requirement_and_store_false() {
+        // Codex backend policy is provider-owned and unaffected by codec reuse.
+        let cfg = test_codex("test-token");
+        let body = codex_body(&cfg);
+        assert_eq!(body["store"], Value::Bool(false));
+        assert_eq!(body["stream"], Value::Bool(true));
     }
 
     #[test]
@@ -1776,6 +2018,7 @@ mod tests {
                 },
             ],
             cache: None,
+            output: None,
         }];
 
         let body: Value = serde_json::from_slice(
@@ -1813,6 +2056,7 @@ mod tests {
                 url: "https://example.com/img.png".to_string(),
             }],
             cache: None,
+            output: None,
         }];
 
         let body: Value = serde_json::from_slice(

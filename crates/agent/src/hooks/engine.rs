@@ -1829,6 +1829,7 @@ fn append_request_context(
             role: querymt::chat::ChatRole::User,
             content: vec![querymt::chat::Content::text(rendered)],
             cache: None,
+            output: None,
         });
     }
 }

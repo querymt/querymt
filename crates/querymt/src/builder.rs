@@ -572,6 +572,7 @@ impl FunctionBuilder {
                 name: self.name,
                 description: self.description,
                 parameters: parameters_value,
+                strict: None,
             },
         }
     }

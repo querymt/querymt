@@ -773,6 +773,7 @@ mod tests {
                 name: name.to_string(),
                 description: String::new(),
                 parameters: json!({"type": "object"}),
+                strict: None,
             },
         }
     }

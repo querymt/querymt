@@ -129,6 +129,7 @@ runs:
         oras push "${IMAGE_BASE}:${VERSIONED},${ALIAS}" \
           --config oci-config.json:application/vnd.oci.image.config.v1+json \
           --annotation "mt.query.plugin.type=native" \
+          --annotation "mt.query.plugin.api=2" \
           --annotation "mt.query.plugin.feature=${{ inputs.feature_tag }}" \
           --annotation "org.opencontainers.image.version=${{ env.VERSION }}" \
           --annotation "org.opencontainers.image.os=${{ inputs.os }}" \

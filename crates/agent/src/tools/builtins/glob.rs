@@ -114,6 +114,7 @@ impl Tool for GlobTool {
                     },
                     "required": ["pattern"]
                 }),
+                strict: None,
             },
         }
     }

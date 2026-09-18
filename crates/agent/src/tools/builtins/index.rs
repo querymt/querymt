@@ -69,6 +69,7 @@ impl ToolTrait for IndexTool {
                     },
                     "required": ["path"]
                 }),
+                strict: None,
             },
         }
     }
