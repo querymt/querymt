@@ -568,7 +568,10 @@ mod item_aware_tests {
             serde_json::from_slice(&encoded).expect("deserialize request");
 
         let reloaded = &decoded.messages[1];
-        let reloaded_output = reloaded.output.as_ref().expect("structured output survives");
+        let reloaded_output = reloaded
+            .output
+            .as_ref()
+            .expect("structured output survives");
         assert_eq!(
             reloaded_output.items.len(),
             3,

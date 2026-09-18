@@ -802,9 +802,7 @@ mod tests {
     /// legacy projections are, so token thresholds trigger on real content.
     #[test]
     fn test_estimate_counts_structured_output_parts() {
-        use querymt::chat::{
-            ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
-        };
+        use querymt::chat::{ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem};
 
         let structured = AgentMessage {
             id: "a1".to_string(),

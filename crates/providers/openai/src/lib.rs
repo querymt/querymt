@@ -389,17 +389,13 @@ mod tests {
 
     #[test]
     fn config_schema_exposes_api_mode_with_chat_completions_default() {
-        let schema = querymt::plugin::HTTPLLMProviderFactory::config_schema(
-            &super::OpenAIFactory,
-        );
+        let schema = querymt::plugin::HTTPLLMProviderFactory::config_schema(&super::OpenAIFactory);
         let schema: Value = serde_json::from_str(&schema).expect("schema is valid json");
         let api_mode = schema
             .get("properties")
             .and_then(|p| p.get("api_mode"))
             .expect("api_mode is part of the config schema");
-        let default = api_mode
-            .get("default")
-            .expect("api_mode carries a default");
+        let default = api_mode.get("default").expect("api_mode carries a default");
         assert_eq!(default, &Value::String("chat_completions".to_string()));
         // Omission must not require callers to supply the field.
         let required = schema
@@ -599,7 +595,13 @@ mod tests {
             .collect();
         assert_eq!(
             types,
-            vec!["message", "message", "function_call", "function_call_output", "message"],
+            vec![
+                "message",
+                "message",
+                "function_call",
+                "function_call_output",
+                "message"
+            ],
             "input items must retain chronological order: {types:?}"
         );
 
@@ -611,10 +613,7 @@ mod tests {
             call["arguments"],
             Value::String(r#"{"path":"a.txt"}"#.to_string())
         );
-        assert_eq!(
-            input[3]["call_id"],
-            Value::String("call_1".to_string())
-        );
+        assert_eq!(input[3]["call_id"], Value::String("call_1".to_string()));
     }
 
     #[test]
@@ -751,8 +750,14 @@ mod tests {
             "Chat Completions max_tokens must not leak into Responses"
         );
         // JSON schema -> text.format.
-        assert_eq!(body["text"]["format"]["type"], Value::String("json_schema".to_string()));
-        assert_eq!(body["text"]["format"]["name"], Value::String("Answer".to_string()));
+        assert_eq!(
+            body["text"]["format"]["type"],
+            Value::String("json_schema".to_string())
+        );
+        assert_eq!(
+            body["text"]["format"]["name"],
+            Value::String("Answer".to_string())
+        );
         assert_eq!(body["text"]["format"]["strict"], Value::Bool(true));
         assert!(body["text"]["format"]["schema"].is_object());
         assert!(
@@ -803,10 +808,7 @@ mod tests {
         assert!(body.get("reasoning").is_none());
     }
 
-    fn responses_tool(
-        strict: Option<bool>,
-        parameters: serde_json::Value,
-    ) -> Tool {
+    fn responses_tool(strict: Option<bool>, parameters: serde_json::Value) -> Tool {
         Tool {
             tool_type: "function".to_string(),
             function: querymt::chat::FunctionTool {
@@ -1152,7 +1154,10 @@ mod tests {
             panic!("expected reasoning item");
         };
         assert!(reasoning.summary.is_empty());
-        assert_eq!(reasoning.encrypted_content.as_deref(), Some("encrypted-only"));
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("encrypted-only")
+        );
 
         let querymt::chat::ChatOutputItem::Message(message) = &output.items[1] else {
             panic!("expected message item");
@@ -1185,7 +1190,10 @@ mod tests {
             .expect("incomplete response should parse");
         let output = response.output().unwrap();
 
-        assert_eq!(output.status, Some(querymt::chat::ChatOutputStatus::Incomplete));
+        assert_eq!(
+            output.status,
+            Some(querymt::chat::ChatOutputStatus::Incomplete)
+        );
         assert_eq!(response.text().as_deref(), Some("partial"));
         assert_eq!(
             response.finish_reason(),
@@ -1313,7 +1321,10 @@ mod tests {
         ));
         assert!(matches!(
             &events[1],
-            StreamChunk::Structured(StructuredStreamEvent::ItemStarted { output_index: 0, .. })
+            StreamChunk::Structured(StructuredStreamEvent::ItemStarted {
+                output_index: 0,
+                ..
+            })
         ));
         assert!(matches!(
             &events[2],
@@ -1459,7 +1470,9 @@ mod tests {
             .unwrap();
         assert!(matches!(
             a_events.last(),
-            Some(StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal { .. }))
+            Some(StreamChunk::Structured(
+                StructuredStreamEvent::ResponseTerminal { .. }
+            ))
         ));
 
         // Parser B is unaffected: it still needs and accepts its own metadata.
@@ -1471,15 +1484,15 @@ mod tests {
         assert!(
             matches!(
                 b_events.first(),
-                Some(StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata { .. }))
+                Some(StreamChunk::Structured(
+                    StructuredStreamEvent::ResponseMetadata { .. }
+                ))
             ),
             "independent stream must start its own attempt"
         );
     }
 
-    fn tagged_assistant_turn(
-        parts: Vec<querymt::chat::ChatMessagePart>,
-    ) -> ChatMessage {
+    fn tagged_assistant_turn(parts: Vec<querymt::chat::ChatMessagePart>) -> ChatMessage {
         let output = querymt::chat::ChatOutput {
             items: vec![querymt::chat::ChatOutputItem::Message(
                 querymt::chat::ChatMessageItem {
@@ -1542,7 +1555,10 @@ mod tests {
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         let content = body["input"][0]["content"].as_array().unwrap();
 
-        let kinds: Vec<&str> = content.iter().map(|p| p["type"].as_str().unwrap()).collect();
+        let kinds: Vec<&str> = content
+            .iter()
+            .map(|p| p["type"].as_str().unwrap())
+            .collect();
         assert_eq!(kinds, vec!["output_text", "input_image", "input_file"]);
 
         // Parsed MIME semantics survive (spelling may normalize), and MIME
@@ -1566,7 +1582,9 @@ mod tests {
             "MIME parameter semantics preserved: {metadata}"
         );
         assert!(
-            metadata.trim_end_matches(";base64").contains("charset=binary"),
+            metadata
+                .trim_end_matches(";base64")
+                .contains("charset=binary"),
             "parameter precedes base64 marker: {metadata}"
         );
 
@@ -1742,7 +1760,10 @@ mod tests {
         });
         assert_eq!(
             terminal,
-            Some((ChatOutputStatus::Completed, Some(querymt::chat::FinishReason::Stop))),
+            Some((
+                ChatOutputStatus::Completed,
+                Some(querymt::chat::FinishReason::Stop)
+            )),
             "opaque built-in item must not be reported as a pending tool call"
         );
     }
@@ -1905,10 +1926,7 @@ mod tests {
         );
 
         // Each result references its original call id, with no duplicate items.
-        assert_eq!(
-            input[5]["call_id"],
-            Value::String("call_1".to_string())
-        );
+        assert_eq!(input[5]["call_id"], Value::String("call_1".to_string()));
         let call_count = types.iter().filter(|t| **t == "function_call").count();
         assert_eq!(call_count, 2, "no duplicate projected function calls");
     }

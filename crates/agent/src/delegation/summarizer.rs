@@ -210,7 +210,9 @@ impl DelegationSummarizer {
                         }
                         MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
-                        MessagePart::Output { output } => self.estimator.estimate(&output.estimate_text()),
+                        MessagePart::Output { output } => {
+                            self.estimator.estimate(&output.estimate_text())
+                        }
                         _ => 0,
                     })
                     .sum::<usize>()
