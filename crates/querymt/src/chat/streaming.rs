@@ -437,8 +437,14 @@ impl ChatStreamAccumulator {
                 detail,
             } => {
                 self.output.status = Some(*status);
-                self.output.usage.clone_from(usage);
-                self.output.finish_reason = *finish_reason;
+                // Terminal events that omit usage/finish_reason must not erase
+                // values accumulated from earlier stream events.
+                if let Some(usage) = usage {
+                    self.output.usage = Some(usage.clone());
+                }
+                if let Some(finish_reason) = finish_reason {
+                    self.output.finish_reason = Some(*finish_reason);
+                }
                 self.terminal_detail.clone_from(detail);
                 self.terminal_seen = true;
             }

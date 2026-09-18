@@ -554,7 +554,8 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
     let (kind, data) = match chunk {
         StreamChunk::Structured(event) => (
             "structured",
-            serde_json::to_value(event).expect("structured stream event is serializable"),
+            // Serialization failure must not panic across the FFI boundary.
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
         ),
         StreamChunk::Text(text) => ("text", serde_json::json!({ "text": text })),
         StreamChunk::Thinking(text) => ("thinking", serde_json::json!({ "text": text })),
@@ -737,12 +738,15 @@ fn py_message_to_rust(message: &Bound<'_, PyDict>) -> Result<ChatMessage> {
 
     match role.as_str() {
         "user" => Ok(ChatMessage::from_user(blocks)),
-        "assistant" => Ok(ChatMessage {
-            role: ChatRole::Assistant,
-            content: blocks,
-            cache: None,
-            output,
-        }),
+        "assistant" => {
+            let mut message = ChatMessage::from_assistant(blocks);
+            if let Some(output) = output {
+                message.replace_output(output).map_err(|e| {
+                    anyhow!("message.output is not consistent with the assistant message: {e}")
+                })?;
+            }
+            Ok(message)
+        }
         "tool" => Ok(ChatMessage {
             role: ChatRole::Assistant,
             content: blocks,
