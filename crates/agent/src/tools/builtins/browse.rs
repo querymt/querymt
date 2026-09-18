@@ -182,6 +182,7 @@ impl ToolTrait for BrowseTool {
                     },
                     "required": ["url"]
                 }),
+                strict: None,
             },
         }
     }

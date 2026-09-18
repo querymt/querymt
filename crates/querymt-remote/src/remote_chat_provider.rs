@@ -185,6 +185,9 @@ where
             remote_router_ref,
             self.core.transport().stream_reconnect_grace().as_secs(),
         );
+        self.core
+            .validate_contract(&host_ref, stream_request.item_aware_contract_version)
+            .await?;
 
         tracing::debug!(
             target: "querymt_remote::provider::stream",

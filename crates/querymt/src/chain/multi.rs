@@ -223,6 +223,7 @@ impl<'a> MultiPromptChain<'a> {
                         role: ChatRole::User,
                         content: vec![Content::text(prompt_text)],
                         cache: None,
+                        output: None,
                     }];
 
                     let mut final_response_text = String::new();
@@ -271,6 +272,7 @@ impl<'a> MultiPromptChain<'a> {
                                 role: ChatRole::User,
                                 content: tool_result_blocks,
                                 cache: None,
+                                output: None,
                             });
 
                             // Continue the loop to allow the LLM to process the tool results.

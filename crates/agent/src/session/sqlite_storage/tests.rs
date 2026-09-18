@@ -58,6 +58,825 @@ async fn prompt_blocks_round_trip_through_persistence_and_fork() {
     assert_eq!(fork_history[0].parts, message.parts);
 }
 
+#[tokio::test]
+async fn canonical_output_part_round_trips_through_sqlite_reload() {
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOpaqueItem, ChatOutput,
+        ChatOutputItem, ChatOutputProvenance, ChatOutputStatus, ChatReasoningItem,
+    };
+
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+
+    let output = ChatOutput {
+        response_id: Some("resp_1".into()),
+        status: Some(ChatOutputStatus::Completed),
+        provenance: Some(ChatOutputProvenance {
+            provider: "openai".into(),
+            protocol: "responses".into(),
+            model: "gpt-5".into(),
+            endpoint: "https://api.openai.com/v1/responses".into(),
+        }),
+        items: vec![
+            // Encrypted-only reasoning: no visible summary, opaque continuation.
+            ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("reasoning_1".into()),
+                summary: Vec::new(),
+                content: Vec::new(),
+                encrypted_content: Some("encrypted-continuation".into()),
+                signature: Some("sig-1".into()),
+                status: None,
+                extensions: Default::default(),
+            }),
+            ChatOutputItem::Message(ChatMessageItem {
+                id: Some("message_1".into()),
+                role: ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![ChatMessagePart::Text {
+                    text: "answer".into(),
+                    annotations: Vec::new(),
+                    extensions: Default::default(),
+                }],
+                extensions: Default::default(),
+            }),
+            ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("item_1".into()),
+                call_id: "call_1".into(),
+                name: "lookup".into(),
+                arguments: "{\"query\":\"rust\",\"raw\": 1 }".into(),
+                status: None,
+                extensions: Default::default(),
+            }),
+            ChatOutputItem::Opaque(ChatOpaqueItem {
+                original_type: "future_action".into(),
+                payload: serde_json::json!({"vendor": true}),
+            }),
+        ],
+        ..ChatOutput::default()
+    };
+    let message = AgentMessage {
+        id: "assistant-1".to_string(),
+        session_id: session.public_id.clone(),
+        role: ChatRole::Assistant,
+        parts: vec![MessagePart::Output { output }],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: Some("openai".to_string()),
+        source_model: Some("gpt-5".to_string()),
+    };
+    storage
+        .add_message(&session.public_id, message)
+        .await
+        .unwrap();
+
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].parts.len(), 1, "one canonical part, no duplicates");
+
+    let MessagePart::Output { output: reloaded } = &history[0].parts[0] else {
+        panic!("expected canonical Output part after reload");
+    };
+    assert_eq!(reloaded.items.len(), 4);
+
+    let ChatOutputItem::Reasoning(reasoning) = &reloaded.items[0] else {
+        panic!("expected reasoning item");
+    };
+    assert!(reasoning.summary.is_empty());
+    assert_eq!(
+        reasoning.encrypted_content.as_deref(),
+        Some("encrypted-continuation"),
+        "encrypted-only reasoning survives reload"
+    );
+    assert_eq!(reasoning.signature.as_deref(), Some("sig-1"));
+
+    let ChatOutputItem::FunctionCall(call) = &reloaded.items[2] else {
+        panic!("expected function call item");
+    };
+    assert_eq!(call.call_id, "call_1");
+    assert_eq!(call.item_id.as_deref(), Some("item_1"));
+    assert_eq!(
+        call.arguments, "{\"query\":\"rust\",\"raw\": 1 }",
+        "raw arguments reload byte-exact"
+    );
+
+    assert!(matches!(reloaded.items[3], ChatOutputItem::Opaque(_)));
+
+    // Reloaded history projects once into provider request content without
+    // duplicated parts.
+    let chat = history[0].to_chat_message().unwrap();
+    let text_blocks = chat
+        .content
+        .iter()
+        .filter(|block| matches!(block, querymt::chat::Content::Text { .. }))
+        .count();
+    let tool_use_blocks = chat
+        .content
+        .iter()
+        .filter(|block| matches!(block, querymt::chat::Content::ToolUse { .. }))
+        .count();
+    assert_eq!(text_blocks, 1);
+    assert_eq!(tool_use_blocks, 1);
+}
+
+fn structured_tool_exchange(session_id: &str) -> (AgentMessage, AgentMessage, AgentMessage) {
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
+    };
+
+    let assistant = AgentMessage {
+        id: "assistant-turn".to_string(),
+        session_id: session_id.to_string(),
+        role: ChatRole::Assistant,
+        parts: vec![MessagePart::Output {
+            output: ChatOutput {
+                items: vec![
+                    ChatOutputItem::Message(ChatMessageItem {
+                        id: None,
+                        role: ChatRole::Assistant,
+                        phase: None,
+                        status: None,
+                        parts: vec![ChatMessagePart::Text {
+                            text: "running lookup".into(),
+                            annotations: Vec::new(),
+                            extensions: Default::default(),
+                        }],
+                        extensions: Default::default(),
+                    }),
+                    ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                        item_id: Some("item_1".into()),
+                        call_id: "call_1".into(),
+                        name: "lookup".into(),
+                        arguments: "{\"query\":\"rust\"}".into(),
+                        status: None,
+                        extensions: Default::default(),
+                    }),
+                ],
+                ..ChatOutput::default()
+            },
+        }],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: Some("openai".to_string()),
+        source_model: Some("gpt-5".to_string()),
+    };
+    let result = AgentMessage {
+        id: "result-turn".to_string(),
+        session_id: session_id.to_string(),
+        role: ChatRole::User,
+        parts: vec![MessagePart::ToolResult {
+            call_id: "call_1".to_string(),
+            content: vec![querymt::chat::Content::text("result payload")],
+            is_error: false,
+            tool_name: Some("lookup".to_string()),
+            tool_arguments: Some("{\"query\":\"rust\"}".to_string()),
+            compacted_at: None,
+        }],
+        created_at: 2,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    let follow_up = AgentMessage {
+        id: "user-follow-up".to_string(),
+        session_id: session_id.to_string(),
+        role: ChatRole::User,
+        parts: vec![MessagePart::Text {
+            content: "and now?".to_string(),
+        }],
+        created_at: 3,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    (assistant, result, follow_up)
+}
+
+/// History edits delete structured output together with its projections: after
+/// an edit frontier, neither the canonical payload nor any projection survives
+/// in storage, so nothing stale can be resurrected on reload.
+#[tokio::test]
+async fn edit_removes_structured_authority_without_resurrection() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+    let (assistant, result, follow_up) = structured_tool_exchange(&session.public_id);
+    for message in [&assistant, &result, &follow_up] {
+        storage
+            .add_message(&session.public_id, message.clone())
+            .await
+            .unwrap();
+    }
+
+    // Edit frontier at the assistant turn removes the whole dependency group.
+    let deleted = storage
+        .delete_messages_after(&session.public_id, "assistant-turn")
+        .await
+        .unwrap();
+    assert_eq!(deleted, 3);
+
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert!(history.is_empty(), "edit frontier drops the exchange");
+
+    // No sidecar: a full storage scan finds no structured residue.
+    let conn = storage.conn_for_test();
+    let conn = conn.lock().unwrap();
+    let residue: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_parts WHERE part_type = 'output'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(residue, 0, "no hidden structured sidecar remains");
+}
+
+/// Pruning replaces result content with placeholders but keeps the
+/// call/result mapping, so structured replay never dangles.
+#[tokio::test]
+async fn pruning_keeps_call_result_mapping_for_structured_turns() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+    let (assistant, result, follow_up) = structured_tool_exchange(&session.public_id);
+    for message in [&assistant, &result, &follow_up] {
+        storage
+            .add_message(&session.public_id, message.clone())
+            .await
+            .unwrap();
+    }
+
+    let updated = storage
+        .mark_tool_results_compacted(&session.public_id, &["call_1".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert_eq!(history.len(), 3);
+
+    // The canonical structured output part is untouched by pruning.
+    let MessagePart::Output { output } = &history[0].parts[0] else {
+        panic!("structured authority must be maintained across pruning");
+    };
+    assert_eq!(output.items.len(), 2);
+    assert_eq!(
+        history[0].parts, assistant.parts,
+        "canonical output is byte-identical after pruning"
+    );
+
+    // The result still references the original call ID with placeholder content.
+    let chat = history[1].to_chat_message().unwrap();
+    let placeholder = chat
+        .content
+        .iter()
+        .find(|block| block.is_tool_result())
+        .expect("tool result still present");
+    match placeholder {
+        querymt::chat::Content::ToolResult { id, content, .. } => {
+            assert_eq!(id, "call_1");
+            assert_eq!(content[0].as_text(), Some("[Old tool result content cleared]"));
+        }
+        other => panic!("expected tool result, got {other:?}"),
+    }
+}
+
+/// Rich media in structured output must survive storage reload with MIME
+/// parameters, filename/detail, source form, and provider-reference scope
+/// intact — and an unresolved reference must not imply renderable bytes.
+#[tokio::test]
+async fn structured_output_media_round_trips_through_sqlite_reload() {
+    use querymt::chat::{
+        ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,
+        MediaKind, MediaPart, MediaSource,
+    };
+
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+
+    let origin = ChatOutputProvenance {
+        provider: "provider-a".into(),
+        protocol: "responses".into(),
+        model: "model-a".into(),
+        endpoint: "https://a.invalid/v1/responses".into(),
+    };
+
+    let mut inline = MediaPart::new(
+        MediaKind::Document,
+        Some("application/pdf; charset=binary".parse().unwrap()),
+        MediaSource::Inline {
+            data: vec![0x25, 0x50, 0x44, 0x46],
+        },
+    )
+    .unwrap();
+    inline.filename = Some("report.pdf".into());
+    inline.detail = Some("high".into());
+
+    let mut reference = MediaPart::new(
+        MediaKind::Document,
+        None,
+        MediaSource::ProviderFile {
+            file_id: "file_abc".into(),
+            origin: origin.clone(),
+        },
+    )
+    .unwrap();
+    reference.filename = Some("remote.pdf".into());
+
+    let message = AgentMessage {
+        id: "media-turn".to_string(),
+        session_id: session.public_id.clone(),
+        role: ChatRole::Assistant,
+        parts: vec![MessagePart::Output {
+            output: ChatOutput {
+                provenance: Some(origin.clone()),
+                items: vec![ChatOutputItem::Message(ChatMessageItem {
+                    id: None,
+                    role: ChatRole::Assistant,
+                    phase: None,
+                    status: None,
+                    parts: vec![
+                        ChatMessagePart::Media(inline.clone()),
+                        ChatMessagePart::Media(reference.clone()),
+                    ],
+                    extensions: Default::default(),
+                })],
+                ..ChatOutput::default()
+            },
+        }],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: Some("provider-a".to_string()),
+        source_model: Some("model-a".to_string()),
+    };
+    storage
+        .add_message(&session.public_id, message.clone())
+        .await
+        .unwrap();
+
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert_eq!(history[0].parts, message.parts, "media survives reload exactly");
+
+    let MessagePart::Output { output } = &history[0].parts[0] else {
+        panic!("expected canonical output part");
+    };
+    let ChatOutputItem::Message(item) = &output.items[0] else {
+        panic!("expected message item");
+    };
+    let ChatMessagePart::Media(reloaded_inline) = &item.parts[0] else {
+        panic!("expected inline media");
+    };
+    assert_eq!(reloaded_inline, &inline);
+    let media_type = reloaded_inline.media_type.as_ref().unwrap();
+    assert_eq!(media_type.type_(), "application");
+    assert_eq!(media_type.subtype(), "pdf");
+    assert_eq!(media_type.parameter("charset"), Some("binary"));
+
+    let ChatMessagePart::Media(reloaded_reference) = &item.parts[1] else {
+        panic!("expected provider reference media");
+    };
+    assert_eq!(reloaded_reference, &reference);
+    assert!(matches!(
+        &reloaded_reference.source,
+        MediaSource::ProviderFile { file_id, origin: o } if file_id == "file_abc" && o == &origin
+    ));
+    assert!(
+        reloaded_reference.portable_content().is_none(),
+        "an unresolved provider reference does not imply renderable bytes"
+    );
+}
+
+/// End-to-end roundtrip: response -> persist -> reload -> tool result ->
+/// second request. The reloaded assistant turn must replay through the provider
+/// conversion with exact raw arguments, preserved order, distinct item/call
+/// IDs, encrypted reasoning continuation, and no duplicate projected items.
+#[tokio::test]
+async fn structured_response_persist_reload_then_second_request_round_trips() {
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
+        ChatOutputProvenance, ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, Content,
+    };
+
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+
+    // Raw (non-canonical) argument text must survive byte-exact.
+    let raw_arguments = r#"{"query":"rust","limit": 2 }"#;
+
+    let output = ChatOutput {
+        response_id: Some("resp_e2e".into()),
+        status: Some(ChatOutputStatus::Completed),
+        provenance: Some(ChatOutputProvenance {
+            provider: "openai".into(),
+            protocol: "responses".into(),
+            model: "gpt-5".into(),
+            endpoint: "https://api.openai.com/v1/responses".into(),
+        }),
+        items: vec![
+            ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("reasoning_e2e".into()),
+                summary: vec![ChatReasoningPart::text("thinking")],
+                content: Vec::new(),
+                encrypted_content: Some("encrypted-continuation-e2e".into()),
+                signature: Some("sig-e2e".into()),
+                status: None,
+                extensions: Default::default(),
+            }),
+            ChatOutputItem::Message(ChatMessageItem {
+                id: Some("message_e2e".into()),
+                role: ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![ChatMessagePart::Text {
+                    text: "running lookup".into(),
+                    annotations: Vec::new(),
+                    extensions: Default::default(),
+                }],
+                extensions: Default::default(),
+            }),
+            ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("fc_item_e2e".into()),
+                call_id: "call_e2e".into(),
+                name: "lookup".into(),
+                arguments: raw_arguments.into(),
+                status: None,
+                extensions: Default::default(),
+            }),
+        ],
+        ..ChatOutput::default()
+    };
+
+    let assistant = AgentMessage {
+        id: "assistant-e2e".to_string(),
+        session_id: session.public_id.clone(),
+        role: ChatRole::Assistant,
+        parts: vec![MessagePart::Output { output }],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: Some("openai".to_string()),
+        source_model: Some("gpt-5".to_string()),
+    };
+    let prompt = AgentMessage {
+        id: "user-e2e".to_string(),
+        session_id: session.public_id.clone(),
+        role: ChatRole::User,
+        parts: vec![MessagePart::Text {
+            content: "look it up".to_string(),
+        }],
+        created_at: 0,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    let result = AgentMessage {
+        id: "result-e2e".to_string(),
+        session_id: session.public_id.clone(),
+        role: ChatRole::User,
+        parts: vec![MessagePart::ToolResult {
+            call_id: "call_e2e".to_string(),
+            content: vec![Content::text("result payload")],
+            is_error: false,
+            tool_name: Some("lookup".to_string()),
+            tool_arguments: Some(raw_arguments.to_string()),
+            compacted_at: None,
+        }],
+        created_at: 2,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+
+    for message in [&prompt, &assistant, &result] {
+        storage
+            .add_message(&session.public_id, message.clone())
+            .await
+            .unwrap();
+    }
+
+    // Reload from storage and convert to the provider request view.
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert_eq!(history.len(), 3);
+
+    let reloaded_assistant = &history[1];
+    let MessagePart::Output { output: reloaded } = &reloaded_assistant.parts[0] else {
+        panic!("expected canonical Output part after reload");
+    };
+    assert_eq!(
+        reloaded.items.len(),
+        3,
+        "no duplicate projected items after reload"
+    );
+
+    let ChatOutputItem::Reasoning(reasoning) = &reloaded.items[0] else {
+        panic!("expected reasoning item");
+    };
+    assert_eq!(
+        reasoning.encrypted_content.as_deref(),
+        Some("encrypted-continuation-e2e"),
+        "reasoning continuation survives reload"
+    );
+
+    let ChatOutputItem::FunctionCall(call) = &reloaded.items[2] else {
+        panic!("expected function call item");
+    };
+    assert_eq!(call.arguments, raw_arguments, "raw arguments reload byte-exact");
+    assert_eq!(call.call_id, "call_e2e");
+    assert_eq!(call.item_id.as_deref(), Some("fc_item_e2e"));
+
+    // Second request: same-origin conversion projects the canonical turn into
+    // portable content exactly once, preserving call/result correlation.
+    let chat_messages: Vec<querymt::chat::ChatMessage> = history
+        .iter()
+        .map(|m| {
+            m.to_chat_message_with_target(Some("openai"), Some("gpt-5"), None)
+                .unwrap()
+        })
+        .collect();
+
+    // The assistant turn projects its structured authority into content rather
+    // than leaking it as a duplicate structured field.
+    let assistant_content = &chat_messages[1].content;
+    let tool_uses: Vec<&Content> = assistant_content
+        .iter()
+        .filter(|block| matches!(block, Content::ToolUse { .. }))
+        .collect();
+    assert_eq!(
+        tool_uses.len(),
+        1,
+        "call projected exactly once into the assistant turn"
+    );
+    let Content::ToolUse { id, name, .. } = tool_uses[0] else {
+        unreachable!()
+    };
+    assert_eq!(id, "call_e2e");
+    assert_eq!(name, "lookup");
+
+    let text_blocks = assistant_content
+        .iter()
+        .filter(|block| matches!(block, Content::Text { .. }))
+        .count();
+    assert_eq!(text_blocks, 1, "message text projected once");
+
+    let tool_result = chat_messages[2]
+        .content
+        .iter()
+        .find(|block| block.is_tool_result())
+        .expect("tool result present");
+    match tool_result {
+        Content::ToolUse { .. } => panic!("expected a tool result, got tool use"),
+        Content::ToolResult { id, .. } => assert_eq!(id, "call_e2e"),
+        _ => panic!("expected tool result block"),
+    }
+
+    // Same-origin replay retains the reasoning continuation on the canonical
+    // projection, and stays a single block.
+    let reasoning_blocks = assistant_content
+        .iter()
+        .filter(|block| matches!(block, Content::Thinking { .. }))
+        .count();
+    assert_eq!(reasoning_blocks, 1, "reasoning projected once");
+}
+
+/// Build a structured assistant turn for a specific origin (provider/model).
+fn origin_turn(
+    id: &str,
+    session_id: &str,
+    provider: &str,
+    model: &str,
+    call_id: &str,
+) -> AgentMessage {
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
+        ChatOutputProvenance,
+    };
+
+    AgentMessage {
+        id: id.to_string(),
+        session_id: session_id.to_string(),
+        role: ChatRole::Assistant,
+        parts: vec![MessagePart::Output {
+            output: ChatOutput {
+                provenance: Some(ChatOutputProvenance {
+                    provider: provider.to_string(),
+                    protocol: "responses".to_string(),
+                    model: model.to_string(),
+                    endpoint: format!("https://{provider}.invalid/v1/responses"),
+                }),
+                items: vec![
+                    ChatOutputItem::Reasoning(querymt::chat::ChatReasoningItem {
+                        id: Some(format!("reasoning_{id}")),
+                        summary: vec![querymt::chat::ChatReasoningPart::text(format!(
+                            "{provider} visible summary"
+                        ))],
+                        content: Vec::new(),
+                        encrypted_content: Some(format!("{provider}-encrypted-continuation")),
+                        signature: Some(format!("{provider}-signature")),
+                        status: None,
+                        extensions: Default::default(),
+                    }),
+                    ChatOutputItem::Message(ChatMessageItem {
+                        id: None,
+                        role: ChatRole::Assistant,
+                        phase: None,
+                        status: None,
+                        parts: vec![ChatMessagePart::Text {
+                            text: format!("{provider} answer"),
+                            annotations: Vec::new(),
+                            extensions: Default::default(),
+                        }],
+                        extensions: Default::default(),
+                    }),
+                    ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                        item_id: Some(format!("item_{call_id}")),
+                        call_id: call_id.to_string(),
+                        name: "lookup".into(),
+                        arguments: "{\"query\":\"rust\"}".into(),
+                        status: None,
+                        extensions: Default::default(),
+                    }),
+                ],
+                ..ChatOutput::default()
+            },
+        }],
+        created_at: 0,
+        parent_message_id: None,
+        source_provider: Some(provider.to_string()),
+        source_model: Some(model.to_string()),
+    }
+}
+
+/// A conversation that moves A -> B -> A keeps native A state in storage, never
+/// forwards it to B, and projects B turn portably on return. Projections never
+/// mutate the stored originals.
+#[tokio::test]
+async fn a_b_a_replay_scopes_opaque_state_to_its_origin() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+
+    let a1 = origin_turn("a1", &session.public_id, "provider-a", "model-a", "call_a1");
+    let b1 = origin_turn("b1", &session.public_id, "provider-b", "model-b", "call_b1");
+    let a2 = origin_turn("a2", &session.public_id, "provider-a", "model-a", "call_a2");
+    for message in [&a1, &b1, &a2] {
+        storage
+            .add_message(&session.public_id, message.clone())
+            .await
+            .unwrap();
+    }
+
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert_eq!(history.len(), 3);
+
+    // Snapshot the stored originals to prove projection does not mutate them.
+    let stored_before: Vec<String> = history
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap())
+        .collect();
+
+    // ── Send to B: A's opaque state must be excluded, B's own reasoning
+    // signature (a same-origin provider-only signal) is retained.
+    let to_b: Vec<_> = history
+        .iter()
+        .map(|m| {
+            m.to_chat_message_with_target(Some("provider-b"), Some("model-b"), None)
+                .unwrap()
+        })
+        .collect();
+    let to_b_json = serde_json::to_string(&to_b).unwrap();
+    assert!(
+        !to_b_json.contains("provider-a-encrypted-continuation"),
+        "A's encrypted continuation must never reach B"
+    );
+    assert!(
+        !to_b_json.contains("provider-a-signature"),
+        "A's reasoning signature must never reach B"
+    );
+    // A's visible/portable content still reaches B.
+    assert!(to_b_json.contains("provider-a answer"));
+    assert!(to_b_json.contains("provider-a visible summary"));
+    assert!(to_b_json.contains("call_a1"));
+    // B's own turn keeps its native provider-only signature when the target is B.
+    assert!(to_b_json.contains("provider-b-signature"));
+    assert!(
+        !to_b_json.contains("provider-a-encrypted-continuation"),
+        "encrypted continuation is never portable content"
+    );
+
+    // ── Return to A: use validated native representations of A turns and
+    // portable projections of B turns, in chronological order.
+    let back_to_a: Vec<_> = history
+        .iter()
+        .map(|m| {
+            m.to_chat_message_with_target(Some("provider-a"), Some("model-a"), None)
+                .unwrap()
+        })
+        .collect();
+    let back_json = serde_json::to_string(&back_to_a).unwrap();
+    // Native A state is retained.
+    assert!(back_json.contains("provider-a-signature"));
+    // B is projected portably: visible content only, no B continuation state.
+    assert!(back_json.contains("provider-b answer"));
+    assert!(back_json.contains("provider-b visible summary"));
+    assert!(
+        !back_json.contains("provider-b-signature"),
+        "B's provider-only signature must not be forwarded back to A"
+    );
+
+    // Chronological order and call/result dependencies are preserved.
+    let a1_pos = back_json.find("call_a1").unwrap();
+    let b1_pos = back_json.find("call_b1").unwrap();
+    let a2_pos = back_json.find("call_a2").unwrap();
+    assert!(a1_pos < b1_pos && b1_pos < a2_pos, "chronological order holds");
+
+    // Stored originals are byte-identical and still hold the excluded
+    // continuation state after projecting to other targets.
+    let stored_after: Vec<String> = storage
+        .get_history(&session.public_id)
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap())
+        .collect();
+    assert_eq!(stored_before, stored_after, "projection never mutates storage");
+    assert!(
+        stored_after.join("\n").contains("provider-a-encrypted-continuation"),
+        "authorized storage retains A continuation for native replay"
+    );
+}
+
+/// A structured A dependency group that is compacted away must never be
+/// resurrected from storage or a hidden sidecar when the conversation later
+/// returns to A.
+#[tokio::test]
+async fn a_b_a_replay_does_not_resurrect_compacted_group() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("source".to_string()), None, None, None)
+        .await
+        .unwrap();
+
+    let a1 = origin_turn("a1", &session.public_id, "provider-a", "model-a", "call_a1");
+    let b1 = origin_turn("b1", &session.public_id, "provider-b", "model-b", "call_b1");
+    storage
+        .add_message(&session.public_id, a1.clone())
+        .await
+        .unwrap();
+    storage
+        .add_message(&session.public_id, b1.clone())
+        .await
+        .unwrap();
+
+    // Edit frontier removes the A group entirely (as compaction/replacement does).
+    storage
+        .delete_messages_after(&session.public_id, "a1")
+        .await
+        .unwrap();
+
+    let history = storage.get_history(&session.public_id).await.unwrap();
+    assert!(history.is_empty(), "compacted A group is gone from history");
+
+    // No hidden sidecar: the structured payload cannot be found anywhere.
+    let conn = storage.conn_for_test();
+    let conn = conn.lock().unwrap();
+    let residue: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM message_parts WHERE content_json LIKE '%provider-a-encrypted-continuation%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(residue, 0, "no sidecar restores excluded A state");
+    drop(conn);
+
+    // A return to A must not surface the removed group.
+    let back_to_a: Vec<String> = history
+        .iter()
+        .map(|m| {
+            m.to_chat_message_with_target(Some("provider-a"), Some("model-a"), None)
+                .unwrap()
+        })
+        .map(|m| serde_json::to_string(&m).unwrap())
+        .collect();
+    let back_json = back_to_a.join("\n");
+    assert!(!back_json.contains("provider-a-encrypted-continuation"));
+    assert!(!back_json.contains("call_a1"));
+}
+
 #[test]
 fn migration_0001_is_recorded() {
     let mut conn = Connection::open_in_memory().expect("in-memory db");

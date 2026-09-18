@@ -105,6 +105,7 @@ impl Tool for QuestionTool {
                     },
                     "required": ["questions"]
                 }),
+                strict: None,
             },
         }
     }

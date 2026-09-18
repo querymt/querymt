@@ -58,6 +58,10 @@ struct PyChatResponse {
     tool_calls: Vec<PyToolCall>,
     #[pyo3(get)]
     content: Vec<PyContentBlock>,
+    /// Canonical structured output as JSON when the provider is item-aware.
+    /// This is lossless; `text`/`thinking`/`tool_calls` remain legacy
+    /// projections.
+    output: Option<Value>,
 }
 
 #[pyclass(name = "Usage", skip_from_py_object)]
@@ -403,6 +407,14 @@ impl PyChatResponse {
     fn __str__(&self) -> String {
         self.text.clone().unwrap_or_default()
     }
+
+    #[getter]
+    fn output<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.output {
+            Some(value) => json_to_python(py, value),
+            None => Ok(py.None().into_bound(py).to_owned()),
+        }
+    }
 }
 
 #[pymethods]
@@ -458,6 +470,9 @@ fn chat_response_to_python(response: &dyn ::querymt::chat::ChatResponse) -> PyCh
             .iter()
             .map(content_block_to_python)
             .collect(),
+        output: response
+            .output()
+            .and_then(|output| serde_json::to_value(output).ok()),
     }
 }
 
@@ -537,6 +552,10 @@ fn stream_to_python(
 
 fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
     let (kind, data) = match chunk {
+        StreamChunk::Structured(event) => (
+            "structured",
+            serde_json::to_value(event).expect("structured stream event is serializable"),
+        ),
         StreamChunk::Text(text) => ("text", serde_json::json!({ "text": text })),
         StreamChunk::Thinking(text) => ("thinking", serde_json::json!({ "text": text })),
         StreamChunk::ThinkingSignature(signature) => (
@@ -703,13 +722,30 @@ fn py_message_to_rust(message: &Bound<'_, PyDict>) -> Result<ChatMessage> {
         .ok_or_else(|| anyhow!("message.content is required"))?;
     let blocks = py_content_to_rust(&content)?;
 
+    // Optional canonical structured output, passed through as JSON so Python
+    // callers can replay item-aware history losslessly.
+    let output = match message.get_item("output")? {
+        Some(value) if !value.is_none() => {
+            let json = python_to_json(&value)?;
+            Some(serde_json::from_value::<::querymt::chat::ChatOutput>(json)
+                .map_err(|e| anyhow!("message.output is not valid structured output: {e}"))?)
+        }
+        _ => None,
+    };
+
     match role.as_str() {
         "user" => Ok(ChatMessage::from_user(blocks)),
-        "assistant" => Ok(ChatMessage::from_assistant(blocks)),
+        "assistant" => Ok(ChatMessage {
+            role: ChatRole::Assistant,
+            content: blocks,
+            cache: None,
+            output,
+        }),
         "tool" => Ok(ChatMessage {
             role: ChatRole::Assistant,
             content: blocks,
             cache: None,
+            output: None,
         }),
         other => Err(anyhow!("unsupported role '{}'", other)),
     }

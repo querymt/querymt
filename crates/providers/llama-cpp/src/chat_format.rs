@@ -845,6 +845,7 @@ mod tests {
                     },
                     "required": ["pattern"]
                 }),
+                strict: None,
             },
         }
     }

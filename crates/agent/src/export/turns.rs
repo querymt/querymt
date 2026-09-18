@@ -398,6 +398,85 @@ mod tests {
         assert!(!turns[0].tool_results[0].is_error);
     }
 
+    /// Exports are lossy portable projections: they carry visible text and
+    /// projected tool calls from the event stream but never provider-only
+    /// continuation state. The exported `Turn` type has no field that could
+    /// hold encrypted reasoning, signatures, or opaque payloads — this test
+    /// pins the projected shape a structured turn produces.
+    #[test]
+    fn materialized_turns_are_lossy_projections_without_continuation_state() {
+        let events = vec![
+            make_event(
+                1,
+                100,
+                AgentEventKind::PromptReceived {
+                    content: "plan the work".to_string(),
+                    message_id: None,
+                },
+            ),
+            make_event(2, 101, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                3,
+                102,
+                AgentEventKind::AssistantMessageStored {
+                    content: "Here is the plan.".to_string(),
+                    thinking: Some("visible summary only".to_string()),
+                    message_id: None,
+                },
+            ),
+            make_event(
+                4,
+                103,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "read_tool".to_string(),
+                    arguments: r#"{"path":"plan.md"}"#.to_string(),
+                },
+            ),
+            make_event(
+                5,
+                104,
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id: "call-1".to_string(),
+                    tool_name: "read_tool".to_string(),
+                    is_error: false,
+                    result: "# Plan".to_string(),
+                },
+            ),
+            make_event(
+                6,
+                105,
+                AgentEventKind::LlmRequestEnd {
+                    usage: None,
+                    tool_calls: 1,
+                    finish_reason: Some(querymt::chat::FinishReason::ToolCalls),
+                    cost_usd: None,
+                    cumulative_cost_usd: None,
+                    context_tokens: 50,
+                    metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                },
+            ),
+        ];
+
+        let (turns, _meta) = materialize_turns(&events);
+        assert_eq!(turns.len(), 1);
+        let turn = &turns[0];
+        assert_eq!(turn.assistant_content, "Here is the plan.");
+        assert_eq!(turn.thinking.as_deref(), Some("visible summary only"));
+        assert_eq!(turn.tool_calls[0].arguments, r#"{"path":"plan.md"}"#);
+
+        // The projection carries no continuation state: its Debug shape never
+        // contains opaque payloads or provider-only secrets, and the Turn type
+        // has no field that could hold them.
+        let debug = format!("{turn:?}");
+        assert!(
+            !debug.contains("encrypted")
+                && !debug.contains("signature")
+                && !debug.contains("opaque"),
+            "exported turns must not carry provider-only continuation state"
+        );
+    }
+
     #[test]
     fn materialize_extracts_metadata() {
         let events = vec![
@@ -429,6 +508,7 @@ mod tests {
                             name: "shell".to_string(),
                             description: "Run a command".to_string(),
                             parameters: serde_json::json!({}),
+                            strict: None,
                         },
                     }],
                     tools_hash: Default::default(),

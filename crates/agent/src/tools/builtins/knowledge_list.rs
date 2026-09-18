@@ -47,6 +47,7 @@ impl ToolTrait for KnowledgeListTool {
                     },
                     "required": []
                 }),
+                strict: None,
             },
         }
     }

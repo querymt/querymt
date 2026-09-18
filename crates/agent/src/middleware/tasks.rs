@@ -47,16 +47,9 @@ impl DuplicateToolCallMiddleware {
             .rev()
             .take(5)
             .flat_map(|msg| {
-                msg.parts.iter().filter_map(|part| {
-                    if let MessagePart::ToolUse(tool_call) = part {
-                        Some((
-                            tool_call.function.name.clone(),
-                            tool_call.function.arguments.clone(),
-                        ))
-                    } else {
-                        None
-                    }
-                })
+                msg.function_calls()
+                    .into_iter()
+                    .map(|call| (call.function.name, call.function.arguments))
             })
             .collect();
 

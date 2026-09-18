@@ -143,16 +143,19 @@ fn test_conversation_context_counts_user_messages() {
             role: ChatRole::User,
             content: vec![Content::text("one")],
             cache: None,
+            output: None,
         },
         ChatMessage {
             role: ChatRole::Assistant,
             content: vec![Content::text("two")],
             cache: None,
+            output: None,
         },
         ChatMessage {
             role: ChatRole::User,
             content: vec![Content::text("three")],
             cache: None,
+            output: None,
         },
     ];
     let stats = AgentStats {

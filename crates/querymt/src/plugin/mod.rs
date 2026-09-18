@@ -18,6 +18,11 @@ pub mod plugin_log;
 
 pub type Fut<'a, T> = BoxFuture<'a, T>;
 
+/// Native Rust plugin ABI version required by this QueryMT release.
+///
+/// Version 2 includes item-aware chat response and streaming contracts.
+pub const NATIVE_PLUGIN_API: u32 = 2;
+
 /// FFI-safe logging callback that native plugins can use to forward log messages
 /// to the host process logger.
 ///

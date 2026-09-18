@@ -120,6 +120,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
 
         let result = actor_ref.ask(req).await;
@@ -170,6 +171,7 @@ mod provider_host_tests {
             tool_calls: vec![],
             usage: None,
             finish_reason: Some("Stop".to_string()),
+            output: None,
         };
         assert_eq!(resp.text(), Some("hello world".to_string()));
     }
@@ -184,6 +186,7 @@ mod provider_host_tests {
             tool_calls: vec![],
             usage: None,
             finish_reason: None,
+            output: None,
         };
         assert!(
             resp.tool_calls().is_none(),
@@ -227,6 +230,7 @@ mod provider_host_tests {
                 tool_calls: vec![],
                 usage: None,
                 finish_reason: Some(expected_str.to_string()),
+                output: None,
             };
             let roundtripped = resp.finish_reason().expect("should be Some");
             // Compare via Debug string since FinishReason may not be PartialEq.
@@ -249,6 +253,7 @@ mod provider_host_tests {
             tool_calls: vec![],
             usage: None,
             finish_reason: Some("GibberishReason".to_string()),
+            output: None,
         };
         let reason = resp.finish_reason().expect("should be Some");
         assert_eq!(
@@ -271,6 +276,7 @@ mod provider_host_tests {
                 ..Default::default()
             }),
             finish_reason: Some("Stop".to_string()),
+            output: None,
         };
 
         let serialized = serde_json::to_string(&original).expect("serialize");
@@ -358,6 +364,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
         let result = f.actor_ref.ask(req).await;
         // The ask returns Result<Result<ProviderChatResponse, AgentError>, SendError>
@@ -395,6 +402,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
 
         // Both calls fail for the same reason (provider not found).
@@ -577,6 +585,7 @@ mod provider_host_tests {
             tool_calls: vec![],
             usage: None,
             finish_reason: None,
+            output: None,
         };
         assert_eq!(with_text.to_string(), "my response");
 
@@ -586,6 +595,7 @@ mod provider_host_tests {
             tool_calls: vec![],
             usage: None,
             finish_reason: None,
+            output: None,
         };
         assert_eq!(no_text.to_string(), "[no text]");
     }
@@ -692,6 +702,7 @@ mod provider_host_tests {
                 "temperature": 0.3,
                 "n_ctx": 32768
             })),
+            item_aware_contract_version: None,
         };
 
         let json = serde_json::to_string(&req).expect("serialize");
@@ -770,6 +781,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(
@@ -980,6 +992,7 @@ mod provider_host_tests {
             tool_calls: vec![tc.clone()],
             usage: None,
             finish_reason: None,
+            output: None,
         };
         let returned = resp.tool_calls().expect("should be Some");
         assert_eq!(returned.len(), 1);

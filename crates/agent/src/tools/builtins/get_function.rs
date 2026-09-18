@@ -66,6 +66,7 @@ impl Tool for GetFunctionTool {
                     },
                     "required": ["paths", "names"]
                 }),
+                strict: None,
             },
         }
     }

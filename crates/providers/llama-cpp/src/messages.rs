@@ -271,6 +271,7 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 role: msg.role.clone(),
                 content: out_blocks,
                 cache: msg.cache.clone(),
+                output: None,
             }
         })
         .collect()
@@ -326,6 +327,7 @@ mod tests {
             role: ChatRole::User,
             content: blocks,
             cache: None,
+            output: None,
         }
     }
 
@@ -334,6 +336,7 @@ mod tests {
             role: ChatRole::Assistant,
             content: blocks,
             cache: None,
+            output: None,
         }
     }
 

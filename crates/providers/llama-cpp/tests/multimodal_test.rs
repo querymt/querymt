@@ -95,6 +95,7 @@ fn weather_tool() -> Tool {
                 },
                 "required": ["location"]
             }),
+            strict: None,
         },
     }
 }

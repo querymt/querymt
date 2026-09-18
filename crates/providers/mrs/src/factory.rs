@@ -60,6 +60,12 @@ impl LLMProviderFactory for MistralRSFactory {
 
 #[cfg(feature = "native")]
 #[unsafe(no_mangle)]
+pub extern "C" fn querymt_plugin_api() -> u32 {
+    querymt::plugin::NATIVE_PLUGIN_API
+}
+
+#[cfg(feature = "native")]
+#[unsafe(no_mangle)]
 pub extern "C" fn plugin_factory() -> *mut dyn LLMProviderFactory {
     Box::into_raw(Box::new(MistralRSFactory {
         model_cache: std::sync::Mutex::new(None),

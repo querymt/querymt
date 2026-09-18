@@ -1,7 +1,7 @@
 use crate::{
-    CancelProviderStreamRequest, GetProviderStreamStatus, ProviderChatRequest,
-    ProviderChatResponse, ProviderStreamRequest, ProviderStreamStatus, RemoteProviderClientConfig,
-    StreamRelayMessage,
+    CancelProviderStreamRequest, GetProviderContractInfo, GetProviderStreamStatus,
+    ProviderChatRequest, ProviderChatResponse, ProviderContractInfo, ProviderStreamRequest,
+    ProviderStreamStatus, RemoteProviderClientConfig, StreamRelayMessage,
 };
 use async_trait::async_trait;
 use querymt::error::{LLMError, TransportErrorKind};
@@ -19,6 +19,11 @@ pub trait RemoteProviderClientTransport: Send + Sync {
     async fn target_peer_id_display(&self, target_locator: &str) -> String;
     async fn invalidate_cached_host(&self, target_locator: &str);
     async fn lookup_host(&self, target_locator: &str) -> Result<Self::HostRef, LLMError>;
+    async fn get_contract_info(
+        &self,
+        host: &Self::HostRef,
+        request: GetProviderContractInfo,
+    ) -> Result<ProviderContractInfo, LLMError>;
     async fn prepare_stream_router(
         &self,
         session_id: &str,
@@ -110,6 +115,33 @@ where
             .await;
     }
 
+    pub async fn validate_contract(
+        &self,
+        host: &TTransport::HostRef,
+        required_version: Option<u32>,
+    ) -> Result<(), LLMError> {
+        let Some(required_version) = required_version else {
+            return Ok(());
+        };
+        let info = self
+            .transport
+            .get_contract_info(host, GetProviderContractInfo)
+            .await
+            .map_err(|error| {
+                LLMError::InvalidRequest(format!(
+                    "remote provider peer cannot advertise item-aware chat contract version {required_version}: {error}"
+                ))
+            })?;
+        if info.item_aware_chat_version != Some(required_version) {
+            return Err(LLMError::InvalidRequest(format!(
+                "remote provider peer does not support item-aware chat contract version {required_version}; advertised version: {}",
+                info.item_aware_chat_version
+                    .map_or_else(|| "none".to_string(), |value| value.to_string())
+            )));
+        }
+        Ok(())
+    }
+
     pub fn build_chat_request(
         &self,
         messages: &[querymt::chat::ChatMessage],
@@ -125,7 +157,10 @@ where
         should_retry: impl Fn(&LLMError) -> bool,
     ) -> Result<ProviderChatResponse, LLMError> {
         let request = self.build_chat_request(messages, tools);
-        self.send_chat_request_with_retry(&request, should_retry)
+        let host = self.lookup_host().await?;
+        self.validate_contract(&host, request.item_aware_contract_version)
+            .await?;
+        self.send_chat_request_with_retry(&host, &request, should_retry)
             .await
     }
 
@@ -200,11 +235,11 @@ where
 
     pub async fn send_chat_request_with_retry(
         &self,
+        host: &TTransport::HostRef,
         request: &ProviderChatRequest,
         should_retry: impl Fn(&LLMError) -> bool,
     ) -> Result<ProviderChatResponse, LLMError> {
-        let host = self.lookup_host().await?;
-        match self.transport.send_chat_request(&host, request).await {
+        match self.transport.send_chat_request(host, request).await {
             Ok(response) => Ok(response),
             Err(error) if should_retry(&error) => {
                 self.invalidate_cached_host().await;
