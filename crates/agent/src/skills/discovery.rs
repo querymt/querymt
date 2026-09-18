@@ -130,12 +130,10 @@ fn is_recursive_project_agents_skills(source: &SkillSource) -> bool {
     matches!(source, SkillSource::Project(_)) && is_agents_skills_source(source)
 }
 
-/// Discover all skills from multiple sources with deduplication
-pub fn discover_all(sources: &[SkillSource], include_external: bool) -> Result<Vec<Skill>> {
-    let mut all_skills = Vec::new();
-    let mut seen_names = std::collections::HashMap::new();
-
-    let sources_to_search: Vec<_> = if include_external {
+/// Filter sources by the `include_external` policy: when external sources
+/// are disabled, only explicitly configured paths are searched.
+fn selected_sources(sources: &[SkillSource], include_external: bool) -> Vec<SkillSource> {
+    if include_external {
         sources.to_vec()
     } else {
         sources
@@ -143,50 +141,96 @@ pub fn discover_all(sources: &[SkillSource], include_external: bool) -> Result<V
             .filter(|s| matches!(s, SkillSource::Configured(_)))
             .cloned()
             .collect()
-    };
+    }
+}
 
-    for source in sources_to_search {
-        match discover_from_source(&source) {
-            Ok(skills) => {
-                for skill in skills {
-                    // Protocol skills override by stable ID; skills without
-                    // an explicit ID keep the legacy name-based key.
-                    let name = skill.metadata.effective_id().to_string();
+/// Merge discovered skills into `all_skills`, deduplicating by stable ID.
+///
+/// Protocol skills override by stable ID; skills without an explicit ID keep
+/// the legacy name-based key. Higher-priority sources override lower ones.
+fn merge_discovered(
+    all_skills: &mut Vec<Skill>,
+    seen_names: &mut std::collections::HashMap<String, (u8, PathBuf)>,
+    source: &SkillSource,
+    skills: Vec<Skill>,
+) {
+    for skill in skills {
+        let name = skill.metadata.effective_id().to_string();
 
-                    // Check for duplicates
-                    if let Some((existing_priority, existing_path)) = seen_names.get(&name) {
-                        let new_priority = source.priority();
-                        if new_priority > *existing_priority {
-                            log::info!(
-                                "Skill '{}' from {:?} overrides version from {:?}",
-                                name,
-                                skill.path,
-                                existing_path
-                            );
-                            seen_names.insert(name.clone(), (new_priority, skill.path.clone()));
-                            all_skills.retain(|s: &Skill| s.metadata.effective_id() != name);
-                            all_skills.push(skill);
-                        } else {
-                            log::warn!(
-                                "Duplicate skill '{}' found at {:?}, ignoring (already loaded from {:?})",
-                                name,
-                                skill.path,
-                                existing_path
-                            );
-                        }
-                    } else {
-                        seen_names.insert(name.clone(), (source.priority(), skill.path.clone()));
-                        all_skills.push(skill);
-                    }
-                }
+        // Check for duplicates
+        if let Some((existing_priority, existing_path)) = seen_names.get(&name) {
+            let new_priority = source.priority();
+            if new_priority > *existing_priority {
+                log::info!(
+                    "Skill '{}' from {:?} overrides version from {:?}",
+                    name,
+                    skill.path,
+                    existing_path
+                );
+                seen_names.insert(name.clone(), (new_priority, skill.path.clone()));
+                all_skills.retain(|s: &Skill| s.metadata.effective_id() != name);
+                all_skills.push(skill);
+            } else {
+                log::warn!(
+                    "Duplicate skill '{}' found at {:?}, ignoring (already loaded from {:?})",
+                    name,
+                    skill.path,
+                    existing_path
+                );
             }
+        } else {
+            seen_names.insert(name.clone(), (source.priority(), skill.path.clone()));
+            all_skills.push(skill);
+        }
+    }
+}
+
+fn discover_all_with(
+    sources: &[SkillSource],
+    include_external: bool,
+    discover_one: &dyn Fn(&SkillSource) -> Result<Vec<Skill>>,
+    strict: bool,
+) -> Result<Vec<Skill>> {
+    let mut all_skills = Vec::new();
+    let mut seen_names = std::collections::HashMap::new();
+
+    for source in selected_sources(sources, include_external) {
+        match discover_one(&source) {
+            Ok(skills) => merge_discovered(&mut all_skills, &mut seen_names, &source, skills),
             Err(e) => {
+                if strict {
+                    return Err(anyhow::anyhow!(
+                        "failed to discover skills from {:?}: {}",
+                        source,
+                        e
+                    ));
+                }
                 log::warn!("Failed to discover skills from {:?}: {}", source, e);
             }
         }
     }
 
     Ok(all_skills)
+}
+
+/// Discover all skills from multiple sources with deduplication.
+///
+/// Best-effort: a selected source that fails traversal is logged and skipped,
+/// so the returned set may be partial. Use [`discover_all_strict`] when a
+/// complete snapshot is required.
+pub fn discover_all(sources: &[SkillSource], include_external: bool) -> Result<Vec<Skill>> {
+    discover_all_with(sources, include_external, &discover_from_source, false)
+}
+
+/// Strict discovery for transactional refresh: returns an error when any
+/// selected source cannot be traversed completely.
+///
+/// A successful return therefore proves the result is a complete snapshot.
+/// Nonexistent source directories still count as empty sources, and malformed
+/// individual skill definitions are diagnosed and skipped so a single bad
+/// entry does not invalidate otherwise successful discovery.
+pub fn discover_all_strict(sources: &[SkillSource], include_external: bool) -> Result<Vec<Skill>> {
+    discover_all_with(sources, include_external, &discover_from_source, true)
 }
 
 #[cfg(test)]
@@ -391,6 +435,106 @@ OpenSpec instructions.
         let source = SkillSource::Global(PathBuf::from("/nonexistent/path"));
         let skills = discover_from_source(&source).unwrap();
         assert_eq!(skills.len(), 0);
+    }
+
+    /// Write a shallow non-protocol skill definition into `dir`.
+    fn create_skill_with_description(dir: &Path, name: &str, description: &str) {
+        create_skill(dir, name, "1.0");
+        let skill_file = dir.join(name).join("SKILL.md");
+        fs::write(
+            &skill_file,
+            format!("---\nname: {name}\ndescription: {description}\n---\nContent\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_strict_discovery_missing_source_is_empty() {
+        let dir = TempDir::new().unwrap();
+        create_skill_with_description(dir.path(), "healthy", "Healthy skill");
+
+        let sources = vec![
+            SkillSource::Global(dir.path().to_path_buf()),
+            SkillSource::Global(PathBuf::from("/nonexistent/path")),
+        ];
+
+        // A missing source counts as empty, not as a failure.
+        let skills = discover_all_strict(&sources, true).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].metadata.effective_id(), "healthy");
+    }
+
+    #[test]
+    fn test_strict_discovery_skips_malformed_entries() {
+        let dir = TempDir::new().unwrap();
+        create_skill_with_description(dir.path(), "valid-skill", "Valid skill");
+
+        // Missing required `description` makes this entry malformed.
+        let malformed_dir = dir.path().join("malformed-skill");
+        fs::create_dir(&malformed_dir).unwrap();
+        fs::write(
+            malformed_dir.join("SKILL.md"),
+            "---\nname: malformed-skill\n---\nBody\n",
+        )
+        .unwrap();
+
+        let sources = vec![SkillSource::Global(dir.path().to_path_buf())];
+
+        let skills = discover_all_strict(&sources, true).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].metadata.effective_id(), "valid-skill");
+    }
+
+    #[test]
+    fn test_strict_discovery_fails_when_source_traversal_fails() {
+        let injected_error = || anyhow::anyhow!("injected traversal failure");
+        let fail_discovery =
+            |_source: &SkillSource| -> Result<Vec<Skill>> { Err(injected_error()) };
+
+        let sources = vec![SkillSource::Global(PathBuf::from("/does/not/matter"))];
+
+        // Strict mode propagates the traversal error instead of dropping it.
+        let result = discover_all_with(&sources, true, &fail_discovery, true);
+        assert!(result.is_err());
+
+        // Best-effort mode keeps suppressing it.
+        let result = discover_all_with(&sources, true, &fail_discovery, false);
+        assert_eq!(result.unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_strict_discovery_fails_on_unreadable_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        create_skill_with_description(dir.path(), "healthy", "Healthy skill");
+
+        let unreadable = TempDir::new().unwrap();
+        create_skill_with_description(unreadable.path(), "locked", "Locked skill");
+        fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Self-check: under privileged users (e.g. root in CI) the directory
+        // remains readable and the walk would succeed, so skip reliably.
+        if fs::read_dir(unreadable.path()).is_ok() {
+            fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: privileged user can still read the locked directory");
+            return;
+        }
+
+        let sources = vec![
+            SkillSource::Global(dir.path().to_path_buf()),
+            SkillSource::Global(unreadable.path().to_path_buf()),
+        ];
+
+        // Strict discovery refuses to return a partial snapshot...
+        assert!(discover_all_strict(&sources, true).is_err());
+        // ...while best-effort discovery still returns the healthy source.
+        let best_effort = discover_all(&sources, true).unwrap();
+        assert_eq!(best_effort.len(), 1);
+        assert_eq!(best_effort[0].metadata.effective_id(), "healthy");
+
+        fs::set_permissions(unreadable.path(), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     /// Write a protocol-style lowercase `skill.md` with the given frontmatter.
