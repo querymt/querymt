@@ -144,8 +144,6 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
                 response: _,
                 ref context,
             } => {
-                use crate::model::MessagePart;
-
                 // Get the session history
                 let history = match self.store.get_history(&context.session_id).await {
                     Ok(h) => h,
