@@ -560,6 +560,7 @@ impl Tool for EditTool {
                     },
                     "required": ["filePath", "oldString", "newString"]
                 }),
+                strict: None,
             },
         }
     }

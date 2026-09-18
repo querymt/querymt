@@ -81,6 +81,7 @@ impl Tool for MultiEditTool {
                     },
                     "required": ["filePath", "edits"]
                 }),
+                strict: None,
             },
         }
     }

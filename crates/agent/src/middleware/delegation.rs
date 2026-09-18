@@ -247,11 +247,8 @@ impl MiddlewareDriver for DelegationMiddleware {
                         return Ok(state);
                     }
 
-                    use crate::model::MessagePart;
-
-                    for part in &last_msg.parts {
-                        if let MessagePart::ToolUse(tool_call) = part
-                            && tool_call.function.name == "delegate"
+                    for tool_call in last_msg.function_calls() {
+                        if tool_call.function.name == "delegate"
                             && let Ok(args) = serde_json::from_str::<serde_json::Value>(
                                 &tool_call.function.arguments,
                             )

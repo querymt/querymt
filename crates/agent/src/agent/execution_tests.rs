@@ -356,6 +356,7 @@ fn provider_tool(name: &str) -> Tool {
             name: name.to_string(),
             description: "test tool".to_string(),
             parameters: json!({"type": "object", "properties": {}}),
+            strict: None,
         },
     }
 }
@@ -513,6 +514,7 @@ async fn test_provider_tools_passed_to_llm() {
                 "properties": {},
                 "required": [],
             }),
+            strict: None,
         },
     };
     let mut harness = TestHarness::new_with_tools(vec![], None, vec![tool.clone()]).await;

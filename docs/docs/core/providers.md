@@ -71,3 +71,80 @@ model = "glm-5.1"
 base_url = "https://api.z.ai/api/coding/paas/v4/"
 ```
 
+## OpenAI Responses API (opt-in)
+
+The `openai` provider can speak either the Chat Completions or the Responses
+protocol. Selection is explicit and defaults to Chat Completions, so existing
+configurations keep their endpoint and body semantics unchanged.
+
+```toml
+[[providers]]
+name = "openai"
+path = "oci://ghcr.io/querymt/openai:latest"
+
+[providers.config]
+api_key = "${OPENAI_API_KEY}"
+model = "gpt-5"
+api_mode = "responses"   # omit for "chat_completions" (default)
+```
+
+`api_mode` accepts `"chat_completions"` (default) or `"responses"`. When omitted
+the configuration schema applies the `chat_completions` default, so the field is
+never required. Setting `api_mode = "responses"` switches both streaming and
+non-streaming operations to `POST /responses`.
+
+### Behavior in Responses mode
+
+- **Stateless local continuation.** Requests always send `store = false`,
+  request `reasoning.encrypted_content` via `include`, and never emit
+  `previous_response_id` or `conversation`. Ordered reasoning, message, and
+  function-call items are replayed locally instead.
+- **No fallback.** A failed Responses request surfaces its original classified
+  error; it is never retried as a Chat Completions request.
+- **Conflicting passthrough is rejected.** Supplying `store`,
+  `previous_response_id`, `conversation`, or `include` through `extra_body`
+  fails request construction instead of silently overriding continuation or
+  retention policy. Unrelated `extra_body` fields still pass through.
+- **Control mapping.** `system` → `instructions`, `max_tokens` →
+  `max_output_tokens`, `json_schema` → `text.format`, `reasoning_effort` →
+  `reasoning.effort`. Controls with no Responses equivalent (for example
+  `top_k`) fail explicitly rather than being silently ignored.
+- **Function tools.** Definitions use the flattened Responses shape. Unspecified
+  strictness serializes `strict = false`; explicit `strict = true` requires a
+  schema where every object sets `additionalProperties: false` and lists all
+  properties as required, otherwise construction fails rather than silently
+  making formerly optional fields required. Named tool choice uses the Responses
+  `{ "type": "function", "name": ... }` shape.
+- **Function outputs** correlate by `call_id` and preserve ordered
+  text/image/file parts. Media the endpoint cannot represent fails explicitly
+  instead of being replaced by a placeholder.
+
+### Compatibility and shared codec
+
+The Responses codec is shared with the `codex` and `xai` providers, which keep
+their own authentication, headers, instructions, streaming requirements, and
+error policies. Codex remains streaming-only and requires its provider-specific
+credentials; xAI retains its endpoint, headers, model-based option gating, and
+does not import OpenAI-only options.
+
+### Portable (lossy) downgrade
+
+Opaque provider items — such as `image_generation_call` — are retained verbatim
+but have no validated input representation. Replaying a turn that requires such
+an item fails with an explicit unsupported-continuation error instead of
+dropping it. To move a session to a target that cannot replay that state, use an
+explicit portable projection, which is **lossy**: visible text and reasoning
+summaries are preserved, while encrypted continuation and opaque payloads are
+not. Portable exports are display-oriented and cannot restore full continuation.
+
+Because structured output adds public message fields and stream variants, older
+QueryMT binaries and native plugins require a coordinated rebuild or an explicit
+lossy export; transparent downgrade compatibility is not provided.
+
+### Out of scope
+
+- Stateful `previous_response_id` and the Conversations API.
+- Automatic endpoint selection or fallback between protocols.
+- A complete built-in/custom-tool execution framework.
+- Universal portability of encrypted or provider-opaque state across origins.
+

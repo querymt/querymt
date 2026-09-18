@@ -70,6 +70,7 @@ impl ToolTrait for KnowledgeIngestTool {
                     },
                     "required": ["text", "source"]
                 }),
+                strict: None,
             },
         }
     }

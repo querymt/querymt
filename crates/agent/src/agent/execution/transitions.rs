@@ -18,14 +18,22 @@ use crate::middleware::{
 };
 use crate::model::{AgentMessage, MessagePart};
 use anyhow::Context as _;
+use futures_util::Stream;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use log::{debug, trace, warn};
 use querymt::ToolCall;
-use querymt::chat::{CacheHint, ChatMessage, ChatRole, FinishReason, StreamChunk};
+use querymt::chat::{
+    CacheHint, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputRepresentation,
+    ChatOutputStatus, ChatRole, ChatStreamAccumulator, ChatStreamAccumulatorError, FinishReason,
+    StreamChunk, StructuredStreamEvent, normalize_chat_response,
+};
 use querymt::error::LLMError;
+use querymt::error::{ProviderErrorKind, ProviderFailure};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
 use uuid::Uuid;
 
@@ -242,6 +250,128 @@ fn validate_stream_terminal(
     Ok(finish_reason)
 }
 
+/// Wrap an accumulator violation as a transient provider stream failure.
+fn stream_accumulation_error(error: ChatStreamAccumulatorError) -> LLMError {
+    LLMError::from(
+        ProviderFailure::new(ProviderErrorKind::UnknownTransient, error.to_string())
+            .with_code(Some("stream_accumulation".into())),
+    )
+}
+
+/// Map a structured item delta onto the UI batching buffers.
+///
+/// Returns `(is_thinking, delta)` for events that carry visible content; function
+/// argument deltas do not surface as assistant text.
+fn structured_delta_for_ui(event: &StructuredStreamEvent) -> Option<(bool, &str)> {
+    match event {
+        StructuredStreamEvent::MessagePartDelta {
+            delta: ChatMessagePartDelta::Text { delta },
+            ..
+        }
+        | StructuredStreamEvent::MessagePartDelta {
+            delta: ChatMessagePartDelta::Refusal { delta },
+            ..
+        } => Some((false, delta)),
+        StructuredStreamEvent::ReasoningPartDelta { delta, .. } => Some((true, delta)),
+        _ => None,
+    }
+}
+
+/// Merge usage events that arrived after the terminal chunk into the output.
+fn merge_drained_usage(mut output: ChatOutput, drained: Option<querymt::Usage>) -> ChatOutput {
+    if let Some(extra) = drained {
+        output.usage = Some(match output.usage.take() {
+            Some(previous) => previous.merge_max(extra),
+            None => extra,
+        });
+    }
+    output
+}
+
+/// Drain remaining stream items after the terminal chunk, collecting trailing
+/// usage events. Some providers emit usage after Done in the same SSE batch.
+///
+/// Cancellation is reported by the caller checking the token after the drain.
+async fn drain_trailing_usage(
+    stream: &mut Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+    cancel_token: &CancellationToken,
+) -> Option<querymt::Usage> {
+    let mut usage: Option<querymt::Usage> = None;
+    loop {
+        let remaining = tokio::select! {
+            remaining = stream.next() => remaining,
+            _ = cancel_token.cancelled() => return usage,
+        };
+        let Some(remaining) = remaining else {
+            break;
+        };
+        match remaining {
+            Ok(StreamChunk::Usage(u)) => {
+                usage = Some(match usage {
+                    Some(previous) => previous.merge_max(u),
+                    None => u,
+                });
+            }
+            Err(_) | Ok(_) => break,
+        }
+    }
+    usage
+}
+
+/// Keep the first call per call identity; duplicates execute at most once.
+fn dedupe_tool_calls_by_call_id(calls: Vec<ToolCall>) -> Vec<ToolCall> {
+    let mut seen = std::collections::HashSet::new();
+    calls
+        .into_iter()
+        .filter(|call| seen.insert(call.id.clone()))
+        .collect()
+}
+
+/// Split function calls into executable calls and synthesized error results.
+///
+/// Local execution is gated on response validation: a call executes only when
+/// its raw arguments parse as a JSON object. Invalid arguments never execute and
+/// never degrade to an empty object; they receive an error result so the
+/// tool_use/tool_result history invariant is preserved. Duplicate call
+/// identities are skipped after the first occurrence.
+fn gate_function_calls_for_execution(
+    calls: &[MiddlewareToolCall],
+) -> (Vec<MiddlewareToolCall>, Vec<ToolResult>) {
+    let mut seen = std::collections::HashSet::new();
+    let mut executable = Vec::new();
+    let mut gated_results = Vec::new();
+    for call in calls {
+        if !seen.insert(call.id.clone()) {
+            warn!(
+                "Skipping duplicate tool call identity {} ({})",
+                call.id, call.function.name
+            );
+            continue;
+        }
+        let valid_arguments = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+            .map(|value| value.is_object())
+            .unwrap_or(false);
+        if valid_arguments {
+            executable.push(call.clone());
+        } else {
+            warn!(
+                "Gating tool call {} ({}): arguments are not a JSON object",
+                call.id, call.function.name
+            );
+            gated_results.push(ToolResult::new(
+                call.id.clone(),
+                vec![querymt::chat::Content::text(
+                    "Error: function call arguments are not a valid JSON object; the call was not executed.",
+                )],
+                true,
+                Some(call.function.name.clone()),
+                Some(call.function.arguments.clone()),
+            ));
+        }
+    }
+    (executable, gated_results)
+}
+
 /// Transition from CallLlm to AfterLlm.
 ///
 /// This invokes the LLM (with or without tools), handles streaming for codex provider,
@@ -295,15 +425,9 @@ pub(super) async fn transition_call_llm(
     let mut streaming_message_id: Option<String> = None;
 
     // Determine response via streaming or non-streaming path.
-    // Each arm produces the same tuple so the rest of the function is uniform.
-    let (
-        response_content,
-        response_thinking,
-        response_thinking_signature,
-        tool_calls,
-        usage,
-        finish_reason,
-    ) = if tools.is_empty() {
+    // Each arm produces canonical ordered output so the rest of the function is
+    // uniform and item-aware data survives without flattening.
+    let output: ChatOutput = if tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
         let resp = match super::llm_retry::call_with_retry(
@@ -331,14 +455,7 @@ pub(super) async fn transition_call_llm(
             Err(e) => return map_failed_llm_call(e, false, context),
         };
 
-        (
-            resp.text().unwrap_or_default(),
-            resp.thinking(),
-            None,
-            resp.tool_calls().unwrap_or_default(),
-            resp.usage(),
-            resp.finish_reason(),
-        )
+        normalize_chat_response(resp.as_ref())
     } else {
         let provider = match super::llm_retry::call_with_retry(
             config,
@@ -375,24 +492,21 @@ pub(super) async fn transition_call_llm(
 
             let max_stream_retries = config.execution_policy.rate_limit.max_stream_retries;
 
-            // Accumulators live outside the retry loop so the post-stream
-            // processing below can read them regardless of how many attempts
-            // were needed. On each retry they are reset to empty.
-            let mut text = String::new();
-            let mut thinking = String::new();
-            // Initial values are always overwritten inside the retry loop below
-            // before first read, so suppress the unused-assignment lint.
+            // Shared accumulator: selects structured mode when structured
+            // metadata appears before semantic output; legacy chunks synthesize
+            // a limited projection otherwise. Canonical history comes from this
+            // accumulator alone — legacy projection chunks accompanying
+            // structured events never duplicate items.
+            let mut accumulator = ChatStreamAccumulator::new();
+            // Usage events that arrive after the terminal chunk bypass the
+            // accumulator (which rejects post-terminal events) and are merged
+            // into the attempt output afterwards.
             #[allow(unused_assignments)]
-            let mut thinking_signature: Option<String> = None;
-            let mut stream_tool_calls: Vec<ToolCall> = Vec::new();
-            let mut tool_call_ids = std::collections::HashSet::new();
-            #[allow(unused_assignments)]
-            let mut usage: Option<querymt::Usage> = None;
-            #[allow(unused_assignments)]
-            let mut stream_finish_reason: Option<FinishReason> = None;
+            let mut drained_usage: Option<querymt::Usage> = None;
 
             // Batching buffers — we flush at most every 50ms or 256 chars to
             // avoid per-token React state updates on fast local models.
+            // Both legacy display chunks and structured item deltas feed them.
             let mut text_buffer = String::new();
             let mut thinking_buffer = String::new();
             #[allow(unused_assignments)]
@@ -452,16 +566,15 @@ pub(super) async fn transition_call_llm(
                 max_stream_retries,
                 config.execution_policy.rate_limit.max_attempts(),
             );
-            'stream: loop {
+            let streamed_output: ChatOutput = 'stream: loop {
                 let mut semantic_output_seen = false;
 
-                // Reset accumulators on retry so we start fresh.
-                text.clear();
-                thinking.clear();
-                thinking_signature = None;
-                stream_tool_calls.clear();
-                tool_call_ids.clear();
-                usage = None;
+                // Reset attempt-local accumulation on retry so attempts never mix.
+                accumulator.reset_attempt();
+                #[allow(unused_assignments)]
+                {
+                    drained_usage = None;
+                }
                 text_buffer.clear();
                 thinking_buffer.clear();
                 last_flush = Instant::now();
@@ -559,7 +672,56 @@ pub(super) async fn transition_call_llm(
 
                     semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
+                    // Canonical accumulation. Accumulator violations are provider
+                    // stream-contract failures and follow the retry policy.
+                    if let Err(error) = accumulator.push(&chunk) {
+                        debug!(
+                            "Stream accumulator rejected chunk: session={} message_id={} error={}",
+                            session_id, message_id, error
+                        );
+                        match super::llm_retry::handle_stream_failure(
+                            config,
+                            session_id,
+                            stream_accumulation_error(error),
+                            &mut retry_budget,
+                            semantic_output_seen,
+                            Some(message_id.clone()),
+                            &exec_ctx.cancellation_token,
+                        )
+                        .await
+                        {
+                            super::llm_retry::StreamFailureAction::Retry => continue 'stream,
+                            super::llm_retry::StreamFailureAction::Cancelled => {
+                                return Ok(ExecutionState::Cancelled);
+                            }
+                            super::llm_retry::StreamFailureAction::Terminal(error) => {
+                                return Err(contextualize_llm_error(error, "streaming", context));
+                            }
+                        }
+                    }
+
+                    // Display projections for the UI. In structured mode these
+                    // legacy-shaped chunks are compatibility projections; the
+                    // accumulator ignores them for canonical history.
                     match chunk {
+                        StreamChunk::Structured(event) => {
+                            if let Some((is_thinking, delta)) = structured_delta_for_ui(&event) {
+                                if is_thinking {
+                                    thinking_buffer.push_str(delta);
+                                } else {
+                                    text_buffer.push_str(delta);
+                                }
+                            }
+                            if matches!(event, StructuredStreamEvent::ResponseTerminal { .. }) {
+                                drained_usage =
+                                    drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
+                                        .await;
+                                if exec_ctx.cancellation_token.is_cancelled() {
+                                    return Ok(ExecutionState::Cancelled);
+                                }
+                                break;
+                            }
+                        }
                         StreamChunk::Text(delta) => {
                             trace!(
                                 "stream chunk: session={} message_id={} type=text len={}",
@@ -567,7 +729,6 @@ pub(super) async fn transition_call_llm(
                                 message_id,
                                 delta.len()
                             );
-                            text.push_str(&delta);
                             text_buffer.push_str(&delta);
                         }
                         StreamChunk::Thinking(delta) => {
@@ -577,7 +738,6 @@ pub(super) async fn transition_call_llm(
                                 message_id,
                                 delta.len()
                             );
-                            thinking.push_str(&delta);
                             thinking_buffer.push_str(&delta);
                         }
                         StreamChunk::ThinkingSignature(signature) => {
@@ -587,7 +747,7 @@ pub(super) async fn transition_call_llm(
                                 message_id,
                                 signature.len()
                             );
-                            thinking_signature = Some(signature);
+                            let _ = signature;
                         }
                         StreamChunk::ToolUseComplete { tool_call, .. } => {
                             // Flush before tool use so UI sees final text before tool starts
@@ -596,9 +756,6 @@ pub(super) async fn transition_call_llm(
                                 session_id, message_id, tool_call.id
                             );
                             flush_buffers!(true);
-                            if tool_call_ids.insert(tool_call.id.clone()) {
-                                stream_tool_calls.push(tool_call);
-                            }
                         }
                         StreamChunk::Usage(u) => {
                             trace!(
@@ -609,82 +766,65 @@ pub(super) async fn transition_call_llm(
                                 u.output_tokens,
                                 u.reasoning_tokens
                             );
-                            // Anthropic (and potentially other providers) split usage across
-                            // multiple streaming events: `input_tokens` arrives in
-                            // `message_start`, while cumulative `output_tokens` arrives in
-                            // `message_delta`.  Taking the field-wise maximum merges both
-                            // events correctly regardless of order.
-                            usage = Some(match usage {
-                                Some(prev) => prev.merge_max(u),
-                                None => u,
-                            });
                         }
                         StreamChunk::Done { finish_reason } => {
                             trace!(
                                 "stream chunk: session={} message_id={} type=done finish_reason={:?}",
                                 session_id, message_id, finish_reason
                             );
-                            // Some providers emit Usage AFTER Done in the same SSE
-                            // batch. Drain remaining items to capture any trailing
-                            // Usage events before exiting the loop.
-                            loop {
-                                let remaining = tokio::select! {
-                                    remaining = stream.next() => remaining,
-                                    _ = exec_ctx.cancellation_token.cancelled() => {
-                                        return Ok(ExecutionState::Cancelled);
-                                    }
-                                };
-                                let Some(remaining) = remaining else {
-                                    break;
-                                };
-                                match remaining {
-                                    Ok(StreamChunk::Usage(u)) => {
-                                        trace!(
-                                            "stream chunk: session={} message_id={} type=usage (post-done drain) input={} output={}",
-                                            session_id, message_id, u.input_tokens, u.output_tokens
-                                        );
-                                        usage = Some(match usage {
-                                            Some(prev) => prev.merge_max(u),
-                                            None => u,
-                                        });
-                                    }
-                                    Err(_) | Ok(_) => break,
+                            if accumulator.is_structured() {
+                                // Legacy framing accompanying a structured stream is a
+                                // display projection; the semantic terminal is the
+                                // structured ResponseTerminal event.
+                            } else {
+                                // Some providers emit Usage AFTER Done in the same SSE
+                                // batch. Drain remaining items to capture any trailing
+                                // Usage events before exiting the loop. These bypass
+                                // the accumulator (post-terminal events are invalid)
+                                // and merge into the output after validation.
+                                drained_usage =
+                                    drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
+                                        .await;
+                                if exec_ctx.cancellation_token.is_cancelled() {
+                                    return Ok(ExecutionState::Cancelled);
                                 }
-                            }
 
-                            match validate_stream_terminal(finish_reason, &stream_tool_calls) {
-                                Ok(finish_reason) => {
-                                    stream_finish_reason = Some(finish_reason);
-                                    break 'stream;
-                                }
-                                Err(error) => match super::llm_retry::handle_stream_failure(
-                                    config,
-                                    session_id,
-                                    error,
-                                    &mut retry_budget,
-                                    semantic_output_seen,
-                                    Some(message_id.clone()),
-                                    &exec_ctx.cancellation_token,
-                                )
-                                .await
+                                let completed_calls =
+                                    accumulator.output().tool_calls().unwrap_or_default();
+                                if let Err(error) =
+                                    validate_stream_terminal(finish_reason, &completed_calls)
                                 {
-                                    super::llm_retry::StreamFailureAction::Retry => {
-                                        continue 'stream;
+                                    match super::llm_retry::handle_stream_failure(
+                                        config,
+                                        session_id,
+                                        error,
+                                        &mut retry_budget,
+                                        semantic_output_seen,
+                                        Some(message_id.clone()),
+                                        &exec_ctx.cancellation_token,
+                                    )
+                                    .await
+                                    {
+                                        super::llm_retry::StreamFailureAction::Retry => {
+                                            continue 'stream;
+                                        }
+                                        super::llm_retry::StreamFailureAction::Cancelled => {
+                                            return Ok(ExecutionState::Cancelled);
+                                        }
+                                        super::llm_retry::StreamFailureAction::Terminal(error) => {
+                                            return Err(contextualize_llm_error(
+                                                error,
+                                                "streaming",
+                                                context,
+                                            ));
+                                        }
                                     }
-                                    super::llm_retry::StreamFailureAction::Cancelled => {
-                                        return Ok(ExecutionState::Cancelled);
-                                    }
-                                    super::llm_retry::StreamFailureAction::Terminal(error) => {
-                                        return Err(contextualize_llm_error(
-                                            error,
-                                            "streaming",
-                                            context,
-                                        ));
-                                    }
-                                },
+                                }
+                                break;
                             }
                         }
-                        _ => {}
+                        StreamChunk::ToolUseStart { .. }
+                        | StreamChunk::ToolUseInputDelta { .. } => {}
                     }
 
                     // Time- or size-based flush
@@ -695,48 +835,77 @@ pub(super) async fn transition_call_llm(
                         flush_buffers!(true);
                     }
                 } // end inner consume loop
-            } // end outer retry loop ('stream)
+
+                // ── Terminal validation ─────────────────────────────────────
+                // A semantic terminal was observed. Validate completion before
+                // the response is considered successful; unfinished items or
+                // calls are attempt failures and never dispatch tools.
+                match accumulator.finish() {
+                    Ok(output) => {
+                        break 'stream merge_drained_usage(output, drained_usage.take());
+                    }
+                    Err(ChatStreamAccumulatorError::IncompleteResponse(detail)) => {
+                        warn!(
+                            "Provider reported incomplete response: session={} message_id={} detail={:?}",
+                            session_id, message_id, detail
+                        );
+                        // Preserve partial output and the terminal status; the
+                        // incomplete cause is handled downstream without retries.
+                        let partial = accumulator.output();
+                        break 'stream merge_drained_usage(partial, drained_usage.take());
+                    }
+                    Err(error) => {
+                        debug!(
+                            "Stream failed terminal validation: session={} message_id={} error={}",
+                            session_id, message_id, error
+                        );
+                        match super::llm_retry::handle_stream_failure(
+                            config,
+                            session_id,
+                            stream_accumulation_error(error),
+                            &mut retry_budget,
+                            semantic_output_seen,
+                            Some(message_id.clone()),
+                            &exec_ctx.cancellation_token,
+                        )
+                        .await
+                        {
+                            super::llm_retry::StreamFailureAction::Retry => continue 'stream,
+                            super::llm_retry::StreamFailureAction::Cancelled => {
+                                return Ok(ExecutionState::Cancelled);
+                            }
+                            super::llm_retry::StreamFailureAction::Terminal(error) => {
+                                return Err(contextualize_llm_error(error, "streaming", context));
+                            }
+                        }
+                    }
+                }
+            }; // end outer retry loop ('stream)
 
             // Final flush of any remaining buffered content (no timer reset needed)
             flush_buffers!(false);
             debug!(
-                "stream finished: session={} message_id={} final_text_len={} final_thinking_len={} tool_calls={}",
+                "stream finished: session={} message_id={} final_text_len={:?} final_thinking_len={:?} tool_calls={} structured={}",
                 session_id,
                 message_id,
-                text.len(),
-                thinking.len(),
-                stream_tool_calls.len()
+                streamed_output.text().map(|text| text.len()),
+                streamed_output.thinking().map(|text| text.len()),
+                streamed_output
+                    .tool_calls()
+                    .map(|calls| calls.len())
+                    .unwrap_or(0),
+                accumulator.is_structured(),
             );
 
-            // The streaming loop exits via `Done => break`, which bypasses the
+            // The streaming loop exits via a terminal chunk, which bypasses the
             // per-chunk cancellation check at the top of the loop. Re-check here
-            // so a cancel signal that arrived concurrently with the Done chunk is
-            // not missed — without this the state machine would advance to AfterLlm.
+            // so a cancel signal that arrived concurrently with the terminal chunk
+            // is not missed — without this the state machine would advance to AfterLlm.
             if exec_ctx.cancellation_token.is_cancelled() {
                 return Ok(ExecutionState::Cancelled);
             }
 
-            let finish_reason = Some(
-                stream_finish_reason
-                    .expect("successful stream loop exits only after an explicit Done chunk"),
-            );
-
-            // Stash message_id in response so transition_after_llm reuses it
-            // (see LlmResponse::with_message_id)
-            // We return the id via a side-channel: we wrap it below.
-            // Use an Option wrapper: the streaming_message_id is set later.
-            (
-                text,
-                if thinking.is_empty() {
-                    None
-                } else {
-                    Some(thinking)
-                },
-                thinking_signature,
-                stream_tool_calls,
-                usage,
-                finish_reason,
-            )
+            streamed_output
         } else {
             // === NON-STREAMING FALLBACK ===
             let cancel = exec_ctx.cancellation_token.clone();
@@ -767,16 +936,18 @@ pub(super) async fn transition_call_llm(
                 Err(e) => return map_failed_llm_call(e, false, context),
             };
 
-            (
-                resp.text().unwrap_or_default(),
-                resp.thinking(),
-                None,
-                resp.tool_calls().unwrap_or_default(),
-                resp.usage(),
-                resp.finish_reason(),
-            )
+            normalize_chat_response(resp.as_ref())
         }
     };
+
+    // Canonical output is authoritative; the flattened fields below are
+    // compatibility projections of it.
+    let response_content = output.text().unwrap_or_default();
+    let response_thinking = output.thinking();
+    let response_thinking_signature = output.signature();
+    let tool_calls = dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default());
+    let usage = output.usage.clone();
+    let finish_reason = output.finish_reason;
 
     let (request_cost, cumulative_cost) = if let Some(usage_info) = &usage {
         let pricing = session_handle.get_pricing();
@@ -842,7 +1013,8 @@ pub(super) async fn transition_call_llm(
 
     let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
         .with_thinking(response_thinking)
-        .with_thinking_signature(response_thinking_signature);
+        .with_thinking_signature(response_thinking_signature)
+        .with_output(Some(output));
     if let Some(mid) = streaming_message_id {
         llm_response = llm_response.with_message_id(mid);
     }
@@ -909,34 +1081,50 @@ pub(super) async fn transition_after_llm(
         AgentEventKind::ProgressRecorded { progress_entry },
     );
 
+    let structured_output = response
+        .output
+        .as_ref()
+        .filter(|output| output.representation == ChatOutputRepresentation::Structured)
+        .cloned();
+
     let mut parts = Vec::new();
 
-    // Persist thinking/reasoning content before the text part
-    if let Some(thinking) = &response.thinking
-        && !thinking.is_empty()
-    {
-        parts.push(MessagePart::Reasoning {
-            content: thinking.clone(),
-            signature: response.thinking_signature.clone(),
-            time_ms: None,
+    if let Some(output) = &structured_output {
+        // Item-aware turn: the canonical output part is the single source of
+        // truth. Text/reasoning/tool-use parts are projections and are not
+        // serialized as additional history.
+        parts.push(MessagePart::Output {
+            output: output.clone(),
         });
-    }
+    } else {
+        // Legacy projection persistence (unchanged behavior).
+        // Persist thinking/reasoning content before the text part
+        if let Some(thinking) = &response.thinking
+            && !thinking.is_empty()
+        {
+            parts.push(MessagePart::Reasoning {
+                content: thinking.clone(),
+                signature: response.thinking_signature.clone(),
+                time_ms: None,
+            });
+        }
 
-    if !response.content.is_empty() {
-        parts.push(MessagePart::Text {
-            content: response.content.clone(),
-        });
-    }
+        if !response.content.is_empty() {
+            parts.push(MessagePart::Text {
+                content: response.content.clone(),
+            });
+        }
 
-    for call in &response.tool_calls {
-        parts.push(MessagePart::ToolUse(querymt::ToolCall {
-            id: call.id.clone(),
-            call_type: "function".to_string(),
-            function: querymt::FunctionCall {
-                name: call.function.name.clone(),
-                arguments: call.function.arguments.clone(),
-            },
-        }));
+        for call in &response.tool_calls {
+            parts.push(MessagePart::ToolUse(querymt::ToolCall {
+                id: call.id.clone(),
+                call_type: "function".to_string(),
+                function: querymt::FunctionCall {
+                    name: call.function.name.clone(),
+                    arguments: call.function.arguments.clone(),
+                },
+            }));
+        }
     }
 
     // Re-use the pre-allocated message_id from the streaming path when available,
@@ -1005,12 +1193,83 @@ pub(super) async fn transition_after_llm(
         .with_fragments(context.fragments.clone()),
     );
 
+    let output_status = structured_output.as_ref().and_then(|output| output.status);
+
+    if output_status == Some(ChatOutputStatus::Failed) {
+        return Err(anyhow::anyhow!(
+            "Provider reported a failed response (provider={}, model={})",
+            context.provider,
+            context.model
+        ));
+    }
+
+    // Gate local execution on response-level validation. Only calls with valid
+    // JSON-object arguments dispatch to the executor; invalid or duplicate
+    // identities produce synthesized results that keep the
+    // tool_use/tool_result history invariant without executing.
+    let (mut executable_calls, mut gated_results) =
+        gate_function_calls_for_execution(&response.tool_calls);
+
+    if output_status == Some(ChatOutputStatus::Incomplete) {
+        // An incomplete terminal never authorizes execution, even when some
+        // items completed. Synthesize skipped results for every call and stop.
+        let detail = response
+            .output
+            .as_ref()
+            .map(|_| "response is incomplete".to_string())
+            .unwrap_or_default();
+        let skipped: Vec<ToolResult> = std::mem::take(&mut executable_calls)
+            .into_iter()
+            .map(|call| {
+                ToolResult::new(
+                    call.id.clone(),
+                    vec![querymt::chat::Content::text(format!(
+                        "Error: tool call skipped because the response was incomplete. {detail}"
+                    ))],
+                    true,
+                    Some(call.function.name.clone()),
+                    Some(call.function.arguments.clone()),
+                )
+            })
+            .collect();
+        gated_results.extend(skipped);
+
+        if gated_results.is_empty() {
+            let (message, stop_type) = match response.finish_reason {
+                Some(FinishReason::Length) => (
+                    "Model hit token limit".to_string(),
+                    StopType::ModelTokenLimit,
+                ),
+                Some(FinishReason::ContentFilter) => (
+                    "Response blocked by content filter".into(),
+                    StopType::ContentFilter,
+                ),
+                _ => (format!("Response incomplete. {detail}"), StopType::Other),
+            };
+            return Ok(ExecutionState::Stopped {
+                message: message.into(),
+                stop_type,
+                context: Some(new_context),
+            });
+        }
+
+        // Store the synthesized results (no execution) before stopping by
+        // routing through the tool-result storage step with no remaining calls.
+        return Ok(ExecutionState::ProcessingToolCalls {
+            remaining_calls: Arc::from(Vec::new().into_boxed_slice()),
+            results: Arc::from(gated_results.into_boxed_slice()),
+            context: new_context,
+        });
+    }
+
+    let has_dispatchable_calls = !executable_calls.is_empty() || !gated_results.is_empty();
+
     match response.finish_reason {
         Some(FinishReason::ToolCalls) => {
-            if !response.tool_calls.is_empty() {
+            if has_dispatchable_calls {
                 Ok(ExecutionState::ProcessingToolCalls {
-                    remaining_calls: Arc::from(response.tool_calls.clone().into_boxed_slice()),
-                    results: Arc::from(Vec::new().into_boxed_slice()),
+                    remaining_calls: Arc::from(executable_calls.into_boxed_slice()),
+                    results: Arc::from(gated_results.into_boxed_slice()),
                     context: new_context,
                 })
             } else {
@@ -1040,14 +1299,14 @@ pub(super) async fn transition_after_llm(
         | Some(FinishReason::Unknown)
         | Some(FinishReason::Other)
         | None => {
-            if response.tool_calls.is_empty() {
-                Ok(ExecutionState::Complete {
+            if has_dispatchable_calls {
+                Ok(ExecutionState::ProcessingToolCalls {
+                    remaining_calls: Arc::from(executable_calls.into_boxed_slice()),
+                    results: Arc::from(gated_results.into_boxed_slice()),
                     context: new_context,
                 })
             } else {
-                Ok(ExecutionState::ProcessingToolCalls {
-                    remaining_calls: Arc::from(response.tool_calls.clone().into_boxed_slice()),
-                    results: Arc::from(Vec::new().into_boxed_slice()),
+                Ok(ExecutionState::Complete {
                     context: new_context,
                 })
             }
@@ -1431,6 +1690,10 @@ pub(super) async fn transition_processing_tool_calls(
 mod tests {
     use super::*;
     use crate::middleware::ConversationContext;
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOpaqueItem, ChatOutputItem,
+        ChatReasoningItem, ChatReasoningPart,
+    };
     use querymt::chat::{ChatMessage, ChatRole, Content};
 
     fn make_message(role: ChatRole, content: &str) -> ChatMessage {
@@ -1438,7 +1701,313 @@ mod tests {
             role,
             content: vec![Content::text(content)],
             cache: None,
+            output: None,
         }
+    }
+
+    // ── Item-aware accumulation (task 4.1) ───────────────────────────────────
+
+    use querymt::Usage;
+    use querymt::chat::ChatOutputStatus;
+
+    fn fn_call_item(item_id: &str, call_id: &str, args: &str) -> ChatOutputItem {
+        ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+            item_id: Some(item_id.into()),
+            call_id: call_id.into(),
+            name: "lookup".into(),
+            arguments: args.into(),
+            status: Some(ChatOutputStatus::Completed),
+            extensions: Default::default(),
+        })
+    }
+
+    fn metadata_event() -> StreamChunk {
+        StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+            response_id: Some("resp_1".into()),
+            status: Some(ChatOutputStatus::InProgress),
+            usage: None,
+            finish_reason: None,
+            provenance: None,
+        })
+    }
+
+    fn terminal_event(status: ChatOutputStatus, finish: Option<FinishReason>) -> StreamChunk {
+        StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+            status,
+            usage: None,
+            finish_reason: finish,
+            detail: None,
+        })
+    }
+
+    /// Ordered items must survive agent accumulation without flattening into
+    /// text/thinking/call buckets.
+    #[test]
+    fn ordered_items_survive_accumulation_without_flattening() {
+        let output = ChatOutput {
+            response_id: Some("resp_1".into()),
+            status: Some(ChatOutputStatus::Completed),
+            finish_reason: Some(FinishReason::ToolCalls),
+            items: vec![
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning_1".into()),
+                    summary: vec![ChatReasoningPart::text("thinking first")],
+                    content: Vec::new(),
+                    encrypted_content: Some("opaque-continuation".into()),
+                    signature: Some("sig".into()),
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::Message(ChatMessageItem {
+                    id: Some("message_1".into()),
+                    role: ChatRole::Assistant,
+                    phase: None,
+                    status: None,
+                    parts: vec![ChatMessagePart::Text {
+                        text: "answer".into(),
+                        annotations: Vec::new(),
+                        extensions: Default::default(),
+                    }],
+                    extensions: Default::default(),
+                }),
+                fn_call_item("item_1", "call_1", "{\"city\":\"oslo\"}"),
+                fn_call_item("item_2", "call_2", "{\"city\":\"rome\"}"),
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning_2".into()),
+                    summary: Vec::new(),
+                    content: Vec::new(),
+                    encrypted_content: Some("encrypted-only".into()),
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::Opaque(ChatOpaqueItem {
+                    original_type: "future_action".into(),
+                    payload: serde_json::json!({"required": true}),
+                }),
+            ],
+            ..ChatOutput::default()
+        };
+
+        // Flattened projections used by the agent execution paths.
+        assert_eq!(output.text().as_deref(), Some("answer"));
+        assert_eq!(output.thinking().as_deref(), Some("thinking first"));
+        assert_eq!(output.signature().as_deref(), Some("sig"));
+        let calls = dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default());
+        assert_eq!(calls.len(), 2, "both calls survive in order");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.arguments, "{\"city\":\"oslo\"}");
+        assert_eq!(calls[1].id, "call_2");
+        // Encrypted-only reasoning and opaque items are never flattened away or
+        // exposed as executable calls.
+        assert!(matches!(output.items[4], ChatOutputItem::Reasoning(_)));
+        assert!(matches!(output.items[5], ChatOutputItem::Opaque(_)));
+    }
+
+    /// A structured stream accompanied by legacy projection events yields one
+    /// canonical call sequence: the legacy ToolUseComplete duplicate is ignored.
+    #[test]
+    fn mixed_structured_legacy_stream_projects_each_call_once() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        let chunks = [
+            metadata_event(),
+            StreamChunk::Structured(StructuredStreamEvent::ItemStarted {
+                output_index: 1,
+                item: fn_call_item("item_1", "call_1", "{"),
+            }),
+            StreamChunk::Structured(StructuredStreamEvent::FunctionArgumentsDelta {
+                output_index: 1,
+                delta: "\"city\":\"oslo\"}".into(),
+            }),
+            StreamChunk::Structured(StructuredStreamEvent::ItemCompleted {
+                output_index: 1,
+                item: fn_call_item("item_1", "call_1", "{\"city\":\"oslo\"}"),
+            }),
+            // Legacy compatibility projection of the same call.
+            StreamChunk::ToolUseComplete {
+                index: 1,
+                tool_call: ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "lookup".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            },
+            terminal_event(ChatOutputStatus::Completed, Some(FinishReason::ToolCalls)),
+        ];
+        for chunk in &chunks {
+            accumulator.push(chunk).unwrap();
+        }
+        assert!(accumulator.is_structured());
+
+        // Post-terminal legacy framing (Done) is drained by the agent and never
+        // pushed: the accumulator rejects events after the semantic terminal.
+        assert_eq!(
+            accumulator.push(&StreamChunk::Done {
+                finish_reason: FinishReason::ToolCalls
+            }),
+            Err(ChatStreamAccumulatorError::EventAfterTerminal)
+        );
+
+        let output = accumulator.finish().expect("structured stream validates");
+        let calls = dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default());
+        assert_eq!(calls.len(), 1, "legacy projection must not duplicate calls");
+        assert_eq!(calls[0].function.arguments, "{\"city\":\"oslo\"}");
+        assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    /// Structured text/reasoning deltas surface on the same UI buffers as
+    /// legacy display chunks.
+    #[test]
+    fn structured_deltas_map_onto_ui_buffers() {
+        let text = StructuredStreamEvent::MessagePartDelta {
+            output_index: 0,
+            content_index: 0,
+            delta: ChatMessagePartDelta::Text {
+                delta: "hello".into(),
+            },
+        };
+        let refusal = StructuredStreamEvent::MessagePartDelta {
+            output_index: 0,
+            content_index: 1,
+            delta: ChatMessagePartDelta::Refusal { delta: "no".into() },
+        };
+        let reasoning = StructuredStreamEvent::ReasoningPartDelta {
+            output_index: 2,
+            part: querymt::chat::ReasoningPartKind::Summary,
+            part_index: 0,
+            delta: "why".into(),
+        };
+
+        assert_eq!(structured_delta_for_ui(&text), Some((false, "hello")));
+        assert_eq!(structured_delta_for_ui(&refusal), Some((false, "no")));
+        assert_eq!(structured_delta_for_ui(&reasoning), Some((true, "why")));
+    }
+
+    #[test]
+    fn drained_usage_merges_fieldwise_without_double_counting() {
+        let output = ChatOutput {
+            usage: Some(Usage {
+                input_tokens: 10,
+                ..Usage::default()
+            }),
+            ..ChatOutput::default()
+        };
+        let merged = merge_drained_usage(
+            output,
+            Some(Usage {
+                output_tokens: 4,
+                ..Usage::default()
+            }),
+        );
+        let usage = merged.usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 4);
+
+        // None + drained yields the drained value.
+        let merged = merge_drained_usage(ChatOutput::default(), Some(Usage::default()));
+        assert!(merged.usage.is_some());
+    }
+
+    // ── Execution gating (task 4.3) ──────────────────────────────────────────
+
+    fn middleware_call(id: &str, arguments: &str) -> MiddlewareToolCall {
+        MiddlewareToolCall {
+            id: id.into(),
+            function: ToolFunction {
+                name: "lookup".into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn invalid_argument_calls_are_gated_not_executed() {
+        let calls = vec![
+            middleware_call("call_ok", "{\"q\":1}"),
+            middleware_call("call_bad", "{not json"),
+            middleware_call("call_array", "[1,2,3]"),
+        ];
+        let (executable, gated) = gate_function_calls_for_execution(&calls);
+
+        assert_eq!(
+            executable
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_ok"]
+        );
+        assert_eq!(
+            gated
+                .iter()
+                .map(|result| result.call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_bad", "call_array"]
+        );
+        assert!(gated.iter().all(|result| result.is_error));
+    }
+
+    #[test]
+    fn duplicate_call_identities_dispatch_once() {
+        let calls = vec![
+            middleware_call("call_1", "{}"),
+            middleware_call("call_1", "{\"other\":1}"),
+            middleware_call("call_2", "{}"),
+        ];
+        let (executable, gated) = gate_function_calls_for_execution(&calls);
+
+        assert_eq!(
+            executable
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["call_1", "call_2"]
+        );
+        assert!(gated.is_empty(), "duplicates are skipped without results");
+    }
+
+    /// Opaque output items never enter the executable function-call projection.
+    #[test]
+    fn opaque_items_never_enter_the_executor_projection() {
+        let output = ChatOutput {
+            items: vec![
+                ChatOutputItem::Opaque(ChatOpaqueItem {
+                    original_type: "code_interpreter_call".into(),
+                    payload: serde_json::json!({"arguments": {"command": "rm -rf /"}}),
+                }),
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("item_1".into()),
+                    call_id: "call_1".into(),
+                    name: "lookup".into(),
+                    arguments: "{invalid".into(),
+                    status: Some(ChatOutputStatus::Completed),
+                    extensions: Default::default(),
+                }),
+            ],
+            ..ChatOutput::default()
+        };
+
+        // Projection drops the opaque item entirely and keeps the invalid call
+        // only as structured data with exact raw arguments.
+        let projected = output.tool_calls().unwrap_or_default();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].function.arguments, "{invalid");
+
+        let middleware_calls: Vec<MiddlewareToolCall> = dedupe_tool_calls_by_call_id(projected)
+            .into_iter()
+            .map(|tc| MiddlewareToolCall {
+                id: tc.id,
+                function: ToolFunction {
+                    name: tc.function.name,
+                    arguments: tc.function.arguments,
+                },
+            })
+            .collect();
+        let (executable, gated) = gate_function_calls_for_execution(&middleware_calls);
+        assert!(executable.is_empty(), "invalid call must not execute");
+        assert_eq!(gated.len(), 1);
     }
 
     // ── map_failed_llm_call ───────────────────────────────────────────────────

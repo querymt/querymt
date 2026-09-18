@@ -127,6 +127,7 @@ impl DelegationSummarizer {
             role: ChatRole::User,
             content: vec![querymt::chat::Content::text(input)],
             cache: None,
+            output: None,
         }];
 
         let timeout = self.timeout;
@@ -209,6 +210,9 @@ impl DelegationSummarizer {
                         }
                         MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
+                        MessagePart::Output { output } => {
+                            self.estimator.estimate(&output.estimate_text())
+                        }
                         _ => 0,
                     })
                     .sum::<usize>()
@@ -283,6 +287,27 @@ impl DelegationSummarizer {
                                     "\n[Tool Call]: {} ({})\n",
                                     tu.function.name, args_summary
                                 ));
+                            }
+                            MessagePart::Output { output } => {
+                                // Structured turn: project calls and visible text
+                                // in canonical item order.
+                                if let Some(text) = output.text() {
+                                    conversation.push_str(&format!("\n[Planner]: {}\n", text));
+                                }
+                                for call in output.tool_calls().unwrap_or_default() {
+                                    let args_summary = if let Ok(args_value) =
+                                        serde_json::from_str::<serde_json::Value>(
+                                            &call.function.arguments,
+                                        ) {
+                                        Self::summarize_tool_args(&args_value)
+                                    } else {
+                                        call.function.arguments.clone()
+                                    };
+                                    conversation.push_str(&format!(
+                                        "\n[Tool Call]: {} ({})\n",
+                                        call.function.name, args_summary
+                                    ));
+                                }
                             }
                             MessagePart::Compaction {
                                 summary,

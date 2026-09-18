@@ -184,6 +184,7 @@ impl ToolTrait for LanguageQueryTool {
                         }
                     }
                 }),
+                strict: None,
             },
         }
     }

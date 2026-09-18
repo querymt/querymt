@@ -302,6 +302,27 @@ fn limit_text(text: &str, remaining: &mut Option<usize>) -> String {
     limited
 }
 
+/// Decide whether a structured output may replay provider-only state (such as
+/// reasoning signatures) to the projection target.
+///
+/// When the output records provenance, provider and model must both match the
+/// target; protocol/endpoint identity remains part of provenance for
+/// request-construction checks. Without provenance, fall back to the message
+/// level provider/model comparison.
+fn output_origin_matches(
+    output: &querymt::chat::ChatOutput,
+    target_provider: Option<&str>,
+    target_model: Option<&str>,
+    fallback: bool,
+) -> bool {
+    let (Some(provenance), Some(target_provider), Some(target_model)) =
+        (output.provenance.as_ref(), target_provider, target_model)
+    else {
+        return fallback;
+    };
+    provenance.provider == target_provider && provenance.model == target_model
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum MessagePart {
@@ -333,6 +354,14 @@ pub enum MessagePart {
         cost: Option<f64>,
     },
     ToolUse(ToolCall),
+    /// Canonical structured output for an item-aware assistant turn.
+    ///
+    /// This part is the authoritative record of generated items; text, reasoning,
+    /// and tool-use parts are not stored alongside it for the same turn.
+    /// Replay projects it exactly once through portable content.
+    Output {
+        output: querymt::chat::ChatOutput,
+    },
     HookContext {
         event_name: String,
         handler_id: String,
@@ -392,6 +421,7 @@ impl MessagePart {
             MessagePart::StepStart { .. } => "step_start",
             MessagePart::StepFinish { .. } => "step_finish",
             MessagePart::ToolUse(_) => "tool_use",
+            MessagePart::Output { .. } => "output",
             MessagePart::HookContext { .. } => "hook_context",
             MessagePart::ToolResult { .. } => "tool_result",
             MessagePart::Patch { .. } => "patch",
@@ -454,6 +484,35 @@ impl AgentMessage {
         self.to_chat_message_with_target(None, None, None)
     }
 
+    /// Function calls represented by this message.
+    ///
+    /// Covers both legacy `ToolUse` parts and the canonical structured output
+    /// part, so call-scanning consumers (delegation detection, loop guards,
+    /// summaries) keep working for item-aware assistant turns. Call identities
+    /// are deduplicated preserving first occurrence and item order.
+    pub fn function_calls(&self) -> Vec<querymt::ToolCall> {
+        let mut calls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for part in &self.parts {
+            match part {
+                MessagePart::ToolUse(call) => {
+                    if seen.insert(call.id.clone()) {
+                        calls.push(call.clone());
+                    }
+                }
+                MessagePart::Output { output } => {
+                    for call in output.tool_calls().unwrap_or_default() {
+                        if seen.insert(call.id.clone()) {
+                            calls.push(call);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls
+    }
+
     pub fn to_chat_message_with_max_prompt_bytes(
         &self,
         max_prompt_bytes: Option<usize>,
@@ -512,6 +571,21 @@ impl AgentMessage {
                         serde_json::from_str(&tc.function.arguments)
                             .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
                     ));
+                }
+                MessagePart::Output { output } => {
+                    // Canonical structured turn: project it exactly once through
+                    // portable content. Opaque provider items and encrypted
+                    // continuation are excluded; reasoning signatures survive only
+                    // when the projection targets the same provider/model origin
+                    // recorded in the output provenance. Stored originals are never
+                    // mutated by this projection.
+                    let same_origin = output_origin_matches(
+                        output,
+                        target_provider,
+                        target_model,
+                        preserve_provider_metadata,
+                    );
+                    blocks.extend(output.portable_content_with(same_origin));
                 }
                 MessagePart::HookContext {
                     event_name,
@@ -572,6 +646,7 @@ impl AgentMessage {
             role: self.role.clone(),
             content: blocks,
             cache: None,
+            output: None,
         })
     }
 }
@@ -1164,5 +1239,330 @@ mod tests {
                 first_text
             );
         }
+    }
+
+    // ── Canonical structured output part (tasks 4.2 / 4.4) ───────────────────
+
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOpaqueItem, ChatOutput,
+        ChatOutputItem, ChatOutputProvenance, ChatReasoningItem, ChatReasoningPart,
+    };
+
+    fn structured_output() -> ChatOutput {
+        ChatOutput {
+            response_id: Some("resp_1".into()),
+            status: Some(querymt::chat::ChatOutputStatus::Completed),
+            finish_reason: Some(querymt::chat::FinishReason::ToolCalls),
+            provenance: Some(ChatOutputProvenance {
+                provider: "openai".into(),
+                protocol: "responses".into(),
+                model: "gpt-5".into(),
+                endpoint: "https://api.openai.com/v1/responses".into(),
+            }),
+            items: vec![
+                // Encrypted-only reasoning must survive storage/reload intact.
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning_1".into()),
+                    summary: Vec::new(),
+                    content: Vec::new(),
+                    encrypted_content: Some("opaque-continuation".into()),
+                    signature: Some("sig-1".into()),
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::Message(ChatMessageItem {
+                    id: Some("message_1".into()),
+                    role: ChatRole::Assistant,
+                    phase: None,
+                    status: None,
+                    parts: vec![ChatMessagePart::Text {
+                        text: "final answer".into(),
+                        annotations: Vec::new(),
+                        extensions: Default::default(),
+                    }],
+                    extensions: Default::default(),
+                }),
+                // Exact raw arguments, distinct item/call IDs.
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("item_1".into()),
+                    call_id: "call_1".into(),
+                    name: "lookup".into(),
+                    arguments: "{\"query\":\"rust\",\"raw\": 1 }".into(),
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                // Unknown items remain opaque.
+                ChatOutputItem::Opaque(ChatOpaqueItem {
+                    original_type: "future_action".into(),
+                    payload: serde_json::json!({"vendor": true}),
+                }),
+            ],
+            ..ChatOutput::default()
+        }
+    }
+
+    fn output_message(output: ChatOutput) -> AgentMessage {
+        AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Output { output }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        }
+    }
+
+    #[test]
+    fn function_calls_reads_legacy_parts_and_canonical_output() {
+        let legacy = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![
+                MessagePart::ToolUse(querymt::ToolCall {
+                    id: "call_a".into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "delegate".into(),
+                        arguments: "{\"target_agent_id\":\"x\",\"objective\":\"y\"}".into(),
+                    },
+                }),
+                MessagePart::Text {
+                    content: "working".into(),
+                },
+            ],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        assert_eq!(legacy.function_calls().len(), 1);
+        assert_eq!(legacy.function_calls()[0].function.name, "delegate");
+
+        // Structured turn: calls live in the canonical output part.
+        let mut output = structured_output();
+        output
+            .items
+            .push(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("item_2".into()),
+                call_id: "call_1".into(), // duplicate identity of item_1
+                name: "lookup".into(),
+                arguments: "{}".into(),
+                status: None,
+                extensions: Default::default(),
+            }));
+        let structured = output_message(output);
+        let calls = structured.function_calls();
+        assert_eq!(calls.len(), 1, "duplicate call identity collapses");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(
+            calls[0].function.arguments,
+            "{\"query\":\"rust\",\"raw\": 1 }"
+        );
+
+        // Mixed legacy + structured in one message never duplicates identities.
+        let mut mixed = structured;
+        mixed.parts.push(MessagePart::ToolUse(querymt::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: querymt::FunctionCall {
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        }));
+        assert_eq!(mixed.function_calls().len(), 1);
+    }
+
+    #[test]
+    fn output_part_serde_round_trip_preserves_opaque_and_raw_data() {
+        let part = MessagePart::Output {
+            output: structured_output(),
+        };
+        let encoded = serde_json::to_string(&part).unwrap();
+        let decoded: MessagePart = serde_json::from_str(&encoded).unwrap();
+
+        let MessagePart::Output { output } = decoded else {
+            panic!("expected Output part");
+        };
+        assert_eq!(output.items.len(), 4);
+
+        let ChatOutputItem::Reasoning(reasoning) = &output.items[0] else {
+            panic!("expected reasoning item");
+        };
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("opaque-continuation"),
+            "encrypted-only reasoning survives the round trip"
+        );
+        assert_eq!(reasoning.signature.as_deref(), Some("sig-1"));
+
+        let ChatOutputItem::FunctionCall(call) = &output.items[2] else {
+            panic!("expected function call item");
+        };
+        assert_eq!(call.item_id.as_deref(), Some("item_1"));
+        assert_eq!(call.call_id, "call_1");
+        assert_eq!(
+            call.arguments, "{\"query\":\"rust\",\"raw\": 1 }",
+            "raw arguments stay byte-exact"
+        );
+
+        assert!(matches!(output.items[3], ChatOutputItem::Opaque(_)));
+    }
+
+    #[test]
+    fn output_part_projects_once_without_duplicate_parts() {
+        let msg = output_message(structured_output());
+        let chat = msg.to_chat_message().unwrap();
+
+        // Portable projection: reasoning text (none visible), the message text,
+        // and the function call — exactly once each.
+        let text_blocks = chat
+            .content
+            .iter()
+            .filter(|block| matches!(block, Content::Text { .. }))
+            .count();
+        let tool_use_blocks = chat
+            .content
+            .iter()
+            .filter(|block| matches!(block, Content::ToolUse { .. }))
+            .count();
+
+        assert_eq!(text_blocks, 1);
+        assert_eq!(tool_use_blocks, 1);
+        assert!(
+            chat.content
+                .iter()
+                .any(|block| block.as_text() == Some("final answer"))
+        );
+        match chat
+            .content
+            .iter()
+            .find(|block| matches!(block, Content::ToolUse { .. }))
+        {
+            Some(Content::ToolUse {
+                id,
+                name,
+                arguments,
+            }) => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "lookup");
+                // Raw arguments round-trip through the projection as the same
+                // JSON value (semantically lossless, not whitespace-identical).
+                assert_eq!(arguments, &serde_json::json!({"query": "rust", "raw": 1}));
+            }
+            other => panic!("expected tool use block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_part_never_projects_invalid_arguments_or_opaque_execution() {
+        let mut output = structured_output();
+        output
+            .items
+            .push(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("item_2".into()),
+                call_id: "call_2".into(),
+                name: "lookup".into(),
+                arguments: "{invalid".into(),
+                status: None,
+                extensions: Default::default(),
+            }));
+        let msg = output_message(output);
+
+        let chat = msg.to_chat_message().unwrap();
+        let tool_use_ids: Vec<&str> = chat
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                Content::ToolUse { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_use_ids,
+            vec!["call_1"],
+            "invalid-argument calls are not projected as executable blocks"
+        );
+    }
+
+    #[test]
+    fn output_part_projection_does_not_leak_opaque_state_across_targets() {
+        let msg = output_message(structured_output());
+        let before = serde_json::to_string(&msg).unwrap();
+
+        // Same provider/model origin: reasoning signature may be forwarded.
+        let same = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-5"), None)
+            .unwrap();
+        let signature_forwarded = same.content.iter().any(|block| {
+            matches!(
+                block,
+                Content::Thinking { signature: Some(sig), .. } if sig == "sig-1"
+            )
+        });
+        // Visible reasoning is empty, so no thinking block is projected at all;
+        // opaque state must never appear as content either way.
+        let _ = signature_forwarded;
+        assert!(
+            !serde_json::to_string(&same)
+                .unwrap()
+                .contains("opaque-continuation"),
+            "encrypted continuation is never projected into portable content"
+        );
+
+        // Different model: portable projection only.
+        let switched = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-4o"), None)
+            .unwrap();
+        assert!(switched.content.iter().all(|block| !matches!(
+            block,
+            Content::Thinking {
+                signature: Some(_),
+                ..
+            }
+        )));
+        assert!(
+            !serde_json::to_string(&switched)
+                .unwrap()
+                .contains("opaque-continuation")
+        );
+
+        // Stored original is never mutated by projection.
+        assert_eq!(serde_json::to_string(&msg).unwrap(), before);
+    }
+
+    #[test]
+    fn output_part_signature_follows_provenance_and_model_switch() {
+        let mut output = structured_output();
+        // Give the reasoning visible summary so thinking blocks are projected.
+        if let ChatOutputItem::Reasoning(reasoning) = &mut output.items[0] {
+            reasoning.summary = vec![ChatReasoningPart::text("visible reasoning")];
+        }
+        let msg = output_message(output);
+
+        let same_origin = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-5"), None)
+            .unwrap();
+        assert!(same_origin.content.iter().any(|block| matches!(
+            block,
+            Content::Thinking { signature: Some(sig), .. } if sig == "sig-1"
+        )));
+
+        let switched = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-4o"), None)
+            .unwrap();
+        assert!(switched.content.iter().any(|block| matches!(
+            block,
+            Content::Thinking { text, signature: None, .. } if text == "visible reasoning"
+        )));
+        assert!(!switched.content.iter().any(|block| matches!(
+            block,
+            Content::Thinking {
+                signature: Some(_),
+                ..
+            }
+        )));
     }
 }

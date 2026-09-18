@@ -47,6 +47,12 @@ impl LLMProviderFactory for IzwiFactory {
 
 #[cfg(feature = "native")]
 #[unsafe(no_mangle)]
+pub extern "C" fn querymt_plugin_api() -> u32 {
+    querymt::plugin::NATIVE_PLUGIN_API
+}
+
+#[cfg(feature = "native")]
+#[unsafe(no_mangle)]
 // SAFETY: While trait objects aren't technically FFI-safe, this is a well-established
 // plugin pattern where both sides of the FFI boundary are Rust code compiled with the
 // same ABI. The host process will cast this back to `Box<dyn LLMProviderFactory>` using

@@ -61,6 +61,7 @@ impl ToolTrait for KnowledgeQueryTool {
                     },
                     "required": ["question"]
                 }),
+                strict: None,
             },
         }
     }

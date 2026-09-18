@@ -52,6 +52,7 @@ impl ToolTrait for CreateTaskTool {
                     },
                     "required": ["kind", "expected_deliverable"]
                 }),
+                strict: None,
             },
         }
     }

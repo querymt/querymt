@@ -148,6 +148,7 @@ async fn run(
             Content::text(&args.prompt),
         ],
         cache: None,
+        output: None,
     }];
 
     println!("Prompt: {}\n", args.prompt);

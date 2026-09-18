@@ -135,6 +135,7 @@ impl SessionCompaction {
             role: ChatRole::User,
             content: vec![querymt::chat::Content::text(COMPACTION_PROMPT)],
             cache: None,
+            output: None,
         });
 
         Ok(chat_messages)
@@ -261,6 +262,9 @@ impl SessionCompaction {
                         }
                         MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
+                        MessagePart::Output { output } => {
+                            self.estimator.estimate(&output.estimate_text())
+                        }
                         _ => 0,
                     })
                     .sum::<usize>()
@@ -682,6 +686,164 @@ mod tests {
         assert_eq!(filtered[0].id, "5"); // Second CompactionRequest
         assert_eq!(filtered[1].id, "6"); // Second Compaction
         assert_eq!(filtered[2].id, "7");
+    }
+
+    /// Compaction must drop the pre-compaction structured exchange completely:
+    /// its canonical output (with continuation state) never leaks back into
+    /// effective replay, and kept turns retain complete call/result groups.
+    #[test]
+    fn test_filter_drops_compacted_structured_exchange_without_dangling_results() {
+        use querymt::chat::{
+            ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
+        };
+
+        fn structured_assistant(id: &str, session_id: &str, call_id: &str) -> AgentMessage {
+            AgentMessage {
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+                role: ChatRole::Assistant,
+                parts: vec![MessagePart::Output {
+                    output: ChatOutput {
+                        items: vec![
+                            ChatOutputItem::Message(ChatMessageItem {
+                                id: None,
+                                role: ChatRole::Assistant,
+                                phase: None,
+                                status: None,
+                                parts: vec![ChatMessagePart::Text {
+                                    text: "calling tool".into(),
+                                    annotations: Vec::new(),
+                                    extensions: Default::default(),
+                                }],
+                                extensions: Default::default(),
+                            }),
+                            ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                                item_id: Some(format!("item_{call_id}")),
+                                call_id: call_id.to_string(),
+                                name: "shell".into(),
+                                arguments: "{}".into(),
+                                status: None,
+                                extensions: Default::default(),
+                            }),
+                        ],
+                        ..ChatOutput::default()
+                    },
+                }],
+                created_at: 0,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            }
+        }
+
+        fn tool_result_user(id: &str, session_id: &str, call_id: &str) -> AgentMessage {
+            AgentMessage {
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::ToolResult {
+                    call_id: call_id.to_string(),
+                    content: vec![querymt::chat::Content::text("output")],
+                    is_error: false,
+                    tool_name: Some("shell".to_string()),
+                    tool_arguments: Some("{}".to_string()),
+                    compacted_at: None,
+                }],
+                created_at: 0,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            }
+        }
+
+        let messages = vec![
+            // Old structured exchange: compacted away, including its calls.
+            structured_assistant("a1", "s1", "call_old"),
+            tool_result_user("r1", "s1", "call_old"),
+            // Compaction pair.
+            make_compaction_request_message("c1", "s1"),
+            make_compaction_message("c2", "s1", "Summary"),
+            // New structured exchange after compaction: kept intact.
+            structured_assistant("a2", "s1", "call_new"),
+            tool_result_user("r2", "s1", "call_new"),
+        ];
+
+        let filtered = filter_to_effective_history(messages);
+        assert_eq!(filtered.len(), 4);
+        assert_eq!(filtered[0].id, "c1");
+
+        // The old canonical output is absent from effective replay.
+        let serialized = serde_json::to_string(&filtered).unwrap();
+        assert!(
+            !serialized.contains("call_old"),
+            "compacted structured exchange must not leak into effective history"
+        );
+
+        // Every kept tool result still has its matching call in a kept
+        // assistant message: no dangling dependencies.
+        let kept_call_ids: std::collections::HashSet<String> = filtered
+            .iter()
+            .flat_map(|m| m.function_calls())
+            .map(|call| call.id.clone())
+            .collect();
+        for msg in &filtered {
+            for part in &msg.parts {
+                if let MessagePart::ToolResult { call_id, .. } = part {
+                    assert!(
+                        kept_call_ids.contains(call_id.as_str()),
+                        "tool result {call_id} has no matching call in effective history"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Structured turns must be sized for compaction estimates like their
+    /// legacy projections are, so token thresholds trigger on real content.
+    #[test]
+    fn test_estimate_counts_structured_output_parts() {
+        use querymt::chat::{ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem};
+
+        let structured = AgentMessage {
+            id: "a1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Output {
+                output: ChatOutput {
+                    items: vec![ChatOutputItem::Message(ChatMessageItem {
+                        id: None,
+                        role: ChatRole::Assistant,
+                        phase: None,
+                        status: None,
+                        parts: vec![ChatMessagePart::Text {
+                            text: "x".repeat(400),
+                            annotations: Vec::new(),
+                            extensions: Default::default(),
+                        }],
+                        extensions: Default::default(),
+                    })],
+                    ..ChatOutput::default()
+                },
+            }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let legacy_equivalent = AgentMessage {
+            parts: vec![MessagePart::Text {
+                content: "x".repeat(400),
+            }],
+            ..structured.clone()
+        };
+
+        let compactor = SessionCompaction::new();
+        let structured_estimate = compactor.estimate_messages_tokens(&[structured], None);
+        let legacy_estimate = compactor.estimate_messages_tokens(&[legacy_equivalent], None);
+        assert_eq!(
+            structured_estimate, legacy_estimate,
+            "structured output must be sized like its legacy projection"
+        );
     }
 
     #[test]

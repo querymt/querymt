@@ -100,6 +100,7 @@ impl Tool for TodoWriteTool {
                     },
                     "required": ["todos"]
                 }),
+                strict: None,
             },
         }
     }
@@ -174,6 +175,7 @@ impl Tool for TodoReadTool {
                     "properties": {},
                     "required": []
                 }),
+                strict: None,
             },
         }
     }

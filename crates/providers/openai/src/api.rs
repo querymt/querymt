@@ -7,8 +7,11 @@ use http::{
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk,
-        StructuredOutputFormat, Tool, ToolChoice,
+        ChatFunctionCallItem, ChatMessage, ChatMessageItem, ChatMessagePart, ChatMessagePartDelta,
+        ChatOpaqueItem, ChatOutput, ChatOutputItem, ChatOutputProvenance, ChatOutputRepresentation,
+        ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatResponse, ChatRole,
+        ChatTextAnnotation, Content, Extensions, FinishReason, ReasoningEffort, ReasoningPartKind,
+        StreamChunk, StructuredOutputFormat, StructuredStreamEvent, Tool, ToolChoice,
     },
     error::{
         LLMError, ProviderErrorKind, ProviderFailure, extract_retry_after_from_json,
@@ -170,6 +173,190 @@ struct OpenAIChatRequest<'a> {
     extra_body: Option<Map<String, Value>>,
 }
 
+/// Ordered input item for the Responses API `input` array.
+///
+/// The Responses protocol does not use a single `messages` array; instead it
+/// replays typed items in chronological order. This mirrors that ordering so
+/// reasoning/message/function items are not flattened. Full ordered replay and
+/// unknown-item handling are completed in later tasks.
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum OpenAIResponsesInputItem<'a> {
+    #[serde(rename = "message")]
+    Message {
+        role: Cow<'a, str>,
+        content: Vec<OpenAIResponsesInputContent<'a>>,
+    },
+    /// Continuation-safe reasoning replay: summaries stay visible while the
+    /// encrypted payload is forwarded verbatim to a compatible origin.
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<Cow<'a, str>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        summary: Vec<OpenAIResponsesReasoningSummary<'a>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encrypted_content: Option<Cow<'a, str>>,
+    },
+    #[serde(rename = "function_call")]
+    FunctionCall {
+        call_id: Cow<'a, str>,
+        name: Cow<'a, str>,
+        arguments: Cow<'a, str>,
+    },
+    #[serde(rename = "function_call_output")]
+    FunctionCallOutput {
+        call_id: Cow<'a, str>,
+        output: OpenAIResponsesFunctionOutput<'a>,
+    },
+}
+
+/// A function output is either plain text or ordered rich parts.
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum OpenAIResponsesFunctionOutput<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<OpenAIResponsesToolOutputPart<'a>>),
+}
+
+/// Ordered rich function-output part. Only fields valid for the selected
+/// endpoint and content position are emitted.
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum OpenAIResponsesToolOutputPart<'a> {
+    #[serde(rename = "output_text")]
+    OutputText { text: Cow<'a, str> },
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: Cow<'a, str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
+    },
+    #[serde(rename = "input_file")]
+    InputFile {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<Cow<'a, str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_data: Option<Cow<'a, str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_url: Option<Cow<'a, str>>,
+    },
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum OpenAIResponsesReasoningSummaryKind {
+    SummaryText,
+}
+
+#[derive(Serialize, Debug)]
+struct OpenAIResponsesReasoningSummary<'a> {
+    #[serde(rename = "type")]
+    summary_type: OpenAIResponsesReasoningSummaryKind,
+    text: Cow<'a, str>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum OpenAIResponsesInputContent<'a> {
+    /// User-turn text: `{ "type": "input_text", "text": "..." }`
+    #[serde(rename = "input_text")]
+    InputText { text: Cow<'a, str> },
+    /// Assistant-turn text: `{ "type": "output_text", "text": "..." }`
+    #[serde(rename = "output_text")]
+    OutputText { text: Cow<'a, str> },
+    /// Inline image: `{ "type": "input_image", "image_url": "data:...;base64,..." }`
+    #[serde(rename = "input_image")]
+    InputImage {
+        image_url: Cow<'a, str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<&'a str>,
+    },
+    /// Inline or referenced file: only fields valid for the position are sent.
+    #[serde(rename = "input_file")]
+    InputFile {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filename: Option<Cow<'a, str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_data: Option<Cow<'a, str>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_url: Option<Cow<'a, str>>,
+    },
+}
+
+/// Flattened function definition used by the Responses API.
+#[derive(Serialize, Debug)]
+struct OpenAIResponsesTool<'a> {
+    #[serde(rename = "type")]
+    tool_type: &'a str,
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+    /// Responses sends explicit strictness. QueryMT's existing intent is
+    /// non-strict when unset, so omission serializes as `false`.
+    strict: bool,
+}
+
+/// Request payload for OpenAI's Responses API endpoint (`POST /responses`).
+#[derive(Serialize, Debug)]
+struct OpenAIResponsesRequest<'a> {
+    model: &'a str,
+    input: Vec<OpenAIResponsesInputItem<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
+    /// Responses mode is stateless locally; remote storage stays disabled.
+    store: bool,
+    /// Requested provider outputs, e.g. encrypted reasoning for local replay.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    include: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    /// Structured output mapping (`text.format`) for the Responses protocol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<OpenAIResponsesText>,
+    /// Reasoning controls (`reasoning.effort`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenAIResponsesReasoning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<OpenAIResponsesTool<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<Value>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    extra_body: Option<Map<String, Value>>,
+}
+
+/// Responses structured-output container: `"text": { "format": {...} }`.
+#[derive(Serialize, Debug)]
+struct OpenAIResponsesText {
+    format: OpenAIResponsesTextFormat,
+}
+
+/// Responses `text.format` payload for JSON-schema structured output.
+#[derive(Serialize, Debug)]
+struct OpenAIResponsesTextFormat {
+    #[serde(rename = "type")]
+    format_type: &'static str,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
+}
+
+/// Responses `reasoning` controls.
+#[derive(Serialize, Debug)]
+struct OpenAIResponsesReasoning {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'static str>,
+}
+
 pub struct DisplayableToolCall(pub ToolCall);
 impl std::fmt::Display for DisplayableToolCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -252,6 +439,140 @@ impl OpenAIRawUsage {
 struct OpenAIChatResponse {
     choices: Vec<OpenAIChatChoice>,
     usage: Option<OpenAIRawUsage>,
+}
+
+/// Raw usage object from the Responses API, before normalization.
+///
+/// Responses reports `input_tokens`/`output_tokens` with cached and reasoning
+/// counts nested under detail objects. QueryMT's categories are exclusive, so
+/// these are subtracted rather than summed.
+#[derive(Deserialize, Debug, Clone)]
+struct OpenAIResponsesRawUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+    #[serde(default)]
+    input_tokens_details: Option<OpenAIPromptTokensDetails>,
+    #[serde(default)]
+    output_tokens_details: Option<OpenAICompletionTokensDetails>,
+}
+
+impl OpenAIResponsesRawUsage {
+    fn into_usage(self) -> Usage {
+        let cache_read = self
+            .input_tokens_details
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        let reasoning = self
+            .output_tokens_details
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        Usage {
+            input_tokens: self.input_tokens.saturating_sub(cache_read),
+            output_tokens: self.output_tokens.saturating_sub(reasoning),
+            reasoning_tokens: reasoning,
+            cache_read,
+            cache_write: 0,
+        }
+    }
+}
+
+/// A non-streaming response from the Responses API (`POST /responses`).
+#[derive(Deserialize, Debug)]
+struct OpenAIResponsesResponse {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    output: Vec<Value>,
+    #[serde(default)]
+    usage: Option<OpenAIResponsesRawUsage>,
+    /// Terminal cause for incomplete responses, e.g. `max_output_tokens`.
+    #[serde(default)]
+    incomplete_details: Option<Value>,
+    #[serde(default)]
+    error: Option<Value>,
+}
+
+/// Raw Responses output item. Unknown item types are retained as opaque data.
+#[derive(Deserialize, Debug)]
+struct OpenAIResponsesOutputItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    summary: Option<Vec<OpenAIResponsesReasoningSummaryText>>,
+    #[serde(default)]
+    content: Option<Vec<OpenAIResponsesOutputContent>>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIResponsesReasoningSummaryText {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAIResponsesOutputContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
+    annotations: Vec<Value>,
+}
+
+/// Normalized non-streaming Responses result.
+#[derive(Debug)]
+struct OpenAIResponsesChatResponse {
+    output: ChatOutput,
+}
+
+impl ChatResponse for OpenAIResponsesChatResponse {
+    fn text(&self) -> Option<String> {
+        self.output.text()
+    }
+
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        self.output.tool_calls()
+    }
+
+    fn thinking(&self) -> Option<String> {
+        self.output.thinking()
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        self.output.usage.clone()
+    }
+
+    fn finish_reason(&self) -> Option<FinishReason> {
+        self.output.finish_reason
+    }
+
+    fn output(&self) -> Option<&ChatOutput> {
+        Some(&self.output)
+    }
+}
+
+impl std::fmt::Display for OpenAIResponsesChatResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "OpenAI Responses response")
+    }
 }
 
 /// Individual choice within an OpenAI chat API response.
@@ -424,6 +745,12 @@ pub trait OpenAIProviderConfig {
         true
     }
     fn json_schema(&self) -> Option<&StructuredOutputFormat>;
+
+    /// Selected API protocol. Defaults to Chat Completions.
+    fn api_mode(&self) -> crate::ApiMode {
+        crate::ApiMode::ChatCompletions
+    }
+
     fn extra_body(&self) -> Option<Map<String, Value>> {
         None
     }
@@ -885,6 +1212,616 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
     Ok(builder.body(json_body)?)
 }
 
+/// Convert history into ordered Responses `input` items.
+///
+/// Unlike Chat Completions, the Responses API replays typed items in
+/// chronological order rather than a single `messages` array. When a turn
+/// carries authoritative structured output, that output is replayed and the
+/// portable `content` projection is ignored to avoid duplicate items.
+///
+/// Replay is input-valid: reasoning, message text, and function calls/outputs
+/// have validated Responses representations. An item that is required for
+/// continuation but has no validated input representation (an opaque provider
+/// item) fails explicitly instead of being silently dropped.
+fn convert_chat_messages_to_responses<'a>(
+    messages: &'a [ChatMessage],
+    out: &mut Vec<OpenAIResponsesInputItem<'a>>,
+) -> Result<(), LLMError> {
+    for msg in messages {
+        if msg.role == ChatRole::Assistant
+            && let Some(output) = &msg.output
+            && output.representation == ChatOutputRepresentation::Structured
+        {
+            convert_structured_output_to_responses(output, out)?;
+            continue;
+        }
+
+        let is_user = matches!(msg.role, ChatRole::User);
+        let role = Cow::Borrowed(if is_user { "user" } else { "assistant" });
+
+        // Single ordered pass: buffered message content is flushed into its own
+        // message item whenever a tool item interrupts it, so the true
+        // chronological interleaving of text and calls is preserved instead of
+        // being regrouped by kind.
+        let mut content: Vec<OpenAIResponsesInputContent<'a>> = Vec::new();
+        for block in &msg.content {
+            match block {
+                Content::Text { text } if !text.is_empty() => {
+                    content.push(if is_user {
+                        OpenAIResponsesInputContent::InputText {
+                            text: Cow::Borrowed(text.as_str()),
+                        }
+                    } else {
+                        OpenAIResponsesInputContent::OutputText {
+                            text: Cow::Borrowed(text.as_str()),
+                        }
+                    });
+                }
+                Content::Text { .. } => {}
+                Content::Image { mime_type, data } => {
+                    content.push(OpenAIResponsesInputContent::InputImage {
+                        image_url: Cow::Owned(format!(
+                            "data:{};base64,{}",
+                            mime_type,
+                            base64::engine::general_purpose::STANDARD.encode(data)
+                        )),
+                        detail: None,
+                    });
+                }
+                Content::ImageUrl { url } => {
+                    content.push(OpenAIResponsesInputContent::InputImage {
+                        image_url: Cow::Borrowed(url.as_str()),
+                        detail: None,
+                    });
+                }
+                Content::Thinking { text, signature } => {
+                    flush_responses_message(out, role.clone(), &mut content);
+                    out.push(OpenAIResponsesInputItem::Reasoning {
+                        id: None,
+                        summary: if text.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![OpenAIResponsesReasoningSummary {
+                                summary_type: OpenAIResponsesReasoningSummaryKind::SummaryText,
+                                text: Cow::Borrowed(text.as_str()),
+                            }]
+                        },
+                        encrypted_content: signature.as_deref().map(Cow::Borrowed),
+                    });
+                }
+                Content::ToolUse {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    flush_responses_message(out, role.clone(), &mut content);
+                    out.push(OpenAIResponsesInputItem::FunctionCall {
+                        call_id: Cow::Borrowed(id.as_str()),
+                        name: Cow::Borrowed(name.as_str()),
+                        arguments: Cow::Owned(serde_json::to_string(arguments).unwrap_or_default()),
+                    });
+                }
+                Content::ToolResult {
+                    id, content: parts, ..
+                } => {
+                    flush_responses_message(out, role.clone(), &mut content);
+                    out.push(OpenAIResponsesInputItem::FunctionCallOutput {
+                        call_id: Cow::Borrowed(id.as_str()),
+                        output: responses_function_output(id, parts)?,
+                    });
+                }
+                Content::Pdf { data } => {
+                    content.push(OpenAIResponsesInputContent::InputFile {
+                        filename: None,
+                        file_data: Some(Cow::Owned(format!(
+                            "data:application/pdf;base64,{}",
+                            base64::engine::general_purpose::STANDARD.encode(data)
+                        ))),
+                        file_url: None,
+                    });
+                }
+                Content::Audio { mime_type, .. } => {
+                    return Err(LLMError::InvalidRequest(format!(
+                        "unsupported Responses message media: audio '{mime_type}' has no \
+                         protocol-valid input representation"
+                    )));
+                }
+                Content::ResourceLink { uri, .. } => {
+                    return Err(LLMError::InvalidRequest(format!(
+                        "unsupported Responses message content: resource link '{uri}' has no \
+                         protocol-valid input representation"
+                    )));
+                }
+            }
+        }
+
+        flush_responses_message(out, role, &mut content);
+    }
+
+    Ok(())
+}
+
+/// Replay authoritative structured output as validated ordered input items.
+fn convert_structured_output_to_responses<'a>(
+    output: &'a ChatOutput,
+    out: &mut Vec<OpenAIResponsesInputItem<'a>>,
+) -> Result<(), LLMError> {
+    for item in &output.items {
+        match item {
+            ChatOutputItem::Reasoning(reasoning) => {
+                out.push(OpenAIResponsesInputItem::Reasoning {
+                    id: reasoning.id.as_deref().map(Cow::Borrowed),
+                    summary: reasoning
+                        .summary
+                        .iter()
+                        .chain(&reasoning.content)
+                        .filter(|part| !part.text.is_empty())
+                        .map(|part| OpenAIResponsesReasoningSummary {
+                            summary_type: OpenAIResponsesReasoningSummaryKind::SummaryText,
+                            text: Cow::Borrowed(part.text.as_str()),
+                        })
+                        .collect(),
+                    encrypted_content: reasoning.encrypted_content.as_deref().map(Cow::Borrowed),
+                });
+            }
+            ChatOutputItem::Message(message) => {
+                let role = match message.role {
+                    ChatRole::User => "user",
+                    ChatRole::Assistant => "assistant",
+                };
+                let mut content: Vec<OpenAIResponsesInputContent<'a>> = Vec::new();
+                for part in &message.parts {
+                    match part {
+                        ChatMessagePart::Text { text, .. } if !text.is_empty() => {
+                            content.push(OpenAIResponsesInputContent::OutputText {
+                                text: Cow::Borrowed(text.as_str()),
+                            });
+                        }
+                        ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
+                            content.push(OpenAIResponsesInputContent::OutputText {
+                                text: Cow::Borrowed(refusal.as_str()),
+                            });
+                        }
+                        ChatMessagePart::Media(media) => {
+                            // Only fields valid for the selected endpoint and the
+                            // assistant content position are emitted.
+                            match responses_message_media(media)? {
+                                Some(emitted) => content.push(emitted),
+                                None => {}
+                            }
+                        }
+                        // Unknown parts remain opaque; they are not reinterpreted.
+                        ChatMessagePart::Opaque(_) => {}
+                        _ => {}
+                    }
+                }
+                if !content.is_empty() {
+                    out.push(OpenAIResponsesInputItem::Message {
+                        role: Cow::Borrowed(role),
+                        content,
+                    });
+                }
+            }
+            ChatOutputItem::FunctionCall(call) => {
+                out.push(OpenAIResponsesInputItem::FunctionCall {
+                    call_id: Cow::Borrowed(call.call_id.as_str()),
+                    name: Cow::Borrowed(call.name.as_str()),
+                    // Exact provider argument text is replayed byte-exact.
+                    arguments: Cow::Borrowed(call.arguments.as_str()),
+                });
+            }
+            ChatOutputItem::Opaque(opaque) => {
+                // No validated input representation exists for an unknown item.
+                // Dropping it would silently corrupt continuation, so fail.
+                return Err(LLMError::InvalidRequest(format!(
+                    "unsupported Responses continuation: output item type '{}' has no validated input representation",
+                    opaque.original_type
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn flush_responses_message<'a>(
+    out: &mut Vec<OpenAIResponsesInputItem<'a>>,
+    role: Cow<'a, str>,
+    content: &mut Vec<OpenAIResponsesInputContent<'a>>,
+) {
+    if content.is_empty() {
+        return;
+    }
+    out.push(OpenAIResponsesInputItem::Message {
+        role,
+        content: std::mem::take(content),
+    });
+}
+
+/// Convert one typed media part into a Responses message content part.
+///
+/// Consumes validated `MediaType` values (never re-parses raw strings) and
+/// preserves the source form:
+/// - inline bytes -> protocol-valid `input_image`/`input_file` with `data:` payloads
+/// - ordinary/data URLs -> URL-bearing image/file fields
+/// - provider file references -> only when their recorded origin matches the
+///   target; a cross-origin reference is rejected rather than forwarded as if
+///   it were a portable URL.
+///
+/// Media kinds this endpoint cannot represent return `None` (they remain in
+/// canonical history and are handled by the display/attachment contract) while
+/// an unsupported *required* continuation is surfaced as an explicit error.
+fn responses_message_media<'a>(
+    media: &'a querymt::chat::MediaPart,
+) -> Result<Option<OpenAIResponsesInputContent<'a>>, LLMError> {
+    use querymt::chat::{MediaKind, MediaSource};
+
+    match &media.source {
+        MediaSource::Inline { data } => {
+            let Some(media_type) = media.media_type.as_ref() else {
+                // Inline media always carries a validated MIME type by contract.
+                return Err(LLMError::InvalidRequest(
+                    "inline Responses media is missing its validated MIME type".to_string(),
+                ));
+            };
+            let data_url = encode_data_url(media_type, data);
+            match media.kind {
+                MediaKind::Image => Ok(Some(OpenAIResponsesInputContent::InputImage {
+                    image_url: Cow::Owned(data_url),
+                    detail: media.detail.as_deref(),
+                })),
+                MediaKind::Document | MediaKind::Other => {
+                    Ok(Some(OpenAIResponsesInputContent::InputFile {
+                        filename: media.filename.as_deref().map(Cow::Borrowed),
+                        file_data: Some(Cow::Owned(data_url)),
+                        file_url: None,
+                    }))
+                }
+                // Audio/video have no message-position representation here.
+                MediaKind::Audio | MediaKind::Video => Ok(None),
+            }
+        }
+        MediaSource::DataUrl { url } | MediaSource::Url { url } => match media.kind {
+            MediaKind::Image => Ok(Some(OpenAIResponsesInputContent::InputImage {
+                image_url: Cow::Borrowed(url.as_str()),
+                detail: media.detail.as_deref(),
+            })),
+            MediaKind::Document | MediaKind::Other => {
+                Ok(Some(OpenAIResponsesInputContent::InputFile {
+                    filename: media.filename.as_deref().map(Cow::Borrowed),
+                    file_data: None,
+                    file_url: Some(Cow::Borrowed(url.as_str())),
+                }))
+            }
+            MediaKind::Audio | MediaKind::Video => Ok(None),
+        },
+        MediaSource::ProviderFile { file_id, origin } => Err(LLMError::InvalidRequest(format!(
+            "provider file reference '{file_id}' from {}/{} cannot be replayed as a portable \
+             Responses URL",
+            origin.provider, origin.endpoint
+        ))),
+    }
+}
+
+/// Build a function output that preserves rich part order and correlates by
+/// `call_id` (the caller supplies the id).
+///
+/// Text stays text when it is the only content. Image and supported file parts
+/// become ordered rich parts. Media this endpoint cannot represent fails
+/// explicitly instead of being replaced by a textual placeholder.
+fn responses_function_output<'a>(
+    call_id: &str,
+    parts: &'a [Content],
+) -> Result<OpenAIResponsesFunctionOutput<'a>, LLMError> {
+    // Text-only results keep the compact string form. Any part that is not
+    // representable as text must go through the rich path so unsupported media
+    // fails explicitly instead of being silently dropped.
+    let is_text_only = parts.iter().all(|part| match part {
+        Content::Text { .. } => true,
+        Content::Thinking { .. } | Content::ToolUse { .. } | Content::ToolResult { .. } => true,
+        _ => false,
+    });
+    if is_text_only {
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                Content::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok(OpenAIResponsesFunctionOutput::Text(Cow::Owned(text)));
+    }
+
+    let mut rich: Vec<OpenAIResponsesToolOutputPart<'a>> = Vec::new();
+    for part in parts {
+        match part {
+            Content::Text { text } => {
+                rich.push(OpenAIResponsesToolOutputPart::OutputText {
+                    text: Cow::Borrowed(text.as_str()),
+                });
+            }
+            Content::Image { mime_type, data } => {
+                rich.push(OpenAIResponsesToolOutputPart::InputImage {
+                    image_url: Cow::Owned(format!(
+                        "data:{};base64,{}",
+                        mime_type,
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    )),
+                    detail: None,
+                });
+            }
+            Content::ImageUrl { url } => {
+                rich.push(OpenAIResponsesToolOutputPart::InputImage {
+                    image_url: Cow::Borrowed(url.as_str()),
+                    detail: None,
+                });
+            }
+            Content::Pdf { data } => {
+                rich.push(OpenAIResponsesToolOutputPart::InputFile {
+                    filename: None,
+                    file_data: Some(Cow::Owned(format!(
+                        "data:application/pdf;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    ))),
+                    file_url: None,
+                });
+            }
+            Content::Audio { mime_type, .. } => {
+                return Err(LLMError::InvalidRequest(format!(
+                    "unsupported Responses function output media for call '{call_id}': \
+                     '{mime_type}' has no protocol-valid representation"
+                )));
+            }
+            Content::ResourceLink { uri, .. } => {
+                return Err(LLMError::InvalidRequest(format!(
+                    "unsupported Responses function output content for call '{call_id}': \
+                     resource link '{uri}' has no protocol-valid representation"
+                )));
+            }
+            Content::Thinking { .. } | Content::ToolUse { .. } | Content::ToolResult { .. } => {}
+        }
+    }
+
+    Ok(OpenAIResponsesFunctionOutput::Parts(rich))
+}
+
+fn to_responses_tools(tools: &[Tool]) -> Result<Vec<OpenAIResponsesTool<'_>>, LLMError> {
+    tools
+        .iter()
+        .map(|tool| {
+            // Responses requires explicit strictness; QueryMT's existing intent
+            // is non-strict when unspecified.
+            let strict = tool.function.strict.unwrap_or(false);
+            if strict {
+                validate_responses_strict_schema(&tool.function.name, &tool.function.parameters)?;
+            }
+            Ok(OpenAIResponsesTool {
+                tool_type: tool.tool_type.as_str(),
+                name: tool.function.name.as_str(),
+                description: tool.function.description.as_str(),
+                parameters: &tool.function.parameters,
+                strict,
+            })
+        })
+        .collect()
+}
+
+/// Validate that a schema can be sent with `strict=true` without changing its
+/// meaning.
+///
+/// Responses strict mode requires `additionalProperties: false` on every object
+/// and that every property is listed as required. Rather than silently
+/// promoting formerly optional properties to required (which would change
+/// caller intent), an incompatible schema is rejected.
+fn validate_responses_strict_schema(name: &str, schema: &Value) -> Result<(), LLMError> {
+    fn check(name: &str, schema: &Value) -> Result<(), LLMError> {
+        let Some(object) = schema.as_object() else {
+            return Ok(());
+        };
+
+        if object.get("type").and_then(Value::as_str) == Some("object") {
+            match object.get("additionalProperties") {
+                Some(Value::Bool(false)) => {}
+                _ => {
+                    return Err(LLMError::InvalidRequest(format!(
+                        "strict schema error for tool '{name}': every object must set \
+                         'additionalProperties: false' for Responses strict validation"
+                    )));
+                }
+            }
+
+            let properties = object
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let required: Vec<&str> = object
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|entries| entries.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if let Some(optional) = properties
+                .keys()
+                .find(|key| !required.contains(&key.as_str()))
+            {
+                return Err(LLMError::InvalidRequest(format!(
+                    "strict schema error for tool '{name}': optional property '{optional}' \
+                     would have to become required, changing caller intent"
+                )));
+            }
+
+            for (key, value) in &properties {
+                check(&format!("{name}.{key}"), value)?;
+            }
+        }
+
+        // Array item schemas are validated independently of the parent type so
+        // objects nested inside arrays cannot escape strict validation.
+        if let Some(items) = object.get("items") {
+            check(&format!("{name}[]"), items)?;
+        }
+
+        Ok(())
+    }
+
+    check(name, schema)
+}
+
+/// Protocol-correct named tool choice for the Responses API.
+fn responses_tool_choice(choice: &ToolChoice) -> Value {
+    match choice {
+        ToolChoice::Any => Value::String("required".to_string()),
+        ToolChoice::Auto => Value::String("auto".to_string()),
+        ToolChoice::None => Value::String("none".to_string()),
+        ToolChoice::Tool(name) => serde_json::json!({ "type": "function", "name": name }),
+    }
+}
+
+/// Extra-body keys that Responses mode owns. Supplying them would silently
+/// change storage or continuation policy, so construction rejects them instead
+/// of letting a duplicate key or override win.
+const RESPONSES_RESERVED_EXTRA_BODY_KEYS: &[&str] =
+    &["store", "previous_response_id", "conversation", "include"];
+
+/// Reject extra-body entries that conflict with Responses-owned protocol policy.
+///
+/// The reserved names cover the two stateful continuation mechanisms
+/// (`previous_response_id`, `conversation`) and the storage/continuation policy
+/// fields (`store`, `include`) so a caller cannot silently flip them via
+/// passthrough configuration.
+fn reject_reserved_extra_body_keys(extra_body: &Map<String, Value>) -> Result<(), LLMError> {
+    for existing in extra_body.keys() {
+        let normalized = existing.to_snake_case();
+        if let Some(key) = RESPONSES_RESERVED_EXTRA_BODY_KEYS
+            .iter()
+            .find(|key| normalized == **key)
+        {
+            return Err(LLMError::InvalidRequest(format!(
+                "conflicting Responses request configuration: '{existing}' resolves to \
+                 protocol-owned field '{key}' and cannot be supplied via extra_body"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build a stateless `POST /responses` request.
+///
+/// This is the opt-in Responses path selected via [`crate::ApiMode`]. It never
+/// falls back to Chat Completions, disables remote storage, requests encrypted
+/// reasoning for local replay, and never emits stateful continuation
+/// references. System config maps to `instructions`, `max_tokens` to
+/// `max_output_tokens`, a JSON schema to `text.format`, and reasoning effort to
+/// `reasoning.effort`. Unsupported controls are rejected explicitly rather than
+/// being silently dropped or copied from another backend's contract.
+pub fn openai_responses_request<C: OpenAIProviderConfig>(
+    cfg: &C,
+    messages: &[ChatMessage],
+    tools: Option<&[Tool]>,
+) -> Result<Request<Vec<u8>>, LLMError> {
+    let token = cfg.api_key();
+    let auth = determine_effective_auth(token, cfg.auth_type(), cfg.base_url())?;
+
+    // Responses has no `top_k` equivalent. Ignoring it would silently change
+    // sampling behavior, so reject it explicitly.
+    if cfg.top_k().is_some() {
+        return Err(LLMError::InvalidRequest(
+            "unsupported parameter for Responses mode: 'top_k' has no Responses equivalent"
+                .to_string(),
+        ));
+    }
+
+    let mut input: Vec<OpenAIResponsesInputItem<'_>> = Vec::new();
+    convert_chat_messages_to_responses(messages, &mut input)?;
+
+    let instructions = {
+        let parts = cfg.system();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n\n"))
+        }
+    };
+
+    let request_tools = match tools {
+        Some(tools) => Some(to_responses_tools(tools)?),
+        None => match cfg.tools() {
+            Some(tools) => Some(to_responses_tools(tools)?),
+            None => None,
+        },
+    };
+    let request_tool_choice = if request_tools.is_some() {
+        cfg.tool_choice().map(responses_tool_choice)
+    } else {
+        None
+    };
+
+    let extra_body = cfg.extra_body().map(|m| {
+        if should_snakecase_extra_body(cfg.base_url()) {
+            normalize_extra_body_map(m)
+        } else {
+            m
+        }
+    });
+
+    if let Some(extra_body) = &extra_body {
+        // Check both the normalized and original spellings so camelCase aliases
+        // cannot slip through on non-OpenAI hosts (which skip normalization).
+        reject_reserved_extra_body_keys(extra_body)?;
+        if let Some(raw) = cfg.extra_body() {
+            reject_reserved_extra_body_keys(&raw)?;
+        }
+    }
+
+    let body = OpenAIResponsesRequest {
+        model: cfg.model(),
+        input,
+        instructions: instructions.as_deref(),
+        // Stateless local continuation: never store remotely and request the
+        // encrypted reasoning needed to replay reasoning items locally.
+        store: false,
+        include: vec!["reasoning.encrypted_content"],
+        max_output_tokens: cfg.max_tokens().copied(),
+        temperature: cfg.temperature().copied(),
+        stream: *cfg.stream().unwrap_or(&false),
+        top_p: cfg.top_p().copied(),
+        text: cfg
+            .json_schema()
+            .cloned()
+            .map(|format| OpenAIResponsesText {
+                format: OpenAIResponsesTextFormat {
+                    format_type: "json_schema",
+                    name: format.name,
+                    description: format.description,
+                    schema: format.schema,
+                    strict: format.strict,
+                },
+            }),
+        reasoning: cfg
+            .reasoning_effort()
+            .map(|effort| OpenAIResponsesReasoning {
+                effort: Some(openai_effort_str(effort)),
+            }),
+        tools: request_tools,
+        tool_choice: request_tool_choice,
+        extra_body,
+    };
+
+    let json_body = serde_json::to_vec(&body)?;
+    let url = cfg
+        .base_url()
+        .join("responses")
+        .map_err(|e| LLMError::HttpError(e.to_string()))?;
+
+    let builder = Request::builder()
+        .method(Method::POST)
+        .uri(url.to_string())
+        .header(CONTENT_TYPE, "application/json");
+    let builder = maybe_add_auth_header(builder, &auth, token)?;
+    Ok(builder.body(json_body)?)
+}
+
 pub fn openai_parse_chat<C: OpenAIProviderConfig>(
     cfg: &C,
     response: Response<Vec<u8>>,
@@ -933,6 +1870,286 @@ pub fn openai_parse_chat_with<C: OpenAIProviderConfig>(
         })
 }
 
+/// Parse and normalize a non-streaming Responses API response.
+///
+/// Preserves ordered structured items (reasoning, message, function calls),
+/// retains unsupported built-in items as opaque data without executing them,
+/// preserves refusal/annotation data, and normalizes usage into exclusive
+/// cached-input, ordinary-input, reasoning-output, and ordinary-output
+/// categories. Incomplete/failed responses keep partial output and terminal
+/// cause instead of reporting a successful stop.
+pub fn openai_parse_responses<C: OpenAIProviderConfig>(
+    _cfg: &C,
+    response: Response<Vec<u8>>,
+    provider_classifier: Option<OpenAIErrorClassifier>,
+) -> Result<Box<dyn ChatResponse>, LLMError> {
+    if !response.status().is_success() {
+        return Err(classify_openai_http_error_with(
+            &response,
+            provider_classifier,
+        ));
+    }
+
+    let envelope: Value =
+        serde_json::from_slice(response.body()).map_err(|error| LLMError::ResponseFormatError {
+            message: format!("Failed to decode Responses API response: {error}"),
+            raw_response: String::from_utf8_lossy(response.body()).into_owned(),
+        })?;
+
+    // A top-level `error` (or a `failed` status with an error object) is a
+    // provider failure with classified details.
+    if let Some(error) = envelope.get("error").filter(|error| !error.is_null()) {
+        let explicit_request_id = envelope.get("id").and_then(Value::as_str);
+        return Err(map_openai_error_envelope(
+            error,
+            &envelope,
+            explicit_request_id,
+            false,
+            provider_classifier,
+        )
+        .into());
+    }
+
+    let parsed: OpenAIResponsesResponse =
+        serde_json::from_value(envelope).map_err(|error| LLMError::ResponseFormatError {
+            message: format!("Failed to decode Responses API response: {error}"),
+            raw_response: String::from_utf8_lossy(response.body()).into_owned(),
+        })?;
+
+    Ok(Box::new(normalize_responses_response(parsed)))
+}
+
+/// Normalize a decoded Responses response into provider-neutral structured output.
+/// Codec behavior callers supply so the shared Responses normalization and SSE
+/// parsing can keep each provider's own policy (authentication, instructions,
+/// supported fields, endpoint restrictions, error classification).
+#[derive(Debug, Clone, Copy)]
+pub struct ResponsesCodecProvider {
+    /// Provider name recorded in output provenance (e.g. `openai`, `codex`).
+    pub name: &'static str,
+    /// Protocol identifier recorded in output provenance.
+    pub protocol: &'static str,
+}
+
+impl Default for ResponsesCodecProvider {
+    fn default() -> Self {
+        Self {
+            name: "openai",
+            protocol: "responses",
+        }
+    }
+}
+
+/// Normalize a decoded Responses response into provider-neutral structured output
+/// using the default OpenAI provenance.
+fn normalize_responses_response(parsed: OpenAIResponsesResponse) -> OpenAIResponsesChatResponse {
+    normalize_responses_response_with(parsed, ResponsesCodecProvider::default())
+}
+
+/// Normalize a decoded Responses response into provider-neutral structured output
+/// while recording the supplied provider provenance.
+///
+/// Accepts the raw response envelope so compatible providers (e.g. Codex) can
+/// reuse the codec without depending on private wire types.
+pub fn normalize_responses_envelope(
+    envelope: Value,
+    provider: ResponsesCodecProvider,
+) -> Result<Box<dyn ChatResponse>, LLMError> {
+    let parsed: OpenAIResponsesResponse =
+        serde_json::from_value(envelope).map_err(|error| LLMError::ResponseFormatError {
+            message: format!("Failed to decode Responses API response: {error}"),
+            raw_response: String::new(),
+        })?;
+    Ok(Box::new(normalize_responses_response_with(
+        parsed, provider,
+    )))
+}
+
+fn normalize_responses_response_with(
+    parsed: OpenAIResponsesResponse,
+    provider: ResponsesCodecProvider,
+) -> OpenAIResponsesChatResponse {
+    let status = parsed.status.as_deref();
+    let failed = status == Some("failed");
+    let incomplete = status == Some("incomplete");
+
+    let mut items: Vec<ChatOutputItem> = Vec::new();
+    for raw in &parsed.output {
+        if let Some(item) = normalize_responses_output_item(raw) {
+            items.push(item);
+        }
+    }
+
+    let finish_reason = if failed {
+        Some(FinishReason::Error)
+    } else if incomplete {
+        Some(incomplete_finish_reason(&parsed.incomplete_details))
+    } else {
+        // Completed responses with supported local calls indicate pending tool
+        // execution; otherwise they stopped.
+        let has_local_calls = items
+            .iter()
+            .any(|item| matches!(item, ChatOutputItem::FunctionCall(_)));
+        Some(if has_local_calls {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::Stop
+        })
+    };
+
+    let output_status = match status {
+        Some("failed") => Some(ChatOutputStatus::Failed),
+        Some("incomplete") => Some(ChatOutputStatus::Incomplete),
+        Some("completed") => Some(ChatOutputStatus::Completed),
+        Some("in_progress") => Some(ChatOutputStatus::InProgress),
+        _ => None,
+    };
+
+    let output = ChatOutput {
+        response_id: parsed.id.clone(),
+        items,
+        status: output_status,
+        usage: parsed
+            .usage
+            .clone()
+            .map(OpenAIResponsesRawUsage::into_usage),
+        finish_reason,
+        provenance: Some(ChatOutputProvenance {
+            provider: provider.name.to_string(),
+            protocol: provider.protocol.to_string(),
+            model: parsed.model.clone().unwrap_or_default(),
+            endpoint: String::new(),
+        }),
+        representation: ChatOutputRepresentation::Structured,
+        extensions: Extensions::new(),
+    };
+
+    OpenAIResponsesChatResponse { output }
+}
+
+/// Map an incomplete terminal cause to a QueryMT finish reason.
+fn incomplete_finish_reason(details: &Option<Value>) -> FinishReason {
+    match details
+        .as_ref()
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("max_output_tokens") => FinishReason::Length,
+        Some("content_filter") => FinishReason::ContentFilter,
+        _ => FinishReason::Other,
+    }
+}
+
+/// Normalize one Responses output item, retaining unknown item types as opaque.
+///
+/// Exposed for compatible providers (e.g. Codex) that share this codec while
+/// keeping their own authentication, instructions, and error policy.
+pub fn normalize_responses_output_item(raw: &Value) -> Option<ChatOutputItem> {
+    let item: OpenAIResponsesOutputItem = serde_json::from_value(raw.clone()).ok()?;
+
+    match item.item_type.as_str() {
+        "reasoning" => {
+            let summary = item
+                .summary
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|part| part.text)
+                .filter(|text| !text.is_empty())
+                .map(ChatReasoningPart::text)
+                .collect();
+            // Encrypted continuation stays separate from the visible summary.
+            let encrypted_content = raw
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: item.id,
+                summary,
+                content: Vec::new(),
+                encrypted_content,
+                signature: None,
+                status: item.status.as_deref().and_then(parse_output_status),
+                extensions: Extensions::new(),
+            }))
+        }
+        "message" => {
+            let parts = item
+                .content
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|content| match content.content_type.as_str() {
+                    "output_text" => content.text.map(|text| ChatMessagePart::Text {
+                        text,
+                        annotations: content
+                            .annotations
+                            .into_iter()
+                            .map(|annotation| ChatTextAnnotation {
+                                annotation_type: annotation
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                fields: annotation
+                                    .as_object()
+                                    .map(|object| {
+                                        object
+                                            .iter()
+                                            .filter(|(key, _)| key.as_str() != "type")
+                                            .map(|(key, value)| (key.clone(), value.clone()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            })
+                            .collect(),
+                        extensions: Extensions::new(),
+                    }),
+                    "refusal" => content.refusal.map(|refusal| ChatMessagePart::Refusal {
+                        refusal,
+                        extensions: Extensions::new(),
+                    }),
+                    // Media and other content kinds are handled in tasks 5.9/5.10.
+                    _ => None,
+                })
+                .collect();
+            Some(ChatOutputItem::Message(ChatMessageItem {
+                id: item.id,
+                role: ChatRole::Assistant,
+                phase: None,
+                status: item.status.as_deref().and_then(parse_output_status),
+                parts,
+                extensions: Extensions::new(),
+            }))
+        }
+        "function_call" => {
+            let call_id = item.call_id.clone().or(item.id.clone())?;
+            Some(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: item.id,
+                call_id,
+                name: item.name.unwrap_or_default(),
+                arguments: item.arguments.unwrap_or_default(),
+                status: item.status.as_deref().and_then(parse_output_status),
+                extensions: Extensions::new(),
+            }))
+        }
+        // Unknown provider items (e.g. built-in tool actions) stay opaque: they
+        // are never promoted to message content or dispatched to the executor.
+        _ => Some(ChatOutputItem::Opaque(ChatOpaqueItem {
+            original_type: item.item_type,
+            payload: raw.clone(),
+        })),
+    }
+}
+
+fn parse_output_status(status: &str) -> Option<ChatOutputStatus> {
+    match status {
+        "in_progress" => Some(ChatOutputStatus::InProgress),
+        "completed" => Some(ChatOutputStatus::Completed),
+        "incomplete" => Some(ChatOutputStatus::Incomplete),
+        "failed" => Some(ChatOutputStatus::Failed),
+        _ => None,
+    }
+}
+
 /// Extract the thinking/reasoning content from a ChatMessage, if any.
 fn extract_reasoning_content<'a>(msg: &'a ChatMessage, include: bool) -> Option<Cow<'a, str>> {
     if !include {
@@ -944,6 +2161,30 @@ fn extract_reasoning_content<'a>(msg: &'a ChatMessage, include: bool) -> Option<
 fn encode_image_data_url(mime_type: &str, data: &[u8]) -> String {
     let encoded = base64::engine::general_purpose::STANDARD.encode(data);
     format!("data:{mime_type};base64,{encoded}")
+}
+
+/// Build a valid `data:` URL from a validated media type.
+///
+/// MIME parameters must appear before the `;base64` marker
+/// (`data:image/png; charset=binary;base64,...`), never after it, otherwise the
+/// marker is corrupted and the payload is no longer decodable. Parameters are
+/// emitted in their parsed form so their semantics survive.
+fn encode_data_url(media_type: &querymt::chat::MediaType, data: &[u8]) -> String {
+    let mut head = format!("{}", media_type.type_());
+    head.push('/');
+    head.push_str(media_type.subtype());
+    if let Some(suffix) = media_type.suffix() {
+        head.push('+');
+        head.push_str(suffix);
+    }
+    for (name, value) in media_type.params() {
+        head.push_str("; ");
+        head.push_str(name);
+        head.push('=');
+        head.push_str(value);
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+    format!("data:{head};base64,{encoded}")
 }
 
 fn text_message_content<'a>(text: impl Into<Cow<'a, str>>) -> MessageContent<'a> {
@@ -1694,6 +2935,292 @@ pub(crate) fn openai_effort_str(e: ReasoningEffort) -> &'static str {
     }
 }
 
+// ============================================================================
+// Responses streaming (semantic SSE)
+// ============================================================================
+
+/// A decoded Responses SSE event line. Unknown event kinds are ignored by kind
+/// rather than being coerced into semantic events.
+#[derive(Deserialize, Debug)]
+struct OpenAIResponsesSseEvent {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    item: Option<Value>,
+    #[serde(default)]
+    item_id: Option<String>,
+    #[serde(default)]
+    output_index: Option<usize>,
+    #[serde(default)]
+    content_index: Option<usize>,
+    #[serde(default)]
+    summary_index: Option<usize>,
+    #[serde(default)]
+    response: Option<Value>,
+}
+
+/// Request-local state for a Responses stream attempt.
+///
+/// Tracks the identities started during this request so semantic events can
+/// reference stable output indexes, and remembers whether any local function
+/// call was seen for terminal finish-reason selection.
+#[derive(Default)]
+pub struct OpenAIResponsesStreamState {
+    response_started: bool,
+    response_id: Option<String>,
+    model: Option<String>,
+    saw_function_call: bool,
+    terminal_seen: bool,
+    /// Provider provenance recorded on emitted metadata events. Defaults to
+    /// OpenAI; compatible providers (e.g. Codex) supply their own identity.
+    provider: ResponsesCodecProvider,
+}
+
+impl OpenAIResponsesStreamState {
+    /// Create request-local stream state that records the supplied provider
+    /// provenance instead of the default OpenAI identity.
+    pub fn for_provider(provider: ResponsesCodecProvider) -> Self {
+        Self {
+            provider,
+            ..Self::default()
+        }
+    }
+}
+
+/// Parse Responses API SSE frames into semantic structured stream events.
+///
+/// Transport framing (`[DONE]`) is ignored; completion is decided only by
+/// `response.completed`. Item snapshots come from `response.output_item.done`
+/// and `response.completed`, while deltas only update provisional state in the
+/// accumulator.
+pub fn parse_openai_responses_sse_chunk(
+    chunk: &[u8],
+    state: &mut OpenAIResponsesStreamState,
+) -> Result<Vec<StreamChunk>, LLMError> {
+    if chunk.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let text = String::from_utf8_lossy(chunk);
+    let mut results = Vec::new();
+
+    for line in text.lines() {
+        if state.terminal_seen {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some(data) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        // Framing-only marker: it does not describe response semantics.
+        if data == "[DONE]" {
+            continue;
+        }
+
+        let event: OpenAIResponsesSseEvent = match serde_json::from_str(data) {
+            Ok(event) => event,
+            Err(_) => {
+                // Ignore unparseable framing lines rather than aborting the stream.
+                continue;
+            }
+        };
+
+        match event.kind.as_str() {
+            "response.created" | "response.in_progress" => {
+                if !state.response_started {
+                    state.response_started = true;
+                    if let Some(response) = &event.response {
+                        state.response_id = response
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        state.model = response
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                    }
+                    results.push(StreamChunk::Structured(
+                        StructuredStreamEvent::ResponseMetadata {
+                            response_id: state.response_id.clone(),
+                            status: Some(ChatOutputStatus::InProgress),
+                            usage: None,
+                            finish_reason: None,
+                            provenance: Some(ChatOutputProvenance {
+                                provider: state.provider.name.to_string(),
+                                protocol: state.provider.protocol.to_string(),
+                                model: state.model.clone().unwrap_or_default(),
+                                endpoint: String::new(),
+                            }),
+                        },
+                    ));
+                }
+            }
+            "response.output_item.added" => {
+                let (Some(item), Some(output_index)) = (&event.item, event.output_index) else {
+                    continue;
+                };
+                if let Some(normalized) = normalize_responses_output_item(item) {
+                    if matches!(normalized, ChatOutputItem::FunctionCall(_)) {
+                        state.saw_function_call = true;
+                    }
+                    results.push(StreamChunk::Structured(
+                        StructuredStreamEvent::ItemStarted {
+                            output_index,
+                            item: normalized,
+                        },
+                    ));
+                }
+            }
+            "response.output_item.done" => {
+                let (Some(item), Some(output_index)) = (&event.item, event.output_index) else {
+                    continue;
+                };
+                if let Some(normalized) = normalize_responses_output_item(item) {
+                    if matches!(normalized, ChatOutputItem::FunctionCall(_)) {
+                        state.saw_function_call = true;
+                    }
+                    results.push(StreamChunk::Structured(
+                        StructuredStreamEvent::ItemCompleted {
+                            output_index,
+                            item: normalized,
+                        },
+                    ));
+                }
+            }
+            "response.output_text.delta" => {
+                let (Some(delta), Some(output_index)) = (&event.delta, event.output_index) else {
+                    continue;
+                };
+                results.push(StreamChunk::Structured(
+                    StructuredStreamEvent::MessagePartDelta {
+                        output_index,
+                        content_index: event.content_index.unwrap_or(0),
+                        delta: ChatMessagePartDelta::Text {
+                            delta: delta.clone(),
+                        },
+                    },
+                ));
+            }
+            "response.refusal.delta" => {
+                let (Some(delta), Some(output_index)) = (&event.delta, event.output_index) else {
+                    continue;
+                };
+                results.push(StreamChunk::Structured(
+                    StructuredStreamEvent::MessagePartDelta {
+                        output_index,
+                        content_index: event.content_index.unwrap_or(0),
+                        delta: ChatMessagePartDelta::Refusal {
+                            delta: delta.clone(),
+                        },
+                    },
+                ));
+            }
+            "response.reasoning_summary_text.delta" => {
+                let (Some(delta), Some(output_index)) = (&event.delta, event.output_index) else {
+                    continue;
+                };
+                results.push(StreamChunk::Structured(
+                    StructuredStreamEvent::ReasoningPartDelta {
+                        output_index,
+                        part: ReasoningPartKind::Summary,
+                        part_index: event.summary_index.unwrap_or(0),
+                        delta: delta.clone(),
+                    },
+                ));
+            }
+            "response.reasoning_text.delta" => {
+                let (Some(delta), Some(output_index)) = (&event.delta, event.output_index) else {
+                    continue;
+                };
+                results.push(StreamChunk::Structured(
+                    StructuredStreamEvent::ReasoningPartDelta {
+                        output_index,
+                        part: ReasoningPartKind::Content,
+                        part_index: event.summary_index.unwrap_or(0),
+                        delta: delta.clone(),
+                    },
+                ));
+            }
+            "response.function_call_arguments.delta" => {
+                let (Some(delta), Some(output_index)) = (&event.delta, event.output_index) else {
+                    continue;
+                };
+                results.push(StreamChunk::Structured(
+                    StructuredStreamEvent::FunctionArgumentsDelta {
+                        output_index,
+                        delta: delta.clone(),
+                    },
+                ));
+            }
+            // The authoritative function call arrives via output_item.done.
+            "response.function_call_arguments.done" => {}
+            "response.completed" => {
+                state.terminal_seen = true;
+                let response = event.response.unwrap_or(Value::Null);
+                let usage = response
+                    .get("usage")
+                    .and_then(|usage| {
+                        serde_json::from_value::<OpenAIResponsesRawUsage>(usage.clone()).ok()
+                    })
+                    .map(OpenAIResponsesRawUsage::into_usage);
+                let finish_reason = if state.saw_function_call {
+                    FinishReason::ToolCalls
+                } else {
+                    FinishReason::Stop
+                };
+                results.push(StreamChunk::Structured(
+                    StructuredStreamEvent::ResponseTerminal {
+                        status: ChatOutputStatus::Completed,
+                        usage,
+                        finish_reason: Some(finish_reason),
+                        detail: None,
+                    },
+                ));
+            }
+            "response.incomplete" => {
+                state.terminal_seen = true;
+                let response = event.response.unwrap_or(Value::Null);
+                let reason = response
+                    .get("incomplete_details")
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let usage = response
+                    .get("usage")
+                    .and_then(|usage| {
+                        serde_json::from_value::<OpenAIResponsesRawUsage>(usage.clone()).ok()
+                    })
+                    .map(OpenAIResponsesRawUsage::into_usage);
+                results.push(StreamChunk::Structured(
+                    StructuredStreamEvent::ResponseTerminal {
+                        status: ChatOutputStatus::Incomplete,
+                        usage,
+                        finish_reason: Some(incomplete_finish_reason(
+                            &response.get("incomplete_details").cloned(),
+                        )),
+                        detail: Some(reason.to_string()),
+                    },
+                ));
+            }
+            "response.failed" => {
+                state.terminal_seen = true;
+                let response = event.response.unwrap_or(Value::Null);
+                let error = response.get("error").unwrap_or(&Value::Null);
+                let provider_error = map_openai_error_envelope(error, &response, None, true, None);
+                return Err(provider_error.into());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use http::Response;
@@ -1722,6 +3249,7 @@ mod tests {
                 Content::text("after"),
             ],
             cache: None,
+            output: None,
         };
         let mut converted = Vec::new();
         convert_chat_message_to_openai(&message, &mut converted, true);
@@ -1742,6 +3270,7 @@ mod tests {
             role: ChatRole::User,
             content: vec![Content::image("image/jpeg", vec![0xff, 0xd8])],
             cache: None,
+            output: None,
         };
         let mut converted = Vec::new();
         convert_chat_message_to_openai(&message, &mut converted, true);
@@ -1761,6 +3290,7 @@ mod tests {
             role: ChatRole::User,
             content: vec![Content::pdf(vec![0x25, 0x50, 0x44, 0x46])],
             cache: None,
+            output: None,
         };
         let mut converted = Vec::new();
         convert_chat_message_to_openai(&message, &mut converted, true);
@@ -1784,6 +3314,7 @@ mod tests {
                 Content::text("after"),
             ],
             cache: None,
+            output: None,
         };
         let mut converted = Vec::new();
         convert_chat_message_to_openai(&message, &mut converted, true);
@@ -1808,6 +3339,7 @@ mod tests {
                 vec![Content::pdf(vec![0x25, 0x50, 0x44, 0x46])],
             )],
             cache: None,
+            output: None,
         };
         let mut converted = Vec::new();
         convert_chat_message_to_openai(&message, &mut converted, true);
@@ -1829,6 +3361,7 @@ mod tests {
                 vec![Content::image("image/png", vec![1, 2, 3])],
             )],
             cache: None,
+            output: None,
         };
         let mut converted = Vec::new();
         convert_chat_message_to_openai(&message, &mut converted, true);
@@ -1868,6 +3401,7 @@ mod tests {
                 Content::text("<run-objective>Inspect screenshot</run-objective>"),
             ],
             cache: None,
+            output: None,
         };
         let mut converted = Vec::new();
         convert_chat_message_to_openai(&message, &mut converted, true);

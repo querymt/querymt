@@ -110,6 +110,7 @@ pub(super) async fn run_ai_compaction(
                             .sum::<usize>()
                             / 4
                     }
+                    MessagePart::Output { output } => output.estimate_text().len() / 4,
                     _ => 0,
                 })
                 .sum::<usize>()

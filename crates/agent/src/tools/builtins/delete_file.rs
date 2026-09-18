@@ -42,6 +42,7 @@ impl ToolTrait for DeleteFileTool {
                     },
                     "required": ["path"]
                 }),
+                strict: None,
             },
         }
     }

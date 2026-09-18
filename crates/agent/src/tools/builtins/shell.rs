@@ -75,6 +75,7 @@ impl ToolTrait for ShellTool {
                     },
                     "required": ["command"]
                 }),
+                strict: None,
             },
         }
     }

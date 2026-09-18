@@ -110,6 +110,7 @@ impl Tool for ReplaceSymbolTool {
                     },
                     "required": ["replacements"]
                 }),
+                strict: None,
             },
         }
     }

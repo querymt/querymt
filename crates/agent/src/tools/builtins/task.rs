@@ -53,6 +53,7 @@ impl ToolTrait for ReadTaskTool {
                     "type": "object",
                     "properties": { "task_id": { "type": "string" } }
                 }),
+                strict: None,
             },
         }
     }
@@ -106,6 +107,7 @@ impl ToolTrait for UpdateTaskTool {
                     },
                     "required": ["task_id", "expected_revision", "reason"]
                 }),
+                strict: None,
             },
         }
     }
@@ -225,6 +227,7 @@ impl ToolTrait for CompleteTaskTool {
                     },
                     "required": ["task_id", "expected_revision", "completion_evidence"]
                 }),
+                strict: None,
             },
         }
     }

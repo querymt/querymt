@@ -60,6 +60,7 @@ impl ToolTrait for WebFetchTool {
                     },
                     "required": ["url"]
                 }),
+                strict: None,
             },
         }
     }
