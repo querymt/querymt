@@ -22,8 +22,6 @@ impl DuplicateToolCallMiddleware {
     }
 
     async fn check_for_duplicates(&self, session_id: &str) -> Option<String> {
-        use crate::model::MessagePart;
-
         // Get session history
         let history = match self.store.get_history(session_id).await {
             Ok(h) => h,

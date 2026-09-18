@@ -468,10 +468,15 @@ pub enum MediaNormalizationError {
     MissingInlineMediaType,
     #[error("invalid data URL")]
     InvalidDataUrl,
-    #[error("data URL MIME type {actual} conflicts with declared MIME type {declared}")]
+    // Media types are boxed so the error stays small enough to return by value.
+    #[error(
+        "data URL MIME type {} conflicts with declared MIME type {}",
+        actual.as_ref(),
+        declared.as_ref()
+    )]
     ConflictingDataUrlMediaType {
-        declared: MediaType,
-        actual: MediaType,
+        declared: Box<MediaType>,
+        actual: Box<MediaType>,
     },
 }
 
@@ -498,8 +503,8 @@ impl MediaPart {
                     && declared != &actual
                 {
                     return Err(MediaNormalizationError::ConflictingDataUrlMediaType {
-                        declared: declared.clone(),
-                        actual,
+                        declared: Box::new(declared.clone()),
+                        actual: Box::new(actual),
                     });
                 }
                 Some(actual)
@@ -681,7 +686,7 @@ pub enum ChatMessagePart {
         #[serde(default, flatten)]
         extensions: Extensions,
     },
-    Media(MediaPart),
+    Media(Box<MediaPart>),
     Opaque(ChatOpaquePart),
 }
 
@@ -1127,7 +1132,7 @@ mod tests {
                 role: ChatRole::Assistant,
                 phase: None,
                 status: None,
-                parts: vec![ChatMessagePart::Media(media.clone())],
+                parts: vec![ChatMessagePart::Media(Box::new(media.clone()))],
                 extensions: Extensions::new(),
             })],
             ..ChatOutput::default()
