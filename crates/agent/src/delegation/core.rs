@@ -1846,10 +1846,8 @@ pub fn extract_session_summary_from_history(history: &[AgentMessage]) -> String 
     for message in history {
         // Function calls from both legacy parts and canonical structured output.
         for tool_call in message.function_calls() {
-            let args_preview = extract_tool_args_preview(
-                &tool_call.function.name,
-                &tool_call.function.arguments,
-            );
+            let args_preview =
+                extract_tool_args_preview(&tool_call.function.name, &tool_call.function.arguments);
             tools_used.push(format!("{} ({})", tool_call.function.name, args_preview));
         }
         for part in &message.parts {

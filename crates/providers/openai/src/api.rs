@@ -10,7 +10,7 @@ use querymt::{
         ChatFunctionCallItem, ChatMessage, ChatMessageItem, ChatMessagePart, ChatMessagePartDelta,
         ChatOpaqueItem, ChatOutput, ChatOutputItem, ChatOutputProvenance, ChatOutputRepresentation,
         ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatResponse, ChatRole,
-        ChatTextAnnotation, Content, Extensions, FinishReason, ReasoningPartKind, ReasoningEffort,
+        ChatTextAnnotation, Content, Extensions, FinishReason, ReasoningEffort, ReasoningPartKind,
         StreamChunk, StructuredOutputFormat, StructuredStreamEvent, Tool, ToolChoice,
     },
     error::{
@@ -1302,9 +1302,7 @@ fn convert_chat_messages_to_responses<'a>(
                     });
                 }
                 Content::ToolResult {
-                    id,
-                    content: parts,
-                    ..
+                    id, content: parts, ..
                 } => {
                     flush_responses_message(out, role.clone(), &mut content);
                     out.push(OpenAIResponsesInputItem::FunctionCallOutput {
@@ -1312,9 +1310,7 @@ fn convert_chat_messages_to_responses<'a>(
                         output: responses_function_output(id, parts)?,
                     });
                 }
-                Content::Pdf { .. }
-                | Content::Audio { .. }
-                | Content::ResourceLink { .. } => {}
+                Content::Pdf { .. } | Content::Audio { .. } | Content::ResourceLink { .. } => {}
             }
         }
 
@@ -1766,15 +1762,18 @@ pub fn openai_responses_request<C: OpenAIProviderConfig>(
         temperature: cfg.temperature().copied(),
         stream: *cfg.stream().unwrap_or(&false),
         top_p: cfg.top_p().copied(),
-        text: cfg.json_schema().cloned().map(|format| OpenAIResponsesText {
-            format: OpenAIResponsesTextFormat {
-                format_type: "json_schema",
-                name: format.name,
-                description: format.description,
-                schema: format.schema,
-                strict: format.strict,
-            },
-        }),
+        text: cfg
+            .json_schema()
+            .cloned()
+            .map(|format| OpenAIResponsesText {
+                format: OpenAIResponsesTextFormat {
+                    format_type: "json_schema",
+                    name: format.name,
+                    description: format.description,
+                    schema: format.schema,
+                    strict: format.strict,
+                },
+            }),
         reasoning: cfg
             .reasoning_effort()
             .map(|effort| OpenAIResponsesReasoning {
@@ -1986,7 +1985,10 @@ fn normalize_responses_response_with(
         response_id: parsed.id.clone(),
         items,
         status: output_status,
-        usage: parsed.usage.clone().map(OpenAIResponsesRawUsage::into_usage),
+        usage: parsed
+            .usage
+            .clone()
+            .map(OpenAIResponsesRawUsage::into_usage),
         finish_reason,
         provenance: Some(ChatOutputProvenance {
             provider: provider.name.to_string(),
@@ -2128,7 +2130,8 @@ fn parse_output_status(status: &str) -> Option<ChatOutputStatus> {
 fn extract_reasoning_content<'a>(msg: &'a ChatMessage, include: bool) -> Option<Cow<'a, str>> {
     if !include {
         return None;
-    }    msg.thinking().map(Cow::Borrowed)
+    }
+    msg.thinking().map(Cow::Borrowed)
 }
 
 fn encode_image_data_url(mime_type: &str, data: &[u8]) -> String {
@@ -3184,8 +3187,7 @@ pub fn parse_openai_responses_sse_chunk(
                 state.terminal_seen = true;
                 let response = event.response.unwrap_or(Value::Null);
                 let error = response.get("error").unwrap_or(&Value::Null);
-                let provider_error =
-                    map_openai_error_envelope(error, &response, None, true, None);
+                let provider_error = map_openai_error_envelope(error, &response, None, true, None);
                 return Err(provider_error.into());
             }
             _ => {}

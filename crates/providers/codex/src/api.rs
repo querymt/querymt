@@ -558,7 +558,8 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
     tools: Option<&[Tool]>,
 ) -> Result<Vec<u8>, LLMError> {
     let instructions = resolve_instructions(cfg.model(), cfg.instructions())?;
-    let mut inputs = Vec::with_capacity(messages.len() + 1);    if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
+    let mut inputs = Vec::with_capacity(messages.len() + 1);
+    if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
         let text = format!(
             "# AGENTS.md instructions for {directory}\n\n<INSTRUCTIONS>\n{system}\n</INSTRUCTIONS>",
             directory = DEFAULT_INSTRUCTIONS_DIRECTORY

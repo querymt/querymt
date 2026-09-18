@@ -35,7 +35,9 @@ impl MediaType {
     /// Needed by wire encoders that must keep parameters separate from
     /// structural markers (e.g. a data URL's `;base64` marker).
     pub fn params(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.0.params().map(|(name, value)| (name.as_str(), value.as_str()))
+        self.0
+            .params()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 }
 
@@ -1505,9 +1507,13 @@ mod tests {
             .push(ChatOutputItem::Reasoning(reasoning_fixture(Some("sig_1"))));
 
         let portable = output.portable_content();
-        assert!(portable.iter().all(
-            |block| !matches!(block, Content::Thinking { signature: Some(_), .. })
-        ));
+        assert!(portable.iter().all(|block| !matches!(
+            block,
+            Content::Thinking {
+                signature: Some(_),
+                ..
+            }
+        )));
 
         let same_origin = output.portable_content_with(true);
         assert!(same_origin.iter().any(|block| matches!(

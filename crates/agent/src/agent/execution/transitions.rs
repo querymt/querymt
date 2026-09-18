@@ -713,11 +713,9 @@ pub(super) async fn transition_call_llm(
                                 }
                             }
                             if matches!(event, StructuredStreamEvent::ResponseTerminal { .. }) {
-                                drained_usage = drain_trailing_usage(
-                                    &mut stream,
-                                    &exec_ctx.cancellation_token,
-                                )
-                                .await;
+                                drained_usage =
+                                    drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
+                                        .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
                                     return Ok(ExecutionState::Cancelled);
                                 }
@@ -784,11 +782,9 @@ pub(super) async fn transition_call_llm(
                                 // Usage events before exiting the loop. These bypass
                                 // the accumulator (post-terminal events are invalid)
                                 // and merge into the output after validation.
-                                drained_usage = drain_trailing_usage(
-                                    &mut stream,
-                                    &exec_ctx.cancellation_token,
-                                )
-                                .await;
+                                drained_usage =
+                                    drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
+                                        .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
                                     return Ok(ExecutionState::Cancelled);
                                 }
@@ -827,8 +823,8 @@ pub(super) async fn transition_call_llm(
                                 break;
                             }
                         }
-                        StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseInputDelta { .. } => {
-                        }
+                        StreamChunk::ToolUseStart { .. }
+                        | StreamChunk::ToolUseInputDelta { .. } => {}
                     }
 
                     // Time- or size-based flush
@@ -894,7 +890,10 @@ pub(super) async fn transition_call_llm(
                 message_id,
                 streamed_output.text().map(|text| text.len()),
                 streamed_output.thinking().map(|text| text.len()),
-                streamed_output.tool_calls().map(|calls| calls.len()).unwrap_or(0),
+                streamed_output
+                    .tool_calls()
+                    .map(|calls| calls.len())
+                    .unwrap_or(0),
                 accumulator.is_structured(),
             );
 
@@ -1245,10 +1244,7 @@ pub(super) async fn transition_after_llm(
                     "Response blocked by content filter".into(),
                     StopType::ContentFilter,
                 ),
-                _ => (
-                    format!("Response incomplete. {detail}"),
-                    StopType::Other,
-                ),
+                _ => (format!("Response incomplete. {detail}"), StopType::Other),
             };
             return Ok(ExecutionState::Stopped {
                 message: message.into(),
@@ -1711,8 +1707,8 @@ mod tests {
 
     // ── Item-aware accumulation (task 4.1) ───────────────────────────────────
 
-    use querymt::chat::ChatOutputStatus;
     use querymt::Usage;
+    use querymt::chat::ChatOutputStatus;
 
     fn fn_call_item(item_id: &str, call_id: &str, args: &str) -> ChatOutputItem {
         ChatOutputItem::FunctionCall(ChatFunctionCallItem {
@@ -1876,9 +1872,7 @@ mod tests {
         let refusal = StructuredStreamEvent::MessagePartDelta {
             output_index: 0,
             content_index: 1,
-            delta: ChatMessagePartDelta::Refusal {
-                delta: "no".into(),
-            },
+            delta: ChatMessagePartDelta::Refusal { delta: "no".into() },
         };
         let reasoning = StructuredStreamEvent::ReasoningPartDelta {
             output_index: 2,
@@ -1889,10 +1883,7 @@ mod tests {
 
         assert_eq!(structured_delta_for_ui(&text), Some((false, "hello")));
         assert_eq!(structured_delta_for_ui(&refusal), Some((false, "no")));
-        assert_eq!(
-            structured_delta_for_ui(&reasoning),
-            Some((true, "why"))
-        );
+        assert_eq!(structured_delta_for_ui(&reasoning), Some((true, "why")));
     }
 
     #[test]
@@ -1940,11 +1931,17 @@ mod tests {
         let (executable, gated) = gate_function_calls_for_execution(&calls);
 
         assert_eq!(
-            executable.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            executable
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["call_ok"]
         );
         assert_eq!(
-            gated.iter().map(|result| result.call_id.as_str()).collect::<Vec<_>>(),
+            gated
+                .iter()
+                .map(|result| result.call_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["call_bad", "call_array"]
         );
         assert!(gated.iter().all(|result| result.is_error));
@@ -1960,7 +1957,10 @@ mod tests {
         let (executable, gated) = gate_function_calls_for_execution(&calls);
 
         assert_eq!(
-            executable.iter().map(|call| call.id.as_str()).collect::<Vec<_>>(),
+            executable
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["call_1", "call_2"]
         );
         assert!(gated.is_empty(), "duplicates are skipped without results");
