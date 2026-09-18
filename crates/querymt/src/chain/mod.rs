@@ -134,6 +134,7 @@ impl<'a> PromptChain<'a> {
                         role: crate::chat::ChatRole::User,
                         content: vec![crate::chat::Content::text(prompt)],
                         cache: None,
+                        output: None,
                     }];
                     self.llm.chat(&messages).await?
                 }

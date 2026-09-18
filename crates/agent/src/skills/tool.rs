@@ -275,6 +275,7 @@ impl SkillTool {
                     },
                     "required": ["name"]
                 }),
+                strict: None,
             },
         }
     }

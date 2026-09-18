@@ -879,6 +879,25 @@ impl SessionHandle {
     pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {
         let mut parts = Vec::new();
 
+        // A structured assistant turn stores its canonical output once; the
+        // projected content blocks are not duplicated as additional parts.
+        if msg.role == ChatRole::Assistant
+            && let Some(output) = &msg.output
+        {
+            parts.push(MessagePart::Output {
+                output: output.clone(),
+            });
+            let source_provider = self.llm_config.as_ref().map(|cfg| cfg.provider.clone());
+            let source_model = self.llm_config.as_ref().map(|cfg| cfg.model.clone());
+            return Self::finish_agent_message(
+                self.session.public_id.clone(),
+                source_provider,
+                source_model,
+                msg,
+                parts,
+            );
+        }
+
         for block in &msg.content {
             match block {
                 Content::Text { text } => {
@@ -943,9 +962,26 @@ impl SessionHandle {
             None
         };
 
+        Self::finish_agent_message(
+            self.session.public_id.clone(),
+            source_provider,
+            source_model,
+            msg,
+            parts,
+        )
+    }
+
+    /// Assemble the AgentMessage envelope for converted chat content.
+    fn finish_agent_message(
+        session_id: String,
+        source_provider: Option<String>,
+        source_model: Option<String>,
+        msg: &ChatMessage,
+        parts: Vec<MessagePart>,
+    ) -> AgentMessage {
         AgentMessage {
             id: uuid::Uuid::now_v7().to_string(),
-            session_id: self.session.public_id.clone(),
+            session_id,
             role: msg.role.clone(),
             parts,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),

@@ -155,6 +155,7 @@ impl ChatProvider for ValidatedLLM {
                             err
                         ))],
                         cache: None,
+                        output: None,
                     });
                 }
             }

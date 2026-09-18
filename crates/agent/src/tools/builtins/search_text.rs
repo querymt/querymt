@@ -444,6 +444,7 @@ impl ToolTrait for SearchTextTool {
                     },
                     "required": ["pattern"]
                 }),
+                strict: None,
             },
         }
     }

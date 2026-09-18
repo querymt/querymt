@@ -59,6 +59,7 @@ impl TryFrom<RmcpTool> for FunctionTool {
             name: tool_name,
             description,
             parameters: schema,
+            strict: None,
         })
     }
 }

@@ -1,4 +1,7 @@
-use crate::{ProviderChatRequest, ProviderStreamRequest};
+use crate::{
+    ITEM_AWARE_CHAT_CONTRACT_VERSION, ProviderChatRequest, ProviderStreamRequest,
+    messages_require_item_aware_contract,
+};
 use querymt::chat::{ChatMessage, Tool};
 
 #[derive(Clone, Debug)]
@@ -68,6 +71,8 @@ impl RemoteProviderClientConfig {
             messages: messages.to_vec(),
             tools: tools.map(|t| t.to_vec()),
             params: self.params.clone(),
+            item_aware_contract_version: messages_require_item_aware_contract(messages)
+                .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
         }
     }
 
@@ -92,6 +97,8 @@ impl RemoteProviderClientConfig {
             heartbeat_interval_secs: self.heartbeat_interval_secs,
             lease_ttl_secs: self.lease_ttl_secs,
             params: self.params.clone(),
+            item_aware_contract_version: messages_require_item_aware_contract(messages)
+                .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
         }
     }
 }

@@ -325,6 +325,7 @@ mod tests {
             role: ChatRole::User,
             content: blocks,
             cache: None,
+            output: None,
         }
     }
 

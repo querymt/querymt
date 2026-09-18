@@ -84,7 +84,7 @@ Older JSON payloads decode with absent output. Old peers do not automatically un
 
 ### 6. Explicit Responses mode and reusable codec
 
-Add OpenAI config selection `api = "chat_completions" | "responses"`; omission retains Chat Completions. Both use existing HTTP provider methods. No fallback after sending a Responses request. Add a codec module in qmt-openai for Responses wire types and mapping; xAI already depends on qmt-openai, and provider-specific wrappers keep authentication, headers, instructions, supported fields, error classification, and backend restrictions. Confirm dependency direction before reuse; no new protocol crate is required by this plan.
+Add OpenAI config selection `api_mode = "chat_completions" | "responses"`; omission retains Chat Completions. Both use existing HTTP provider methods. No fallback after sending a Responses request. Add a codec module in qmt-openai for Responses wire types and mapping; xAI already depends on qmt-openai, and provider-specific wrappers keep authentication, headers, instructions, supported fields, error classification, and backend restrictions. Confirm dependency direction before reuse; no new protocol crate is required by this plan.
 
 Responses requests use store=false, request encrypted reasoning via include where supported, and replay local items rather than previous_response_id or conversation IDs. Reject conflicting extra-body values for protocol-owned fields rather than allowing duplicate keys or changing retention/continuation mode. Map max_tokens to max_output_tokens, JSON schema to text.format, reasoning effort to reasoning.effort, and system config to instructions. Exclude unsupported sampling fields explicitly instead of inheriting Codex/xAI quirks.
 

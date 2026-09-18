@@ -122,6 +122,10 @@ pub async fn handle_any_response(
                                 break;
                             };
                             match chunk_res? {
+                                StreamChunk::Structured(_) => {
+                                    // Structured events are accumulated by item-aware consumers;
+                                    // this legacy CLI renders their compatibility projections.
+                                }
                                 StreamChunk::Text(t) => {
                                     log::trace!("Received stream text chunk: {} bytes", t.len());
                                     print!("{}", t);

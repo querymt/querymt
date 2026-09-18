@@ -60,6 +60,7 @@ impl ToolTrait for KnowledgeConsolidateTool {
                     },
                     "required": ["source_ids", "summary", "insight"]
                 }),
+                strict: None,
             },
         }
     }

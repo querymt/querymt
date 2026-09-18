@@ -11,6 +11,20 @@ use futures::Stream;
 use std::pin::Pin;
 
 pub mod http;
+pub mod output;
+pub mod streaming;
+
+pub use output::{
+    ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOpaqueItem, ChatOpaquePart,
+    ChatOutput, ChatOutputItem, ChatOutputProvenance, ChatOutputRepresentation, ChatOutputStatus,
+    ChatReasoningItem, ChatReasoningPart, ChatTextAnnotation, Extensions, MediaDisplayProjection,
+    MediaKind, MediaNormalizationError, MediaPart, MediaSource, MediaType, MediaTypeError,
+    normalize_chat_response, normalize_tool_result_media,
+};
+pub use streaming::{
+    ChatMessagePartDelta, ChatStreamAccumulator, ChatStreamAccumulatorError, ReasoningPartKind,
+    StructuredStreamEvent,
+};
 
 // ---------------------------------------------------------------------------
 // Content — a single content block within a message
@@ -427,6 +441,9 @@ pub struct ChatMessage {
     /// will translate this into provider-specific cache breakpoint markers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheHint>,
+    /// Authoritative generated output for item-aware assistant turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ChatOutput>,
 }
 
 /// Represents a parameter in a function tool
@@ -466,6 +483,9 @@ pub struct FunctionTool {
     pub description: String,
     /// The parameters schema for the function
     pub parameters: Value,
+    /// Whether the provider should enforce strict schema adherence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Defines rules for structured output responses based on [OpenAI's structured output requirements](https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format).
@@ -548,9 +568,12 @@ const _: () = {
         (size + align - 1) & !(align - 1)
     }
 
-    // FunctionTool = name (String) + description (String) + parameters (Value)
-    // No padding needed: String fields are adjacent, then Value at end
-    const EXPECTED_FUNCTION_TOOL_SIZE: usize = STRING_SIZE + STRING_SIZE + VALUE_SIZE;
+    // FunctionTool = name + description + parameters + optional strictness, rounded
+    // up to Value's alignment.
+    const EXPECTED_FUNCTION_TOOL_SIZE: usize = align_up(
+        STRING_SIZE + STRING_SIZE + VALUE_SIZE + std::mem::size_of::<Option<bool>>(),
+        VALUE_ALIGN,
+    );
 
     // Tool = tool_type (String) + function (FunctionTool)
     // Need to align String to FunctionTool's alignment (which matches Value's alignment)
@@ -741,37 +764,23 @@ pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
         None
     }
     fn usage(&self) -> Option<Usage>;
+
+    /// Authoritative ordered output when this response supports item-aware chat.
+    fn output(&self) -> Option<&ChatOutput> {
+        None
+    }
 }
 
 impl From<&dyn ChatResponse> for ChatMessage {
     fn from(response: &dyn ChatResponse) -> Self {
-        let mut content = Vec::new();
-
-        if let Some(t) = response.thinking()
-            && !t.is_empty()
-        {
-            content.push(Content::thinking(t));
-        }
-        if let Some(text) = response.text()
-            && !text.is_empty()
-        {
-            content.push(Content::text(text));
-        }
-        if let Some(calls) = response.tool_calls() {
-            for call in calls {
-                content.push(Content::ToolUse {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    arguments: serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| Value::Object(Default::default())),
-                });
-            }
-        }
+        let output = normalize_chat_response(response);
+        let content = output.portable_content();
 
         ChatMessage {
             role: ChatRole::Assistant,
             content,
             cache: None,
+            output: Some(output),
         }
     }
 }
@@ -796,6 +805,9 @@ pub enum FinishReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamChunk {
+    /// Item-aware response metadata, lifecycle, delta, or snapshot event.
+    Structured(StructuredStreamEvent),
+
     /// Text content delta
     Text(String),
 
@@ -961,7 +973,69 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
+/// Validation failure for a message carrying authoritative structured output.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatMessageConsistencyError {
+    #[error("structured output is only valid on assistant messages")]
+    StructuredOutputOnUserMessage,
+    #[error("structured message item role does not match its assistant envelope")]
+    StructuredItemRoleMismatch,
+    #[error("message content does not match the structured output projection")]
+    StalePortableProjection,
+}
+
 impl ChatMessage {
+    /// Validate that structured authority and its portable projection agree.
+    pub fn validate_output_consistency(&self) -> Result<(), ChatMessageConsistencyError> {
+        let Some(output) = &self.output else {
+            return Ok(());
+        };
+
+        if self.role != ChatRole::Assistant {
+            return Err(ChatMessageConsistencyError::StructuredOutputOnUserMessage);
+        }
+        if output.items.iter().any(|item| {
+            matches!(
+                item,
+                ChatOutputItem::Message(message) if message.role != self.role
+            )
+        }) {
+            return Err(ChatMessageConsistencyError::StructuredItemRoleMismatch);
+        }
+        if self.content != output.portable_content() {
+            return Err(ChatMessageConsistencyError::StalePortableProjection);
+        }
+
+        Ok(())
+    }
+
+    /// Replace authoritative output and regenerate its portable projection.
+    pub fn replace_output(
+        &mut self,
+        output: ChatOutput,
+    ) -> Result<(), ChatMessageConsistencyError> {
+        if self.role != ChatRole::Assistant {
+            return Err(ChatMessageConsistencyError::StructuredOutputOnUserMessage);
+        }
+        if output.items.iter().any(|item| {
+            matches!(
+                item,
+                ChatOutputItem::Message(message) if message.role != self.role
+            )
+        }) {
+            return Err(ChatMessageConsistencyError::StructuredItemRoleMismatch);
+        }
+
+        self.content = output.portable_content();
+        self.output = Some(output);
+        Ok(())
+    }
+
+    /// Clear structured authority before deliberately editing portable content.
+    pub fn clear_output(&mut self) -> Option<ChatOutput> {
+        self.output.take()
+    }
+
     /// Create a new builder for a user message.
     pub fn user() -> ChatMessageBuilder {
         ChatMessageBuilder::new(ChatRole::User)
@@ -978,6 +1052,7 @@ impl ChatMessage {
             role: ChatRole::User,
             content,
             cache: None,
+            output: None,
         }
     }
 
@@ -987,6 +1062,7 @@ impl ChatMessage {
             role: ChatRole::Assistant,
             content,
             cache: None,
+            output: None,
         }
     }
 
@@ -1118,6 +1194,7 @@ impl ChatMessageBuilder {
             role: self.role,
             content: self.content,
             cache: self.cache,
+            output: None,
         }
     }
 }
@@ -1240,6 +1317,102 @@ mod tests {
         let json = serde_json::to_string(&blocks).unwrap();
         let roundtripped: Vec<Content> = serde_json::from_str(&json).unwrap();
         assert_eq!(blocks, roundtripped);
+    }
+
+    #[test]
+    fn function_tool_omits_unspecified_strictness() {
+        let legacy = serde_json::json!({
+            "name": "lookup",
+            "description": "Look up data",
+            "parameters": {"type": "object"}
+        });
+
+        let tool: FunctionTool = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(tool.strict, None);
+        assert_eq!(serde_json::to_value(&tool).unwrap(), legacy);
+
+        let strict = FunctionTool {
+            strict: Some(true),
+            ..tool
+        };
+        assert_eq!(serde_json::to_value(strict).unwrap()["strict"], true);
+    }
+
+    #[test]
+    fn old_message_json_defaults_structured_output_to_none() {
+        let json = serde_json::json!({
+            "role": "Assistant",
+            "content": [{"type": "text", "text": "hello"}]
+        });
+
+        let message: ChatMessage = serde_json::from_value(json.clone()).unwrap();
+        assert!(message.output.is_none());
+        assert_eq!(serde_json::to_value(message).unwrap(), json);
+    }
+
+    #[test]
+    fn structured_message_helpers_enforce_authority() {
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::Message(ChatMessageItem {
+                id: Some("message_1".into()),
+                role: ChatRole::Assistant,
+                phase: None,
+                status: Some(ChatOutputStatus::Completed),
+                parts: vec![ChatMessagePart::Text {
+                    text: "authoritative".into(),
+                    annotations: Vec::new(),
+                    extensions: Extensions::new(),
+                }],
+                extensions: Extensions::new(),
+            })],
+            ..ChatOutput::default()
+        };
+        let mut message = ChatMessage::from_assistant(Vec::new());
+
+        message.replace_output(output.clone()).unwrap();
+        assert_eq!(message.content, vec![Content::text("authoritative")]);
+        assert_eq!(message.output, Some(output));
+        assert_eq!(message.validate_output_consistency(), Ok(()));
+
+        message.content = vec![Content::text("stale edit")];
+        assert_eq!(
+            message.validate_output_consistency(),
+            Err(ChatMessageConsistencyError::StalePortableProjection)
+        );
+
+        assert!(message.clear_output().is_some());
+        assert_eq!(message.validate_output_consistency(), Ok(()));
+        assert_eq!(message.content, vec![Content::text("stale edit")]);
+    }
+
+    #[test]
+    fn structured_output_rejects_user_and_mismatched_item_roles() {
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::Message(ChatMessageItem {
+                id: None,
+                role: ChatRole::User,
+                phase: None,
+                status: None,
+                parts: vec![ChatMessagePart::Text {
+                    text: "wrong role".into(),
+                    annotations: Vec::new(),
+                    extensions: Extensions::new(),
+                }],
+                extensions: Extensions::new(),
+            })],
+            ..ChatOutput::default()
+        };
+        let mut user = ChatMessage::from_user(Vec::new());
+        assert_eq!(
+            user.replace_output(output.clone()),
+            Err(ChatMessageConsistencyError::StructuredOutputOnUserMessage)
+        );
+
+        let mut assistant = ChatMessage::from_assistant(Vec::new());
+        assert_eq!(
+            assistant.replace_output(output),
+            Err(ChatMessageConsistencyError::StructuredItemRoleMismatch)
+        );
     }
 
     #[test]

@@ -212,13 +212,20 @@ async fn ensure_credential_fresh_resolves_before_request_building() {
 
 /// One-shot HTTP/1.1 responder for adapter integration tests.
 async fn serve_once(status_line: &str, headers: &[(&str, &str)], body: &[u8]) -> String {
+    serve_chunks_once(status_line, headers, vec![body.to_vec()]).await
+}
+
+async fn serve_chunks_once(
+    status_line: &str,
+    headers: &[(&str, &str)],
+    chunks: Vec<Vec<u8>>,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind test listener");
     let addr = listener.local_addr().expect("local addr");
-    let body = body.to_vec();
     let headers: Vec<(String, String)> = headers
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -229,7 +236,7 @@ async fn serve_once(status_line: &str, headers: &[(&str, &str)], body: &[u8]) ->
         let (mut socket, _) = listener.accept().await.expect("accept");
         let mut buf = vec![0u8; 8192];
         let _ = socket.read(&mut buf).await;
-        let mut response = format!("{status_line}\r\nContent-Length: {}\r\n", body.len());
+        let mut response = format!("{status_line}\r\nTransfer-Encoding: chunked\r\n");
         for (k, v) in &headers {
             response.push_str(&format!("{k}: {v}\r\n"));
         }
@@ -238,7 +245,17 @@ async fn serve_once(status_line: &str, headers: &[(&str, &str)], body: &[u8]) ->
             .write_all(response.as_bytes())
             .await
             .expect("write hdr");
-        socket.write_all(&body).await.expect("write body");
+        for chunk in chunks {
+            socket
+                .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                .await
+                .expect("write chunk size");
+            socket.write_all(&chunk).await.expect("write chunk");
+            socket.write_all(b"\r\n").await.expect("write chunk end");
+            socket.flush().await.expect("flush chunk");
+            tokio::task::yield_now().await;
+        }
+        socket.write_all(b"0\r\n\r\n").await.expect("finish body");
     });
 
     format!("http://{addr}/chat")
@@ -259,6 +276,8 @@ enum StreamTestParserMode {
     FinishClassified,
     /// Non-empty lines classify as rate-limited.
     ChunkClassified,
+    /// Parses complete SSE lines handed off by the HTTP adapter framing layer.
+    SemanticSse,
 }
 
 struct StreamTestParser {
@@ -277,6 +296,27 @@ impl ChatStreamParser for StreamTestParser {
                 )
                 .with_retry_after_secs(Some(3))
                 .into())
+            }
+            StreamTestParserMode::SemanticSse => {
+                let line = std::str::from_utf8(chunk)
+                    .map_err(|error| LLMError::ResponseFormatError {
+                        message: format!("invalid UTF-8 at parser boundary: {error}"),
+                        raw_response: String::from_utf8_lossy(chunk).into_owned(),
+                    })?
+                    .trim();
+                let Some(data) = line.strip_prefix("data: ") else {
+                    return Ok(Vec::new());
+                };
+                if data == "[DONE]" {
+                    return Ok(vec![StreamChunk::Done {
+                        finish_reason: crate::chat::FinishReason::Stop,
+                    }]);
+                }
+                let value: serde_json::Value = serde_json::from_str(data)?;
+                Ok(value["text"]
+                    .as_str()
+                    .map(|text| vec![StreamChunk::Text(text.to_owned())])
+                    .unwrap_or_default())
             }
             _ => Ok(Vec::new()),
         }
@@ -478,4 +518,68 @@ async fn stream_parser_chunk_failure_preserves_classification() {
         other => panic!("expected ProviderResponseError, got {other}"),
     }
     assert!(err.is_retryable());
+}
+
+#[tokio::test]
+async fn http_adapter_frames_split_utf8_json_and_sse_once() {
+    let body = "data: {\"text\":\"héllo 🌍\"}\n\ndata: [DONE]\n\n".as_bytes();
+    let emoji = body
+        .windows("🌍".len())
+        .position(|window| window == "🌍".as_bytes())
+        .expect("emoji bytes");
+    let json_split = body
+        .windows("héllo".len())
+        .position(|window| window == "héllo".as_bytes())
+        .expect("text bytes")
+        + 2;
+    let sse_split = body
+        .windows(b"data: [DONE]".len())
+        .position(|window| window == b"data: [DONE]")
+        .expect("done frame")
+        + 3;
+    let mut boundaries = vec![
+        1,
+        json_split,
+        emoji + 1,
+        emoji + 3,
+        sse_split,
+        body.len() - 1,
+    ];
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    let mut start = 0;
+    let mut chunks = Vec::new();
+    for end in boundaries.into_iter().chain(std::iter::once(body.len())) {
+        if end > start {
+            chunks.push(body[start..end].to_vec());
+            start = end;
+        }
+    }
+
+    let uri = serve_chunks_once(
+        "HTTP/1.1 200 OK",
+        &[("Content-Type", "text/event-stream")],
+        chunks,
+    )
+    .await;
+    let adapter = LLMProviderFromHTTP::new(Box::new(StreamTestProvider {
+        uri,
+        parser: StreamTestParserMode::SemanticSse,
+    }));
+    let events: Vec<StreamChunk> = adapter
+        .chat_stream_with_tools(&[], None)
+        .await
+        .expect("stream open")
+        .map(|result| result.expect("semantic event"))
+        .collect()
+        .await;
+
+    assert_eq!(events.len(), 2, "SSE framing must not duplicate events");
+    assert!(matches!(&events[0], StreamChunk::Text(text) if text == "héllo 🌍"));
+    assert!(matches!(
+        events[1],
+        StreamChunk::Done {
+            finish_reason: crate::chat::FinishReason::Stop
+        }
+    ));
 }

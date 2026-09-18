@@ -51,6 +51,7 @@ impl ToolTrait for RouteDelegationToPeerTool {
                     },
                     "required": ["agent_id"]
                 }),
+                strict: None,
             },
         }
     }

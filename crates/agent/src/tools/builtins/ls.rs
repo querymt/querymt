@@ -231,6 +231,7 @@ impl Tool for ListTool {
                     },
                     "required": []
                 }),
+                strict: None,
             },
         }
     }

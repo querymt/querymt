@@ -86,6 +86,7 @@ impl Tool for GetSymbolTool {
                     },
                     "required": ["requests"]
                 }),
+                strict: None,
             },
         }
     }

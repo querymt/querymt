@@ -57,6 +57,7 @@ pub fn test_context_with_user_messages(
             role: ChatRole::User,
             content: vec![querymt::chat::Content::text(format!("User message {}", i))],
             cache: None,
+            output: None,
         })
         .collect();
 

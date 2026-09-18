@@ -6,6 +6,10 @@ use crate::{
 use http::{Request, Response};
 use std::{future::Future, pin::Pin};
 
+/// Parses semantic stream frames supplied by the HTTP adapter.
+///
+/// The adapter buffers arbitrary transport chunks through the next newline, so
+/// implementations receive complete SSE lines rather than raw network chunks.
 pub trait ChatStreamParser: Send {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError>;
 

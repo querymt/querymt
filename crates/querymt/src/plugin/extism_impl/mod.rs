@@ -4,7 +4,8 @@ pub use interface::{
     ExtismChatRequest, ExtismChatResponse, ExtismCompleteParseRequest, ExtismCompleteRequest,
     ExtismEmbedParseRequest, ExtismEmbedRequest, ExtismListModelsParseRequest,
     ExtismListModelsRequest, ExtismLogRecord, ExtismSttRequest, ExtismSttResponse,
-    ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig, PluginError, StreamOpenResult,
+    ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION,
+    PluginError, StreamOpenResult, messages_require_item_aware_contract,
 };
 
 #[cfg(feature = "extism_host")]

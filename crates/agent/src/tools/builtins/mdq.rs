@@ -55,6 +55,7 @@ Text matching: unquoted = case-insensitive; quoted = case-sensitive; `^...$` anc
                     },
                     "required": ["path", "selector"]
                 }),
+                strict: None,
             },
         }
     }

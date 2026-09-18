@@ -1,17 +1,35 @@
 use querymt::ToolCall;
 use querymt::Usage;
-use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, ChatResponse, FinishReason, StreamChunk, Tool};
 use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+pub const ITEM_AWARE_CHAT_CONTRACT_VERSION: u32 = 1;
+
+pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| message.output.is_some())
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct GetProviderContractInfo;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderContractInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_aware_chat_version: Option<u32>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderChatResponse {
     pub text: Option<String>,
     pub thinking: Option<String>,
+    #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<ChatOutput>,
 }
 
 impl fmt::Display for ProviderChatResponse {
@@ -55,6 +73,10 @@ impl ChatResponse for ProviderChatResponse {
     fn usage(&self) -> Option<Usage> {
         self.usage.clone()
     }
+
+    fn output(&self) -> Option<&ChatOutput> {
+        self.output.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +117,8 @@ pub struct ProviderChatRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_aware_contract_version: Option<u32>,
 }
 
 pub type GenericProviderStreamRequest<TRouterRef> = ProviderStreamRequest<TRouterRef>;
@@ -115,6 +139,8 @@ pub struct ProviderStreamRequest<TRouterRef> {
     pub lease_ttl_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_aware_contract_version: Option<u32>,
 }
 
 pub fn default_stream_heartbeat_secs() -> u64 {
@@ -220,5 +246,269 @@ pub fn should_ack_relay_message(
         StreamRelayMessage::ProviderError { .. } | StreamRelayMessage::TransportFailed { .. } => {
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod item_aware_tests {
+    use super::*;
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessage, ChatOutput, ChatOutputItem, ChatOutputStatus,
+        ChatStreamAccumulator, StructuredStreamEvent,
+    };
+    use serde_json::json;
+
+    fn structured_message() -> ChatMessage {
+        let mut message = ChatMessage::assistant().build();
+        message
+            .replace_output(ChatOutput {
+                response_id: Some("response-1".into()),
+                status: Some(ChatOutputStatus::Completed),
+                extensions: [("opaque".into(), json!({"preserved": true}))]
+                    .into_iter()
+                    .collect(),
+                ..ChatOutput::default()
+            })
+            .expect("structured assistant message");
+        message
+    }
+
+    #[test]
+    fn legacy_remote_payloads_default_item_aware_fields() {
+        let request: ProviderChatRequest = serde_json::from_value(json!({
+            "provider": "demo",
+            "model": "m1",
+            "messages": [],
+            "tools": null
+        }))
+        .expect("legacy request");
+        assert_eq!(request.item_aware_contract_version, None);
+
+        let response: ProviderChatResponse = serde_json::from_value(json!({
+            "text": "legacy",
+            "thinking": null,
+            "tool_calls": [],
+            "usage": null,
+            "finish_reason": "Stop"
+        }))
+        .expect("legacy response");
+        assert!(response.output.is_none());
+    }
+
+    #[test]
+    fn structured_remote_response_and_stream_event_round_trip() {
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("item-1".into()),
+                call_id: "call-1".into(),
+                name: "lookup".into(),
+                arguments: "{not valid json".into(),
+                status: Some(ChatOutputStatus::Completed),
+                extensions: Default::default(),
+            })],
+            ..structured_message().output.expect("output")
+        };
+        let response = ProviderChatResponse {
+            text: None,
+            thinking: None,
+            tool_calls: Vec::new(),
+            usage: None,
+            finish_reason: Some("Stop".into()),
+            output: Some(output.clone()),
+        };
+        let encoded = serde_json::to_vec(&response).expect("serialize response");
+        let decoded: ProviderChatResponse =
+            serde_json::from_slice(&encoded).expect("deserialize response");
+        assert_eq!(decoded.output(), Some(&output));
+        let decoded_call = match &decoded.output().expect("output").items[0] {
+            ChatOutputItem::FunctionCall(call) => call,
+            other => panic!("expected function call, got {other:?}"),
+        };
+        assert_eq!(decoded_call.item_id.as_deref(), Some("item-1"));
+        assert_eq!(decoded_call.call_id, "call-1");
+        assert_eq!(decoded_call.arguments, "{not valid json");
+
+        let events = [
+            StructuredStreamEvent::ResponseMetadata {
+                response_id: Some("response-1".into()),
+                status: Some(ChatOutputStatus::InProgress),
+                usage: None,
+                finish_reason: None,
+                provenance: None,
+            },
+            StructuredStreamEvent::ItemCompleted {
+                output_index: 0,
+                item: output.items[0].clone(),
+            },
+            StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                usage: None,
+                finish_reason: Some(FinishReason::Stop),
+                detail: None,
+            },
+        ];
+        let mut accumulator = ChatStreamAccumulator::new();
+        for event in events {
+            let relay = StreamRelayMessage::Chunk(StreamChunk::Structured(event));
+            let encoded = serde_json::to_vec(&relay).expect("serialize chunk");
+            let decoded: StreamRelayMessage =
+                serde_json::from_slice(&encoded).expect("deserialize chunk");
+            let StreamRelayMessage::Chunk(chunk) = decoded else {
+                panic!("expected relayed chunk")
+            };
+            accumulator.push(&chunk).expect("accumulate chunk");
+        }
+        let streamed = accumulator.finish().expect("complete stream");
+        assert_eq!(streamed.items, output.items);
+    }
+
+    #[test]
+    fn requests_advertise_item_aware_contract_only_when_needed() {
+        let config = crate::RemoteProviderClientConfig::new("peer", "demo", "m1");
+        let legacy = config.build_chat_request(&[ChatMessage::user().text("hi").build()], None);
+        assert_eq!(legacy.item_aware_contract_version, None);
+
+        let structured = config.build_chat_request(&[structured_message()], None);
+        assert_eq!(
+            structured.item_aware_contract_version,
+            Some(ITEM_AWARE_CHAT_CONTRACT_VERSION)
+        );
+    }
+
+    /// End-to-end over the remote transport: a structured response is carried
+    /// back as request history (response -> reload -> tool result -> second
+    /// request) with item/call IDs, raw arguments, reasoning continuation, and
+    /// order intact, and with no duplicate projected items.
+    #[test]
+    fn structured_remote_history_round_trips_into_second_request() {
+        use querymt::chat::{
+            ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutputItem,
+            ChatReasoningItem, ChatReasoningPart, Content,
+        };
+
+        let config = crate::RemoteProviderClientConfig::new("peer", "demo", "m1");
+        let raw_arguments = "{\"query\":\"rust\",\"limit\": 2 }";
+
+        // The remote returns structured output.
+        let output = ChatOutput {
+            response_id: Some("resp-remote".into()),
+            status: Some(ChatOutputStatus::Completed),
+            items: vec![
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning-remote".into()),
+                    summary: vec![ChatReasoningPart::text("thinking")],
+                    content: Vec::new(),
+                    encrypted_content: Some("encrypted-continuation".into()),
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::Message(ChatMessageItem {
+                    id: Some("message-remote".into()),
+                    role: querymt::chat::ChatRole::Assistant,
+                    phase: None,
+                    status: None,
+                    parts: vec![ChatMessagePart::Text {
+                        text: "running lookup".into(),
+                        annotations: Vec::new(),
+                        extensions: Default::default(),
+                    }],
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("fc-item-remote".into()),
+                    call_id: "call-remote".into(),
+                    name: "lookup".into(),
+                    arguments: raw_arguments.into(),
+                    status: None,
+                    extensions: Default::default(),
+                }),
+            ],
+            ..ChatOutput::default()
+        };
+        let response = ProviderChatResponse {
+            text: output.text(),
+            thinking: output.thinking(),
+            tool_calls: output.tool_calls().unwrap_or_default(),
+            usage: None,
+            finish_reason: Some("ToolCalls".into()),
+            output: Some(output.clone()),
+        };
+        let encoded = serde_json::to_vec(&response).expect("serialize response");
+        let decoded: ProviderChatResponse =
+            serde_json::from_slice(&encoded).expect("deserialize response");
+        let decoded_output = decoded.output().expect("structured output survives");
+        assert_eq!(decoded_output.items.len(), 3);
+
+        // Reload the structured turn into request history plus its tool result.
+        let mut assistant = ChatMessage::from_assistant(decoded_output.portable_content());
+        assistant
+            .replace_output(decoded_output.clone())
+            .expect("projection must match structured output");
+
+        let result = ChatMessage::from_user(vec![Content::ToolResult {
+            id: "call-remote".into(),
+            name: Some("lookup".into()),
+            is_error: false,
+            content: vec![Content::text("result payload")],
+        }]);
+
+        let request = config.build_chat_request(
+            &[
+                ChatMessage::from_user(vec![Content::text("look it up")]),
+                assistant,
+                result,
+            ],
+            None,
+        );
+        assert_eq!(
+            request.item_aware_contract_version,
+            Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            "structured history must advertise the item-aware contract"
+        );
+
+        // Round-trip the request across the transport and inspect the reloaded
+        // structured turn.
+        let encoded = serde_json::to_vec(&request).expect("serialize request");
+        let decoded: ProviderChatRequest =
+            serde_json::from_slice(&encoded).expect("deserialize request");
+
+        let reloaded = &decoded.messages[1];
+        let reloaded_output = reloaded
+            .output
+            .as_ref()
+            .expect("structured output survives the transport");
+        assert_eq!(
+            reloaded_output.items.len(),
+            3,
+            "no duplicate projected items across the remote boundary"
+        );
+
+        let ChatOutputItem::Reasoning(reasoning) = &reloaded_output.items[0] else {
+            panic!("expected reasoning item");
+        };
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("encrypted-continuation"),
+            "reasoning continuation survives the remote boundary"
+        );
+
+        let ChatOutputItem::FunctionCall(call) = &reloaded_output.items[2] else {
+            panic!("expected function call item");
+        };
+        assert_eq!(call.call_id, "call-remote");
+        assert_eq!(call.item_id.as_deref(), Some("fc-item-remote"));
+        assert_eq!(call.arguments, raw_arguments, "raw arguments byte-exact");
+
+        // The tool result still references the original call ID.
+        let tool_result = decoded.messages[2]
+            .content
+            .iter()
+            .find(|block| block.is_tool_result())
+            .expect("tool result present");
+        let Content::ToolResult { id, .. } = tool_result else {
+            panic!("expected tool result block");
+        };
+        assert_eq!(id, "call-remote");
     }
 }
