@@ -252,6 +252,62 @@ async fn websocket_event_forwarder_emits_owned_delegation_update() {
 }
 
 #[tokio::test]
+async fn websocket_event_forwarder_emits_owned_input_state() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let session_id = "ws-session";
+    state
+        .session_owners
+        .lock()
+        .await
+        .insert(session_id.to_string(), HashSet::from(["conn".to_string()]));
+
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
+    let cancel = CancellationToken::new();
+    spawn_event_forwarders(
+        state,
+        ConnectionEventState {
+            conn_id: "conn".to_string(),
+            tx: wire_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+        },
+    );
+
+    fixture
+        .config
+        .event_sink
+        .fanout()
+        .publish(EventEnvelope::Durable(DurableEvent {
+            event_id: "input-event".into(),
+            stream_seq: 1,
+            session_id: session_id.into(),
+            timestamp: 10,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::InputQueued {
+                input_id: "input-1".into(),
+                position: 2,
+            },
+        }));
+
+    let wire = timeout(Duration::from_secs(2), wire_rx.recv())
+        .await
+        .expect("input state should be sent")
+        .expect("wire channel should remain open");
+    let value: serde_json::Value = serde_json::from_str(&wire).expect("valid notification");
+    assert_eq!(value["method"], "querymt/session/inputState");
+    assert_eq!(value["params"]["session_id"], session_id);
+    assert_eq!(value["params"]["input_id"], "input-1");
+    assert_eq!(value["params"]["delivery"], "queue");
+    assert_eq!(value["params"]["state"], "queued");
+    assert_eq!(value["params"]["position"], 2);
+    cancel.cancel();
+}
+
+#[tokio::test]
 async fn websocket_connections_receive_global_extension_notifications() {
     let fixture = crate::test_utils::TestAgent::new().await;
     let state = WsServerState::new(fixture.handle.clone());
