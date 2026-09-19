@@ -114,15 +114,18 @@ pub(crate) async fn apply_pending_steering(
 
     let mut messages = context.messages.to_vec();
     for input in pending {
-        let display = crate::agent::utils::render_prompt_for_display(&input.blocks);
+        let blocks = input.blocks;
+        let display = crate::agent::utils::render_prompt_for_display(&blocks);
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let client_prompt_id = input.client_input_id.clone();
         let message = crate::model::AgentMessage {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: message_id.clone(),
             session_id: exec_ctx.session_id.clone(),
             role: querymt::chat::ChatRole::User,
             parts: vec![crate::model::MessagePart::Steering {
                 run_id: exec_ctx.turn_id().unwrap_or_default().to_string(),
-                client_input_id: input.client_input_id.clone(),
-                blocks: input.blocks,
+                client_input_id: client_prompt_id.clone(),
+                blocks: blocks.clone(),
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -134,6 +137,34 @@ pub(crate) async fn apply_pending_steering(
             .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
         exec_ctx.add_message(message).await?;
         messages.push(chat_message);
+
+        for block in blocks {
+            config.emit_event(
+                &exec_ctx.session_id,
+                AgentEventKind::UserPromptBlock {
+                    message_id: message_id.clone(),
+                    client_prompt_id: client_prompt_id.clone(),
+                    block,
+                },
+            );
+        }
+        config
+            .emit_event_persisted(
+                &exec_ctx.session_id,
+                AgentEventKind::PromptReceived {
+                    content: display.clone(),
+                    message_id: Some(message_id),
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to persist steering prompt event: {error}"))?;
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::UserMessageStored {
+                content: display.clone(),
+            },
+        );
+
         if !display.trim().is_empty() {
             let summary = exec_ctx
                 .state
@@ -762,9 +793,14 @@ pub(crate) async fn execute_cycle_state_machine(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_stop_hook_continuation_message, has_effective_task_completion_tool};
+    use super::{
+        apply_pending_steering, format_stop_hook_continuation_message,
+        has_effective_task_completion_tool,
+    };
+    use crate::session::backend::StorageBackend;
     use querymt::chat::{FunctionTool, Tool};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn tool(name: &str) -> Tool {
         Tool {
@@ -775,6 +811,166 @@ mod tests {
                 parameters: json!({"type": "object"}),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn applied_steering_persists_a_replayable_user_message_before_lifecycle_completion() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let session_handle = fixture
+            .config
+            .provider
+            .with_session(&session_id)
+            .await
+            .expect("load session handle");
+        let runtime_context = crate::session::RuntimeContext::new(
+            fixture.config.provider.history_store(),
+            session_id.clone(),
+        )
+        .await
+        .expect("create runtime context");
+        let runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            std::collections::HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
+            "run-1".to_string(),
+        ));
+        let blocks = vec![
+            crate::acp::protocol::ContentBlock::Text(crate::acp::protocol::TextContent::new(
+                "before",
+            )),
+            crate::acp::protocol::ContentBlock::Image(crate::acp::protocol::ImageContent::new(
+                "AQID",
+                "image/png",
+            )),
+            crate::acp::protocol::ContentBlock::Text(crate::acp::protocol::TextContent::new(
+                "after",
+            )),
+        ];
+        steering
+            .push(
+                "input-1".to_string(),
+                Some("client-1".to_string()),
+                blocks.clone(),
+            )
+            .await
+            .expect("queue steering");
+        let mut exec_ctx = crate::agent::execution_context::ExecutionContext::new(
+            session_id.clone(),
+            runtime,
+            runtime_context,
+            session_handle,
+            crate::agent::core::ToolConfig::default(),
+        )
+        .with_turn_id("run-1")
+        .with_steering(steering);
+        let context = Arc::new(crate::middleware::ConversationContext::new(
+            session_id.clone().into(),
+            Arc::from([]),
+            Arc::new(crate::middleware::AgentStats::default()),
+            "mock".into(),
+            "mock".into(),
+        ));
+        let mut live_events = fixture.config.subscribe_events();
+
+        let next = apply_pending_steering(
+            &fixture.config,
+            &mut exec_ctx,
+            &context,
+            "before_model_request",
+            false,
+        )
+        .await
+        .expect("apply steering")
+        .expect("steering changes context");
+
+        assert_eq!(next.messages.len(), 1);
+        let history = fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(&session_id)
+            .await
+            .expect("load history");
+        assert_eq!(history.len(), 1);
+        let message_id = history[0].id.clone();
+        assert!(matches!(
+            &history[0].parts[0],
+            crate::model::MessagePart::Steering {
+                run_id,
+                client_input_id: Some(client_input_id),
+                blocks: stored_blocks,
+            } if run_id == "run-1" && client_input_id == "client-1" && stored_blocks == &blocks
+        ));
+
+        let mut observed = Vec::new();
+        while !observed.iter().any(|event: &crate::events::EventEnvelope| {
+            matches!(
+                event.kind(),
+                crate::events::AgentEventKind::SteeringApplied { input_id, .. }
+                    if input_id == "input-1"
+            )
+        }) {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), live_events.recv())
+                .await
+                .expect("steering events should arrive")
+                .expect("event stream should remain open");
+            observed.push(event);
+        }
+        for (index, block) in blocks.iter().enumerate() {
+            assert!(matches!(
+                observed[index].kind(),
+                crate::events::AgentEventKind::UserPromptBlock {
+                    message_id: event_message_id,
+                    client_prompt_id: Some(client_prompt_id),
+                    block: event_block,
+                } if event_message_id == &message_id && client_prompt_id == "client-1" && event_block == block
+            ));
+        }
+        assert!(matches!(
+            observed[blocks.len()].kind(),
+            crate::events::AgentEventKind::PromptReceived {
+                message_id: Some(event_message_id),
+                ..
+            } if event_message_id == &message_id
+        ));
+        assert!(observed[blocks.len() + 1..].iter().any(|event| matches!(
+            event.kind(),
+            crate::events::AgentEventKind::SteeringApplied { input_id, .. }
+                if input_id == "input-1"
+        )));
+
+        let durable = fixture
+            .storage
+            .event_journal()
+            .load_session_stream(&session_id, None, None)
+            .await
+            .expect("load durable events");
+        let prompt_position = durable
+            .iter()
+            .position(|event| matches!(
+                &event.kind,
+                crate::events::AgentEventKind::PromptReceived { message_id: Some(prompt_id), .. }
+                    if prompt_id == &message_id
+            ))
+            .expect("durable prompt event");
+        let applied_position = durable
+            .iter()
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    crate::events::AgentEventKind::SteeringApplied { input_id, .. }
+                        if input_id == "input-1"
+                )
+            })
+            .expect("durable steering lifecycle event");
+        assert!(prompt_position < applied_position);
+        assert!(durable.iter().any(|event| matches!(
+            event.kind,
+            crate::events::AgentEventKind::UserMessageStored { .. }
+        )));
     }
 
     #[test]

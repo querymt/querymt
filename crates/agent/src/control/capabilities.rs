@@ -134,6 +134,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/models/changed".to_string(),
         "querymt/schedules/changed".to_string(),
         crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE.to_string(),
+        crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE.to_string(),
     ];
     if agent.profiles().is_some() {
         notifications

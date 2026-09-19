@@ -1206,6 +1206,32 @@ export interface SessionGroup {
 	next_cursor?: string;
 }
 
+export enum SessionInputDelivery {
+	Steer = "steer",
+	Queue = "queue",
+}
+
+export enum SessionInputState {
+	Accepted = "accepted",
+	Queued = "queued",
+	Applied = "applied",
+	Started = "started",
+	Discarded = "discarded",
+}
+
+export interface SessionInputStateNotification {
+	version: number;
+	session_id: string;
+	input_id: string;
+	delivery: SessionInputDelivery;
+	state: SessionInputState;
+	run_id?: string;
+	position?: number;
+	boundary?: string;
+	reason?: string;
+	latency_ms?: number;
+}
+
 /**
  * Session limits configuration (exposed to UI)
  * Typeshare-annotated: generated for TypeScript and Swift.

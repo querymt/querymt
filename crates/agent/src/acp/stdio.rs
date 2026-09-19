@@ -32,8 +32,9 @@ use crate::acp::protocol::{
     SetSessionModeRequest, SetSessionModelRequest,
 };
 use crate::acp::shared::{
-    AcpLiveEventTranslator, QMT_NOTIFICATION_DELEGATION_UPDATE, convert_elicitation_response,
-    create_elicitation_request, replay_agent_events_with_user_prompts,
+    AcpLiveEventTranslator, QMT_NOTIFICATION_DELEGATION_UPDATE, QMT_NOTIFICATION_INPUT_STATE,
+    convert_elicitation_response, create_elicitation_request, input_state_from_event,
+    replay_agent_events_with_user_prompts,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
@@ -52,6 +53,22 @@ pub struct AcpSessionLoadOutcome {
     pub response: LoadSessionResponse,
     pub notifications: Vec<SessionNotification>,
     pub event_count: usize,
+}
+
+fn stored_user_prompt_blocks(
+    history: Vec<crate::model::AgentMessage>,
+) -> HashMap<String, Vec<crate::acp::protocol::ContentBlock>> {
+    history
+        .into_iter()
+        .filter_map(|message| {
+            let blocks = message.parts.into_iter().find_map(|part| match part {
+                crate::model::MessagePart::Prompt { blocks }
+                | crate::model::MessagePart::Steering { blocks, .. } => Some(blocks),
+                _ => None,
+            })?;
+            Some((message.id, blocks))
+        })
+        .collect()
 }
 
 fn session_load_span(req: &LoadSessionRequest) -> tracing::Span {
@@ -104,16 +121,7 @@ async fn prepare_session_load(
                             "sessionId": session_id,
                         }))
                     })?;
-                let prompt_blocks = history
-                    .into_iter()
-                    .filter_map(|message| {
-                        let blocks = message.parts.into_iter().find_map(|part| match part {
-                            crate::model::MessagePart::Prompt { blocks } => Some(blocks),
-                            _ => None,
-                        })?;
-                        Some((message.id, blocks))
-                    })
-                    .collect::<HashMap<_, _>>();
+                let prompt_blocks = stored_user_prompt_blocks(history);
                 (events, prompt_blocks)
             }
             Err(err) => {
@@ -453,6 +461,7 @@ fn spawn_event_bridge_forwarder(
                         continue;
                     }
 
+                    let input_state = input_state_from_event(&event);
                     let (delegation_update, session_update) = {
                         let mut translator = translator
                             .lock()
@@ -487,6 +496,24 @@ fn spawn_event_bridge_forwarder(
                                 .await,
                             Err(error) => Err(error),
                         }
+                        } else if let Some(update) = input_state {
+                            let params = serde_json::value::RawValue::from_string(
+                                serde_json::to_string(&update)
+                                    .unwrap_or_else(|_| "null".to_string()),
+                            )
+                            .map(Arc::from)
+                            .map_err(acp::Error::into_internal_error);
+                            match params {
+                                Ok(params) => {
+                                    bridge
+                                        .notify_ext(crate::acp::protocol::ExtNotification::new(
+                                            QMT_NOTIFICATION_INPUT_STATE,
+                                            params,
+                                        ))
+                                        .await
+                                }
+                                Err(err) => Err(err),
+                            }
                         } else if let Some(update) = delegation_update {
                             let params = serde_json::value::RawValue::from_string(
                                 serde_json::to_string(&update)
@@ -876,7 +903,7 @@ mod stdio_tests {
     use super::{
         AcpLiveEventTranslator, CancelNotification, ClientBridgeMessage, PromptRequest,
         agent_ext_request, create_elicitation_request, replay_agent_events_with_user_prompts,
-        run_bridge_task, spawn_event_bridge_forwarder,
+        run_bridge_task, spawn_event_bridge_forwarder, stored_user_prompt_blocks,
     };
     use crate::acp::client_bridge::ClientBridgeSender;
     use crate::acp::protocol::{
@@ -893,8 +920,7 @@ mod stdio_tests {
     use tokio::time::{Duration, timeout};
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-    #[test]
-    fn session_load_replay_preserves_structured_prompt_order_and_message_id() {
+    fn assert_structured_user_message_replay(prompt_part: crate::model::MessagePart) {
         let event = crate::events::AgentEvent {
             seq: 1,
             timestamp: 1,
@@ -906,14 +932,17 @@ mod stdio_tests {
                 message_id: Some("stored-message-id".to_string()),
             },
         };
-        let prompt_blocks = std::collections::HashMap::from([(
-            "stored-message-id".to_string(),
-            vec![
-                ContentBlock::Text(TextContent::new("before")),
-                ContentBlock::Image(ImageContent::new("AQID", "image/png")),
-                ContentBlock::Text(TextContent::new("after")),
-            ],
-        )]);
+        let message = crate::model::AgentMessage {
+            id: "stored-message-id".to_string(),
+            session_id: "s-1".to_string(),
+            role: querymt::chat::ChatRole::User,
+            parts: vec![prompt_part],
+            created_at: 1,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let prompt_blocks = stored_user_prompt_blocks(vec![message]);
 
         let notifications =
             replay_agent_events_with_user_prompts("s-1", vec![event], &prompt_blocks);
@@ -943,6 +972,30 @@ mod stdio_tests {
                 Some("stored-message-id")
             );
         }
+    }
+
+    fn structured_blocks() -> Vec<ContentBlock> {
+        vec![
+            ContentBlock::Text(TextContent::new("before")),
+            ContentBlock::Image(ImageContent::new("AQID", "image/png")),
+            ContentBlock::Text(TextContent::new("after")),
+        ]
+    }
+
+    #[test]
+    fn session_load_replay_preserves_structured_prompt_order_and_message_id() {
+        assert_structured_user_message_replay(crate::model::MessagePart::Prompt {
+            blocks: structured_blocks(),
+        });
+    }
+
+    #[test]
+    fn session_load_replay_preserves_structured_steering_order_and_message_id() {
+        assert_structured_user_message_replay(crate::model::MessagePart::Steering {
+            run_id: "run-1".to_string(),
+            client_input_id: Some("input-1".to_string()),
+            blocks: structured_blocks(),
+        });
     }
 
     #[tokio::test]
@@ -992,6 +1045,60 @@ mod stdio_tests {
             params,
             serde_json::json!({ "version": 1, "session_id": "parent", "revision": 7 })
         );
+        forwarder.abort();
+    }
+
+    #[tokio::test]
+    async fn input_state_uses_typed_ext_notification_bridge() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(4);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let forwarder = spawn_event_bridge_forwarder(
+            fixture.config.event_sink.fanout().clone(),
+            ClientBridgeSender::new(bridge_tx),
+            fixture.handle.clone(),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            shutdown_tx,
+        );
+        tokio::task::yield_now().await;
+        fixture
+            .config
+            .event_sink
+            .fanout()
+            .publish(crate::events::EventEnvelope::Durable(
+                crate::events::DurableEvent {
+                    event_id: "input-event".into(),
+                    stream_seq: 1,
+                    session_id: "parent".into(),
+                    timestamp: 0,
+                    origin: crate::events::EventOrigin::Local,
+                    source_node: None,
+                    kind: crate::events::AgentEventKind::SteeringApplied {
+                        run_id: "run-1".into(),
+                        input_id: "input-1".into(),
+                        boundary: "after_tools".into(),
+                        latency_ms: 12,
+                    },
+                },
+            ));
+        let message = timeout(Duration::from_secs(2), bridge_rx.recv())
+            .await
+            .expect("notification should arrive")
+            .expect("bridge should remain open");
+        let ClientBridgeMessage::ExtNotification(notification) = message else {
+            panic!("expected extension notification");
+        };
+        assert_eq!(
+            notification.method.as_ref(),
+            crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE
+        );
+        let params: serde_json::Value =
+            serde_json::from_str(notification.params.get()).expect("valid params");
+        assert_eq!(params["session_id"], "parent");
+        assert_eq!(params["input_id"], "input-1");
+        assert_eq!(params["state"], "applied");
+        assert_eq!(params["boundary"], "after_tools");
         forwarder.abort();
     }
 

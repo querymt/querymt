@@ -327,6 +327,7 @@ pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
 pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed";
 pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
 pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/delegateModelsChanged";
+pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -415,13 +416,101 @@ pub fn delegation_update_notification(
     )
 }
 
+pub fn input_state_from_event(
+    event: &EventEnvelope,
+) -> Option<crate::control::notifications::SessionInputStateNotification> {
+    use crate::control::notifications::{
+        SESSION_INPUT_STATE_VERSION, SessionInputDelivery, SessionInputState,
+        SessionInputStateNotification,
+    };
+
+    let mut notification = SessionInputStateNotification {
+        version: SESSION_INPUT_STATE_VERSION,
+        session_id: event.session_id().to_owned(),
+        input_id: String::new(),
+        delivery: SessionInputDelivery::Steer,
+        state: SessionInputState::Accepted,
+        run_id: None,
+        position: None,
+        boundary: None,
+        reason: None,
+        latency_ms: None,
+    };
+    match event.kind() {
+        AgentEventKind::SteeringAccepted {
+            run_id,
+            input_id,
+            position,
+        } => {
+            notification.input_id.clone_from(input_id);
+            notification.run_id = Some(run_id.clone());
+            notification.position = Some(*position);
+        }
+        AgentEventKind::SteeringApplied {
+            run_id,
+            input_id,
+            boundary,
+            latency_ms,
+        } => {
+            notification.input_id.clone_from(input_id);
+            notification.state = SessionInputState::Applied;
+            notification.run_id = Some(run_id.clone());
+            notification.boundary = Some(boundary.clone());
+            notification.latency_ms = Some(*latency_ms);
+        }
+        AgentEventKind::SteeringDiscarded {
+            run_id,
+            input_id,
+            reason,
+        } => {
+            notification.input_id.clone_from(input_id);
+            notification.state = SessionInputState::Discarded;
+            notification.run_id = Some(run_id.clone());
+            notification.reason = Some(reason.clone());
+        }
+        AgentEventKind::InputQueued { input_id, position } => {
+            notification.input_id.clone_from(input_id);
+            notification.delivery = SessionInputDelivery::Queue;
+            notification.state = SessionInputState::Queued;
+            notification.position = Some(*position);
+        }
+        AgentEventKind::QueuedInputStarted { input_id, run_id } => {
+            notification.input_id.clone_from(input_id);
+            notification.delivery = SessionInputDelivery::Queue;
+            notification.state = SessionInputState::Started;
+            notification.run_id = Some(run_id.clone());
+        }
+        _ => return None,
+    }
+    Some(notification)
+}
+
+pub fn input_state_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
+    let payload = input_state_from_event(event)?;
+    Some(ext_notification(
+        QMT_NOTIFICATION_INPUT_STATE,
+        serde_json::to_value(payload).expect("serialize session input state notification"),
+    ))
+}
+
 fn normalize_querymt_ext_method(method: &str) -> &str {
     method.strip_prefix('_').unwrap_or(method)
 }
 
+fn attach_before_querymt_ext_method(method: &str) -> bool {
+    matches!(
+        normalize_querymt_ext_method(method),
+        "querymt/session/steer" | "querymt/session/queue"
+    )
+}
+
 fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> Option<String> {
     match normalize_querymt_ext_method(method) {
-        "querymt/session/delegateModels" | "querymt/session/setDelegateModel" => params
+        "querymt/session/delegateModels"
+        | "querymt/session/setDelegateModel"
+        | "querymt/session/steer"
+        | "querymt/session/queue"
+        | "querymt/session/runtimeState" => params
             .get("session_id")
             .or_else(|| params.get("sessionId"))
             .and_then(serde_json::Value::as_str)
@@ -568,6 +657,9 @@ impl AcpLiveEventTranslator {
         }
         if let Some(update) = self.translate_delegation_update(event) {
             return Some(delegation_update_notification(update));
+        }
+        if let Some(notification) = input_state_notification(event) {
+            return Some(notification);
         }
 
         // Handle ElicitationRequested specially - it's a custom notification, not a session/update
@@ -1349,23 +1441,40 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                         ext_method,
                         std::sync::Arc::from(raw_params),
                     );
+                    let attached_before_request = attach_before_querymt_ext_method(ext_method);
+                    if attached_before_request
+                        && let Some(session_id) = session_id_for_owner.as_deref()
+                    {
+                        attach_rpc_session(
+                            agent,
+                            session_owners,
+                            conn_id,
+                            &context,
+                            session_id,
+                            false,
+                        )
+                        .await?;
+                    }
                     let response = agent.ext_method(ext_req).await.map(|r| {
                         serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null)
                     });
                     match response {
                         Ok(mut value) => {
-                            let session_id = session_id_for_owner
-                                .or_else(|| querymt_session_id_from_response(ext_method, &value));
+                            let session_id = session_id_for_owner.clone().or_else(|| {
+                                querymt_session_id_from_response(ext_method, &value)
+                            });
                             if let Some(session_id) = session_id {
-                                attach_rpc_session(
-                                    agent,
-                                    session_owners,
-                                    conn_id,
-                                    &context,
-                                    &session_id,
-                                    false,
-                                )
-                                .await?;
+                                if !attached_before_request {
+                                    attach_rpc_session(
+                                        agent,
+                                        session_owners,
+                                        conn_id,
+                                        &context,
+                                        &session_id,
+                                        false,
+                                    )
+                                    .await?;
+                                }
 
                                 if let (Some(hooks), Some(local_agent)) = (
                                     context.session_hooks.as_ref(),
@@ -1572,6 +1681,9 @@ mod tests {
         for method in [
             "querymt/session/delegateModels",
             "_querymt/session/setDelegateModel",
+            "querymt/session/steer",
+            "_querymt/session/queue",
+            "querymt/session/runtimeState",
         ] {
             assert_eq!(
                 querymt_session_id_from_request(
@@ -1585,6 +1697,112 @@ mod tests {
             querymt_session_id_from_request("querymt/capabilities", &serde_json::json!({})),
             None
         );
+    }
+
+    #[test]
+    fn input_lifecycle_events_translate_to_input_state_notifications() {
+        let cases = [
+            (
+                AgentEventKind::SteeringAccepted {
+                    run_id: "run-1".into(),
+                    input_id: "input-1".into(),
+                    position: 2,
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-1",
+                    "delivery": "steer",
+                    "state": "accepted",
+                    "run_id": "run-1",
+                    "position": 2
+                }),
+            ),
+            (
+                AgentEventKind::SteeringApplied {
+                    run_id: "run-1".into(),
+                    input_id: "input-1".into(),
+                    boundary: "after_tools".into(),
+                    latency_ms: 25,
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-1",
+                    "delivery": "steer",
+                    "state": "applied",
+                    "run_id": "run-1",
+                    "boundary": "after_tools",
+                    "latency_ms": 25
+                }),
+            ),
+            (
+                AgentEventKind::SteeringDiscarded {
+                    run_id: "run-1".into(),
+                    input_id: "input-1".into(),
+                    reason: "run_completed".into(),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-1",
+                    "delivery": "steer",
+                    "state": "discarded",
+                    "run_id": "run-1",
+                    "reason": "run_completed"
+                }),
+            ),
+            (
+                AgentEventKind::InputQueued {
+                    input_id: "input-2".into(),
+                    position: 1,
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-2",
+                    "delivery": "queue",
+                    "state": "queued",
+                    "position": 1
+                }),
+            ),
+            (
+                AgentEventKind::QueuedInputStarted {
+                    input_id: "input-2".into(),
+                    run_id: "run-2".into(),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-2",
+                    "delivery": "queue",
+                    "state": "started",
+                    "run_id": "run-2"
+                }),
+            ),
+        ];
+
+        for (index, kind, expected) in cases
+            .into_iter()
+            .enumerate()
+            .map(|(index, (kind, expected))| (index, kind, expected))
+        {
+            let event = EventEnvelope::Durable(DurableEvent {
+                event_id: format!("input-event-{index}"),
+                stream_seq: index as i64 + 1,
+                session_id: "s-1".into(),
+                timestamp: index as i64,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind,
+            });
+            let notification = AcpLiveEventTranslator::new()
+                .translate_notification(&event)
+                .expect("input lifecycle notification");
+            assert_eq!(notification["method"], QMT_NOTIFICATION_INPUT_STATE);
+            assert_eq!(notification["params"], expected);
+            assert!(translate_replay_event_to_notification(&event).is_none());
+        }
     }
 
     #[test]
