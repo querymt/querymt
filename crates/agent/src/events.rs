@@ -169,6 +169,12 @@ pub enum AgentEventKind {
         run_id: String,
         input_id: String,
         position: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[typeshare(serialized_as = "any")]
+        blocks: Vec<ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        accepted_at_ms: Option<u64>,
     },
     SteeringApplied {
         run_id: String,
@@ -185,10 +191,20 @@ pub enum AgentEventKind {
     InputQueued {
         input_id: String,
         position: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[typeshare(serialized_as = "any")]
+        blocks: Vec<ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        accepted_at_ms: Option<u64>,
     },
     QueuedInputStarted {
         input_id: String,
         run_id: String,
+    },
+    QueuedInputDiscarded {
+        input_id: String,
+        reason: String,
     },
     ObjectiveInitialized {
         run_id: String,
@@ -964,6 +980,38 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn historical_pending_input_events_default_missing_content() {
+        for value in [
+            serde_json::json!({
+                "type": "steering_accepted",
+                "data": {"run_id": "run-1", "input_id": "input-1", "position": 1}
+            }),
+            serde_json::json!({
+                "type": "input_queued",
+                "data": {"input_id": "input-2", "position": 2}
+            }),
+        ] {
+            let kind: AgentEventKind = serde_json::from_value(value).unwrap();
+            match kind {
+                AgentEventKind::SteeringAccepted {
+                    blocks,
+                    accepted_at_ms,
+                    ..
+                }
+                | AgentEventKind::InputQueued {
+                    blocks,
+                    accepted_at_ms,
+                    ..
+                } => {
+                    assert!(blocks.is_empty());
+                    assert_eq!(accepted_at_ms, None);
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
     }
 
     #[test]

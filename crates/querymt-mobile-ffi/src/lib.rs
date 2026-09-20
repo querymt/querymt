@@ -514,7 +514,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
     let conn_id = format!("ffi-{connection_handle}");
     let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
     let pending_elicitations = inner.pending_elicitations();
-    let session_owners = Arc::new(Mutex::new(HashMap::new()));
+    let session_owners = querymt_agent::acp::shared::SessionOwnerMap::default();
     let outbox = Arc::new(Mutex::new(VecDeque::new()));
 
     let event_sources = querymt_agent::acp::shared::collect_event_sources(&inner);
@@ -1161,8 +1161,7 @@ mod tests {
             Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: querymt_agent::acp::shared::PendingElicitationMap =
             Arc::new(Mutex::new(HashMap::new()));
-        let session_owners: querymt_agent::acp::shared::SessionOwnerMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = querymt_agent::acp::shared::SessionOwnerMap::default();
 
         runtime::global_runtime().block_on(async {
             ACP_CONNECTIONS.lock().await.insert(

@@ -41,6 +41,9 @@ impl LocalAgentHandle {
                 )
                 .await
             }
+            "querymt/session/discardQueuedInput" => {
+                self.handle_ext_session_discard_queued_input(req).await
+            }
             "querymt/session/runtimeState" => self.handle_ext_session_runtime_state(req).await,
             "querymt/session/undo" => self.handle_ext_session_undo(req).await,
             "querymt/session/redo" => self.handle_ext_session_redo(req).await,

@@ -15,6 +15,7 @@ pub(crate) enum SessionOperationSafety {
 pub(crate) enum SessionOperation {
     LegacyPrompt,
     SubmitInput { has_key: bool },
+    DiscardQueuedInput,
     RuntimeState,
     Cancel,
     GetMode,
@@ -35,6 +36,7 @@ impl SessionOperation {
         match self {
             Self::LegacyPrompt => "legacy_prompt",
             Self::SubmitInput { .. } => "submit_input",
+            Self::DiscardQueuedInput => "discard_queued_input",
             Self::RuntimeState => "runtime_state",
             Self::Cancel => "cancel",
             Self::GetMode => "get_mode",
@@ -53,7 +55,8 @@ impl SessionOperation {
 
     pub(crate) fn safety(self) -> SessionOperationSafety {
         match self {
-            Self::RuntimeState
+            Self::DiscardQueuedInput
+            | Self::RuntimeState
             | Self::GetMode
             | Self::GetReasoningEffort
             | Self::FileIndex
@@ -685,6 +688,10 @@ mod tests {
     fn operation_safety_is_conservative() {
         assert_eq!(
             SessionOperation::RuntimeState.safety(),
+            SessionOperationSafety::Idempotent
+        );
+        assert_eq!(
+            SessionOperation::DiscardQueuedInput.safety(),
             SessionOperationSafety::Idempotent
         );
         assert_eq!(

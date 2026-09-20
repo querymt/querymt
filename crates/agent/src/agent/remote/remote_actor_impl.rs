@@ -113,6 +113,11 @@ remote_msg_impl!(
     "querymt::SubmitSessionInput",
     REG_SUBMIT_SESSION_INPUT
 );
+remote_msg_impl!(
+    messages::DiscardQueuedInput,
+    "querymt::DiscardQueuedInput",
+    REG_DISCARD_QUEUED_INPUT
+);
 remote_msg_impl!(messages::Cancel, "querymt::Cancel", REG_CANCEL);
 remote_msg_impl!(messages::SetMode, "querymt::SetMode", REG_SET_MODE);
 remote_msg_impl!(messages::GetMode, "querymt::GetMode", REG_GET_MODE);

@@ -21,22 +21,52 @@ use crate::session::domain::ForkOrigin;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Session subscriptions keyed by session id.
 ///
 /// Multiple connections may subscribe to the same session so browser tabs do not
 /// steal live updates from one another.
-pub type SessionOwnerMap = Arc<Mutex<HashMap<String, HashSet<String>>>>;
+type SessionRequestLocks = Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>;
 
-async fn subscribe_connection(session_owners: &SessionOwnerMap, session_id: String, conn_id: &str) {
+#[derive(Clone, Default)]
+pub struct SessionOwnerMap {
+    owners: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    request_locks: SessionRequestLocks,
+}
+
+impl SessionOwnerMap {
+    /// Lock the session subscription map.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, HashSet<String>>> {
+        self.owners.lock().await
+    }
+
+    async fn request_lock(&self, session_id: &str, conn_id: &str) -> Arc<Mutex<()>> {
+        let key = (session_id.to_string(), conn_id.to_string());
+        let mut request_locks = self.request_locks.lock().await;
+        request_locks.retain(|_, request_lock| request_lock.strong_count() > 0);
+        if let Some(request_lock) = request_locks.get(&key).and_then(Weak::upgrade) {
+            return request_lock;
+        }
+
+        let request_lock = Arc::new(Mutex::new(()));
+        request_locks.insert(key, Arc::downgrade(&request_lock));
+        request_lock
+    }
+}
+
+async fn subscribe_connection(
+    session_owners: &SessionOwnerMap,
+    session_id: String,
+    conn_id: &str,
+) -> bool {
     session_owners
         .lock()
         .await
         .entry(session_id)
         .or_default()
-        .insert(conn_id.to_string());
+        .insert(conn_id.to_string())
 }
 
 async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &str, conn_id: &str) {
@@ -250,7 +280,28 @@ async fn attach_rpc_session<S: SendAgent>(
     context: &RpcDispatchContext,
     session_id: &str,
     bridge_required: bool,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
+    let request_lock = session_owners.request_lock(session_id, conn_id).await;
+    let _request_guard = request_lock.lock().await;
+    attach_rpc_session_locked(
+        agent,
+        session_owners,
+        conn_id,
+        context,
+        session_id,
+        bridge_required,
+    )
+    .await
+}
+
+async fn attach_rpc_session_locked<S: SendAgent>(
+    agent: &S,
+    session_owners: &SessionOwnerMap,
+    conn_id: &str,
+    context: &RpcDispatchContext,
+    session_id: &str,
+    bridge_required: bool,
+) -> Result<bool, Error> {
     let connection_state = context
         .session_bridge
         .as_ref()
@@ -266,13 +317,14 @@ async fn attach_rpc_session<S: SendAgent>(
         return if bridge_required {
             Err(Error::from(crate::error::AgentError::ClientBridgeClosed))
         } else {
-            Ok(())
+            Ok(false)
         };
     }
 
-    subscribe_connection(session_owners, session_id.to_string(), conn_id).await;
+    let ownership_inserted =
+        subscribe_connection(session_owners, session_id.to_string(), conn_id).await;
     let Some(local_agent) = agent.as_any().downcast_ref::<AgentHandle>() else {
-        return Ok(());
+        return Ok(ownership_inserted);
     };
     if let Some(bridge) = context.session_bridge.as_ref()
         && let Err(error) = local_agent
@@ -280,15 +332,22 @@ async fn attach_rpc_session<S: SendAgent>(
             .await
     {
         if bridge_required {
-            unsubscribe_connection(session_owners, session_id, conn_id).await;
+            if ownership_inserted {
+                unsubscribe_connection(session_owners, session_id, conn_id).await;
+            }
             return Err(error);
         }
         log::warn!("Failed to attach ACP bridge for session {session_id}: {error}");
     }
-    if let Some(hooks) = context.session_hooks.as_ref() {
-        hooks.on_session_attached(local_agent, session_id).await?;
+    if let Some(hooks) = context.session_hooks.as_ref()
+        && let Err(error) = hooks.on_session_attached(local_agent, session_id).await
+    {
+        if ownership_inserted {
+            unsubscribe_connection(session_owners, session_id, conn_id).await;
+        }
+        return Err(error);
     }
-    Ok(())
+    Ok(ownership_inserted)
 }
 
 #[async_trait::async_trait]
@@ -327,6 +386,7 @@ pub const QMT_NOTIFICATION_MODELS_CHANGED: &str = "querymt/models/changed";
 pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed";
 pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
 pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/delegateModelsChanged";
+pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
@@ -415,13 +475,111 @@ pub fn delegation_update_notification(
     )
 }
 
+pub fn input_state_from_event(
+    event: &EventEnvelope,
+) -> Option<crate::control::notifications::SessionInputStateNotification> {
+    use crate::control::notifications::{
+        SESSION_INPUT_STATE_VERSION, SessionInputDelivery, SessionInputState,
+        SessionInputStateNotification,
+    };
+
+    let mut notification = SessionInputStateNotification {
+        version: SESSION_INPUT_STATE_VERSION,
+        session_id: event.session_id().to_owned(),
+        input_id: String::new(),
+        delivery: SessionInputDelivery::Steer,
+        state: SessionInputState::Accepted,
+        run_id: None,
+        position: None,
+        boundary: None,
+        reason: None,
+        latency_ms: None,
+    };
+    match event.kind() {
+        AgentEventKind::SteeringAccepted {
+            run_id,
+            input_id,
+            position,
+            ..
+        } => {
+            notification.input_id.clone_from(input_id);
+            notification.run_id = Some(run_id.clone());
+            notification.position = Some(*position);
+        }
+        AgentEventKind::SteeringApplied {
+            run_id,
+            input_id,
+            boundary,
+            latency_ms,
+        } => {
+            notification.input_id.clone_from(input_id);
+            notification.state = SessionInputState::Applied;
+            notification.run_id = Some(run_id.clone());
+            notification.boundary = Some(boundary.clone());
+            notification.latency_ms = Some(*latency_ms);
+        }
+        AgentEventKind::SteeringDiscarded {
+            run_id,
+            input_id,
+            reason,
+        } => {
+            notification.input_id.clone_from(input_id);
+            notification.state = SessionInputState::Discarded;
+            notification.run_id = Some(run_id.clone());
+            notification.reason = Some(reason.clone());
+        }
+        AgentEventKind::InputQueued {
+            input_id, position, ..
+        } => {
+            notification.input_id.clone_from(input_id);
+            notification.delivery = SessionInputDelivery::Queue;
+            notification.state = SessionInputState::Queued;
+            notification.position = Some(*position);
+        }
+        AgentEventKind::QueuedInputStarted { input_id, run_id } => {
+            notification.input_id.clone_from(input_id);
+            notification.delivery = SessionInputDelivery::Queue;
+            notification.state = SessionInputState::Started;
+            notification.run_id = Some(run_id.clone());
+        }
+        AgentEventKind::QueuedInputDiscarded { input_id, reason } => {
+            notification.input_id.clone_from(input_id);
+            notification.delivery = SessionInputDelivery::Queue;
+            notification.state = SessionInputState::Discarded;
+            notification.reason = Some(reason.clone());
+        }
+        _ => return None,
+    }
+    Some(notification)
+}
+
+pub fn input_state_notification(event: &EventEnvelope) -> Option<serde_json::Value> {
+    let payload = input_state_from_event(event)?;
+    Some(ext_notification(
+        QMT_NOTIFICATION_INPUT_STATE,
+        serde_json::to_value(payload).expect("serialize session input state notification"),
+    ))
+}
+
 fn normalize_querymt_ext_method(method: &str) -> &str {
     method.strip_prefix('_').unwrap_or(method)
 }
 
+fn attach_before_querymt_ext_method(method: &str) -> bool {
+    matches!(
+        normalize_querymt_ext_method(method),
+        "querymt/session/steer" | "querymt/session/queue" | "querymt/session/discardQueuedInput"
+    )
+}
+
 fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> Option<String> {
     match normalize_querymt_ext_method(method) {
-        "querymt/session/delegateModels" | "querymt/session/setDelegateModel" => params
+        "querymt/session/delegateModels"
+        | "querymt/session/setDelegateModel"
+        | "querymt/session/steer"
+        | "querymt/session/queue"
+        | "querymt/session/discardQueuedInput"
+        | "querymt/session/runtimeState" => params
             .get("session_id")
             .or_else(|| params.get("sessionId"))
             .and_then(serde_json::Value::as_str)
@@ -568,6 +726,9 @@ impl AcpLiveEventTranslator {
         }
         if let Some(update) = self.translate_delegation_update(event) {
             return Some(delegation_update_notification(update));
+        }
+        if let Some(notification) = input_state_notification(event) {
+            return Some(notification);
         }
 
         // Handle ElicitationRequested specially - it's a custom notification, not a session/update
@@ -1113,7 +1274,10 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let response = agent.load_session(params).await;
                             match response {
                                 Ok(r) => {
-                                    attach_rpc_session(
+                                    let request_lock =
+                                        session_owners.request_lock(&session_id, conn_id).await;
+                                    let _request_guard = request_lock.lock().await;
+                                    let ownership_inserted = attach_rpc_session_locked(
                                         agent,
                                         session_owners,
                                         conn_id,
@@ -1126,10 +1290,19 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     if let (Some(hooks), Some(local_agent)) = (
                                         context.session_hooks.as_ref(),
                                         agent.as_any().downcast_ref::<AgentHandle>(),
-                                    ) {
-                                        hooks
-                                            .on_session_loaded(local_agent, &session_id, &mut value)
-                                            .await?;
+                                    ) && let Err(error) = hooks
+                                        .on_session_loaded(local_agent, &session_id, &mut value)
+                                        .await
+                                    {
+                                        if ownership_inserted {
+                                            unsubscribe_connection(
+                                                session_owners,
+                                                &session_id,
+                                                conn_id,
+                                            )
+                                            .await;
+                                        }
+                                        return Err(error);
                                     }
                                     if let Some(notification) =
                                         available_commands_session_update(agent, &session_id).await
@@ -1349,40 +1522,98 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                         ext_method,
                         std::sync::Arc::from(raw_params),
                     );
+                    let attached_before_request = attach_before_querymt_ext_method(ext_method);
+                    let _ownership_request_guard = if attached_before_request {
+                        if let Some(session_id) = session_id_for_owner.as_deref() {
+                            Some(
+                                session_owners
+                                    .request_lock(session_id, conn_id)
+                                    .await
+                                    .lock_owned()
+                                    .await,
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    let ownership_inserted = if attached_before_request {
+                        if let Some(session_id) = session_id_for_owner.as_deref() {
+                            attach_rpc_session_locked(
+                                agent,
+                                session_owners,
+                                conn_id,
+                                &context,
+                                session_id,
+                                false,
+                            )
+                            .await?
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     let response = agent.ext_method(ext_req).await.map(|r| {
                         serde_json::from_str(r.0.get()).unwrap_or(serde_json::Value::Null)
                     });
                     match response {
                         Ok(mut value) => {
-                            let session_id = session_id_for_owner
-                                .or_else(|| querymt_session_id_from_response(ext_method, &value));
+                            let session_id = session_id_for_owner.clone().or_else(|| {
+                                querymt_session_id_from_response(ext_method, &value)
+                            });
                             if let Some(session_id) = session_id {
-                                attach_rpc_session(
-                                    agent,
-                                    session_owners,
-                                    conn_id,
-                                    &context,
-                                    &session_id,
-                                    false,
-                                )
-                                .await?;
+                                let mut post_attach_guard = None;
+                                let mut post_attach_inserted = false;
+                                if !attached_before_request {
+                                    let request_lock =
+                                        session_owners.request_lock(&session_id, conn_id).await;
+                                    post_attach_guard = Some(request_lock.lock_owned().await);
+                                    post_attach_inserted = attach_rpc_session_locked(
+                                        agent,
+                                        session_owners,
+                                        conn_id,
+                                        &context,
+                                        &session_id,
+                                        false,
+                                    )
+                                    .await?;
+                                }
 
                                 if let (Some(hooks), Some(local_agent)) = (
                                     context.session_hooks.as_ref(),
                                     agent.as_any().downcast_ref::<AgentHandle>(),
-                                ) {
-                                    hooks
-                                        .on_remote_session_attached(
-                                            local_agent,
+                                ) && let Err(error) = hooks
+                                    .on_remote_session_attached(
+                                        local_agent,
+                                        &session_id,
+                                        &mut value,
+                                    )
+                                    .await
+                                {
+                                    if ownership_inserted || post_attach_inserted {
+                                        unsubscribe_connection(
+                                            session_owners,
                                             &session_id,
-                                            &mut value,
+                                            conn_id,
                                         )
-                                        .await?;
+                                        .await;
+                                    }
+                                    return Err(error);
                                 }
+                                drop(post_attach_guard);
                             }
                             Ok(value)
                         }
-                        Err(e) => Err(e),
+                        Err(e) => {
+                            if ownership_inserted
+                                && let Some(session_id) = session_id_for_owner.as_deref()
+                            {
+                                unsubscribe_connection(session_owners, session_id, conn_id).await;
+                            }
+                            Err(e)
+                        }
                     }
                 }
 
@@ -1530,13 +1761,14 @@ mod tests {
     use crate::test_utils::DelegateTestFixture;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
     use tokio::sync::{Mutex, Notify};
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn session_subscriptions_support_multiple_connections_and_cleanup() {
-        let subscriptions: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let subscriptions = SessionOwnerMap::default();
         subscribe_connection(&subscriptions, "session".to_string(), "conn-a").await;
         subscribe_connection(&subscriptions, "session".to_string(), "conn-b").await;
 
@@ -1572,6 +1804,10 @@ mod tests {
         for method in [
             "querymt/session/delegateModels",
             "_querymt/session/setDelegateModel",
+            "querymt/session/steer",
+            "_querymt/session/queue",
+            "querymt/session/discardQueuedInput",
+            "querymt/session/runtimeState",
         ] {
             assert_eq!(
                 querymt_session_id_from_request(
@@ -1585,6 +1821,126 @@ mod tests {
             querymt_session_id_from_request("querymt/capabilities", &serde_json::json!({})),
             None
         );
+    }
+
+    #[test]
+    fn input_lifecycle_events_translate_to_input_state_notifications() {
+        let cases = [
+            (
+                AgentEventKind::SteeringAccepted {
+                    run_id: "run-1".into(),
+                    input_id: "input-1".into(),
+                    position: 2,
+                    blocks: vec![ContentBlock::Text(TextContent::new("steer"))],
+                    accepted_at_ms: Some(10),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-1",
+                    "delivery": "steer",
+                    "state": "accepted",
+                    "run_id": "run-1",
+                    "position": 2
+                }),
+            ),
+            (
+                AgentEventKind::SteeringApplied {
+                    run_id: "run-1".into(),
+                    input_id: "input-1".into(),
+                    boundary: "after_tools".into(),
+                    latency_ms: 25,
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-1",
+                    "delivery": "steer",
+                    "state": "applied",
+                    "run_id": "run-1",
+                    "boundary": "after_tools",
+                    "latency_ms": 25
+                }),
+            ),
+            (
+                AgentEventKind::SteeringDiscarded {
+                    run_id: "run-1".into(),
+                    input_id: "input-1".into(),
+                    reason: "run_completed".into(),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-1",
+                    "delivery": "steer",
+                    "state": "discarded",
+                    "run_id": "run-1",
+                    "reason": "run_completed"
+                }),
+            ),
+            (
+                AgentEventKind::InputQueued {
+                    input_id: "input-2".into(),
+                    position: 1,
+                    blocks: vec![ContentBlock::Text(TextContent::new("queue"))],
+                    accepted_at_ms: Some(20),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-2",
+                    "delivery": "queue",
+                    "state": "queued",
+                    "position": 1
+                }),
+            ),
+            (
+                AgentEventKind::QueuedInputStarted {
+                    input_id: "input-2".into(),
+                    run_id: "run-2".into(),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-2",
+                    "delivery": "queue",
+                    "state": "started",
+                    "run_id": "run-2"
+                }),
+            ),
+            (
+                AgentEventKind::QueuedInputDiscarded {
+                    input_id: "input-3".into(),
+                    reason: "removed_by_user".into(),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-3",
+                    "delivery": "queue",
+                    "state": "discarded",
+                    "reason": "removed_by_user"
+                }),
+            ),
+        ];
+
+        for (index, (kind, expected)) in cases.into_iter().enumerate() {
+            let event = EventEnvelope::Durable(DurableEvent {
+                event_id: format!("input-event-{index}"),
+                stream_seq: index as i64 + 1,
+                session_id: "s-1".into(),
+                timestamp: index as i64,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind,
+            });
+            let notification = AcpLiveEventTranslator::new()
+                .translate_notification(&event)
+                .expect("input lifecycle notification");
+            assert_eq!(notification["method"], QMT_NOTIFICATION_INPUT_STATE);
+            assert_eq!(notification["params"], expected);
+            assert!(translate_replay_event_to_notification(&event).is_none());
+        }
     }
 
     #[test]
@@ -2253,6 +2609,49 @@ mod tests {
         release_prompt: Option<Arc<Notify>>,
         cancel_seen: Option<Arc<Notify>>,
         local_handle: Option<Arc<AgentHandle>>,
+        reject_ext_method: bool,
+        ext_method_control: Option<Arc<ExtMethodControl>>,
+    }
+
+    struct ExtMethodControl {
+        calls: AtomicUsize,
+        first_started: Notify,
+        second_started: Notify,
+        release_first: Notify,
+    }
+
+    struct RejectPostAttachmentHooks {
+        session_load: bool,
+        remote_session: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpSessionHooks for RejectPostAttachmentHooks {
+        async fn on_session_loaded(
+            &self,
+            _: &AgentHandle,
+            _: &str,
+            _: &mut serde_json::Value,
+        ) -> Result<(), Error> {
+            if self.session_load {
+                Err(Error::invalid_params().data("session load hook rejected"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn on_remote_session_attached(
+            &self,
+            _: &AgentHandle,
+            _: &str,
+            _: &mut serde_json::Value,
+        ) -> Result<(), Error> {
+            if self.remote_session {
+                Err(Error::invalid_params().data("remote session hook rejected"))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -2303,7 +2702,7 @@ mod tests {
             &self,
             _: crate::acp::protocol::LoadSessionRequest,
         ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
-            unreachable!()
+            Ok(crate::acp::protocol::LoadSessionResponse::new())
         }
         async fn list_sessions(
             &self,
@@ -2343,9 +2742,33 @@ mod tests {
         }
         async fn ext_method(
             &self,
-            _: crate::acp::protocol::ExtRequest,
+            req: crate::acp::protocol::ExtRequest,
         ) -> Result<crate::acp::protocol::ExtResponse, Error> {
-            unreachable!()
+            if let Some(control) = &self.ext_method_control {
+                if control.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    control.first_started.notify_one();
+                    control.release_first.notified().await;
+                    return Err(Error::invalid_params().data("rejected extension request"));
+                }
+                control.second_started.notify_one();
+                let raw = serde_json::value::RawValue::from_string("null".to_string()).unwrap();
+                return Ok(crate::acp::protocol::ExtResponse::new(Arc::from(raw)));
+            }
+            if self.reject_ext_method {
+                return Err(Error::invalid_params().data("rejected extension request"));
+            }
+            let response = if req.method.as_ref() == "querymt/remote/createSession" {
+                serde_json::json!({
+                    "session_id": "s-remote-created",
+                    "node_id": "n-1",
+                    "attached": false,
+                    "config_options": []
+                })
+            } else {
+                serde_json::json!({"attached": true})
+            };
+            let raw = serde_json::value::RawValue::from_string(response.to_string()).unwrap();
+            Ok(crate::acp::protocol::ExtResponse::new(Arc::from(raw)))
         }
         async fn ext_notification(
             &self,
@@ -2369,6 +2792,8 @@ mod tests {
                 release_prompt: None,
                 cancel_seen: None,
                 local_handle: None,
+                reject_ext_method: false,
+                ext_method_control: None,
             },
             cancelled_session,
         )
@@ -2395,8 +2820,10 @@ mod tests {
             cancel_seen: Some(cancel_seen.clone()),
             cancelled_session: cancelled_session.clone(),
             local_handle: None,
+            reject_ext_method: false,
+            ext_method_control: None,
         });
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(2);
@@ -2459,7 +2886,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_cancel_notification_dispatches_without_response() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (agent, cancelled_session) = cancel_test_agent();
@@ -2479,6 +2906,303 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_input_extension_rolls_back_only_new_session_ownership() {
+        let session_owners = SessionOwnerMap::default();
+        session_owners.lock().await.insert(
+            "s-existing".to_string(),
+            HashSet::from(["conn-ext".to_string(), "conn-other".to_string()]),
+        );
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: None,
+            reject_ext_method: true,
+            ext_method_control: None,
+        };
+
+        for (method, session_id) in [
+            ("querymt/session/steer", "s-steer"),
+            ("querymt/session/queue", "s-queue"),
+            ("querymt/session/discardQueuedInput", "s-discard"),
+            ("querymt/session/queue", "s-existing"),
+        ] {
+            let output = handle_rpc_message(
+                &agent,
+                &session_owners,
+                &pending_permissions,
+                &pending_elicitations,
+                "conn-ext",
+                RpcMessage {
+                    jsonrpc: "2.0".to_string(),
+                    method: method.to_string(),
+                    params: serde_json::json!({
+                        "session_id": session_id,
+                        "client_input_id": "input-1",
+                        "input_id": "input-1",
+                        "prompt": [{"type": "text", "text": "queued"}]
+                    }),
+                    id: Some(serde_json::json!(1)),
+                },
+            )
+            .await;
+            assert!(
+                output
+                    .response
+                    .expect("request should produce response")
+                    .error
+                    .is_some()
+            );
+        }
+
+        let owners = session_owners.lock().await;
+        for session_id in ["s-steer", "s-queue", "s-discard"] {
+            assert!(!owners.contains_key(session_id));
+        }
+        assert_eq!(
+            owners.get("s-existing"),
+            Some(&HashSet::from([
+                "conn-ext".to_string(),
+                "conn-other".to_string()
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_input_extensions_keep_successful_session_ownership() {
+        let control = Arc::new(ExtMethodControl {
+            calls: AtomicUsize::new(0),
+            first_started: Notify::new(),
+            second_started: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let agent = Arc::new(CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: None,
+            reject_ext_method: false,
+            ext_method_control: Some(control.clone()),
+        });
+        let session_owners = SessionOwnerMap::default();
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let spawn_request = |id| {
+            let agent = agent.clone();
+            let session_owners = session_owners.clone();
+            let pending_permissions = pending_permissions.clone();
+            let pending_elicitations = pending_elicitations.clone();
+            tokio::spawn(async move {
+                handle_rpc_message(
+                    agent.as_ref(),
+                    &session_owners,
+                    &pending_permissions,
+                    &pending_elicitations,
+                    "conn-ext",
+                    RpcMessage {
+                        jsonrpc: "2.0".to_string(),
+                        method: "querymt/session/queue".to_string(),
+                        params: serde_json::json!({
+                            "session_id": "s-concurrent",
+                            "client_input_id": format!("input-{id}"),
+                            "prompt": [{"type": "text", "text": "queued"}]
+                        }),
+                        id: Some(serde_json::json!(id)),
+                    },
+                )
+                .await
+            })
+        };
+
+        let rejected = spawn_request(1);
+        timeout(Duration::from_secs(2), control.first_started.notified())
+            .await
+            .expect("first extension should start");
+        let accepted = spawn_request(2);
+        assert!(
+            timeout(Duration::from_millis(50), control.second_started.notified())
+                .await
+                .is_err(),
+            "second extension must wait for the first ownership decision"
+        );
+
+        control.release_first.notify_one();
+        let rejected = rejected.await.expect("rejected request should finish");
+        assert!(
+            rejected
+                .response
+                .expect("rejected request should produce response")
+                .error
+                .is_some()
+        );
+        timeout(Duration::from_secs(2), control.second_started.notified())
+            .await
+            .expect("second extension should start after rollback");
+        let accepted = accepted.await.expect("accepted request should finish");
+        assert!(
+            accepted
+                .response
+                .expect("accepted request should produce response")
+                .error
+                .is_none()
+        );
+        assert_eq!(
+            session_owners.lock().await.get("s-concurrent").cloned(),
+            Some(HashSet::from(["conn-ext".to_string()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_session_load_hook_rolls_back_only_new_ownership() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+            reject_ext_method: false,
+            ext_method_control: None,
+        };
+        let session_owners = SessionOwnerMap::default();
+        session_owners.lock().await.insert(
+            "s-load-existing".to_string(),
+            HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
+        );
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let context = RpcDispatchContext {
+            session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
+                session_load: true,
+                remote_session: false,
+            })),
+            session_bridge: None,
+        };
+
+        for session_id in ["s-load-new", "s-load-existing"] {
+            let output = handle_rpc_message_with_context(
+                &agent,
+                &session_owners,
+                &pending_permissions,
+                &pending_elicitations,
+                "conn-hook",
+                RpcMessage {
+                    jsonrpc: "2.0".to_string(),
+                    method: AGENT_METHOD_NAMES.session_load.to_string(),
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "cwd": "/tmp",
+                        "mcpServers": []
+                    }),
+                    id: Some(serde_json::json!(1)),
+                },
+                context.clone(),
+            )
+            .await;
+            assert!(
+                output
+                    .response
+                    .expect("request should produce response")
+                    .error
+                    .is_some()
+            );
+        }
+
+        let owners = session_owners.lock().await;
+        assert!(!owners.contains_key("s-load-new"));
+        assert_eq!(
+            owners.get("s-load-existing"),
+            Some(&HashSet::from([
+                "conn-hook".to_string(),
+                "conn-other".to_string()
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remote_attachment_hook_rolls_back_only_new_ownership() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+            reject_ext_method: false,
+            ext_method_control: None,
+        };
+        let session_owners = SessionOwnerMap::default();
+        session_owners.lock().await.insert(
+            "s-remote-existing".to_string(),
+            HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
+        );
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let context = RpcDispatchContext {
+            session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
+                session_load: false,
+                remote_session: true,
+            })),
+            session_bridge: None,
+        };
+
+        for (method, params) in [
+            (
+                "querymt/remote/attachSession",
+                serde_json::json!({"session_id": "s-remote-new", "node_id": "n-1"}),
+            ),
+            (
+                "querymt/remote/attachSession",
+                serde_json::json!({"session_id": "s-remote-existing", "node_id": "n-1"}),
+            ),
+            (
+                "querymt/remote/createSession",
+                serde_json::json!({"node_id": "n-1"}),
+            ),
+        ] {
+            let output = handle_rpc_message_with_context(
+                &agent,
+                &session_owners,
+                &pending_permissions,
+                &pending_elicitations,
+                "conn-hook",
+                RpcMessage {
+                    jsonrpc: "2.0".to_string(),
+                    method: method.to_string(),
+                    params,
+                    id: Some(serde_json::json!(1)),
+                },
+                context.clone(),
+            )
+            .await;
+            assert!(
+                output
+                    .response
+                    .expect("request should produce response")
+                    .error
+                    .is_some()
+            );
+        }
+
+        let owners = session_owners.lock().await;
+        for session_id in ["s-remote-new", "s-remote-created"] {
+            assert!(!owners.contains_key(session_id));
+        }
+        assert_eq!(
+            owners.get("s-remote-existing"),
+            Some(&HashSet::from([
+                "conn-hook".to_string(),
+                "conn-other".to_string()
+            ]))
+        );
+    }
+
+    #[tokio::test]
     async fn lifecycle_response_survives_bridge_attachment_failure() {
         let local_fixture = crate::test_utils::TestAgent::new().await;
         let (bridge_tx, _bridge_rx) = mpsc::channel(1);
@@ -2488,8 +3212,10 @@ mod tests {
             release_prompt: None,
             cancel_seen: None,
             local_handle: Some(local_fixture.handle),
+            reject_ext_method: false,
+            ext_method_control: None,
         };
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
@@ -2539,8 +3265,10 @@ mod tests {
             release_prompt: None,
             cancel_seen: None,
             local_handle: Some(local_fixture.handle),
+            reject_ext_method: false,
+            ext_method_control: None,
         };
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
@@ -2584,7 +3312,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_rpc_dispatches_to_agent_new_session() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -2744,7 +3472,7 @@ mod tests {
         method: &str,
         params: serde_json::Value,
     ) -> RpcDispatchOutput {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
@@ -2826,7 +3554,7 @@ mod tests {
         let mut registry = crate::slash_commands::SlashCommandRegistry::new();
         registry.register(docs_slash_command());
         let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(8);
@@ -2865,7 +3593,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_attach_extension_records_session_owner_with_snake_case_payload() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -2993,7 +3721,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_create_session_records_session_owner_from_snake_case_response() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3120,7 +3848,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_load_records_session_owner_for_live_updates() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3247,7 +3975,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_close_rpc_forwards_to_send_agent() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3373,7 +4101,7 @@ mod tests {
     /// to the SendAgent trait method (default impl returns method_not_found).
     #[tokio::test]
     async fn set_config_option_rpc_forwards_to_send_agent() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3513,7 +4241,7 @@ mod tests {
             },
         );
 
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = fixture.planner.pending_elicitations();
 

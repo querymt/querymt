@@ -43,6 +43,8 @@ export type AgentEventKind =
 	run_id: string;
 	input_id: string;
 	position: number;
+	blocks?: any;
+	accepted_at_ms?: number;
 }}
 	| { type: "steering_applied", data: {
 	run_id: string;
@@ -58,10 +60,16 @@ export type AgentEventKind =
 	| { type: "input_queued", data: {
 	input_id: string;
 	position: number;
+	blocks?: any;
+	accepted_at_ms?: number;
 }}
 	| { type: "queued_input_started", data: {
 	input_id: string;
 	run_id: string;
+}}
+	| { type: "queued_input_discarded", data: {
+	input_id: string;
+	reason: string;
 }}
 	| { type: "objective_initialized", data: {
 	run_id: string;
@@ -1206,6 +1214,32 @@ export interface SessionGroup {
 	next_cursor?: string;
 }
 
+export enum SessionInputDelivery {
+	Steer = "steer",
+	Queue = "queue",
+}
+
+export enum SessionInputState {
+	Accepted = "accepted",
+	Queued = "queued",
+	Applied = "applied",
+	Started = "started",
+	Discarded = "discarded",
+}
+
+export interface SessionInputStateNotification {
+	version: number;
+	session_id: string;
+	input_id: string;
+	delivery: SessionInputDelivery;
+	state: SessionInputState;
+	run_id?: string;
+	position?: number;
+	boundary?: string;
+	reason?: string;
+	latency_ms?: number;
+}
+
 /**
  * Session limits configuration (exposed to UI)
  * Typeshare-annotated: generated for TypeScript and Swift.
@@ -1342,6 +1376,14 @@ export enum DelegateReasoningEffort {
 	High = "high",
 	Max = "max",
 }
+
+export type DiscardQueuedInputResult = 
+	| { status: "discarded", data: {
+	input_id: string;
+}}
+	| { status: "not_pending", data: {
+	input_id: string;
+}};
 
 /**
  * Whether an event must be persisted to the journal (durable) or is

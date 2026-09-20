@@ -29,6 +29,10 @@ async fn test_querymt_capabilities_lists_control_surface() {
             .any(|method| method == "querymt/schedules/get")
     );
     for expected in [
+        "querymt/session/steer",
+        "querymt/session/queue",
+        "querymt/session/discardQueuedInput",
+        "querymt/session/runtimeState",
         "querymt/session/undo",
         "querymt/session/redo",
         "querymt/session/undoStack",
@@ -63,6 +67,12 @@ async fn test_querymt_capabilities_lists_control_surface() {
             .iter()
             .any(|method| method == "querymt/session/delegationUpdate")
     );
+    assert!(
+        notifications
+            .iter()
+            .any(|method| method == "querymt/session/inputState")
+    );
+    assert_eq!(result["features"]["steering"], true);
     assert_eq!(result["transport"]["mesh_transport"], "none");
     assert_eq!(result["features"]["mesh_invites"], false);
     assert_eq!(result["features"]["profiles"], false);

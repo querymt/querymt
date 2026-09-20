@@ -79,7 +79,7 @@ impl WsServerState {
             event_sources: collect_event_sources(&agent),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             pending_elicitations: agent.pending_elicitations(),
-            session_owners: Arc::new(Mutex::new(HashMap::new())),
+            session_owners: SessionOwnerMap::default(),
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
             session_reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
             require_same_origin,

@@ -1781,6 +1781,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                         run_id: run.run_id.clone(),
                     }));
                 }
+                let blocks = input.prompt.clone();
                 let position = run
                     .steering
                     .push(
@@ -1790,6 +1791,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     )
                     .await
                     .map_err(AgentError::from)?;
+                let accepted_at_ms = now_ms();
                 let position = crate::agent::utils::u32_from_usize(
                     position,
                     "steering_position",
@@ -1801,6 +1803,8 @@ impl Message<SubmitSessionInput> for SessionActor {
                         run_id: run.run_id.clone(),
                         input_id: input_id.clone(),
                         position,
+                        blocks,
+                        accepted_at_ms: Some(accepted_at_ms),
                     },
                 );
                 let result = SubmitInputResult::Steered {
@@ -1812,6 +1816,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                 Ok(result)
             }
             InputDelivery::Queue => {
+                let blocks = input.prompt.clone();
                 let req =
                     crate::acp::protocol::PromptRequest::new(self.session_id.clone(), input.prompt);
                 if self.active_run.is_some() && self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
@@ -1851,30 +1856,73 @@ impl Message<SubmitSessionInput> for SessionActor {
                     Ok(result)
                 } else {
                     let position = self.queued_prompts.len() + 1;
+                    let position = crate::agent::utils::u32_from_usize(
+                        position,
+                        "queued_input_position",
+                        Some(&self.session_id),
+                    );
+                    self.config
+                        .emit_event_persisted(
+                            &self.session_id,
+                            AgentEventKind::InputQueued {
+                                input_id: input_id.clone(),
+                                position,
+                                blocks,
+                                accepted_at_ms: Some(now_ms()),
+                            },
+                        )
+                        .await
+                        .map_err(AgentError::from)?;
                     self.queued_prompts.push_back(QueuedPrompt {
                         input_id: input_id.clone(),
                         req,
                         bridge: self.bridge.clone(),
                         reply,
                     });
-                    let position = crate::agent::utils::u32_from_usize(
-                        position,
-                        "queued_input_position",
-                        Some(&self.session_id),
-                    );
-                    self.config.emit_event(
-                        &self.session_id,
-                        AgentEventKind::InputQueued {
-                            input_id: input_id.clone(),
-                            position,
-                        },
-                    );
                     let result = SubmitInputResult::Queued { input_id, position };
                     self.record_submit_receipt(input.client_input_id, &result);
                     Ok(result)
                 }
             }
         }
+    }
+}
+
+impl Message<DiscardQueuedInput> for SessionActor {
+    type Reply = Result<DiscardQueuedInputResult, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: DiscardQueuedInput,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let input_id = msg.input_id;
+        let Some(position) = self
+            .queued_prompts
+            .iter()
+            .position(|queued| queued.input_id == input_id)
+        else {
+            return Ok(DiscardQueuedInputResult::NotPending { input_id });
+        };
+        self.config
+            .emit_event_persisted(
+                &self.session_id,
+                AgentEventKind::QueuedInputDiscarded {
+                    input_id: input_id.clone(),
+                    reason: "removed_by_user".to_string(),
+                },
+            )
+            .await
+            .map_err(AgentError::from)?;
+        let Some(queued) = self.queued_prompts.remove(position) else {
+            return Err(AgentError::Internal(format!(
+                "queued input {input_id} disappeared after discard persistence"
+            )));
+        };
+        let _ = queued
+            .reply
+            .send(Ok(PromptResponse::new(StopReason::Cancelled)));
+        Ok(DiscardQueuedInputResult::Discarded { input_id })
     }
 }
 
@@ -1893,6 +1941,7 @@ impl Message<Prompt> for SessionActor {
             }
             let input_id = Uuid::new_v4().to_string();
             let position = self.queued_prompts.len() + 1;
+            let blocks = msg.req.prompt.clone();
             self.queued_prompts.push_back(QueuedPrompt {
                 input_id: input_id.clone(),
                 req: msg.req,
@@ -1908,6 +1957,8 @@ impl Message<Prompt> for SessionActor {
                         "legacy_queued_input_position",
                         Some(&self.session_id),
                     ),
+                    blocks,
+                    accepted_at_ms: Some(now_ms()),
                 },
             );
         } else {
@@ -2754,7 +2805,7 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use kameo::actor::Spawn;
     use querymt::LLMParams;
@@ -2765,8 +2816,11 @@ mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
+    use crate::events::DurableEvent;
     use crate::session::backend::StorageBackend;
     use crate::session::domain::IntentSnapshot;
+    use crate::session::error::{SessionError, SessionResult};
+    use crate::session::projection::{EventJournal, NewDurableEvent};
     use crate::session::runtime::RuntimeContext;
     use crate::session::store::SessionStore;
     use crate::test_utils::{
@@ -2775,6 +2829,118 @@ mod tests {
     };
 
     // ── Shared fixture ───────────────────────────────────────────────────────
+
+    struct FailNextAppendJournal {
+        inner: Arc<dyn EventJournal>,
+        fail_next_append: AtomicBool,
+    }
+
+    impl FailNextAppendJournal {
+        fn new(inner: Arc<dyn EventJournal>) -> Self {
+            Self {
+                inner,
+                fail_next_append: AtomicBool::new(false),
+            }
+        }
+
+        fn fail_next_append(&self) {
+            self.fail_next_append.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventJournal for FailNextAppendJournal {
+        async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
+            if self.fail_next_append.swap(false, Ordering::SeqCst) {
+                return Err(SessionError::DatabaseError(
+                    "simulated event append failure".to_string(),
+                ));
+            }
+            self.inner.append_durable(event).await
+        }
+
+        async fn load_session_stream(
+            &self,
+            session_id: &str,
+            after_seq: Option<i64>,
+            limit: Option<usize>,
+        ) -> SessionResult<Vec<DurableEvent>> {
+            self.inner
+                .load_session_stream(session_id, after_seq, limit)
+                .await
+        }
+
+        async fn load_global_stream(
+            &self,
+            after_seq: Option<i64>,
+            limit: Option<usize>,
+        ) -> SessionResult<Vec<DurableEvent>> {
+            self.inner.load_global_stream(after_seq, limit).await
+        }
+
+        async fn delete_session_events_from(
+            &self,
+            session_id: &str,
+            from_seq: i64,
+        ) -> SessionResult<usize> {
+            self.inner
+                .delete_session_events_from(session_id, from_seq)
+                .await
+        }
+
+        async fn append_durable_from_source(
+            &self,
+            event: &NewDurableEvent,
+        ) -> SessionResult<Option<DurableEvent>> {
+            self.inner.append_durable_from_source(event).await
+        }
+
+        async fn latest_source_seq(
+            &self,
+            session_id: &str,
+            source_node_id: &str,
+        ) -> SessionResult<Option<i64>> {
+            self.inner
+                .latest_source_seq(session_id, source_node_id)
+                .await
+        }
+
+        async fn remote_sync_cursor(
+            &self,
+            session_id: &str,
+            source_node_id: &str,
+        ) -> SessionResult<Option<i64>> {
+            self.inner
+                .remote_sync_cursor(session_id, source_node_id)
+                .await
+        }
+
+        async fn advance_remote_sync_cursor(
+            &self,
+            session_id: &str,
+            source_node_id: &str,
+            source_seq: i64,
+            complete: bool,
+        ) -> SessionResult<()> {
+            self.inner
+                .advance_remote_sync_cursor(session_id, source_node_id, source_seq, complete)
+                .await
+        }
+
+        async fn load_remote_session_stream(
+            &self,
+            session_id: &str,
+            source_node_id: &str,
+        ) -> SessionResult<Vec<DurableEvent>> {
+            self.inner
+                .load_remote_session_stream(session_id, source_node_id)
+                .await
+        }
+
+        async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
+            self.inner.max_stream_seq(session_id).await
+        }
+    }
 
     struct GetQueuedPromptBridgeIds;
 
@@ -2804,6 +2970,7 @@ mod tests {
         actor_ref: kameo::actor::ActorRef<SessionActor>,
         _session_id: String,
         _temp_dir: tempfile::TempDir,
+        event_journal: Arc<FailNextAppendJournal>,
         intent_writes: Arc<AtomicUsize>,
         history_writes: Arc<AtomicUsize>,
     }
@@ -2939,11 +3106,12 @@ mod tests {
                 store,
                 LLMParams::new().provider("mock").model("mock-model"),
             ));
+            let event_journal = Arc::new(FailNextAppendJournal::new(mock_storage.event_journal()));
             let config = Arc::new(
                 AgentConfigBuilder::from_provider(
                     mock_storage.clone(),
                     provider,
-                    mock_storage.event_journal(),
+                    event_journal.clone(),
                 )
                 .with_tool_policy(ToolPolicy::ProviderOnly)
                 .build(),
@@ -2962,6 +3130,7 @@ mod tests {
                 actor_ref,
                 _session_id: session_id.to_string(),
                 _temp_dir: temp_dir,
+                event_journal,
                 intent_writes,
                 history_writes,
             }
@@ -3804,6 +3973,236 @@ mod tests {
             .await
             .expect("ask GetMode after potential bridge set");
         assert_eq!(mode, AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn discard_queued_input_removes_only_pending_input_and_is_idempotent() {
+        let fixture = ActorFixture::new().await;
+        let session_id = fixture._session_id.clone();
+        let mut actor = SessionActor::new(
+            fixture.config.clone(),
+            session_id.clone(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        actor.active_run = Some(ActiveRun::new(
+            "running".to_string(),
+            1,
+            CancellationToken::new(),
+        ));
+        let actor_ref = SessionActor::spawn(actor);
+        let mut events = fixture.config.subscribe_events();
+        for input_id in ["queued-1", "queued-2"] {
+            actor_ref
+                .ask(SubmitSessionInput {
+                    input: SubmitInput {
+                        session_id: session_id.clone(),
+                        client_input_id: Some(input_id.to_string()),
+                        expected_run_id: None,
+                        delivery: InputDelivery::Queue,
+                        prompt: vec![crate::acp::protocol::ContentBlock::from(input_id)],
+                    },
+                })
+                .await
+                .expect("queue input");
+        }
+
+        let discarded = actor_ref
+            .ask(DiscardQueuedInput {
+                input_id: "queued-1".to_string(),
+            })
+            .await
+            .expect("discard queued input");
+        assert_eq!(
+            discarded,
+            DiscardQueuedInputResult::Discarded {
+                input_id: "queued-1".to_string()
+            }
+        );
+        assert_eq!(
+            actor_ref
+                .ask(GetRuntimeStatus)
+                .await
+                .expect("get runtime status")
+                .queued_input_count,
+            1
+        );
+
+        let repeated = actor_ref
+            .ask(DiscardQueuedInput {
+                input_id: "queued-1".to_string(),
+            })
+            .await
+            .expect("repeat discard queued input");
+        assert_eq!(
+            repeated,
+            DiscardQueuedInputResult::NotPending {
+                input_id: "queued-1".to_string()
+            }
+        );
+
+        let mut saw_queued_content = false;
+        let mut saw_discarded = false;
+        for _ in 0..3 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("queue lifecycle event")
+                .expect("event stream open");
+            match event.kind() {
+                AgentEventKind::InputQueued {
+                    input_id,
+                    blocks,
+                    accepted_at_ms,
+                    ..
+                } if input_id == "queued-1" => {
+                    assert_eq!(
+                        serde_json::to_value(blocks).expect("serialize queued blocks"),
+                        serde_json::json!([{"type": "text", "text": "queued-1"}])
+                    );
+                    assert!(accepted_at_ms.is_some());
+                    saw_queued_content = true;
+                }
+                AgentEventKind::QueuedInputDiscarded { input_id, reason }
+                    if input_id == "queued-1" && reason == "removed_by_user" =>
+                {
+                    assert!(event.is_durable());
+                    saw_discarded = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_queued_content, "queued input content event missing");
+        assert!(saw_discarded, "queued discard lifecycle event missing");
+        let durable_kinds = fixture
+            .event_journal
+            .load_session_stream(&session_id, None, None)
+            .await
+            .expect("load queued input lifecycle")
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
+        let queued_index = durable_kinds
+            .iter()
+            .position(|kind| {
+                matches!(
+                    kind,
+                    AgentEventKind::InputQueued { input_id, .. } if input_id == "queued-1"
+                )
+            })
+            .expect("queued event should be durable");
+        let discarded_index = durable_kinds
+            .iter()
+            .position(|kind| {
+                matches!(
+                    kind,
+                    AgentEventKind::QueuedInputDiscarded { input_id, .. }
+                        if input_id == "queued-1"
+                )
+            })
+            .expect("discard event should be durable");
+        assert!(queued_index < discarded_index);
+        actor_ref.tell(Shutdown).await.expect("shutdown actor");
+    }
+
+    #[tokio::test]
+    async fn queued_input_mutations_wait_for_durable_events() {
+        let fixture = ActorFixture::new().await;
+        let session_id = fixture._session_id.clone();
+        let mut actor = SessionActor::new(
+            fixture.config.clone(),
+            session_id.clone(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        actor.active_run = Some(ActiveRun::new(
+            "running".to_string(),
+            1,
+            CancellationToken::new(),
+        ));
+        let actor_ref = SessionActor::spawn(actor);
+        let submit = || SubmitSessionInput {
+            input: SubmitInput {
+                session_id: session_id.clone(),
+                client_input_id: Some("queued-failure".to_string()),
+                expected_run_id: None,
+                delivery: InputDelivery::Queue,
+                prompt: vec![crate::acp::protocol::ContentBlock::from("queued")],
+            },
+        };
+
+        fixture.event_journal.fail_next_append();
+        let failed_queue = actor_ref.ask(submit()).await;
+        assert!(matches!(
+            failed_queue,
+            Err(kameo::error::SendError::HandlerError(AgentError::Internal(message)))
+                if message.contains("simulated event append failure")
+        ));
+        assert_eq!(
+            actor_ref
+                .ask(GetRuntimeStatus)
+                .await
+                .expect("get status after failed queue")
+                .queued_input_count,
+            0
+        );
+
+        let queued = actor_ref
+            .ask(submit())
+            .await
+            .expect("queue retry should succeed");
+        assert!(matches!(
+            queued,
+            SubmitInputResult::Queued { ref input_id, position: 1 }
+                if input_id == "queued-failure"
+        ));
+
+        fixture.event_journal.fail_next_append();
+        let failed_discard = actor_ref
+            .ask(DiscardQueuedInput {
+                input_id: "queued-failure".to_string(),
+            })
+            .await;
+        assert!(matches!(
+            failed_discard,
+            Err(kameo::error::SendError::HandlerError(AgentError::Internal(message)))
+                if message.contains("simulated event append failure")
+        ));
+        assert_eq!(
+            actor_ref
+                .ask(GetRuntimeStatus)
+                .await
+                .expect("get status after failed discard")
+                .queued_input_count,
+            1
+        );
+
+        let discarded = actor_ref
+            .ask(DiscardQueuedInput {
+                input_id: "queued-failure".to_string(),
+            })
+            .await
+            .expect("discard retry should succeed");
+        assert_eq!(
+            discarded,
+            DiscardQueuedInputResult::Discarded {
+                input_id: "queued-failure".to_string()
+            }
+        );
+        assert_eq!(
+            actor_ref
+                .ask(GetRuntimeStatus)
+                .await
+                .expect("get status after discard retry")
+                .queued_input_count,
+            0
+        );
+        actor_ref.tell(Shutdown).await.expect("shutdown actor");
     }
 
     #[tokio::test]

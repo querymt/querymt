@@ -88,6 +88,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/auth/setMethod".to_string(),
         "querymt/session/steer".to_string(),
         "querymt/session/queue".to_string(),
+        "querymt/session/discardQueuedInput".to_string(),
         "querymt/session/runtimeState".to_string(),
         "querymt/session/undo".to_string(),
         "querymt/session/redo".to_string(),
@@ -134,6 +135,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/models/changed".to_string(),
         "querymt/schedules/changed".to_string(),
         crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE.to_string(),
+        crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE.to_string(),
     ];
     if agent.profiles().is_some() {
         notifications
