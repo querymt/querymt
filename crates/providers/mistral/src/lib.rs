@@ -10,7 +10,7 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider, ToolCall,
     chat::{
-ChatMessage, ChatOutput, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatOutput, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,

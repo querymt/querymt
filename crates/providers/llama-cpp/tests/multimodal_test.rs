@@ -294,7 +294,10 @@ async fn test_text_only_with_vision_model() {
 
     assert!(!text.is_empty(), "Should get text response");
     assert!(
-        response.usage.as_ref().map_or(false, |u| u.output_tokens > 0),
+        response
+            .usage
+            .as_ref()
+            .map_or(false, |u| u.output_tokens > 0),
         "Should generate tokens"
     );
 

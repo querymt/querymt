@@ -564,12 +564,9 @@ async fn test_parallel_tool_results_in_single_user_message() {
         .expect_chat()
         .times(1)
         .in_sequence(&mut seq)
-        .returning(move |_| {
-            Ok(MockChatResponse::with_tools(
-                "thinking",
-                tool_calls.clone(),
-            ).into())
-        });
+        .returning(
+            move |_| Ok(MockChatResponse::with_tools("thinking", tool_calls.clone()).into()),
+        );
     // Second LLM call — capture the history to assert on message structure.
     harness
         .provider_mut()
@@ -610,9 +607,7 @@ async fn test_parallel_tool_results_in_single_user_message() {
     // Count User messages that contain at least one tool result input part.
     let user_tool_result_messages: Vec<_> = history
         .iter()
-        .filter(|msg| {
-            msg.role == querymt::chat::ChatRole::User && msg.has_tool_result()
-        })
+        .filter(|msg| msg.role == querymt::chat::ChatRole::User && msg.has_tool_result())
         .collect();
 
     // All 3 tool results must be in a SINGLE user message, not 3 separate ones.
@@ -795,12 +790,7 @@ async fn test_single_tool_call_cycle() {
         .expect_chat()
         .times(1)
         .in_sequence(&mut seq)
-        .returning(move |_| {
-            Ok(MockChatResponse::with_tools(
-                "",
-                vec![tool_call.clone()],
-            ).into())
-        });
+        .returning(move |_| Ok(MockChatResponse::with_tools("", vec![tool_call.clone()]).into()));
     harness
         .provider_mut()
         .await
@@ -812,7 +802,11 @@ async fn test_single_tool_call_cycle() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "tool output".to_string() }]))
+        .returning(|_, _| {
+            Ok(vec![querymt::chat::ToolResultPart::Text {
+                text: "tool output".to_string(),
+            }])
+        })
         .times(1);
     harness
         .provider_mut()
@@ -841,12 +835,7 @@ async fn test_multiple_tool_calls_batch() {
         .expect_chat()
         .times(1)
         .in_sequence(&mut seq)
-        .returning(move |_| {
-            Ok(MockChatResponse::with_tools(
-                "",
-                tool_calls.clone(),
-            ).into())
-        });
+        .returning(move |_| Ok(MockChatResponse::with_tools("", tool_calls.clone()).into()));
     harness
         .provider_mut()
         .await
@@ -858,7 +847,11 @@ async fn test_multiple_tool_calls_batch() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "tool output".to_string() }]))
+        .returning(|_, _| {
+            Ok(vec![querymt::chat::ToolResultPart::Text {
+                text: "tool output".to_string(),
+            }])
+        })
         .times(2);
     harness
         .provider_mut()
@@ -953,12 +946,7 @@ async fn test_tool_error_continues() {
         .expect_chat()
         .times(1)
         .in_sequence(&mut seq)
-        .returning(move |_| {
-            Ok(MockChatResponse::with_tools(
-                "",
-                vec![tool_call.clone()],
-            ).into())
-        });
+        .returning(move |_| Ok(MockChatResponse::with_tools("", vec![tool_call.clone()]).into()));
     harness
         .provider_mut()
         .await
@@ -998,12 +986,7 @@ async fn test_tool_binary_output_survives_follow_up_turn_until_compaction() {
         .expect_chat()
         .times(1)
         .in_sequence(&mut seq)
-        .returning(move |_| {
-            Ok(MockChatResponse::with_tools(
-                "",
-                vec![tool_call.clone()],
-            ).into())
-        });
+        .returning(move |_| Ok(MockChatResponse::with_tools("", vec![tool_call.clone()]).into()));
     harness
         .provider_mut()
         .await
@@ -1034,7 +1017,9 @@ async fn test_tool_binary_output_survives_follow_up_turn_until_compaction() {
                     querymt::chat::MediaPart::new(
                         querymt::chat::MediaKind::Document,
                         Some("application/pdf".parse().unwrap()),
-                        querymt::chat::MediaSource::Inline { data: vec![1u8; 64] },
+                        querymt::chat::MediaSource::Inline {
+                            data: vec![1u8; 64],
+                        },
                     )
                     .unwrap(),
                 )),
@@ -1105,12 +1090,7 @@ async fn test_waiting_for_event_delegation() {
         .expect_chat()
         .times(1)
         .in_sequence(&mut seq)
-        .returning(move |_| {
-            Ok(MockChatResponse::with_tools(
-                "",
-                vec![tool_call.clone()],
-            ).into())
-        });
+        .returning(move |_| Ok(MockChatResponse::with_tools("", vec![tool_call.clone()]).into()));
     harness
         .provider_mut()
         .await
@@ -1122,7 +1102,11 @@ async fn test_waiting_for_event_delegation() {
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
+        .returning(|_, _| {
+            Ok(vec![querymt::chat::ToolResultPart::Text {
+                text: "ok".to_string(),
+            }])
+        })
         .times(1);
     harness
         .provider_mut()

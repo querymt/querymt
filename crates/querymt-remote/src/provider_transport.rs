@@ -262,8 +262,12 @@ mod tests {
     #[test]
     fn encoded_envelope_size_matches_the_real_cbor_codec() {
         let messages = vec![
-            ChatMessage::from_user_parts(vec![png_part((0..258_708).map(|i| (i % 256) as u8).collect())]),
-            ChatMessage::from_user_parts(vec![png_part((0..250_180).map(|i| (i % 256) as u8).collect())]),
+            ChatMessage::from_user_parts(vec![png_part(
+                (0..258_708).map(|i| (i % 256) as u8).collect(),
+            )]),
+            ChatMessage::from_user_parts(vec![png_part(
+                (0..250_180).map(|i| (i % 256) as u8).collect(),
+            )]),
         ];
         let request = tell_request(&messages);
         let actual_size = wire_bytes(&request).len() as u64;

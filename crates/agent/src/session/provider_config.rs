@@ -232,10 +232,7 @@ mod tests {
             unimplemented!()
         }
 
-        fn parse_chat(
-            &self,
-            _resp: http::Response<Vec<u8>>,
-        ) -> Result<ChatOutput, LLMError> {
+        fn parse_chat(&self, _resp: http::Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
             unimplemented!()
         }
     }

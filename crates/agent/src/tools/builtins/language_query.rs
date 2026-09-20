@@ -201,7 +201,7 @@ impl ToolTrait for LanguageQueryTool {
                 return Ok(vec![ToolResultPart::text(
                     "language_query is not available in this mode. \
                      It requires a VS Code client with workspace query support. \
-                     Use file reading and search tools instead."
+                     Use file reading and search tools instead.",
                 )]);
             }
         };

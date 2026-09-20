@@ -147,11 +147,15 @@ impl ChatProvider for ValidatedLLM {
                         )));
                     }
 
-                    local_messages.push(ChatMessage::user().text(format!(
-                        "Your previous output was invalid because: {}\n\
+                    local_messages.push(
+                        ChatMessage::user()
+                            .text(format!(
+                                "Your previous output was invalid because: {}\n\
                          Please try again and produce a valid response.",
-                        err
-                    )).build());
+                                err
+                            ))
+                            .build(),
+                    );
                 }
             }
         }
