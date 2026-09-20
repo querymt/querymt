@@ -494,8 +494,8 @@ enum XaiResponsesFunctionOutput<'a> {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type")]
 enum XaiResponsesToolOutputPart<'a> {
-    #[serde(rename = "output_text")]
-    OutputText { text: Cow<'a, str> },
+    #[serde(rename = "input_text")]
+    InputText { text: Cow<'a, str> },
     #[serde(rename = "input_image")]
     InputImage { image_url: String },
 }
@@ -634,7 +634,7 @@ fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem
                     for c in content {
                         match c {
                             Content::Text { text } => {
-                                output_parts.push(XaiResponsesToolOutputPart::OutputText {
+                                output_parts.push(XaiResponsesToolOutputPart::InputText {
                                     text: Cow::Borrowed(text.as_str()),
                                 });
                                 text_only_parts.push(text.clone());
@@ -661,7 +661,7 @@ fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem
                                     "[PDF tool output not yet serialized natively ({} bytes)]",
                                     data.len()
                                 );
-                                output_parts.push(XaiResponsesToolOutputPart::OutputText {
+                                output_parts.push(XaiResponsesToolOutputPart::InputText {
                                     text: Cow::Owned(text),
                                 });
                             }
@@ -672,7 +672,7 @@ fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem
                                     mime_type,
                                     data.len()
                                 );
-                                output_parts.push(XaiResponsesToolOutputPart::OutputText {
+                                output_parts.push(XaiResponsesToolOutputPart::InputText {
                                     text: Cow::Owned(text),
                                 });
                             }
@@ -1185,6 +1185,64 @@ mod tests {
                 .get("OpenAI-Beta")
                 .and_then(|v| v.to_str().ok()),
             Some("responses=experimental")
+        );
+    }
+
+    #[test]
+    fn responses_tool_output_uses_input_text_parts_and_bare_string_for_text_only() {
+        let xai = test_xai("xai-key");
+        let messages = vec![
+            ChatMessage::assistant()
+                .tool_use("call-rich", "render", serde_json::json!({}))
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    "call-rich".to_string(),
+                    None,
+                    false,
+                    vec![
+                        Content::text("chart summary"),
+                        Content::image_url("https://example.test/chart.png"),
+                    ],
+                )
+                .build(),
+            ChatMessage::assistant()
+                .tool_use("call-text", "lookup", serde_json::json!({}))
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    "call-text".to_string(),
+                    None,
+                    false,
+                    vec![Content::text("plain answer")],
+                )
+                .build(),
+        ];
+
+        let req = xai
+            .chat_request(&messages, None)
+            .expect("responses request should build");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
+
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+
+        // Mixed text+image tool output must be a rich parts array with the
+        // xAI Responses `input_text` tag (mirrors the Codex fix), text first.
+        let rich_parts = body["input"][1]["output"]
+            .as_array()
+            .expect("mixed text+image output should be a parts array");
+        assert_eq!(rich_parts[0]["type"], "input_text");
+        assert_eq!(rich_parts[0]["text"], "chart summary");
+        assert_eq!(rich_parts[1]["type"], "input_image");
+        assert_eq!(rich_parts[1]["image_url"], "https://example.test/chart.png");
+
+        // Text-only tool output must remain a bare JSON string.
+        assert_eq!(
+            body["input"][3]["output"],
+            serde_json::json!("plain answer")
         );
     }
 

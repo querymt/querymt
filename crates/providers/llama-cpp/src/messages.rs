@@ -102,17 +102,35 @@ pub(crate) fn messages_to_json(
                 Content::ToolResult {
                     id, name, content, ..
                 } => {
+                    // Emit text blocks plus explicit fallback markers for
+                    // unsupported rich blocks (ImageUrl, Pdf, Audio,
+                    // ResourceLink) so their reference information survives.
+                    // Raw images are excluded here: they are forwarded via
+                    // dedicated media markers below, exactly matching what
+                    // extract_media() collects.
                     let output_text = content
                         .iter()
-                        .filter_map(|c| c.as_text())
+                        .filter(|c| !matches!(c, Content::Image { .. }))
+                        .filter_map(|c| {
+                            c.as_text()
+                                .map(str::to_string)
+                                .or_else(|| unsupported_fallback_text(c))
+                        })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    json_messages.push(serde_json::json!({
+
+                    let mut tool_msg = serde_json::json!({
                         "role": "tool",
                         "tool_call_id": id,
-                        "name": name.clone().unwrap_or_default(),
-                        "content": output_text
-                    }));
+                        "content": output_text,
+                    });
+                    // Omit the tool name entirely when absent: an empty string
+                    // is not a valid tool name and some chat templates reject
+                    // or mis-render it.
+                    if let Some(tool_name) = name {
+                        tool_msg["name"] = serde_json::json!(tool_name);
+                    }
+                    json_messages.push(tool_msg);
 
                     // Count only Content::Image inside tool results (matching extract_media).
                     let nested_images = content
@@ -127,15 +145,24 @@ pub(crate) fn messages_to_json(
                         media_count += 1;
                     }
 
-                    // Warn about skipped ImageUrl in tool results.
-                    let skipped_urls = content
+                    // Unsupported media blocks were downgraded to text fallback
+                    // markers above; log so operators know media was reduced to
+                    // a textual reference.
+                    let downgraded_media = content
                         .iter()
-                        .filter(|c| matches!(c, Content::ImageUrl { .. }))
+                        .filter(|c| {
+                            matches!(
+                                c,
+                                Content::ImageUrl { .. }
+                                    | Content::Pdf { .. }
+                                    | Content::Audio { .. }
+                            )
+                        })
                         .count();
-                    if skipped_urls > 0 {
+                    if downgraded_media > 0 {
                         log::warn!(
-                            "Skipped {} ImageUrl block(s) inside ToolResult (not supported for multimodal)",
-                            skipped_urls
+                            "Rendered {} unsupported media block(s) inside ToolResult as text fallback markers",
+                            downgraded_media
                         );
                     }
                 }
@@ -188,6 +215,44 @@ pub(crate) fn messages_to_json(
     Ok((json, media_count))
 }
 
+/// Render an unsupported content block as an explicit text fallback marker.
+///
+/// llama.cpp's multimodal path can only ingest raw images (see `extract_media`
+/// in `multimodal.rs`). Other rich blocks — image URLs, PDF documents, audio
+/// and resource links — cannot be forwarded as media, but their reference
+/// information is still valuable to the model. This downgrades such blocks to
+/// a short textual marker instead of silently dropping them.
+///
+/// Returns `None` for blocks that either serialize natively (Text) or are
+/// handled through dedicated media markers (Image).
+fn unsupported_fallback_text(block: &Content) -> Option<String> {
+    match block {
+        Content::ImageUrl { url } => Some(format!("[image url: {url}]")),
+        Content::Pdf { data } => Some(format!("[pdf document: {} bytes]", data.len())),
+        Content::Audio { mime_type, data } => {
+            Some(format!("[audio: {mime_type}, {} bytes]", data.len()))
+        }
+        Content::ResourceLink {
+            uri,
+            name,
+            mime_type,
+            ..
+        } => {
+            let mut text = String::from("[resource link: ");
+            match name.as_deref() {
+                Some(tool_name) => text.push_str(&format!("{tool_name} ({uri})")),
+                None => text.push_str(uri),
+            }
+            if let Some(mime) = mime_type.as_deref() {
+                text.push_str(&format!(", {mime}"));
+            }
+            text.push(']');
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
 /// Convert ChatMessages to simple text prompt (fallback for models without templates).
 /// This normalizes ToolUse/ToolResult to Text and concatenates all messages.
 ///
@@ -202,15 +267,26 @@ pub(crate) fn messages_to_text(
     messages: &[ChatMessage],
 ) -> Result<String, LLMError> {
     // Check for binary/image content - not supported in text-only mode.
-    if messages.iter().flat_map(|m| m.content.iter()).any(|b| {
+    // This includes media nested inside ToolResult blocks: text-only mode must
+    // fail explicitly rather than silently dropping them during normalization.
+    fn is_binary_block(block: &Content) -> bool {
         matches!(
-            b,
+            block,
             Content::Image { .. }
                 | Content::ImageUrl { .. }
                 | Content::Pdf { .. }
                 | Content::Audio { .. }
         )
-    }) {
+    }
+    let has_binary_content =
+        messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .any(|block| match block {
+                Content::ToolResult { content, .. } => content.iter().any(is_binary_block),
+                other => is_binary_block(other),
+            });
+    if has_binary_content {
         return Err(LLMError::InvalidRequest(
             "Binary content not supported in text-only mode (model lacks chat template or multimodal support)".into(),
         ));
@@ -254,11 +330,18 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                         serde_json::to_string(arguments).unwrap_or_default()
                     ))),
                     Content::ToolResult { id, content, .. } => {
+                        // Keep resource-link references visible in text mode
+                        // too; binary blocks are rejected before normalization
+                        // so only Text/ResourceLink reach this fallback.
                         out_blocks.push(Content::text(format!(
                             "[ToolResult: {id}] {}",
                             content
                                 .iter()
-                                .filter_map(|c| c.as_text())
+                                .filter_map(|c| {
+                                    c.as_text()
+                                        .map(str::to_string)
+                                        .or_else(|| unsupported_fallback_text(c))
+                                })
                                 .collect::<Vec<_>>()
                                 .join("\\n")
                         )))
@@ -670,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn image_url_in_tool_result_skipped() {
+    fn image_url_in_tool_result_preserved_as_text() {
         let cfg = test_config();
         let messages = vec![user_msg(vec![Content::ToolResult {
             id: "call_1".to_string(),
@@ -685,10 +768,129 @@ mod tests {
         let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
         let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
 
-        // ImageUrl inside ToolResult is unsupported — no marker
+        // ImageUrl inside ToolResult cannot become media, but the URL must be
+        // preserved as a text fallback marker instead of being silently dropped.
         assert_eq!(media_count, 0);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["role"], "tool");
+        assert_eq!(
+            parsed[0]["content"],
+            "result\n[image url: https://example.com/img.png]"
+        );
+    }
+
+    #[test]
+    fn tool_result_mixed_rich_content_preserves_fallbacks() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: Some("fetch_assets".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("metadata"),
+                Content::pdf(vec![1, 2, 3]),
+                Content::image("image/png", vec![1]),
+                Content::audio("audio/wav", vec![7, 8]),
+                Content::image_url("https://example.com/x.jpg"),
+                Content::ResourceLink {
+                    uri: "file:///tmp/report.pdf".to_string(),
+                    name: Some("report.pdf".to_string()),
+                    description: None,
+                    mime_type: Some("application/pdf".to_string()),
+                },
+                Content::image("image/jpeg", vec![2]),
+            ],
+        }])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, Some("<M>")).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        // Only the two raw images become media; everything else is preserved
+        // as explicit text in the tool message.
+        assert_eq!(media_count, 2);
+        // 1 tool message + 2 user marker messages
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0]["role"], "tool");
+        assert_eq!(parsed[0]["name"], "fetch_assets");
+        assert_eq!(
+            parsed[0]["content"],
+            "metadata\n\
+             [pdf document: 3 bytes]\n\
+             [audio: audio/wav, 2 bytes]\n\
+             [image url: https://example.com/x.jpg]\n\
+             [resource link: report.pdf (file:///tmp/report.pdf), application/pdf]"
+        );
+        // Nested raw images keep the exact marker/count invariant: one marker
+        // user message per image, and no markers inside the tool text.
+        let tool_content = parsed[0]["content"].as_str().unwrap();
+        assert_eq!(tool_content.matches("<M>").count(), 0);
+        for i in 1..=2 {
+            assert_eq!(parsed[i]["role"], "user");
+            assert_eq!(parsed[i]["content"], "<M>");
+        }
+    }
+
+    #[test]
+    fn tool_result_absent_name_omits_name_field() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_42".to_string(),
+            name: None,
+            is_error: false,
+            content: vec![Content::text("ok")],
+        }])];
+
+        let (result, media_count) = messages_to_json(&cfg, &messages, None).unwrap();
+        let parsed: Vec<Value> = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(media_count, 0);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["role"], "tool");
+        assert_eq!(parsed[0]["tool_call_id"], "call_42");
+        // Absent tool name must be omitted entirely, not emitted as "".
+        assert!(
+            parsed[0].get("name").is_none(),
+            "name field should be omitted when ToolResult.name is None"
+        );
+    }
+
+    #[test]
+    fn text_mode_rejects_nested_binary_in_tool_result() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: None,
+            is_error: false,
+            content: vec![
+                Content::text("notes"),
+                Content::image("image/png", vec![1, 2, 3]),
+            ],
+        }])];
+
+        // Text-only mode must fail explicitly instead of silently dropping
+        // media nested inside tool results.
+        let result = messages_to_text(&cfg, &messages);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn text_mode_preserves_resource_link_in_tool_result() {
+        let cfg = test_config();
+        let messages = vec![user_msg(vec![Content::ToolResult {
+            id: "call_1".to_string(),
+            name: None,
+            is_error: false,
+            content: vec![
+                Content::text("notes"),
+                Content::resource_link("file:///tmp/a.txt"),
+            ],
+        }])];
+
+        // Resource links are not binary: their reference must survive in
+        // text-only mode as an explicit marker.
+        let result = messages_to_text(&cfg, &messages).unwrap();
+        assert!(result.contains("[ToolResult: call_1] notes"));
+        assert!(result.contains("[resource link: file:///tmp/a.txt]"));
     }
 
     #[test]

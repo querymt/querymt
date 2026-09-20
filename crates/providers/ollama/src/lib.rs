@@ -227,15 +227,69 @@ struct OllamaOptions {
     numa: Option<bool>,
 }
 
-/// Individual message in an Ollama chat conversation.
+/// Individual message in an Ollama chat conversation (request side only).
+///
+/// Deserialization of chat responses uses the separate [`OllamaChatResponseMessage`]
+/// type because the serde direction and accepted fields differ.
 #[derive(Serialize)]
 struct OllamaChatMessage {
     role: String,
     content: String,
+    /// Name of the tool that produced this result; only set on `tool` role
+    /// messages built from `Content::ToolResult`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
+    tool_name: Option<String>,
+    /// Id of the originating `Content::ToolUse` call, used to correlate a
+    /// `tool` role result with the assistant message that requested it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     images: Option<Vec<String>>,
+    /// Assistant tool invocations replayed in conversation history.
+    /// Serialized using Ollama's `tool_calls` message shape; see
+    /// [`OllamaRequestToolCall`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<OllamaRequestToolCall>>,
+}
+
+/// Tool call within a request-side assistant message (`/api/chat`).
+///
+/// Ollama's tool call shape is `{"function": {"name", "arguments"}}`. The
+/// caller-supplied `id` is preserved as an additional field so the call can be
+/// correlated with its `ToolResult` on replay; Ollama ignores unknown fields,
+/// and OpenAI-compatible intermediaries in front of Ollama rely on it. It is
+/// omitted when no id is available.
+#[derive(Serialize)]
+struct OllamaRequestToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    function: OllamaRequestFunctionToolCall,
+}
+
+/// Function payload of a request-side tool call.
+///
+/// Kept separate from the response-side [`OllamaFunctionToolCall`], which only
+/// derives `Deserialize`.
+#[derive(Serialize)]
+struct OllamaRequestFunctionToolCall {
+    name: String,
+    arguments: Value,
+}
+
+/// Bounded discriminator used in fallback markers so that nested content this
+/// provider cannot represent natively is never silently dropped.
+fn content_kind(c: &Content) -> &'static str {
+    match c {
+        Content::Text { .. } => "text",
+        Content::Image { .. } => "image",
+        Content::ImageUrl { .. } => "image_url",
+        Content::Pdf { .. } => "pdf",
+        Content::Audio { .. } => "audio",
+        Content::Thinking { .. } => "thinking",
+        Content::ToolUse { .. } => "tool_use",
+        Content::ToolResult { .. } => "tool_result",
+        Content::ResourceLink { .. } => "resource_link",
+    }
 }
 
 /// Response from Ollama's API endpoints.
@@ -467,40 +521,92 @@ impl HTTPChatProvider for Ollama {
                 .join("\n");
 
             let mut inline_images: Vec<String> = Vec::new();
+            let mut tool_calls: Vec<OllamaRequestToolCall> = Vec::new();
 
             for block in &msg.content {
                 match block {
                     Content::Image { data, .. } => inline_images.push(BASE64.encode(data)),
+                    Content::ToolUse {
+                        id,
+                        name,
+                        arguments,
+                    } => tool_calls.push(OllamaRequestToolCall {
+                        id: Some(id.clone()),
+                        function: OllamaRequestFunctionToolCall {
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        },
+                    }),
                     Content::ToolResult {
                         id, name, content, ..
                     } => {
-                        let output = content
-                            .iter()
-                            .filter_map(|c| c.as_text())
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        // Ollama's tool role only supports plain text, so the result is
+                        // flattened: text is kept verbatim, inline images are forwarded via
+                        // a follow-up user message, and any nested content the API cannot
+                        // represent gets an explicit bounded marker instead of being
+                        // silently dropped.
+                        let mut output_parts: Vec<String> = Vec::new();
+                        let mut tool_images: Vec<String> = Vec::new();
+
+                        for c in content {
+                            match c {
+                                Content::Text { text } => output_parts.push(text.clone()),
+                                Content::Image { data, .. } => {
+                                    tool_images.push(BASE64.encode(data))
+                                }
+                                Content::Pdf { data } => output_parts.push(format!(
+                                    "[Tool result PDF document omitted: {} bytes]",
+                                    data.len()
+                                )),
+                                Content::Audio { mime_type, data } => output_parts.push(format!(
+                                    "[Tool result audio ({mime_type}) omitted: {} bytes]",
+                                    data.len()
+                                )),
+                                Content::ImageUrl { url } => {
+                                    output_parts.push(format!("[Tool result image URL: {url}]"));
+                                }
+                                Content::ResourceLink {
+                                    uri,
+                                    name,
+                                    mime_type,
+                                    ..
+                                } => {
+                                    let label = name.as_deref().unwrap_or("unnamed");
+                                    match mime_type {
+                                        Some(mime) => output_parts.push(format!(
+                                            "[Tool result resource link: {label} ({uri}, {mime})]"
+                                        )),
+                                        None => output_parts.push(format!(
+                                            "[Tool result resource link: {label} ({uri})]"
+                                        )),
+                                    }
+                                }
+                                other => output_parts.push(format!(
+                                    "[Tool result unsupported content omitted ({})]",
+                                    content_kind(other)
+                                )),
+                            }
+                        }
+
                         chat_messages.push(OllamaChatMessage {
                             role: "tool".to_string(),
-                            name: name.clone(),
-                            content: output,
+                            tool_name: name.clone(),
+                            tool_call_id: Some(id.clone()),
+                            content: output_parts.join("\n"),
                             images: None,
+                            tool_calls: None,
                         });
 
                         // If tool result contains images, emit a separate user image message
                         // because Ollama tool role only supports text content.
-                        let tool_images: Vec<String> = content
-                            .iter()
-                            .filter_map(|c| match c {
-                                Content::Image { data, .. } => Some(BASE64.encode(data)),
-                                _ => None,
-                            })
-                            .collect();
                         if !tool_images.is_empty() {
                             chat_messages.push(OllamaChatMessage {
                                 role: "user".to_string(),
-                                name: None,
+                                tool_name: None,
+                                tool_call_id: None,
                                 content: format!("[Tool result image for {id}]"),
                                 images: Some(tool_images),
+                                tool_calls: None,
                             });
                         }
                     }
@@ -517,13 +623,27 @@ impl HTTPChatProvider for Ollama {
                         role,
                         content: text,
                         images: None,
-                        name: None,
+                        tool_name: None,
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                }
+                // If the same message also carried assistant tool invocations,
+                // replay them as a dedicated assistant message so they are not lost.
+                if !tool_calls.is_empty() {
+                    chat_messages.push(OllamaChatMessage {
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        images: None,
+                        tool_name: None,
+                        tool_call_id: None,
+                        tool_calls: Some(tool_calls),
                     });
                 }
                 continue;
             }
 
-            if !text.is_empty() || !inline_images.is_empty() {
+            if !text.is_empty() || !inline_images.is_empty() || !tool_calls.is_empty() {
                 chat_messages.push(OllamaChatMessage {
                     role,
                     content: text,
@@ -532,7 +652,13 @@ impl HTTPChatProvider for Ollama {
                     } else {
                         Some(inline_images)
                     },
-                    name: None,
+                    tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
                 });
             }
         }
@@ -544,7 +670,9 @@ impl HTTPChatProvider for Ollama {
                     role: "system".to_string(),
                     content: system.clone(),
                     images: None,
-                    name: None,
+                    tool_name: None,
+                    tool_call_id: None,
+                    tool_calls: None,
                 },
             );
         }
@@ -811,6 +939,198 @@ mod tests {
             .chat_request(&[], None)
             .expect("chat_request should succeed");
         assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn chat_request_replays_assistant_tool_calls() {
+        let ollama = test_ollama(None);
+        let messages = vec![
+            ChatMessage::from_user(vec![Content::text("What's the weather?")]),
+            ChatMessage::from_assistant(vec![
+                Content::text("Checking the weather."),
+                Content::tool_use(
+                    "call_abc123",
+                    "get_weather",
+                    serde_json::json!({ "city": "Toronto", "unit": "celsius" }),
+                ),
+            ]),
+        ];
+
+        let req = ollama
+            .chat_request(&messages, None)
+            .expect("chat_request should succeed");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
+        let messages = body["messages"].as_array().expect("messages array");
+
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"].as_str() == Some("assistant"))
+            .expect("assistant message should be replayed");
+        assert_eq!(assistant["content"].as_str(), Some("Checking the weather."));
+
+        let calls = assistant["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"].as_str(), Some("call_abc123"));
+        assert_eq!(calls[0]["function"]["name"].as_str(), Some("get_weather"));
+        assert_eq!(
+            calls[0]["function"]["arguments"]["city"].as_str(),
+            Some("Toronto")
+        );
+        assert_eq!(
+            calls[0]["function"]["arguments"]["unit"].as_str(),
+            Some("celsius")
+        );
+
+        // tool_calls is skipped on messages that carry none.
+        for m in messages
+            .iter()
+            .filter(|m| m["role"].as_str() != Some("assistant"))
+        {
+            assert!(m.get("tool_calls").is_none());
+        }
+
+        // Tool correlation fields are only emitted on tool role messages.
+        for m in messages {
+            if m["role"].as_str() != Some("tool") {
+                assert!(m.get("tool_name").is_none());
+                assert!(m.get("tool_call_id").is_none());
+                assert!(m.get("name").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn chat_request_assistant_tool_call_without_text_is_preserved() {
+        let ollama = test_ollama(None);
+        let msg = ChatMessage::from_assistant(vec![Content::tool_use(
+            "call_empty",
+            "ping",
+            serde_json::json!({}),
+        )]);
+
+        let req = ollama
+            .chat_request(&[msg], None)
+            .expect("chat_request should succeed");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
+        let messages = body["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"].as_str(), Some("assistant"));
+        let calls = messages[0]["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"].as_str(), Some("call_empty"));
+        assert_eq!(calls[0]["function"]["name"].as_str(), Some("ping"));
+    }
+
+    #[test]
+    fn chat_request_mixed_tool_result_keeps_text_images_and_marks_unsupported() {
+        let ollama = test_ollama(None);
+        let png_bytes = b"png-bytes".to_vec();
+        let pdf_bytes = b"%PDF-1.4 fake".to_vec();
+        let audio_bytes = vec![0u8, 1, 2, 3];
+
+        let msg = ChatMessage::from_user(vec![Content::ToolResult {
+            id: "call_abc123".to_string(),
+            name: Some("get_weather".to_string()),
+            is_error: false,
+            content: vec![
+                Content::text("Forecast: sunny."),
+                Content::image("image/png", png_bytes.clone()),
+                Content::pdf(pdf_bytes.clone()),
+                Content::audio("audio/wav", audio_bytes.clone()),
+                Content::image_url("https://example.com/radar.png"),
+                Content::ResourceLink {
+                    uri: "file:///reports/q3.pdf".to_string(),
+                    name: Some("Q3 report".to_string()),
+                    description: Some("Quarterly summary".to_string()),
+                    mime_type: Some("application/pdf".to_string()),
+                },
+            ],
+        }]);
+
+        let req = ollama
+            .chat_request(&[msg], None)
+            .expect("chat_request should succeed");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
+        let messages = body["messages"].as_array().expect("messages array");
+
+        // Tool role message keeps the text result and carries the exact
+        // correlation fields Ollama's /api/chat expects.
+        let tool = messages
+            .iter()
+            .find(|m| m["role"].as_str() == Some("tool"))
+            .expect("tool message should be emitted");
+        assert_eq!(tool["tool_name"].as_str(), Some("get_weather"));
+        assert_eq!(tool["tool_call_id"].as_str(), Some("call_abc123"));
+        // The legacy `name` field must not be serialized.
+        assert!(tool.get("name").is_none());
+        assert!(tool.get("tool_calls").is_none());
+        assert!(tool.get("images").is_none());
+        assert_eq!(
+            tool["content"].as_str(),
+            Some(concat!(
+                "Forecast: sunny.\n",
+                "[Tool result PDF document omitted: 13 bytes]\n",
+                "[Tool result audio (audio/wav) omitted: 4 bytes]\n",
+                "[Tool result image URL: https://example.com/radar.png]\n",
+                "[Tool result resource link: Q3 report (file:///reports/q3.pdf, application/pdf)]"
+            ))
+        );
+
+        // Inline images are still forwarded via the follow-up user message,
+        // which must not carry tool correlation fields.
+        let image_msg = messages
+            .iter()
+            .find(|m| m["images"].as_array().is_some())
+            .expect("tool result images should be forwarded as a user message");
+        assert_eq!(image_msg["role"].as_str(), Some("user"));
+        assert_eq!(
+            image_msg["content"].as_str(),
+            Some("[Tool result image for call_abc123]")
+        );
+        let encoded_png = BASE64.encode(png_bytes);
+        assert_eq!(image_msg["images"][0].as_str(), Some(encoded_png.as_str()));
+        assert!(image_msg.get("tool_name").is_none());
+        assert!(image_msg.get("tool_call_id").is_none());
+        assert!(image_msg.get("name").is_none());
+
+        // Unsupported nested content must not leak raw bytes either.
+        let raw = String::from_utf8(req.body().clone()).expect("body should be UTF-8");
+        assert!(!raw.contains(&BASE64.encode(pdf_bytes)));
+        assert!(!raw.contains(&BASE64.encode(audio_bytes)));
+    }
+
+    #[test]
+    fn chat_request_tool_result_without_name_omits_tool_name() {
+        let ollama = test_ollama(None);
+        let msg = ChatMessage::from_user(vec![Content::ToolResult {
+            id: "call_42".to_string(),
+            name: None,
+            is_error: false,
+            content: vec![Content::text("done")],
+        }]);
+
+        let req = ollama
+            .chat_request(&[msg], None)
+            .expect("chat_request should succeed");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
+        let messages = body["messages"].as_array().expect("messages array");
+
+        let tool = messages
+            .iter()
+            .find(|m| m["role"].as_str() == Some("tool"))
+            .expect("tool message should be emitted");
+        // tool_call_id is always populated from the ToolResult id; tool_name
+        // is omitted when the ToolResult carries no name, and neither may
+        // fall back to the legacy `name` field.
+        assert_eq!(tool["tool_call_id"].as_str(), Some("call_42"));
+        assert!(tool.get("tool_name").is_none());
+        assert!(tool.get("name").is_none());
+        assert_eq!(tool["content"].as_str(), Some("done"));
     }
 
     #[test]

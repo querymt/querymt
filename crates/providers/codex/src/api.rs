@@ -165,8 +165,8 @@ enum CodexFunctionCallOutput<'a> {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type")]
 enum CodexToolOutputPart<'a> {
-    #[serde(rename = "output_text")]
-    OutputText { text: Cow<'a, str> },
+    #[serde(rename = "input_text")]
+    InputText { text: Cow<'a, str> },
     #[serde(rename = "input_image")]
     InputImage {
         image_url: Cow<'a, str>,
@@ -613,7 +613,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                     for c in content {
                         match c {
                             Content::Text { text } => {
-                                output_parts.push(CodexToolOutputPart::OutputText {
+                                output_parts.push(CodexToolOutputPart::InputText {
                                     text: Cow::Borrowed(text.as_str()),
                                 });
                                 text_only_parts.push(text.clone());
@@ -638,7 +638,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                             }
                             Content::Pdf { data } => {
                                 has_non_text = true;
-                                output_parts.push(CodexToolOutputPart::OutputText {
+                                output_parts.push(CodexToolOutputPart::InputText {
                                     text: Cow::Owned(format!(
                                         "[PDF tool output not yet serialized natively ({} bytes)]",
                                         data.len()
@@ -647,7 +647,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                             }
                             Content::Audio { mime_type, data } => {
                                 has_non_text = true;
-                                output_parts.push(CodexToolOutputPart::OutputText {
+                                output_parts.push(CodexToolOutputPart::InputText {
                                     text: Cow::Owned(format!(
                                         "[Audio tool output not yet serialized natively ({}: {} bytes)]",
                                         mime_type,
@@ -1753,7 +1753,7 @@ mod tests {
             .and_then(|i| i["output"].as_array())
             .expect("rich function_call_output parts");
 
-        assert_eq!(output_parts[0]["type"].as_str(), Some("output_text"));
+        assert_eq!(output_parts[0]["type"].as_str(), Some("input_text"));
         assert_eq!(output_parts[0]["text"].as_str(), Some("some text output"));
         assert_eq!(output_parts[1]["type"].as_str(), Some("input_image"));
     }

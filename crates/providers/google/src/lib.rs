@@ -206,14 +206,26 @@ impl<'a> GoogleContentPart<'a> {
         }
     }
 
-    fn function_response(name: String, content: Value) -> Self {
+    fn function_response(
+        id: String,
+        name: String,
+        content: Value,
+        is_error: bool,
+        media: Vec<GoogleFunctionResponsePart>,
+    ) -> Self {
         Self {
             text: None,
             inline_data: None,
             function_call: None,
             function_response: Some(GoogleFunctionResponse {
+                id: Some(id),
                 name: name.clone(),
-                response: GoogleFunctionResponseContent { name, content },
+                response: GoogleFunctionResponseContent {
+                    name,
+                    content,
+                    error: is_error,
+                },
+                parts: if media.is_empty() { None } else { Some(media) },
             }),
             thought: None,
             thought_signature: None,
@@ -604,31 +616,73 @@ struct GoogleFunctionCall {
 ///
 /// The expected format is:
 /// {
-///   "role": "function",
+///   "role": "user",
 ///   "parts": [{
 ///     "functionResponse": {
+///       "id": "call_id",
 ///       "name": "function_name",
 ///       "response": {
 ///         "name": "function_name",
-///         "content": { ... } // JSON content returned by the function
-///       }
+///         "content": "...", // text or JSON result returned by the function
+///         "error": true // only when the tool reported an error
+///       },
+///       "parts": [{ "inlineData": { "mimeType": "...", "data": "..." } }]
 ///     }
 ///   }]
 /// }
 #[derive(Deserialize, Debug, Serialize)]
 struct GoogleFunctionResponse {
+    /// Optional id of the function call this result answers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
     /// Name of the function that was called
     name: String,
     /// Response from the function as structured JSON
     response: GoogleFunctionResponseContent,
+    /// Optional inline media parts returned by the function.
+    ///
+    /// Only populated when the configured model supports multimodal function
+    /// responses (documented for Gemini 3 series models); all other models get
+    /// bounded text markers in the response content instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parts: Option<Vec<GoogleFunctionResponsePart>>,
 }
 
 #[derive(Deserialize, Debug, Serialize)]
 struct GoogleFunctionResponseContent {
     /// Name of the function that was called
     name: String,
-    /// Content of the function response
+    /// Text or structured result returned by the function
     content: Value,
+    /// Whether the function reported an error
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    error: bool,
+}
+
+/// A part nested in a `functionResponse`, used to carry inline media such as
+/// images, PDFs, or audio produced by the tool.
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleFunctionResponsePart {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inline_data: Option<GoogleFunctionResponseInlineData>,
+}
+
+/// Inline media data nested in a `functionResponse` part
+/// (`{"inlineData": {"mimeType": "...", "data": "..."}}`).
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleFunctionResponseInlineData {
+    mime_type: String,
+    data: String,
+}
+
+impl GoogleFunctionResponsePart {
+    fn inline_data(mime_type: String, data: String) -> Self {
+        Self {
+            inline_data: Some(GoogleFunctionResponseInlineData { mime_type, data }),
+        }
+    }
 }
 
 /// Request body for embedding content
@@ -670,6 +724,25 @@ impl Google {
 
     fn is_gemini_2_5(&self) -> bool {
         self.model.contains("2.5")
+    }
+
+    /// Gemini's official function-calling docs restrict multimodal content in
+    /// `functionResponse.parts` to Gemini 3 series models
+    /// (https://ai.google.dev/gemini-api/docs/function-calling, section
+    /// "Multimodal function responses": "For Gemini 3 series models, you can
+    /// include multimodal content in the function response parts that you send
+    /// to the model.").
+    ///
+    /// This check is intentionally narrow: only model names that identify a
+    /// Gemini 3 series model (e.g. `gemini-3-pro-preview`, `gemini-3-flash`,
+    /// `gemini-3.8-flash`) return true. Older, unrelated, or unknown names
+    /// (including fine-tunes) conservatively fall back to bounded text markers
+    /// so requests keep a wire shape the target model accepts.
+    fn model_supports_multimodal_function_response(&self) -> bool {
+        // Compare only the final path segment so Vertex AI style resource
+        // names such as "publishers/google/models/gemini-3-pro" match too.
+        let name = self.model.rsplit('/').next().unwrap_or_default();
+        name.to_ascii_lowercase().starts_with("gemini-3")
     }
 
     fn effort_to_budget(effort: ReasoningEffort) -> u32 {
@@ -739,10 +812,18 @@ impl HTTPChatProvider for Google {
             ));
         }
 
+        // Gemini only accepts multimodal content inside functionResponse.parts
+        // on Gemini 3 series models (see
+        // `model_supports_multimodal_function_response`); every other model
+        // gets bounded text markers so the request keeps a valid shape.
+        let native_media_in_function_response = self.model_supports_multimodal_function_response();
+
         for msg in messages {
             let has_tool_result = msg.content.iter().any(|b| b.is_tool_result());
+            // Tool results are sent in a user turn: Gemini Content only
+            // supports the "user" and "model" roles.
             let role = if has_tool_result {
-                "function"
+                "user"
             } else {
                 match msg.role {
                     ChatRole::User => "user",
@@ -799,21 +880,81 @@ impl HTTPChatProvider for Google {
                         ));
                     }
                     Content::ToolResult {
-                        id, name, content, ..
+                        id,
+                        name,
+                        content,
+                        is_error,
                     } => {
-                        let text = content
-                            .iter()
-                            .filter_map(|c| c.as_text())
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        // Google's functionResponse requires the invoked function's
+                        // name; the call id is not a valid substitute.
+                        let name = name.clone().ok_or_else(|| {
+                            LLMError::InvalidRequest(format!(
+                                "ToolResult with id '{id}' is missing a function name; \
+                                 Google's functionResponse requires 'name'"
+                            ))
+                        })?;
+                        let mut texts = Vec::new();
+                        let mut media = Vec::new();
+                        for c in content {
+                            match c {
+                                Content::Text { text } => texts.push(text.clone()),
+                                Content::Image { mime_type, data } => {
+                                    if native_media_in_function_response {
+                                        media.push(GoogleFunctionResponsePart::inline_data(
+                                            mime_type.clone(),
+                                            BASE64.encode(data),
+                                        ));
+                                    } else {
+                                        // Bounded marker: raw bytes/base64 never
+                                        // reach the text channel.
+                                        texts.push(format!("[image omitted: {mime_type}]"));
+                                    }
+                                }
+                                Content::Pdf { data } => {
+                                    if native_media_in_function_response {
+                                        media.push(GoogleFunctionResponsePart::inline_data(
+                                            "application/pdf".to_string(),
+                                            BASE64.encode(data),
+                                        ));
+                                    } else {
+                                        texts.push("[pdf omitted: application/pdf]".to_string());
+                                    }
+                                }
+                                Content::Audio { mime_type, data } => {
+                                    if native_media_in_function_response {
+                                        media.push(GoogleFunctionResponsePart::inline_data(
+                                            mime_type.clone(),
+                                            BASE64.encode(data),
+                                        ));
+                                    } else {
+                                        texts.push(format!("[audio omitted: {mime_type}]"));
+                                    }
+                                }
+                                Content::ImageUrl { url } => {
+                                    texts.push(format!("[image url: {url}]"));
+                                }
+                                Content::ResourceLink { uri, .. } => {
+                                    texts.push(format!("[resource link: {uri}]"));
+                                }
+                                // Nested tool traffic and reasoning have no representation
+                                // inside a functionResponse; skip them.
+                                Content::Thinking { .. }
+                                | Content::ToolUse { .. }
+                                | Content::ToolResult { .. } => {}
+                            }
+                        }
+                        let text = texts.join("\n");
                         let payload = if text.is_empty() {
                             Value::Null
                         } else {
                             Value::String(text)
                         };
                         parts.push(GoogleContentPart::function_response(
-                            name.clone().unwrap_or_else(|| id.clone()),
+                            id.clone(),
+                            name,
                             payload,
+                            *is_error,
+                            media,
                         ));
                     }
                     Content::Audio { .. } | Content::ResourceLink { .. } => {
@@ -1547,6 +1688,12 @@ mod tests {
         }
     }
 
+    fn test_google_with_model(model: &str) -> Google {
+        let mut google = test_google();
+        google.model = model.to_string();
+        google
+    }
+
     #[test]
     fn classify_http_google_retry_info_is_preserved() {
         let response = Response::builder()
@@ -1740,6 +1887,253 @@ mod tests {
                 assert_eq!(failure.kind(), ProviderErrorKind::UnknownTransient);
             }
             other => panic!("expected ProviderResponseError, got {other}"),
+        }
+    }
+
+    // ---- ToolResult request-shape regression tests ----
+
+    fn tool_result_message(
+        content: Vec<Content>,
+        name: Option<String>,
+        is_error: bool,
+    ) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::ToolResult {
+                id: "call_123".to_string(),
+                name,
+                is_error,
+                content,
+            }],
+            cache: None,
+        }
+    }
+
+    fn request_body(google: &Google, messages: &[ChatMessage]) -> Value {
+        let request = google
+            .chat_request(messages, None)
+            .expect("tool-result request should build");
+        serde_json::from_slice(request.body()).expect("request body should be valid JSON")
+    }
+
+    #[test]
+    fn tool_result_uses_user_role_and_preserves_id_and_name() {
+        let google = test_google();
+        let messages = vec![tool_result_message(
+            vec![Content::text("42 degrees")],
+            Some("get_weather".to_string()),
+            false,
+        )];
+        let body = request_body(&google, &messages);
+
+        let content = &body["contents"][0];
+        assert_eq!(content["role"], "user");
+        let fr = &content["parts"][0]["functionResponse"];
+        assert_eq!(fr["id"], "call_123");
+        assert_eq!(fr["name"], "get_weather");
+        assert_eq!(fr["response"]["name"], "get_weather");
+        assert_eq!(fr["response"]["content"], "42 degrees");
+        assert!(
+            fr["response"].get("error").is_none(),
+            "error flag must be absent for successful results"
+        );
+        assert!(
+            fr.get("parts").is_none(),
+            "parts must be absent without nested media"
+        );
+    }
+
+    /// Gemini 3 series models accept multimodal content in
+    /// functionResponse.parts (Gemini API function-calling docs,
+    /// "Multimodal function responses").
+    #[test]
+    fn tool_result_media_serializes_as_native_parts_on_gemini_3() {
+        let google = test_google_with_model("gemini-3-pro-preview");
+        let messages = vec![tool_result_message(
+            vec![
+                Content::text("Screenshot attached"),
+                Content::image("image/png", vec![1, 2, 3, 4]),
+                Content::pdf(vec![5, 6, 7, 8]),
+                Content::audio("audio/wav", vec![9, 10, 11, 12]),
+            ],
+            Some("take_screenshot".to_string()),
+            false,
+        )];
+        let body = request_body(&google, &messages);
+
+        let fr = &body["contents"][0]["parts"][0]["functionResponse"];
+        assert_eq!(fr["response"]["content"], "Screenshot attached");
+        let parts = fr["parts"].as_array().expect("functionResponse parts");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(
+            parts[0]["inlineData"]["data"],
+            BASE64.encode([1u8, 2, 3, 4])
+        );
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "application/pdf");
+        assert_eq!(
+            parts[1]["inlineData"]["data"],
+            BASE64.encode([5u8, 6, 7, 8])
+        );
+        assert_eq!(parts[2]["inlineData"]["mimeType"], "audio/wav");
+        assert_eq!(
+            parts[2]["inlineData"]["data"],
+            BASE64.encode([9u8, 10, 11, 12])
+        );
+    }
+
+    /// Multimodal function responses are documented for Gemini 3 series models
+    /// only, so Gemini 2 models must receive a valid text-only functionResponse
+    /// with bounded markers instead of inlineData parts or raw bytes.
+    #[test]
+    fn tool_result_media_downgrades_to_text_markers_on_gemini_2() {
+        let google = test_google(); // gemini-2.0-flash
+        let messages = vec![tool_result_message(
+            vec![
+                Content::text("Report follows"),
+                Content::image("image/png", vec![1, 2, 3, 4]),
+                Content::pdf(vec![5, 6, 7, 8]),
+                Content::audio("audio/wav", vec![9, 10, 11, 12]),
+            ],
+            Some("capture_report".to_string()),
+            false,
+        )];
+        let body = request_body(&google, &messages);
+
+        let fr = &body["contents"][0]["parts"][0]["functionResponse"];
+        assert!(
+            fr.get("parts").is_none(),
+            "functionResponse.parts must be absent for models without support"
+        );
+        assert_eq!(
+            fr["response"]["content"],
+            concat!(
+                "Report follows\n",
+                "[image omitted: image/png]\n",
+                "[pdf omitted: application/pdf]\n",
+                "[audio omitted: audio/wav]"
+            )
+        );
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(!raw.contains("inlineData"), "no inline media may be sent");
+        assert!(
+            !raw.contains(&BASE64.encode([1u8, 2, 3, 4])),
+            "image bytes leaked into the request body"
+        );
+        assert!(
+            !raw.contains(&BASE64.encode([5u8, 6, 7, 8])),
+            "pdf bytes leaked into the request body"
+        );
+        assert!(
+            !raw.contains(&BASE64.encode([9u8, 10, 11, 12])),
+            "audio bytes leaked into the request body"
+        );
+    }
+
+    /// Unknown model names are treated as unsupported and must not receive
+    /// functionResponse.parts.
+    #[test]
+    fn tool_result_media_downgrades_to_markers_for_unknown_models() {
+        let google = test_google_with_model("tunedModels/my-experimental-tune");
+        let messages = vec![tool_result_message(
+            vec![Content::image("image/jpeg", vec![42, 42])],
+            Some("fetch_photo".to_string()),
+            false,
+        )];
+        let body = request_body(&google, &messages);
+
+        let fr = &body["contents"][0]["parts"][0]["functionResponse"];
+        assert!(fr.get("parts").is_none());
+        assert_eq!(fr["response"]["content"], "[image omitted: image/jpeg]");
+    }
+
+    /// Only names identifying a Gemini 3 series model may enable native
+    /// multimodal function responses; everything else must fall back to
+    /// markers.
+    #[test]
+    fn multimodal_function_response_support_is_narrow() {
+        for model in [
+            "gemini-3-pro-preview",
+            "gemini-3-flash",
+            "gemini-3.8-flash",
+            "publishers/google/models/gemini-3-pro",
+        ] {
+            assert!(
+                test_google_with_model(model).model_supports_multimodal_function_response(),
+                "{model} should be treated as Gemini 3 series"
+            );
+        }
+        for model in [
+            "gemini-2.0-flash",
+            "gemini-2.5-pro",
+            "gemini-1.5-flash",
+            "gemma-3-27b-it",
+            "tunedModels/custom-tune",
+            "",
+        ] {
+            assert!(
+                !test_google_with_model(model).model_supports_multimodal_function_response(),
+                "{model} must not be treated as Gemini 3 series"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_result_error_is_flagged_in_response_object() {
+        let google = test_google();
+        let messages = vec![tool_result_message(
+            vec![Content::text("boom")],
+            Some("failing_tool".to_string()),
+            true,
+        )];
+        let body = request_body(&google, &messages);
+
+        let fr = &body["contents"][0]["parts"][0]["functionResponse"];
+        assert_eq!(fr["response"]["error"], true);
+        assert_eq!(fr["response"]["content"], "boom");
+        assert_eq!(fr["response"]["name"], "failing_tool");
+    }
+
+    #[test]
+    fn tool_result_url_and_resource_link_use_text_markers() {
+        let google = test_google();
+        let messages = vec![tool_result_message(
+            vec![
+                Content::ImageUrl {
+                    url: "https://example.com/cat.png".to_string(),
+                },
+                Content::resource_link("file:///tmp/report.pdf"),
+            ],
+            Some("fetch_assets".to_string()),
+            false,
+        )];
+        let body = request_body(&google, &messages);
+
+        let fr = &body["contents"][0]["parts"][0]["functionResponse"];
+        assert_eq!(
+            fr["response"]["content"],
+            "[image url: https://example.com/cat.png]\n[resource link: file:///tmp/report.pdf]"
+        );
+        assert!(fr.get("parts").is_none());
+    }
+
+    #[test]
+    fn tool_result_without_name_is_rejected() {
+        let google = test_google();
+        let messages = vec![tool_result_message(
+            vec![Content::text("orphan result")],
+            None,
+            false,
+        )];
+        let error = google
+            .chat_request(&messages, None)
+            .expect_err("missing tool name must fail request construction");
+        match error {
+            LLMError::InvalidRequest(message) => {
+                assert!(message.contains("missing a function name"));
+                assert!(message.contains("call_123"));
+            }
+            other => panic!("expected InvalidRequest, got {other}"),
         }
     }
 }

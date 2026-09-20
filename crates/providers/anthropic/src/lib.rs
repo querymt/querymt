@@ -217,13 +217,6 @@ enum MessageContent {
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<CacheControlEphemeral>,
     },
-    ImageUrl {
-        #[serde(rename = "type")]
-        content_type: &'static str, // "image_url"
-        image_url: ImageUrlContent,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        cache_control: Option<CacheControlEphemeral>,
-    },
     Document {
         #[serde(rename = "type")]
         content_type: &'static str, // "document"
@@ -281,7 +274,6 @@ impl MessageContent {
         match self {
             MessageContent::Text { cache_control, .. }
             | MessageContent::Image { cache_control, .. }
-            | MessageContent::ImageUrl { cache_control, .. }
             | MessageContent::Document { cache_control, .. }
             | MessageContent::Thinking { cache_control, .. }
             | MessageContent::ToolUse { cache_control, .. }
@@ -292,17 +284,104 @@ impl MessageContent {
     }
 }
 
+/// Anthropic `source` object for image/document blocks.
+///
+/// Base64 sources serialize as `{"type":"base64","media_type":...,"data":...}`;
+/// URL sources serialize as `{"type":"url","url":...}` (untagged: the field sets
+/// are disjoint, so serde picks the matching variant).
 #[derive(Serialize, Debug)]
-struct ImageUrlContent {
-    url: String,
+#[serde(untagged)]
+enum ImageSource {
+    Base64 {
+        #[serde(rename = "type")]
+        source_type: &'static str, // "base64"
+        media_type: String,
+        data: String,
+    },
+    Url {
+        #[serde(rename = "type")]
+        source_type: &'static str, // "url"
+        url: String,
+    },
 }
 
-#[derive(Serialize, Debug)]
-struct ImageSource {
-    #[serde(rename = "type")]
-    source_type: &'static str,
-    media_type: String,
-    data: String,
+/// Convert generic content blocks into Anthropic `tool_result` content blocks.
+///
+/// Anthropic `tool_result` content supports `text` and `image` blocks only.
+/// Supported image blocks are preserved natively (base64 and URL sources);
+/// everything else is preserved as an explicit text fallback marker instead of
+/// being silently dropped. A result with no usable blocks still yields visible
+/// text so the API never receives an empty `content` array.
+fn tool_result_content(inner: &[Content]) -> Vec<ToolResultContent> {
+    let mut out: Vec<ToolResultContent> = Vec::with_capacity(inner.len());
+    for block in inner {
+        match block {
+            Content::Text { text } => {
+                // Avoid Anthropic API error: "text content blocks must be
+                // non-empty" (mirrors top-level handling). Skipping may leave
+                // the result empty, in which case the fallback below supplies
+                // visible text.
+                if !text.is_empty() {
+                    out.push(ToolResultContent::Text {
+                        content_type: "text",
+                        text: text.clone(),
+                    });
+                }
+            }
+            Content::Image { mime_type, data } => out.push(ToolResultContent::Image {
+                content_type: "image",
+                source: ImageSource::Base64 {
+                    source_type: "base64",
+                    media_type: mime_type.clone(),
+                    data: BASE64.encode(data),
+                },
+            }),
+            Content::ImageUrl { url } => out.push(ToolResultContent::Image {
+                content_type: "image",
+                source: ImageSource::Url {
+                    source_type: "url",
+                    url: url.clone(),
+                },
+            }),
+            Content::Pdf { data } => out.push(ToolResultContent::Text {
+                content_type: "text",
+                text: format!(
+                    "[PDF document omitted: {} bytes; Anthropic tool_result content supports text/image only]",
+                    data.len()
+                ),
+            }),
+            Content::Audio { mime_type, data } => out.push(ToolResultContent::Text {
+                content_type: "text",
+                text: format!(
+                    "[audio omitted: mime_type={mime_type}, {} bytes; Anthropic tool_result content supports text/image only]",
+                    data.len()
+                ),
+            }),
+            Content::ResourceLink { uri, .. } => out.push(ToolResultContent::Text {
+                content_type: "text",
+                text: format!("[resource link: {uri}]"),
+            }),
+            Content::ToolUse { id, name, .. } => out.push(ToolResultContent::Text {
+                content_type: "text",
+                text: format!("[tool call omitted: id={id}, name={name}]"),
+            }),
+            Content::ToolResult { id, .. } => out.push(ToolResultContent::Text {
+                content_type: "text",
+                text: format!("[nested tool result omitted: id={id}]"),
+            }),
+            Content::Thinking { text, .. } => out.push(ToolResultContent::Text {
+                content_type: "text",
+                text: format!("[reasoning omitted: {} chars]", text.chars().count()),
+            }),
+        }
+    }
+    if out.is_empty() {
+        out.push(ToolResultContent::Text {
+            content_type: "text",
+            text: "[tool result contained no content]".to_string(),
+        });
+    }
+    out
 }
 
 // --- System prompt types (Anthropic API union: string | TextBlockParam[]) ---
@@ -819,7 +898,7 @@ impl HTTPChatProvider for Anthropic {
                         Content::Image { mime_type, data } => {
                             content.push(MessageContent::Image {
                                 content_type: "image",
-                                source: ImageSource {
+                                source: ImageSource::Base64 {
                                     source_type: "base64",
                                     media_type: mime_type.clone(),
                                     data: BASE64.encode(data),
@@ -828,16 +907,21 @@ impl HTTPChatProvider for Anthropic {
                             });
                         }
                         Content::ImageUrl { url } => {
-                            content.push(MessageContent::ImageUrl {
-                                content_type: "image_url",
-                                image_url: ImageUrlContent { url: url.clone() },
+                            // Anthropic expects a native image block with a url
+                            // source: {"type":"image","source":{"type":"url","url":...}}
+                            content.push(MessageContent::Image {
+                                content_type: "image",
+                                source: ImageSource::Url {
+                                    source_type: "url",
+                                    url: url.clone(),
+                                },
                                 cache_control: None,
                             });
                         }
                         Content::Pdf { data } => {
                             content.push(MessageContent::Document {
                                 content_type: "document",
-                                source: ImageSource {
+                                source: ImageSource::Base64 {
                                     source_type: "base64",
                                     media_type: "application/pdf".to_string(),
                                     data: BASE64.encode(data),
@@ -872,26 +956,9 @@ impl HTTPChatProvider for Anthropic {
                         } => {
                             // Anthropic supports multi-content tool results natively:
                             // { type: "tool_result", tool_use_id, content: [text, image, ...] }
-                            let tool_content: Vec<ToolResultContent> = inner
-                                .iter()
-                                .filter_map(|c| match c {
-                                    Content::Text { text } => Some(ToolResultContent::Text {
-                                        content_type: "text",
-                                        text: text.clone(),
-                                    }),
-                                    Content::Image { mime_type, data } => {
-                                        Some(ToolResultContent::Image {
-                                            content_type: "image",
-                                            source: ImageSource {
-                                                source_type: "base64",
-                                                media_type: mime_type.clone(),
-                                                data: BASE64.encode(data),
-                                            },
-                                        })
-                                    }
-                                    _ => None, // Skip unsupported nested types
-                                })
-                                .collect();
+                            // Unsupported nested blocks are preserved as text fallback
+                            // markers, never silently dropped.
+                            let tool_content = tool_result_content(inner);
                             content.push(MessageContent::ToolResult {
                                 content_type: "tool_result",
                                 tool_use_id: id.clone(),
@@ -2132,5 +2199,178 @@ mod tests {
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
+    }
+
+    #[test]
+    fn test_top_level_url_image_uses_anthropic_image_block() {
+        let anthropic = test_anthropic("sk-ant-api03-test");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![
+                Content::text("What is in this image?"),
+                Content::image_url("https://example.com/cat.png"),
+            ],
+            cache: None,
+        }];
+
+        let req = anthropic
+            .chat_request(&messages, None)
+            .expect("request should build");
+        let body: serde_json::Value =
+            serde_json::from_slice(req.body()).expect("request body should be valid JSON");
+
+        let content = body["messages"][0]["content"].as_array().expect("content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        // Native Anthropic image block with a url source; never the OpenAI-style
+        // {"type":"image_url","image_url":{"url":...}} shape.
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(
+            content[1]["source"],
+            serde_json::json!({ "type": "url", "url": "https://example.com/cat.png" })
+        );
+        let raw = serde_json::to_string(&body).unwrap();
+        assert!(!raw.contains("image_url"));
+    }
+
+    #[test]
+    fn test_mixed_tool_result_request_schema() {
+        let anthropic = test_anthropic("sk-ant-api03-test");
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G'];
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::tool_result(
+                "toolu_01",
+                vec![
+                    Content::text("scan complete"),
+                    Content::image("image/png", png.clone()),
+                    Content::image_url("https://example.com/shot.png"),
+                    Content::pdf(vec![0x25, b'P', b'D', b'F']),
+                    Content::audio("audio/wav", vec![0, 1, 2, 3]),
+                    Content::resource_link("file:///reports/q3.pdf"),
+                ],
+            )],
+            cache: None,
+        }];
+
+        let req = anthropic.chat_request(&messages, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        let tr = &blocks[0];
+        assert_eq!(tr["type"], "tool_result");
+        assert_eq!(tr["tool_use_id"], "toolu_01");
+
+        let inner = tr["content"].as_array().expect("tool_result content array");
+        assert_eq!(inner.len(), 6);
+
+        // Text preserved.
+        assert_eq!(inner[0]["type"], "text");
+        assert_eq!(inner[0]["text"], "scan complete");
+        // Base64 image preserved.
+        assert_eq!(inner[1]["type"], "image");
+        assert_eq!(inner[1]["source"]["type"], "base64");
+        assert_eq!(inner[1]["source"]["media_type"], "image/png");
+        assert_eq!(
+            inner[1]["source"]["data"],
+            serde_json::json!(BASE64.encode(&png))
+        );
+        // URL image preserved as a native Anthropic image block.
+        assert_eq!(inner[2]["type"], "image");
+        assert_eq!(
+            inner[2]["source"],
+            serde_json::json!({ "type": "url", "url": "https://example.com/shot.png" })
+        );
+        // PDF / audio / resource link become explicit text fallback markers
+        // (tool_result content supports text/image only, not document blocks).
+        for block in &inner[3..] {
+            assert_eq!(block["type"], "text");
+            assert!(!block["text"].as_str().unwrap().is_empty());
+        }
+        assert!(inner[3]["text"].as_str().unwrap().contains("PDF"));
+        assert!(inner[4]["text"].as_str().unwrap().contains("audio"));
+        assert!(
+            inner[5]["text"]
+                .as_str()
+                .unwrap()
+                .contains("file:///reports/q3.pdf")
+        );
+    }
+
+    #[test]
+    fn test_tool_result_all_unsupported_still_has_visible_text() {
+        let anthropic = test_anthropic("sk-ant-api03-test");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::tool_result(
+                "toolu_02",
+                vec![Content::audio("audio/mpeg", vec![0u8; 8])],
+            )],
+            cache: None,
+        }];
+
+        let req = anthropic.chat_request(&messages, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
+        let inner = body["messages"][0]["content"][0]["content"]
+            .as_array()
+            .expect("tool_result content array");
+        assert!(
+            !inner.is_empty(),
+            "tool_result content must never serialize as an empty array"
+        );
+        assert_eq!(inner[0]["type"], "text");
+        assert!(inner[0]["text"].as_str().unwrap().contains("audio"));
+    }
+
+    #[test]
+    fn test_tool_result_empty_inner_vec_gets_visible_text_fallback() {
+        let anthropic = test_anthropic("sk-ant-api03-test");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::tool_result("toolu_03", vec![])],
+            cache: None,
+        }];
+
+        let req = anthropic.chat_request(&messages, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
+        let inner = body["messages"][0]["content"][0]["content"]
+            .as_array()
+            .expect("tool_result content array");
+        assert_eq!(inner.len(), 1, "expected exactly one fallback text block");
+        assert_eq!(inner[0]["type"], "text");
+        assert!(
+            !inner[0]["text"].as_str().unwrap().is_empty(),
+            "fallback text must be visible (non-empty)"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_single_empty_text_block_gets_visible_text_fallback() {
+        let anthropic = test_anthropic("sk-ant-api03-test");
+        let messages = vec![ChatMessage {
+            role: ChatRole::User,
+            content: vec![Content::tool_result("toolu_04", vec![Content::text("")])],
+            cache: None,
+        }];
+
+        let req = anthropic.chat_request(&messages, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
+        let inner = body["messages"][0]["content"][0]["content"]
+            .as_array()
+            .expect("tool_result content array");
+        assert!(!inner.is_empty(), "tool_result content must never be empty");
+        for block in inner {
+            if block["type"] == "text" {
+                assert!(
+                    !block["text"].as_str().unwrap().is_empty(),
+                    "tool_result must never contain an empty text block"
+                );
+            }
+        }
+        assert_eq!(inner[0]["type"], "text");
+        assert!(
+            !inner[0]["text"].as_str().unwrap().is_empty(),
+            "fallback text must be visible (non-empty)"
+        );
     }
 }
