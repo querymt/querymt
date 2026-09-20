@@ -1274,7 +1274,10 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let response = agent.load_session(params).await;
                             match response {
                                 Ok(r) => {
-                                    attach_rpc_session(
+                                    let request_lock =
+                                        session_owners.request_lock(&session_id, conn_id).await;
+                                    let _request_guard = request_lock.lock().await;
+                                    let ownership_inserted = attach_rpc_session_locked(
                                         agent,
                                         session_owners,
                                         conn_id,
@@ -1287,10 +1290,19 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     if let (Some(hooks), Some(local_agent)) = (
                                         context.session_hooks.as_ref(),
                                         agent.as_any().downcast_ref::<AgentHandle>(),
-                                    ) {
-                                        hooks
-                                            .on_session_loaded(local_agent, &session_id, &mut value)
-                                            .await?;
+                                    ) && let Err(error) = hooks
+                                        .on_session_loaded(local_agent, &session_id, &mut value)
+                                        .await
+                                    {
+                                        if ownership_inserted {
+                                            unsubscribe_connection(
+                                                session_owners,
+                                                &session_id,
+                                                conn_id,
+                                            )
+                                            .await;
+                                        }
+                                        return Err(error);
                                     }
                                     if let Some(notification) =
                                         available_commands_session_update(agent, &session_id).await
@@ -1552,8 +1564,13 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 querymt_session_id_from_response(ext_method, &value)
                             });
                             if let Some(session_id) = session_id {
+                                let mut post_attach_guard = None;
+                                let mut post_attach_inserted = false;
                                 if !attached_before_request {
-                                    attach_rpc_session(
+                                    let request_lock =
+                                        session_owners.request_lock(&session_id, conn_id).await;
+                                    post_attach_guard = Some(request_lock.lock_owned().await);
+                                    post_attach_inserted = attach_rpc_session_locked(
                                         agent,
                                         session_owners,
                                         conn_id,
@@ -1567,15 +1584,25 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 if let (Some(hooks), Some(local_agent)) = (
                                     context.session_hooks.as_ref(),
                                     agent.as_any().downcast_ref::<AgentHandle>(),
-                                ) {
-                                    hooks
-                                        .on_remote_session_attached(
-                                            local_agent,
+                                ) && let Err(error) = hooks
+                                    .on_remote_session_attached(
+                                        local_agent,
+                                        &session_id,
+                                        &mut value,
+                                    )
+                                    .await
+                                {
+                                    if ownership_inserted || post_attach_inserted {
+                                        unsubscribe_connection(
+                                            session_owners,
                                             &session_id,
-                                            &mut value,
+                                            conn_id,
                                         )
-                                        .await?;
+                                        .await;
+                                    }
+                                    return Err(error);
                                 }
+                                drop(post_attach_guard);
                             }
                             Ok(value)
                         }
@@ -2597,6 +2624,40 @@ mod tests {
         release_first: Notify,
     }
 
+    struct RejectPostAttachmentHooks {
+        session_load: bool,
+        remote_session: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpSessionHooks for RejectPostAttachmentHooks {
+        async fn on_session_loaded(
+            &self,
+            _: &AgentHandle,
+            _: &str,
+            _: &mut serde_json::Value,
+        ) -> Result<(), Error> {
+            if self.session_load {
+                Err(Error::invalid_params().data("session load hook rejected"))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn on_remote_session_attached(
+            &self,
+            _: &AgentHandle,
+            _: &str,
+            _: &mut serde_json::Value,
+        ) -> Result<(), Error> {
+            if self.remote_session {
+                Err(Error::invalid_params().data("remote session hook rejected"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl SendAgent for CancelTestAgent {
         async fn initialize(
@@ -2645,7 +2706,7 @@ mod tests {
             &self,
             _: crate::acp::protocol::LoadSessionRequest,
         ) -> Result<crate::acp::protocol::LoadSessionResponse, Error> {
-            unreachable!()
+            Ok(crate::acp::protocol::LoadSessionResponse::new())
         }
         async fn list_sessions(
             &self,
@@ -2685,7 +2746,7 @@ mod tests {
         }
         async fn ext_method(
             &self,
-            _: crate::acp::protocol::ExtRequest,
+            req: crate::acp::protocol::ExtRequest,
         ) -> Result<crate::acp::protocol::ExtResponse, Error> {
             if let Some(control) = &self.ext_method_control {
                 if control.calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -2698,10 +2759,20 @@ mod tests {
                 return Ok(crate::acp::protocol::ExtResponse::new(Arc::from(raw)));
             }
             if self.reject_ext_method {
-                Err(Error::invalid_params().data("rejected extension request"))
-            } else {
-                unreachable!()
+                return Err(Error::invalid_params().data("rejected extension request"));
             }
+            let response = if req.method.as_ref() == "querymt/remote/createSession" {
+                serde_json::json!({
+                    "session_id": "s-remote-created",
+                    "node_id": "n-1",
+                    "attached": false,
+                    "config_options": []
+                })
+            } else {
+                serde_json::json!({"attached": true})
+            };
+            let raw = serde_json::value::RawValue::from_string(response.to_string()).unwrap();
+            Ok(crate::acp::protocol::ExtResponse::new(Arc::from(raw)))
         }
         async fn ext_notification(
             &self,
@@ -2987,6 +3058,151 @@ mod tests {
         assert_eq!(
             session_owners.lock().await.get("s-concurrent").cloned(),
             Some(HashSet::from(["conn-ext".to_string()]))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_session_load_hook_rolls_back_only_new_ownership() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+            reject_ext_method: false,
+            ext_method_control: None,
+        };
+        let session_owners = SessionOwnerMap::default();
+        session_owners.lock().await.insert(
+            "s-load-existing".to_string(),
+            HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
+        );
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let context = RpcDispatchContext {
+            session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
+                session_load: true,
+                remote_session: false,
+            })),
+            session_bridge: None,
+        };
+
+        for session_id in ["s-load-new", "s-load-existing"] {
+            let output = handle_rpc_message_with_context(
+                &agent,
+                &session_owners,
+                &pending_permissions,
+                &pending_elicitations,
+                "conn-hook",
+                RpcMessage {
+                    jsonrpc: "2.0".to_string(),
+                    method: AGENT_METHOD_NAMES.session_load.to_string(),
+                    params: serde_json::json!({
+                        "sessionId": session_id,
+                        "cwd": "/tmp",
+                        "mcpServers": []
+                    }),
+                    id: Some(serde_json::json!(1)),
+                },
+                context.clone(),
+            )
+            .await;
+            assert!(
+                output
+                    .response
+                    .expect("request should produce response")
+                    .error
+                    .is_some()
+            );
+        }
+
+        let owners = session_owners.lock().await;
+        assert!(!owners.contains_key("s-load-new"));
+        assert_eq!(
+            owners.get("s-load-existing"),
+            Some(&HashSet::from([
+                "conn-hook".to_string(),
+                "conn-other".to_string()
+            ]))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remote_attachment_hook_rolls_back_only_new_ownership() {
+        let local_fixture = crate::test_utils::TestAgent::new().await;
+        let agent = CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: Some(local_fixture.handle),
+            reject_ext_method: false,
+            ext_method_control: None,
+        };
+        let session_owners = SessionOwnerMap::default();
+        session_owners.lock().await.insert(
+            "s-remote-existing".to_string(),
+            HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
+        );
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let context = RpcDispatchContext {
+            session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
+                session_load: false,
+                remote_session: true,
+            })),
+            session_bridge: None,
+        };
+
+        for (method, params) in [
+            (
+                "querymt/remote/attachSession",
+                serde_json::json!({"session_id": "s-remote-new", "node_id": "n-1"}),
+            ),
+            (
+                "querymt/remote/attachSession",
+                serde_json::json!({"session_id": "s-remote-existing", "node_id": "n-1"}),
+            ),
+            (
+                "querymt/remote/createSession",
+                serde_json::json!({"node_id": "n-1"}),
+            ),
+        ] {
+            let output = handle_rpc_message_with_context(
+                &agent,
+                &session_owners,
+                &pending_permissions,
+                &pending_elicitations,
+                "conn-hook",
+                RpcMessage {
+                    jsonrpc: "2.0".to_string(),
+                    method: method.to_string(),
+                    params,
+                    id: Some(serde_json::json!(1)),
+                },
+                context.clone(),
+            )
+            .await;
+            assert!(
+                output
+                    .response
+                    .expect("request should produce response")
+                    .error
+                    .is_some()
+            );
+        }
+
+        let owners = session_owners.lock().await;
+        for session_id in ["s-remote-new", "s-remote-created"] {
+            assert!(!owners.contains_key(session_id));
+        }
+        assert_eq!(
+            owners.get("s-remote-existing"),
+            Some(&HashSet::from([
+                "conn-hook".to_string(),
+                "conn-other".to_string()
+            ]))
         );
     }
 
