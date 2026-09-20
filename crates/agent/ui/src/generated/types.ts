@@ -43,6 +43,8 @@ export type AgentEventKind =
 	run_id: string;
 	input_id: string;
 	position: number;
+	blocks?: any;
+	accepted_at_ms?: number;
 }}
 	| { type: "steering_applied", data: {
 	run_id: string;
@@ -58,6 +60,8 @@ export type AgentEventKind =
 	| { type: "input_queued", data: {
 	input_id: string;
 	position: number;
+	blocks?: any;
+	accepted_at_ms?: number;
 }}
 	| { type: "queued_input_started", data: {
 	input_id: string;

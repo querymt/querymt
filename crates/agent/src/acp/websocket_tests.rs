@@ -290,6 +290,8 @@ async fn websocket_event_forwarder_emits_owned_input_state() {
             kind: AgentEventKind::InputQueued {
                 input_id: "input-1".into(),
                 position: 2,
+                blocks: Vec::new(),
+                accepted_at_ms: None,
             },
         }));
 

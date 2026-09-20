@@ -1781,6 +1781,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                         run_id: run.run_id.clone(),
                     }));
                 }
+                let blocks = input.prompt.clone();
                 let position = run
                     .steering
                     .push(
@@ -1790,6 +1791,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     )
                     .await
                     .map_err(AgentError::from)?;
+                let accepted_at_ms = now_ms();
                 let position = crate::agent::utils::u32_from_usize(
                     position,
                     "steering_position",
@@ -1801,6 +1803,8 @@ impl Message<SubmitSessionInput> for SessionActor {
                         run_id: run.run_id.clone(),
                         input_id: input_id.clone(),
                         position,
+                        blocks,
+                        accepted_at_ms: Some(accepted_at_ms),
                     },
                 );
                 let result = SubmitInputResult::Steered {
@@ -1812,6 +1816,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                 Ok(result)
             }
             InputDelivery::Queue => {
+                let blocks = input.prompt.clone();
                 let req =
                     crate::acp::protocol::PromptRequest::new(self.session_id.clone(), input.prompt);
                 if self.active_run.is_some() && self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
@@ -1867,6 +1872,8 @@ impl Message<SubmitSessionInput> for SessionActor {
                         AgentEventKind::InputQueued {
                             input_id: input_id.clone(),
                             position,
+                            blocks,
+                            accepted_at_ms: Some(now_ms()),
                         },
                     );
                     let result = SubmitInputResult::Queued { input_id, position };
@@ -1926,6 +1933,7 @@ impl Message<Prompt> for SessionActor {
             }
             let input_id = Uuid::new_v4().to_string();
             let position = self.queued_prompts.len() + 1;
+            let blocks = msg.req.prompt.clone();
             self.queued_prompts.push_back(QueuedPrompt {
                 input_id: input_id.clone(),
                 req: msg.req,
@@ -1941,6 +1949,8 @@ impl Message<Prompt> for SessionActor {
                         "legacy_queued_input_position",
                         Some(&self.session_id),
                     ),
+                    blocks,
+                    accepted_at_ms: Some(now_ms()),
                 },
             );
         } else {
@@ -3908,22 +3918,37 @@ mod tests {
             }
         );
 
+        let mut saw_queued_content = false;
         let mut saw_discarded = false;
         for _ in 0..3 {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
                 .await
                 .expect("queue lifecycle event")
                 .expect("event stream open");
-            if matches!(
-                event.kind(),
+            match event.kind() {
+                AgentEventKind::InputQueued {
+                    input_id,
+                    blocks,
+                    accepted_at_ms,
+                    ..
+                } if input_id == "queued-1" => {
+                    assert_eq!(
+                        serde_json::to_value(blocks).expect("serialize queued blocks"),
+                        serde_json::json!([{"type": "text", "text": "queued-1"}])
+                    );
+                    assert!(accepted_at_ms.is_some());
+                    saw_queued_content = true;
+                }
                 AgentEventKind::QueuedInputDiscarded { input_id, reason }
-                    if input_id == "queued-1" && reason == "removed_by_user"
-            ) {
-                assert!(event.is_durable());
-                saw_discarded = true;
-                break;
+                    if input_id == "queued-1" && reason == "removed_by_user" =>
+                {
+                    assert!(event.is_durable());
+                    saw_discarded = true;
+                }
+                _ => {}
             }
         }
+        assert!(saw_queued_content, "queued input content event missing");
         assert!(saw_discarded, "queued discard lifecycle event missing");
         actor_ref.tell(Shutdown).await.expect("shutdown actor");
     }

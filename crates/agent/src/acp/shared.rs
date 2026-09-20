@@ -441,6 +441,7 @@ pub fn input_state_from_event(
             run_id,
             input_id,
             position,
+            ..
         } => {
             notification.input_id.clone_from(input_id);
             notification.run_id = Some(run_id.clone());
@@ -468,7 +469,9 @@ pub fn input_state_from_event(
             notification.run_id = Some(run_id.clone());
             notification.reason = Some(reason.clone());
         }
-        AgentEventKind::InputQueued { input_id, position } => {
+        AgentEventKind::InputQueued {
+            input_id, position, ..
+        } => {
             notification.input_id.clone_from(input_id);
             notification.delivery = SessionInputDelivery::Queue;
             notification.state = SessionInputState::Queued;
@@ -1715,6 +1718,8 @@ mod tests {
                     run_id: "run-1".into(),
                     input_id: "input-1".into(),
                     position: 2,
+                    blocks: vec![ContentBlock::Text(TextContent::new("steer"))],
+                    accepted_at_ms: Some(10),
                 },
                 serde_json::json!({
                     "version": 1,
@@ -1764,6 +1769,8 @@ mod tests {
                 AgentEventKind::InputQueued {
                     input_id: "input-2".into(),
                     position: 1,
+                    blocks: vec![ContentBlock::Text(TextContent::new("queue"))],
+                    accepted_at_ms: Some(20),
                 },
                 serde_json::json!({
                     "version": 1,
