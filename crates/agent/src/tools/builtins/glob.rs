@@ -1,7 +1,7 @@
 //! Glob tool for fast file pattern matching
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -134,7 +134,7 @@ impl Tool for GlobTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         // Extract pattern (required)
         let pattern = args
             .get("pattern")
@@ -181,7 +181,7 @@ impl Tool for GlobTool {
             output.push_str(&format!("({} matches)", count));
         }
 
-        Ok(vec![Content::text(output)])
+        Ok(vec![ToolResultPart::text(output)])
     }
 }
 
@@ -189,11 +189,11 @@ impl Tool for GlobTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

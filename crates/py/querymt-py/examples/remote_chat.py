@@ -10,7 +10,7 @@ async def main() -> None:
         model="gpt-4o-mini",
     )
     response = await provider.chat([
-        {"role": "user", "content": "Say hello from the mesh."}
+        querymt.user_message([querymt.text_part("Say hello from the mesh.")])
     ])
     print(response.text)
 

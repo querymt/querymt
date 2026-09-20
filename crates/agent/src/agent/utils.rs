@@ -93,7 +93,7 @@ pub fn render_prompt_for_llm(blocks: &[ContentBlock], max_prompt_bytes: Option<u
 pub fn approximate_token_count(messages: &[querymt::chat::ChatMessage]) -> usize {
     let mut chars = 0usize;
     for msg in messages {
-        chars += msg.content.len();
+        chars += msg.input_parts().len() + msg.text().len();
     }
     (chars / 4).max(1)
 }

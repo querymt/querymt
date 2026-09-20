@@ -25,7 +25,7 @@
 use querymt::{
     LLMProvider, ToolCall,
     builder::{FunctionBuilder, ParamBuilder},
-    chat::{ChatMessage, Content, Tool, ToolChoice},
+    chat::{ChatMessage, Tool, ToolChoice, ToolResultPart},
     dynamic::PluginRegistryDynamicExt,
     plugin::host::PluginRegistry,
 };
@@ -191,7 +191,7 @@ fn build_tool_result_message(tool_calls: &[ToolCall]) -> ExampleResult<ChatMessa
             call.id.clone(),
             Some(call.function.name.clone()),
             false,
-            vec![Content::text(serde_json::to_string(&result)?)],
+            vec![ToolResultPart::text(serde_json::to_string(&result)?)],
         );
     }
 
@@ -212,7 +212,7 @@ async fn run_until_final_answer(
                 println!("- {}({})", call.function.name, call.function.arguments);
             }
 
-            conversation.push(ChatMessage::from(response.as_ref()));
+            conversation.push(ChatMessage::from(&response));
             conversation.push(build_tool_result_message(&tool_calls)?);
             continue;
         }

@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prepare conversation history with example messages
     let messages = vec![
         ChatMessage::user().image_url("https://media.istockphoto.com/id/1443562748/fr/photo/mignon-chat-gingembre.jpg?s=612x612&w=0&k=20&c=ygNVVnqLk9V8BWu4VQ0D21u7-daIyHUoyKlCcx3K1E8=").build(),
-        ChatMessage::user().image("image/jpeg", content).build(),
+        ChatMessage::user().image("image/jpeg".parse().unwrap(), content).build(),
         ChatMessage::user()
             .text("What is in this image (image 1 and 2)?")
             .build(),

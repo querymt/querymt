@@ -1,6 +1,6 @@
 use crate::{
     LLMProvider, Tool,
-    chat::{ChatMessage, ChatProvider, ChatResponse, Content, StreamChunk},
+    chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, ToolResultPart},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -15,12 +15,13 @@ use std::pin::Pin;
 
 /// Adapter interface for your host‐side implementations.
 ///
-/// Tool implementations return `Vec<Content>` to support mixed content results
-/// (e.g., text + images from MCP tools).
+/// Tool implementations return canonical bounded [`ToolResultPart`] values to
+/// support mixed content results (e.g., text + images from MCP tools) without
+/// the legacy recursive content representation.
 #[async_trait]
 pub trait CallFunctionTool: Send + Sync {
     fn descriptor(&self) -> Tool;
-    async fn call(&self, args: Value) -> anyhow::Result<Vec<Content>>;
+    async fn call(&self, args: Value) -> anyhow::Result<Vec<ToolResultPart>>;
 
     /// Returns the server name for server-aware tools (e.g., MCP tools).
     /// Returns None for tools that don't have server information.
@@ -125,7 +126,7 @@ impl ChatProvider for ToolEnabledProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let to_send = tools.unwrap_or(&self.tool_list);
         self.inner.chat_with_tools(messages, Some(to_send)).await
     }
@@ -152,7 +153,7 @@ impl LLMProvider for ToolEnabledProvider {
         &self,
         name: &str,
         args: serde_json::Value,
-    ) -> Result<Vec<Content>, LLMError> {
+    ) -> Result<Vec<ToolResultPart>, LLMError> {
         let tool = self
             .registry
             .get(name)

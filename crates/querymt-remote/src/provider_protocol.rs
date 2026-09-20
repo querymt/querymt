@@ -1,14 +1,22 @@
 use querymt::ToolCall;
 use querymt::Usage;
-use querymt::chat::{ChatMessage, ChatOutput, ChatResponse, FinishReason, StreamChunk, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
 use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub const ITEM_AWARE_CHAT_CONTRACT_VERSION: u32 = 1;
 
+/// Whether any message retains item-aware-only fidelity semantics.
+///
+/// Derived from the concrete retained semantics, not the mere presence of a
+/// canonical output value, so portable output can cross a legacy boundary.
 pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|message| message.output.is_some())
+    messages.iter().any(|message| {
+        message
+            .output()
+            .is_some_and(|output| output.requires_item_aware_fidelity())
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -41,25 +49,15 @@ impl fmt::Display for ProviderChatResponse {
     }
 }
 
-impl ChatResponse for ProviderChatResponse {
-    fn text(&self) -> Option<String> {
-        self.text.clone()
-    }
-
-    fn thinking(&self) -> Option<String> {
-        self.thinking.clone()
-    }
-
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        if self.tool_calls.is_empty() {
-            None
-        } else {
-            Some(self.tool_calls.clone())
+impl ProviderChatResponse {
+    /// Project the canonical output, falling back to the legacy flat fields
+    /// when the peer only returned a legacy payload.
+    pub fn to_canonical_output(&self) -> ChatOutput {
+        if let Some(output) = &self.output {
+            return output.clone();
         }
-    }
 
-    fn finish_reason(&self) -> Option<FinishReason> {
-        self.finish_reason.as_deref().map(|reason| match reason {
+        let finish_reason = self.finish_reason.as_deref().map(|reason| match reason {
             "Stop" => FinishReason::Stop,
             "Length" => FinishReason::Length,
             "ContentFilter" => FinishReason::ContentFilter,
@@ -67,15 +65,44 @@ impl ChatResponse for ProviderChatResponse {
             "Error" => FinishReason::Error,
             "Other" => FinishReason::Other,
             _ => FinishReason::Unknown,
-        })
+        });
+        let tool_calls = if self.tool_calls.is_empty() {
+            None
+        } else {
+            Some(self.tool_calls.clone())
+        };
+
+        ChatOutput::from_projections(
+            self.thinking.clone(),
+            self.text.clone(),
+            tool_calls,
+            self.usage.clone(),
+            finish_reason,
+        )
     }
 
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
-    }
-
-    fn output(&self) -> Option<&ChatOutput> {
+    /// Authoritative ordered output when the peer returned one.
+    pub fn output(&self) -> Option<&ChatOutput> {
         self.output.as_ref()
+    }
+}
+
+impl From<ChatOutput> for ProviderChatResponse {
+    fn from(output: ChatOutput) -> Self {
+        let text = output.text();
+        let thinking = output.thinking();
+        let tool_calls = output.tool_calls().unwrap_or_default();
+        let usage = output.usage.clone();
+        let finish_reason = output.finish_reason.map(|reason| format!("{:?}", reason));
+
+        ProviderChatResponse {
+            text,
+            thinking,
+            tool_calls,
+            usage,
+            finish_reason,
+            output: Some(output),
+        }
     }
 }
 
@@ -215,13 +242,14 @@ pub fn keep_stream_message_buffered(message: &StreamRelayMessage) -> bool {
 pub fn relay_message_is_terminal(message: &StreamRelayMessage) -> bool {
     matches!(
         message,
-        StreamRelayMessage::Chunk(StreamChunk::Done { .. })
-            | StreamRelayMessage::ProviderError { .. }
-            | StreamRelayMessage::TransportFailed { .. }
+        StreamRelayMessage::Chunk(chunk) if querymt::chat::chunk_is_terminal(chunk)
+    ) || matches!(
+        message,
+        StreamRelayMessage::ProviderError { .. } | StreamRelayMessage::TransportFailed { .. }
     ) || matches!(
         message,
         StreamRelayMessage::ChunkBatch(chunks)
-            if chunks.iter().any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
+            if chunks.iter().any(querymt::chat::chunk_is_terminal)
     )
 }
 
@@ -264,6 +292,15 @@ mod item_aware_tests {
             .replace_output(ChatOutput {
                 response_id: Some("response-1".into()),
                 status: Some(ChatOutputStatus::Completed),
+                // A provider-only identity makes fidelity item-aware.
+                items: vec![ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("item-1".into()),
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                    status: None,
+                    extensions: Default::default(),
+                })],
                 extensions: [("opaque".into(), json!({"preserved": true}))]
                     .into_iter()
                     .collect(),
@@ -293,6 +330,22 @@ mod item_aware_tests {
         }))
         .expect("legacy response");
         assert!(response.output.is_none());
+
+        let legacy_history: ProviderChatRequest = serde_json::from_value(json!({
+            "provider": "demo",
+            "model": "m1",
+            "messages": [{
+                "role": "Assistant",
+                "content": [{"type": "text", "text": "legacy answer"}]
+            }],
+            "tools": null
+        }))
+        .expect("legacy history request");
+        let saved = serde_json::to_value(&legacy_history).expect("serialize canonical request");
+        let message = &saved["messages"][0];
+        assert!(message.get("content").is_none());
+        assert!(message.get("input").is_none());
+        assert_eq!(message["output"]["items"][0]["type"], "message");
     }
 
     #[test]
@@ -306,7 +359,7 @@ mod item_aware_tests {
                 status: Some(ChatOutputStatus::Completed),
                 extensions: Default::default(),
             })],
-            ..structured_message().output.expect("output")
+            ..structured_message().output().expect("output").clone()
         };
         let response = ProviderChatResponse {
             text: None,
@@ -358,7 +411,7 @@ mod item_aware_tests {
             };
             accumulator.push(&chunk).expect("accumulate chunk");
         }
-        let streamed = accumulator.finish().expect("complete stream");
+        let streamed = accumulator.finish_success().expect("complete stream");
         assert_eq!(streamed.items, output.items);
     }
 
@@ -382,8 +435,8 @@ mod item_aware_tests {
     #[test]
     fn structured_remote_history_round_trips_into_second_request() {
         use querymt::chat::{
-            ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOutputItem,
-            ChatReasoningItem, ChatReasoningPart, Content,
+            ChatFunctionCallItem, ChatInputPart, ChatMessageItem, ChatMessagePart, ChatOutputItem,
+            ChatReasoningItem, ChatReasoningPart, ToolResult, ToolResultPart,
         };
 
         let config = crate::RemoteProviderClientConfig::new("peer", "demo", "m1");
@@ -441,21 +494,18 @@ mod item_aware_tests {
         assert_eq!(decoded_output.items.len(), 3);
 
         // Reload the structured turn into request history plus its tool result.
-        let mut assistant = ChatMessage::from_assistant(decoded_output.portable_content());
-        assistant
-            .replace_output(decoded_output.clone())
-            .expect("projection must match structured output");
+        let assistant = ChatMessage::from_assistant_output(decoded_output.clone());
 
-        let result = ChatMessage::from_user(vec![Content::ToolResult {
-            id: "call-remote".into(),
-            name: Some("lookup".into()),
-            is_error: false,
-            content: vec![Content::text("result payload")],
-        }]);
+        let mut tool_result = ToolResult::new("call-remote".to_string());
+        tool_result.name = Some("lookup".into());
+        tool_result
+            .parts
+            .push(ToolResultPart::text("result payload"));
+        let result = ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(tool_result)]);
 
         let request = config.build_chat_request(
             &[
-                ChatMessage::from_user(vec![Content::text("look it up")]),
+                ChatMessage::from_user_parts(vec![ChatInputPart::text("look it up")]),
                 assistant,
                 result,
             ],
@@ -475,8 +525,7 @@ mod item_aware_tests {
 
         let reloaded = &decoded.messages[1];
         let reloaded_output = reloaded
-            .output
-            .as_ref()
+            .output()
             .expect("structured output survives the transport");
         assert_eq!(
             reloaded_output.items.len(),
@@ -502,13 +551,13 @@ mod item_aware_tests {
 
         // The tool result still references the original call ID.
         let tool_result = decoded.messages[2]
-            .content
-            .iter()
-            .find(|block| block.is_tool_result())
+            .input_parts()
+            .into_iter()
+            .find_map(|part| match part {
+                querymt::chat::ChatInputPart::ToolResult(result) => Some(result),
+                _ => None,
+            })
             .expect("tool result present");
-        let Content::ToolResult { id, .. } = tool_result else {
-            panic!("expected tool result block");
-        };
-        assert_eq!(id, "call-remote");
+        assert_eq!(tool_result.call_id, "call-remote");
     }
 }

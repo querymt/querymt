@@ -6,7 +6,7 @@ use izwi_core::{
     Error as IzwiError, GenerationConfig, GenerationRequest, ModelVariant, RuntimeService,
     parse_tts_model_variant, resolve_asr_model_variant,
 };
-use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -215,7 +215,7 @@ impl ChatProvider for IzwiProvider {
         &self,
         _messages: &[ChatMessage],
         _tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         Err(LLMError::NotImplemented(AUDIO_ONLY_ERR.into()))
     }
 }

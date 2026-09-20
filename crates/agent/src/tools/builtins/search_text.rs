@@ -8,7 +8,7 @@ use grep_searcher::{
 };
 use ignore::{WalkBuilder, types::TypesBuilder};
 use indexmap::IndexMap;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -464,7 +464,7 @@ impl ToolTrait for SearchTextTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let pattern = args
             .get("pattern")
             .and_then(Value::as_str)
@@ -566,7 +566,7 @@ impl ToolTrait for SearchTextTool {
         let compact_output =
             Self::format_compact_text(&internal_results, &root_for_format, has_context);
 
-        Ok(vec![Content::text(compact_output)])
+        Ok(vec![ToolResultPart::text(compact_output)])
     }
 }
 
@@ -574,11 +574,11 @@ impl ToolTrait for SearchTextTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

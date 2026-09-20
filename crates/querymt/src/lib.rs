@@ -102,7 +102,7 @@ pub trait LLMProvider:
         &self,
         _name: &str,
         _args: Value,
-    ) -> Result<Vec<chat::Content>, error::LLMError> {
+    ) -> Result<Vec<chat::ToolResultPart>, error::LLMError> {
         Err(error::LLMError::ProviderError(
             "tool calling not supported".into(),
         ))

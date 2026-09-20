@@ -11,7 +11,7 @@ async def main() -> None:
         raise RuntimeError("provider does not support streaming")
 
     stream = await provider.chat_stream(
-        [{"role": "user", "content": "Explain streaming in one short paragraph."}]
+        [querymt.user_message([querymt.text_part("Explain streaming in one short paragraph.")])]
     )
 
     async for chunk in stream:

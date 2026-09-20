@@ -13,7 +13,7 @@ Item-aware native, plugin, remote, and persisted history paths SHALL preserve or
 - **AND** each result references its original call ID with no duplicate projected items.
 
 ### Requirement: Compatibility failures are explicit
-Old serialized histories without structured output SHALL remain readable. Peers SHALL advertise support for the structured contract before it is used; an incompatible peer SHALL reject item-aware operation instead of silently dropping data. Native plugin compatibility SHALL be checked under the coordinated build/version contract rather than assumed from JSON compatibility.
+Old serialized histories without structured output SHALL remain readable and SHALL normalize at the load boundary. Peers SHALL advertise support before an operation sends semantics that require the item-aware contract; use of the canonical output type alone SHALL NOT require item-aware negotiation when all retained semantics have a lossless legacy representation. An incompatible peer SHALL reject fidelity-requiring operation instead of silently dropping data. Native plugin compatibility SHALL be checked under the coordinated build/version contract rather than assumed from JSON compatibility.
 
 #### Scenario: Older remote or plugin peer
 - **WHEN** an item-aware operation targets a peer without support for its contract version
@@ -21,8 +21,18 @@ Old serialized histories without structured output SHALL remain readable. Peers 
 - **AND** legacy non-item-aware operations remain available.
 
 #### Scenario: Existing stored history
-- **WHEN** a history record has only legacy text, thinking, and tool parts
-- **THEN** it loads without a structured output field and remains usable as legacy history.
+- **WHEN** a history record contains legacy text, image, image-URL, PDF, audio, resource-link, thinking, tool-use, or tool-result content variants
+- **THEN** a private migration decoder normalizes user text, resources, and results into canonical input parts
+- **AND** it normalizes an entire assistant turn into one structured output payload, including message items for assistant text or attachments and reasoning or function-call items for generated semantics
+- **AND** the loaded in-memory model contains no public legacy content value.
+
+#### Scenario: Canonical portable history targets an older peer
+- **WHEN** canonical output contains only semantics that the legacy wire contract preserves losslessly
+- **THEN** the operation may use an explicit legacy transport projection without falsely requiring item-aware support.
+
+#### Scenario: Item-aware state targets an older peer
+- **WHEN** canonical output contains ordering, identity, opaque, or continuation semantics that the legacy wire contract cannot preserve
+- **THEN** the operation fails before generation with an explicit compatibility error.
 
 ### Requirement: Opaque replay is scoped and validated
 The system SHALL retain provider/protocol/model/endpoint provenance without credentials. Opaque state SHALL only be replayed to a compatible origin; changed targets SHALL receive portable projections by default without modifying stored originals. Same-origin replay SHALL emit only protocol-valid input fields. Unsupported required opaque continuation SHALL cause an explicit error, not silent omission or blind JSON passthrough.
@@ -38,7 +48,7 @@ The system SHALL retain provider/protocol/model/endpoint provenance without cred
 - **AND** the return request uses validated native representations of A turns and portable projections of B turns, preserving chronological order and call/result dependencies.
 
 #### Scenario: Return after compaction or edit
-- **WHEN** an original A dependency group is compacted or explicitly replaced with portable content while using B and the conversation later returns to A
+- **WHEN** an original A dependency group is compacted or explicitly replaced with canonical portable input parts while using B and the conversation later returns to A
 - **THEN** the return request does not restore that group's previous opaque state from archived history or a hidden sidecar.
 
 #### Scenario: Unknown item cannot be safely replayed
@@ -46,12 +56,33 @@ The system SHALL retain provider/protocol/model/endpoint provenance without cred
 - **THEN** replay fails with an unsupported-continuation error rather than discarding the item.
 
 ### Requirement: Edits and compaction cannot resurrect hidden history
-History-edit operations SHALL update structured output and projections together or explicitly discard structured output. Compaction SHALL replace complete affected reasoning/call/result dependency groups with portable summaries, removing their continuation state from effective replay. Unaffected turns SHALL retain their original structured output.
+History-edit operations SHALL replace an assistant turn's single authoritative payload or explicitly convert structured output to canonical portable input parts before editing. Compaction SHALL replace complete affected reasoning/call/result dependency groups with portable summaries, removing their continuation state from effective replay. Unaffected turns SHALL retain their original structured output.
 
 #### Scenario: Compacted tool exchange
 - **WHEN** a tool exchange is compacted into a summary
 - **THEN** its old opaque reasoning and calls are absent from the next effective request
 - **AND** no dangling tool result or hidden raw-output sidecar restores the exchange.
+
+### Requirement: Backward compatibility is limited to data migration
+The system SHALL preserve decoding of supported old history formats through private migration-only DTOs and SHALL offer explicit lossy projection for legacy exports or transports. Legacy values SHALL normalize immediately into canonical input parts or structured output. New persistence and transport serialization SHALL write only the canonical model. The public Rust input, response, message, and stream APIs SHALL NOT retain the legacy recursive content enum or duplicate representations solely for source compatibility. Lossy conversion SHALL be visible to the caller and SHALL NOT be presented as preserving native continuation.
+
+#### Scenario: Old application source upgrades
+- **WHEN** application code upgrades from the recursive content, flattened response, or legacy stream API
+- **THEN** it must migrate to canonical input parts, output items, and event projections rather than relying on duplicate deprecated variants, fields, or events.
+
+#### Scenario: Canonical history is saved after migration
+- **WHEN** an old history containing legacy media, reasoning, calls, and results is loaded and saved
+- **THEN** the saved record contains only canonical input attachments, tool results, and structured assistant output
+- **AND** future reads do not require the legacy representation except when opening an unchanged old record.
+
+#### Scenario: Invalid legacy attachment metadata
+- **WHEN** an old media or resource variant contains malformed MIME metadata or an impossible source/type combination
+- **THEN** migration returns an explicit path-specific normalization error
+- **AND** it does not construct an invalid canonical attachment or silently discard the part.
+
+#### Scenario: Legacy export is requested
+- **WHEN** a caller explicitly requests a legacy-compatible export
+- **THEN** the system emits the portable projection and identifies that provider-only continuation and identities may be lost.
 
 ### Requirement: Sensitive continuation is not display content
 Encrypted continuation, signatures, and opaque replay payloads SHALL be retained in authorized persistence but redacted from ordinary logs, Debug/display output, telemetry, and portable exports. Portable exports SHALL be identified as lossy rather than usable for complete continuation restoration.

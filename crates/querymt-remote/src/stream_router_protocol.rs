@@ -1,5 +1,4 @@
 use crate::StreamRelayMessage;
-use querymt::chat::StreamChunk;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -37,9 +36,11 @@ pub enum RequestPhase {
 
 pub fn terminal_request_phase(message: &StreamRelayMessage) -> Option<RequestPhase> {
     match message {
-        StreamRelayMessage::Chunk(StreamChunk::Done { .. }) => Some(RequestPhase::Completed),
+        StreamRelayMessage::Chunk(chunk) if querymt::chat::chunk_is_terminal(chunk) => {
+            Some(RequestPhase::Completed)
+        }
         StreamRelayMessage::ChunkBatch(chunks)
-            if chunks.iter().any(|c| matches!(c, StreamChunk::Done { .. })) =>
+            if chunks.iter().any(querymt::chat::chunk_is_terminal) =>
         {
             Some(RequestPhase::Completed)
         }

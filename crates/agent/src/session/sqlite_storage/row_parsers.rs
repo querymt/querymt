@@ -22,6 +22,8 @@ pub(super) fn parse_llm_config_row(row: &rusqlite::Row<'_>) -> Result<LLMConfig,
         name: row.get(1)?,
         provider: row.get(2)?,
         model: row.get(3)?,
+        protocol: String::new(),
+        endpoint: String::new(),
         params: parse_llm_params(&params_str)?,
         created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
             OffsetDateTime::parse(&s, &time::format_description::well_known::Rfc3339).ok()

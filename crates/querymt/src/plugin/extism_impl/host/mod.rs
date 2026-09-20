@@ -5,7 +5,7 @@ use crate::{
     adapters::LLMProviderFromHTTP,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool,
+        ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{
@@ -781,7 +781,7 @@ impl ChatProvider for ExtismProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let mut cfg = self.config.clone();
 
         // Refresh OAuth token if resolver is present
@@ -819,7 +819,7 @@ impl ChatProvider for ExtismProvider {
             })
             .await?;
 
-        Ok(Box::new(out) as Box<dyn ChatResponse>)
+        Ok(out.to_canonical_output())
     }
 
     #[cfg_attr(
@@ -1378,7 +1378,7 @@ impl HTTPChatProvider for ExtismProvider {
         })
     }
 
-    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         let cfg = self.effective_config()?;
         let out = self.call_short_blocking("parse_chat_response", move |plug| {
             let out: Json<ExtismChatResponse> = plug
@@ -1393,7 +1393,7 @@ impl HTTPChatProvider for ExtismProvider {
             Ok(out.0)
         })?;
 
-        Ok(Box::new(out) as Box<dyn ChatResponse>)
+        Ok(out.to_canonical_output())
     }
 
     fn supports_streaming(&self) -> bool {

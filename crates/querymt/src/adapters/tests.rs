@@ -60,7 +60,7 @@ impl HTTPChatProvider for DummyHttpProvider {
         Err(LLMError::NotImplemented("unused in test".into()))
     }
 
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         Err(LLMError::NotImplemented("unused in test".into()))
     }
 
@@ -119,7 +119,7 @@ impl HTTPChatProvider for ResolveAwareHttpProvider {
         Ok(req)
     }
 
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         Err(LLMError::NotImplemented("unused in test".into()))
     }
 
@@ -367,7 +367,7 @@ impl HTTPChatProvider for StreamTestProvider {
             .map_err(|e| LLMError::InvalidRequest(e.to_string()))
     }
 
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         Err(LLMError::NotImplemented("unused".into()))
     }
 

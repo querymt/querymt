@@ -6,7 +6,7 @@ use http::{Request, Response};
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -232,7 +232,7 @@ impl HTTPChatProvider for OpenAI {
         }
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         match self.api_mode {
             ApiMode::ChatCompletions => api::openai_parse_chat(self, response),
             ApiMode::Responses => api::openai_parse_responses(self, response, None),
@@ -360,7 +360,9 @@ mod tests {
     use super::{ApiMode, OpenAI};
     use querymt::{
         chat::{
-            ChatMessage, ChatRole, Content, StreamChunk, Tool, ToolChoice, http::HTTPChatProvider,
+            ChatInputPart, ChatMessage, ChatRole, MediaKind, MediaPart, MediaSource, StreamChunk,
+            Tool, ToolChoice, ToolResult, ToolResultPart,
+            http::{ChatStreamParser, HTTPChatProvider},
         },
         error::LLMError,
     };
@@ -417,9 +419,9 @@ mod tests {
             "system": ["be terse"]
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
 
         let req = provider
             .chat_request(&messages, None)
@@ -455,9 +457,9 @@ mod tests {
             "system": ["be terse"]
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
 
         let req = provider
             .chat_request(&messages, None)
@@ -489,9 +491,9 @@ mod tests {
             "api_mode": "responses"
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         let tools = vec![Tool {
             tool_type: "function".to_string(),
             function: querymt::chat::FunctionTool {
@@ -550,37 +552,40 @@ mod tests {
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
 
         let messages = vec![
-            ChatMessage::from_user(vec![Content::Text {
-                text: "read a.txt".to_string(),
-            }]),
-            ChatMessage {
-                role: ChatRole::Assistant,
-                content: vec![
-                    Content::Text {
-                        text: "on it".to_string(),
-                    },
-                    Content::ToolUse {
-                        id: "call_1".to_string(),
-                        name: "read_file".to_string(),
-                        arguments: serde_json::json!({"path": "a.txt"}),
-                    },
+            ChatMessage::user().text("read a.txt").build(),
+            ChatMessage::from(querymt::chat::ChatOutput {
+                items: vec![
+                    querymt::chat::ChatOutputItem::Message(querymt::chat::ChatMessageItem {
+                        id: None,
+                        role: ChatRole::Assistant,
+                        phase: None,
+                        status: None,
+                        parts: vec![querymt::chat::ChatMessagePart::Text {
+                            text: "on it".to_string(),
+                            annotations: Vec::new(),
+                            extensions: querymt::chat::Extensions::new(),
+                        }],
+                        extensions: querymt::chat::Extensions::new(),
+                    }),
+                    querymt::chat::ChatOutputItem::FunctionCall(
+                        querymt::chat::ChatFunctionCallItem {
+                            item_id: Some("item_1".to_string()),
+                            call_id: "call_1".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: "{\"path\":\"a.txt\"}".to_string(),
+                            status: None,
+                            extensions: querymt::chat::Extensions::new(),
+                        },
+                    ),
                 ],
-                cache: None,
-                output: None,
-            },
-            ChatMessage::from_user(vec![
-                Content::ToolResult {
-                    id: "call_1".to_string(),
-                    name: None,
-                    is_error: false,
-                    content: vec![Content::Text {
-                        text: "file body".to_string(),
-                    }],
-                },
-                Content::Text {
-                    text: "summarize".to_string(),
-                },
-            ]),
+                ..querymt::chat::ChatOutput::default()
+            }),
+            ChatMessage::user()
+                .part(querymt::chat::ChatInputPart::tool_result(
+                    querymt::chat::ToolResult::text("call_1", "file body"),
+                ))
+                .text("summarize")
+                .build(),
         ];
 
         let req = provider
@@ -619,9 +624,9 @@ mod tests {
     #[test]
     fn responses_request_is_stateless_and_requests_encrypted_reasoning() {
         let provider = responses_provider();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         let req = provider.chat_request(&messages, None).unwrap();
         let body: Value = serde_json::from_slice(req.body()).unwrap();
 
@@ -655,9 +660,9 @@ mod tests {
                 "extra_body": { reserved: true }
             });
             let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-            let messages = vec![ChatMessage::from_user(vec![Content::Text {
-                text: "hello".to_string(),
-            }])];
+            let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+                "hello".to_string(),
+            )])];
             let error = provider
                 .chat_request(&messages, None)
                 .expect_err("reserved override must fail");
@@ -680,9 +685,9 @@ mod tests {
             "extra_body": { "previousResponseId": "resp_123" }
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         let error = provider
             .chat_request(&messages, None)
             .expect_err("camelCase retention alias must fail");
@@ -701,9 +706,9 @@ mod tests {
             "extra_body": { "metadata": {"trace": "abc"} }
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         let req = provider
             .chat_request(&messages, None)
             .expect("unrelated passthrough must be allowed");
@@ -729,9 +734,9 @@ mod tests {
             }
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "answer me".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "answer me".to_string(),
+        )])];
 
         let req = provider
             .chat_request(&messages, None)
@@ -780,9 +785,9 @@ mod tests {
             "top_k": 40
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
 
         let error = provider
             .chat_request(&messages, None)
@@ -796,9 +801,9 @@ mod tests {
     #[test]
     fn responses_omits_controls_that_are_not_configured() {
         let provider = responses_provider();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         let req = provider.chat_request(&messages, None).unwrap();
         let body: Value = serde_json::from_slice(req.body()).unwrap();
 
@@ -823,9 +828,9 @@ mod tests {
     #[test]
     fn responses_omitted_strictness_serializes_as_false() {
         let provider = responses_provider();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         // A schema with an optional property is fine when strictness is omitted.
         let tools = vec![responses_tool(
             None,
@@ -845,9 +850,9 @@ mod tests {
     #[test]
     fn responses_rejects_incompatible_strict_schema_without_altering_optionality() {
         let provider = responses_provider();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         // `query` is optional and additionalProperties is unset, so strict mode
         // cannot be honored without changing the schema's meaning.
         let tools = vec![responses_tool(
@@ -874,9 +879,9 @@ mod tests {
     #[test]
     fn responses_accepts_compatible_strict_schema() {
         let provider = responses_provider();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         let tools = vec![responses_tool(
             Some(true),
             serde_json::json!({
@@ -902,9 +907,9 @@ mod tests {
             "model": "gpt-4o-mini"
         });
         let provider: OpenAI = serde_json::from_value(cfg).unwrap();
-        let messages = vec![ChatMessage::from_user(vec![Content::Text {
-            text: "hello".to_string(),
-        }])];
+        let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "hello".to_string(),
+        )])];
         let tools = vec![responses_tool(
             None,
             serde_json::json!({"type": "object", "properties": {}}),
@@ -937,26 +942,23 @@ mod tests {
             items: vec![querymt::chat::ChatOutputItem::FunctionCall(call)],
             ..querymt::chat::ChatOutput::default()
         };
-        let mut assistant = ChatMessage::from_assistant(output.portable_content());
-        assert!(assistant.replace_output(output).is_ok());
+        let assistant = ChatMessage::from_assistant_output(output);
 
-        let result = ChatMessage::from_user(vec![Content::ToolResult {
-            id: "call_7".to_string(),
+        let result = ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(ToolResult {
+            call_id: "call_7".to_string(),
             name: Some("render".to_string()),
             is_error: false,
-            content: vec![
-                Content::Text {
-                    text: "here is the result".to_string(),
-                },
-                Content::Image {
-                    mime_type: "image/png".to_string(),
-                    data: vec![1, 2, 3],
-                },
-                Content::Pdf {
-                    data: vec![4, 5, 6],
-                },
+            parts: vec![
+                ToolResultPart::text("here is the result"),
+                attachment_part(MediaKind::Image, "image/png".to_string(), vec![1, 2, 3]),
+                attachment_part(
+                    MediaKind::Document,
+                    "application/pdf".to_string(),
+                    vec![4, 5, 6],
+                ),
             ],
-        }]);
+            extensions: Default::default(),
+        })]);
 
         let req = provider
             .chat_request(&[assistant, result], None)
@@ -1002,14 +1004,13 @@ mod tests {
     #[test]
     fn responses_text_only_function_output_uses_string_form() {
         let provider = responses_provider();
-        let result = ChatMessage::from_user(vec![Content::ToolResult {
-            id: "call_1".to_string(),
+        let result = ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(ToolResult {
+            call_id: "call_1".to_string(),
             name: None,
             is_error: false,
-            content: vec![Content::Text {
-                text: "plain result".to_string(),
-            }],
-        }]);
+            parts: vec![ToolResultPart::text("plain result")],
+            extensions: Default::default(),
+        })]);
 
         let req = provider
             .chat_request(&[result], None)
@@ -1024,22 +1025,24 @@ mod tests {
     #[test]
     fn responses_rejects_unsupported_function_output_media_without_placeholder() {
         let provider = responses_provider();
-        let result = ChatMessage::from_user(vec![Content::ToolResult {
-            id: "call_1".to_string(),
+        let result = ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(ToolResult {
+            call_id: "call_1".to_string(),
             name: None,
             is_error: false,
-            content: vec![Content::Audio {
-                mime_type: "audio/wav".to_string(),
-                data: vec![1, 2, 3],
-            }],
-        }]);
+            parts: vec![attachment_part(
+                MediaKind::Audio,
+                "audio/wav".to_string(),
+                vec![1, 2, 3],
+            )],
+            extensions: Default::default(),
+        })]);
 
         let error = provider
             .chat_request(&[result], None)
             .expect_err("unsupported output media must fail");
         assert!(
             matches!(error, LLMError::InvalidRequest(ref msg)
-                if msg.contains("audio/wav") && msg.contains("call_1")),
+                if msg.contains("unsupported") && msg.contains("Audio")),
             "expected explicit unsupported-media error, got {error:?}"
         );
     }
@@ -1090,7 +1093,7 @@ mod tests {
             .parse_chat(responses_json_response(body))
             .expect("completed response should parse");
 
-        let output = response.output().expect("structured output present");
+        let output = &response;
         assert_eq!(output.items.len(), 4);
         assert!(matches!(
             output.items[0],
@@ -1102,12 +1105,12 @@ mod tests {
         ));
         assert_eq!(output.tool_calls().unwrap().len(), 2);
         assert_eq!(
-            response.finish_reason(),
+            response.finish_reason,
             Some(querymt::chat::FinishReason::ToolCalls)
         );
 
         // Cached and reasoning tokens are counted once, not double-counted.
-        let usage = response.usage().unwrap();
+        let usage = response.usage.as_ref().unwrap();
         assert_eq!(usage.cache_read, 30);
         assert_eq!(usage.reasoning_tokens, 20);
         assert_eq!(usage.input_tokens, 70);
@@ -1148,7 +1151,7 @@ mod tests {
         let response = provider
             .parse_chat(responses_json_response(body))
             .expect("response should parse");
-        let output = response.output().unwrap();
+        let output = &response;
 
         let querymt::chat::ChatOutputItem::Reasoning(reasoning) = &output.items[0] else {
             panic!("expected reasoning item");
@@ -1168,7 +1171,7 @@ mod tests {
         assert_eq!(refusal, "cannot comply");
 
         assert_eq!(
-            response.finish_reason(),
+            response.finish_reason,
             Some(querymt::chat::FinishReason::Stop)
         );
     }
@@ -1188,7 +1191,7 @@ mod tests {
         let response = provider
             .parse_chat(responses_json_response(body))
             .expect("incomplete response should parse");
-        let output = response.output().unwrap();
+        let output = &response;
 
         assert_eq!(
             output.status,
@@ -1196,7 +1199,7 @@ mod tests {
         );
         assert_eq!(response.text().as_deref(), Some("partial"));
         assert_eq!(
-            response.finish_reason(),
+            response.finish_reason,
             Some(querymt::chat::FinishReason::Length),
             "incomplete max_output_tokens is a length terminal, not a failure"
         );
@@ -1221,7 +1224,7 @@ mod tests {
         let response = provider
             .parse_chat(responses_json_response(body))
             .expect("unknown item should parse");
-        let output = response.output().unwrap();
+        let output = &response;
 
         let querymt::chat::ChatOutputItem::Opaque(opaque) = &output.items[0] else {
             panic!("expected opaque item");
@@ -1356,6 +1359,38 @@ mod tests {
     }
 
     #[test]
+    fn responses_message_role_does_not_collide_in_serialized_stream_chunk() {
+        use querymt::chat::{ChatOutputItem, StructuredStreamEvent};
+
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let events = parser
+            .parse_chunk(&sse(
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_1","role":"assistant","phase":"final_answer","custom_field":{"retained":true},"content":[{"type":"output_text","text":"Madrid"}]}}"#,
+            ))
+            .unwrap();
+        let chunk = events.into_iter().next().expect("item completion event");
+
+        let encoded = serde_json::to_vec(&chunk)
+            .expect("stream chunk serializes without duplicate canonical fields");
+        let decoded: querymt::chat::StreamChunk =
+            serde_json::from_slice(&encoded).expect("transport can deserialize the message chunk");
+
+        let querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ItemCompleted {
+            item: ChatOutputItem::Message(message),
+            ..
+        }) = decoded
+        else {
+            panic!("expected completed message item");
+        };
+        assert_eq!(message.role, querymt::chat::ChatRole::Assistant);
+        assert_eq!(message.phase.as_deref(), Some("final_answer"));
+        assert_eq!(message.extensions["custom_field"]["retained"], true);
+        assert!(!message.extensions.contains_key("role"));
+        assert!(!message.extensions.contains_key("phase"));
+    }
+
+    #[test]
     fn responses_stream_ignores_framing_only_done_marker() {
         let provider = responses_provider();
         let mut parser = provider.chat_stream_parser().unwrap();
@@ -1364,6 +1399,128 @@ mod tests {
             events.is_empty(),
             "[DONE] is transport framing, not a semantic terminal"
         );
+    }
+
+    #[test]
+    fn responses_part_then_delta_accumulates_end_to_end() {
+        use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator};
+
+        // The real SSE sequence for ordinary assistant text: the message item
+        // is added with no content, then `content_part.added` declares the
+        // indexed part, then text deltas arrive. Feeding the emitted events
+        // through the shared accumulator must succeed and produce the text.
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+
+        let mut feed = |parser: &mut Box<dyn ChatStreamParser>,
+                        accumulator: &mut ChatStreamAccumulator,
+                        payload: &str| {
+            for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
+                accumulator.push(&chunk).expect("accumulator accepts event");
+            }
+        };
+
+        feed(
+            &mut parser,
+            &mut accumulator,
+            r#"{"type":"response.created","response":{"id":"resp_e2e","model":"gpt-4o-mini"}}"#,
+        );
+        feed(
+            &mut parser,
+            &mut accumulator,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_e2e","content":[]}}"#,
+        );
+        feed(
+            &mut parser,
+            &mut accumulator,
+            r#"{"type":"response.content_part.added","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}"#,
+        );
+        feed(
+            &mut parser,
+            &mut accumulator,
+            r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello "}"#,
+        );
+        feed(
+            &mut parser,
+            &mut accumulator,
+            r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"world"}"#,
+        );
+        feed(
+            &mut parser,
+            &mut accumulator,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_e2e","status":"completed","content":[{"type":"output_text","text":"hello world"}]}}"#,
+        );
+        feed(
+            &mut parser,
+            &mut accumulator,
+            r#"{"type":"response.completed","response":{"id":"resp_e2e","status":"completed"}}"#,
+        );
+
+        let output = accumulator
+            .finish_success()
+            .expect("accumulation completes");
+        assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+        assert_eq!(output.text().as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn responses_text_delta_without_part_added_still_accumulates() {
+        use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator};
+
+        // Defensive: a provider may omit `content_part.added`; the accumulator
+        // must create the indexed part on demand instead of failing.
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"resp_def","model":"gpt-4o-mini"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_def","content":[]}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hi"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_def","status":"completed","content":[{"type":"output_text","text":"hi"}]}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_def","status":"completed"}}"#,
+        ] {
+            for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
+                accumulator.push(&chunk).expect("accumulator accepts event");
+            }
+        }
+
+        let output = accumulator
+            .finish_success()
+            .expect("accumulation completes");
+        assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+        assert_eq!(output.text().as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn responses_reasoning_summary_part_then_delta_accumulates_end_to_end() {
+        use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator};
+
+        // Reasoning summaries have the same part/delta ordering: the summary
+        // part is declared by `reasoning_summary_part.added` before deltas.
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"resp_r","model":"gpt-5"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+            r#"{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"thinking"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"thinking"}]}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_r","status":"completed"}}"#,
+        ] {
+            for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
+                accumulator.push(&chunk).expect("accumulator accepts event");
+            }
+        }
+
+        let output = accumulator
+            .finish_success()
+            .expect("accumulation completes");
+        assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+        assert_eq!(output.thinking().as_deref(), Some("thinking"));
     }
 
     #[test]
@@ -1506,11 +1663,7 @@ mod tests {
             )],
             ..querymt::chat::ChatOutput::default()
         };
-        let mut message = ChatMessage::from_assistant(output.portable_content());
-        message
-            .replace_output(output)
-            .expect("projection must match structured output");
-        message
+        ChatMessage::from_assistant_output(output)
     }
 
     #[test]
@@ -1683,7 +1836,7 @@ mod tests {
         let response = provider
             .parse_chat(responses_json_response(body))
             .expect("built-in media response should parse");
-        let output = response.output().unwrap();
+        let output = &response;
 
         let ChatOutputItem::Opaque(opaque) = &output.items[0] else {
             panic!("expected opaque item");
@@ -1704,7 +1857,7 @@ mod tests {
         );
         // A completed response with no local calls is a stop, not tool execution.
         assert_eq!(
-            response.finish_reason(),
+            response.finish_reason,
             Some(querymt::chat::FinishReason::Stop)
         );
         // Opaque payloads are redacted from ordinary debug output.
@@ -1787,7 +1940,8 @@ mod tests {
             ..querymt::chat::ChatOutput::default()
         };
 
-        let mut assistant = ChatMessage::from_assistant(Vec::new());
+        let mut assistant =
+            ChatMessage::from_assistant_output(querymt::chat::ChatOutput::default());
         assert!(assistant.replace_output(output).is_ok());
 
         let error = provider
@@ -1800,6 +1954,17 @@ mod tests {
             ),
             "expected explicit unsupported-continuation error, got {error:?}"
         );
+    }
+
+    /// Build a validated inline attachment result part.
+    fn attachment_part(kind: MediaKind, mime_type: String, data: Vec<u8>) -> ToolResultPart {
+        let media = MediaPart::new(
+            kind,
+            Some(mime_type.parse().expect("valid media type")),
+            MediaSource::Inline { data },
+        )
+        .expect("valid inline attachment");
+        ToolResultPart::Attachment(Box::new(media))
     }
 
     fn responses_provider() -> OpenAI {
@@ -1822,6 +1987,12 @@ mod tests {
         let provider = responses_provider();
 
         let output = querymt::chat::ChatOutput {
+            provenance: Some(querymt::chat::ChatOutputProvenance {
+                provider: "openai".into(),
+                protocol: "responses".into(),
+                model: "gpt-4o-mini".into(),
+                endpoint: "https://api.openai.com/v1/responses".into(),
+            }),
             items: vec![
                 ChatOutputItem::Reasoning(ChatReasoningItem {
                     id: Some("rs_1".to_string()),
@@ -1864,22 +2035,18 @@ mod tests {
             ..querymt::chat::ChatOutput::default()
         };
 
-        let mut assistant = ChatMessage::from_assistant(output.portable_content());
-        assert!(assistant.replace_output(output).is_ok());
+        let assistant = ChatMessage::from_assistant_output(output);
 
         let messages = vec![
-            ChatMessage::from_user(vec![Content::Text {
-                text: "read both".to_string(),
-            }]),
+            ChatMessage::from_user_parts(vec![ChatInputPart::text("read both".to_string())]),
             assistant,
-            ChatMessage::from_user(vec![Content::ToolResult {
-                id: "call_1".to_string(),
+            ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(ToolResult {
+                call_id: "call_1".to_string(),
                 name: None,
                 is_error: false,
-                content: vec![Content::Text {
-                    text: "body a".to_string(),
-                }],
-            }]),
+                parts: vec![ToolResultPart::text("body a")],
+                extensions: Default::default(),
+            })]),
         ];
 
         let req = provider
@@ -1931,6 +2098,75 @@ mod tests {
         assert_eq!(call_count, 2, "no duplicate projected function calls");
     }
 
+    #[test]
+    fn responses_replays_portable_calls_without_native_metadata() {
+        let provider = responses_provider();
+        let output = querymt::chat::ChatOutput::from_projections(
+            None,
+            Some("calling".into()),
+            Some(vec![querymt::ToolCall {
+                id: "call_portable".into(),
+                call_type: "function".into(),
+                function: querymt::FunctionCall {
+                    name: "lookup".into(),
+                    arguments: r#"{"q":"rust"}"#.into(),
+                },
+            }]),
+            None,
+            Some(querymt::chat::FinishReason::ToolCalls),
+        );
+        let messages = vec![
+            ChatMessage::from_assistant_output(output),
+            ChatMessage::user()
+                .tool_result_value(ToolResult::text("call_portable", "result"))
+                .build(),
+        ];
+
+        let request = provider.chat_request(&messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_portable");
+        assert_eq!(input[1]["name"], "lookup");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_portable");
+    }
+
+    #[test]
+    fn responses_cross_origin_strips_encrypted_reasoning() {
+        use querymt::chat::{
+            ChatOutputItem, ChatOutputProvenance, ChatReasoningItem, ChatReasoningPart,
+        };
+
+        let provider = responses_provider();
+        let output = querymt::chat::ChatOutput {
+            provenance: Some(ChatOutputProvenance {
+                provider: "openai".into(),
+                protocol: "responses".into(),
+                model: "other-model".into(),
+                endpoint: "https://other.example/v1/responses".into(),
+            }),
+            items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("reasoning_1".into()),
+                summary: vec![ChatReasoningPart::text("visible")],
+                content: Vec::new(),
+                encrypted_content: Some("must-not-leak".into()),
+                signature: None,
+                status: None,
+                extensions: Default::default(),
+            })],
+            ..querymt::chat::ChatOutput::default()
+        };
+
+        let request = provider
+            .chat_request(&[ChatMessage::from_assistant_output(output)], None)
+            .unwrap();
+        let body = String::from_utf8(request.into_body()).unwrap();
+        assert!(body.contains("visible"));
+        assert!(!body.contains("must-not-leak"));
+        assert!(!body.contains("reasoning_1"));
+    }
+
     /// Invalid function arguments are replayed byte-exact, not reparsed.
     #[test]
     fn responses_replays_raw_invalid_arguments_byte_exact() {
@@ -1950,7 +2186,8 @@ mod tests {
             ..querymt::chat::ChatOutput::default()
         };
 
-        let mut assistant = ChatMessage::from_assistant(Vec::new());
+        let mut assistant =
+            ChatMessage::from_assistant_output(querymt::chat::ChatOutput::default());
         assert!(assistant.replace_output(output).is_ok());
 
         let req = provider
@@ -1978,7 +2215,8 @@ mod tests {
             ..querymt::chat::ChatOutput::default()
         };
 
-        let mut assistant = ChatMessage::from_assistant(Vec::new());
+        let mut assistant =
+            ChatMessage::from_assistant_output(querymt::chat::ChatOutput::default());
         assert!(assistant.replace_output(output).is_ok());
 
         let error = provider
@@ -1988,6 +2226,153 @@ mod tests {
             matches!(error, LLMError::InvalidRequest(ref msg) if msg.contains("future_action")),
             "expected explicit unsupported-continuation error, got {error:?}"
         );
+    }
+
+    /// A message whose projected content disagrees with its authoritative output
+    /// must not silently resend the stale payload.
+    ///
+    /// The exclusive payload makes that state unrepresentable through the public
+    /// API, so the remaining entry point is a transitional serialized record: the
+    /// migration boundary rejects it instead of choosing a representation.
+    #[test]
+    fn responses_request_rejects_stale_portable_projection() {
+        use querymt::chat::{ChatOutputItem, Extensions};
+
+        let output = querymt::chat::ChatOutput {
+            items: vec![ChatOutputItem::Message(querymt::chat::ChatMessageItem {
+                id: None,
+                role: querymt::chat::ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![querymt::chat::ChatMessagePart::Text {
+                    text: "secret".to_string(),
+                    annotations: Vec::new(),
+                    extensions: Extensions::new(),
+                }],
+                extensions: Extensions::new(),
+            })],
+            ..querymt::chat::ChatOutput::default()
+        };
+
+        // A transitional `{ role, content, output }` record whose content is not
+        // the output's projection is rejected at the load boundary.
+        let stale = serde_json::json!({
+            "role": "Assistant",
+            "content": [{"type": "text", "text": "redacted"}],
+            "output": serde_json::to_value(&output).unwrap()
+        });
+        let error = serde_json::from_value::<ChatMessage>(stale)
+            .expect_err("stale duplicate representation must be rejected");
+        assert!(
+            error.to_string().contains("does not match"),
+            "expected an explicit consistency error, got {error}"
+        );
+    }
+
+    /// Reconcile `response.completed`: a stream that never sends
+    /// `output_item.done` still yields completed items from the final snapshot.
+    #[test]
+    fn responses_stream_completed_reconciles_missing_item_done() {
+        use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator};
+
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"resp_rec","model":"gpt-4o-mini"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_rec","content":[]}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"reconciled"}"#,
+            // Note: no output_item.done. The final snapshot must be reconciled.
+            r#"{"type":"response.completed","response":{"id":"resp_rec","status":"completed","output":[{"type":"message","id":"msg_rec","status":"completed","content":[{"type":"output_text","text":"reconciled"}]}]}}"#,
+        ] {
+            for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
+                accumulator.push(&chunk).expect("accumulator accepts event");
+            }
+        }
+
+        let output = accumulator
+            .finish_success()
+            .expect("terminal snapshot reconciles missing output_item.done");
+        assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+        assert_eq!(output.text().as_deref(), Some("reconciled"));
+    }
+
+    /// A function call that appears only in the final completed snapshot must be
+    /// reconciled before terminal classification so it yields `ToolCalls` and is
+    /// dispatchable exactly once.
+    #[test]
+    fn responses_stream_final_snapshot_only_function_call_yields_tool_calls() {
+        use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator, FinishReason};
+
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"resp_fc","model":"gpt-4o-mini"}}"#,
+            // The call is absent from the deltas; it appears only in the final snapshot.
+            r#"{"type":"response.completed","response":{"id":"resp_fc","status":"completed","output":[{"type":"function_call","id":"item_fc","call_id":"call_fc","name":"lookup","arguments":"{\"q\":\"rust\"}","status":"completed"}]}}"#,
+        ] {
+            for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
+                accumulator.push(&chunk).expect("accumulator accepts event");
+            }
+        }
+
+        let output = accumulator
+            .finish_success()
+            .expect("final-snapshot call reconciles before terminal classification");
+        assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+        assert_eq!(
+            output.finish_reason,
+            Some(FinishReason::ToolCalls),
+            "a call discovered only in the final snapshot must indicate pending tool execution"
+        );
+        let calls = output.tool_calls().expect("call available for execution");
+        assert_eq!(calls.len(), 1, "call is dispatched exactly once");
+        assert_eq!(calls[0].id, "call_fc");
+        assert_eq!(calls[0].function.name, "lookup");
+    }
+
+    /// An incomplete streaming response must retain its partial canonical output
+    /// together with the terminal cause, and unfinished calls must never be
+    /// executable.
+    #[test]
+    fn responses_stream_incomplete_retains_partial_output_and_cause() {
+        use querymt::chat::{ChatOutputStatus, ChatStreamAccumulator, ChatStreamFinish};
+
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"resp_inc","model":"gpt-4o-mini"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_inc","content":[]}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"partial answer"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"msg_inc","status":"incomplete","content":[{"type":"output_text","text":"partial answer"}]}}"#,
+            r#"{"type":"response.incomplete","response":{"id":"resp_inc","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        ] {
+            for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
+                accumulator.push(&chunk).expect("accumulator accepts event");
+            }
+        }
+
+        match accumulator.finish() {
+            ChatStreamFinish::Incomplete { output, detail } => {
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("max_output_tokens"),
+                    "terminal cause is retained"
+                );
+                assert_eq!(output.status, Some(ChatOutputStatus::Incomplete));
+                assert_eq!(
+                    output.text().as_deref(),
+                    Some("partial answer"),
+                    "partial output remains inspectable"
+                );
+            }
+            other => panic!("expected incomplete outcome, got {other:?}"),
+        }
     }
 
     #[test]

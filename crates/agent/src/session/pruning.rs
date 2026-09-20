@@ -5,7 +5,7 @@
 
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::store::LLMConfig;
-use querymt::chat::{ChatRole, Content};
+use querymt::chat::{ChatRole, MediaKind, MediaPart, MediaSource, ToolResultPart};
 use tracing::instrument;
 
 // TODO: Move image metadata extraction into a shared utility if more subsystems need it.
@@ -250,11 +250,11 @@ pub trait TokenEstimator: Send + Sync {
     fn estimate(&self, text: &str) -> usize;
 }
 
-/// Trait for estimating pruning cost from rich content blocks.
+/// Trait for estimating pruning cost from canonical tool-result parts.
 ///
-/// Pruning cost is computed by summing per-content-block estimates recursively.
-/// In practice, total estimated context cost is the sum of text, image, PDF,
-/// audio, and other nested content estimates across a tool result.
+/// Pruning cost is computed by summing per-part estimates.
+/// In practice, total estimated context cost is the sum of text and validated
+/// attachment estimates across a tool result.
 /// These estimates are used for pruning/compaction decisions, not exact billing.
 pub trait ContentCostEstimator: Send + Sync {
     fn estimate_text(&self, text: &str) -> usize;
@@ -268,39 +268,51 @@ pub trait ContentCostEstimator: Send + Sync {
         data.len().saturating_div(4)
     }
 
-    fn estimate_content(&self, content: &[Content]) -> usize {
-        content.iter().map(|block| self.estimate_block(block)).sum()
+    fn estimate_content(&self, content: &[ToolResultPart]) -> usize {
+        content.iter().map(|part| self.estimate_part(part)).sum()
     }
 
-    fn estimate_block(&self, block: &Content) -> usize {
-        match block {
-            Content::Text { text } => self.estimate_text(text),
-            Content::Image { mime_type, data } => self.estimate_image(mime_type, data),
-            Content::Pdf { data } => self.estimate_pdf(data),
-            Content::Audio { mime_type, data } => self.estimate_audio(mime_type, data),
-            Content::ImageUrl { url } => self.estimate_text(url),
-            Content::Thinking { text, .. } => self.estimate_text(text),
-            Content::ToolUse {
-                name, arguments, ..
-            } => self.estimate_text(name) + self.estimate_text(&arguments.to_string()),
-            Content::ToolResult { content, .. } => self.estimate_content(content),
-            Content::ResourceLink {
-                uri,
-                name,
-                description,
-                mime_type,
-            } => {
-                self.estimate_text(uri)
-                    + name.as_deref().map(|s| self.estimate_text(s)).unwrap_or(0)
-                    + description
-                        .as_deref()
-                        .map(|s| self.estimate_text(s))
-                        .unwrap_or(0)
-                    + mime_type
-                        .as_deref()
-                        .map(|s| self.estimate_text(s))
-                        .unwrap_or(0)
+    fn estimate_part(&self, part: &ToolResultPart) -> usize {
+        match part {
+            ToolResultPart::Text { text } => self.estimate_text(text),
+            ToolResultPart::Attachment(media) => self.estimate_media(media),
+        }
+    }
+
+    fn estimate_media(&self, media: &MediaPart) -> usize {
+        let mut total = 0;
+        if let Some(filename) = &media.filename {
+            total += self.estimate_text(filename);
+        }
+        if let Some(detail) = &media.detail {
+            total += self.estimate_text(detail);
+        }
+        match media.source() {
+            MediaSource::Inline { data } => total + self.estimate_media_bytes(media, data),
+            MediaSource::DataUrl { url } => total + self.estimate_text(url),
+            MediaSource::Url { url } => total + self.estimate_text(url),
+            MediaSource::ProviderFile { file_id, .. } => total + self.estimate_text(file_id),
+        }
+    }
+
+    fn estimate_media_bytes(&self, media: &MediaPart, data: &[u8]) -> usize {
+        match media.kind {
+            MediaKind::Image => {
+                let mime = media
+                    .media_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                self.estimate_image(&mime, data)
             }
+            MediaKind::Document => self.estimate_pdf(data),
+            MediaKind::Audio => {
+                let mime = media
+                    .media_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                self.estimate_audio(&mime, data)
+            }
+            MediaKind::Video | MediaKind::Other => data.len().saturating_div(4),
         }
     }
 }
@@ -413,7 +425,10 @@ pub fn content_cost_estimator_for_llm_config(
     }
 }
 
-fn estimate_content_tokens(content: &[Content], estimator: &dyn ContentCostEstimator) -> usize {
+fn estimate_content_tokens(
+    content: &[ToolResultPart],
+    estimator: &dyn ContentCostEstimator,
+) -> usize {
     estimator.estimate_content(content)
 }
 
@@ -611,7 +626,7 @@ mod tests {
             role: ChatRole::Assistant,
             parts: vec![MessagePart::ToolResult {
                 call_id: call_id.to_string(),
-                content: vec![querymt::chat::Content::text(content)],
+                content: vec![querymt::chat::ToolResultPart::text(content)],
                 is_error: false,
                 tool_name: tool_name.map(|s| s.to_string()),
                 tool_arguments: None,
@@ -644,7 +659,7 @@ mod tests {
         id: &str,
         session_id: &str,
         call_id: &str,
-        content: Vec<Content>,
+        content: Vec<querymt::chat::ToolResultPart>,
     ) -> AgentMessage {
         AgentMessage {
             id: id.to_string(),
@@ -689,14 +704,36 @@ mod tests {
     fn test_estimate_content_tokens_counts_binary_payloads() {
         let estimator = GenericContentCostEstimator;
         let content = vec![
-            Content::image("image/png", vec![0u8; 400]),
-            Content::pdf(vec![1u8; 800]),
-            Content::text("tiny"),
+            inline_image_part("image/png", vec![0u8; 400]),
+            inline_document_part(vec![1u8; 800]),
+            ToolResultPart::text("tiny"),
         ];
 
         let tokens = estimate_content_tokens(&content, &estimator);
 
         assert_eq!(tokens, 100 + 200 + 1);
+    }
+
+    /// Build a validated inline image result part for tests.
+    fn inline_image_part(mime: &str, data: Vec<u8>) -> ToolResultPart {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            mime.parse().ok(),
+            MediaSource::Inline { data },
+        )
+        .expect("valid inline image media");
+        ToolResultPart::attachment(media)
+    }
+
+    /// Build a validated inline document result part for tests.
+    fn inline_document_part(data: Vec<u8>) -> ToolResultPart {
+        let media = MediaPart::new(
+            MediaKind::Document,
+            "application/pdf".parse().ok(),
+            MediaSource::Inline { data },
+        )
+        .expect("valid inline document media");
+        ToolResultPart::attachment(media)
     }
 
     fn png_header(width: u32, height: u32) -> Vec<u8> {
@@ -717,13 +754,15 @@ mod tests {
             name: None,
             provider: "openai".to_string(),
             model: "gpt-4.1".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: None,
             created_at: None,
             updated_at: None,
             provider_node_id: None,
         };
         let estimator = content_cost_estimator_for_llm_config(Some(&llm_config));
-        let content = vec![Content::image("image/png", png_header(1024, 1024))];
+        let content = vec![inline_image_part("image/png", png_header(1024, 1024))];
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
@@ -737,13 +776,15 @@ mod tests {
             name: None,
             provider: "openai".to_string(),
             model: "gpt-4.1-mini".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: None,
             created_at: None,
             updated_at: None,
             provider_node_id: None,
         };
         let estimator = content_cost_estimator_for_llm_config(Some(&llm_config));
-        let content = vec![Content::image("image/png", png_header(1024, 1024))];
+        let content = vec![inline_image_part("image/png", png_header(1024, 1024))];
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
@@ -757,13 +798,15 @@ mod tests {
             name: None,
             provider: "codex".to_string(),
             model: "codex-mini-latest".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: None,
             created_at: None,
             updated_at: None,
             provider_node_id: None,
         };
         let estimator = content_cost_estimator_for_llm_config(Some(&llm_config));
-        let content = vec![Content::image("image/png", png_header(1024, 1024))];
+        let content = vec![inline_image_part("image/png", png_header(1024, 1024))];
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
@@ -777,13 +820,15 @@ mod tests {
             name: None,
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: None,
             created_at: None,
             updated_at: None,
             provider_node_id: None,
         };
         let estimator = content_cost_estimator_for_llm_config(Some(&llm_config));
-        let content = vec![Content::image("image/png", png_header(1024, 1024))];
+        let content = vec![inline_image_part("image/png", png_header(1024, 1024))];
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
@@ -797,13 +842,15 @@ mod tests {
             name: None,
             provider: "openai".to_string(),
             model: "gpt-4.1".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: None,
             created_at: None,
             updated_at: None,
             provider_node_id: None,
         };
         let estimator = content_cost_estimator_for_llm_config(Some(&llm_config));
-        let content = vec![Content::image("image/png", vec![0u8; 400])];
+        let content = vec![inline_image_part("image/png", vec![0u8; 400])];
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
@@ -817,13 +864,15 @@ mod tests {
             name: None,
             provider: "custom".to_string(),
             model: "vision-x".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: None,
             created_at: None,
             updated_at: None,
             provider_node_id: None,
         };
         let estimator = content_cost_estimator_for_llm_config(Some(&llm_config));
-        let content = vec![Content::image("image/png", vec![0u8; 400])];
+        let content = vec![inline_image_part("image/png", vec![0u8; 400])];
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
@@ -970,7 +1019,7 @@ mod tests {
                 "2",
                 "s1",
                 "c1",
-                vec![Content::image("image/png", vec![0u8; 400])],
+                vec![inline_image_part("image/png", vec![0u8; 400])],
             ),
             make_user_message("3", "s1"),
             make_user_message("4", "s1"),

@@ -131,12 +131,11 @@ impl SessionCompaction {
             .collect::<std::result::Result<_, _>>()?;
 
         // Add the compaction prompt as a user message
-        chat_messages.push(querymt::chat::ChatMessage {
-            role: ChatRole::User,
-            content: vec![querymt::chat::Content::text(COMPACTION_PROMPT)],
-            cache: None,
-            output: None,
-        });
+        chat_messages.push(
+            querymt::chat::ChatMessage::user()
+                .text(COMPACTION_PROMPT)
+                .build(),
+        );
 
         Ok(chat_messages)
     }
@@ -229,7 +228,8 @@ impl SessionCompaction {
         while let Some(chunk) = stream.next().await {
             match chunk? {
                 StreamChunk::Text(delta) => text.push_str(&delta),
-                StreamChunk::Done { .. } => break,
+                // Canonical structured terminals also end the stream.
+                chunk if querymt::chat::chunk_is_terminal(&chunk) => break,
                 _ => {} // ignore Thinking, ToolUseStart, etc. for compaction
             }
         }
@@ -260,7 +260,9 @@ impl SessionCompaction {
                                 .join("\n");
                             self.estimator.estimate(&text)
                         }
-                        MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
+                        MessagePart::Reasoning { item, .. } => {
+                            self.estimator.estimate(&item.visible_text())
+                        }
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
                         MessagePart::Output { output } => {
                             self.estimator.estimate(&output.estimate_text())
@@ -498,7 +500,7 @@ mod tests {
                 role: ChatRole::Assistant,
                 parts: vec![MessagePart::ToolResult {
                     call_id: call_id.to_string(),
-                    content: vec![querymt::chat::Content::text(content)],
+                    content: vec![querymt::chat::ToolResultPart::text(content)],
                     is_error: false,
                     tool_name: Some("test_tool".to_string()),
                     tool_arguments: None,
@@ -548,8 +550,15 @@ mod tests {
                 session_id: session_id.to_string(),
                 role: ChatRole::Assistant,
                 parts: vec![MessagePart::Reasoning {
-                    content: reasoning.to_string(),
-                    signature: None,
+                    item: querymt::chat::ChatReasoningItem {
+                        id: None,
+                        summary: Vec::new(),
+                        content: vec![querymt::chat::ChatReasoningPart::text(reasoning)],
+                        encrypted_content: None,
+                        signature: None,
+                        status: None,
+                        extensions: Default::default(),
+                    },
                     time_ms: Some(100),
                 }],
                 created_at: 0,
@@ -743,7 +752,7 @@ mod tests {
                 role: ChatRole::User,
                 parts: vec![MessagePart::ToolResult {
                     call_id: call_id.to_string(),
-                    content: vec![querymt::chat::Content::text("output")],
+                    content: vec![querymt::chat::ToolResultPart::text("output")],
                     is_error: false,
                     tool_name: Some("shell".to_string()),
                     tool_arguments: Some("{}".to_string()),
@@ -1073,8 +1082,9 @@ mod tests {
             .build_compaction_messages(&[message], None)
             .unwrap();
         assert!(matches!(
-            &chat_messages[0].content[0],
-            querymt::chat::Content::Pdf { data } if data == b"%PDF"
+            &chat_messages[0].input_parts()[0],
+            querymt::chat::ChatInputPart::Attachment(media)
+                if media.kind == querymt::chat::MediaKind::Document
         ));
     }
 
@@ -1481,7 +1491,7 @@ mod tests {
             role: ChatRole::User,
             parts: vec![MessagePart::ToolResult {
                 call_id: call_id.to_string(),
-                content: vec![querymt::chat::Content::text("output")],
+                content: vec![querymt::chat::ToolResultPart::text("output")],
                 is_error: false,
                 tool_name: Some("tool".to_string()),
                 tool_arguments: None,

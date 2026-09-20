@@ -25,7 +25,7 @@
 use clap::Parser;
 use futures::StreamExt;
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
-use querymt::chat::{ChatMessage, ChatRole, Content};
+use querymt::chat::{ChatMessage, ChatRole};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -141,15 +141,12 @@ async fn run(
     let provider = create_provider(config)?;
     println!("Model loaded.\n");
 
-    let messages = vec![ChatMessage {
-        role: ChatRole::User,
-        content: vec![
-            Content::image(mime, image_data),
-            Content::text(&args.prompt),
-        ],
-        cache: None,
-        output: None,
-    }];
+    let messages = vec![
+        ChatMessage::user()
+            .try_image(&mime, image_data)?
+            .text(&args.prompt)
+            .build(),
+    ];
 
     println!("Prompt: {}\n", args.prompt);
 
@@ -176,7 +173,7 @@ async fn run(
         println!("--- response ---");
         let response = provider.chat(&messages).await?;
         println!("{}", response.text().unwrap_or_default());
-        if let Some(u) = response.usage() {
+        if let Some(u) = response.usage.clone() {
             println!("---\ninput={} output={}", u.input_tokens, u.output_tokens);
         }
     }

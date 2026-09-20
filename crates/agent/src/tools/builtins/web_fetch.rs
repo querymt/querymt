@@ -1,7 +1,7 @@
 //! Web fetch tool implementation using ToolContext
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -80,7 +80,7 @@ impl ToolTrait for WebFetchTool {
         &self,
         args: Value,
         _context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let url = args
             .get("url")
             .and_then(Value::as_str)
@@ -121,7 +121,7 @@ impl ToolTrait for WebFetchTool {
             "body": body
         });
         serde_json::to_string(&result)
-            .map(|s| vec![Content::text(s)])
+            .map(|s| vec![ToolResultPart::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
     }
 }

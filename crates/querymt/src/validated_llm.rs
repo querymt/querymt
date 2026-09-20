@@ -26,7 +26,7 @@
 
 use async_trait::async_trait;
 
-use crate::chat::{ChatMessage, ChatProvider, ChatResponse, ChatRole, Content, StreamChunk, Tool};
+use crate::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool, ToolResultPart};
 use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use crate::embedding::EmbeddingProvider;
 use crate::error::LLMError;
@@ -84,7 +84,7 @@ impl LLMProvider for ValidatedLLM {
         &self,
         name: &str,
         args: serde_json::Value,
-    ) -> Result<Vec<Content>, LLMError> {
+    ) -> Result<Vec<ToolResultPart>, LLMError> {
         self.inner.call_tool(name, args).await
     }
 
@@ -124,7 +124,7 @@ impl ChatProvider for ValidatedLLM {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let mut local_messages = messages.to_vec();
         let mut remaining_attempts = self.attempts;
 
@@ -147,16 +147,11 @@ impl ChatProvider for ValidatedLLM {
                         )));
                     }
 
-                    local_messages.push(ChatMessage {
-                        role: ChatRole::User,
-                        content: vec![Content::text(format!(
-                            "Your previous output was invalid because: {}\n\
-                             Please try again and produce a valid response.",
-                            err
-                        ))],
-                        cache: None,
-                        output: None,
-                    });
+                    local_messages.push(ChatMessage::user().text(format!(
+                        "Your previous output was invalid because: {}\n\
+                         Please try again and produce a valid response.",
+                        err
+                    )).build());
                 }
             }
         }

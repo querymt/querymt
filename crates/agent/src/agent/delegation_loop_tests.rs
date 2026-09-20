@@ -330,21 +330,21 @@ impl TestHarness {
             .times(1)
             .in_sequence(&mut seq)
             .returning(move |_| {
-                Ok(Box::new(MockChatResponse::with_tools(
+                Ok(MockChatResponse::with_tools(
                     "Delegating task",
                     vec![delegate_call.clone()],
-                )))
+                ).into())
             });
         self.provider_mut()
             .await
             .expect_chat()
             .times(1)
             .in_sequence(&mut seq)
-            .returning(|_| Ok(Box::new(MockChatResponse::text_only("Done"))));
+            .returning(|_| Ok(MockChatResponse::text_only("Done").into()));
         self.provider_mut()
             .await
             .expect_call_tool()
-            .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+            .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
             .times(1);
         self.provider_mut()
             .await
@@ -368,21 +368,21 @@ impl TestHarness {
             .times(1)
             .in_sequence(&mut seq)
             .returning(move |_| {
-                Ok(Box::new(MockChatResponse::with_tools(
+                Ok(MockChatResponse::with_tools(
                     "Delegating task",
                     vec![delegate_call.clone()],
-                )))
+                ).into())
             });
         self.provider_mut()
             .await
             .expect_chat()
             .times(1)
             .in_sequence(&mut seq)
-            .returning(|_| Ok(Box::new(MockChatResponse::text_only("Done"))));
+            .returning(|_| Ok(MockChatResponse::text_only("Done").into()));
         self.provider_mut()
             .await
             .expect_call_tool()
-            .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+            .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
             .times(1);
         self.provider_mut()
             .await
@@ -443,7 +443,7 @@ async fn build_delegate_handle(
             DelegateBehavior::AlwaysOk => {
                 mock.expect_chat()
                     .times(0..)
-                    .returning(|_| Ok(Box::new(MockChatResponse::text_only("Task complete"))));
+                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
             }
             DelegateBehavior::AlwaysFail => {
                 mock.expect_chat().times(0..).returning(|_| {
@@ -457,7 +457,7 @@ async fn build_delegate_handle(
                 // before the LLM call. Set up a fallback that would succeed if reached.
                 mock.expect_chat()
                     .times(0..)
-                    .returning(|_| Ok(Box::new(MockChatResponse::text_only("Task complete"))));
+                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
             }
             DelegateBehavior::ContextThresholdCompactionSucceeds => {
                 // ContextThresholdOnceMiddleware fires ContextThreshold on the first
@@ -471,15 +471,15 @@ async fn build_delegate_handle(
                     .times(1)
                     .in_sequence(&mut seq)
                     .returning(|_| {
-                        Ok(Box::new(MockChatResponse::text_only(
+                        Ok(MockChatResponse::text_only(
                             "Summary of previous conversation context.",
-                        )))
+                        ).into())
                     });
                 // 2nd chat call: normal delegate completion
                 mock.expect_chat()
                     .times(1)
                     .in_sequence(&mut seq)
-                    .returning(|_| Ok(Box::new(MockChatResponse::text_only("Task complete"))));
+                    .returning(|_| Ok(MockChatResponse::text_only("Task complete").into()));
             }
             DelegateBehavior::ContextThresholdCompactionFails => {
                 // ContextThresholdOnceMiddleware fires ContextThreshold. The state
@@ -1197,10 +1197,10 @@ async fn test_multiple_sequential_delegations() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "Delegating task 1",
                 vec![delegate_call_1.clone()],
-            )))
+            ).into())
         });
 
     harness
@@ -1210,10 +1210,10 @@ async fn test_multiple_sequential_delegations() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "Delegating task 2",
                 vec![delegate_call_2.clone()],
-            )))
+            ).into())
         });
 
     harness
@@ -1222,13 +1222,13 @@ async fn test_multiple_sequential_delegations() {
         .expect_chat()
         .times(1)
         .in_sequence(&mut seq)
-        .returning(|_| Ok(Box::new(MockChatResponse::text_only("All tasks complete"))));
+        .returning(|_| Ok(MockChatResponse::text_only("All tasks complete").into()));
 
     harness
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
         .times(2);
 
     harness
@@ -1260,10 +1260,10 @@ async fn test_delegation_failure_recovery() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "Delegating task",
                 vec![delegate_call.clone()],
-            )))
+            ).into())
         });
 
     harness
@@ -1276,16 +1276,16 @@ async fn test_delegation_failure_recovery() {
             let last_msg = messages.last().unwrap();
             assert!(last_msg.text().contains("Delegation failed"));
             assert!(last_msg.text().contains("Patch Application Failure"));
-            Ok(Box::new(MockChatResponse::text_only(
+            Ok(MockChatResponse::text_only(
                 "I'll handle it differently",
-            )))
+            ).into())
         });
 
     harness
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
         .times(1);
 
     harness
@@ -1317,10 +1317,10 @@ async fn test_delegation_completion_message_format() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "",
                 vec![delegate_call.clone()],
-            )))
+            ).into())
         });
 
     harness
@@ -1335,16 +1335,16 @@ async fn test_delegation_completion_message_format() {
             assert!(last_msg.text().contains("Delegation ID:"));
             assert!(last_msg.text().contains("Please review the changes"));
             assert!(last_msg.text().contains("=== Delegate Agent Results ==="));
-            Ok(Box::new(MockChatResponse::text_only(
+            Ok(MockChatResponse::text_only(
                 "Perfect, task complete",
-            )))
+            ).into())
         });
 
     harness
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
         .times(1);
 
     harness
@@ -1376,10 +1376,10 @@ async fn test_delegation_failure_message_format() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "",
                 vec![delegate_call.clone()],
-            )))
+            ).into())
         });
 
     harness
@@ -1394,16 +1394,16 @@ async fn test_delegation_failure_message_format() {
             assert!(last_msg.text().contains("Error Type:"));
             assert!(last_msg.text().contains("Patch Application Failure"));
             assert!(last_msg.text().contains("Do NOT immediately retry"));
-            Ok(Box::new(MockChatResponse::text_only(
+            Ok(MockChatResponse::text_only(
                 "I'll try a different approach",
-            )))
+            ).into())
         });
 
     harness
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
         .times(1);
 
     harness
@@ -1593,10 +1593,10 @@ async fn test_delegation_premature_stop_is_failure() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "Delegating task",
                 vec![delegate_call.clone()],
-            )))
+            ).into())
         });
 
     // Second LLM call: planner receives the delegation failure result.
@@ -1620,16 +1620,16 @@ async fn test_delegation_premature_stop_is_failure() {
                 "Expected 'stopped prematurely' in message, got: {}",
                 last_msg.text()
             );
-            Ok(Box::new(MockChatResponse::text_only(
+            Ok(MockChatResponse::text_only(
                 "I see the delegate was stopped. Let me try differently.",
-            )))
+            ).into())
         });
 
     harness
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
         .times(1);
 
     harness
@@ -1668,10 +1668,10 @@ async fn test_delegation_compaction_success_continues() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "Delegating task",
                 vec![delegate_call.clone()],
-            )))
+            ).into())
         });
 
     // Second LLM call: planner receives the delegation result.
@@ -1695,16 +1695,16 @@ async fn test_delegation_compaction_success_continues() {
                 "Should NOT contain 'Delegation failed' after successful compaction, got: {}",
                 last_msg.text()
             );
-            Ok(Box::new(MockChatResponse::text_only(
+            Ok(MockChatResponse::text_only(
                 "Great, the delegate completed successfully after compaction.",
-            )))
+            ).into())
         });
 
     harness
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
         .times(1);
 
     harness
@@ -1747,10 +1747,10 @@ async fn test_delegation_compaction_failure_is_delegation_failure() {
         .times(1)
         .in_sequence(&mut seq)
         .returning(move |_| {
-            Ok(Box::new(MockChatResponse::with_tools(
+            Ok(MockChatResponse::with_tools(
                 "Delegating task",
                 vec![delegate_call.clone()],
-            )))
+            ).into())
         });
 
     // Second LLM call: planner receives the delegation failure result.
@@ -1774,16 +1774,16 @@ async fn test_delegation_compaction_failure_is_delegation_failure() {
                 "Expected 'stopped prematurely' after compaction failure, got: {}",
                 last_msg.text()
             );
-            Ok(Box::new(MockChatResponse::text_only(
+            Ok(MockChatResponse::text_only(
                 "The delegate failed due to compaction failure. I'll try a different approach.",
-            )))
+            ).into())
         });
 
     harness
         .provider_mut()
         .await
         .expect_call_tool()
-        .returning(|_, _| Ok(vec![querymt::chat::Content::text("ok")]))
+        .returning(|_, _| Ok(vec![querymt::chat::ToolResultPart::Text { text: "ok".to_string() }]))
         .times(1);
 
     harness

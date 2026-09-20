@@ -1,4 +1,4 @@
-use querymt::chat::Content;
+use querymt::chat::{MediaKind, MediaPart, MediaSource, ToolResultPart};
 use std::path::Path;
 
 pub const DEFAULT_READ_LIMIT: usize = 2000;
@@ -18,15 +18,15 @@ pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
 
 /// Render read output for the given path.
 ///
-/// - Text files   → `[Content::Text]` with line-numbered XML-like format
-/// - Image files  → `[Content::Image { mime_type, data }]`
-/// - Other binary → `[Content::Text]` with a descriptive error message
-/// - Directories  → `[Content::Text]` with entry listing
+/// - Text files   → canonical text tool-result part with line-numbered XML-like format
+/// - Image files  → validated inline image attachment tool-result part
+/// - Other binary → text part with a descriptive error message
+/// - Directories  → text part with entry listing
 pub async fn render_read_output(
     target: &Path,
     offset: usize,
     limit: usize,
-) -> Result<Vec<Content>, String> {
+) -> Result<Vec<ToolResultPart>, String> {
     let metadata = tokio::fs::metadata(target)
         .await
         .map_err(|e| format!("stat failed: {}", e))?;
@@ -34,7 +34,7 @@ pub async fn render_read_output(
     if metadata.is_file() {
         // Guard against loading enormous binaries into memory.
         if metadata.len() > MAX_BINARY_READ_BYTES {
-            return Ok(vec![Content::text(format!(
+            return Ok(vec![ToolResultPart::text(format!(
                 "File too large to read inline ({} bytes, limit {} bytes). \
                  Use an external tool to process this file.",
                 metadata.len(),
@@ -46,9 +46,15 @@ pub async fn render_read_output(
             .await
             .map_err(|e| format!("read failed: {}", e))?;
 
-        // Binary detection: images get returned as rich content blocks.
+        // Binary detection: images get returned as validated attachment parts.
         if let Some(mime_type) = detect_image_mime(&bytes) {
-            return Ok(vec![Content::image(mime_type, bytes)]);
+            let media = MediaPart::new(
+                MediaKind::Image,
+                mime_type.parse().ok(),
+                MediaSource::Inline { data: bytes },
+            )
+            .map_err(|e| format!("invalid image media: {e}"))?;
+            return Ok(vec![ToolResultPart::Attachment(Box::new(media))]);
         }
 
         // Not a recognised binary format — try to interpret as UTF-8 text.
@@ -74,14 +80,14 @@ pub async fn render_read_output(
                         .push_str(&format!("\n(End of file - total {} lines)\n", total_lines));
                 }
 
-                return Ok(vec![Content::text(format!(
+                return Ok(vec![ToolResultPart::text(format!(
                     "<path>{}</path>\n<type>file</type>\n<content>\n{}</content>",
                     target.display(),
                     file_content
                 ))]);
             }
             Err(_) => {
-                return Ok(vec![Content::text(format!(
+                return Ok(vec![ToolResultPart::text(format!(
                     "Binary file '{}'; not a supported format (image/text). \
                      Use an external tool to process this file.",
                     target.display(),
@@ -131,7 +137,7 @@ pub async fn render_read_output(
             entries_output.push_str("(More entries available. Use a higher offset.)\n");
         }
 
-        return Ok(vec![Content::text(format!(
+        return Ok(vec![ToolResultPart::text(format!(
             "<path>{}</path>\n<type>directory</type>\n<entries>\n{}</entries>",
             target.display(),
             entries_output

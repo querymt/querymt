@@ -228,19 +228,12 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
                 })?;
 
             let tool_calls = response.tool_calls().unwrap_or_default();
-            let finish_reason = response.finish_reason().map(|r| format!("{:?}", r));
+            let finish_reason = response.finish_reason.map(|r| format!("{:?}", r));
             tracing::Span::current()
                 .record("tool_calls_returned", tool_calls.len())
                 .record("finish_reason", finish_reason.as_deref().unwrap_or("none"));
 
-            Ok(ProviderChatResponse {
-                text: response.text(),
-                thinking: response.thinking(),
-                tool_calls,
-                usage: response.usage(),
-                finish_reason,
-                output: response.output().cloned(),
-            })
+            Ok(ProviderChatResponse::from(response))
         })
     }
 }
@@ -462,9 +455,12 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                                         let mut finish_reason = None;
                                         match chunk_result {
                                             Ok(chunk) => {
-                                                let chunk_is_done = matches!(chunk, StreamChunk::Done { .. });
-                                                if let StreamChunk::Done { finish_reason: reason } = &chunk {
-                                                    finish_reason = Some(*reason);
+                                                let chunk_is_done = querymt::chat::chunk_is_terminal(&chunk);
+                                                if chunk_is_done {
+                                                    finish_reason = match &chunk {
+                                                        StreamChunk::Done { finish_reason: reason } => Some(*reason),
+                                                        _ => None,
+                                                    };
                                                     upstream_done = true;
                                                 }
                                                 pending_batch.push(chunk);

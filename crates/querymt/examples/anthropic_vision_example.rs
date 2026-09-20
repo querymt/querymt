@@ -44,7 +44,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prepare conversation history asking about the image
     let messages = vec![
         ChatMessage::user().text("What is in this image?").build(),
-        ChatMessage::user().image("image/jpeg", content).build(),
+        ChatMessage::user()
+            .image("image/jpeg".parse().unwrap(), content)
+            .build(),
     ];
 
     // Send chat request and handle the response

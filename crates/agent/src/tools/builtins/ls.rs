@@ -1,7 +1,7 @@
 //! List directory contents tool
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -251,7 +251,7 @@ impl Tool for ListTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let root = if let Some(path_str) = args.get("path").and_then(Value::as_str) {
             context.resolve_path(path_str)?
         } else {
@@ -288,7 +288,7 @@ impl Tool for ListTool {
         .await
         .map_err(|e| ToolError::ProviderError(format!("list task failed: {}", e)))??;
 
-        Ok(vec![Content::text(Self::format_tree(
+        Ok(vec![ToolResultPart::text(Self::format_tree(
             entries,
             &root_for_format,
             truncated,
@@ -300,11 +300,11 @@ impl Tool for ListTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

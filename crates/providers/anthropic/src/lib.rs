@@ -19,8 +19,8 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, Tool,
-        ToolChoice,
+        ChatInputPart, ChatMessage, ChatOutput, ChatOutputItem, ChatRole, FinishReason, MediaKind,
+        MediaPart, MediaSource, ReasoningEffort, Tool, ToolChoice, ToolResultPart,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -581,32 +581,28 @@ impl std::fmt::Display for AnthropicCompleteResponse {
     }
 }
 
-impl ChatResponse for AnthropicCompleteResponse {
-    fn text(&self) -> Option<String> {
-        Some(
-            self.content
-                .iter()
-                .filter_map(|c| {
-                    if c.content_type == Some("text".to_string()) || c.content_type.is_none() {
-                        c.text.clone()
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    }
+impl From<AnthropicCompleteResponse> for ChatOutput {
+    fn from(response: AnthropicCompleteResponse) -> Self {
+        let text = response
+            .content
+            .iter()
+            .filter_map(|c| {
+                if c.content_type == Some("text".to_string()) || c.content_type.is_none() {
+                    c.text.clone()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-    fn thinking(&self) -> Option<String> {
-        self.content
+        let thinking = response
+            .content
             .iter()
             .find(|c| c.content_type == Some("thinking".to_string()))
-            .and_then(|c| c.thinking.clone())
-    }
+            .and_then(|c| c.thinking.clone());
 
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        match self
+        let tool_calls = match response
             .content
             .iter()
             .filter_map(|c| {
@@ -630,22 +626,20 @@ impl ChatResponse for AnthropicCompleteResponse {
         {
             v if v.is_empty() => None,
             v => Some(v),
-        }
-    }
+        };
 
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
-    }
+        let usage = response.usage.clone();
 
-    fn finish_reason(&self) -> Option<FinishReason> {
-        Some(match self.stop_reason.as_ref() {
+        let finish_reason = Some(match response.stop_reason.as_ref() {
             "end_turn" => FinishReason::Stop,
             "max_tokens" => FinishReason::Length,
             "stop_sequence" => FinishReason::Stop,
             "tool_use" => FinishReason::ToolCalls,
             "refusal" | "pause_turn" => FinishReason::Other,
             _ => FinishReason::Unknown,
-        })
+        });
+
+        ChatOutput::from_projections(thinking, Some(text), tool_calls, usage, finish_reason)
     }
 }
 
@@ -777,6 +771,73 @@ impl Anthropic {
     }
 }
 
+/// Convert a canonical attachment into an Anthropic message content block.
+///
+/// Unsupported sources (provider file references) return `None` rather than
+/// fabricating content.
+fn attachment_to_message_content(media: &MediaPart) -> Option<MessageContent> {
+    match (&media.kind, media.source()) {
+        (MediaKind::Image, MediaSource::Inline { data }) => {
+            let media_type = media.media_type()?.to_string();
+            Some(MessageContent::Image {
+                content_type: "image",
+                source: ImageSource {
+                    source_type: "base64",
+                    media_type,
+                    data: BASE64.encode(data),
+                },
+                cache_control: None,
+            })
+        }
+        (MediaKind::Image, MediaSource::DataUrl { url } | MediaSource::Url { url }) => {
+            Some(MessageContent::ImageUrl {
+                content_type: "image_url",
+                image_url: ImageUrlContent { url: url.clone() },
+                cache_control: None,
+            })
+        }
+        (MediaKind::Document, MediaSource::Inline { data }) => {
+            let media_type = media
+                .media_type()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "application/pdf".to_string());
+            Some(MessageContent::Document {
+                content_type: "document",
+                source: ImageSource {
+                    source_type: "base64",
+                    media_type,
+                    data: BASE64.encode(data),
+                },
+                cache_control: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Convert one canonical tool-result part into an Anthropic result content block.
+fn tool_result_content(part: &ToolResultPart) -> Option<ToolResultContent> {
+    match part {
+        ToolResultPart::Text { text } => Some(ToolResultContent::Text {
+            content_type: "text",
+            text: text.clone(),
+        }),
+        ToolResultPart::Attachment(media) => match media.source() {
+            MediaSource::Inline { data } if media.kind == MediaKind::Image => {
+                Some(ToolResultContent::Image {
+                    content_type: "image",
+                    source: ImageSource {
+                        source_type: "base64",
+                        media_type: media.media_type()?.to_string(),
+                        data: BASE64.encode(data),
+                    },
+                })
+            }
+            _ => None,
+        },
+    }
+}
+
 impl HTTPChatProvider for Anthropic {
     fn chat_request(
         &self,
@@ -792,116 +853,86 @@ impl HTTPChatProvider for Anthropic {
             .map(|m| {
                 let mut content: Vec<MessageContent> = Vec::new();
 
-                for block in &m.content {
-                    match block {
-                        Content::Text { text } => {
+                // Replay generated reasoning and function calls from structured
+                // output; these are output-only semantics.
+                if let Some(output) = m.output() {
+                    for item in &output.items {
+                        match item {
+                            ChatOutputItem::Reasoning(reasoning) => {
+                                // Anthropic requires signed thinking blocks when
+                                // replaying assistant history. Skip unsigned ones.
+                                if let Some(signature) = &reasoning.signature {
+                                    let text = reasoning
+                                        .summary
+                                        .iter()
+                                        .chain(&reasoning.content)
+                                        .map(|part| part.text.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n\n");
+                                    if !text.is_empty() {
+                                        content.push(MessageContent::Thinking {
+                                            content_type: "thinking",
+                                            thinking: text,
+                                            signature: signature.clone(),
+                                            cache_control: None,
+                                        });
+                                    }
+                                }
+                            }
+                            ChatOutputItem::FunctionCall(call) => {
+                                // Anthropic requires `input` to be a JSON object.
+                                let input = call.parse_arguments().unwrap_or(Value::Null);
+                                let input = if input.is_object() {
+                                    input
+                                } else {
+                                    Value::Object(Default::default())
+                                };
+                                content.push(MessageContent::ToolUse {
+                                    content_type: "tool_use",
+                                    id: call.call_id.clone(),
+                                    name: self.prefix_tool_name(&call.name),
+                                    input,
+                                    cache_control: None,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                for part in m.input_parts() {
+                    match part {
+                        ChatInputPart::Text { text } => {
                             // Avoid Anthropic API error: "text content blocks must be non-empty"
                             if !text.is_empty() {
                                 content.push(MessageContent::Text {
                                     content_type: "text",
-                                    text: text.clone(),
+                                    text,
                                     cache_control: None,
                                 });
                             }
                         }
-                        Content::Thinking { text, signature } => {
-                            // Anthropic requires signed thinking blocks when replaying
-                            // assistant history. Skip unsigned legacy blocks.
-                            if let Some(signature) = signature {
-                                content.push(MessageContent::Thinking {
-                                    content_type: "thinking",
-                                    thinking: text.clone(),
-                                    signature: signature.clone(),
-                                    cache_control: None,
-                                });
+                        ChatInputPart::Attachment(media) => {
+                            if let Some(block) = attachment_to_message_content(&media) {
+                                content.push(block);
                             }
                         }
-                        Content::Image { mime_type, data } => {
-                            content.push(MessageContent::Image {
-                                content_type: "image",
-                                source: ImageSource {
-                                    source_type: "base64",
-                                    media_type: mime_type.clone(),
-                                    data: BASE64.encode(data),
-                                },
-                                cache_control: None,
-                            });
-                        }
-                        Content::ImageUrl { url } => {
-                            content.push(MessageContent::ImageUrl {
-                                content_type: "image_url",
-                                image_url: ImageUrlContent { url: url.clone() },
-                                cache_control: None,
-                            });
-                        }
-                        Content::Pdf { data } => {
-                            content.push(MessageContent::Document {
-                                content_type: "document",
-                                source: ImageSource {
-                                    source_type: "base64",
-                                    media_type: "application/pdf".to_string(),
-                                    data: BASE64.encode(data),
-                                },
-                                cache_control: None,
-                            });
-                        }
-                        Content::ToolUse {
-                            id,
-                            name,
-                            arguments,
-                        } => {
-                            // Anthropic API requires `input` to be a JSON object, never null.
-                            let input = if arguments.is_object() {
-                                arguments.clone()
-                            } else {
-                                Value::Object(Default::default())
-                            };
-                            content.push(MessageContent::ToolUse {
-                                content_type: "tool_use",
-                                id: id.clone(),
-                                name: self.prefix_tool_name(name),
-                                input,
-                                cache_control: None,
-                            });
-                        }
-                        Content::ToolResult {
-                            id,
-                            is_error,
-                            content: inner,
-                            ..
-                        } => {
+                        ChatInputPart::ToolResult(result) => {
                             // Anthropic supports multi-content tool results natively:
                             // { type: "tool_result", tool_use_id, content: [text, image, ...] }
-                            let tool_content: Vec<ToolResultContent> = inner
+                            let tool_content: Vec<ToolResultContent> = result
+                                .parts
                                 .iter()
-                                .filter_map(|c| match c {
-                                    Content::Text { text } => Some(ToolResultContent::Text {
-                                        content_type: "text",
-                                        text: text.clone(),
-                                    }),
-                                    Content::Image { mime_type, data } => {
-                                        Some(ToolResultContent::Image {
-                                            content_type: "image",
-                                            source: ImageSource {
-                                                source_type: "base64",
-                                                media_type: mime_type.clone(),
-                                                data: BASE64.encode(data),
-                                            },
-                                        })
-                                    }
-                                    _ => None, // Skip unsupported nested types
-                                })
+                                .filter_map(tool_result_content)
                                 .collect();
                             content.push(MessageContent::ToolResult {
                                 content_type: "tool_result",
-                                tool_use_id: id.clone(),
-                                is_error: if *is_error { Some(true) } else { None },
+                                tool_use_id: result.call_id.clone(),
+                                is_error: result.is_error.then_some(true),
                                 content: tool_content,
                                 cache_control: None,
                             });
                         }
-                        // Audio, ResourceLink — skip (not supported by Anthropic)
-                        _ => {}
                     }
                 }
 
@@ -1039,7 +1070,7 @@ impl HTTPChatProvider for Anthropic {
         classify_anthropic_http_error(response)
     }
 
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         let mut json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
             .map_err(|e| LLMError::ResponseFormatError {
                 message: format!("Failed to parse Anthropic response JSON: {e}"),
@@ -1055,7 +1086,7 @@ impl HTTPChatProvider for Anthropic {
             }
         }
 
-        Ok(Box::new(json_resp))
+        Ok(json_resp.into())
     }
 
     fn supports_streaming(&self) -> bool {

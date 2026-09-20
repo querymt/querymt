@@ -1,5 +1,5 @@
 use querymt::Usage;
-use querymt::chat::{ChatResponse, FinishReason};
+use querymt::chat::{ChatOutput, FinishReason};
 use std::fmt;
 
 /// Response from a llama.cpp chat completion.
@@ -18,25 +18,15 @@ impl fmt::Display for LlamaCppChatResponse {
     }
 }
 
-impl ChatResponse for LlamaCppChatResponse {
-    fn text(&self) -> Option<String> {
-        Some(self.text.clone())
-    }
-
-    fn thinking(&self) -> Option<String> {
-        self.thinking.clone()
-    }
-
-    fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
-        self.tool_calls.clone()
-    }
-
-    fn usage(&self) -> Option<Usage> {
-        Some(self.usage.clone())
-    }
-
-    fn finish_reason(&self) -> Option<FinishReason> {
-        Some(self.finish_reason)
+impl From<LlamaCppChatResponse> for ChatOutput {
+    fn from(response: LlamaCppChatResponse) -> Self {
+        ChatOutput::from_projections(
+            response.thinking.clone(),
+            Some(response.text.clone()),
+            response.tool_calls.clone(),
+            Some(response.usage.clone()),
+            Some(response.finish_reason),
+        )
     }
 }
 

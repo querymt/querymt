@@ -213,7 +213,7 @@ pub(crate) async fn resolve_provider_config(
 mod tests {
     use super::*;
     use querymt::HTTPLLMProvider;
-    use querymt::chat::{ChatMessage, ChatResponse, Tool};
+    use querymt::chat::{ChatMessage, ChatOutput, Tool};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::host::{PluginRegistry, ProviderBinding};
@@ -235,7 +235,7 @@ mod tests {
         fn parse_chat(
             &self,
             _resp: http::Response<Vec<u8>>,
-        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        ) -> Result<ChatOutput, LLMError> {
             unimplemented!()
         }
     }

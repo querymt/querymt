@@ -68,16 +68,32 @@ Responses media conversion SHALL consume validated media types and preserve MIME
 - **THEN** the complete item is retained as opaque data rather than fabricated message content
 - **AND** it is not dispatched to the local function executor; any required unsupported replay or client action fails explicitly.
 
+### Requirement: Responses parsing preserves extensible semantics
+Responses parsing SHALL preserve unknown semantic fields on known items and parts in scoped extensions, and SHALL preserve the complete payload of unknown items and parts as opaque data. Deserializing through a known wire shape SHALL NOT discard unmodelled siblings. Opaque data SHALL remain non-executable unless an explicit codec recognizes it.
+
+#### Scenario: Known item gains an unknown field
+- **WHEN** a response contains a recognized message, reasoning, or function-call item with an unrecognized semantic field
+- **THEN** the normalized known item retains that field in scoped extensions for storage and compatible replay.
+
+#### Scenario: Unknown content part carries arbitrary payload
+- **WHEN** a recognized message contains an unknown content-part type with fields other than a property named raw
+- **THEN** the complete content-part object is retained as opaque payload rather than normalized to null or discarded.
+
 ### Requirement: Responses status and usage retain meaning
-Responses parsing SHALL preserve structured items, refusal data, annotations, terminal cause, and provider failure details. Token counts SHALL normalize to QueryMT's non-overlapping cached-input, ordinary-input, reasoning-output, and ordinary-output categories. Completed responses with supported local calls SHALL indicate pending tool execution; completed responses without such calls SHALL indicate stop. Unsupported provider actions requiring local participation SHALL fail explicitly and never enter the local function executor.
+Responses parsing SHALL preserve structured items, refusal data, annotations, terminal cause, provider failure details, and available partial output. Token counts SHALL normalize to QueryMT's non-overlapping cached-input, ordinary-input, reasoning-output, and ordinary-output categories. The parser SHALL reconcile any final response snapshot before deriving terminal meaning. Completed responses with supported local calls, including calls discovered only in the final snapshot, SHALL indicate pending tool execution; completed responses without such calls SHALL indicate stop. Unsupported provider actions requiring local participation SHALL fail explicitly and never enter the local function executor.
 
 #### Scenario: Completed function response
 - **WHEN** a successful response contains two local function calls plus reasoning and text
 - **THEN** both calls remain available for execution, ordered output remains intact, and cached/reasoning tokens are counted once.
 
+#### Scenario: Function call appears only in final snapshot
+- **WHEN** streaming deltas omit a function-call item but the final completed response snapshot contains it
+- **THEN** snapshot reconciliation adds the call before terminal classification
+- **AND** the result indicates pending tool execution rather than stop.
+
 #### Scenario: Incomplete or failed response
-- **WHEN** a response is incomplete or failed
-- **THEN** the system retains its partial output and terminal cause or classified error
+- **WHEN** a streaming or non-streaming response is incomplete or failed after producing output items
+- **THEN** the outcome retains its partial canonical output together with the terminal cause or classified error
 - **AND** it does not report successful stop or dispatch incomplete calls.
 
 ### Requirement: Compatible providers retain their own policies

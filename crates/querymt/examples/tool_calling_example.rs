@@ -9,7 +9,7 @@
 
 use querymt::{
     builder::{FunctionBuilder, ParamBuilder},
-    chat::{ChatMessage, Content, Tool},
+    chat::{ChatMessage, Tool, ToolResultPart},
     dynamic::PluginRegistryDynamicExt,
     plugin::host::PluginRegistry,
 };
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 call.id,
                 Some(call.function.name),
                 false,
-                vec![Content::text(serde_json::to_string(&result)?)],
+                vec![ToolResultPart::text(serde_json::to_string(&result)?)],
             );
         }
         messages.push(tool_result_message.build());
