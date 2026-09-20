@@ -53,7 +53,11 @@ pub fn test_context_with_user_messages(
     user_message_count: usize,
 ) -> Arc<ConversationContext> {
     let messages: Vec<ChatMessage> = (0..user_message_count)
-        .map(|i| ChatMessage::user().text(format!("User message {}", i)).build())
+        .map(|i| {
+            ChatMessage::user()
+                .text(format!("User message {}", i))
+                .build()
+        })
         .collect();
 
     Arc::new(ConversationContext::new(

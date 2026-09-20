@@ -7,7 +7,7 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider,
     chat::{
-ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},

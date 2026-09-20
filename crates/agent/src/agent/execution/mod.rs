@@ -510,7 +510,8 @@ pub(crate) async fn execute_cycle_state_machine(
                             crate::middleware::ToolResult::new(
                                 call.id.clone(),
                                 vec![querymt::chat::ToolResultPart::Text {
-                                    text: "Skipped because new user steering was received".to_string(),
+                                    text: "Skipped because new user steering was received"
+                                        .to_string(),
                                 }],
                                 true,
                                 Some(call.function.name.clone()),

@@ -1,9 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{
-    chat::ChatOutput,
-    error::LLMError,
-};
+use crate::{chat::ChatOutput, error::LLMError};
 use serde::{Deserialize, Serialize};
 
 pub mod http;

@@ -102,7 +102,7 @@ impl ToolTrait for UseRemoteProviderTool {
         });
 
         Ok(vec![ToolResultPart::text(
-            serde_json::to_string_pretty(&result).unwrap_or(status)
+            serde_json::to_string_pretty(&result).unwrap_or(status),
         )])
     }
 }

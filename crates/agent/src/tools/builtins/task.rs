@@ -23,7 +23,7 @@ fn task_content(
     value["current_task"] = Value::Bool(current);
     Ok(vec![ToolResultPart::text(
         serde_json::to_string_pretty(&value)
-            .map_err(|error| ToolError::SessionError(error.to_string()))?
+            .map_err(|error| ToolError::SessionError(error.to_string()))?,
     )])
 }
 

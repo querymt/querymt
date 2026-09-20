@@ -229,9 +229,10 @@ impl ConversationContext {
         // Keep the latest durable turn last. This preserves delegation and other
         // resumed-turn feedback while still avoiding a message between tool use
         // and its immediately following result.
-        if messages.last().is_some_and(|last| {
-            last.role == ChatRole::User && last.has_tool_result()
-        }) {
+        if messages
+            .last()
+            .is_some_and(|last| last.role == ChatRole::User && last.has_tool_result())
+        {
             if let Some(mut latest) = messages.pop() {
                 for fragment in fragments {
                     for part in fragment.input_parts() {

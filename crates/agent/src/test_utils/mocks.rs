@@ -525,7 +525,13 @@ impl From<MockChatResponse> for ChatOutput {
             None
         };
 
-        ChatOutput::from_projections(None, text, tool_calls, response.usage.clone(), finish_reason)
+        ChatOutput::from_projections(
+            None,
+            text,
+            tool_calls,
+            response.usage.clone(),
+            finish_reason,
+        )
     }
 }
 

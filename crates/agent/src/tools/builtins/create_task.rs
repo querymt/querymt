@@ -95,7 +95,7 @@ impl ToolTrait for CreateTaskTool {
         context.emit_event(crate::events::AgentEventKind::TaskCreated { task: task.clone() });
         Ok(vec![ToolResultPart::text(
             serde_json::to_string_pretty(&task)
-                .map_err(|error| ToolError::SessionError(error.to_string()))?
+                .map_err(|error| ToolError::SessionError(error.to_string()))?,
         )])
     }
 }

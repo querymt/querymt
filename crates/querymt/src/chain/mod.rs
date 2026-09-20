@@ -130,8 +130,7 @@ impl<'a> PromptChain<'a> {
 
             let response_text = match step.mode {
                 ChainStepMode::Chat => {
-                    let messages =
-                        vec![crate::chat::ChatMessage::user().text(prompt).build()];
+                    let messages = vec![crate::chat::ChatMessage::user().text(prompt).build()];
                     self.llm.chat(&messages).await?
                 }
                 ChainStepMode::Completion => {
