@@ -3,13 +3,21 @@ use super::*;
 #[tokio::test]
 async fn querymt_session_discard_queued_input_is_idempotent_when_not_pending() {
     let f = HandleFixture::new().await;
-    register_test_session(&f, "test-session").await;
+    let session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    register_test_session(&f, &session.public_id).await;
 
     let result = ext_method_json(
         &f.handle,
         "querymt/session/discardQueuedInput",
         serde_json::json!({
-            "session_id": "test-session",
+            "session_id": session.public_id,
             "input_id": "missing-input"
         }),
     )
