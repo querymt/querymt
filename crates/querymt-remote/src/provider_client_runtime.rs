@@ -365,7 +365,7 @@ where
                 if let Some(first_chunk_ms) = first_chunk_ms {
                     setup_span.record("first_chunk_ms", first_chunk_ms);
                 }
-                if let querymt::chat::StreamChunk::Done { finish_reason } = &chunk {
+                if querymt::chat::chunk_is_terminal(&chunk) {
                     tracing::info!(
                         target: "querymt_remote::provider::stream",
                         session_id = %session_id,
@@ -377,9 +377,9 @@ where
                         target_node = %target_name,
                         chunk_index,
                         elapsed_ms,
-                        finish_reason = ?finish_reason,
+                        chunk = ?chunk,
                         pending_chunks = stream_state.pending_chunks_len(),
-                        "stream done received from remote provider"
+                        "stream terminal received from remote provider"
                     );
                 } else {
                     tracing::trace!(

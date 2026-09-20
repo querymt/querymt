@@ -1,6 +1,6 @@
 use crate::{
     ToolCall, Usage,
-    chat::{ChatMessage, ChatOutput, ChatResponse, FinishReason, Tool},
+    chat::{ChatMessage, ChatOutput, FinishReason, Tool},
     completion::CompletionRequest,
     error::{LLMError, LLMErrorPayload},
     plugin::extism_impl::SerializableHttpResponse,
@@ -12,8 +12,18 @@ use std::fmt;
 /// Version of the item-aware chat contract carried across serialized transports.
 pub const ITEM_AWARE_CHAT_CONTRACT_VERSION: u32 = 1;
 
+/// Whether any message retains item-aware-only fidelity semantics.
+///
+/// Fidelity is derived from the concrete retained identities, opaque state,
+/// ordering, or continuation in each output — not from the mere presence of a
+/// canonical output value. A basic normalized output that projects losslessly
+/// does not require the item-aware contract.
 pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|message| message.output.is_some())
+    messages.iter().any(|message| {
+        message
+            .output()
+            .is_some_and(|output| output.requires_item_aware_fidelity())
+    })
 }
 
 // ============================================================================
@@ -385,36 +395,44 @@ impl fmt::Display for ExtismChatResponse {
     }
 }
 
-impl ChatResponse for ExtismChatResponse {
-    fn text(&self) -> Option<String> {
-        self.text.clone()
+impl ExtismChatResponse {
+    /// Project the canonical output, falling back to the legacy flat fields
+    /// when the plugin only returned a legacy payload.
+    pub fn to_canonical_output(&self) -> ChatOutput {
+        if let Some(output) = &self.output {
+            return output.clone();
+        }
+
+        ChatOutput::from_projections(
+            self.thinking.clone(),
+            self.text.clone(),
+            self.tool_calls.clone(),
+            self.usage.clone(),
+            self.finish_reason,
+        )
     }
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        self.tool_calls.clone()
-    }
-    fn thinking(&self) -> Option<String> {
-        self.thinking.clone()
-    }
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
-    }
-    fn finish_reason(&self) -> Option<FinishReason> {
-        self.finish_reason
-    }
-    fn output(&self) -> Option<&ChatOutput> {
+
+    /// Authoritative ordered output when the plugin returned one.
+    pub fn output(&self) -> Option<&ChatOutput> {
         self.output.as_ref()
     }
 }
 
-impl From<Box<dyn ChatResponse>> for ExtismChatResponse {
-    fn from(r: Box<dyn ChatResponse>) -> Self {
+impl From<ChatOutput> for ExtismChatResponse {
+    fn from(output: ChatOutput) -> Self {
+        let text = output.text();
+        let tool_calls = output.tool_calls();
+        let thinking = output.thinking();
+        let usage = output.usage.clone();
+        let finish_reason = output.finish_reason;
+
         ExtismChatResponse {
-            text: r.text(),
-            tool_calls: r.tool_calls(),
-            thinking: r.thinking(),
-            usage: r.usage(),
-            finish_reason: r.finish_reason(),
-            output: r.output().cloned(),
+            text,
+            tool_calls,
+            thinking,
+            usage,
+            finish_reason,
+            output: Some(output),
         }
     }
 }
@@ -444,6 +462,21 @@ mod item_aware_tests {
         }))
         .expect("legacy response");
         assert!(response.output.is_none());
+
+        let legacy_history: ExtismChatRequest<serde_json::Value> = serde_json::from_value(json!({
+            "cfg": {},
+            "messages": [{
+                "role": "User",
+                "content": [{"type": "text", "text": "hello"}]
+            }],
+            "tools": null
+        }))
+        .expect("legacy history request");
+        let saved = serde_json::to_value(&legacy_history).expect("serialize canonical request");
+        let message = &saved["messages"][0];
+        assert!(message.get("content").is_none());
+        assert_eq!(message["input"][0]["type"], "text");
+        assert_eq!(message["input"][0]["text"], "hello");
     }
 
     #[test]
@@ -495,7 +528,7 @@ mod item_aware_tests {
     fn structured_extism_history_round_trips_into_second_request() {
         use crate::chat::{
             ChatFunctionCallItem, ChatMessage, ChatMessageItem, ChatMessagePart, ChatOutputItem,
-            ChatReasoningItem, ChatReasoningPart, Content,
+            ChatReasoningItem, ChatReasoningPart,
         };
 
         let raw_arguments = "{\"query\":\"rust\",\"limit\": 2 }";
@@ -536,22 +569,21 @@ mod item_aware_tests {
             ..ChatOutput::default()
         };
 
-        let mut assistant = ChatMessage::from_assistant(output.portable_content());
-        assistant
-            .replace_output(output)
-            .expect("projection must match structured output");
+        let assistant = ChatMessage::from_assistant_output(output);
 
         // Second request carries the structured turn plus its tool result.
-        let result = ChatMessage::from_user(vec![Content::ToolResult {
-            id: "call-extism".into(),
-            name: Some("lookup".into()),
-            is_error: false,
-            content: vec![Content::text("result payload")],
-        }]);
+        let mut tool_result = crate::chat::ToolResult::new("call-extism");
+        tool_result.name = Some("lookup".into());
+        tool_result.parts.push(crate::chat::ToolResultPart::Text {
+            text: "result payload".into(),
+        });
+        let result = ChatMessage::from_user_parts(vec![crate::chat::ChatInputPart::tool_result(
+            tool_result,
+        )]);
         let request = ExtismChatRequest {
             cfg: json!({}),
             messages: vec![
-                ChatMessage::from_user(vec![Content::text("look it up")]),
+                ChatMessage::from_user_parts(vec![crate::chat::ChatInputPart::text("look it up")]),
                 assistant,
                 result,
             ],
@@ -568,10 +600,7 @@ mod item_aware_tests {
             serde_json::from_slice(&encoded).expect("deserialize request");
 
         let reloaded = &decoded.messages[1];
-        let reloaded_output = reloaded
-            .output
-            .as_ref()
-            .expect("structured output survives");
+        let reloaded_output = reloaded.output().expect("structured output survives");
         assert_eq!(
             reloaded_output.items.len(),
             3,
@@ -596,13 +625,13 @@ mod item_aware_tests {
 
         // The tool result references the original call ID.
         let tool_result = decoded.messages[2]
-            .content
-            .iter()
-            .find(|block| block.is_tool_result())
+            .input_parts()
+            .into_iter()
+            .find_map(|part| match part {
+                crate::chat::ChatInputPart::ToolResult(result) => Some(result),
+                _ => None,
+            })
             .expect("tool result present");
-        let Content::ToolResult { id, .. } = tool_result else {
-            panic!("expected tool result block");
-        };
-        assert_eq!(id, "call-extism");
+        assert_eq!(tool_result.call_id, "call-extism");
     }
 }

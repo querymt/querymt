@@ -1,6 +1,6 @@
 use crate::{
     Tool,
-    chat::{ChatMessage, ChatResponse, StreamChunk},
+    chat::{ChatMessage, ChatOutput, StreamChunk},
     error::{LLMError, classify_status_only},
 };
 use http::{Request, Response};
@@ -55,7 +55,7 @@ pub trait HTTPChatProvider: Send + Sync {
     /// The HTTP adapter only calls this after a success status. Non-success
     /// responses go through [`Self::classify_chat_error`] instead — do not
     /// re-check status here.
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError>;
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError>;
 
     fn supports_streaming(&self) -> bool {
         false

@@ -123,12 +123,7 @@ impl DelegationSummarizer {
         let input = self.prepare_llm_input(parent_history, delegation_objective);
 
         // 2. Call LLM with timeout
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            content: vec![querymt::chat::Content::text(input)],
-            cache: None,
-            output: None,
-        }];
+        let messages = vec![ChatMessage::user().text(input).build()];
 
         let timeout = self.timeout;
         let use_streaming = self.provider.supports_streaming();
@@ -180,7 +175,9 @@ impl DelegationSummarizer {
         while let Some(chunk) = stream.next().await {
             match chunk? {
                 StreamChunk::Text(delta) => text.push_str(&delta),
-                StreamChunk::Done { .. } => break,
+                // The canonical structured terminal is terminal for consumers
+                // that only need display text, just like a legacy `Done`.
+                chunk if querymt::chat::chunk_is_terminal(&chunk) => break,
                 _ => {}
             }
         }
@@ -208,7 +205,9 @@ impl DelegationSummarizer {
                                 .join("\n");
                             self.estimator.estimate(&text)
                         }
-                        MessagePart::Reasoning { content, .. } => self.estimator.estimate(content),
+                        MessagePart::Reasoning { item, .. } => {
+                            self.estimator.estimate(&item.visible_text())
+                        }
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
                         MessagePart::Output { output } => {
                             self.estimator.estimate(&output.estimate_text())
@@ -407,7 +406,7 @@ planning conversation."#
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use querymt::chat::{ChatResponse, FinishReason, Tool};
+    use querymt::chat::{ChatOutput, FinishReason, Tool};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use std::pin::Pin;
@@ -480,7 +479,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _tools: Option<&[Tool]>,
-        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        ) -> Result<ChatOutput, LLMError> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             let result = self
                 .chat_result
@@ -492,10 +491,7 @@ mod tests {
                         "non-streaming chat was not configured".to_string(),
                     ))
                 });
-            result.map(|text| {
-                Box::new(crate::test_utils::mocks::MockChatResponse::text_only(&text))
-                    as Box<dyn ChatResponse>
-            })
+            result.map(|text| crate::test_utils::mocks::MockChatResponse::text_only(&text).into())
         }
 
         async fn chat_stream_with_tools(

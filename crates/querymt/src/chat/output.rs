@@ -1,9 +1,10 @@
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
+use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 use std::{fmt, str::FromStr};
 
-use super::{ChatResponse, ChatRole, Content, FinishReason};
+use super::{ChatMessagePartDelta, ChatRole, FinishReason};
 use crate::{FunctionCall, ToolCall, Usage};
 
 /// Provider-specific fields retained by the structured chat contract.
@@ -122,19 +123,6 @@ pub enum MediaTypeError {
     Wildcard(String),
 }
 
-/// Whether output came from an item-aware provider or was synthesized from legacy accessors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ChatOutputRepresentation {
-    #[default]
-    Structured,
-    LegacyProjection,
-}
-
-fn is_structured_representation(representation: &ChatOutputRepresentation) -> bool {
-    *representation == ChatOutputRepresentation::Structured
-}
-
 /// Origin information used to decide whether provider-specific state can be replayed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ChatOutputProvenance {
@@ -154,6 +142,13 @@ pub enum ChatOutputStatus {
     Failed,
 }
 
+impl fmt::Display for ChatOutput {
+    /// Render the visible text projection of the canonical output.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.text().unwrap_or_default())
+    }
+}
+
 /// Ordered, provider-neutral output from one generation attempt.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatOutput {
@@ -169,8 +164,6 @@ pub struct ChatOutput {
     pub finish_reason: Option<FinishReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<ChatOutputProvenance>,
-    #[serde(default, skip_serializing_if = "is_structured_representation")]
-    pub representation: ChatOutputRepresentation,
     #[serde(default, flatten)]
     pub extensions: Extensions,
 }
@@ -184,18 +177,23 @@ impl Default for ChatOutput {
             usage: None,
             finish_reason: None,
             provenance: None,
-            representation: ChatOutputRepresentation::Structured,
             extensions: Extensions::new(),
         }
     }
 }
 
 impl ChatOutput {
-    /// Build the limited structured representation available from a legacy response.
-    pub fn from_legacy_response(response: &dyn ChatResponse) -> Self {
+    /// Build a limited canonical output from already-normalized projections.
+    pub fn from_projections(
+        thinking: Option<String>,
+        text: Option<String>,
+        tool_calls: Option<Vec<ToolCall>>,
+        usage: Option<Usage>,
+        finish_reason: Option<FinishReason>,
+    ) -> Self {
         let mut items = Vec::new();
 
-        if let Some(thinking) = response.thinking()
+        if let Some(thinking) = thinking
             && !thinking.is_empty()
         {
             items.push(ChatOutputItem::Reasoning(ChatReasoningItem {
@@ -209,7 +207,7 @@ impl ChatOutput {
             }));
         }
 
-        if let Some(text) = response.text()
+        if let Some(text) = text
             && !text.is_empty()
         {
             items.push(ChatOutputItem::Message(ChatMessageItem {
@@ -226,7 +224,7 @@ impl ChatOutput {
             }));
         }
 
-        if let Some(calls) = response.tool_calls() {
+        if let Some(calls) = tool_calls {
             items.extend(calls.into_iter().map(|call| {
                 ChatOutputItem::FunctionCall(ChatFunctionCallItem {
                     item_id: None,
@@ -241,12 +239,9 @@ impl ChatOutput {
 
         Self {
             items,
-            status: response
-                .finish_reason()
-                .map(|_| ChatOutputStatus::Completed),
-            usage: response.usage(),
-            finish_reason: response.finish_reason(),
-            representation: ChatOutputRepresentation::LegacyProjection,
+            status: finish_reason.map(|_| ChatOutputStatus::Completed),
+            usage,
+            finish_reason,
             ..Self::default()
         }
     }
@@ -293,9 +288,6 @@ impl ChatOutput {
         })
     }
 
-    /// Provider-visible text used for sizing estimates: message text, visible
-    /// reasoning summaries, and raw function arguments. Encrypted continuation
-    /// and opaque payloads are excluded because they are not portable content.
     pub fn estimate_text(&self) -> String {
         let mut chunks: Vec<&str> = Vec::new();
         for item in &self.items {
@@ -331,32 +323,115 @@ impl ChatOutput {
         chunks.join("\n")
     }
 
-    /// Build deterministic portable content without interpreting opaque items.
-    ///
-    /// Function calls with invalid JSON remain in structured output but are not
-    /// projected as executable `Content::ToolUse` blocks.
-    pub fn portable_content(&self) -> Vec<Content> {
-        self.portable_content_with(false)
+    pub fn usage(&self) -> Option<&Usage> {
+        self.usage.as_ref()
     }
 
-    /// Like [`ChatOutput::portable_content`], optionally attaching reasoning
-    /// signatures to projected thinking blocks for same-origin replay.
-    pub fn portable_content_with(&self, preserve_signatures: bool) -> Vec<Content> {
-        let mut content = Vec::new();
+    /// Whether this response completed successfully and may authorize local calls.
+    pub fn is_successful(&self) -> bool {
+        self.status == Some(ChatOutputStatus::Completed)
+    }
+
+    /// Whether this output retains semantics a legacy boundary cannot preserve.
+    pub fn requires_item_aware_fidelity(&self) -> bool {
+        self.items.iter().any(ChatOutputItem::is_native)
+    }
+
+    /// Iterate over canonical function-call items without allocation or projection.
+    pub fn function_calls(&self) -> impl Iterator<Item = &ChatFunctionCallItem> {
+        self.items.iter().filter_map(|item| match item {
+            ChatOutputItem::FunctionCall(call) => Some(call),
+            _ => None,
+        })
+    }
+
+    /// Project supported function items to the legacy `ToolCall` shape.
+    pub fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        let calls: Vec<ToolCall> = self
+            .function_calls()
+            .map(ChatFunctionCallItem::to_tool_call)
+            .collect();
+        (!calls.is_empty()).then_some(calls)
+    }
+
+    /// Return executable calls only after successful response-level validation.
+    pub fn executable_tool_calls(&self) -> Option<Vec<ToolCall>> {
+        self.is_successful().then(|| self.tool_calls()).flatten()
+    }
+
+    /// Consume this output and remove origin-scoped continuation while retaining
+    /// portable messages, visible reasoning, and call/result correlation.
+    pub fn into_portable(mut self) -> Self {
+        self.response_id = None;
+        self.provenance = None;
+        self.extensions.clear();
+        self.items.retain_mut(|item| match item {
+            ChatOutputItem::Message(message) => {
+                message.id = None;
+                message.phase = None;
+                message.extensions.clear();
+                for part in &mut message.parts {
+                    match part {
+                        ChatMessagePart::Text {
+                            annotations,
+                            extensions,
+                            ..
+                        } => {
+                            annotations.clear();
+                            extensions.clear();
+                        }
+                        ChatMessagePart::Refusal { extensions, .. } => extensions.clear(),
+                        ChatMessagePart::Media(media) => media.extensions.clear(),
+                        ChatMessagePart::Opaque(_) => return false,
+                    }
+                }
+                true
+            }
+            ChatOutputItem::Reasoning(reasoning) => {
+                reasoning.id = None;
+                reasoning.encrypted_content = None;
+                reasoning.signature = None;
+                reasoning.status = None;
+                reasoning.extensions.clear();
+                for part in reasoning.summary.iter_mut().chain(&mut reasoning.content) {
+                    part.extensions.clear();
+                }
+                !reasoning.visible_text().is_empty()
+            }
+            ChatOutputItem::FunctionCall(call) => {
+                call.item_id = None;
+                call.status = None;
+                call.extensions.clear();
+                true
+            }
+            ChatOutputItem::Opaque(_) => false,
+        });
+        self
+    }
+
+    /// Build a lossy display projection of visible text and attachments.
+    /// Function calls remain available through `function_calls()` instead of
+    /// being misrepresented as ordinary argument text.
+    pub fn portable_input_parts(&self) -> Vec<ChatInputPart> {
+        let mut parts = Vec::new();
 
         for item in &self.items {
             match item {
                 ChatOutputItem::Message(message) => {
-                    content.extend(message.parts.iter().filter_map(|part| match part {
-                        ChatMessagePart::Text { text, .. } if !text.is_empty() => {
-                            Some(Content::text(text.clone()))
+                    for part in &message.parts {
+                        match part {
+                            ChatMessagePart::Text { text, .. } if !text.is_empty() => {
+                                parts.push(ChatInputPart::text(text.clone()));
+                            }
+                            ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
+                                parts.push(ChatInputPart::text(refusal.clone()));
+                            }
+                            ChatMessagePart::Media(media) => {
+                                parts.push(ChatInputPart::attachment((**media).clone()));
+                            }
+                            _ => {}
                         }
-                        ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
-                            Some(Content::text(refusal.clone()))
-                        }
-                        ChatMessagePart::Media(media) => media.portable_content(),
-                        _ => None,
-                    }));
+                    }
                 }
                 ChatOutputItem::Reasoning(reasoning) => {
                     let visible: Vec<&str> = reasoning
@@ -367,52 +442,15 @@ impl ChatOutput {
                         .filter(|text| !text.is_empty())
                         .collect();
                     if !visible.is_empty() {
-                        content.push(Content::Thinking {
-                            text: visible.join("\n\n"),
-                            signature: if preserve_signatures {
-                                reasoning.signature.clone()
-                            } else {
-                                None
-                            },
-                        });
+                        parts.push(ChatInputPart::text(visible.join("\n\n")));
                     }
                 }
-                ChatOutputItem::FunctionCall(call) => {
-                    if let Ok(arguments) = call.parse_arguments() {
-                        content.push(Content::tool_use(
-                            call.call_id.clone(),
-                            call.name.clone(),
-                            arguments,
-                        ));
-                    }
-                }
-                ChatOutputItem::Opaque(_) => {}
+                ChatOutputItem::FunctionCall(_) | ChatOutputItem::Opaque(_) => {}
             }
         }
 
-        content
+        parts
     }
-
-    /// Project supported function items without interpreting opaque items.
-    pub fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        let calls: Vec<ToolCall> = self
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                ChatOutputItem::FunctionCall(call) => Some(call.to_tool_call()),
-                _ => None,
-            })
-            .collect();
-        (!calls.is_empty()).then_some(calls)
-    }
-}
-
-/// Return authoritative structured output, or synthesize a marked legacy projection.
-pub fn normalize_chat_response(response: &dyn ChatResponse) -> ChatOutput {
-    response
-        .output()
-        .cloned()
-        .unwrap_or_else(|| ChatOutput::from_legacy_response(response))
 }
 
 /// Broad media category used for rendering and endpoint capability checks.
@@ -446,18 +484,54 @@ pub enum MediaSource {
 }
 
 /// Provider-neutral media shared by generated output and normalized tool results.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Fields carry cross-field invariants (inline bytes require a media type; a
+/// data URL's declared type must agree with its payload). Deserialization runs
+/// through the same validation as [`MediaPart::new`], so serialized input cannot
+/// construct a state rejected by ordinary constructors.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MediaPart {
     pub kind: MediaKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_type: Option<MediaType>,
-    pub source: MediaSource,
+    media_type: Option<MediaType>,
+    source: MediaSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, flatten)]
     pub extensions: Extensions,
+}
+
+impl<'de> Deserialize<'de> for MediaPart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // A permissive DTO collects the raw fields; construction then re-runs the
+        // cross-field validation so serde cannot bypass the invariants.
+        #[derive(Deserialize)]
+        struct MediaPartDto {
+            kind: MediaKind,
+            #[serde(default)]
+            media_type: Option<MediaType>,
+            source: MediaSource,
+            #[serde(default)]
+            filename: Option<String>,
+            #[serde(default)]
+            detail: Option<String>,
+            #[serde(default, flatten)]
+            extensions: Extensions,
+        }
+
+        let dto = MediaPartDto::deserialize(deserializer)?;
+        let mut media =
+            MediaPart::new(dto.kind, dto.media_type, dto.source).map_err(de::Error::custom)?;
+        media.filename = dto.filename;
+        media.detail = dto.detail;
+        media.extensions = dto.extensions;
+        Ok(media)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -521,80 +595,34 @@ impl MediaPart {
         })
     }
 
-    /// Normalize a legacy media block on demand; unrelated legacy history can still load first.
-    pub fn from_legacy_content(content: &Content) -> Result<Option<Self>, MediaNormalizationError> {
-        let normalized = match content {
-            Content::Image { mime_type, data } => Self::new(
-                MediaKind::Image,
-                Some(mime_type.parse()?),
-                MediaSource::Inline { data: data.clone() },
-            )?,
-            Content::ImageUrl { url } => Self::new(
-                MediaKind::Image,
-                None,
-                MediaSource::Url { url: url.clone() },
-            )?,
-            Content::Pdf { data } => Self::new(
-                MediaKind::Document,
-                Some(
-                    "application/pdf"
-                        .parse()
-                        .expect("static MIME type is valid"),
-                ),
-                MediaSource::Inline { data: data.clone() },
-            )?,
-            Content::Audio { mime_type, data } => Self::new(
-                MediaKind::Audio,
-                Some(mime_type.parse()?),
-                MediaSource::Inline { data: data.clone() },
-            )?,
-            Content::ResourceLink {
-                uri,
-                name,
-                mime_type,
-                ..
-            } => {
-                let mut media = Self::new(
-                    MediaKind::Other,
-                    mime_type.as_deref().map(str::parse).transpose()?,
-                    MediaSource::Url { url: uri.clone() },
-                )?;
-                media.filename.clone_from(name);
-                media
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(normalized))
+    pub fn media_type(&self) -> Option<&MediaType> {
+        self.media_type.as_ref()
     }
 
-    /// Build the legacy-compatible display projection without fetching referenced data.
-    pub fn portable_content(&self) -> Option<Content> {
-        match (&self.kind, &self.source) {
-            (MediaKind::Image, MediaSource::Inline { data }) => Some(Content::Image {
-                mime_type: self.media_type.as_ref()?.to_string(),
-                data: data.clone(),
-            }),
-            (MediaKind::Audio, MediaSource::Inline { data }) => Some(Content::Audio {
-                mime_type: self.media_type.as_ref()?.to_string(),
-                data: data.clone(),
-            }),
-            (MediaKind::Document, MediaSource::Inline { data })
-                if self.media_type.as_ref()?.type_() == "application"
-                    && self.media_type.as_ref()?.subtype() == "pdf" =>
-            {
-                Some(Content::Pdf { data: data.clone() })
-            }
-            (MediaKind::Image, MediaSource::DataUrl { url } | MediaSource::Url { url }) => {
-                Some(Content::ImageUrl { url: url.clone() })
-            }
-            (_, MediaSource::Url { url }) => Some(Content::ResourceLink {
-                uri: url.clone(),
-                name: self.filename.clone(),
-                description: None,
-                mime_type: self.media_type.as_ref().map(ToString::to_string),
-            }),
-            _ => None,
-        }
+    pub fn source(&self) -> &MediaSource {
+        &self.source
+    }
+
+    /// Replace source and MIME metadata only when the pair is valid.
+    pub fn set_source(
+        &mut self,
+        media_type: Option<MediaType>,
+        source: MediaSource,
+    ) -> Result<(), MediaNormalizationError> {
+        let replacement = Self::new(self.kind, media_type, source)?;
+        self.media_type = replacement.media_type;
+        self.source = replacement.source;
+        Ok(())
+    }
+
+    pub fn with_filename(mut self, filename: impl Into<String>) -> Self {
+        self.filename = Some(filename.into());
+        self
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 
     pub fn display_projection(
@@ -607,23 +635,6 @@ impl MediaPart {
             MediaDisplayProjection::Attachment(self)
         }
     }
-}
-
-/// Normalize media nested in a legacy tool result without changing or executing other blocks.
-pub fn normalize_tool_result_media(
-    content: &Content,
-) -> Result<Vec<MediaPart>, MediaNormalizationError> {
-    let Content::ToolResult { content, .. } = content else {
-        return Ok(Vec::new());
-    };
-    content
-        .iter()
-        .filter_map(|part| match MediaPart::from_legacy_content(part) {
-            Ok(Some(media)) => Some(Ok(media)),
-            Ok(None) => None,
-            Err(error) => Some(Err(error)),
-        })
-        .collect()
 }
 
 fn data_url_media_type(url: &str) -> Result<MediaType, MediaNormalizationError> {
@@ -652,6 +663,48 @@ pub enum ChatOutputItem {
     Reasoning(ChatReasoningItem),
     FunctionCall(ChatFunctionCallItem),
     Opaque(ChatOpaqueItem),
+}
+
+impl ChatOutputItem {
+    /// Whether this item retains native provider semantics (identity, opaque
+    /// state, or continuation) that a plain portable projection would lose.
+    ///
+    /// Fidelity is derived from the retained fields themselves rather than a
+    /// caller-set marker on the output as a whole.
+    pub fn is_native(&self) -> bool {
+        match self {
+            ChatOutputItem::Message(item) => {
+                item.id.is_some()
+                    || item.phase.is_some()
+                    || !item.extensions.is_empty()
+                    || item.parts.iter().any(|part| match part {
+                        ChatMessagePart::Text {
+                            annotations,
+                            extensions,
+                            ..
+                        } => !annotations.is_empty() || !extensions.is_empty(),
+                        ChatMessagePart::Refusal { extensions, .. } => !extensions.is_empty(),
+                        ChatMessagePart::Media(media) => !media.extensions.is_empty(),
+                        ChatMessagePart::Opaque(_) => true,
+                    })
+            }
+            ChatOutputItem::Reasoning(item) => {
+                item.id.is_some()
+                    || item.encrypted_content.is_some()
+                    || item.signature.is_some()
+                    || !item.extensions.is_empty()
+                    || item
+                        .summary
+                        .iter()
+                        .chain(item.content.iter())
+                        .any(|part| !part.extensions.is_empty())
+            }
+            ChatOutputItem::FunctionCall(item) => {
+                item.item_id.is_some() || item.status.is_some() || !item.extensions.is_empty()
+            }
+            ChatOutputItem::Opaque(_) => true,
+        }
+    }
 }
 
 /// A generated assistant message and its ordered parts.
@@ -688,6 +741,65 @@ pub enum ChatMessagePart {
     },
     Media(Box<MediaPart>),
     Opaque(ChatOpaquePart),
+}
+
+impl ChatMessagePart {
+    /// Whether this is an empty placeholder created by the accumulator for a
+    /// part index a provider addressed before declaring the part itself.
+    pub(crate) fn is_empty_placeholder(&self) -> bool {
+        match self {
+            ChatMessagePart::Text { text, .. } => text.is_empty(),
+            ChatMessagePart::Refusal { refusal, .. } => refusal.is_empty(),
+            ChatMessagePart::Media(_) | ChatMessagePart::Opaque(_) => false,
+        }
+    }
+
+    /// Materialize a typed part from an indexed delta addressed before the
+    /// provider declared the part, so ordinary part/delta ordering survives.
+    pub(crate) fn into_message_part(self, delta: &ChatMessagePartDelta) -> Self {
+        match self {
+            ChatMessagePart::Text {
+                text,
+                annotations,
+                extensions,
+            } => {
+                let mut text = text;
+                if let ChatMessagePartDelta::Text { delta } = delta {
+                    text.push_str(delta);
+                }
+                ChatMessagePart::Text {
+                    text,
+                    annotations,
+                    extensions,
+                }
+            }
+            ChatMessagePart::Refusal {
+                refusal,
+                extensions,
+            } => {
+                let mut refusal = refusal;
+                if let ChatMessagePartDelta::Refusal { delta } = delta {
+                    refusal.push_str(delta);
+                }
+                ChatMessagePart::Refusal {
+                    refusal,
+                    extensions,
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+/// Create the empty placeholder used for indexed parts addressed before
+/// declaration. It is always a `Text` part because text is the common case and
+/// its first delta is either text (kept) or a type mismatch (reported).
+pub fn empty_message_part() -> ChatMessagePart {
+    ChatMessagePart::Text {
+        text: String::new(),
+        annotations: Vec::new(),
+        extensions: Extensions::new(),
+    }
 }
 
 /// Annotation data attached to generated text.
@@ -740,6 +852,23 @@ pub struct ChatReasoningPart {
     pub text: String,
     #[serde(default, flatten)]
     pub extensions: Extensions,
+}
+
+impl ChatReasoningItem {
+    /// Concatenated visible reasoning text (summary followed by content).
+    ///
+    /// Encrypted continuation and provider signatures are deliberately excluded:
+    /// this is display/estimation text, not replayable state.
+    pub fn visible_text(&self) -> String {
+        let parts: Vec<&str> = self
+            .summary
+            .iter()
+            .chain(&self.content)
+            .map(|part| part.text.as_str())
+            .filter(|text| !text.is_empty())
+            .collect();
+        parts.join("\n\n")
+    }
 }
 
 impl ChatReasoningPart {
@@ -833,6 +962,291 @@ impl fmt::Debug for ChatOpaquePart {
             .field("original_type", &self.original_type)
             .field("payload", &"[REDACTED]")
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical input model
+// ---------------------------------------------------------------------------
+
+/// One ordered part of ordinary (supplied) chat input.
+///
+/// Generated reasoning and function calls are output-only concepts; they are
+/// deliberately not representable here. Use [`ChatOutput`] items for replaying
+/// generated semantics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatInputPart {
+    /// Plain user/assistant text.
+    Text { text: String },
+    /// A validated attachment (image, audio, video, document, or resource link).
+    Attachment(Box<MediaPart>),
+    /// The result of a previously requested tool call.
+    ToolResult(ToolResult),
+}
+
+impl ChatInputPart {
+    /// Create a text input part.
+    pub fn text(text: impl Into<String>) -> Self {
+        ChatInputPart::Text { text: text.into() }
+    }
+
+    /// Create a validated attachment input part.
+    pub fn attachment(media: MediaPart) -> Self {
+        ChatInputPart::Attachment(Box::new(media))
+    }
+
+    /// Create a correlated tool-result input part.
+    pub fn tool_result(result: ToolResult) -> Self {
+        ChatInputPart::ToolResult(result)
+    }
+
+    /// Returns the text if this is a text part.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            ChatInputPart::Text { text } => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Returns the attachment if this is an attachment part.
+    pub fn as_attachment(&self) -> Option<&MediaPart> {
+        match self {
+            ChatInputPart::Attachment(media) => Some(media),
+            _ => None,
+        }
+    }
+
+    /// Returns the correlated tool result if this is a tool-result part.
+    pub fn as_tool_result(&self) -> Option<&ToolResult> {
+        match self {
+            ChatInputPart::ToolResult(result) => Some(result),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this is a tool result part.
+    pub fn is_tool_result(&self) -> bool {
+        matches!(self, ChatInputPart::ToolResult(_))
+    }
+}
+
+/// A correlated tool result. Bounded and nonrecursive: it cannot contain another
+/// result, a function call, or generated reasoning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    /// The call ID this result answers.
+    pub call_id: String,
+    /// Optional function name, preserved when the provider supplies one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Whether the tool reported an error.
+    #[serde(default)]
+    pub is_error: bool,
+    /// Ordered result parts (text and validated attachments only).
+    #[serde(default)]
+    pub parts: Vec<ToolResultPart>,
+    #[serde(default, flatten)]
+    pub extensions: Extensions,
+}
+
+impl ToolResult {
+    /// Create an empty successful result for a call.
+    pub fn new(call_id: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            name: None,
+            is_error: false,
+            parts: Vec::new(),
+            extensions: Extensions::new(),
+        }
+    }
+
+    /// Create a text-only result for a call.
+    pub fn text(call_id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::new(call_id).with_text(text)
+    }
+
+    /// Mark this result as an error.
+    pub fn error(mut self) -> Self {
+        self.is_error = true;
+        self
+    }
+
+    /// Set the optional function name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Append a text part.
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.parts.push(ToolResultPart::Text { text: text.into() });
+        self
+    }
+
+    /// Append a validated attachment part.
+    pub fn with_attachment(mut self, media: MediaPart) -> Self {
+        self.parts.push(ToolResultPart::Attachment(Box::new(media)));
+        self
+    }
+
+    /// Concatenate the text parts.
+    pub fn text_content(&self) -> String {
+        self.parts
+            .iter()
+            .filter_map(ToolResultPart::as_text)
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+/// One ordered part of a tool result. Deliberately nonrecursive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolResultPart {
+    /// Text result content.
+    Text { text: String },
+    /// A validated attachment result.
+    Attachment(Box<MediaPart>),
+}
+
+impl ToolResultPart {
+    /// Create a text result part.
+    ///
+    /// This is the ergonomic constructor for the common case where a tool
+    /// produces a single block of text output.
+    pub fn text(text: impl Into<String>) -> Self {
+        ToolResultPart::Text { text: text.into() }
+    }
+
+    /// Create a validated attachment result part.
+    pub fn attachment(media: MediaPart) -> Self {
+        ToolResultPart::Attachment(Box::new(media))
+    }
+
+    /// Returns the text if this is a text part.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            ToolResultPart::Text { text } => Some(text),
+            ToolResultPart::Attachment(_) => None,
+        }
+    }
+
+    /// Returns the attachment if this is an attachment part.
+    pub fn as_attachment(&self) -> Option<&MediaPart> {
+        match self {
+            ToolResultPart::Attachment(media) => Some(media),
+            ToolResultPart::Text { .. } => None,
+        }
+    }
+}
+
+impl From<String> for ToolResultPart {
+    fn from(text: String) -> Self {
+        ToolResultPart::text(text)
+    }
+}
+
+impl From<&str> for ToolResultPart {
+    fn from(text: &str) -> Self {
+        ToolResultPart::text(text)
+    }
+}
+
+impl From<MediaPart> for ToolResultPart {
+    fn from(media: MediaPart) -> Self {
+        ToolResultPart::attachment(media)
+    }
+}
+
+impl From<Box<MediaPart>> for ToolResultPart {
+    fn from(media: Box<MediaPart>) -> Self {
+        ToolResultPart::Attachment(media)
+    }
+}
+
+/// Error returned when an invariant-bearing canonical value is constructed with
+/// inconsistent fields, whether directly or through deserialization.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatInputError {
+    #[error(transparent)]
+    Media(#[from] MediaNormalizationError),
+    #[error("message payload does not match the message role")]
+    RolePayloadMismatch,
+}
+
+// ---------------------------------------------------------------------------
+// Exclusive message payload
+// ---------------------------------------------------------------------------
+
+/// The single authoritative payload of a chat turn.
+///
+/// A user or tool-result turn carries canonical [`ChatInputPart`]s. An assistant
+/// turn carries a [`ChatOutput`]. The two forms are exclusive: callers cannot
+/// independently mutate a portable projection and structured output, so a stale
+/// projection can never hide authoritative continuation state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatMessagePayload {
+    /// Supplied input parts (ordinary user/tool-result turns, or a portable
+    /// projection of an assistant turn).
+    Input(Vec<ChatInputPart>),
+    /// Structured generated output (assistant turns).
+    Output(ChatOutput),
+}
+
+impl ChatMessagePayload {
+    /// Build a canonical input payload.
+    pub fn input(parts: Vec<ChatInputPart>) -> Self {
+        ChatMessagePayload::Input(parts)
+    }
+
+    /// Build a structured output payload.
+    pub fn output(output: ChatOutput) -> Self {
+        ChatMessagePayload::Output(output)
+    }
+
+    /// Borrow the payload as canonical input parts, if this is an input payload.
+    pub fn as_input(&self) -> Option<&[ChatInputPart]> {
+        match self {
+            ChatMessagePayload::Input(parts) => Some(parts),
+            ChatMessagePayload::Output(_) => None,
+        }
+    }
+
+    /// Borrow the payload as structured output, if this is an output payload.
+    pub fn as_output(&self) -> Option<&ChatOutput> {
+        match self {
+            ChatMessagePayload::Output(output) => Some(output),
+            ChatMessagePayload::Input(_) => None,
+        }
+    }
+
+    /// Whether this payload carries structured generated output.
+    pub fn is_output(&self) -> bool {
+        matches!(self, ChatMessagePayload::Output(_))
+    }
+
+    /// Convert this payload into canonical portable input parts.
+    ///
+    /// Structured output is projected on demand; provider-only continuation is
+    /// intentionally not part of the projection. Input payloads are returned
+    /// unchanged.
+    pub fn into_portable(self) -> Vec<ChatInputPart> {
+        match self {
+            ChatMessagePayload::Input(parts) => parts,
+            ChatMessagePayload::Output(output) => output.portable_input_parts(),
+        }
+    }
+
+    /// Borrow this payload as canonical portable input parts, projecting
+    /// structured output on demand.
+    pub fn portable_parts(&self) -> Vec<ChatInputPart> {
+        match self {
+            ChatMessagePayload::Input(parts) => parts.clone(),
+            ChatMessagePayload::Output(output) => output.portable_input_parts(),
+        }
     }
 }
 
@@ -1015,7 +1429,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(defaulted.media_type.unwrap().type_(), "text");
+        assert_eq!(defaulted.media_type().unwrap().type_(), "text");
 
         let conflict = MediaPart::new(
             MediaKind::Image,
@@ -1049,26 +1463,41 @@ mod tests {
         let decoded: MediaPart =
             serde_json::from_str(&serde_json::to_string(&reference).unwrap()).unwrap();
         assert_eq!(decoded, reference);
-        assert!(decoded.portable_content().is_none());
+        assert!(matches!(decoded.source(), MediaSource::ProviderFile { .. }));
         assert!(matches!(
-            decoded.source,
-            MediaSource::ProviderFile { origin: actual, .. } if actual == origin
+            decoded.source(),
+            MediaSource::ProviderFile { origin: actual, .. } if actual == &origin
         ));
     }
 
     #[test]
-    fn legacy_media_normalizes_explicitly_and_display_falls_back_to_attachment() {
-        let invalid_legacy: Content = serde_json::from_value(serde_json::json!({
-            "type": "image",
-            "mime_type": "invalid mime",
-            "data": [1, 2, 3]
-        }))
-        .unwrap();
-        assert!(matches!(
-            MediaPart::from_legacy_content(&invalid_legacy),
-            Err(MediaNormalizationError::MediaType(_))
-        ));
+    fn media_deserialization_enforces_the_same_invariants_as_construction() {
+        // Inline bytes without a media type fail through serde exactly as they do
+        // through the constructor.
+        let inline_without_type = serde_json::json!({
+            "kind": "image",
+            "source": {"type": "inline", "data": [1, 2, 3]}
+        });
+        assert!(
+            serde_json::from_value::<MediaPart>(inline_without_type).is_err(),
+            "inline media must require a media type through serde"
+        );
 
+        // A data URL whose declared type conflicts with the separately supplied
+        // type fails through serde.
+        let conflicting = serde_json::json!({
+            "kind": "image",
+            "media_type": "image/jpeg",
+            "source": {"type": "data_url", "url": "data:image/png;base64,iVBORw0KGgo="}
+        });
+        assert!(
+            serde_json::from_value::<MediaPart>(conflicting).is_err(),
+            "conflicting data URL media type must fail through serde"
+        );
+    }
+
+    #[test]
+    fn unfamiliar_media_uses_attachment_display_fallback() {
         let mut unfamiliar = MediaPart::new(
             MediaKind::Image,
             Some("image/x-future".parse().unwrap()),
@@ -1114,46 +1543,6 @@ mod tests {
         assert_eq!(recognized.kind, MediaKind::Image);
         assert_eq!(opaque.original_type, "future_media");
         assert_eq!(opaque.payload["data"], "secret");
-    }
-
-    #[test]
-    fn output_media_projects_once_and_tool_result_normalization_keeps_order() {
-        let media = MediaPart::new(
-            MediaKind::Image,
-            Some("image/png".parse().unwrap()),
-            MediaSource::Inline {
-                data: vec![1, 2, 3],
-            },
-        )
-        .unwrap();
-        let output = ChatOutput {
-            items: vec![ChatOutputItem::Message(ChatMessageItem {
-                id: None,
-                role: ChatRole::Assistant,
-                phase: None,
-                status: None,
-                parts: vec![ChatMessagePart::Media(Box::new(media.clone()))],
-                extensions: Extensions::new(),
-            })],
-            ..ChatOutput::default()
-        };
-        assert_eq!(
-            output.portable_content(),
-            vec![Content::image("image/png", vec![1, 2, 3])]
-        );
-
-        let tool_result = Content::tool_result(
-            "call_1",
-            vec![
-                Content::text("before"),
-                Content::image("image/png", vec![1]),
-                Content::pdf(vec![2]),
-            ],
-        );
-        let normalized = normalize_tool_result_media(&tool_result).unwrap();
-        assert_eq!(normalized.len(), 2);
-        assert_eq!(normalized[0].kind, MediaKind::Image);
-        assert_eq!(normalized[1].kind, MediaKind::Document);
     }
 
     /// MIME spelling/parameters, source form, filename/detail, and provider
@@ -1208,7 +1597,7 @@ mod tests {
         // MIME parameters survive (spelling may normalize, semantics must not).
         let decoded_inline = roundtrip(&inline);
         assert_eq!(decoded_inline, inline);
-        let media_type = decoded_inline.media_type.as_ref().unwrap();
+        let media_type = decoded_inline.media_type().unwrap();
         assert_eq!(media_type.type_(), "application");
         assert_eq!(media_type.subtype(), "pdf");
         assert_eq!(media_type.parameter("charset"), Some("binary"));
@@ -1218,7 +1607,7 @@ mod tests {
         // Provider reference scope is preserved exactly, including origin.
         let decoded_reference = roundtrip(&reference);
         assert_eq!(decoded_reference, reference);
-        match &decoded_reference.source {
+        match &decoded_reference.source() {
             MediaSource::ProviderFile { file_id, origin: o } => {
                 assert_eq!(file_id, "file_abc");
                 assert_eq!(o, &origin);
@@ -1226,214 +1615,48 @@ mod tests {
             other => panic!("expected provider file reference, got {other:?}"),
         }
 
-        // An unresolved provider reference does not imply renderable bytes.
-        assert!(
-            decoded_reference.portable_content().is_none(),
-            "provider file references must not fabricate portable bytes"
-        );
+        // An unresolved provider reference retains only its provider-scoped ID.
+        assert!(matches!(
+            decoded_reference.source(),
+            MediaSource::ProviderFile { .. }
+        ));
 
         // URL source form, filename, and absent MIME metadata survive as-is.
         let decoded_url = roundtrip(&url_media);
         assert_eq!(decoded_url, url_media);
-        assert!(decoded_url.media_type.is_none());
+        assert!(decoded_url.media_type().is_none());
         assert_eq!(decoded_url.filename.as_deref(), Some("pic.png"));
-        assert!(matches!(decoded_url.source, MediaSource::Url { .. }));
+        assert!(matches!(decoded_url.source(), MediaSource::Url { .. }));
     }
 
-    #[derive(Debug)]
-    struct StructuredResponse {
-        output: ChatOutput,
-    }
-    impl fmt::Display for StructuredResponse {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "structured response")
-        }
-    }
-
-    impl ChatResponse for StructuredResponse {
-        fn text(&self) -> Option<String> {
-            self.output.text()
-        }
-
-        fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-            self.output.tool_calls()
-        }
-
-        fn finish_reason(&self) -> Option<FinishReason> {
-            self.output.finish_reason
-        }
-
-        fn thinking(&self) -> Option<String> {
-            self.output.thinking()
-        }
-
-        fn usage(&self) -> Option<Usage> {
-            self.output.usage.clone()
-        }
-
-        fn output(&self) -> Option<&ChatOutput> {
-            Some(&self.output)
-        }
-    }
-
-    #[test]
-    fn portable_projection_preserves_item_order_once() {
-        let output = ChatOutput {
-            items: vec![
-                ChatOutputItem::Reasoning(ChatReasoningItem {
-                    id: None,
-                    summary: vec![ChatReasoningPart::text("reasoning")],
-                    content: Vec::new(),
-                    encrypted_content: None,
-                    signature: None,
-                    status: None,
-                    extensions: Extensions::new(),
-                }),
-                ChatOutputItem::Message(ChatMessageItem {
-                    id: None,
-                    role: ChatRole::Assistant,
-                    phase: None,
-                    status: None,
-                    parts: vec![ChatMessagePart::Text {
-                        text: "first".into(),
-                        annotations: Vec::new(),
-                        extensions: Extensions::new(),
-                    }],
-                    extensions: Extensions::new(),
-                }),
-                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
-                    item_id: Some("item_1".into()),
-                    call_id: "call_1".into(),
-                    name: "lookup".into(),
-                    arguments: "{\"query\":\"rust\"}".into(),
-                    status: None,
-                    extensions: Extensions::new(),
-                }),
-                ChatOutputItem::Message(ChatMessageItem {
-                    id: None,
-                    role: ChatRole::Assistant,
-                    phase: None,
-                    status: None,
-                    parts: vec![ChatMessagePart::Text {
-                        text: "second".into(),
-                        annotations: Vec::new(),
-                        extensions: Extensions::new(),
-                    }],
-                    extensions: Extensions::new(),
-                }),
-            ],
-            ..ChatOutput::default()
-        };
-
-        assert_eq!(
-            output.portable_content(),
-            vec![
-                Content::thinking("reasoning"),
-                Content::text("first"),
-                Content::tool_use("call_1", "lookup", serde_json::json!({"query": "rust"})),
-                Content::text("second"),
-            ]
-        );
-    }
-
-    #[test]
-    fn invalid_function_arguments_are_not_projected_as_executable_content() {
-        let output = ChatOutput {
-            items: vec![ChatOutputItem::FunctionCall(ChatFunctionCallItem {
-                item_id: None,
-                call_id: "call_invalid".into(),
-                name: "lookup".into(),
-                arguments: "{invalid".into(),
-                status: None,
-                extensions: Extensions::new(),
-            })],
-            ..ChatOutput::default()
-        };
-
-        assert!(output.portable_content().is_empty());
-        assert_eq!(
-            output.tool_calls().unwrap()[0].function.arguments,
-            "{invalid"
-        );
-    }
-
-    #[test]
-    fn normalization_prefers_authoritative_structured_output() {
-        let expected = ChatOutput {
-            response_id: Some("resp_structured".into()),
-            items: vec![ChatOutputItem::Message(ChatMessageItem {
-                id: Some("message_1".into()),
-                role: ChatRole::Assistant,
-                phase: None,
-                status: Some(ChatOutputStatus::Completed),
-                parts: vec![ChatMessagePart::Text {
-                    text: "hello".into(),
-                    annotations: Vec::new(),
-                    extensions: Extensions::new(),
-                }],
-                extensions: Extensions::new(),
-            })],
-            status: Some(ChatOutputStatus::Completed),
-            finish_reason: Some(FinishReason::Stop),
-            ..ChatOutput::default()
-        };
-        let response = StructuredResponse {
-            output: expected.clone(),
-        };
-
-        assert_eq!(normalize_chat_response(&response), expected);
-        assert_eq!(response.text().as_deref(), Some("hello"));
-    }
-
-    #[derive(Debug)]
-    struct LegacyResponse;
-
-    impl fmt::Display for LegacyResponse {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "legacy response")
-        }
-    }
-
-    impl ChatResponse for LegacyResponse {
-        fn text(&self) -> Option<String> {
-            Some("legacy text".into())
-        }
-
-        fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-            Some(vec![ToolCall {
-                id: "call_legacy".into(),
-                call_type: "function".into(),
-                function: FunctionCall {
-                    name: "legacy_tool".into(),
-                    arguments: "{\"value\":1}".into(),
-                },
-            }])
-        }
-
-        fn finish_reason(&self) -> Option<FinishReason> {
-            Some(FinishReason::ToolCalls)
-        }
-
-        fn usage(&self) -> Option<Usage> {
-            None
-        }
-    }
-
-    struct LegacyProvider;
+    struct LimitedProvider;
 
     #[async_trait]
-    impl ChatProvider for LegacyProvider {
+    impl ChatProvider for LimitedProvider {
         async fn chat_with_tools(
             &self,
             _messages: &[ChatMessage],
             _tools: Option<&[Tool]>,
-        ) -> Result<Box<dyn ChatResponse>, LLMError> {
-            Ok(Box::new(LegacyResponse))
+        ) -> Result<ChatOutput, LLMError> {
+            Ok(ChatOutput::from_projections(
+                None,
+                Some("legacy text".into()),
+                Some(vec![ToolCall {
+                    id: "call_legacy".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "legacy_tool".into(),
+                        arguments: "{\"value\":1}".into(),
+                    },
+                }]),
+                None,
+                Some(FinishReason::ToolCalls),
+            ))
         }
     }
 
     #[async_trait]
-    impl CompletionProvider for LegacyProvider {
+    impl CompletionProvider for LimitedProvider {
         async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
             Ok(CompletionResponse {
                 text: "legacy completion".into(),
@@ -1442,27 +1665,44 @@ mod tests {
     }
 
     #[async_trait]
-    impl EmbeddingProvider for LegacyProvider {
+    impl EmbeddingProvider for LimitedProvider {
         async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
             Ok(Vec::new())
         }
     }
 
-    impl crate::LLMProvider for LegacyProvider {}
+    impl crate::LLMProvider for LimitedProvider {}
 
     #[tokio::test]
     async fn legacy_provider_remains_usable_through_dyn_llm_provider() {
-        let provider: &dyn crate::LLMProvider = &LegacyProvider;
-        let response = provider.chat(&[]).await.unwrap();
+        let provider: &dyn crate::LLMProvider = &LimitedProvider;
+        let output = provider.chat(&[]).await.unwrap();
 
-        assert!(response.output().is_none());
-        let output = normalize_chat_response(response.as_ref());
-        assert_eq!(
-            output.representation,
-            ChatOutputRepresentation::LegacyProjection
-        );
+        assert!(!output.requires_item_aware_fidelity());
         assert_eq!(output.text().as_deref(), Some("legacy text"));
         assert_eq!(output.tool_calls().unwrap()[0].id, "call_legacy");
+        assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    #[test]
+    fn projections_build_limited_output_without_native_identities() {
+        let output = ChatOutput::from_projections(
+            Some("thinking".into()),
+            Some("hello".into()),
+            None,
+            Some(Usage {
+                input_tokens: 3,
+                output_tokens: 5,
+                ..Usage::default()
+            }),
+            Some(FinishReason::Stop),
+        );
+
+        assert_eq!(output.thinking().as_deref(), Some("thinking"));
+        assert_eq!(output.text().as_deref(), Some("hello"));
+        assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+        assert_eq!(output.usage.as_ref().unwrap().input_tokens, 3);
+        assert!(output.items.iter().all(|item| !item.is_native()));
     }
 
     fn reasoning_fixture(signature: Option<&str>) -> ChatReasoningItem {
@@ -1475,6 +1715,69 @@ mod tests {
             status: None,
             extensions: Extensions::new(),
         }
+    }
+
+    #[test]
+    fn executable_calls_require_completed_response() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let mut output = ChatOutput::from_projections(
+            None,
+            None,
+            Some(vec![call]),
+            None,
+            Some(FinishReason::ToolCalls),
+        );
+        output.status = Some(ChatOutputStatus::Incomplete);
+        assert!(
+            output.tool_calls().is_some(),
+            "partial calls remain inspectable"
+        );
+        assert!(output.executable_tool_calls().is_none());
+
+        output.status = Some(ChatOutputStatus::Completed);
+        assert_eq!(output.executable_tool_calls().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn portable_output_strips_native_state_but_keeps_call_identity() {
+        let output = ChatOutput {
+            response_id: Some("resp_1".into()),
+            provenance: Some(ChatOutputProvenance::default()),
+            items: vec![
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning_1".into()),
+                    summary: vec![ChatReasoningPart::text("visible")],
+                    content: Vec::new(),
+                    encrypted_content: Some("secret".into()),
+                    signature: Some("signature".into()),
+                    status: None,
+                    extensions: Extensions::new(),
+                }),
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("item_1".into()),
+                    call_id: "call_1".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                    status: Some(ChatOutputStatus::Completed),
+                    extensions: Extensions::new(),
+                }),
+            ],
+            ..ChatOutput::default()
+        }
+        .into_portable();
+
+        assert!(output.provenance.is_none());
+        assert!(!output.requires_item_aware_fidelity());
+        let call = output.function_calls().next().unwrap();
+        assert_eq!(call.call_id, "call_1");
+        assert_eq!(call.name, "lookup");
     }
 
     #[test]
@@ -1502,29 +1805,6 @@ mod tests {
             .push(ChatOutputItem::Reasoning(reasoning_fixture(Some("sig_2"))));
 
         assert_eq!(output.signature().as_deref(), Some("sig_2"));
-    }
-
-    #[test]
-    fn portable_content_optionally_preserves_reasoning_signatures() {
-        let mut output = ChatOutput::default();
-        output
-            .items
-            .push(ChatOutputItem::Reasoning(reasoning_fixture(Some("sig_1"))));
-
-        let portable = output.portable_content();
-        assert!(portable.iter().all(|block| !matches!(
-            block,
-            Content::Thinking {
-                signature: Some(_),
-                ..
-            }
-        )));
-
-        let same_origin = output.portable_content_with(true);
-        assert!(same_origin.iter().any(|block| matches!(
-            block,
-            Content::Thinking { signature: Some(sig), .. } if sig == "sig_1"
-        )));
     }
 
     /// The wire format shared by remote, plugin (Extism), and binding
@@ -1565,16 +1845,16 @@ mod tests {
                 }
             ]
         });
-        let message = crate::chat::ChatMessage {
-            role: ChatRole::Assistant,
-            content: Vec::new(),
-            cache: None,
-            output: Some(serde_json::from_value::<ChatOutput>(fixture.clone()).unwrap()),
-        };
+        let message = crate::chat::ChatMessage::from(
+            serde_json::from_value::<ChatOutput>(fixture.clone()).unwrap(),
+        );
 
         let encoded = serde_json::to_string(&message).unwrap();
         let decoded: crate::chat::ChatMessage = serde_json::from_str(&encoded).unwrap();
-        let output = decoded.output.expect("structured output survives");
+        let output = decoded
+            .output()
+            .expect("structured output survives")
+            .clone();
 
         assert_eq!(serde_json::to_value(&output).unwrap(), fixture);
         let ChatOutputItem::FunctionCall(call) = &output.items[1] else {

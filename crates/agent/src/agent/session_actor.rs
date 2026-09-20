@@ -1696,20 +1696,27 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             .await
             .map_err(FileProxyError::ReadError)?;
 
-        // Map the single Content block returned by render_read_output to the
+        // Map the single result part returned by render_read_output to the
         // appropriate ReadRemoteFileResponse variant.
         for block in blocks {
             match block {
-                querymt::chat::Content::Image { mime_type, data } => {
+                querymt::chat::ToolResultPart::Attachment(media) => {
                     return Ok(ReadRemoteFileResponse::Image {
-                        mime_type,
-                        base64_data: base64::engine::general_purpose::STANDARD.encode(&data),
+                        mime_type: media
+                            .media_type()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                        base64_data: match media.source() {
+                            querymt::chat::MediaSource::Inline { data } => {
+                                base64::engine::general_purpose::STANDARD.encode(data)
+                            }
+                            _ => String::new(),
+                        },
                     });
                 }
-                querymt::chat::Content::Text { text } => {
+                querymt::chat::ToolResultPart::Text { text } => {
                     return Ok(ReadRemoteFileResponse::Text(text));
                 }
-                _ => {}
             }
         }
 
@@ -3774,6 +3781,8 @@ mod tests {
             name: None,
             provider: "codex".to_string(),
             model: "gpt-5.4".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: Some(serde_json::json!({
                 "reasoning_effort": "medium"
             })),
@@ -3824,6 +3833,8 @@ mod tests {
                     name: None,
                     provider: "codex".to_string(),
                     model: "gpt-5.4".to_string(),
+                    protocol: String::new(),
+                    endpoint: String::new(),
                     params: Some(serde_json::json!({"reasoning_effort": "high"})),
                     created_at: Some(time::OffsetDateTime::now_utc()),
                     updated_at: Some(time::OffsetDateTime::now_utc()),

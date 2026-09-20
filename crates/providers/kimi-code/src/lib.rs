@@ -11,7 +11,7 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, Content, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -179,7 +179,7 @@ impl HTTPChatProvider for KimiCode {
         Ok(request)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 
@@ -268,26 +268,34 @@ impl KimiCode {
         let mut normalized = Vec::with_capacity(messages.len());
 
         for message in messages {
-            if message.content.iter().any(Content::is_tool_result) {
-                let mut tool_results = message.clone();
-                let supplemental = tool_results
-                    .content
-                    .iter()
-                    .filter(|block| !block.is_tool_result())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                tool_results.content.retain(Content::is_tool_result);
-                let role = tool_results.role.clone();
-                let cache = tool_results.cache.clone();
+            let parts = message.input_parts();
+            if parts.iter().any(|part| part.is_tool_result()) {
+                // Tool-result messages are split: the results stay on the original
+                // message, and any supplemental text becomes a following message.
+                let mut tool_results = ChatMessage::user();
+                if let Some(cache) = message.cache.clone() {
+                    tool_results = tool_results.cache(cache.clone());
+                }
+                let mut supplemental = ChatMessage::user();
+                if let Some(cache) = message.cache.clone() {
+                    supplemental = supplemental.cache(cache);
+                }
+
+                for part in parts {
+                    if part.is_tool_result() {
+                        tool_results = tool_results.part(part);
+                    } else {
+                        supplemental = supplemental.part(part);
+                    }
+                }
+
+                let tool_results = tool_results.build();
+                let supplemental = supplemental.build();
+                let has_supplemental = !supplemental.input_parts().is_empty();
                 normalized.push(tool_results);
 
-                if !supplemental.is_empty() {
-                    normalized.push(ChatMessage {
-                        role,
-                        content: supplemental,
-                        cache,
-                        output: None,
-                    });
+                if has_supplemental {
+                    normalized.push(supplemental);
                 }
             } else {
                 normalized.push(message.clone());
@@ -465,7 +473,7 @@ mod tests {
 
     #[test]
     fn stream_request_emits_context_after_tool_response_batch() {
-        use querymt::chat::Content;
+        use querymt::chat::ToolResultPart;
 
         let provider = test_provider();
         let messages = vec![
@@ -477,7 +485,7 @@ mod tests {
                     "call_1".to_string(),
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("specs.md")],
+                    vec![ToolResultPart::text("specs.md")],
                 )
                 .text("<run-objective>Collect benchmark data</run-objective>")
                 .build(),
@@ -502,7 +510,7 @@ mod tests {
 
     #[test]
     fn non_stream_request_emits_context_after_tool_response_batch() {
-        use querymt::chat::Content;
+        use querymt::chat::ToolResultPart;
 
         let provider = test_provider();
         let messages = vec![
@@ -514,7 +522,7 @@ mod tests {
                     "call_1".to_string(),
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("specs.md")],
+                    vec![ToolResultPart::text("specs.md")],
                 )
                 .text("<run-objective>Collect benchmark data</run-objective>")
                 .build(),
@@ -815,7 +823,7 @@ mod tests {
 
     #[test]
     fn streaming_tool_call_id_is_stable_across_response_and_replay() {
-        use querymt::chat::{Content, StreamChunk};
+        use querymt::chat::{StreamChunk, ToolResultPart};
 
         let provider = test_provider();
         let mut parser = provider
@@ -859,7 +867,7 @@ mod tests {
                     complete.id,
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("specs.md")],
+                    vec![ToolResultPart::text("specs.md")],
                 )
                 .build(),
         ];
@@ -880,7 +888,7 @@ mod tests {
 
     #[test]
     fn missing_tool_call_id_is_stable_across_response_and_replay() {
-        use querymt::chat::{Content, StreamChunk};
+        use querymt::chat::{StreamChunk, ToolResultPart};
 
         let provider = test_provider();
         let mut parser = provider
@@ -924,7 +932,7 @@ mod tests {
                     complete.id,
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("specs.md")],
+                    vec![ToolResultPart::text("specs.md")],
                 )
                 .build(),
         ];
@@ -939,7 +947,7 @@ mod tests {
 
     #[test]
     fn replay_preserves_existing_opaque_tool_call_ids() {
-        use querymt::chat::Content;
+        use querymt::chat::ToolResultPart;
 
         let provider = test_provider();
         let opaque_id = "tool_LUbH2dHPwNU9pt1GrIYrywKV";
@@ -952,7 +960,7 @@ mod tests {
                     opaque_id.to_string(),
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("specs.md")],
+                    vec![ToolResultPart::text("specs.md")],
                 )
                 .build(),
         ];
@@ -967,7 +975,7 @@ mod tests {
 
     #[test]
     fn replay_preserves_multiple_tool_call_ids_and_result_order() {
-        use querymt::chat::Content;
+        use querymt::chat::ToolResultPart;
 
         let provider = test_provider();
         let messages = vec![
@@ -981,19 +989,19 @@ mod tests {
                     "opaque-read".to_string(),
                     Some("read_tool".to_string()),
                     false,
-                    vec![Content::text("a")],
+                    vec![ToolResultPart::text("a")],
                 )
                 .tool_result(
                     "opaque-ls-2".to_string(),
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("src/lib.rs")],
+                    vec![ToolResultPart::text("src/lib.rs")],
                 )
                 .tool_result(
                     "opaque-ls-1".to_string(),
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("a")],
+                    vec![ToolResultPart::text("a")],
                 )
                 .build(),
         ];

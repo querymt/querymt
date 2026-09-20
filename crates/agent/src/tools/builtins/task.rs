@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 use crate::session::domain::{TaskKind, TaskStatus};
@@ -17,13 +17,13 @@ fn service(context: &dyn ToolContext) -> Result<crate::session::TaskService, Too
 fn task_content(
     task: &crate::session::domain::Task,
     current: bool,
-) -> Result<Vec<Content>, ToolError> {
+) -> Result<Vec<ToolResultPart>, ToolError> {
     let mut value =
         serde_json::to_value(task).map_err(|error| ToolError::SessionError(error.to_string()))?;
     value["current_task"] = Value::Bool(current);
-    Ok(vec![Content::text(
+    Ok(vec![ToolResultPart::text(
         serde_json::to_string_pretty(&value)
-            .map_err(|error| ToolError::SessionError(error.to_string()))?,
+            .map_err(|error| ToolError::SessionError(error.to_string()))?
     )])
 }
 
@@ -62,7 +62,7 @@ impl ToolTrait for ReadTaskTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let requested_id = args.get("task_id").and_then(Value::as_str);
         let task = service(context)?
             .read(requested_id)
@@ -124,7 +124,7 @@ impl ToolTrait for UpdateTaskTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let task_id = args
             .get("task_id")
             .and_then(Value::as_str)
@@ -184,7 +184,7 @@ impl ToolTrait for UpdateTaskTool {
             .await
             .map_err(|error| ToolError::SessionError(error.to_string()))?;
         if task.revision == expected_revision {
-            return Ok(vec![Content::text(format!(
+            return Ok(vec![ToolResultPart::text(format!(
                 "Task unchanged; no revision was created. Current task state:\n{}",
                 serde_json::to_string_pretty(&task)
                     .map_err(|error| ToolError::Other(error.into()))?
@@ -244,7 +244,7 @@ impl ToolTrait for CompleteTaskTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let task_id = args
             .get("task_id")
             .and_then(Value::as_str)

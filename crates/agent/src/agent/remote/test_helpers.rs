@@ -23,7 +23,7 @@ pub(crate) mod fixtures {
     use kameo::actor::{ActorRef, Spawn};
     use querymt::LLMParams;
     use querymt::LLMProvider;
-    use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk, Tool};
+    use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
     use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
@@ -214,7 +214,7 @@ pub(crate) mod fixtures {
         }
     }
 
-    /// Concrete `ChatResponse` returned by `MockLLMProvider`.
+    /// Concrete projection source returned by `MockLLMProvider`.
     #[derive(Debug)]
     pub struct MockChatResp {
         pub text: String,
@@ -227,21 +227,15 @@ pub(crate) mod fixtures {
         }
     }
 
-    impl ChatResponse for MockChatResp {
-        fn text(&self) -> Option<String> {
-            Some(self.text.clone())
-        }
-        fn thinking(&self) -> Option<String> {
-            None
-        }
-        fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
-            None
-        }
-        fn finish_reason(&self) -> Option<FinishReason> {
-            Some(self.finish)
-        }
-        fn usage(&self) -> Option<querymt::Usage> {
-            None
+    impl From<MockChatResp> for ChatOutput {
+        fn from(response: MockChatResp) -> Self {
+            ChatOutput::from_projections(
+                None,
+                Some(response.text.clone()),
+                None,
+                None,
+                Some(response.finish),
+            )
         }
     }
 
@@ -251,13 +245,14 @@ pub(crate) mod fixtures {
             &self,
             _messages: &[ChatMessage],
             _tools: Option<&[Tool]>,
-        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        ) -> Result<ChatOutput, LLMError> {
             let mut count = self.call_count.lock().await;
             *count += 1;
-            Ok(Box::new(MockChatResp {
+            Ok(MockChatResp {
                 text: self.response_text.clone(),
                 finish: FinishReason::Stop,
-            }))
+            }
+            .into())
         }
 
         async fn chat_stream_with_tools(

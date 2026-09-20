@@ -10,7 +10,7 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider, ToolCall,
     chat::{
-        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -179,7 +179,7 @@ impl HTTPChatProvider for Groq {
         openai_chat_request(&cfg, messages, tools)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 

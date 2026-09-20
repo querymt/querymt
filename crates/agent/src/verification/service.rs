@@ -30,10 +30,10 @@ impl VerificationService {
         Self { tool_registry }
     }
 
-    fn parse_text_only_result(content: &[querymt::chat::Content]) -> Option<Value> {
+    fn parse_text_only_result(content: &[querymt::chat::ToolResultPart]) -> Option<Value> {
         if !content
             .iter()
-            .all(|block| matches!(block, querymt::chat::Content::Text { .. }))
+            .all(|block| matches!(block, querymt::chat::ToolResultPart::Text { .. }))
         {
             return None;
         }
@@ -41,7 +41,7 @@ impl VerificationService {
         let result_text = content
             .iter()
             .filter_map(|block| match block {
-                querymt::chat::Content::Text { text } => Some(text.as_str()),
+                querymt::chat::ToolResultPart::Text { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -50,73 +50,38 @@ impl VerificationService {
         Some(serde_json::from_str(&result_text).unwrap_or(Value::String(result_text)))
     }
 
-    fn content_block_to_value(block: &querymt::chat::Content) -> Value {
+    fn content_block_to_value(block: &querymt::chat::ToolResultPart) -> Value {
         match block {
-            querymt::chat::Content::Text { text } => serde_json::json!({
+            querymt::chat::ToolResultPart::Text { text } => serde_json::json!({
                 "type": "text",
                 "text": text,
             }),
-            querymt::chat::Content::Image { mime_type, data } => serde_json::json!({
-                "type": "image",
-                "mime_type": mime_type,
-                "byte_len": data.len(),
-            }),
-            querymt::chat::Content::ImageUrl { url } => serde_json::json!({
-                "type": "image_url",
-                "url": url,
-            }),
-            querymt::chat::Content::Pdf { data } => serde_json::json!({
-                "type": "pdf",
-                "byte_len": data.len(),
-            }),
-            querymt::chat::Content::Audio { mime_type, data } => serde_json::json!({
-                "type": "audio",
-                "mime_type": mime_type,
-                "byte_len": data.len(),
-            }),
-            querymt::chat::Content::Thinking { text, signature } => serde_json::json!({
-                "type": "thinking",
-                "text": text,
-                "signature": signature,
-            }),
-            querymt::chat::Content::ToolUse {
-                id,
-                name,
-                arguments,
-            } => serde_json::json!({
-                "type": "tool_use",
-                "id": id,
-                "name": name,
-                "arguments": arguments,
-            }),
-            querymt::chat::Content::ToolResult {
-                id,
-                name,
-                is_error,
-                content,
-            } => serde_json::json!({
-                "type": "tool_result",
-                "id": id,
-                "name": name,
-                "is_error": is_error,
-                "content": content.iter().map(Self::content_block_to_value).collect::<Vec<_>>(),
-            }),
-            querymt::chat::Content::ResourceLink {
-                uri,
-                name,
-                description,
-                mime_type,
-            } => serde_json::json!({
-                "type": "resource_link",
-                "uri": uri,
-                "name": name,
-                "description": description,
-                "mime_type": mime_type,
-            }),
+            querymt::chat::ToolResultPart::Attachment(media) => Self::media_part_to_value(media),
         }
     }
 
-    fn tool_output_to_value(content: Vec<querymt::chat::Content>) -> Value {
+    fn media_part_to_value(media: &querymt::chat::MediaPart) -> Value {
+        let mime_type = media.media_type().map(ToString::to_string);
+        let (source_type, byte_len, reference) = match media.source() {
+            querymt::chat::MediaSource::Inline { data } => ("inline", Some(data.len()), None),
+            querymt::chat::MediaSource::DataUrl { url } => ("data_url", None, Some(url.as_str())),
+            querymt::chat::MediaSource::Url { url } => ("url", None, Some(url.as_str())),
+            querymt::chat::MediaSource::ProviderFile { file_id, .. } => {
+                ("provider_file", None, Some(file_id.as_str()))
+            }
+        };
+        serde_json::json!({
+            "type": "attachment",
+            "kind": media.kind,
+            "mime_type": mime_type,
+            "source": source_type,
+            "byte_len": byte_len,
+            "reference": reference,
+            "filename": media.filename,
+        })
+    }
+
+    fn tool_output_to_value(content: Vec<querymt::chat::ToolResultPart>) -> Value {
         if let Some(text_only_value) = Self::parse_text_only_result(&content) {
             return text_only_value;
         }
@@ -431,12 +396,12 @@ mod tests {
     use crate::verification::{
         Expectation, VerificationSpec, VerificationStep, VerificationStrategy,
     };
-    use querymt::chat::{Content, Tool as ChatTool};
+    use querymt::chat::{Tool as ChatTool, ToolResultPart};
     use std::borrow::Cow;
     use std::path::PathBuf;
 
     struct MockVerificationTool {
-        result: Vec<Content>,
+        result: Vec<ToolResultPart>,
     }
 
     #[async_trait::async_trait]
@@ -465,7 +430,7 @@ mod tests {
             &self,
             _args: Value,
             _context: &dyn ToolContext,
-        ) -> Result<Vec<Content>, ToolError> {
+        ) -> Result<Vec<ToolResultPart>, ToolError> {
             Ok(self.result.clone())
         }
     }
@@ -695,10 +660,21 @@ mod tests {
 
     // ── VerificationService — tool output serialization ─────────────────────
 
+    /// Build a validated inline image result part for tests.
+    fn image_result_part(mime: &str, data: Vec<u8>) -> ToolResultPart {
+        let media = querymt::chat::MediaPart::new(
+            querymt::chat::MediaKind::Image,
+            mime.parse().ok(),
+            querymt::chat::MediaSource::Inline { data },
+        )
+        .expect("valid inline image media");
+        ToolResultPart::attachment(media)
+    }
+
     #[tokio::test]
     async fn test_tool_verification_json_matches_image_only_output() {
         let tool: Arc<dyn Tool> = Arc::new(MockVerificationTool {
-            result: vec![Content::image("image/png", vec![0u8; 4])],
+            result: vec![image_result_part("image/png", vec![0u8; 4])],
         });
         let service = make_service_with_tool(tool.clone());
         let ctx = make_context_with_tool(tool, None);
@@ -710,9 +686,13 @@ mod tests {
                 expectation: Expectation::JsonMatches(serde_json::json!({
                     "content": [
                         {
-                            "type": "image",
+                            "type": "attachment",
+                            "kind": "image",
                             "mime_type": "image/png",
-                            "byte_len": 4
+                            "source": "inline",
+                            "byte_len": 4,
+                            "reference": null,
+                            "filename": null
                         }
                     ]
                 })),
@@ -731,7 +711,7 @@ mod tests {
     #[tokio::test]
     async fn test_tool_verification_contains_can_see_image_metadata() {
         let tool: Arc<dyn Tool> = Arc::new(MockVerificationTool {
-            result: vec![Content::image("image/png", vec![0u8; 4])],
+            result: vec![image_result_part("image/png", vec![0u8; 4])],
         });
         let service = make_service_with_tool(tool.clone());
         let ctx = make_context_with_tool(tool, None);
@@ -757,8 +737,8 @@ mod tests {
     async fn test_tool_verification_json_matches_mixed_text_and_image_output() {
         let tool: Arc<dyn Tool> = Arc::new(MockVerificationTool {
             result: vec![
-                Content::text("hello"),
-                Content::image("image/png", vec![0u8; 4]),
+                ToolResultPart::text("hello"),
+                image_result_part("image/png", vec![0u8; 4]),
             ],
         });
         let service = make_service_with_tool(tool.clone());
@@ -775,9 +755,13 @@ mod tests {
                             "text": "hello"
                         },
                         {
-                            "type": "image",
+                            "type": "attachment",
+                            "kind": "image",
                             "mime_type": "image/png",
-                            "byte_len": 4
+                            "source": "inline",
+                            "byte_len": 4,
+                            "reference": null,
+                            "filename": null
                         }
                     ]
                 })),
@@ -795,7 +779,7 @@ mod tests {
 
     #[test]
     fn test_tool_output_to_value_preserves_text_only_json_parsing() {
-        let value = VerificationService::tool_output_to_value(vec![Content::text(
+        let value = VerificationService::tool_output_to_value(vec![ToolResultPart::text(
             r#"{"exit_code":0,"stdout":"ok"}"#,
         )]);
 

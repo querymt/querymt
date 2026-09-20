@@ -251,10 +251,7 @@ fn render_template(
     );
     let add_generation_prompt = messages.last().map_or(true, |msg| {
         msg.role == querymt::chat::ChatRole::User
-            || msg
-                .content
-                .iter()
-                .any(|block| matches!(block, querymt::chat::Content::ToolResult { .. }))
+            || msg.has_tool_result()
     });
     let context = ChatTemplateContext {
         messages: messages_value,

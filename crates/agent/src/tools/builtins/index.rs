@@ -5,7 +5,7 @@
 //! with `read_tool`.
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 use crate::index::outline_index::common::get_language_for_extension;
@@ -82,7 +82,7 @@ impl ToolTrait for IndexTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let path_str = args
             .get("path")
             .and_then(Value::as_str)
@@ -164,7 +164,7 @@ impl ToolTrait for IndexTool {
         let display_path = target.to_string_lossy().to_string();
         let output = format_outline(&display_path, language, &sections);
 
-        Ok(vec![Content::Text { text: output }])
+        Ok(vec![ToolResultPart::Text { text: output }])
     }
 }
 
@@ -175,13 +175,13 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    fn first_text(blocks: &[Content]) -> &str {
+    fn first_text(blocks: &[ToolResultPart]) -> &str {
         for b in blocks {
-            if let Content::Text { text } = b {
+            if let ToolResultPart::Text { text } = b {
                 return text.as_str();
             }
         }
-        panic!("no Content::Text block found");
+        panic!("no ToolResultPart::Text block found");
     }
 
     #[tokio::test]

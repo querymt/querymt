@@ -46,8 +46,8 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
-        StructuredOutputFormat, Tool, ToolChoice,
+        ChatInputPart, ChatMessage, ChatOutput, ChatOutputItem, ChatRole, FinishReason,
+        MediaSource, ReasoningEffort, StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -148,7 +148,7 @@ struct GoogleSystemInstruction<'a> {
 struct GoogleContentPart<'a> {
     /// The actual text content
     #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
+    text: Option<std::borrow::Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inline_data: Option<GoogleInlineData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,9 +162,9 @@ struct GoogleContentPart<'a> {
 }
 
 impl<'a> GoogleContentPart<'a> {
-    fn text(text: &'a str) -> Self {
+    fn text(text: impl Into<std::borrow::Cow<'a, str>>) -> Self {
         Self {
-            text: Some(text),
+            text: Some(text.into()),
             inline_data: None,
             function_call: None,
             function_response: None,
@@ -173,9 +173,9 @@ impl<'a> GoogleContentPart<'a> {
         }
     }
 
-    fn thought(text: &'a str) -> Self {
+    fn thought(text: impl Into<std::borrow::Cow<'a, str>>) -> Self {
         Self {
-            text: Some(text),
+            text: Some(text.into()),
             inline_data: None,
             function_call: None,
             function_response: None,
@@ -274,7 +274,7 @@ struct GoogleChatResponse {
 
 impl std::fmt::Display for GoogleChatResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.text(), self.tool_calls()) {
+        match (self.text_projection(), self.tool_calls_projection()) {
             (Some(text), Some(tool_calls)) => {
                 for call in tool_calls {
                     write!(f, "{:?}", call)?;
@@ -320,8 +320,8 @@ struct GoogleResponseContent {
     function_calls: Option<Vec<GoogleFunctionCall>>,
 }
 
-impl ChatResponse for GoogleChatResponse {
-    fn text(&self) -> Option<String> {
+impl GoogleChatResponse {
+    fn text_projection(&self) -> Option<String> {
         self.candidates.first().map(|c| {
             c.content
                 .parts
@@ -332,7 +332,7 @@ impl ChatResponse for GoogleChatResponse {
         })
     }
 
-    fn thinking(&self) -> Option<String> {
+    fn thinking_projection(&self) -> Option<String> {
         self.candidates.first().and_then(|c| {
             let thoughts: String = c
                 .content
@@ -349,7 +349,7 @@ impl ChatResponse for GoogleChatResponse {
         })
     }
 
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+    fn tool_calls_projection(&self) -> Option<Vec<ToolCall>> {
         self.candidates.first().and_then(|c| {
             // First check for function calls at the part level (new API format)
             let part_function_calls: Vec<ToolCall> = c
@@ -416,12 +416,8 @@ impl ChatResponse for GoogleChatResponse {
         })
     }
 
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
-    }
-
-    fn finish_reason(&self) -> Option<FinishReason> {
-        if self.tool_calls().is_some() {
+    fn finish_reason_projection(&self) -> Option<FinishReason> {
+        if self.tool_calls_projection().is_some() {
             return Some(FinishReason::ToolCalls);
         }
 
@@ -447,6 +443,18 @@ impl ChatResponse for GoogleChatResponse {
             Some("FINISH_REASON_UNSPECIFIED") => Some(FinishReason::Unknown),
             _ => None,
         }
+    }
+}
+
+impl From<GoogleChatResponse> for ChatOutput {
+    fn from(response: GoogleChatResponse) -> Self {
+        let text = response.text_projection();
+        let thinking = response.thinking_projection();
+        let tool_calls = response.tool_calls_projection();
+        let usage = response.usage.clone();
+        let finish_reason = response.finish_reason_projection();
+
+        ChatOutput::from_projections(thinking, text, tool_calls, usage, finish_reason)
     }
 }
 
@@ -740,7 +748,8 @@ impl HTTPChatProvider for Google {
         }
 
         for msg in messages {
-            let has_tool_result = msg.content.iter().any(|b| b.is_tool_result());
+            let parts = msg.input_parts();
+            let has_tool_result = parts.iter().any(ChatInputPart::is_tool_result);
             let role = if has_tool_result {
                 "function"
             } else {
@@ -750,79 +759,85 @@ impl HTTPChatProvider for Google {
                 }
             };
 
-            let mut parts = Vec::new();
+            let mut google_parts = Vec::new();
 
-            for block in &msg.content {
-                match block {
-                    Content::Text { text } => {
+            // Replay generated function calls / reasoning from structured output.
+            if let Some(output) = msg.output() {
+                for item in &output.items {
+                    match item {
+                        ChatOutputItem::FunctionCall(call) => {
+                            // Preserve the provider signature encoded in the call ID.
+                            let expected_prefix = format!("call_{}:", call.name);
+                            let signature = call
+                                .call_id
+                                .strip_prefix(&expected_prefix)
+                                .map(str::to_string);
+                            let arguments = call.parse_arguments().unwrap_or(Value::Null);
+                            google_parts.push(GoogleContentPart::function_call(
+                                call.name.clone(),
+                                arguments,
+                                signature,
+                            ));
+                        }
+                        ChatOutputItem::Reasoning(reasoning) => {
+                            for part in reasoning.summary.iter().chain(&reasoning.content) {
+                                if !part.text.is_empty() {
+                                    google_parts.push(GoogleContentPart::thought(&part.text));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Canonical input parts are consumed directly; text parts own their
+            // strings so the borrowed Google parts below stay valid.
+            for part in &parts {
+                match part {
+                    ChatInputPart::Text { text } => {
                         if !text.is_empty() {
-                            parts.push(GoogleContentPart::text(text));
+                            google_parts.push(GoogleContentPart::text(text.clone()));
                         }
                     }
-                    Content::Thinking { text, .. } => {
-                        if !text.is_empty() {
-                            parts.push(GoogleContentPart::thought(text));
+                    ChatInputPart::Attachment(media) => match media.source() {
+                        MediaSource::Inline { data } => {
+                            if let Some(media_type) = media.media_type() {
+                                google_parts.push(GoogleContentPart::inline_data(
+                                    media_type.to_string(),
+                                    BASE64.encode(data),
+                                ));
+                            }
                         }
-                    }
-                    Content::Image { mime_type, data } => {
-                        parts.push(GoogleContentPart::inline_data(
-                            mime_type.clone(),
-                            BASE64.encode(data),
-                        ));
-                    }
-                    Content::Pdf { data } => {
-                        parts.push(GoogleContentPart::inline_data(
-                            "application/pdf".to_string(),
-                            BASE64.encode(data),
-                        ));
-                    }
-                    Content::ImageUrl { url } => {
-                        // Google input parts do not expose a direct image URL field,
-                        // so preserve the reference as text.
-                        parts.push(GoogleContentPart::text(url));
-                    }
-                    Content::ToolUse {
-                        id,
-                        name,
-                        arguments,
-                    } => {
-                        let expected_prefix = format!("call_{}:", name);
-                        let signature = if id.starts_with(&expected_prefix) {
-                            Some(id[expected_prefix.len()..].to_string())
-                        } else {
-                            None
-                        };
-                        parts.push(GoogleContentPart::function_call(
-                            name.clone(),
-                            arguments.clone(),
-                            signature,
-                        ));
-                    }
-                    Content::ToolResult {
-                        id, name, content, ..
-                    } => {
-                        let text = content
-                            .iter()
-                            .filter_map(|c| c.as_text())
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        MediaSource::DataUrl { url } | MediaSource::Url { url } => {
+                            // Google input parts do not expose a direct image URL
+                            // field, so preserve the reference as text.
+                            google_parts.push(GoogleContentPart::text(url.clone()));
+                        }
+                        MediaSource::ProviderFile { .. } => {}
+                    },
+                    ChatInputPart::ToolResult(result) => {
+                        let text = result.text_content();
                         let payload = if text.is_empty() {
                             Value::Null
                         } else {
                             Value::String(text)
                         };
-                        parts.push(GoogleContentPart::function_response(
-                            name.clone().unwrap_or_else(|| id.clone()),
+                        google_parts.push(GoogleContentPart::function_response(
+                            result
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| result.call_id.clone()),
                             payload,
                         ));
-                    }
-                    Content::Audio { .. } | Content::ResourceLink { .. } => {
-                        // Unsupported in Google request format today.
                     }
                 }
             }
 
-            chat_contents.push(GoogleChatContent { role, parts });
+            chat_contents.push(GoogleChatContent {
+                role,
+                parts: google_parts,
+            });
         }
 
         // Add system message if present
@@ -918,7 +933,7 @@ impl HTTPChatProvider for Google {
         cfg.chat_request(messages, tools)
     }
 
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         debug_assert!(
             resp.status().is_success(),
             "parse_chat is success-only; adapter must classify non-success first"
@@ -928,7 +943,7 @@ impl HTTPChatProvider for Google {
             serde_json::from_slice(resp.body());
 
         match json_resp {
-            Ok(response) => Ok(Box::new(response)),
+            Ok(response) => Ok(response.into()),
             Err(e) => {
                 // Return a more descriptive error with the raw response
                 Err(LLMError::ResponseFormatError {

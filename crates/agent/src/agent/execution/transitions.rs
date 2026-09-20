@@ -24,9 +24,9 @@ use futures_util::future::join_all;
 use log::{debug, trace, warn};
 use querymt::ToolCall;
 use querymt::chat::{
-    CacheHint, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputRepresentation,
-    ChatOutputStatus, ChatRole, ChatStreamAccumulator, ChatStreamAccumulatorError, FinishReason,
-    StreamChunk, StructuredStreamEvent, normalize_chat_response,
+    CacheHint, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputStatus, ChatRole,
+    ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, FinishReason, StreamChunk,
+    StructuredStreamEvent,
 };
 use querymt::error::LLMError;
 use querymt::error::{ProviderErrorKind, ProviderFailure};
@@ -124,12 +124,10 @@ pub(super) async fn transition_before_llm_call(
     }
 
     let mut messages = context.request_messages();
-    let trigger = if messages.last().is_some_and(|message| {
-        message
-            .content
-            .iter()
-            .any(querymt::chat::Content::is_tool_result)
-    }) {
+    let trigger = if messages
+        .last()
+        .is_some_and(|message| message.has_tool_result())
+    {
         "after_tool_batch"
     } else {
         "user_prompt"
@@ -360,9 +358,10 @@ fn gate_function_calls_for_execution(
             );
             gated_results.push(ToolResult::new(
                 call.id.clone(),
-                vec![querymt::chat::Content::text(
-                    "Error: function call arguments are not a valid JSON object; the call was not executed.",
-                )],
+                vec![querymt::chat::ToolResultPart::Text {
+                    text: "Error: function call arguments are not a valid JSON object; the call was not executed."
+                        .to_string(),
+                }],
                 true,
                 Some(call.function.name.clone()),
                 Some(call.function.arguments.clone()),
@@ -455,7 +454,7 @@ pub(super) async fn transition_call_llm(
             Err(e) => return map_failed_llm_call(e, false, context),
         };
 
-        normalize_chat_response(resp.as_ref())
+        resp
     } else {
         let provider = match super::llm_retry::call_with_retry(
             config,
@@ -492,12 +491,6 @@ pub(super) async fn transition_call_llm(
 
             let max_stream_retries = config.execution_policy.rate_limit.max_stream_retries;
 
-            // Shared accumulator: selects structured mode when structured
-            // metadata appears before semantic output; legacy chunks synthesize
-            // a limited projection otherwise. Canonical history comes from this
-            // accumulator alone — legacy projection chunks accompanying
-            // structured events never duplicate items.
-            let mut accumulator = ChatStreamAccumulator::new();
             // Usage events that arrive after the terminal chunk bypass the
             // accumulator (which rejects post-terminal events) and are merged
             // into the attempt output afterwards.
@@ -569,8 +562,12 @@ pub(super) async fn transition_call_llm(
             let streamed_output: ChatOutput = 'stream: loop {
                 let mut semantic_output_seen = false;
 
-                // Reset attempt-local accumulation on retry so attempts never mix.
-                accumulator.reset_attempt();
+                // Attempt-local accumulator: selects structured mode when
+                // structured metadata appears before semantic output; legacy
+                // chunks synthesize a limited projection otherwise. This is
+                // recreated per attempt (and consumed by finalization) so retries
+                // never mix partial items.
+                let mut accumulator = ChatStreamAccumulator::new();
                 #[allow(unused_assignments)]
                 {
                     drained_usage = None;
@@ -841,20 +838,19 @@ pub(super) async fn transition_call_llm(
                 // the response is considered successful; unfinished items or
                 // calls are attempt failures and never dispatch tools.
                 match accumulator.finish() {
-                    Ok(output) => {
+                    ChatStreamFinish::Completed(output) => {
                         break 'stream merge_drained_usage(output, drained_usage.take());
                     }
-                    Err(ChatStreamAccumulatorError::IncompleteResponse(detail)) => {
+                    ChatStreamFinish::Incomplete { output, detail } => {
                         warn!(
                             "Provider reported incomplete response: session={} message_id={} detail={:?}",
                             session_id, message_id, detail
                         );
                         // Preserve partial output and the terminal status; the
                         // incomplete cause is handled downstream without retries.
-                        let partial = accumulator.output();
-                        break 'stream merge_drained_usage(partial, drained_usage.take());
+                        break 'stream merge_drained_usage(output, drained_usage.take());
                     }
-                    Err(error) => {
+                    ChatStreamFinish::Failed { error, .. } => {
                         debug!(
                             "Stream failed terminal validation: session={} message_id={} error={}",
                             session_id, message_id, error
@@ -884,6 +880,11 @@ pub(super) async fn transition_call_llm(
 
             // Final flush of any remaining buffered content (no timer reset needed)
             flush_buffers!(false);
+            let structured_stream = streamed_output.provenance.is_some()
+                || streamed_output
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, querymt::chat::ChatOutputItem::Opaque(_)));
             debug!(
                 "stream finished: session={} message_id={} final_text_len={:?} final_thinking_len={:?} tool_calls={} structured={}",
                 session_id,
@@ -894,7 +895,7 @@ pub(super) async fn transition_call_llm(
                     .tool_calls()
                     .map(|calls| calls.len())
                     .unwrap_or(0),
-                accumulator.is_structured(),
+                structured_stream,
             );
 
             // The streaming loop exits via a terminal chunk, which bypasses the
@@ -936,7 +937,7 @@ pub(super) async fn transition_call_llm(
                 Err(e) => return map_failed_llm_call(e, false, context),
             };
 
-            normalize_chat_response(resp.as_ref())
+            resp
         }
     };
 
@@ -1081,11 +1082,7 @@ pub(super) async fn transition_after_llm(
         AgentEventKind::ProgressRecorded { progress_entry },
     );
 
-    let structured_output = response
-        .output
-        .as_ref()
-        .filter(|output| output.representation == ChatOutputRepresentation::Structured)
-        .cloned();
+    let structured_output = response.output.clone();
 
     let mut parts = Vec::new();
 
@@ -1103,8 +1100,15 @@ pub(super) async fn transition_after_llm(
             && !thinking.is_empty()
         {
             parts.push(MessagePart::Reasoning {
-                content: thinking.clone(),
-                signature: response.thinking_signature.clone(),
+                item: querymt::chat::ChatReasoningItem {
+                    id: None,
+                    summary: Vec::new(),
+                    content: vec![querymt::chat::ChatReasoningPart::text(thinking.clone())],
+                    encrypted_content: None,
+                    signature: response.thinking_signature.clone(),
+                    status: None,
+                    extensions: Default::default(),
+                },
                 time_ms: None,
             });
         }
@@ -1218,20 +1222,21 @@ pub(super) async fn transition_after_llm(
             .as_ref()
             .map(|_| "response is incomplete".to_string())
             .unwrap_or_default();
-        let skipped: Vec<ToolResult> = std::mem::take(&mut executable_calls)
-            .into_iter()
-            .map(|call| {
-                ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::Content::text(format!(
+        let skipped: Vec<ToolResult> =
+            std::mem::take(&mut executable_calls)
+                .into_iter()
+                .map(|call| {
+                    ToolResult::new(
+                        call.id.clone(),
+                        vec![querymt::chat::ToolResultPart::Text { text: format!(
                         "Error: tool call skipped because the response was incomplete. {detail}"
-                    ))],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                )
-            })
-            .collect();
+                    ).to_string() }],
+                        true,
+                        Some(call.function.name.clone()),
+                        Some(call.function.arguments.clone()),
+                    )
+                })
+                .collect();
         gated_results.extend(skipped);
 
         if gated_results.is_empty() {
@@ -1422,7 +1427,7 @@ pub(super) async fn transition_processing_tool_calls(
                             ) => result,
                             _ = cancel.cancelled() => Ok(ToolResult::new(
                                 call.id.clone(),
-                                vec![querymt::chat::Content::text("Error: Cancelled by user")],
+                                vec![querymt::chat::ToolResultPart::Text { text: "Error: Cancelled by user".to_string() }],
                                 true,
                                 Some(call.function.name.clone()),
                                 Some(call.function.arguments.clone()),
@@ -1439,9 +1444,10 @@ pub(super) async fn transition_processing_tool_calls(
                         Ok(tool_result) => all_results.push(tool_result),
                         Err(error) => all_results.push(ToolResult::new(
                             call.id.clone(),
-                            vec![querymt::chat::Content::text(format!(
-                                "Error: internal tool execution failed: {error}"
-                            ))],
+                            vec![querymt::chat::ToolResultPart::Text {
+                                text: format!("Error: internal tool execution failed: {error}")
+                                    .to_string(),
+                            }],
                             true,
                             Some(call.function.name.clone()),
                             Some(call.function.arguments.clone()),
@@ -1516,9 +1522,9 @@ pub(super) async fn transition_processing_tool_calls(
                 }
                 Err(error) => all_results.push(ToolResult::new(
                     call.id.clone(),
-                    vec![querymt::chat::Content::text(format!(
-                        "Error: internal tool execution failed: {error}"
-                    ))],
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: format!("Error: internal tool execution failed: {error}").to_string(),
+                    }],
                     true,
                     Some(call.function.name.clone()),
                     Some(call.function.arguments.clone()),
@@ -1543,7 +1549,9 @@ pub(super) async fn transition_processing_tool_calls(
                 };
                 all_results.push(ToolResult::new(
                     call.id.clone(),
-                    vec![querymt::chat::Content::text(message.to_string())],
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: message.to_string(),
+                    }],
                     true,
                     Some(call.function.name.clone()),
                     Some(call.function.arguments.clone()),
@@ -1614,7 +1622,7 @@ pub(super) async fn transition_processing_tool_calls(
                     // Produce a synthetic cancelled result so history stays valid.
                     Ok(ToolResult::new(
                         call.id.clone(),
-                        vec![querymt::chat::Content::text("Error: Cancelled by user")],
+                        vec![querymt::chat::ToolResultPart::Text { text: "Error: Cancelled by user".to_string() }],
                         true,
                         Some(call.function.name.clone()),
                         Some(call.function.arguments.clone()),
@@ -1640,10 +1648,9 @@ pub(super) async fn transition_processing_tool_calls(
                 );
                 all_results.push(ToolResult::new(
                     call.id.clone(),
-                    vec![querymt::chat::Content::text(format!(
-                        "Error: internal tool execution failed: {}",
-                        e
-                    ))],
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: format!("Error: internal tool execution failed: {}", e).to_string(),
+                    }],
                     true,
                     Some(call.function.name.clone()),
                     Some(call.function.arguments.clone()),
@@ -1694,14 +1701,12 @@ mod tests {
         ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOpaqueItem, ChatOutputItem,
         ChatReasoningItem, ChatReasoningPart,
     };
-    use querymt::chat::{ChatMessage, ChatRole, Content};
+    use querymt::chat::{ChatMessage, ChatRole};
 
     fn make_message(role: ChatRole, content: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: vec![Content::text(content)],
-            cache: None,
-            output: None,
+        match role {
+            ChatRole::User => ChatMessage::user().text(content).build(),
+            ChatRole::Assistant => ChatMessage::assistant().text(content).build(),
         }
     }
 
@@ -1851,7 +1856,9 @@ mod tests {
             Err(ChatStreamAccumulatorError::EventAfterTerminal)
         );
 
-        let output = accumulator.finish().expect("structured stream validates");
+        let output = accumulator
+            .finish_success()
+            .expect("structured stream validates");
         let calls = dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default());
         assert_eq!(calls.len(), 1, "legacy projection must not duplicate calls");
         assert_eq!(calls[0].function.arguments, "{\"city\":\"oslo\"}");

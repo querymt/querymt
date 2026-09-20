@@ -7,7 +7,7 @@ async def main() -> None:
     registry = await querymt.Registry.default()
     provider = await registry.provider("openai", model="gpt-4o-mini")
     response = await provider.chat([
-        {"role": "user", "content": "Say hello in one short sentence."}
+        querymt.user_message([querymt.text_part("Say hello in one short sentence.")])
     ])
     print(response.text)
 

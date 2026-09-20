@@ -3,7 +3,7 @@
 use crate::knowledge::IngestRequest;
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 pub struct KnowledgeIngestTool;
@@ -83,7 +83,7 @@ impl ToolTrait for KnowledgeIngestTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         // Extract required fields
         let raw_text = args["text"]
             .as_str()
@@ -172,7 +172,7 @@ impl ToolTrait for KnowledgeIngestTool {
             source: entry.source.clone(),
         });
 
-        Ok(vec![Content::text(format!(
+        Ok(vec![ToolResultPart::text(format!(
             "Ingested knowledge entry {} (scope: {}, importance: {:.2})",
             entry.public_id, scope, importance
         ))])
@@ -183,11 +183,11 @@ impl ToolTrait for KnowledgeIngestTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

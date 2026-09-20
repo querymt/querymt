@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -109,7 +109,7 @@ impl Tool for TodoWriteTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let todos_val = args
             .get("todos")
             .and_then(Value::as_array)
@@ -137,7 +137,7 @@ impl Tool for TodoWriteTool {
         });
 
         serde_json::to_string_pretty(&result)
-            .map(|s| vec![Content::text(s)])
+            .map(|s| vec![ToolResultPart::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
     }
 }
@@ -184,7 +184,7 @@ impl Tool for TodoReadTool {
         &self,
         _args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let session_id = context.session_id().to_string();
 
         let storage = TODO_STORAGE.lock();
@@ -196,7 +196,7 @@ impl Tool for TodoReadTool {
         });
 
         serde_json::to_string_pretty(&result)
-            .map(|s| vec![Content::text(s)])
+            .map(|s| vec![ToolResultPart::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
     }
 }
@@ -205,11 +205,11 @@ impl Tool for TodoReadTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

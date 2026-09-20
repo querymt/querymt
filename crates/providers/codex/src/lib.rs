@@ -5,7 +5,7 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, StreamChunk, Tool, ToolChoice,
+        ChatMessage, ChatOutput, StreamChunk, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -149,7 +149,7 @@ impl HTTPChatProvider for Codex {
         api::codex_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         let tool_state_buffer = Arc::new(Mutex::new(HashMap::new()));
         api::codex_parse_chat_with_state(response, &tool_state_buffer)
     }
@@ -173,17 +173,33 @@ impl HTTPChatProvider for Codex {
 
 #[derive(Default)]
 struct CodexStreamParser {
-    tool_states: Arc<Mutex<HashMap<usize, api::CodexToolUseState>>>,
+    state: qmt_openai::api::OpenAIResponsesStreamState,
+    policy: qmt_openai::api::ResponsesStreamPolicy,
+    initialized: bool,
     completed: bool,
 }
 
 impl ChatStreamParser for CodexStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        let chunks = api::codex_parse_stream_chunk_with_state(chunk, &self.tool_states)?;
-        if chunks
-            .iter()
-            .any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
-        {
+        if !self.initialized {
+            self.state =
+                qmt_openai::api::OpenAIResponsesStreamState::for_provider(codex_provenance());
+            self.policy.reject_end_turn_false = true;
+            self.initialized = true;
+        }
+        let chunks = qmt_openai::api::parse_openai_responses_sse_chunk_with_policy(
+            chunk,
+            &mut self.state,
+            &self.policy,
+        )?;
+        if chunks.iter().any(|chunk| {
+            matches!(
+                chunk,
+                StreamChunk::Structured(
+                    querymt::chat::StructuredStreamEvent::ResponseTerminal { .. }
+                )
+            )
+        }) {
             self.completed = true;
         }
         Ok(chunks)
@@ -196,6 +212,15 @@ impl ChatStreamParser for CodexStreamParser {
             Err(api::codex_stream_closed_error())
         }
     }
+}
+
+/// Provenance recorded for Codex-originated structured output.
+fn codex_provenance() -> qmt_openai::api::ResponsesCodecProvider {
+    qmt_openai::api::ResponsesCodecProvider::with_endpoint(
+        "codex",
+        "responses",
+        api::codex_responses_endpoint(),
+    )
 }
 
 impl HTTPEmbeddingProvider for Codex {
@@ -315,6 +340,7 @@ mod extism_exports {
 #[cfg(test)]
 mod stream_parser_tests {
     use super::{ChatStreamParser, CodexStreamParser, LLMError, StreamChunk};
+    use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
     use querymt::error::ProviderErrorKind;
 
     #[test]
@@ -342,7 +368,87 @@ mod stream_parser_tests {
 "#,
             )
             .unwrap();
-        assert!(matches!(events.as_slice(), [StreamChunk::Done { .. }]));
+        // The shared item-aware codec emits a semantic terminal rather than a
+        // flattened legacy `Done` chunk, so structured continuation survives.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                ..
+            })
+        )));
         assert!(parser.finish().unwrap().is_empty());
+    }
+
+    /// A streamed Codex response must retain native continuation state
+    /// (encrypted reasoning, item IDs) as structured events rather than being
+    /// flattened into lossy legacy chunks.
+    #[test]
+    fn codex_stream_retains_native_continuation_state() {
+        use querymt::chat::ChatOutputItem;
+
+        let mut parser = CodexStreamParser::default();
+        let mut events = Vec::new();
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"resp_nat","model":"gpt-5.1-codex"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_nat","summary":[]}}"#,
+            r#"{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"native thought"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_nat","encrypted_content":"codex-encrypted-payload","summary":[{"type":"summary_text","text":"native thought"}]}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_nat","call_id":"call_nat","name":"lookup","arguments":""}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"q\": 1 }"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","id":"fc_nat","call_id":"call_nat","name":"lookup","arguments":"{\"q\": 1 }"}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_nat","end_turn":true}}"#,
+        ] {
+            events.extend(
+                parser
+                    .parse_chunk(format!("data: {payload}\n\n").as_bytes())
+                    .unwrap(),
+            );
+        }
+
+        // The reasoning item completed with its encrypted continuation intact.
+        let reasoning = events.iter().find_map(|event| match event {
+            StreamChunk::Structured(StructuredStreamEvent::ItemCompleted { item, .. }) => {
+                match item {
+                    ChatOutputItem::Reasoning(reasoning) => Some(reasoning),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+        let reasoning = reasoning.expect("reasoning item completion emitted");
+        assert_eq!(reasoning.id.as_deref(), Some("rs_nat"));
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("codex-encrypted-payload"),
+            "encrypted reasoning must survive the Codex stream"
+        );
+
+        // Item IDs and byte-exact arguments survive for the function call.
+        let call = events.iter().find_map(|event| match event {
+            StreamChunk::Structured(StructuredStreamEvent::ItemCompleted { item, .. }) => {
+                match item {
+                    ChatOutputItem::FunctionCall(call) => Some(call),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+        let call = call.expect("function call item completion emitted");
+        assert_eq!(call.item_id.as_deref(), Some("fc_nat"));
+        assert_eq!(call.arguments, r#"{"q": 1 }"#);
+
+        // The reasoning summary delta was accumulated into the item.
+        let has_summary = events.iter().any(|event| {
+            matches!(
+                event,
+                StreamChunk::Structured(StructuredStreamEvent::ReasoningPartDelta { .. })
+            )
+        });
+        assert!(
+            has_summary,
+            "reasoning deltas are emitted as structured events"
+        );
     }
 }

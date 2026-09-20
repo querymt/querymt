@@ -157,7 +157,7 @@ mod provider_host_tests {
         StreamChunkRelay, StreamRelayMessage,
     };
     use kameo::actor::Spawn;
-    use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
+    use querymt::chat::{FinishReason, StreamChunk};
     use querymt::{FunctionCall, ToolCall};
     use querymt_remote::StreamReceiverActor;
 
@@ -173,7 +173,7 @@ mod provider_host_tests {
             finish_reason: Some("Stop".to_string()),
             output: None,
         };
-        assert_eq!(resp.text(), Some("hello world".to_string()));
+        assert_eq!(resp.text, Some("hello world".to_string()));
     }
 
     // ── A.2 ──────────────────────────────────────────────────────────────────
@@ -189,7 +189,7 @@ mod provider_host_tests {
             output: None,
         };
         assert!(
-            resp.tool_calls().is_none(),
+            resp.tool_calls.is_empty(),
             "empty tool_calls vec should yield None"
         );
     }
@@ -232,7 +232,10 @@ mod provider_host_tests {
                 finish_reason: Some(expected_str.to_string()),
                 output: None,
             };
-            let roundtripped = resp.finish_reason().expect("should be Some");
+            let roundtripped = resp
+                .to_canonical_output()
+                .finish_reason
+                .expect("should be Some");
             // Compare via Debug string since FinishReason may not be PartialEq.
             assert_eq!(
                 format!("{:?}", roundtripped),
@@ -255,7 +258,10 @@ mod provider_host_tests {
             finish_reason: Some("GibberishReason".to_string()),
             output: None,
         };
-        let reason = resp.finish_reason().expect("should be Some");
+        let reason = resp
+            .to_canonical_output()
+            .finish_reason
+            .expect("should be Some");
         assert_eq!(
             format!("{:?}", reason),
             format!("{:?}", FinishReason::Unknown)
@@ -994,7 +1000,10 @@ mod provider_host_tests {
             finish_reason: None,
             output: None,
         };
-        let returned = resp.tool_calls().expect("should be Some");
+        let returned = resp
+            .to_canonical_output()
+            .tool_calls()
+            .expect("should be Some");
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0].function.name, "my_tool");
     }

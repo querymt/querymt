@@ -94,16 +94,25 @@ pub async fn build_prompt_blocks(
 
         for block in content_blocks {
             match block {
-                querymt::chat::Content::Image { mime_type, data } => {
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
-                    let image = ImageContent::new(encoded, mime_type).uri(raw_path.to_string());
+                querymt::chat::ToolResultPart::Attachment(media) => {
+                    if media.kind != querymt::chat::MediaKind::Image {
+                        continue;
+                    }
+                    let Some(media_type) = media.media_type() else {
+                        continue;
+                    };
+                    let querymt::chat::MediaSource::Inline { data } = media.source() else {
+                        continue;
+                    };
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+                    let image =
+                        ImageContent::new(encoded, media_type.as_ref()).uri(raw_path.to_string());
                     blocks.push(ContentBlock::Image(image));
                 }
-                querymt::chat::Content::Text { text } => {
+                querymt::chat::ToolResultPart::Text { text } => {
                     let uri = attachment_uri(&resolved_path, is_dir);
                     blocks.push(text_resource(text, uri));
                 }
-                _ => {}
             }
         }
     }

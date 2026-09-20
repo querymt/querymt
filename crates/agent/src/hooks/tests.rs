@@ -288,7 +288,7 @@ printf 'this is not json'
             permission_mode: "default".to_string(),
             tool_name: "shell".to_string(),
             tool_input: json!({"command": "echo hi"}),
-            content: vec![querymt::chat::Content::text("ok")],
+            content: vec![querymt::chat::ToolResultPart::text("ok")],
             is_error: false,
             execution_is_error: false,
             tool_source: "builtin".to_string(),
@@ -544,7 +544,7 @@ async fn post_tool_patches_chain_and_preserve_execution_truth() {
             permission_mode: "default".into(),
             tool_name: "shell".into(),
             tool_input: json!({}),
-            content: vec![querymt::chat::Content::text("secret")],
+            content: vec![querymt::chat::ToolResultPart::text("secret")],
             is_error: false,
             execution_is_error: false,
             tool_source: "builtin".into(),
@@ -566,12 +566,7 @@ async fn context_replacement_is_request_only_and_chained() {
         }],
         ..HooksConfig::default()
     };
-    let stored = vec![querymt::chat::ChatMessage {
-        role: querymt::chat::ChatRole::User,
-        content: vec![querymt::chat::Content::text("stored")],
-        cache: None,
-        output: None,
-    }];
+    let stored = vec![querymt::chat::ChatMessage::user().text("stored").build()];
     let result = Hooks::new(config)
         .unwrap()
         .run_context(ContextHookRequest {
@@ -587,11 +582,11 @@ async fn context_replacement_is_request_only_and_chained() {
         })
         .await
         .unwrap();
-    assert_eq!(stored[0].content[0].as_text(), Some("stored"));
+    assert_eq!(stored[0].input_parts()[0].as_text(), Some("stored"));
     let projected = result.messages.unwrap();
-    assert_eq!(projected[0].content[0].as_text(), Some("projected"));
+    assert_eq!(projected[0].input_parts()[0].as_text(), Some("projected"));
     assert!(
-        projected[0].content[1]
+        projected[0].input_parts()[1]
             .as_text()
             .unwrap()
             .contains("memory")

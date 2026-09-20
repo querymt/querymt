@@ -18,7 +18,7 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::{LogOptions, send_logs_to_tracing};
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -307,7 +307,7 @@ impl ChatProvider for LlamaCppProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let max_tokens = self.cfg.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         // Extract media from messages (empty vec if none)
@@ -366,13 +366,14 @@ impl ChatProvider for LlamaCppProvider {
                     .termination
                     .finish_reason(tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()));
 
-                return Ok(Box::new(LlamaCppChatResponse {
+                return Ok(LlamaCppChatResponse {
                     text: content,
                     thinking,
                     tool_calls,
                     finish_reason,
                     usage: generated.usage,
-                }));
+                }
+                .into());
             }
         }
 
@@ -394,13 +395,14 @@ impl ChatProvider for LlamaCppProvider {
             let (content, thinking, _tool_calls, _) =
                 parse_tool_response(&template_result, &generated.text)?;
             let finish_reason = generated.termination.finish_reason(false);
-            return Ok(Box::new(LlamaCppChatResponse {
+            return Ok(LlamaCppChatResponse {
                 text: content,
                 thinking,
                 tool_calls: None,
                 finish_reason,
                 usage: generated.usage,
-            }));
+            }
+            .into());
         }
 
         // Standard generation (with or without images)
@@ -460,13 +462,14 @@ impl ChatProvider for LlamaCppProvider {
         );
         let clean_text = parsed.content;
         let thinking = parsed.thinking;
-        Ok(Box::new(LlamaCppChatResponse {
+        Ok(LlamaCppChatResponse {
             text: clean_text,
             thinking,
             tool_calls: None,
             finish_reason: generated.termination.finish_reason(false),
             usage: generated.usage,
-        }))
+        }
+        .into())
     }
 
     async fn chat_stream_with_tools(

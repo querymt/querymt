@@ -10,9 +10,8 @@ use log::debug;
 use querymt::{
     FunctionCall, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputRepresentation,
-        ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort, StreamChunk, Tool,
-        ToolChoice,
+        ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatRole,
+        FinishReason, MediaSource, ReasoningEffort, StreamChunk, Tool, ToolChoice, ToolResultPart,
     },
     error::{
         LLMError, ProviderErrorKind, ProviderFailure, extract_retry_after_from_json,
@@ -496,10 +495,10 @@ fn extract_reasoning_text_from_response(response: &Value) -> Option<String> {
     joined_non_empty(thoughts)
 }
 
-impl ChatResponse for CodexChatResponse {
-    fn text(&self) -> Option<String> {
+impl From<CodexChatResponse> for ChatOutput {
+    fn from(response: CodexChatResponse) -> Self {
         let mut pieces = Vec::new();
-        for output in &self.output {
+        for output in &response.output {
             if output.output_type != "message" {
                 continue;
             }
@@ -513,42 +512,23 @@ impl ChatResponse for CodexChatResponse {
                 }
             }
         }
-        if pieces.is_empty() {
-            None
-        } else {
-            Some(pieces.join(""))
-        }
-    }
+        let text = joined_non_empty(pieces);
 
-    fn thinking(&self) -> Option<String> {
         let mut thoughts = Vec::new();
-        for output in &self.output {
+        for output in &response.output {
             collect_codex_output_reasoning(output, &mut thoughts);
         }
-        joined_non_empty(thoughts)
-    }
+        let thinking = joined_non_empty(thoughts);
 
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        //self.output.iter().flat_map(|c| c.content).collect();
-        None
-    }
+        let usage = response.usage.clone().map(|u| u.into_usage());
 
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone().map(|u| u.into_usage())
-    }
-
-    fn finish_reason(&self) -> Option<FinishReason> {
-        None
+        ChatOutput::from_projections(thinking, text, None, usage, None)
     }
 }
 
 impl std::fmt::Display for CodexChatResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(text) = self.text() {
-            write!(f, "{}", text)
-        } else {
-            write!(f, "")
-        }
+        write!(f, "Codex response")
     }
 }
 
@@ -557,6 +537,14 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
     messages: &[ChatMessage],
     tools: Option<&[Tool]>,
 ) -> Result<Vec<u8>, LLMError> {
+    // A message carrying authoritative structured output must still agree with
+    // its portable projection before serialization, so an edit that forgot to
+    // clear the output cannot silently resend the stale payload.
+    for msg in messages {
+        msg.validate_output_consistency().map_err(|error| {
+            LLMError::InvalidRequest(format!("inconsistent structured message: {error}"))
+        })?;
+    }
     let instructions = resolve_instructions(cfg.model(), cfg.instructions())?;
     let mut inputs = Vec::with_capacity(messages.len() + 1);
     if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
@@ -572,50 +560,62 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
         });
     }
     for msg in messages {
-        // When a turn carries authoritative structured output, replay it in
-        // order through the shared Responses codec and ignore the portable
-        // `content` projection to avoid duplicate items. Codex keeps its own
-        // authentication, instructions, streaming requirement, and error policy.
+        // When a turn retains item-aware fidelity semantics, replay it in order
+        // through the shared Responses codec and ignore the portable projection
+        // to avoid duplicate items. Codex keeps its own authentication,
+        // instructions, streaming requirement, and error policy.
         if msg.role == ChatRole::Assistant
-            && let Some(output) = &msg.output
-            && output.representation == ChatOutputRepresentation::Structured
+            && let Some(output) = msg.output()
         {
-            convert_structured_output_to_codex(output, &mut inputs)?;
+            let native_replay = output.provenance.as_ref().is_some_and(|origin| {
+                origin.provider == "codex"
+                    && origin.protocol == "responses"
+                    && origin.model == cfg.model()
+                    && origin.endpoint == codex_responses_endpoint()
+            });
+            convert_structured_output_to_codex(output, &mut inputs, native_replay)?;
             continue;
         }
 
         let is_user = matches!(msg.role, ChatRole::User);
+        let parts = msg.input_parts();
 
         // ── Pass 1: collect regular content blocks into a single message item ──
-        // ToolUse and ToolResult are emitted as separate API items in pass 2.
+        // Tool results are emitted as separate API items in pass 2.
         let mut content_blocks: Vec<CodexInputContent> = Vec::new();
 
-        for block in &msg.content {
-            match block {
-                Content::Text { text } if !text.is_empty() => {
+        for part in &parts {
+            match part {
+                ChatInputPart::Text { text } if !text.is_empty() => {
                     content_blocks.push(if is_user {
                         CodexInputContent::InputText {
-                            text: Cow::Borrowed(text.as_str()),
+                            text: Cow::Owned(text.clone()),
                         }
                     } else {
                         CodexInputContent::OutputText {
-                            text: Cow::Borrowed(text.as_str()),
+                            text: Cow::Owned(text.clone()),
                         }
                     });
                 }
-                Content::Image { mime_type, data } => {
-                    let data_url = format!("data:{};base64,{}", mime_type, STANDARD.encode(data));
-                    content_blocks.push(CodexInputContent::InputImage {
-                        image_url: Cow::Owned(data_url),
-                    });
-                }
-                Content::ImageUrl { url } => {
-                    content_blocks.push(CodexInputContent::InputImage {
-                        image_url: Cow::Borrowed(url.as_str()),
-                    });
-                }
-                // ToolUse, ToolResult, Thinking — handled in pass 2 or skipped.
-                _ => {}
+                ChatInputPart::Text { .. } => {}
+                ChatInputPart::Attachment(media) => match media.source() {
+                    MediaSource::Inline { data } => {
+                        if let Some(media_type) = media.media_type() {
+                            let data_url =
+                                format!("data:{};base64,{}", media_type, STANDARD.encode(data));
+                            content_blocks.push(CodexInputContent::InputImage {
+                                image_url: Cow::Owned(data_url),
+                            });
+                        }
+                    }
+                    MediaSource::DataUrl { url } | MediaSource::Url { url } => {
+                        content_blocks.push(CodexInputContent::InputImage {
+                            image_url: Cow::Owned(url.clone()),
+                        });
+                    }
+                    MediaSource::ProviderFile { .. } => {}
+                },
+                ChatInputPart::ToolResult(_) => {}
             }
         }
 
@@ -628,87 +628,68 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
         }
 
         // ── Pass 2: emit function_call / function_call_output items ──────────
-        for block in &msg.content {
-            match block {
-                Content::ToolUse {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    inputs.push(CodexInputItem::FunctionCall {
-                        call_id: Cow::Borrowed(id.as_str()),
-                        name: Cow::Borrowed(name.as_str()),
-                        arguments: Cow::Owned(serde_json::to_string(arguments).unwrap_or_default()),
-                    });
-                }
-                Content::ToolResult { id, content, .. } => {
-                    let mut output_parts: Vec<CodexToolOutputPart> = Vec::new();
-                    let mut text_only_parts: Vec<String> = Vec::new();
-                    let mut has_non_text = false;
+        for part in &parts {
+            let ChatInputPart::ToolResult(result) = part else {
+                continue;
+            };
 
-                    for c in content {
-                        match c {
-                            Content::Text { text } => {
-                                output_parts.push(CodexToolOutputPart::InputText {
-                                    text: Cow::Borrowed(text.as_str()),
-                                });
-                                text_only_parts.push(text.clone());
-                            }
-                            Content::Image { mime_type, data } => {
-                                has_non_text = true;
+            let mut output_parts: Vec<CodexToolOutputPart> = Vec::new();
+            let mut text_only_parts: Vec<String> = Vec::new();
+            let mut has_non_text = false;
+
+            for result_part in &result.parts {
+                match result_part {
+                    ToolResultPart::Text { text } => {
+                        output_parts.push(CodexToolOutputPart::InputText {
+                            text: Cow::Owned(text.clone()),
+                        });
+                        text_only_parts.push(text.clone());
+                    }
+                    ToolResultPart::Attachment(media) => {
+                        has_non_text = true;
+                        match media.source() {
+                            MediaSource::Inline { data } => {
+                                let media_type = media
+                                    .media_type()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_default();
                                 output_parts.push(CodexToolOutputPart::InputImage {
                                     image_url: Cow::Owned(format!(
                                         "data:{};base64,{}",
-                                        mime_type,
+                                        media_type,
                                         STANDARD.encode(data)
                                     )),
                                     detail: None,
                                 });
                             }
-                            Content::ImageUrl { url } => {
-                                has_non_text = true;
+                            MediaSource::DataUrl { url } | MediaSource::Url { url } => {
                                 output_parts.push(CodexToolOutputPart::InputImage {
-                                    image_url: Cow::Borrowed(url.as_str()),
+                                    image_url: Cow::Owned(url.clone()),
                                     detail: None,
                                 });
                             }
-                            Content::Pdf { data } => {
-                                has_non_text = true;
+                            MediaSource::ProviderFile { file_id, .. } => {
                                 output_parts.push(CodexToolOutputPart::InputText {
                                     text: Cow::Owned(format!(
-                                        "[PDF tool output not yet serialized natively ({} bytes)]",
-                                        data.len()
+                                        "[Provider tool output reference: {file_id}]"
                                     )),
                                 });
                             }
-                            Content::Audio { mime_type, data } => {
-                                has_non_text = true;
-                                output_parts.push(CodexToolOutputPart::InputText {
-                                    text: Cow::Owned(format!(
-                                        "[Audio tool output not yet serialized natively ({}: {} bytes)]",
-                                        mime_type,
-                                        data.len()
-                                    )),
-                                });
-                            }
-                            _ => {}
                         }
                     }
-
-                    let output = if has_non_text {
-                        CodexFunctionCallOutput::Parts(output_parts)
-                    } else {
-                        CodexFunctionCallOutput::Text(Cow::Owned(text_only_parts.join("\n")))
-                    };
-
-                    inputs.push(CodexInputItem::FunctionCallOutput {
-                        call_id: Cow::Borrowed(id.as_str()),
-                        output,
-                    });
                 }
-                // Audio, ResourceLink, Thinking — not supported; skip.
-                _ => {}
             }
+
+            let output = if has_non_text {
+                CodexFunctionCallOutput::Parts(output_parts)
+            } else {
+                CodexFunctionCallOutput::Text(Cow::Owned(text_only_parts.join("\n")))
+            };
+
+            inputs.push(CodexInputItem::FunctionCallOutput {
+                call_id: Cow::Owned(result.call_id.clone()),
+                output,
+            });
         }
     }
 
@@ -798,10 +779,27 @@ fn to_codex_tools(tools: &[Tool]) -> Vec<CodexTool<'_>> {
 fn convert_structured_output_to_codex<'a>(
     output: &'a ChatOutput,
     out: &mut Vec<CodexInputItem<'a>>,
+    native_replay: bool,
 ) -> Result<(), LLMError> {
     for item in &output.items {
         match item {
             ChatOutputItem::Reasoning(reasoning) => {
+                if !native_replay
+                    && (reasoning.id.is_some()
+                        || reasoning.encrypted_content.is_some()
+                        || reasoning.signature.is_some())
+                {
+                    let visible = reasoning.visible_text();
+                    if !visible.is_empty() {
+                        out.push(CodexInputItem::Message {
+                            role: Cow::Borrowed("assistant"),
+                            content: vec![CodexInputContent::OutputText {
+                                text: Cow::Owned(visible),
+                            }],
+                        });
+                    }
+                    continue;
+                }
                 out.push(CodexInputItem::Reasoning {
                     id: reasoning.id.as_deref().map(Cow::Borrowed),
                     summary: reasoning
@@ -880,7 +878,7 @@ fn convert_structured_output_to_codex<'a>(
 pub fn codex_parse_chat_with_state(
     response: Response<Vec<u8>>,
     tool_state_buffer: &Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
-) -> Result<Box<dyn ChatResponse>, LLMError> {
+) -> Result<ChatOutput, LLMError> {
     if !response.status().is_success() {
         return Err(classify_codex_http_error(&response));
     }
@@ -901,7 +899,7 @@ pub fn codex_parse_chat_with_state(
 
     let json_resp: Result<CodexChatResponse, serde_json::Error> = serde_json::from_slice(body);
     match json_resp {
-        Ok(response) => Ok(Box::new(response)),
+        Ok(response) => Ok(response.into()),
         Err(e) => Err(LLMError::ResponseFormatError {
             message: format!("Failed to decode Codex API response: {}", e),
             raw_response: raw.into_owned(),
@@ -1417,6 +1415,11 @@ pub fn codex_stream_closed_error() -> LLMError {
     retryable_codex_stream_error("stream closed before response.completed")
 }
 
+/// Provenance endpoint recorded for Codex-originated structured output.
+pub fn codex_responses_endpoint() -> String {
+    "https://chatgpt.com/backend-api/codex/responses".to_string()
+}
+
 fn emit_arguments_delta(
     index: usize,
     arguments: &str,
@@ -1611,8 +1614,7 @@ mod tests {
     use querymt::{
         chat::{
             ChatMessage, ChatMessageItem, ChatMessagePart, ChatOpaquePart, ChatOutput,
-            ChatOutputItem, ChatOutputRepresentation, ChatResponse, ChatRole, Content,
-            FinishReason, StreamChunk,
+            ChatOutputItem, ChatRole, FinishReason, StreamChunk,
         },
         error::{LLMError, ProviderErrorKind},
     };
@@ -1657,7 +1659,6 @@ mod tests {
     #[test]
     fn structured_message_with_unsupported_part_fails_replay() {
         let output = ChatOutput {
-            representation: ChatOutputRepresentation::Structured,
             items: vec![ChatOutputItem::Message(ChatMessageItem {
                 id: None,
                 role: ChatRole::Assistant,
@@ -1673,7 +1674,7 @@ mod tests {
         };
 
         let mut inputs = Vec::new();
-        let err = convert_structured_output_to_codex(&output, &mut inputs)
+        let err = convert_structured_output_to_codex(&output, &mut inputs, true)
             .expect_err("unsupported message part must fail the replay");
         assert!(matches!(err, LLMError::InvalidRequest(_)));
         assert!(inputs.is_empty());
@@ -1724,20 +1725,15 @@ mod tests {
         );
     }
 
-    /// Build a user `ChatMessage` whose content is a single `Content::ToolResult`
-    /// wrapping the given inner blocks.
-    fn tool_result_msg(call_id: &str, inner: Vec<Content>) -> ChatMessage {
-        ChatMessage {
-            role: ChatRole::User,
-            content: vec![Content::ToolResult {
-                id: call_id.to_string(),
-                name: Some("read_tool".to_string()),
-                is_error: false,
-                content: inner,
-            }],
-            cache: None,
-            output: None,
-        }
+    /// Build a user `ChatMessage` whose canonical input is a single correlated
+    /// tool result wrapping the given result parts.
+    fn tool_result_msg(call_id: &str, parts: Vec<querymt::chat::ToolResultPart>) -> ChatMessage {
+        let mut result = querymt::chat::ToolResult::new(call_id.to_string());
+        result.name = Some("read_tool".to_string());
+        result.parts = parts;
+        ChatMessage::user()
+            .part(querymt::chat::ChatInputPart::tool_result(result))
+            .build()
     }
 
     // ── helpers ──────────────────────────────────────────────────────────────
@@ -1764,14 +1760,16 @@ mod tests {
 
     fn structured_assistant_turn(items: Vec<ChatOutputItem>) -> ChatMessage {
         let output = ChatOutput {
+            provenance: Some(querymt::chat::ChatOutputProvenance {
+                provider: "codex".into(),
+                protocol: "responses".into(),
+                model: "codex-mini-latest".into(),
+                endpoint: super::codex_responses_endpoint(),
+            }),
             items,
             ..ChatOutput::default()
         };
-        let mut message = ChatMessage::from_assistant(output.portable_content());
-        message
-            .replace_output(output)
-            .expect("projection must match structured output");
-        message
+        ChatMessage::from_assistant_output(output)
     }
 
     #[test]
@@ -1817,7 +1815,7 @@ mod tests {
         let messages = vec![
             ChatMessage::user().text("read a.txt").build(),
             turn,
-            tool_result_msg("call_1", vec![Content::text("body")]),
+            tool_result_msg("call_1", vec![querymt::chat::ToolResultPart::text("body")]),
         ];
 
         let body: Value =
@@ -1975,10 +1973,16 @@ mod tests {
 
         let messages = vec![tool_result_msg(
             "call-1",
-            vec![Content::Image {
-                mime_type: "image/png".to_string(),
-                data: png_bytes.clone(),
-            }],
+            vec![querymt::chat::ToolResultPart::Attachment(Box::new(
+                querymt::chat::MediaPart::new(
+                    querymt::chat::MediaKind::Image,
+                    Some("image/png".parse().unwrap()),
+                    querymt::chat::MediaSource::Inline {
+                        data: png_bytes.clone(),
+                    },
+                )
+                .expect("valid inline image"),
+            ))],
         )];
 
         let body: Value = serde_json::from_slice(
@@ -2013,11 +2017,17 @@ mod tests {
         let messages = vec![tool_result_msg(
             "call-3",
             vec![
-                Content::text("some text output"),
-                Content::Image {
-                    mime_type: "image/jpeg".to_string(),
-                    data: vec![0xFF, 0xD8, 0xFF],
-                },
+                querymt::chat::ToolResultPart::text("some text output"),
+                querymt::chat::ToolResultPart::Attachment(Box::new(
+                    querymt::chat::MediaPart::new(
+                        querymt::chat::MediaKind::Image,
+                        Some("image/jpeg".parse().unwrap()),
+                        querymt::chat::MediaSource::Inline {
+                            data: vec![0xFF, 0xD8, 0xFF],
+                        },
+                    )
+                    .expect("valid inline image"),
+                )),
             ],
         )];
 
@@ -2038,24 +2048,18 @@ mod tests {
 
     // ── top-level image tests ────────────────────────────────────────────────
 
-    /// A top-level Content::Image in a user message must be serialized as an
+    /// A top-level inline image attachment in a user message must be serialized as an
     /// `input_image` content block — not skipped, not errored.
     #[test]
     fn codex_top_level_image_serialized_as_input_image() {
         let cfg = test_codex("test-token");
 
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            content: vec![
-                Content::text("describe this"),
-                Content::Image {
-                    mime_type: "image/png".to_string(),
-                    data: vec![0x89, 0x50, 0x4E, 0x47],
-                },
-            ],
-            cache: None,
-            output: None,
-        }];
+        let messages = vec![
+            ChatMessage::user()
+                .text("describe this")
+                .image("image/png".parse().unwrap(), vec![0x89, 0x50, 0x4E, 0x47])
+                .build(),
+        ];
 
         let body: Value = serde_json::from_slice(
             &codex_chat_body_json(&cfg, &messages, None)
@@ -2080,20 +2084,17 @@ mod tests {
         );
     }
 
-    /// A top-level Content::ImageUrl must be serialized as an `input_image` block
+    /// A top-level image URL attachment must be serialized as an `input_image` block
     /// with the URL passed through directly (no base64 encoding).
     #[test]
     fn codex_top_level_image_url_serialized_as_input_image() {
         let cfg = test_codex("test-token");
 
-        let messages = vec![ChatMessage {
-            role: ChatRole::User,
-            content: vec![Content::ImageUrl {
-                url: "https://example.com/img.png".to_string(),
-            }],
-            cache: None,
-            output: None,
-        }];
+        let messages = vec![
+            ChatMessage::user()
+                .image_url("https://example.com/img.png")
+                .build(),
+        ];
 
         let body: Value = serde_json::from_slice(
             &codex_chat_body_json(&cfg, &messages, None)
@@ -2128,7 +2129,7 @@ mod tests {
             }]
         }"#;
 
-        let response: CodexChatResponse = serde_json::from_slice(body).unwrap();
+        let response = ChatOutput::from(serde_json::from_slice::<CodexChatResponse>(body).unwrap());
         assert_eq!(response.text().as_deref(), Some("answer"));
         assert_eq!(response.thinking().as_deref(), Some("think 1 + think 2"));
     }
@@ -2148,7 +2149,7 @@ mod tests {
             ]
         }"#;
 
-        let response: CodexChatResponse = serde_json::from_slice(body).unwrap();
+        let response = ChatOutput::from(serde_json::from_slice::<CodexChatResponse>(body).unwrap());
         assert_eq!(response.text().as_deref(), Some("answer"));
         assert_eq!(response.thinking().as_deref(), Some("why"));
     }
@@ -2173,7 +2174,7 @@ mod tests {
             ]
         }"#;
 
-        let response: CodexChatResponse = serde_json::from_slice(body).unwrap();
+        let response = ChatOutput::from(serde_json::from_slice::<CodexChatResponse>(body).unwrap());
         assert_eq!(response.text().as_deref(), Some("answer"));
         assert_eq!(response.thinking().as_deref(), Some("why because details"));
     }

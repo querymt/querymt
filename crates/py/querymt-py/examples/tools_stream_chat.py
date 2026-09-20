@@ -30,7 +30,7 @@ async def main() -> None:
 
     messages = [
         querymt.user_message(
-            [querymt.text_block("What is the weather in Paris? Stream the reasoning.")]
+            [querymt.text_part("What is the weather in Paris? Stream the reasoning.")]
         )
     ]
 

@@ -3,10 +3,7 @@ use http::{
     Method, Request, Response,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use qmt_codex::api::{
-    CodexToolUseState, classify_codex_http_error, codex_parse_chat_with_state,
-    codex_parse_stream_chunk_with_state,
-};
+use qmt_codex::api::{classify_codex_http_error, codex_parse_chat_with_state};
 use qmt_openai::{
     AuthType,
     api::{
@@ -19,9 +16,9 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputRepresentation,
-        ChatResponse, ChatRole, Content, ReasoningEffort, StreamChunk, StructuredOutputFormat,
-        Tool, ToolChoice,
+        ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatRole,
+        MediaSource, ReasoningEffort, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        ToolResultPart,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -246,7 +243,7 @@ impl HTTPChatProvider for Xai {
         Ok(request)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         if self.should_use_responses_api() {
             let tool_state_buffer = Arc::new(Mutex::new(HashMap::new()));
             codex_parse_chat_with_state(response, &tool_state_buffer)
@@ -349,7 +346,8 @@ impl HTTPCompletionProvider for Xai {
 struct XaiStreamParser {
     use_responses_api: bool,
     responses_completed: bool,
-    codex_tool_state: Arc<Mutex<HashMap<usize, CodexToolUseState>>>,
+    responses_state: qmt_openai::api::OpenAIResponsesStreamState,
+    responses_initialized: bool,
     openai_tool_state: HashMap<usize, qmt_openai::api::OpenAIToolUseState>,
 }
 
@@ -358,7 +356,8 @@ impl XaiStreamParser {
         Self {
             use_responses_api,
             responses_completed: false,
-            codex_tool_state: Arc::new(Mutex::new(HashMap::new())),
+            responses_state: qmt_openai::api::OpenAIResponsesStreamState::default(),
+            responses_initialized: false,
             openai_tool_state: HashMap::new(),
         }
     }
@@ -367,11 +366,28 @@ impl XaiStreamParser {
 impl ChatStreamParser for XaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         if self.use_responses_api {
-            let chunks = codex_parse_stream_chunk_with_state(chunk, &self.codex_tool_state)?;
-            if chunks
-                .iter()
-                .any(|chunk| matches!(chunk, StreamChunk::Done { .. }))
-            {
+            if !self.responses_initialized {
+                self.responses_state = qmt_openai::api::OpenAIResponsesStreamState::for_provider(
+                    qmt_openai::api::ResponsesCodecProvider::with_endpoint(
+                        "xai",
+                        "responses",
+                        Xai::responses_endpoint(),
+                    ),
+                );
+                self.responses_initialized = true;
+            }
+            let chunks = qmt_openai::api::parse_openai_responses_sse_chunk(
+                chunk,
+                &mut self.responses_state,
+            )?;
+            if chunks.iter().any(|chunk| {
+                matches!(
+                    chunk,
+                    StreamChunk::Structured(
+                        querymt::chat::StructuredStreamEvent::ResponseTerminal { .. }
+                    )
+                )
+            }) {
                 self.responses_completed = true;
             }
             Ok(chunks)
@@ -408,6 +424,11 @@ impl Xai {
         Url::parse("https://api.x.ai/v1/").unwrap()
     }
 
+    /// Normalized Responses endpoint recorded in streamed output provenance.
+    fn responses_endpoint() -> String {
+        "https://api.x.ai/v1/responses".to_string()
+    }
+
     /// Detects when targeting xAI endpoints that support Responses-style API
     /// (e.g. base URL contains x.ai or explicit OAuth auth type).
     fn should_use_responses_api(&self) -> bool {
@@ -442,7 +463,7 @@ impl Xai {
 #[derive(Serialize, Debug)]
 struct XaiResponsesRequest<'a> {
     model: &'a str,
-    input: Vec<XaiResponsesInputItem<'a>>,
+    input: Vec<XaiResponsesInputItem>,
     instructions: &'a str,
     store: bool,
     stream: bool,
@@ -466,33 +487,33 @@ struct XaiResponsesRequest<'a> {
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "type")]
-enum XaiResponsesInputItem<'a> {
+enum XaiResponsesInputItem {
     #[serde(rename = "message")]
     Message {
-        role: &'a str,
-        content: Vec<XaiResponsesInputContent<'a>>,
+        role: String,
+        content: Vec<XaiResponsesInputContent>,
     },
     /// Continuation-safe reasoning replay, sharing the Responses codec semantics
     /// without importing OpenAI-only endpoint options.
     #[serde(rename = "reasoning")]
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
-        id: Option<&'a str>,
+        id: Option<String>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        summary: Vec<XaiResponsesReasoningSummary<'a>>,
+        summary: Vec<XaiResponsesReasoningSummary>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        encrypted_content: Option<&'a str>,
+        encrypted_content: Option<String>,
     },
     #[serde(rename = "function_call")]
     FunctionCall {
-        call_id: &'a str,
-        name: &'a str,
+        call_id: String,
+        name: String,
         arguments: String,
     },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
-        call_id: &'a str,
-        output: XaiResponsesFunctionOutput<'a>,
+        call_id: String,
+        output: XaiResponsesFunctionOutput,
     },
 }
 
@@ -503,35 +524,35 @@ enum XaiResponsesReasoningSummaryKind {
 }
 
 #[derive(Serialize, Debug)]
-struct XaiResponsesReasoningSummary<'a> {
+struct XaiResponsesReasoningSummary {
     #[serde(rename = "type")]
     summary_type: XaiResponsesReasoningSummaryKind,
-    text: &'a str,
+    text: String,
 }
 
 #[derive(Serialize, Debug)]
 #[serde(untagged)]
-enum XaiResponsesFunctionOutput<'a> {
+enum XaiResponsesFunctionOutput {
     Text(String),
-    Parts(Vec<XaiResponsesToolOutputPart<'a>>),
+    Parts(Vec<XaiResponsesToolOutputPart>),
 }
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "type")]
-enum XaiResponsesToolOutputPart<'a> {
+enum XaiResponsesToolOutputPart {
     #[serde(rename = "input_text")]
-    InputText { text: Cow<'a, str> },
+    InputText { text: String },
     #[serde(rename = "input_image")]
     InputImage { image_url: String },
 }
 
 #[derive(Serialize, Debug)]
 #[serde(tag = "type")]
-enum XaiResponsesInputContent<'a> {
+enum XaiResponsesInputContent {
     #[serde(rename = "input_text")]
-    InputText { text: &'a str },
+    InputText { text: String },
     #[serde(rename = "output_text")]
-    OutputText { text: &'a str },
+    OutputText { text: String },
     #[serde(rename = "input_image")]
     InputImage { image_url: String },
 }
@@ -605,131 +626,142 @@ struct XaiResponsesReasoning {
 
 fn to_xai_responses_input(
     messages: &[ChatMessage],
-) -> Result<Vec<XaiResponsesInputItem<'_>>, LLMError> {
+    model: &str,
+) -> Result<Vec<XaiResponsesInputItem>, LLMError> {
+    // Materialize all owned canonical parts up front so the borrowed input
+    // items built below can reference stable storage that outlives the loop.
+    let owned_parts: Vec<Vec<ChatInputPart>> =
+        messages.iter().map(ChatMessage::input_parts).collect();
+
     let mut inputs = Vec::with_capacity(messages.len());
 
-    for msg in messages {
-        // When a turn carries authoritative structured output, replay it in
-        // order through the shared codec semantics rather than the lossy
-        // portable projection.
+    for (msg, parts) in messages.iter().zip(owned_parts.iter()) {
+        // A message carrying authoritative structured output must still agree
+        // with its portable projection before serialization, so an edit that
+        // forgot to clear the output cannot silently resend a stale payload.
+        msg.validate_output_consistency().map_err(|error| {
+            LLMError::InvalidRequest(format!("inconsistent structured message: {error}"))
+        })?;
+
+        // When a turn retains item-aware fidelity semantics, replay it in order
+        // through the shared codec semantics rather than the lossy portable
+        // projection.
         if msg.role == ChatRole::Assistant
-            && let Some(output) = &msg.output
-            && output.representation == ChatOutputRepresentation::Structured
+            && let Some(output) = msg.output()
         {
-            convert_structured_output_to_xai(output, &mut inputs)?;
+            let native_replay = output.provenance.as_ref().is_some_and(|origin| {
+                origin.provider == "xai"
+                    && origin.protocol == "responses"
+                    && origin.model == model
+                    && origin.endpoint == Xai::responses_endpoint()
+            });
+            convert_structured_output_to_xai(output, &mut inputs, native_replay)?;
             continue;
         }
 
         let is_user = matches!(msg.role, ChatRole::User);
         let mut content_blocks = Vec::new();
 
-        for block in &msg.content {
-            match block {
-                Content::Text { text } if !text.is_empty() => {
+        for part in parts {
+            match part {
+                ChatInputPart::Text { text } if !text.is_empty() => {
                     if is_user {
-                        content_blocks.push(XaiResponsesInputContent::InputText { text });
+                        content_blocks
+                            .push(XaiResponsesInputContent::InputText { text: text.clone() });
                     } else {
-                        content_blocks.push(XaiResponsesInputContent::OutputText { text });
+                        content_blocks
+                            .push(XaiResponsesInputContent::OutputText { text: text.clone() });
                     }
                 }
-                Content::Image { mime_type, data } => {
-                    content_blocks.push(XaiResponsesInputContent::InputImage {
-                        image_url: format!("data:{};base64,{}", mime_type, STANDARD.encode(data)),
-                    });
-                }
-                Content::ImageUrl { url } => {
-                    content_blocks.push(XaiResponsesInputContent::InputImage {
-                        image_url: url.clone(),
-                    });
-                }
-                _ => {}
+                ChatInputPart::Text { .. } => {}
+                ChatInputPart::Attachment(media) => match media.source() {
+                    MediaSource::Inline { data } => {
+                        let media_type = media
+                            .media_type()
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
+                        content_blocks.push(XaiResponsesInputContent::InputImage {
+                            image_url: format!(
+                                "data:{};base64,{}",
+                                media_type,
+                                STANDARD.encode(data)
+                            ),
+                        });
+                    }
+                    MediaSource::DataUrl { url } | MediaSource::Url { url } => {
+                        content_blocks.push(XaiResponsesInputContent::InputImage {
+                            image_url: url.clone(),
+                        });
+                    }
+                    MediaSource::ProviderFile { .. } => {}
+                },
+                ChatInputPart::ToolResult(_) => {}
             }
         }
 
         if !content_blocks.is_empty() {
             inputs.push(XaiResponsesInputItem::Message {
-                role: if is_user { "user" } else { "assistant" },
+                role: if is_user { "user" } else { "assistant" }.to_string(),
                 content: content_blocks,
             });
         }
 
-        for block in &msg.content {
-            match block {
-                Content::ToolUse {
-                    id,
-                    name,
-                    arguments,
-                } => inputs.push(XaiResponsesInputItem::FunctionCall {
-                    call_id: id,
-                    name,
-                    arguments: serde_json::to_string(arguments).unwrap_or_default(),
-                }),
-                Content::ToolResult { id, content, .. } => {
-                    let mut output_parts = Vec::new();
-                    let mut text_only_parts = Vec::new();
-                    let mut has_non_text = false;
+        for part in parts {
+            let ChatInputPart::ToolResult(result) = part else {
+                continue;
+            };
 
-                    for c in content {
-                        match c {
-                            Content::Text { text } => {
-                                output_parts.push(XaiResponsesToolOutputPart::InputText {
-                                    text: Cow::Borrowed(text.as_str()),
-                                });
-                                text_only_parts.push(text.clone());
-                            }
-                            Content::Image { mime_type, data } => {
-                                has_non_text = true;
+            let mut output_parts = Vec::new();
+            let mut text_only_parts = Vec::new();
+            let mut has_non_text = false;
+
+            for result_part in &result.parts {
+                match result_part {
+                    ToolResultPart::Text { text } => {
+                        output_parts
+                            .push(XaiResponsesToolOutputPart::InputText { text: text.clone() });
+                        text_only_parts.push(text.clone());
+                    }
+                    ToolResultPart::Attachment(media) => {
+                        has_non_text = true;
+                        match media.source() {
+                            MediaSource::Inline { data } => {
+                                let media_type = media
+                                    .media_type()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_default();
                                 output_parts.push(XaiResponsesToolOutputPart::InputImage {
                                     image_url: format!(
                                         "data:{};base64,{}",
-                                        mime_type,
+                                        media_type,
                                         STANDARD.encode(data)
                                     ),
                                 });
                             }
-                            Content::ImageUrl { url } => {
-                                has_non_text = true;
+                            MediaSource::DataUrl { url } | MediaSource::Url { url } => {
                                 output_parts.push(XaiResponsesToolOutputPart::InputImage {
                                     image_url: url.clone(),
                                 });
                             }
-                            Content::Pdf { data } => {
-                                has_non_text = true;
-                                let text = format!(
-                                    "[PDF tool output not yet serialized natively ({} bytes)]",
-                                    data.len()
-                                );
+                            MediaSource::ProviderFile { file_id, .. } => {
                                 output_parts.push(XaiResponsesToolOutputPart::InputText {
-                                    text: Cow::Owned(text),
+                                    text: format!("[Provider tool output reference: {file_id}]"),
                                 });
                             }
-                            Content::Audio { mime_type, data } => {
-                                has_non_text = true;
-                                let text = format!(
-                                    "[Audio tool output not yet serialized natively ({}: {} bytes)]",
-                                    mime_type,
-                                    data.len()
-                                );
-                                output_parts.push(XaiResponsesToolOutputPart::InputText {
-                                    text: Cow::Owned(text),
-                                });
-                            }
-                            _ => {}
                         }
                     }
-
-                    let output = if has_non_text {
-                        XaiResponsesFunctionOutput::Parts(output_parts)
-                    } else {
-                        XaiResponsesFunctionOutput::Text(text_only_parts.join("\n"))
-                    };
-                    inputs.push(XaiResponsesInputItem::FunctionCallOutput {
-                        call_id: id,
-                        output,
-                    });
                 }
-                _ => {}
             }
+
+            let output = if has_non_text {
+                XaiResponsesFunctionOutput::Parts(output_parts)
+            } else {
+                XaiResponsesFunctionOutput::Text(text_only_parts.join("\n"))
+            };
+            inputs.push(XaiResponsesInputItem::FunctionCallOutput {
+                call_id: result.call_id.clone(),
+                output,
+            });
         }
     }
 
@@ -741,15 +773,30 @@ fn to_xai_responses_input(
 /// Shares the Responses codec's item semantics (ordered reasoning/message/call
 /// items; opaque items fail rather than being dropped) while xAI keeps its own
 /// endpoint, headers, supported options, and OpenAI-only-option exclusions.
-fn convert_structured_output_to_xai<'a>(
-    output: &'a ChatOutput,
-    out: &mut Vec<XaiResponsesInputItem<'a>>,
+fn convert_structured_output_to_xai(
+    output: &ChatOutput,
+    out: &mut Vec<XaiResponsesInputItem>,
+    native_replay: bool,
 ) -> Result<(), LLMError> {
     for item in &output.items {
         match item {
             ChatOutputItem::Reasoning(reasoning) => {
+                if !native_replay
+                    && (reasoning.id.is_some()
+                        || reasoning.encrypted_content.is_some()
+                        || reasoning.signature.is_some())
+                {
+                    let visible = reasoning.visible_text();
+                    if !visible.is_empty() {
+                        out.push(XaiResponsesInputItem::Message {
+                            role: "assistant".to_string(),
+                            content: vec![XaiResponsesInputContent::OutputText { text: visible }],
+                        });
+                    }
+                    continue;
+                }
                 out.push(XaiResponsesInputItem::Reasoning {
-                    id: reasoning.id.as_deref(),
+                    id: reasoning.id.clone(),
                     summary: reasoning
                         .summary
                         .iter()
@@ -757,10 +804,10 @@ fn convert_structured_output_to_xai<'a>(
                         .filter(|part| !part.text.is_empty())
                         .map(|part| XaiResponsesReasoningSummary {
                             summary_type: XaiResponsesReasoningSummaryKind::SummaryText,
-                            text: part.text.as_str(),
+                            text: part.text.clone(),
                         })
                         .collect(),
-                    encrypted_content: reasoning.encrypted_content.as_deref(),
+                    encrypted_content: reasoning.encrypted_content.clone(),
                 });
             }
             ChatOutputItem::Message(message) => {
@@ -768,28 +815,51 @@ fn convert_structured_output_to_xai<'a>(
                     ChatRole::User => "user",
                     ChatRole::Assistant => "assistant",
                 };
-                let content: Vec<XaiResponsesInputContent<'a>> = message
-                    .parts
-                    .iter()
-                    .filter_map(|part| match part {
+                let mut content: Vec<XaiResponsesInputContent> = Vec::new();
+                for part in &message.parts {
+                    match part {
                         ChatMessagePart::Text { text, .. } if !text.is_empty() => {
-                            Some(XaiResponsesInputContent::OutputText { text })
+                            content
+                                .push(XaiResponsesInputContent::OutputText { text: text.clone() });
                         }
                         ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
-                            Some(XaiResponsesInputContent::OutputText { text: refusal })
+                            content.push(XaiResponsesInputContent::OutputText {
+                                text: refusal.clone(),
+                            });
                         }
-                        // Media/opaque parts keep their existing xAI handling.
-                        _ => None,
-                    })
-                    .collect();
+                        // A structured media part this endpoint cannot represent
+                        // is required continuation, so it fails explicitly
+                        // instead of being silently omitted.
+                        ChatMessagePart::Media(_) => {
+                            return Err(LLMError::InvalidRequest(
+                                "unsupported Responses continuation: media part has no validated \
+                                 input representation for this endpoint"
+                                    .to_string(),
+                            ));
+                        }
+                        // Unknown parts have no validated representation; dropping
+                        // them would silently corrupt continuation.
+                        ChatMessagePart::Opaque(opaque) => {
+                            return Err(LLMError::InvalidRequest(format!(
+                                "unsupported Responses continuation: message part type '{}' has \
+                                 no validated input representation",
+                                opaque.original_type
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
                 if !content.is_empty() {
-                    out.push(XaiResponsesInputItem::Message { role, content });
+                    out.push(XaiResponsesInputItem::Message {
+                        role: role.to_string(),
+                        content,
+                    });
                 }
             }
             ChatOutputItem::FunctionCall(call) => {
                 out.push(XaiResponsesInputItem::FunctionCall {
-                    call_id: call.call_id.as_str(),
-                    name: call.name.as_str(),
+                    call_id: call.call_id.clone(),
+                    name: call.name.clone(),
                     // Exact provider argument text is replayed byte-exact.
                     arguments: call.arguments.clone(),
                 });
@@ -915,7 +985,7 @@ fn xai_responses_chat_request<C: qmt_openai::api::OpenAIProviderConfig>(
     let instructions = cfg.system().join("\n");
     let body = XaiResponsesRequest {
         model: cfg.model(),
-        input: to_xai_responses_input(messages)?,
+        input: to_xai_responses_input(messages, cfg.model())?,
         instructions: instructions.as_str(),
         store: false,
         stream: true,
@@ -1017,6 +1087,7 @@ mod extism_exports {
 mod tests {
     use super::*;
     use querymt::auth::static_key;
+    use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
 
     fn test_xai(api_key: &str) -> Xai {
         Xai {
@@ -1086,7 +1157,10 @@ mod tests {
             .parse_list_models(response)
             .expect("model parsing should succeed");
 
-        assert_eq!(models, vec!["grok-4", "grok-3", "grok-composer-2.5-fast"]);
+        assert_eq!(
+            models,
+            vec!["grok-4", "grok-3", "grok-composer-2.5-fast", "grok-4.5"]
+        );
     }
 
     #[test]
@@ -1100,7 +1174,7 @@ mod tests {
             .parse_list_models(response)
             .expect("model parsing should succeed");
 
-        assert_eq!(models, vec!["grok-4", "grok-composer-2.5-fast"]);
+        assert_eq!(models, vec!["grok-4", "grok-composer-2.5-fast", "grok-4.5"]);
     }
 
     #[test]
@@ -1116,7 +1190,11 @@ mod tests {
 
         assert_eq!(
             models,
-            vec!["x-ai/grok-composer-2.5-fast", "grok-composer-2.5-fast"]
+            vec![
+                "x-ai/grok-composer-2.5-fast",
+                "grok-composer-2.5-fast",
+                "grok-4.5"
+            ]
         );
     }
 
@@ -1173,7 +1251,15 @@ mod tests {
 "#,
             )
             .unwrap();
-        assert!(matches!(chunks.as_slice(), [StreamChunk::Done { .. }]));
+        // xAI now shares the item-aware codec, so completion is a semantic
+        // terminal rather than a flattened legacy `Done` chunk.
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                ..
+            })
+        )));
         assert!(parser.finish().unwrap().is_empty());
     }
 
@@ -1218,16 +1304,23 @@ mod tests {
                 .text("hello")
                 .image_url("https://example.test/image.png")
                 .build(),
-            ChatMessage::assistant()
-                .tool_use("call-1", "lookup", serde_json::json!({"q":"hello"}))
-                .build(),
+            ChatMessage::from(querymt::chat::ChatOutput {
+                items: vec![querymt::chat::ChatOutputItem::FunctionCall(
+                    querymt::chat::ChatFunctionCallItem {
+                        item_id: Some("item-1".to_string()),
+                        call_id: "call-1".to_string(),
+                        name: "lookup".to_string(),
+                        arguments: "{\"q\":\"hello\"}".to_string(),
+                        status: None,
+                        extensions: Default::default(),
+                    },
+                )],
+                ..querymt::chat::ChatOutput::default()
+            }),
             ChatMessage::user()
-                .tool_result(
-                    "call-1".to_string(),
-                    None,
-                    false,
-                    vec![Content::text("answer")],
-                )
+                .part(querymt::chat::ChatInputPart::tool_result(
+                    querymt::chat::ToolResult::text("call-1", "answer"),
+                ))
                 .build(),
         ];
         let tools = vec![Tool {
@@ -1399,13 +1492,19 @@ mod tests {
     #[test]
     fn responses_request_replays_structured_output_items_in_order() {
         use querymt::chat::{
-            ChatFunctionCallItem, ChatMessageItem, ChatOutput, ChatOutputItem,
-            ChatOutputRepresentation, ChatReasoningItem, ChatReasoningPart, Extensions,
+            ChatFunctionCallItem, ChatMessageItem, ChatOutput, ChatOutputItem, ChatReasoningItem,
+            ChatReasoningPart, Extensions,
         };
 
         let xai = test_xai("xai-key");
 
         let output = ChatOutput {
+            provenance: Some(querymt::chat::ChatOutputProvenance {
+                provider: "xai".into(),
+                protocol: "responses".into(),
+                model: "grok-test".into(),
+                endpoint: Xai::responses_endpoint(),
+            }),
             items: vec![
                 ChatOutputItem::Reasoning(ChatReasoningItem {
                     id: Some("rs_1".to_string()),
@@ -1439,12 +1538,7 @@ mod tests {
             ],
             ..ChatOutput::default()
         };
-        assert_eq!(output.representation, ChatOutputRepresentation::Structured);
-
-        let mut assistant = ChatMessage::from_assistant(output.portable_content());
-        assistant
-            .replace_output(output)
-            .expect("projection must match structured output");
+        let assistant = ChatMessage::from_assistant_output(output);
 
         let messages = vec![
             ChatMessage::user().text("read a.txt").build(),
@@ -1454,7 +1548,7 @@ mod tests {
                     "call_1".to_string(),
                     None,
                     false,
-                    vec![Content::text("body")],
+                    vec![ToolResultPart::text("body")],
                 )
                 .build(),
         ];
@@ -1502,7 +1596,8 @@ mod tests {
             })],
             ..ChatOutput::default()
         };
-        let mut assistant = ChatMessage::from_assistant(Vec::new());
+        let mut assistant =
+            ChatMessage::from_assistant_output(querymt::chat::ChatOutput::default());
         assistant.replace_output(output).unwrap();
 
         let messages = vec![ChatMessage::user().text("go").build(), assistant];

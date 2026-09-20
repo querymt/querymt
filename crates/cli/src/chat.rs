@@ -5,8 +5,11 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::future::join_all;
 use querymt::{
-    FunctionCall, LLMProvider, ToolCall,
-    chat::{ChatMessage, ChatResponse, Content, StreamChunk},
+    LLMProvider,
+    chat::{
+        ChatMessage, ChatMessagePartDelta, ChatOutput, ChatStreamAccumulator, ChatStreamFinish,
+        StreamChunk, StructuredStreamEvent, ToolResultPart, chunk_is_terminal,
+    },
     error::LLMError,
 };
 use rustyline::{
@@ -19,7 +22,6 @@ use rustyline::{
 };
 use rustyline_derive::{Completer, Helper, Hinter, Validator};
 use spinners::{Spinner, Spinners};
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::{
     borrow::Cow,
@@ -66,7 +68,75 @@ impl Highlighter for QmtHelper {
 
 pub(crate) enum StreamOrResponse {
     Stream(Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>),
-    Response(Box<dyn ChatResponse>),
+    Response(ChatOutput),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreamDisplayDelta<'a> {
+    Text(&'a str),
+    Thinking(&'a str),
+}
+
+#[derive(Default)]
+struct CliStreamState {
+    accumulator: ChatStreamAccumulator,
+    displayed_text: bool,
+    displayed_thinking: bool,
+}
+
+impl CliStreamState {
+    fn push<'a>(
+        &mut self,
+        chunk: &'a StreamChunk,
+    ) -> Result<Option<StreamDisplayDelta<'a>>, LLMError> {
+        self.accumulator
+            .push(chunk)
+            .map_err(|error| LLMError::ProviderError(error.to_string()))?;
+
+        let display = match chunk {
+            StreamChunk::Structured(StructuredStreamEvent::MessagePartDelta {
+                delta:
+                    ChatMessagePartDelta::Text { delta } | ChatMessagePartDelta::Refusal { delta },
+                ..
+            }) => {
+                self.displayed_text = true;
+                Some(StreamDisplayDelta::Text(delta))
+            }
+            StreamChunk::Structured(StructuredStreamEvent::ReasoningPartDelta {
+                delta, ..
+            }) => {
+                self.displayed_thinking = true;
+                Some(StreamDisplayDelta::Thinking(delta))
+            }
+            StreamChunk::Text(delta) if !self.accumulator.is_structured() => {
+                self.displayed_text = true;
+                Some(StreamDisplayDelta::Text(delta))
+            }
+            StreamChunk::Thinking(delta) if !self.accumulator.is_structured() => {
+                self.displayed_thinking = true;
+                Some(StreamDisplayDelta::Thinking(delta))
+            }
+            _ => None,
+        };
+        Ok(display)
+    }
+
+    fn finish(self) -> Result<(ChatOutput, bool, bool, bool), LLMError> {
+        let displayed_text = self.displayed_text;
+        let displayed_thinking = self.displayed_thinking;
+        match self.accumulator.finish() {
+            ChatStreamFinish::Completed(output) => {
+                Ok((output, displayed_text, displayed_thinking, true))
+            }
+            ChatStreamFinish::Incomplete { output, detail } => {
+                log::warn!("Provider returned an incomplete response: {:?}", detail);
+                Ok((output, displayed_text, displayed_thinking, false))
+            }
+            ChatStreamFinish::Failed { error, .. } => {
+                Err(LLMError::ProviderError(error.to_string()))
+            }
+        }
+    }
 }
 
 async fn unified_chat(
@@ -99,11 +169,9 @@ pub async fn handle_any_response(
 
     loop {
         let is_stream = matches!(current, StreamOrResponse::Stream(_));
-        let (text, thinking, tool_calls, _usage) = match current {
+        let (output, execute_tools) = match current {
             StreamOrResponse::Stream(mut stream) => {
-                let mut full_text = String::new();
-                let mut thinking_text = String::new();
-                let mut tool_calls_map: HashMap<usize, (String, String, String)> = HashMap::new();
+                let mut state = CliStreamState::default();
 
                 if let Some(mut sp) = spinner.take() {
                     sp.stop();
@@ -121,66 +189,17 @@ pub async fn handle_any_response(
                             let Some(chunk_res) = chunk else {
                                 break;
                             };
-                            match chunk_res? {
-                                StreamChunk::Structured(_) => {
-                                    // Structured events are accumulated by item-aware consumers;
-                                    // this legacy CLI renders their compatibility projections.
+                            let chunk = chunk_res?;
+                            let terminal = chunk_is_terminal(&chunk);
+                            if let Some(delta) = state.push(&chunk)? {
+                                match delta {
+                                    StreamDisplayDelta::Text(text) => print!("{}", text),
+                                    StreamDisplayDelta::Thinking(text) => print!("{}", text.dimmed()),
                                 }
-                                StreamChunk::Text(t) => {
-                                    log::trace!("Received stream text chunk: {} bytes", t.len());
-                                    print!("{}", t);
-                                    io::stdout().flush().ok();
-                                    full_text.push_str(&t);
-                                }
-                                StreamChunk::Thinking(t) => {
-                                    log::trace!("Received thinking chunk: {} bytes", t.len());
-                                    print!("{}", t.dimmed());
-                                    io::stdout().flush().ok();
-                                    thinking_text.push_str(&t);
-                                }
-                                StreamChunk::ThinkingSignature(_sig) => {
-                                    // Signature is used for signed thinking replay, not terminal display.
-                                }
-                                StreamChunk::ToolUseStart { index, id, name } => {
-                                    log::debug!("Received tool use start: {} (idx {})", name, index);
-                                    tool_calls_map.insert(index, (id, name, String::new()));
-                                }
-                                StreamChunk::ToolUseInputDelta {
-                                    index,
-                                    partial_json,
-                                } => {
-                                    log::trace!(
-                                        "Received tool use input delta: {} bytes (idx {})",
-                                        partial_json.len(),
-                                        index
-                                    );
-                                    if let Some(entry) = tool_calls_map.get_mut(&index) {
-                                        entry.2.push_str(&partial_json);
-                                    }
-                                }
-                                StreamChunk::ToolUseComplete { index, tool_call } => {
-                                    log::debug!(
-                                        "Received tool use complete: {} (idx {})",
-                                        tool_call.function.name, index
-                                    );
-                                    tool_calls_map.insert(index, (
-                                        tool_call.id,
-                                        tool_call.function.name,
-                                        tool_call.function.arguments,
-                                    ));
-                                }
-                                StreamChunk::Usage(usage) => {
-                                    log::debug!(
-                                        "Usage: input={}, output={}",
-                                        usage.input_tokens,
-                                        usage.output_tokens
-                                    );
-                                }
-                                StreamChunk::Done { finish_reason } => {
-                                    log::debug!("Stream done: finish_reason={:?}", finish_reason);
-                                    println!();
-                                    break;
-                                }
+                                io::stdout().flush().ok();
+                            }
+                            if terminal {
+                                break;
                             }
                         }
                         _ = tokio::signal::ctrl_c() => {
@@ -197,35 +216,15 @@ pub async fn handle_any_response(
                     print!("\r\x1B[K");
                 }
 
-                let tool_calls = if tool_calls_map.is_empty() {
-                    None
-                } else {
-                    let mut calls: Vec<_> = tool_calls_map.into_iter().collect();
-                    calls.sort_by_key(|(idx, _)| *idx);
-                    Some(
-                        calls
-                            .into_iter()
-                            .map(|(_, (id, name, arguments))| ToolCall {
-                                id,
-                                call_type: "function".to_string(),
-                                function: FunctionCall { name, arguments },
-                            })
-                            .collect(),
-                    )
-                };
-
-                // If streaming didn't emit separate Thinking chunks (e.g. the
-                // provider doesn't support it), fall back to extracting <think>
-                // blocks from the accumulated text so that future turns have
-                // clean content and proper reasoning_content separation.
-                let (thinking, clean_text) = if thinking_text.is_empty() {
-                    let (extracted, clean) = querymt::chat::extract_thinking(&full_text);
-                    (extracted, clean)
-                } else {
-                    (Some(thinking_text), full_text)
-                };
-
-                (Some(clean_text), thinking, tool_calls, None)
+                let (output, displayed_text, displayed_thinking, execute_tools) = state.finish()?;
+                if !displayed_thinking && let Some(thinking) = output.thinking() {
+                    print!("{}", thinking.dimmed());
+                }
+                if !displayed_text && let Some(text) = output.text() {
+                    print!("{}", text);
+                }
+                println!();
+                (output, execute_tools)
             }
             StreamOrResponse::Response(resp) => {
                 if let Some(mut sp) = spinner.take() {
@@ -233,33 +232,21 @@ pub async fn handle_any_response(
                     print!("\r\x1B[K");
                 }
 
-                if let Some(usage) = resp.usage() {
+                if let Some(usage) = resp.usage.clone() {
                     log::info!(
                         "Tokens usage (in/out): {}/{}",
                         usage.input_tokens,
                         usage.output_tokens
                     );
                 }
-                (
-                    resp.text(),
-                    resp.thinking(),
-                    resp.tool_calls(),
-                    resp.usage(),
-                )
+                (resp, true)
             }
         };
+        let text = output.text();
+        let tool_calls = execute_tools.then(|| output.tool_calls()).flatten();
 
         if let Some(ref tcalls) = tool_calls {
-            let mut msg_builder = ChatMessage::assistant().text(text.clone().unwrap_or_default());
-            for tc in tcalls {
-                let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
-                    .unwrap_or(serde_json::Value::Object(Default::default()));
-                msg_builder = msg_builder.tool_use(tc.id.clone(), tc.function.name.clone(), args);
-            }
-            if let Some(ref t) = thinking {
-                msg_builder = msg_builder.thinking(t.clone());
-            }
-            messages.push(msg_builder.build());
+            messages.push(ChatMessage::from_assistant_output(output));
 
             let tool_futures = tcalls.clone().into_iter().map(|call| async {
                 let tool_name = call.function.name.clone();
@@ -308,11 +295,14 @@ pub async fn handle_any_response(
                             };
                             return (
                                 call,
-                                Ok(vec![Content::text(format!(
-                                    "Tool execution denied by user. The user chose not to execute the '{}' tool. {}",
-                                    tool_name, denial_message
-                                )
-                                .trim())]),
+                                Ok(vec![ToolResultPart::Text {
+                                    text: format!(
+                                        "Tool execution denied by user. The user chose not to execute the '{}' tool. {}",
+                                        tool_name, denial_message
+                                    )
+                                    .trim()
+                                    .to_string(),
+                                }]),
                             );
                         }
                         Err(e) => {
@@ -327,13 +317,15 @@ pub async fn handle_any_response(
                     },
                     ToolPolicyState::Allow => {}
                     ToolPolicyState::Deny => {
-                        return (
-                            call,
-                            Ok(vec![Content::text(format!(
-                                "Tool execution denied by configuration. The '{}' tool is not allowed.",
-                                tool_name
-                            ))]),
-                        );
+                            return (
+                                call,
+                                Ok(vec![ToolResultPart::Text {
+                                    text: format!(
+                                        "Tool execution denied by configuration. The '{}' tool is not allowed.",
+                                        tool_name
+                                    ),
+                                }]),
+                            );
                     }
                 }
 
@@ -377,29 +369,31 @@ pub async fn handle_any_response(
             };
             let mut tool_result_builder = ChatMessage::user();
             for (call, result) in tool_results_from_futures {
-                let (content_blocks, is_error) = match result {
-                    Ok(blocks) => {
-                        let text_preview: String = blocks
+                let (result_parts, is_error) = match result {
+                    Ok(parts) => {
+                        let text_preview: String = parts
                             .iter()
-                            .filter_map(|b| match b {
-                                Content::Text { text } => Some(text.as_str()),
-                                _ => None,
-                            })
+                            .filter_map(|b| b.as_text())
                             .collect::<Vec<_>>()
                             .join("\n");
                         log::debug!("Tool {} result: {}", call.function.name, text_preview);
-                        (blocks, false)
+                        (parts, false)
                     }
                     Err(e) => {
                         log::debug!("Tool {} error: {}", call.function.name, e);
-                        (vec![Content::text(e.to_string())], true)
+                        (
+                            vec![ToolResultPart::Text {
+                                text: e.to_string(),
+                            }],
+                            true,
+                        )
                     }
                 };
                 tool_result_builder = tool_result_builder.tool_result(
                     call.id.clone(),
                     Some(call.function.name.clone()),
                     is_error,
-                    content_blocks,
+                    result_parts,
                 );
             }
             messages.push(tool_result_builder.build());
@@ -426,16 +420,283 @@ pub async fn handle_any_response(
                     println!("{}", text.as_deref().unwrap_or_default());
                 }
             }
-            let mut msg_builder = ChatMessage::assistant().text(text.unwrap_or_default());
-            if let Some(t) = thinking {
-                msg_builder = msg_builder.thinking(t);
-            }
-            messages.push(msg_builder.build());
+            messages.push(ChatMessage::from_assistant_output(output));
             break;
         }
     }
     print_separator();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::chat::{
+        ChatMessageItem, ChatMessagePart, ChatOutputItem, ChatOutputStatus, ChatReasoningItem,
+        ChatReasoningPart, ChatRole, FinishReason, ReasoningPartKind,
+    };
+
+    fn message(text: &str) -> ChatOutputItem {
+        ChatOutputItem::Message(ChatMessageItem {
+            id: Some("msg_1".into()),
+            role: ChatRole::Assistant,
+            phase: None,
+            status: Some(ChatOutputStatus::Completed),
+            parts: vec![ChatMessagePart::Text {
+                text: text.into(),
+                annotations: Vec::new(),
+                extensions: Default::default(),
+            }],
+            extensions: Default::default(),
+        })
+    }
+
+    fn metadata() -> StreamChunk {
+        StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+            response_id: Some("resp_1".into()),
+            status: Some(ChatOutputStatus::InProgress),
+            usage: None,
+            finish_reason: None,
+            provenance: None,
+        })
+    }
+
+    fn terminal(status: ChatOutputStatus) -> StreamChunk {
+        StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+            status,
+            usage: None,
+            finish_reason: Some(FinishReason::Stop),
+            detail: None,
+        })
+    }
+
+    #[test]
+    fn structured_text_delta_is_displayed_and_finalized() {
+        let mut state = CliStreamState::default();
+        state.push(&metadata()).unwrap();
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemStarted {
+                    output_index: 0,
+                    item: message(""),
+                },
+            ))
+            .unwrap();
+        let delta = StreamChunk::Structured(StructuredStreamEvent::MessagePartDelta {
+            output_index: 0,
+            content_index: 0,
+            delta: ChatMessagePartDelta::Text {
+                delta: "Paris".into(),
+            },
+        });
+        assert_eq!(
+            state.push(&delta).unwrap(),
+            Some(StreamDisplayDelta::Text("Paris"))
+        );
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemCompleted {
+                    output_index: 0,
+                    item: message("Paris"),
+                },
+            ))
+            .unwrap();
+        state.push(&terminal(ChatOutputStatus::Completed)).unwrap();
+
+        let (output, displayed_text, _, execute_tools) = state.finish().unwrap();
+        assert_eq!(output.text().as_deref(), Some("Paris"));
+        assert!(displayed_text);
+        assert!(execute_tools);
+    }
+
+    #[test]
+    fn final_snapshot_supplies_text_when_no_delta_was_streamed() {
+        let mut state = CliStreamState::default();
+        state.push(&metadata()).unwrap();
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemCompleted {
+                    output_index: 0,
+                    item: message("Madrid"),
+                },
+            ))
+            .unwrap();
+        state.push(&terminal(ChatOutputStatus::Completed)).unwrap();
+
+        let (output, displayed_text, _, _) = state.finish().unwrap();
+        assert_eq!(output.text().as_deref(), Some("Madrid"));
+        assert!(!displayed_text);
+    }
+
+    #[test]
+    fn structured_reasoning_stays_separate_from_answer_text() {
+        let mut state = CliStreamState::default();
+        state.push(&metadata()).unwrap();
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemStarted {
+                    output_index: 0,
+                    item: ChatOutputItem::Reasoning(ChatReasoningItem {
+                        id: Some("reasoning_1".into()),
+                        summary: vec![ChatReasoningPart::text("")],
+                        content: Vec::new(),
+                        encrypted_content: None,
+                        signature: None,
+                        status: Some(ChatOutputStatus::Completed),
+                        extensions: Default::default(),
+                    }),
+                },
+            ))
+            .unwrap();
+        let reasoning_delta = StreamChunk::Structured(StructuredStreamEvent::ReasoningPartDelta {
+            output_index: 0,
+            part: ReasoningPartKind::Summary,
+            part_index: 0,
+            delta: "thinking".into(),
+        });
+        assert_eq!(
+            state.push(&reasoning_delta).unwrap(),
+            Some(StreamDisplayDelta::Thinking("thinking"))
+        );
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemCompleted {
+                    output_index: 0,
+                    item: ChatOutputItem::Reasoning(ChatReasoningItem {
+                        id: Some("reasoning_1".into()),
+                        summary: vec![ChatReasoningPart::text("thinking")],
+                        content: Vec::new(),
+                        encrypted_content: None,
+                        signature: None,
+                        status: Some(ChatOutputStatus::Completed),
+                        extensions: Default::default(),
+                    }),
+                },
+            ))
+            .unwrap();
+        state.push(&terminal(ChatOutputStatus::Completed)).unwrap();
+
+        let (output, _, displayed_thinking, _) = state.finish().unwrap();
+        assert_eq!(output.thinking().as_deref(), Some("thinking"));
+        assert_eq!(output.text(), None);
+        assert!(displayed_thinking);
+    }
+
+    #[test]
+    fn structured_mode_ignores_legacy_display_projections() {
+        let mut state = CliStreamState::default();
+        state.push(&metadata()).unwrap();
+        assert_eq!(
+            state.push(&StreamChunk::Text("duplicate".into())).unwrap(),
+            None
+        );
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemCompleted {
+                    output_index: 0,
+                    item: message("canonical"),
+                },
+            ))
+            .unwrap();
+        state.push(&terminal(ChatOutputStatus::Completed)).unwrap();
+
+        let (output, displayed_text, _, _) = state.finish().unwrap();
+        assert_eq!(output.text().as_deref(), Some("canonical"));
+        assert!(!displayed_text);
+    }
+
+    #[test]
+    fn stream_without_terminal_is_not_a_successful_empty_response() {
+        let mut state = CliStreamState::default();
+        state.push(&metadata()).unwrap();
+        let error = state.finish().unwrap_err();
+        assert!(error.to_string().contains("non-terminal status"));
+    }
+
+    #[test]
+    fn structured_function_call_is_retained_once_and_enabled_after_completion() {
+        use querymt::chat::ChatFunctionCallItem;
+
+        let call = ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+            item_id: Some("item_1".into()),
+            call_id: "call_1".into(),
+            name: "distance".into(),
+            arguments: r#"{"from":"Madrid","to":"Paris"}"#.into(),
+            status: Some(ChatOutputStatus::Completed),
+            extensions: Default::default(),
+        });
+        let mut state = CliStreamState::default();
+        state.push(&metadata()).unwrap();
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemCompleted {
+                    output_index: 0,
+                    item: call.clone(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            state
+                .push(&StreamChunk::ToolUseComplete {
+                    index: 0,
+                    tool_call: querymt::ToolCall {
+                        id: "call_1".into(),
+                        call_type: "function".into(),
+                        function: querymt::FunctionCall {
+                            name: "distance".into(),
+                            arguments: r#"{"from":"Madrid","to":"Paris"}"#.into(),
+                        },
+                    },
+                })
+                .unwrap(),
+            None
+        );
+        state.push(&terminal(ChatOutputStatus::Completed)).unwrap();
+
+        let (output, _, _, execute_tools) = state.finish().unwrap();
+        let calls = output.tool_calls().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert!(execute_tools);
+    }
+
+    #[test]
+    fn incomplete_response_retains_partial_output_but_disables_tools() {
+        let mut state = CliStreamState::default();
+        state.push(&metadata()).unwrap();
+        state
+            .push(&StreamChunk::Structured(
+                StructuredStreamEvent::ItemCompleted {
+                    output_index: 0,
+                    item: message("partial"),
+                },
+            ))
+            .unwrap();
+        state.push(&terminal(ChatOutputStatus::Incomplete)).unwrap();
+
+        let (output, _, _, execute_tools) = state.finish().unwrap();
+        assert_eq!(output.text().as_deref(), Some("partial"));
+        assert!(!execute_tools);
+    }
+
+    #[test]
+    fn legacy_streams_still_render_and_accumulate() {
+        let mut state = CliStreamState::default();
+        assert_eq!(
+            state.push(&StreamChunk::Text("legacy".into())).unwrap(),
+            Some(StreamDisplayDelta::Text("legacy"))
+        );
+        state
+            .push(&StreamChunk::Done {
+                finish_reason: FinishReason::Stop,
+            })
+            .unwrap();
+
+        let (output, displayed_text, _, execute_tools) = state.finish().unwrap();
+        assert_eq!(output.text().as_deref(), Some("legacy"));
+        assert!(displayed_text);
+        assert!(execute_tools);
+    }
 }
 
 /// Handle piped input or single-shot chat

@@ -4,7 +4,7 @@ use crate::tools::{
     CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError, ToolExecutionClass,
 };
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 pub struct CreateTaskTool;
@@ -69,7 +69,7 @@ impl ToolTrait for CreateTaskTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         // Validate arguments
         let kind_str = args["kind"]
             .as_str()
@@ -93,9 +93,9 @@ impl ToolTrait for CreateTaskTool {
             .await
             .map_err(|error| ToolError::SessionError(error.to_string()))?;
         context.emit_event(crate::events::AgentEventKind::TaskCreated { task: task.clone() });
-        Ok(vec![Content::text(
+        Ok(vec![ToolResultPart::text(
             serde_json::to_string_pretty(&task)
-                .map_err(|error| ToolError::SessionError(error.to_string()))?,
+                .map_err(|error| ToolError::SessionError(error.to_string()))?
         )])
     }
 }

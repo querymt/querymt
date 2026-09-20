@@ -229,7 +229,7 @@ mod tests {
     use super::*;
     use kameo::error::RemoteSendError;
     use kameo::remote::messaging::SwarmRequest;
-    use querymt::chat::{ChatMessage, Content};
+    use querymt::chat::{ChatInputPart, ChatMessage, MediaKind, MediaPart, MediaSource};
     use std::borrow::Cow;
 
     fn tell_request<T: Serialize>(message: &T) -> SwarmRequest {
@@ -243,6 +243,18 @@ mod tests {
         }
     }
 
+    /// Build an inline PNG image input part.
+    fn png_part(data: Vec<u8>) -> ChatInputPart {
+        ChatInputPart::attachment(
+            MediaPart::new(
+                MediaKind::Image,
+                Some("image/png".parse().expect("valid media type")),
+                MediaSource::Inline { data },
+            )
+            .expect("valid inline attachment"),
+        )
+    }
+
     fn wire_bytes(request: &SwarmRequest) -> Vec<u8> {
         cbor4ii::serde::to_vec(Vec::new(), request).unwrap()
     }
@@ -250,14 +262,8 @@ mod tests {
     #[test]
     fn encoded_envelope_size_matches_the_real_cbor_codec() {
         let messages = vec![
-            ChatMessage::from_user(vec![Content::image(
-                "image/png",
-                (0..258_708).map(|i| (i % 256) as u8).collect(),
-            )]),
-            ChatMessage::from_user(vec![Content::image(
-                "image/png",
-                (0..250_180).map(|i| (i % 256) as u8).collect(),
-            )]),
+            ChatMessage::from_user_parts(vec![png_part((0..258_708).map(|i| (i % 256) as u8).collect())]),
+            ChatMessage::from_user_parts(vec![png_part((0..250_180).map(|i| (i % 256) as u8).collect())]),
         ];
         let request = tell_request(&messages);
         let actual_size = wire_bytes(&request).len() as u64;

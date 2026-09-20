@@ -7,7 +7,7 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -170,7 +170,7 @@ impl HTTPChatProvider for Deepseek {
         openai_chat_request(&cfg, messages, tools)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 
@@ -276,7 +276,7 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 #[cfg(test)]
 mod tests {
     use super::Deepseek;
-    use querymt::chat::{ChatMessage, Content, http::HTTPChatProvider};
+    use querymt::chat::{ChatMessage, ToolResultPart, http::HTTPChatProvider};
     use serde_json::Value;
 
     #[test]
@@ -295,7 +295,7 @@ mod tests {
                     "call_1".to_string(),
                     Some("ls".to_string()),
                     false,
-                    vec![Content::text("specs.md")],
+                    vec![ToolResultPart::text("specs.md")],
                 )
                 .text("<run-objective>Collect benchmark data</run-objective>")
                 .build(),

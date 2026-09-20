@@ -226,7 +226,7 @@ pub struct PostToolUseRequest {
     pub permission_mode: String,
     pub tool_name: String,
     pub tool_input: Value,
-    pub content: Vec<querymt::chat::Content>,
+    pub content: Vec<querymt::chat::ToolResultPart>,
     pub is_error: bool,
     pub execution_is_error: bool,
     pub tool_source: String,
@@ -235,7 +235,7 @@ pub struct PostToolUseRequest {
 
 #[derive(Debug, Clone, Default)]
 pub struct PostToolUseResult {
-    pub content: Option<Vec<querymt::chat::Content>>,
+    pub content: Option<Vec<querymt::chat::ToolResultPart>>,
     pub is_error: Option<bool>,
     pub should_block: bool,
     pub block_reason: Option<String>,
@@ -962,7 +962,9 @@ impl Hooks {
                 .await?;
             result.notices.extend(outcome.notices);
             if let Some(reason) = outcome.hard_block_reason {
-                current_content = vec![querymt::chat::Content::text(reason.clone())];
+                current_content = vec![querymt::chat::ToolResultPart::Text {
+                    text: reason.clone(),
+                }];
                 current_is_error = true;
                 result.should_block = true;
                 result.block_reason.get_or_insert(reason);
@@ -988,7 +990,7 @@ impl Hooks {
                             match content
                                 .into_iter()
                                 .map(serde_json::from_value)
-                                .collect::<Result<Vec<querymt::chat::Content>, _>>()
+                                .collect::<Result<Vec<querymt::chat::ToolResultPart>, _>>()
                             {
                                 Ok(content) => current_content = content,
                                 Err(err) => result.notices.push(control_notice(
@@ -1009,7 +1011,9 @@ impl Hooks {
                             .reason
                             .clone()
                             .unwrap_or_else(|| "tool result blocked by hook".to_string());
-                        current_content = vec![querymt::chat::Content::text(reason.clone())];
+                        current_content = vec![querymt::chat::ToolResultPart::Text {
+                            text: reason.clone(),
+                        }];
                         current_is_error = true;
                         result.should_block = true;
                         result.block_reason.get_or_insert(reason);
@@ -1019,7 +1023,9 @@ impl Hooks {
                             .stop_reason
                             .or(parsed.reason)
                             .unwrap_or_else(|| "hook suppressed tool result".to_string());
-                        current_content = vec![querymt::chat::Content::text(reason.clone())];
+                        current_content = vec![querymt::chat::ToolResultPart::Text {
+                            text: reason.clone(),
+                        }];
                         current_is_error = true;
                         result.stop_reason.get_or_insert(reason);
                     }
@@ -1823,14 +1829,9 @@ fn append_request_context(
     if let Some(last) = messages.last_mut()
         && last.role == querymt::chat::ChatRole::User
     {
-        last.content.push(querymt::chat::Content::text(rendered));
+        last.push_input_part(querymt::chat::ChatInputPart::text(rendered));
     } else {
-        messages.push(querymt::chat::ChatMessage {
-            role: querymt::chat::ChatRole::User,
-            content: vec![querymt::chat::Content::text(rendered)],
-            cache: None,
-            output: None,
-        });
+        messages.push(querymt::chat::ChatMessage::user().text(rendered).build());
     }
 }
 
@@ -1840,21 +1841,25 @@ fn validate_message_projection(messages: &[querymt::chat::ChatMessage]) -> anyho
     }
     let mut pending_tool_ids = std::collections::BTreeSet::new();
     for message in messages {
-        if message.content.is_empty() {
+        if message.input_parts().is_empty() && message.output().is_none() {
             anyhow::bail!("projection contains an empty message");
         }
-        for content in &message.content {
-            match content {
-                querymt::chat::Content::ToolUse { id, .. } => {
-                    if !pending_tool_ids.insert(id.clone()) {
-                        anyhow::bail!("duplicate tool call id '{}'", id);
-                    }
+        // Generated calls come from structured output.
+        if let Some(output) = message.output() {
+            for item in &output.items {
+                if let querymt::chat::ChatOutputItem::FunctionCall(call) = item
+                    && !pending_tool_ids.insert(call.call_id.clone())
+                {
+                    anyhow::bail!("duplicate tool call id '{}'", call.call_id);
                 }
-                querymt::chat::Content::ToolResult { id, .. } if !pending_tool_ids.remove(id) => {
-                    anyhow::bail!("unmatched tool result id '{}'", id);
-                }
-                querymt::chat::Content::ToolResult { .. } => {}
-                _ => {}
+            }
+        }
+        // Supplied results are canonical input parts.
+        for part in message.input_parts() {
+            if let querymt::chat::ChatInputPart::ToolResult(result) = part
+                && !pending_tool_ids.remove(&result.call_id)
+            {
+                anyhow::bail!("unmatched tool result id '{}'", result.call_id);
             }
         }
     }
@@ -1871,17 +1876,22 @@ fn preserves_tool_identities(
     fn identities(
         messages: &[querymt::chat::ChatMessage],
     ) -> std::collections::BTreeSet<(String, String)> {
-        messages
-            .iter()
-            .flat_map(|message| &message.content)
-            .filter_map(|content| match content {
-                querymt::chat::Content::ToolUse { id, .. } => Some(("use".to_string(), id.clone())),
-                querymt::chat::Content::ToolResult { id, .. } => {
-                    Some(("result".to_string(), id.clone()))
+        let mut ids = std::collections::BTreeSet::new();
+        for message in messages {
+            if let Some(output) = message.output() {
+                for item in &output.items {
+                    if let querymt::chat::ChatOutputItem::FunctionCall(call) = item {
+                        ids.insert(("use".to_string(), call.call_id.clone()));
+                    }
                 }
-                _ => None,
-            })
-            .collect()
+            }
+            for part in message.input_parts() {
+                if let querymt::chat::ChatInputPart::ToolResult(result) = part {
+                    ids.insert(("result".to_string(), result.call_id.clone()));
+                }
+            }
+        }
+        ids
     }
     identities(candidate).is_subset(&identities(current))
 }
@@ -1889,12 +1899,22 @@ fn preserves_tool_identities(
 fn estimate_chat_tokens(messages: &[querymt::chat::ChatMessage]) -> usize {
     messages
         .iter()
-        .flat_map(|message| &message.content)
-        .map(|content| serde_json::to_vec(content).map_or(0, |bytes| bytes.len() / 4))
+        .map(|message| {
+            let parts = message.input_parts();
+            let parts_bytes: usize = parts
+                .iter()
+                .map(|part| serde_json::to_vec(part).map_or(0, |bytes| bytes.len() / 4))
+                .sum();
+            let output_bytes = message
+                .output()
+                .and_then(|output| serde_json::to_vec(output).ok())
+                .map_or(0, |bytes| bytes.len() / 4);
+            parts_bytes + output_bytes
+        })
         .sum()
 }
 
-fn flatten_content(content: &[querymt::chat::Content]) -> String {
+fn flatten_content(content: &[querymt::chat::ToolResultPart]) -> String {
     content
         .iter()
         .filter_map(|block| block.as_text())

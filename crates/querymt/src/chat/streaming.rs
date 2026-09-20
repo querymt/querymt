@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     ChatFunctionCallItem, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,
-    ChatOutputRepresentation, ChatOutputStatus, ChatReasoningPart, FinishReason, StreamChunk,
+    ChatOutputStatus, ChatReasoningPart, FinishReason, StreamChunk, empty_message_part,
 };
 use crate::Usage;
 
@@ -29,10 +29,26 @@ pub enum StructuredStreamEvent {
         output_index: usize,
         item: ChatOutputItem,
     },
+    /// A new indexed message content part was opened by the provider.
+    ///
+    /// Providers emit this for `response.content_part.added` so that a delta
+    /// can address a part that already exists, rather than requiring the
+    /// accumulator to synthesize it from an item snapshot that omitted it.
+    MessagePartStarted {
+        output_index: usize,
+        content_index: usize,
+        part: ChatMessagePart,
+    },
     MessagePartDelta {
         output_index: usize,
         content_index: usize,
         delta: ChatMessagePartDelta,
+    },
+    /// A new indexed reasoning part was opened by the provider.
+    ReasoningPartStarted {
+        output_index: usize,
+        part: ReasoningPartKind,
+        part_index: usize,
     },
     ReasoningPartDelta {
         output_index: usize,
@@ -81,6 +97,54 @@ enum AccumulationMode {
     Structured,
 }
 
+/// Explicit outcome of finalizing a canonical accumulation attempt.
+///
+/// Every variant carries the available canonical output, so partial items from
+/// incomplete or failed responses remain inspectable. Only `Completed` output is
+/// authorized for local tool execution; unfinished calls in the other variants
+/// are never executable.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChatStreamFinish {
+    /// The response completed successfully.
+    Completed(ChatOutput),
+    /// The provider reported an incomplete response (for example an output
+    /// token limit). Partial output is retained with the terminal detail.
+    Incomplete {
+        output: ChatOutput,
+        detail: Option<String>,
+    },
+    /// The response failed, or the stream ended without a valid terminal.
+    Failed {
+        output: ChatOutput,
+        error: ChatStreamAccumulatorError,
+    },
+}
+
+impl ChatStreamFinish {
+    /// Borrow the available canonical output, whether complete or partial.
+    pub fn output(&self) -> &ChatOutput {
+        match self {
+            ChatStreamFinish::Completed(output)
+            | ChatStreamFinish::Incomplete { output, .. }
+            | ChatStreamFinish::Failed { output, .. } => output,
+        }
+    }
+
+    /// Consume the outcome, returning the available canonical output.
+    pub fn into_output(self) -> ChatOutput {
+        match self {
+            ChatStreamFinish::Completed(output)
+            | ChatStreamFinish::Incomplete { output, .. }
+            | ChatStreamFinish::Failed { output, .. } => output,
+        }
+    }
+
+    /// Whether the response completed successfully.
+    pub fn is_completed(&self) -> bool {
+        matches!(self, ChatStreamFinish::Completed(_))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChatStreamAccumulatorError {
     #[error("structured response metadata must precede semantic output")]
@@ -93,6 +157,13 @@ pub enum ChatStreamAccumulatorError {
         "structured message delta references missing content index {content_index} at output index {output_index}"
     )]
     MissingMessagePart {
+        output_index: usize,
+        content_index: usize,
+    },
+    #[error(
+        "structured message part at output index {output_index}, content index {content_index} was started more than once"
+    )]
+    ConflictingPartStart {
         output_index: usize,
         content_index: usize,
     },
@@ -201,7 +272,6 @@ impl ChatStreamAccumulator {
                 self.output.usage.clone_from(usage);
                 self.output.finish_reason = *finish_reason;
                 self.output.provenance.clone_from(provenance);
-                self.output.representation = ChatOutputRepresentation::Structured;
             }
             StreamChunk::Structured(event) => {
                 if self.mode != AccumulationMode::Structured {
@@ -271,37 +341,80 @@ impl ChatStreamAccumulator {
         output
     }
 
-    /// Validate semantic completion and return the attempt output.
-    pub fn finish(&self) -> Result<ChatOutput, ChatStreamAccumulatorError> {
-        if !self.terminal_seen {
-            return Err(ChatStreamAccumulatorError::PrematureEof);
-        }
-        if self.mode == AccumulationMode::Legacy && !self.pending_legacy_calls.is_empty() {
-            return Err(ChatStreamAccumulatorError::IncompleteToolCalls(
-                self.pending_legacy_calls.iter().copied().collect(),
-            ));
-        }
-        if self.mode == AccumulationMode::Structured {
-            let unfinished: Vec<usize> = self
-                .structured_items
-                .keys()
-                .filter(|index| !self.completed_items.contains_key(index))
-                .copied()
-                .collect();
-            if self.output.status == Some(ChatOutputStatus::Completed) && !unfinished.is_empty() {
-                return Err(ChatStreamAccumulatorError::IncompleteItems(unfinished));
+    /// Consume the accumulator and finalize into an explicit outcome.
+    ///
+    /// Finalization consumes the accumulator so callers cannot keep appending
+    /// after interpreting a terminal outcome. Successful completion carries the
+    /// canonical output; incomplete and failed outcomes retain the available
+    /// partial output alongside the classified terminal cause so partial items
+    /// remain inspectable while unfinished calls are never executable.
+    pub fn finish(self) -> ChatStreamFinish {
+        let output = self.output();
+        match self.output.status {
+            Some(ChatOutputStatus::Completed) => {
+                if self.mode == AccumulationMode::Legacy && !self.pending_legacy_calls.is_empty() {
+                    return ChatStreamFinish::Failed {
+                        error: ChatStreamAccumulatorError::IncompleteToolCalls(
+                            self.pending_legacy_calls.iter().copied().collect(),
+                        ),
+                        output,
+                    };
+                }
+                if self.mode == AccumulationMode::Structured {
+                    let unfinished: Vec<usize> = self
+                        .structured_items
+                        .keys()
+                        .filter(|index| !self.completed_items.contains_key(index))
+                        .copied()
+                        .collect();
+                    if !unfinished.is_empty() {
+                        return ChatStreamFinish::Failed {
+                            error: ChatStreamAccumulatorError::IncompleteItems(unfinished),
+                            output,
+                        };
+                    }
+                }
+                ChatStreamFinish::Completed(output)
+            }
+            Some(ChatOutputStatus::Incomplete) => ChatStreamFinish::Incomplete {
+                output,
+                detail: self.terminal_detail,
+            },
+            Some(ChatOutputStatus::Failed) => ChatStreamFinish::Failed {
+                output,
+                error: ChatStreamAccumulatorError::FailedResponse(self.terminal_detail),
+            },
+            Some(status) => ChatStreamFinish::Failed {
+                output,
+                error: ChatStreamAccumulatorError::InvalidTerminalStatus(status),
+            },
+            None => {
+                // An unfinished local-call set is a distinct terminal cause.
+                if self.mode == AccumulationMode::Legacy && !self.pending_legacy_calls.is_empty() {
+                    return ChatStreamFinish::Failed {
+                        output,
+                        error: ChatStreamAccumulatorError::IncompleteToolCalls(
+                            self.pending_legacy_calls.iter().copied().collect(),
+                        ),
+                    };
+                }
+                ChatStreamFinish::Failed {
+                    output,
+                    error: ChatStreamAccumulatorError::PrematureEof,
+                }
             }
         }
-        match self.output.status {
-            Some(ChatOutputStatus::Completed) => Ok(self.output()),
-            Some(ChatOutputStatus::Incomplete) => Err(
-                ChatStreamAccumulatorError::IncompleteResponse(self.terminal_detail.clone()),
-            ),
-            Some(ChatOutputStatus::Failed) => Err(ChatStreamAccumulatorError::FailedResponse(
-                self.terminal_detail.clone(),
-            )),
-            Some(status) => Err(ChatStreamAccumulatorError::InvalidTerminalStatus(status)),
-            None => Err(ChatStreamAccumulatorError::PrematureEof),
+    }
+
+    /// Finalize and require successful completion, discarding partial output on
+    /// incomplete or failed outcomes.
+    pub fn finish_success(self) -> Result<ChatOutput, ChatStreamAccumulatorError> {
+        match self.finish() {
+            ChatStreamFinish::Completed(output) => Ok(output),
+            ChatStreamFinish::Incomplete { detail, .. } => {
+                Err(ChatStreamAccumulatorError::IncompleteResponse(detail))
+            }
+            ChatStreamFinish::Failed { error, .. } => Err(error),
         }
     }
 
@@ -313,7 +426,6 @@ impl ChatStreamAccumulator {
     fn select_legacy(&mut self) {
         if self.mode == AccumulationMode::Undecided {
             self.mode = AccumulationMode::Legacy;
-            self.output.representation = ChatOutputRepresentation::LegacyProjection;
         }
     }
 
@@ -353,6 +465,33 @@ impl ChatStreamAccumulator {
                 self.structured_items.insert(*output_index, item.clone());
                 self.completed_items.insert(*output_index, item.clone());
             }
+            StructuredStreamEvent::MessagePartStarted {
+                output_index,
+                content_index,
+                part,
+            } => {
+                self.ensure_item_open(*output_index)?;
+                let item = self
+                    .structured_items
+                    .get_mut(output_index)
+                    .ok_or(ChatStreamAccumulatorError::MissingItem(*output_index))?;
+                let ChatOutputItem::Message(message) = item else {
+                    return Err(ChatStreamAccumulatorError::ExpectedMessage(*output_index));
+                };
+                // Extend with placeholders so an out-of-order or skipped
+                // part-added event cannot leave a hole; the declared part is
+                // then written at its declared index.
+                while message.parts.len() <= *content_index {
+                    message.parts.push(empty_message_part());
+                }
+                if message.parts.len() > *content_index + 1 {
+                    return Err(ChatStreamAccumulatorError::ConflictingPartStart {
+                        output_index: *output_index,
+                        content_index: *content_index,
+                    });
+                }
+                message.parts[*content_index] = part.clone();
+            }
             StructuredStreamEvent::MessagePartDelta {
                 output_index,
                 content_index,
@@ -366,12 +505,12 @@ impl ChatStreamAccumulator {
                 let ChatOutputItem::Message(message) = item else {
                     return Err(ChatStreamAccumulatorError::ExpectedMessage(*output_index));
                 };
-                let part = message.parts.get_mut(*content_index).ok_or(
-                    ChatStreamAccumulatorError::MissingMessagePart {
-                        output_index: *output_index,
-                        content_index: *content_index,
-                    },
-                )?;
+                // Create the indexed part on demand when the provider streamed
+                // a delta without a preceding part-added event.
+                while message.parts.len() <= *content_index {
+                    message.parts.push(empty_message_part());
+                }
+                let part = &mut message.parts[*content_index];
                 match (part, delta) {
                     (ChatMessagePart::Text { text, .. }, ChatMessagePartDelta::Text { delta }) => {
                         text.push_str(delta);
@@ -380,6 +519,9 @@ impl ChatStreamAccumulator {
                         ChatMessagePart::Refusal { refusal, .. },
                         ChatMessagePartDelta::Refusal { delta },
                     ) => refusal.push_str(delta),
+                    (placeholder, delta) if placeholder.is_empty_placeholder() => {
+                        *placeholder = placeholder.clone().into_message_part(delta);
+                    }
                     _ => {
                         return Err(ChatStreamAccumulatorError::MessagePartTypeMismatch {
                             output_index: *output_index,
@@ -387,6 +529,28 @@ impl ChatStreamAccumulator {
                         });
                     }
                 }
+            }
+            StructuredStreamEvent::ReasoningPartStarted {
+                output_index,
+                part,
+                part_index,
+            } => {
+                self.ensure_item_open(*output_index)?;
+                let item = self
+                    .structured_items
+                    .get_mut(output_index)
+                    .ok_or(ChatStreamAccumulatorError::MissingItem(*output_index))?;
+                let ChatOutputItem::Reasoning(reasoning) = item else {
+                    return Err(ChatStreamAccumulatorError::ExpectedReasoning(*output_index));
+                };
+                let parts = match part {
+                    ReasoningPartKind::Summary => &mut reasoning.summary,
+                    ReasoningPartKind::Content => &mut reasoning.content,
+                };
+                while parts.len() <= *part_index {
+                    parts.push(ChatReasoningPart::text(String::new()));
+                }
+                parts[*part_index].text.clear();
             }
             StructuredStreamEvent::ReasoningPartDelta {
                 output_index,
@@ -406,13 +570,10 @@ impl ChatStreamAccumulator {
                     ReasoningPartKind::Summary => &mut reasoning.summary,
                     ReasoningPartKind::Content => &mut reasoning.content,
                 };
-                let part = parts.get_mut(*part_index).ok_or(
-                    ChatStreamAccumulatorError::MissingReasoningPart {
-                        output_index: *output_index,
-                        part_index: *part_index,
-                    },
-                )?;
-                part.text.push_str(delta);
+                while parts.len() <= *part_index {
+                    parts.push(ChatReasoningPart::text(String::new()));
+                }
+                parts[*part_index].text.push_str(delta);
             }
             StructuredStreamEvent::FunctionArgumentsDelta {
                 output_index,
@@ -458,6 +619,73 @@ impl ChatStreamAccumulator {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Explicit adapter that projects canonical output into legacy/UI chunks.
+///
+/// Legacy display, UI, and tool-oriented consumers attach through this adapter
+/// rather than receiving compatibility events interleaved with canonical ones.
+/// The projection exposes visible text, visible reasoning, supported local
+/// function calls, usage, and a terminal `Done`; it never interprets opaque
+/// items as executable content and is never fed back into canonical
+/// accumulation.
+pub struct LegacyStreamProjection;
+
+impl LegacyStreamProjection {
+    /// Project visible canonical content into legacy UI chunks.
+    ///
+    /// Calls are projected only for completed responses, and `Done` is emitted
+    /// only for a successful terminal response. Incomplete or failed output stays
+    /// inspectable without being misrepresented as executable completion.
+    pub fn project(output: &ChatOutput) -> Vec<StreamChunk> {
+        let mut chunks = Vec::new();
+
+        for item in &output.items {
+            match item {
+                ChatOutputItem::Message(message) => {
+                    for part in &message.parts {
+                        match part {
+                            ChatMessagePart::Text { text, .. } if !text.is_empty() => {
+                                chunks.push(StreamChunk::Text(text.clone()));
+                            }
+                            ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
+                                chunks.push(StreamChunk::Text(refusal.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                ChatOutputItem::Reasoning(reasoning) => {
+                    for part in reasoning.summary.iter().chain(&reasoning.content) {
+                        if !part.text.is_empty() {
+                            chunks.push(StreamChunk::Thinking(part.text.clone()));
+                        }
+                    }
+                }
+                ChatOutputItem::FunctionCall(call) if output.is_successful() => {
+                    if call.parse_arguments().is_ok() {
+                        chunks.push(StreamChunk::ToolUseComplete {
+                            index: chunks.len(),
+                            tool_call: call.to_tool_call(),
+                        });
+                    }
+                }
+                ChatOutputItem::FunctionCall(_) | ChatOutputItem::Opaque(_) => {}
+            }
+        }
+
+        if let Some(usage) = &output.usage {
+            chunks.push(StreamChunk::Usage(usage.clone()));
+        }
+
+        if output.is_successful() {
+            chunks.push(StreamChunk::Done {
+                finish_reason: output.finish_reason.unwrap_or(FinishReason::Stop),
+            });
+        }
+
+        chunks
     }
 }
 
@@ -770,14 +998,29 @@ mod tests {
 
     #[test]
     fn terminal_validation_distinguishes_eof_incomplete_failure_and_unfinished_items() {
+        // Metadata alone never reaches a terminal, so finalization reports the
+        // observable status rather than a success.
         let mut premature = ChatStreamAccumulator::new();
         premature
             .push(&StreamChunk::Structured(metadata()))
             .unwrap();
-        assert_eq!(
-            premature.finish(),
-            Err(ChatStreamAccumulatorError::PrematureEof)
-        );
+        match premature.finish() {
+            ChatStreamFinish::Failed { error, .. } => assert_eq!(
+                error,
+                ChatStreamAccumulatorError::InvalidTerminalStatus(ChatOutputStatus::InProgress)
+            ),
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
+
+        // No events at all is a premature EOF.
+        let empty = ChatStreamAccumulator::new();
+        match empty.finish() {
+            ChatStreamFinish::Failed { error, output } => {
+                assert_eq!(error, ChatStreamAccumulatorError::PrematureEof);
+                assert!(output.items.is_empty());
+            }
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
 
         let mut unfinished = ChatStreamAccumulator::new();
         unfinished
@@ -797,35 +1040,38 @@ mod tests {
                 None,
             )))
             .unwrap();
-        assert_eq!(
-            unfinished.finish(),
-            Err(ChatStreamAccumulatorError::IncompleteItems(vec![4]))
-        );
+        match unfinished.finish() {
+            ChatStreamFinish::Failed { error, output } => {
+                assert_eq!(error, ChatStreamAccumulatorError::IncompleteItems(vec![4]));
+                // Partial items remain inspectable in the failed outcome.
+                assert_eq!(output.items, vec![message("partial")]);
+            }
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
 
         for (status, expected) in [
-            (
-                ChatOutputStatus::Incomplete,
-                ChatStreamAccumulatorError::IncompleteResponse(Some("max_output_tokens".into())),
-            ),
-            (
-                ChatOutputStatus::Failed,
-                ChatStreamAccumulatorError::FailedResponse(Some("provider_error".into())),
-            ),
+            (ChatOutputStatus::Incomplete, "max_output_tokens"),
+            (ChatOutputStatus::Failed, "provider_error"),
         ] {
             let mut accumulator = ChatStreamAccumulator::new();
             accumulator
                 .push(&StreamChunk::Structured(metadata()))
                 .unwrap();
             accumulator
-                .push(&StreamChunk::Structured(terminal(
-                    status,
-                    Some(match status {
-                        ChatOutputStatus::Incomplete => "max_output_tokens",
-                        _ => "provider_error",
-                    }),
-                )))
+                .push(&StreamChunk::Structured(terminal(status, Some(expected))))
                 .unwrap();
-            assert_eq!(accumulator.finish(), Err(expected));
+            match accumulator.finish() {
+                ChatStreamFinish::Incomplete { detail, .. } => {
+                    assert_eq!(detail.as_deref(), Some(expected));
+                }
+                ChatStreamFinish::Failed { error, .. } => {
+                    assert_eq!(
+                        error,
+                        ChatStreamAccumulatorError::FailedResponse(Some(expected.to_string()))
+                    );
+                }
+                other => panic!("expected non-success outcome, got {other:?}"),
+            }
         }
     }
 
@@ -844,10 +1090,13 @@ mod tests {
                 finish_reason: FinishReason::ToolCalls,
             })
             .unwrap();
-        assert_eq!(
-            accumulator.finish(),
-            Err(ChatStreamAccumulatorError::IncompleteToolCalls(vec![3]))
-        );
+        match accumulator.finish() {
+            ChatStreamFinish::Failed { error, .. } => assert_eq!(
+                error,
+                ChatStreamAccumulatorError::IncompleteToolCalls(vec![3])
+            ),
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
     }
 
     #[test]
@@ -884,7 +1133,7 @@ mod tests {
             )))
             .unwrap();
 
-        let output = accumulator.finish().unwrap();
+        let output = accumulator.finish_success().unwrap();
         assert_eq!(output.items, vec![message("retry output")]);
         assert_eq!(output.text().as_deref(), Some("retry output"));
     }

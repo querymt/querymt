@@ -715,6 +715,8 @@ impl SessionStore for SqliteStorage {
                 name,
                 provider,
                 model,
+                protocol: String::new(),
+                endpoint: String::new(),
                 params: parse_llm_params(&params_str)?,
                 created_at: OffsetDateTime::parse(
                     &now,

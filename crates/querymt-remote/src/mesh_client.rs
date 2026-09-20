@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use kameo::actor::Spawn;
 use libp2p::PeerId;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatProvider, StreamChunk, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -423,7 +423,7 @@ impl ChatProvider for MeshChatProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn querymt::chat::ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         self.inner.chat_with_tools(messages, tools).await
     }
 

@@ -1,6 +1,6 @@
 use crate::{
     HTTPLLMProvider, LLMProvider, Tool,
-    chat::{ChatMessage, ChatProvider, ChatResponse, StreamChunk},
+    chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -39,7 +39,7 @@ impl LLMProviderFromHTTP {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         self.ensure_credential_fresh().await?;
 
         let req = self.inner.chat_request(messages, tools)?;
@@ -67,7 +67,7 @@ impl ChatProvider for LLMProviderFromHTTP {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         self.do_chat(messages, tools).await
     }
 

@@ -1,4 +1,4 @@
-use querymt::chat::{ChatMessage, ChatOutput, ChatRole, Content, FinishReason};
+use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, ToolResultPart};
 use std::sync::Arc;
 
 use crate::events::StopType;
@@ -163,12 +163,7 @@ impl ConversationContext {
     pub fn inject_message(&self, content: String) -> Self {
         let mut messages = Vec::from(&*self.messages);
 
-        let injected_msg = ChatMessage {
-            role: ChatRole::User,
-            content: vec![Content::text(content)],
-            cache: None,
-            output: None,
-        };
+        let injected_msg = ChatMessage::user().text(content).build();
 
         messages.push(injected_msg);
 
@@ -220,12 +215,7 @@ impl ConversationContext {
     pub fn fragment_messages(&self) -> Vec<ChatMessage> {
         self.fragments
             .iter()
-            .map(|fragment| ChatMessage {
-                role: ChatRole::User,
-                content: vec![Content::text(fragment.content.clone())],
-                cache: None,
-                output: None,
-            })
+            .map(|fragment| ChatMessage::user().text(fragment.content.clone()).build())
             .collect()
     }
 
@@ -240,12 +230,14 @@ impl ConversationContext {
         // resumed-turn feedback while still avoiding a message between tool use
         // and its immediately following result.
         if messages.last().is_some_and(|last| {
-            last.role == ChatRole::User && last.content.iter().any(Content::is_tool_result)
+            last.role == ChatRole::User && last.has_tool_result()
         }) {
             if let Some(mut latest) = messages.pop() {
-                latest
-                    .content
-                    .extend(fragments.into_iter().flat_map(|fragment| fragment.content));
+                for fragment in fragments {
+                    for part in fragment.input_parts() {
+                        latest.push_input_part(part);
+                    }
+                }
                 messages.push(latest);
             }
         } else if let Some(latest) = messages.pop() {
@@ -352,7 +344,7 @@ impl LlmResponse {
 #[derive(Debug, Clone)]
 pub struct ToolResult {
     pub call_id: String,
-    pub content: Vec<Content>,
+    pub content: Vec<querymt::chat::ToolResultPart>,
     pub is_error: bool,
     pub execution_is_error: bool,
     pub tool_source: String,
@@ -365,7 +357,7 @@ pub struct ToolResult {
 impl ToolResult {
     pub fn new(
         call_id: String,
-        content: Vec<Content>,
+        content: Vec<querymt::chat::ToolResultPart>,
         is_error: bool,
         tool_name: Option<String>,
         tool_arguments: Option<String>,
@@ -537,12 +529,7 @@ mod tests {
 
     #[test]
     fn request_messages_keep_latest_feedback_after_context_fragments() {
-        let latest = ChatMessage {
-            role: ChatRole::User,
-            content: vec![Content::text("Delegation completed")],
-            cache: None,
-            output: None,
-        };
+        let latest = ChatMessage::user().text("Delegation completed").build();
         let context = ConversationContext::new(
             Arc::from("session"),
             Arc::from([latest]),
@@ -564,15 +551,11 @@ mod tests {
 
     #[test]
     fn request_messages_append_fragments_after_tool_results() {
-        let latest = ChatMessage {
-            role: ChatRole::User,
-            content: vec![Content::tool_result(
-                "call-1".to_string(),
-                vec![Content::text("result")],
-            )],
-            cache: None,
-            output: None,
-        };
+        let latest = ChatMessage::user()
+            .part(querymt::chat::ChatInputPart::tool_result(
+                querymt::chat::ToolResult::text("call-1", "result"),
+            ))
+            .build();
         let context = ConversationContext::new(
             Arc::from("session"),
             Arc::from([latest]),
@@ -588,15 +571,15 @@ mod tests {
 
         let messages = context.request_messages();
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].content[0].is_tool_result());
-        assert_eq!(messages[0].content[1].as_text(), Some("objective"));
+        assert!(messages[0].input_parts()[0].is_tool_result());
+        assert_eq!(messages[0].input_parts()[1].as_text(), Some("objective"));
     }
 
     #[test]
     fn test_tool_result_with_snapshot() {
         let result = ToolResult::new(
             "call-123".to_string(),
-            vec![Content::text("tool output")],
+            vec![ToolResultPart::text("tool output")],
             false,
             Some("shell".to_string()),
             Some("{}".to_string()),
