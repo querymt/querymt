@@ -1373,7 +1373,7 @@ export enum DelegateReasoningEffort {
 	Max = "max",
 }
 
-export type DiscardQueuedInputResult =
+export type DiscardQueuedInputResult = 
 	| { status: "discarded", data: {
 	input_id: string;
 }}
