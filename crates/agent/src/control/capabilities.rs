@@ -88,6 +88,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/auth/setMethod".to_string(),
         "querymt/session/steer".to_string(),
         "querymt/session/queue".to_string(),
+        "querymt/session/discardQueuedInput".to_string(),
         "querymt/session/runtimeState".to_string(),
         "querymt/session/undo".to_string(),
         "querymt/session/redo".to_string(),

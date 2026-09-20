@@ -190,6 +190,10 @@ pub enum AgentEventKind {
         input_id: String,
         run_id: String,
     },
+    QueuedInputDiscarded {
+        input_id: String,
+        reason: String,
+    },
     ObjectiveInitialized {
         run_id: String,
         #[typeshare(serialized_as = "number")]

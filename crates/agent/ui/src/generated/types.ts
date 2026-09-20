@@ -63,6 +63,10 @@ export type AgentEventKind =
 	input_id: string;
 	run_id: string;
 }}
+	| { type: "queued_input_discarded", data: {
+	input_id: string;
+	reason: string;
+}}
 	| { type: "objective_initialized", data: {
 	run_id: string;
 	revision: number;
@@ -1368,6 +1372,14 @@ export enum DelegateReasoningEffort {
 	High = "high",
 	Max = "max",
 }
+
+export type DiscardQueuedInputResult =
+	| { status: "discarded", data: {
+	input_id: string;
+}}
+	| { status: "not_pending", data: {
+	input_id: string;
+}};
 
 /**
  * Whether an event must be persisted to the journal (durable) or is

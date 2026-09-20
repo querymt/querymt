@@ -1,6 +1,25 @@
 use super::*;
 
 #[tokio::test]
+async fn querymt_session_discard_queued_input_is_idempotent_when_not_pending() {
+    let f = HandleFixture::new().await;
+    register_test_session(&f, "test-session").await;
+
+    let result = ext_method_json(
+        &f.handle,
+        "querymt/session/discardQueuedInput",
+        serde_json::json!({
+            "session_id": "test-session",
+            "input_id": "missing-input"
+        }),
+    )
+    .await;
+
+    assert_eq!(result["status"], "not_pending");
+    assert_eq!(result["data"]["input_id"], "missing-input");
+}
+
+#[tokio::test]
 async fn querymt_session_undo_stack_returns_empty_stack_for_new_session() {
     let f = HandleFixture::new().await;
 

@@ -31,6 +31,7 @@ async fn test_querymt_capabilities_lists_control_surface() {
     for expected in [
         "querymt/session/steer",
         "querymt/session/queue",
+        "querymt/session/discardQueuedInput",
         "querymt/session/runtimeState",
         "querymt/session/undo",
         "querymt/session/redo",

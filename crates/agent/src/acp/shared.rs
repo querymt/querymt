@@ -480,6 +480,12 @@ pub fn input_state_from_event(
             notification.state = SessionInputState::Started;
             notification.run_id = Some(run_id.clone());
         }
+        AgentEventKind::QueuedInputDiscarded { input_id, reason } => {
+            notification.input_id.clone_from(input_id);
+            notification.delivery = SessionInputDelivery::Queue;
+            notification.state = SessionInputState::Discarded;
+            notification.reason = Some(reason.clone());
+        }
         _ => return None,
     }
     Some(notification)
@@ -500,7 +506,7 @@ fn normalize_querymt_ext_method(method: &str) -> &str {
 fn attach_before_querymt_ext_method(method: &str) -> bool {
     matches!(
         normalize_querymt_ext_method(method),
-        "querymt/session/steer" | "querymt/session/queue"
+        "querymt/session/steer" | "querymt/session/queue" | "querymt/session/discardQueuedInput"
     )
 }
 
@@ -510,6 +516,7 @@ fn querymt_session_id_from_request(method: &str, params: &serde_json::Value) -> 
         | "querymt/session/setDelegateModel"
         | "querymt/session/steer"
         | "querymt/session/queue"
+        | "querymt/session/discardQueuedInput"
         | "querymt/session/runtimeState" => params
             .get("session_id")
             .or_else(|| params.get("sessionId"))
@@ -1683,6 +1690,7 @@ mod tests {
             "_querymt/session/setDelegateModel",
             "querymt/session/steer",
             "_querymt/session/queue",
+            "querymt/session/discardQueuedInput",
             "querymt/session/runtimeState",
         ] {
             assert_eq!(
@@ -1778,6 +1786,20 @@ mod tests {
                     "delivery": "queue",
                     "state": "started",
                     "run_id": "run-2"
+                }),
+            ),
+            (
+                AgentEventKind::QueuedInputDiscarded {
+                    input_id: "input-3".into(),
+                    reason: "removed_by_user".into(),
+                },
+                serde_json::json!({
+                    "version": 1,
+                    "session_id": "s-1",
+                    "input_id": "input-3",
+                    "delivery": "queue",
+                    "state": "discarded",
+                    "reason": "removed_by_user"
                 }),
             ),
         ];

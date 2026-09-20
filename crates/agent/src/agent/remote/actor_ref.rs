@@ -265,6 +265,32 @@ impl SessionActorRef {
         }
     }
 
+    pub async fn discard_queued_input(
+        &self,
+        input_id: String,
+    ) -> Result<messages::DiscardQueuedInputResult, AgentError> {
+        let message = messages::DiscardQueuedInput { input_id };
+        match self {
+            Self::Local(actor_ref) => actor_ref.ask(message).await.map_err(|error| match error {
+                kameo::error::SendError::HandlerError(error) => error,
+                other => AgentError::RemoteActor(other.to_string()),
+            }),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&message)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| {
+                    Self::map_agent_timeout_remote_send_error(
+                        error,
+                        "DiscardQueuedInput timed out on remote session",
+                    )
+                }),
+        }
+    }
+
     pub async fn steer(
         &self,
         session_id: String,

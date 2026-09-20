@@ -1878,6 +1878,39 @@ impl Message<SubmitSessionInput> for SessionActor {
     }
 }
 
+impl Message<DiscardQueuedInput> for SessionActor {
+    type Reply = Result<DiscardQueuedInputResult, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: DiscardQueuedInput,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let input_id = msg.input_id;
+        let Some(position) = self
+            .queued_prompts
+            .iter()
+            .position(|queued| queued.input_id == input_id)
+        else {
+            return Ok(DiscardQueuedInputResult::NotPending { input_id });
+        };
+        let Some(queued) = self.queued_prompts.remove(position) else {
+            return Ok(DiscardQueuedInputResult::NotPending { input_id });
+        };
+        let _ = queued
+            .reply
+            .send(Ok(PromptResponse::new(StopReason::Cancelled)));
+        self.config.emit_event(
+            &self.session_id,
+            AgentEventKind::QueuedInputDiscarded {
+                input_id: input_id.clone(),
+                reason: "removed_by_user".to_string(),
+            },
+        );
+        Ok(DiscardQueuedInputResult::Discarded { input_id })
+    }
+}
+
 impl Message<Prompt> for SessionActor {
     type Reply = DelegatedReply<Result<PromptResponse, AgentError>>;
 
@@ -3804,6 +3837,95 @@ mod tests {
             .await
             .expect("ask GetMode after potential bridge set");
         assert_eq!(mode, AgentMode::Build);
+    }
+
+    #[tokio::test]
+    async fn discard_queued_input_removes_only_pending_input_and_is_idempotent() {
+        let fixture = ActorFixture::new().await;
+        let session_id = fixture._session_id.clone();
+        let mut actor = SessionActor::new(
+            fixture.config.clone(),
+            session_id.clone(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        actor.active_run = Some(ActiveRun::new(
+            "running".to_string(),
+            1,
+            CancellationToken::new(),
+        ));
+        let actor_ref = SessionActor::spawn(actor);
+        let mut events = fixture.config.subscribe_events();
+        for input_id in ["queued-1", "queued-2"] {
+            actor_ref
+                .ask(SubmitSessionInput {
+                    input: SubmitInput {
+                        session_id: session_id.clone(),
+                        client_input_id: Some(input_id.to_string()),
+                        expected_run_id: None,
+                        delivery: InputDelivery::Queue,
+                        prompt: vec![crate::acp::protocol::ContentBlock::from(input_id)],
+                    },
+                })
+                .await
+                .expect("queue input");
+        }
+
+        let discarded = actor_ref
+            .ask(DiscardQueuedInput {
+                input_id: "queued-1".to_string(),
+            })
+            .await
+            .expect("discard queued input");
+        assert_eq!(
+            discarded,
+            DiscardQueuedInputResult::Discarded {
+                input_id: "queued-1".to_string()
+            }
+        );
+        assert_eq!(
+            actor_ref
+                .ask(GetRuntimeStatus)
+                .await
+                .expect("get runtime status")
+                .queued_input_count,
+            1
+        );
+
+        let repeated = actor_ref
+            .ask(DiscardQueuedInput {
+                input_id: "queued-1".to_string(),
+            })
+            .await
+            .expect("repeat discard queued input");
+        assert_eq!(
+            repeated,
+            DiscardQueuedInputResult::NotPending {
+                input_id: "queued-1".to_string()
+            }
+        );
+
+        let mut saw_discarded = false;
+        for _ in 0..3 {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .expect("queue lifecycle event")
+                .expect("event stream open");
+            if matches!(
+                event.kind(),
+                AgentEventKind::QueuedInputDiscarded { input_id, reason }
+                    if input_id == "queued-1" && reason == "removed_by_user"
+            ) {
+                assert!(event.is_durable());
+                saw_discarded = true;
+                break;
+            }
+        }
+        assert!(saw_discarded, "queued discard lifecycle event missing");
+        actor_ref.tell(Shutdown).await.expect("shutdown actor");
     }
 
     #[tokio::test]

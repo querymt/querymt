@@ -44,6 +44,20 @@ pub struct SubmitSessionInput {
     pub input: SubmitInput,
 }
 
+/// Remove an input that has not started from the session queue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscardQueuedInput {
+    pub input_id: String,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "data", rename_all = "snake_case")]
+pub enum DiscardQueuedInputResult {
+    Discarded { input_id: String },
+    NotPending { input_id: String },
+}
+
 /// Signal cancellation of the running prompt.
 #[derive(Serialize, Deserialize)]
 pub struct Cancel;

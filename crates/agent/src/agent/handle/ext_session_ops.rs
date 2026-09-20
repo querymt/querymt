@@ -22,6 +22,12 @@ struct SubmitInputRequest {
     client_input_id: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DiscardQueuedInputRequest {
+    session_id: String,
+    input_id: String,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct UndoStackFrameResponse {
     message_id: String,
@@ -79,6 +85,32 @@ impl LocalAgentHandle {
             .session_ref_for_agent_session(&session_id)
             .await?
             .submit_input(message)
+            .await
+            .map_err(Error::from)?;
+        ext_json_response(&result)
+    }
+
+    pub(super) async fn handle_ext_session_discard_queued_input(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: DiscardQueuedInputRequest = parse_session_op_request(req)?;
+        let session_id = parsed.session_id;
+        let input_id = parsed.input_id;
+        #[cfg(feature = "remote")]
+        let result = self
+            .execute_session_operation(
+                &session_id,
+                session_operation::SessionOperation::DiscardQueuedInput,
+                |session_ref| Box::pin(session_ref.discard_queued_input(input_id.clone())),
+            )
+            .await
+            .map_err(session_operation::SessionOperationError::into_acp_error)?;
+        #[cfg(not(feature = "remote"))]
+        let result = self
+            .session_ref_for_agent_session(&session_id)
+            .await?
+            .discard_queued_input(input_id)
             .await
             .map_err(Error::from)?;
         ext_json_response(&result)
