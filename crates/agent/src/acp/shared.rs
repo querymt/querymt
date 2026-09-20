@@ -1924,11 +1924,7 @@ mod tests {
             ),
         ];
 
-        for (index, kind, expected) in cases
-            .into_iter()
-            .enumerate()
-            .map(|(index, (kind, expected))| (index, kind, expected))
-        {
+        for (index, (kind, expected)) in cases.into_iter().enumerate() {
             let event = EventEnvelope::Durable(DurableEvent {
                 event_id: format!("input-event-{index}"),
                 stream_seq: index as i64 + 1,
