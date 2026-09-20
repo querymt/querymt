@@ -85,7 +85,7 @@ impl AcpServer {
         let event_sources = collect_event_sources(&agent);
         let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = agent.pending_elicitations();
-        let session_owners = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
 
         Self {
             agent,

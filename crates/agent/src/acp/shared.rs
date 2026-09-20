@@ -21,14 +21,40 @@ use crate::session::domain::ForkOrigin;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Session subscriptions keyed by session id.
 ///
 /// Multiple connections may subscribe to the same session so browser tabs do not
 /// steal live updates from one another.
-pub type SessionOwnerMap = Arc<Mutex<HashMap<String, HashSet<String>>>>;
+type SessionRequestLocks = Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>>;
+
+#[derive(Clone, Default)]
+pub struct SessionOwnerMap {
+    owners: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    request_locks: SessionRequestLocks,
+}
+
+impl SessionOwnerMap {
+    /// Lock the session subscription map.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, HashSet<String>>> {
+        self.owners.lock().await
+    }
+
+    async fn request_lock(&self, session_id: &str, conn_id: &str) -> Arc<Mutex<()>> {
+        let key = (session_id.to_string(), conn_id.to_string());
+        let mut request_locks = self.request_locks.lock().await;
+        request_locks.retain(|_, request_lock| request_lock.strong_count() > 0);
+        if let Some(request_lock) = request_locks.get(&key).and_then(Weak::upgrade) {
+            return request_lock;
+        }
+
+        let request_lock = Arc::new(Mutex::new(()));
+        request_locks.insert(key, Arc::downgrade(&request_lock));
+        request_lock
+    }
+}
 
 async fn subscribe_connection(
     session_owners: &SessionOwnerMap,
@@ -248,6 +274,27 @@ pub struct RpcDispatchContext {
 }
 
 async fn attach_rpc_session<S: SendAgent>(
+    agent: &S,
+    session_owners: &SessionOwnerMap,
+    conn_id: &str,
+    context: &RpcDispatchContext,
+    session_id: &str,
+    bridge_required: bool,
+) -> Result<bool, Error> {
+    let request_lock = session_owners.request_lock(session_id, conn_id).await;
+    let _request_guard = request_lock.lock().await;
+    attach_rpc_session_locked(
+        agent,
+        session_owners,
+        conn_id,
+        context,
+        session_id,
+        bridge_required,
+    )
+    .await
+}
+
+async fn attach_rpc_session_locked<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
     conn_id: &str,
@@ -1464,9 +1511,24 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                         std::sync::Arc::from(raw_params),
                     );
                     let attached_before_request = attach_before_querymt_ext_method(ext_method);
+                    let _ownership_request_guard = if attached_before_request {
+                        if let Some(session_id) = session_id_for_owner.as_deref() {
+                            Some(
+                                session_owners
+                                    .request_lock(session_id, conn_id)
+                                    .await
+                                    .lock_owned()
+                                    .await,
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     let ownership_inserted = if attached_before_request {
                         if let Some(session_id) = session_id_for_owner.as_deref() {
-                            attach_rpc_session(
+                            attach_rpc_session_locked(
                                 agent,
                                 session_owners,
                                 conn_id,
@@ -1672,13 +1734,14 @@ mod tests {
     use crate::test_utils::DelegateTestFixture;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::oneshot;
     use tokio::sync::{Mutex, Notify};
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn session_subscriptions_support_multiple_connections_and_cleanup() {
-        let subscriptions: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let subscriptions = SessionOwnerMap::default();
         subscribe_connection(&subscriptions, "session".to_string(), "conn-a").await;
         subscribe_connection(&subscriptions, "session".to_string(), "conn-b").await;
 
@@ -2524,6 +2587,14 @@ mod tests {
         cancel_seen: Option<Arc<Notify>>,
         local_handle: Option<Arc<AgentHandle>>,
         reject_ext_method: bool,
+        ext_method_control: Option<Arc<ExtMethodControl>>,
+    }
+
+    struct ExtMethodControl {
+        calls: AtomicUsize,
+        first_started: Notify,
+        second_started: Notify,
+        release_first: Notify,
     }
 
     #[async_trait::async_trait]
@@ -2616,6 +2687,16 @@ mod tests {
             &self,
             _: crate::acp::protocol::ExtRequest,
         ) -> Result<crate::acp::protocol::ExtResponse, Error> {
+            if let Some(control) = &self.ext_method_control {
+                if control.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    control.first_started.notify_one();
+                    control.release_first.notified().await;
+                    return Err(Error::invalid_params().data("rejected extension request"));
+                }
+                control.second_started.notify_one();
+                let raw = serde_json::value::RawValue::from_string("null".to_string()).unwrap();
+                return Ok(crate::acp::protocol::ExtResponse::new(Arc::from(raw)));
+            }
             if self.reject_ext_method {
                 Err(Error::invalid_params().data("rejected extension request"))
             } else {
@@ -2645,6 +2726,7 @@ mod tests {
                 cancel_seen: None,
                 local_handle: None,
                 reject_ext_method: false,
+                ext_method_control: None,
             },
             cancelled_session,
         )
@@ -2672,8 +2754,9 @@ mod tests {
             cancelled_session: cancelled_session.clone(),
             local_handle: None,
             reject_ext_method: false,
+            ext_method_control: None,
         });
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(2);
@@ -2736,7 +2819,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_cancel_notification_dispatches_without_response() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (agent, cancelled_session) = cancel_test_agent();
@@ -2757,10 +2840,11 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_input_extension_rolls_back_only_new_session_ownership() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::from([(
+        let session_owners = SessionOwnerMap::default();
+        session_owners.lock().await.insert(
             "s-existing".to_string(),
             HashSet::from(["conn-ext".to_string(), "conn-other".to_string()]),
-        )])));
+        );
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let agent = CancelTestAgent {
@@ -2770,6 +2854,7 @@ mod tests {
             cancel_seen: None,
             local_handle: None,
             reject_ext_method: true,
+            ext_method_control: None,
         };
 
         for (method, session_id) in [
@@ -2820,6 +2905,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_input_extensions_keep_successful_session_ownership() {
+        let control = Arc::new(ExtMethodControl {
+            calls: AtomicUsize::new(0),
+            first_started: Notify::new(),
+            second_started: Notify::new(),
+            release_first: Notify::new(),
+        });
+        let agent = Arc::new(CancelTestAgent {
+            cancelled_session: Arc::new(Mutex::new(None)),
+            prompt_started: None,
+            release_prompt: None,
+            cancel_seen: None,
+            local_handle: None,
+            reject_ext_method: false,
+            ext_method_control: Some(control.clone()),
+        });
+        let session_owners = SessionOwnerMap::default();
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let spawn_request = |id| {
+            let agent = agent.clone();
+            let session_owners = session_owners.clone();
+            let pending_permissions = pending_permissions.clone();
+            let pending_elicitations = pending_elicitations.clone();
+            tokio::spawn(async move {
+                handle_rpc_message(
+                    agent.as_ref(),
+                    &session_owners,
+                    &pending_permissions,
+                    &pending_elicitations,
+                    "conn-ext",
+                    RpcMessage {
+                        jsonrpc: "2.0".to_string(),
+                        method: "querymt/session/queue".to_string(),
+                        params: serde_json::json!({
+                            "session_id": "s-concurrent",
+                            "client_input_id": format!("input-{id}"),
+                            "prompt": [{"type": "text", "text": "queued"}]
+                        }),
+                        id: Some(serde_json::json!(id)),
+                    },
+                )
+                .await
+            })
+        };
+
+        let rejected = spawn_request(1);
+        timeout(Duration::from_secs(2), control.first_started.notified())
+            .await
+            .expect("first extension should start");
+        let accepted = spawn_request(2);
+        assert!(
+            timeout(Duration::from_millis(50), control.second_started.notified())
+                .await
+                .is_err(),
+            "second extension must wait for the first ownership decision"
+        );
+
+        control.release_first.notify_one();
+        let rejected = rejected.await.expect("rejected request should finish");
+        assert!(
+            rejected
+                .response
+                .expect("rejected request should produce response")
+                .error
+                .is_some()
+        );
+        timeout(Duration::from_secs(2), control.second_started.notified())
+            .await
+            .expect("second extension should start after rollback");
+        let accepted = accepted.await.expect("accepted request should finish");
+        assert!(
+            accepted
+                .response
+                .expect("accepted request should produce response")
+                .error
+                .is_none()
+        );
+        assert_eq!(
+            session_owners.lock().await.get("s-concurrent").cloned(),
+            Some(HashSet::from(["conn-ext".to_string()]))
+        );
+    }
+
+    #[tokio::test]
     async fn lifecycle_response_survives_bridge_attachment_failure() {
         let local_fixture = crate::test_utils::TestAgent::new().await;
         let (bridge_tx, _bridge_rx) = mpsc::channel(1);
@@ -2830,8 +3001,9 @@ mod tests {
             cancel_seen: None,
             local_handle: Some(local_fixture.handle),
             reject_ext_method: false,
+            ext_method_control: None,
         };
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
@@ -2882,8 +3054,9 @@ mod tests {
             cancel_seen: None,
             local_handle: Some(local_fixture.handle),
             reject_ext_method: false,
+            ext_method_control: None,
         };
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
@@ -2927,7 +3100,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_new_rpc_dispatches_to_agent_new_session() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3087,7 +3260,7 @@ mod tests {
         method: &str,
         params: serde_json::Value,
     ) -> RpcDispatchOutput {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
@@ -3169,7 +3342,7 @@ mod tests {
         let mut registry = crate::slash_commands::SlashCommandRegistry::new();
         registry.register(docs_slash_command());
         let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(8);
@@ -3208,7 +3381,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_attach_extension_records_session_owner_with_snake_case_payload() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3336,7 +3509,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_create_session_records_session_owner_from_snake_case_response() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3463,7 +3636,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_load_records_session_owner_for_live_updates() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3590,7 +3763,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_close_rpc_forwards_to_send_agent() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3716,7 +3889,7 @@ mod tests {
     /// to the SendAgent trait method (default impl returns method_not_found).
     #[tokio::test]
     async fn set_config_option_rpc_forwards_to_send_agent() {
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3856,7 +4029,7 @@ mod tests {
             },
         );
 
-        let session_owners: SessionOwnerMap = Arc::new(Mutex::new(HashMap::new()));
+        let session_owners = SessionOwnerMap::default();
         let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = fixture.planner.pending_elicitations();
 
