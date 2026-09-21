@@ -46,8 +46,9 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatInputPart, ChatMessage, ChatOutput, ChatOutputItem, ChatRole, FinishReason,
-        MediaSource, ReasoningEffort, StructuredOutputFormat, Tool, ToolChoice,
+        ChatFunctionCallItem, ChatInputPart, ChatMessage, ChatOutput, ChatOutputItem, ChatRole,
+        Extensions, FinishReason, MediaSource, ReasoningEffort, StructuredOutputFormat, Tool,
+        ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -62,6 +63,61 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
+
+/// Scoped extension key carrying a function call's provider-only thought
+/// signature.
+///
+/// The signature is origin-scoped replay state. It is deliberately kept out of
+/// the portable `call_id` (which is call/result correlation identity) so that
+/// [`querymt::chat::ChatOutput::into_portable`] strips it without disturbing
+/// call/result correlation.
+const GOOGLE_THOUGHT_SIGNATURE: &str = "google_thought_signature";
+
+/// Build a canonical function-call item for a Google response call.
+///
+/// Google correlates tool results by function name and returns no call ID, so a
+/// plain local identifier is minted per call. The provider's `thoughtSignature`,
+/// when present, is carried in scoped extensions.
+fn google_function_call_item(
+    call: &GoogleFunctionCall,
+    thought_signature: Option<&str>,
+    index: usize,
+) -> ChatOutputItem {
+    let mut extensions = Extensions::new();
+    if let Some(signature) = thought_signature {
+        extensions.insert(
+            GOOGLE_THOUGHT_SIGNATURE.to_string(),
+            Value::String(signature.to_string()),
+        );
+    }
+    ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+        item_id: None,
+        call_id: format!("call_{}_{}", call.name, index),
+        name: call.name.clone(),
+        arguments: serde_json::to_string(&call.args).unwrap_or_default(),
+        status: None,
+        extensions,
+    })
+}
+
+/// Provider thought signature to echo when replaying a function call.
+///
+/// Current output stores it in scoped extensions. The legacy
+/// `call_{name}:{signature}` encoding is decoded only so histories persisted
+/// before the split remain resumable.
+fn google_replay_signature(call: &ChatFunctionCallItem) -> Option<String> {
+    if let Some(signature) = call
+        .extensions
+        .get(GOOGLE_THOUGHT_SIGNATURE)
+        .and_then(Value::as_str)
+    {
+        return Some(signature.to_string());
+    }
+    let expected_prefix = format!("call_{}:", call.name);
+    call.call_id
+        .strip_prefix(&expected_prefix)
+        .map(str::to_string)
+}
 
 /// Client for interacting with Google's Gemini API.
 ///
@@ -358,11 +414,7 @@ impl GoogleChatResponse {
                 .iter()
                 .filter_map(|part| {
                     part.function_call.as_ref().map(|f| {
-                        let id = if let Some(sig) = &part.thought_signature {
-                            format!("call_{}:{}", f.name, sig)
-                        } else {
-                            format!("call_{}", f.name)
-                        };
+                        let id = format!("call_{}", f.name);
 
                         ToolCall {
                             id,
@@ -416,8 +468,51 @@ impl GoogleChatResponse {
         })
     }
 
+    /// Canonical function-call items for this response.
+    ///
+    /// Prefers part-level calls (which may carry a per-call thought signature)
+    /// and falls back to the older content-level shapes. Each call's
+    /// provider-only signature is preserved in scoped extensions rather than the
+    /// portable `call_id`.
+    fn function_call_items(&self) -> Vec<ChatOutputItem> {
+        let Some(candidate) = self.candidates.first() else {
+            return Vec::new();
+        };
+
+        let mut items: Vec<ChatOutputItem> = candidate
+            .content
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, part)| {
+                part.function_call.as_ref().map(|function_call| {
+                    google_function_call_item(
+                        function_call,
+                        part.thought_signature.as_deref(),
+                        index,
+                    )
+                })
+            })
+            .collect();
+
+        if !items.is_empty() {
+            return items;
+        }
+
+        if let Some(function_call) = &candidate.content.function_call {
+            items.push(google_function_call_item(function_call, None, 0));
+        }
+        if let Some(function_calls) = &candidate.content.function_calls {
+            for (index, function_call) in function_calls.iter().enumerate() {
+                items.push(google_function_call_item(function_call, None, index));
+            }
+        }
+
+        items
+    }
+
     fn finish_reason_projection(&self) -> Option<FinishReason> {
-        if self.tool_calls_projection().is_some() {
+        if !self.function_call_items().is_empty() {
             return Some(FinishReason::ToolCalls);
         }
 
@@ -450,11 +545,15 @@ impl From<GoogleChatResponse> for ChatOutput {
     fn from(response: GoogleChatResponse) -> Self {
         let text = response.text_projection();
         let thinking = response.thinking_projection();
-        let tool_calls = response.tool_calls_projection();
         let usage = response.usage.clone();
         let finish_reason = response.finish_reason_projection();
 
-        ChatOutput::from_projections(thinking, text, tool_calls, usage, finish_reason)
+        // Function calls are appended canonically so their provider-only
+        // thought signatures stay in scoped extensions; `from_projections`
+        // cannot carry them.
+        let mut output = ChatOutput::from_projections(thinking, text, None, usage, finish_reason);
+        output.items.extend(response.function_call_items());
+        output
     }
 }
 
@@ -766,12 +865,9 @@ impl HTTPChatProvider for Google {
                 for item in &output.items {
                     match item {
                         ChatOutputItem::FunctionCall(call) => {
-                            // Preserve the provider signature encoded in the call ID.
-                            let expected_prefix = format!("call_{}:", call.name);
-                            let signature = call
-                                .call_id
-                                .strip_prefix(&expected_prefix)
-                                .map(str::to_string);
+                            // Echo the provider signature only when it is present
+                            // as scoped origin state; portable projection strips it.
+                            let signature = google_replay_signature(call);
                             let arguments = call.parse_arguments().unwrap_or(Value::Null);
                             google_parts.push(GoogleContentPart::function_call(
                                 call.name.clone(),
@@ -1318,11 +1414,14 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
 
             // Extract tool calls
             if let Some(function_call) = &part.function_call {
-                let id = if let Some(sig) = &part.thought_signature {
-                    format!("call_{}:{}", function_call.name, sig)
-                } else {
-                    format!("call_{}", function_call.name)
-                };
+                let mut extensions = Extensions::new();
+                if let Some(signature) = &part.thought_signature {
+                    extensions.insert(
+                        GOOGLE_THOUGHT_SIGNATURE.to_string(),
+                        Value::String(signature.clone()),
+                    );
+                }
+                let id = format!("call_{}_{}", function_call.name, index);
 
                 chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                     index,
@@ -1341,6 +1440,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
                                 .unwrap_or_default(),
                         },
                     },
+                    extensions,
                 });
             }
         }
@@ -1364,6 +1464,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
                         arguments: serde_json::to_string(&fc.args).unwrap_or_default(),
                     },
                 },
+                extensions: Default::default(),
             });
         }
 
@@ -1386,6 +1487,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
                             arguments: serde_json::to_string(&fc.args).unwrap_or_default(),
                         },
                     },
+                    extensions: Default::default(),
                 });
             }
         }
@@ -1756,5 +1858,90 @@ mod tests {
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
+    }
+
+    fn function_call_response(thought_signature: Option<&str>) -> GoogleChatResponse {
+        GoogleChatResponse {
+            candidates: vec![GoogleCandidate {
+                content: GoogleResponseContent {
+                    parts: vec![GoogleResponsePart {
+                        text: None,
+                        function_call: Some(GoogleFunctionCall {
+                            name: "lookup".into(),
+                            args: serde_json::json!({"q": "rust"}),
+                        }),
+                        thought: false,
+                        thought_signature: thought_signature.map(str::to_string),
+                    }],
+                    function_call: None,
+                    function_calls: None,
+                },
+                finish_reason: Some("STOP".into()),
+                index: 0,
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn thought_signature_is_scoped_not_embedded_in_call_id() {
+        let output: ChatOutput = function_call_response(Some("sig-123")).into();
+        let call = output
+            .function_calls()
+            .next()
+            .expect("expected a function call");
+        assert!(
+            !call.call_id.contains("sig-123"),
+            "provider signature must not be embedded in the portable call ID"
+        );
+        assert_eq!(
+            call.extensions.get(GOOGLE_THOUGHT_SIGNATURE),
+            Some(&Value::String("sig-123".into())),
+            "signature is carried as scoped origin state"
+        );
+        assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+
+        // Portable projection strips the signature without touching call_id.
+        let portable = output.clone().into_portable();
+        let portable_call = portable
+            .function_calls()
+            .next()
+            .expect("portable output keeps the call");
+        assert_eq!(
+            portable_call.call_id, call.call_id,
+            "portable projection keeps call identity for correlation"
+        );
+        assert!(
+            !portable_call
+                .extensions
+                .contains_key(GOOGLE_THOUGHT_SIGNATURE),
+            "portable projection strips the provider-only signature"
+        );
+    }
+
+    #[test]
+    fn google_replay_signature_reads_scoped_extension_and_legacy_id() {
+        let mut call = ChatFunctionCallItem {
+            item_id: None,
+            call_id: "call_lookup_0".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+            status: None,
+            extensions: Extensions::new(),
+        };
+        assert_eq!(google_replay_signature(&call), None);
+        call.extensions.insert(
+            GOOGLE_THOUGHT_SIGNATURE.into(),
+            Value::String("scoped".into()),
+        );
+        assert_eq!(google_replay_signature(&call), Some("scoped".into()));
+
+        // Histories persisted before the split still decode the legacy prefix.
+        let legacy = ChatFunctionCallItem {
+            call_id: "call_lookup:legacy-sig".into(),
+            extensions: Extensions::new(),
+            ..call.clone()
+        };
+        assert_eq!(google_replay_signature(&legacy), Some("legacy-sig".into()));
     }
 }

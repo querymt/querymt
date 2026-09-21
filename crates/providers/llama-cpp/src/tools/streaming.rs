@@ -110,6 +110,7 @@ pub(crate) fn generate_streaming_with_tools(
                 let _ = tx.unbounded_send(Ok(querymt::chat::StreamChunk::ToolUseComplete {
                     index,
                     tool_call,
+                    extensions: Default::default(),
                 }));
             }
         } else if !content.is_empty() {
@@ -303,6 +304,7 @@ pub(crate) fn generate_streaming_with_tools(
                 .unbounded_send(Ok(querymt::chat::StreamChunk::ToolUseComplete {
                     index,
                     tool_call: call,
+                    extensions: Default::default(),
                 }))
                 .is_err()
             {

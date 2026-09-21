@@ -280,7 +280,11 @@ impl ChatStreamAccumulator {
                 self.select_legacy();
                 append_legacy_signature(&mut self.output.items, signature);
             }
-            StreamChunk::ToolUseComplete { index, tool_call } => {
+            StreamChunk::ToolUseComplete {
+                index,
+                tool_call,
+                extensions,
+            } => {
                 self.select_legacy();
                 self.pending_legacy_calls.remove(index);
                 self.output
@@ -291,7 +295,7 @@ impl ChatStreamAccumulator {
                         name: tool_call.function.name.clone(),
                         arguments: tool_call.function.arguments.clone(),
                         status: Some(ChatOutputStatus::Completed),
-                        extensions: Default::default(),
+                        extensions: extensions.clone(),
                     }));
             }
             StreamChunk::Usage(usage) => {
@@ -789,6 +793,7 @@ mod tests {
                         arguments: "{}".into(),
                     },
                 },
+                extensions: Default::default(),
             },
             StreamChunk::Usage(Usage {
                 input_tokens: 99,
@@ -822,6 +827,7 @@ mod tests {
                         arguments: "{\"q\":1}".into(),
                     },
                 },
+                extensions: Default::default(),
             },
             StreamChunk::Text("second".into()),
             StreamChunk::Usage(Usage {

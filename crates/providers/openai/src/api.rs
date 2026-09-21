@@ -3019,6 +3019,7 @@ pub fn parse_openai_sse_chunk_with(
                                 arguments: state.arguments_buffer,
                             },
                         },
+                        extensions: Default::default(),
                     });
                 }
             }
@@ -3128,6 +3129,7 @@ pub fn parse_openai_sse_chunk_with(
                                     arguments: state.arguments_buffer,
                                 },
                             },
+                            extensions: Default::default(),
                         });
                     }
                 }

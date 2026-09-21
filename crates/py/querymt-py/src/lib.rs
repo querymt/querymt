@@ -529,7 +529,7 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
             "tool_use_input_delta",
             serde_json::json!({ "index": index, "partial_json": partial_json }),
         ),
-        StreamChunk::ToolUseComplete { index, tool_call } => (
+        StreamChunk::ToolUseComplete { index, tool_call, .. } => (
             "tool_use_complete",
             serde_json::json!({
                 "index": index,

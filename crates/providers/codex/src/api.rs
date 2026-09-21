@@ -1360,6 +1360,7 @@ fn handle_output_item_done(
                 arguments: arguments.to_string(),
             },
         },
+        extensions: Default::default(),
     });
     Ok(())
 }
@@ -2832,7 +2833,7 @@ data: {"type":"response.completed","response":{"output":[{"type":"reasoning","su
         ));
         assert!(matches!(
             &item_events[1],
-            StreamChunk::ToolUseComplete { index: 0, tool_call }
+            StreamChunk::ToolUseComplete { index: 0, tool_call, .. }
                 if tool_call.id == "call_1"
                     && tool_call.function.name == "shell"
                     && tool_call.function.arguments == r#"{"command":"pwd"}"#
