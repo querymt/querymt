@@ -98,8 +98,8 @@ pub fn discover_from_source(source: &SkillSource) -> Result<Vec<Skill>> {
                 log::debug!("Discovered skill '{}' at {:?}", skill.metadata.name, path);
                 skills.push(skill);
             }
-            Err(e) => {
-                log::warn!("Failed to parse skill at {}: {}", path.display(), e);
+            Err(error) => {
+                log::warn!("Failed to parse skill at {}: {error:#}", path.display());
             }
         }
     }

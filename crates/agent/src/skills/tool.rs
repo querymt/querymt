@@ -6,6 +6,8 @@ use crate::tools::{Tool, ToolContext, ToolError};
 use async_trait::async_trait;
 use querymt::chat::Content;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Discovery function used by registry refreshes. Swappable in tests to
@@ -14,11 +16,12 @@ type DiscoverFn = dyn Fn(&[SkillSource], bool) -> anyhow::Result<Vec<Skill>> + S
 
 /// The skill tool that agents use to load skills on-demand
 pub struct SkillTool {
-    registry: Arc<Mutex<SkillRegistry>>,
+    registries: Arc<Mutex<HashMap<PathBuf, SkillRegistry>>>,
     permissions: Arc<SkillPermissions>,
-    /// Discovery sources retained from construction so the registry can be
-    /// refreshed on demand without re-deriving configuration.
+    /// Discovery sources for the fallback workspace. Global and configured
+    /// sources remain common; project sources are re-derived for session cwd.
     sources: Vec<SkillSource>,
+    fallback_workspace: PathBuf,
     include_external: bool,
     discovery_fn: Arc<DiscoverFn>,
 }
@@ -32,10 +35,34 @@ impl SkillTool {
         sources: Vec<SkillSource>,
         include_external: bool,
     ) -> Self {
-        Self {
+        Self::new_with_fallback(
             registry,
             permissions,
             sources,
+            include_external,
+            PathBuf::from("."),
+        )
+    }
+
+    pub fn new_with_fallback(
+        registry: Arc<Mutex<SkillRegistry>>,
+        permissions: Arc<SkillPermissions>,
+        sources: Vec<SkillSource>,
+        include_external: bool,
+        fallback_workspace: PathBuf,
+    ) -> Self {
+        let initial_registry = registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut registries = HashMap::new();
+        registries.insert(fallback_workspace.clone(), initial_registry);
+
+        Self {
+            registries: Arc::new(Mutex::new(registries)),
+            permissions,
+            sources,
+            fallback_workspace,
             include_external,
             discovery_fn: Arc::new(discovery::discover_all_strict),
         }
@@ -48,26 +75,73 @@ impl SkillTool {
         self
     }
 
-    /// Re-discover skills from the retained sources and replace the registry
-    /// contents atomically.
-    ///
-    /// On failure the previous registry contents are retained and the error is
-    /// returned to the caller (who is responsible for logging it).
-    fn refresh_registry(&self) -> anyhow::Result<()> {
-        let mut registry = self
-            .registry
-            .lock()
-            .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
-        match (self.discovery_fn)(&self.sources, self.include_external) {
+    fn effective_workspace(&self, cwd: Option<&Path>) -> PathBuf {
+        cwd.unwrap_or(&self.fallback_workspace).to_path_buf()
+    }
+
+    fn sources_for_workspace(&self, workspace: &Path) -> Vec<SkillSource> {
+        let mut sources = Vec::new();
+
+        // Keep common sources in priority order around the workspace-derived
+        // project paths: global < project < configured/remote.
+        sources.extend(
+            self.sources
+                .iter()
+                .filter(|source| matches!(source, SkillSource::Global(_)))
+                .cloned(),
+        );
+        if workspace == self.fallback_workspace {
+            sources.extend(
+                self.sources
+                    .iter()
+                    .filter(|source| matches!(source, SkillSource::Project(_)))
+                    .cloned(),
+            );
+        } else {
+            sources.extend(
+                discovery::default_search_paths(workspace)
+                    .into_iter()
+                    .filter(|source| matches!(source, SkillSource::Project(_))),
+            );
+        }
+        sources.extend(
+            self.sources
+                .iter()
+                .filter(|source| {
+                    matches!(
+                        source,
+                        SkillSource::Configured(_) | SkillSource::Remote { .. }
+                    )
+                })
+                .cloned(),
+        );
+        sources
+    }
+
+    /// Re-discover skills for one workspace and atomically replace only that
+    /// workspace's registry snapshot.
+    fn refresh_registry(&self, workspace: &Path) -> anyhow::Result<()> {
+        let sources = self.sources_for_workspace(workspace);
+        match (self.discovery_fn)(&sources, self.include_external) {
             Ok(skills) => {
-                let count = registry.reload_with(skills);
-                log::debug!("Skill registry refreshed: {count} skills available");
+                let mut registries = self
+                    .registries
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
+                let count = registries
+                    .entry(workspace.to_path_buf())
+                    .or_default()
+                    .reload_with(skills);
+                log::debug!(
+                    "Skill registry refreshed for {}: {count} skills available",
+                    workspace.display()
+                );
                 Ok(())
             }
             Err(error) => {
                 log::warn!(
-                    "Failed to refresh skills: {}. Retaining previously discovered skills.",
-                    error
+                    "Failed to refresh skills for {}: {error:#}. Retaining previously discovered skills.",
+                    workspace.display()
                 );
                 Err(error)
             }
@@ -77,8 +151,9 @@ impl SkillTool {
     /// Async variant of [`Self::refresh_registry`] for the tool-call path:
     /// discovery runs off the Tokio worker via `spawn_blocking`, and the
     /// registry lock is only held to publish the results.
-    async fn refresh_registry_async(&self) -> anyhow::Result<()> {
-        let sources = self.sources.clone();
+    async fn refresh_registry_async(&self, workspace: &Path) -> anyhow::Result<()> {
+        let workspace = workspace.to_path_buf();
+        let sources = self.sources_for_workspace(&workspace);
         let include_external = self.include_external;
         let discovery_fn = Arc::clone(&self.discovery_fn);
 
@@ -91,44 +166,55 @@ impl SkillTool {
             Ok(skills) => skills,
             Err(error) => {
                 log::warn!(
-                    "Failed to refresh skills: {}. Retaining previously discovered skills.",
-                    error
+                    "Failed to refresh skills for {}: {error:#}. Retaining previously discovered skills.",
+                    workspace.display()
                 );
                 return Err(error);
             }
         };
 
-        let mut registry = self
-            .registry
+        let mut registries = self
+            .registries
             .lock()
             .map_err(|_| anyhow::anyhow!("registry lock poisoned"))?;
-        let count = registry.reload_with(skills);
-        log::debug!("Skill registry refreshed: {count} skills available");
+        let count = registries
+            .entry(workspace.clone())
+            .or_default()
+            .reload_with(skills);
+        log::debug!(
+            "Skill registry refreshed for {}: {count} skills available",
+            workspace.display()
+        );
         Ok(())
     }
 
-    /// Look up a skill by callable ID.
-    fn lookup_skill(&self, id: &str) -> Result<Option<Arc<Skill>>, ToolError> {
-        let registry = self
-            .registry
+    /// Look up a skill by callable ID in one workspace snapshot.
+    fn lookup_skill(&self, workspace: &Path, id: &str) -> Result<Option<Arc<Skill>>, ToolError> {
+        let registries = self
+            .registries
             .lock()
             .map_err(|_| ToolError::Other(anyhow::anyhow!("Registry lock poisoned")))?;
-        Ok(registry.get(id))
+        Ok(registries
+            .get(workspace)
+            .and_then(|registry| registry.get(id)))
     }
 
     /// Deterministic not-found error naming the requested callable ID and the
     /// sorted currently available callable IDs (explicitly stating when none
     /// are available).
-    fn not_found_error(&self, id: &str) -> ToolError {
+    fn not_found_error(&self, workspace: &Path, id: &str) -> ToolError {
         let available = self
-            .registry
+            .registries
             .lock()
-            .map(|registry| {
-                registry
-                    .names()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
+            .ok()
+            .and_then(|registries| {
+                registries.get(workspace).map(|registry| {
+                    registry
+                        .names()
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
             })
             .unwrap_or_default();
 
@@ -141,6 +227,56 @@ impl SkillTool {
             )
         };
         ToolError::InvalidRequest(message)
+    }
+
+    fn definition_for_workspace(&self, cwd: Option<&Path>) -> querymt::chat::Tool {
+        let workspace = self.effective_workspace(cwd);
+
+        // Refresh before snapshotting so the model-facing schema reflects the
+        // current filesystem state. On refresh failure the previous workspace
+        // snapshot is retained.
+        let _ = self.refresh_registry(&workspace);
+
+        let (skill_list, skill_names) = if let Ok(registries) = self.registries.lock() {
+            if let Some(registry) = registries.get(&workspace) {
+                let list = registry.list_for_description();
+                let names = registry
+                    .names()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                (list, names)
+            } else {
+                ("No skills available".to_string(), vec![])
+            }
+        } else {
+            ("Registry unavailable".to_string(), vec![])
+        };
+
+        querymt::chat::Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: Self::NAME.to_string(),
+                description: format!(
+                    "Load a skill to gain domain-specific knowledge and workflows.\n\n\
+                    Available skills:\n{}\n\n\
+                    Call with the skill name to load its content. Once loaded, the skill's \
+                    instructions and workflows will be available for the remainder of the session.",
+                    skill_list
+                ),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name of the skill to load",
+                            "enum": skill_names
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+        }
     }
 
     /// Format sample files from skill directory
@@ -180,54 +316,18 @@ impl Tool for SkillTool {
     }
 
     fn definition(&self) -> querymt::chat::Tool {
-        // Refresh before snapshotting so the model-facing schema reflects the
-        // current filesystem state. On refresh failure the previous registry
-        // contents are retained and snapshotted.
-        let _ = self.refresh_registry();
+        self.definition_for_workspace(None)
+    }
 
-        // Take one coherent description/enum snapshot under the registry lock.
-        let (skill_list, skill_names) = if let Ok(registry) = self.registry.lock() {
-            let list = registry.list_for_description();
-            let names = registry
-                .names()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>();
-            (list, names)
-        } else {
-            ("Registry unavailable".to_string(), vec![])
-        };
-
-        querymt::chat::Tool {
-            tool_type: "function".to_string(),
-            function: querymt::chat::FunctionTool {
-                name: Self::NAME.to_string(),
-                description: format!(
-                    "Load a skill to gain domain-specific knowledge and workflows.\n\n\
-                    Available skills:\n{}\n\n\
-                    Call with the skill name to load its content. Once loaded, the skill's \
-                    instructions and workflows will be available for the remainder of the session.",
-                    skill_list
-                ),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string",
-                            "description": "Name of the skill to load",
-                            "enum": skill_names
-                        }
-                    },
-                    "required": ["name"]
-                }),
-            },
-        }
+    fn definition_for_cwd(&self, cwd: Option<&Path>) -> querymt::chat::Tool {
+        self.definition_for_workspace(cwd)
     }
 
     async fn call(&self, args: Value, ctx: &dyn ToolContext) -> Result<Vec<Content>, ToolError> {
         let name = args["name"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidRequest("'name' parameter required".into()))?;
+        let workspace = self.effective_workspace(ctx.cwd());
 
         // Check permissions for the requested callable ID
         let permission = self.permissions.check(name);
@@ -263,23 +363,22 @@ impl Tool for SkillTool {
             }
         }
 
-        // Get skill from registry by callable ID; on a miss, refresh once and
-        // retry so skills added after the last schema snapshot can still be
-        // loaded.
-        let mut skill = self.lookup_skill(name)?;
+        // Get skill from this workspace's registry; on a miss, refresh once and
+        // retry so skills added after the last schema snapshot can still load.
+        let mut skill = self.lookup_skill(&workspace, name)?;
         if skill.is_none() {
-            if let Err(error) = self.refresh_registry_async().await {
+            if let Err(error) = self.refresh_registry_async(&workspace).await {
                 log::warn!(
-                    "Skill '{}' is not registered and the refresh failed: {}",
+                    "Skill '{}' is not registered for {} and the refresh failed: {error:#}",
                     name,
-                    error
+                    workspace.display()
                 );
             }
-            skill = self.lookup_skill(name)?;
+            skill = self.lookup_skill(&workspace, name)?;
         }
 
         let Some(skill) = skill else {
-            return Err(self.not_found_error(name));
+            return Err(self.not_found_error(&workspace, name));
         };
 
         log::info!("Loading skill: {}", name);
@@ -337,6 +436,7 @@ mod tests {
     /// script answers with no selections (i.e. the user denied the request).
     struct MockContext {
         session_id: String,
+        cwd: Option<PathBuf>,
         ask_answers: Mutex<Vec<String>>,
     }
 
@@ -344,13 +444,22 @@ mod tests {
         fn new() -> Self {
             Self {
                 session_id: "test-session".to_string(),
+                cwd: None,
                 ask_answers: Mutex::new(vec![]),
+            }
+        }
+
+        fn with_cwd(cwd: impl Into<PathBuf>) -> Self {
+            Self {
+                cwd: Some(cwd.into()),
+                ..Self::new()
             }
         }
 
         fn with_answers(answers: &[&str]) -> Self {
             Self {
                 session_id: "test-session".to_string(),
+                cwd: None,
                 ask_answers: Mutex::new(answers.iter().map(|s| s.to_string()).collect()),
             }
         }
@@ -363,7 +472,7 @@ mod tests {
         }
 
         fn cwd(&self) -> Option<&std::path::Path> {
-            None
+            self.cwd.as_deref()
         }
 
         async fn record_progress(
@@ -435,9 +544,8 @@ mod tests {
         SkillTool::new(registry, permissions, sources, true)
     }
 
-    fn enum_of(tool: &SkillTool) -> Vec<String> {
-        let def = tool.definition();
-        def.function.parameters["properties"]["name"]["enum"]
+    fn names_from_definition(definition: querymt::chat::Tool) -> Vec<String> {
+        definition.function.parameters["properties"]["name"]["enum"]
             .as_array()
             .unwrap()
             .iter()
@@ -445,11 +553,314 @@ mod tests {
             .collect()
     }
 
-    async fn call_named(tool: &SkillTool, name: &str) -> Result<String, ToolError> {
-        let ctx = MockContext::new();
-        tool.call(json!({"name": name}), &ctx)
+    fn enum_of(tool: &SkillTool) -> Vec<String> {
+        names_from_definition(tool.definition())
+    }
+
+    fn enum_for_cwd(tool: &SkillTool, cwd: &Path) -> Vec<String> {
+        names_from_definition(tool.definition_for_cwd(Some(cwd)))
+    }
+
+    async fn call_named_with_context(
+        tool: &SkillTool,
+        name: &str,
+        ctx: &dyn ToolContext,
+    ) -> Result<String, ToolError> {
+        tool.call(json!({"name": name}), ctx)
             .await
             .map(first_text_block)
+    }
+
+    async fn call_named(tool: &SkillTool, name: &str) -> Result<String, ToolError> {
+        call_named_with_context(tool, name, &MockContext::new()).await
+    }
+
+    #[tokio::test]
+    async fn test_two_workspaces_advertise_and_call_only_their_own_skills() {
+        let fallback = TempDir::new().unwrap();
+        let workspace_a = TempDir::new().unwrap();
+        let workspace_b = TempDir::new().unwrap();
+        write_skill(
+            &workspace_a.path().join(".qmt/skills"),
+            "only-a",
+            "Workspace A",
+        );
+        write_skill(
+            &workspace_b.path().join(".qmt/skills"),
+            "only-b",
+            "Workspace B",
+        );
+
+        let tool = SkillTool::new_with_fallback(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
+            true,
+            fallback.path().to_path_buf(),
+        );
+
+        assert_eq!(enum_for_cwd(&tool, workspace_a.path()), vec!["only-a"]);
+        assert_eq!(enum_for_cwd(&tool, workspace_b.path()), vec!["only-b"]);
+
+        let context_a = MockContext::with_cwd(workspace_a.path());
+        let context_b = MockContext::with_cwd(workspace_b.path());
+        let output_a = call_named_with_context(&tool, "only-a", &context_a)
+            .await
+            .unwrap();
+        let output_b = call_named_with_context(&tool, "only-b", &context_b)
+            .await
+            .unwrap();
+        assert!(output_a.contains("Workspace A"));
+        assert!(output_b.contains("Workspace B"));
+
+        let error = call_named_with_context(&tool, "only-b", &context_a)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidRequest(message) if message.contains("only-a") && !message.contains("Available skills: only-b"))
+        );
+        assert_eq!(enum_for_cwd(&tool, workspace_b.path()), vec!["only-b"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_simultaneous_workspace_calls_do_not_cross_registry_snapshots() {
+        let fallback = TempDir::new().unwrap();
+        let workspace_a = TempDir::new().unwrap();
+        let workspace_b = TempDir::new().unwrap();
+        write_skill(
+            &workspace_a.path().join(".qmt/skills"),
+            "shared",
+            "Content from A",
+        );
+        write_skill(
+            &workspace_b.path().join(".qmt/skills"),
+            "shared",
+            "Content from B",
+        );
+
+        let tool = Arc::new(SkillTool::new_with_fallback(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
+            true,
+            fallback.path().to_path_buf(),
+        ));
+        assert_eq!(enum_for_cwd(&tool, workspace_a.path()), vec!["shared"]);
+        assert_eq!(enum_for_cwd(&tool, workspace_b.path()), vec!["shared"]);
+
+        let mut calls = Vec::new();
+        for (workspace, expected, unexpected) in [
+            (
+                workspace_a.path().to_path_buf(),
+                "Content from A",
+                "Content from B",
+            ),
+            (
+                workspace_b.path().to_path_buf(),
+                "Content from B",
+                "Content from A",
+            ),
+        ] {
+            for _ in 0..20 {
+                let tool = Arc::clone(&tool);
+                let context = MockContext::with_cwd(workspace.clone());
+                calls.push(tokio::spawn(async move {
+                    let output = call_named_with_context(&tool, "shared", &context)
+                        .await
+                        .unwrap();
+                    assert!(output.contains(expected), "{output}");
+                    assert!(!output.contains(unexpected), "{output}");
+                }));
+            }
+        }
+
+        for call in calls {
+            call.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn test_no_cwd_definition_uses_builder_workspace_fallback() {
+        let fallback = TempDir::new().unwrap();
+        let session = TempDir::new().unwrap();
+        write_skill(
+            &fallback.path().join(".qmt/skills"),
+            "builder-skill",
+            "Builder fallback",
+        );
+        write_skill(
+            &session.path().join(".qmt/skills"),
+            "session-skill",
+            "Session workspace",
+        );
+
+        let tool = SkillTool::new_with_fallback(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
+            true,
+            fallback.path().to_path_buf(),
+        );
+
+        assert_eq!(enum_of(&tool), vec!["builder-skill"]);
+        assert_eq!(enum_for_cwd(&tool, session.path()), vec!["session-skill"]);
+        assert_eq!(
+            names_from_definition(tool.definition_for_cwd(None)),
+            vec!["builder-skill"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_precedence_and_configured_source_are_context_aware() {
+        let fallback = TempDir::new().unwrap();
+        let workspace_a = TempDir::new().unwrap();
+        let workspace_b = TempDir::new().unwrap();
+        let global = TempDir::new().unwrap();
+        let configured = TempDir::new().unwrap();
+
+        write_skill(global.path(), "shared", "Global version");
+        write_skill(
+            &workspace_a.path().join(".qmt/skills"),
+            "shared",
+            "Workspace A version",
+        );
+        write_skill(
+            &workspace_b.path().join(".qmt/skills"),
+            "shared",
+            "Workspace B version",
+        );
+        write_skill(configured.path(), "shared", "Configured version");
+        write_skill(configured.path(), "configured-only", "Common configured");
+
+        let sources = vec![
+            SkillSource::Global(global.path().to_path_buf()),
+            SkillSource::Project(fallback.path().join(".qmt/skills")),
+            SkillSource::Configured(configured.path().to_path_buf()),
+        ];
+        let tool = SkillTool::new_with_fallback(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            sources,
+            true,
+            fallback.path().to_path_buf(),
+        );
+
+        let expected = vec!["configured-only".to_string(), "shared".to_string()];
+        assert_eq!(enum_for_cwd(&tool, workspace_a.path()), expected);
+        assert_eq!(enum_for_cwd(&tool, workspace_b.path()), expected);
+
+        for workspace in [workspace_a.path(), workspace_b.path()] {
+            let context = MockContext::with_cwd(workspace);
+            let output = call_named_with_context(&tool, "shared", &context)
+                .await
+                .unwrap();
+            assert!(output.contains("Configured version"));
+        }
+    }
+
+    #[test]
+    fn test_include_external_false_keeps_configured_sources_common() {
+        let fallback = TempDir::new().unwrap();
+        let workspace = TempDir::new().unwrap();
+        let configured = TempDir::new().unwrap();
+        write_skill(
+            &workspace.path().join(".qmt/skills"),
+            "project-only",
+            "Project source",
+        );
+        write_skill(configured.path(), "configured-only", "Configured source");
+
+        let sources = vec![
+            SkillSource::Project(fallback.path().join(".qmt/skills")),
+            SkillSource::Configured(configured.path().to_path_buf()),
+        ];
+        let tool = SkillTool::new_with_fallback(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            sources,
+            false,
+            fallback.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            enum_for_cwd(&tool, workspace.path()),
+            vec!["configured-only"]
+        );
+    }
+
+    #[test]
+    fn test_tool_registry_definitions_are_context_aware() {
+        let fallback = TempDir::new().unwrap();
+        let workspace_a = TempDir::new().unwrap();
+        let workspace_b = TempDir::new().unwrap();
+        write_skill(
+            &workspace_a.path().join(".qmt/skills"),
+            "registry-a",
+            "Registry A",
+        );
+        write_skill(
+            &workspace_b.path().join(".qmt/skills"),
+            "registry-b",
+            "Registry B",
+        );
+
+        let skill_tool = SkillTool::new_with_fallback(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
+            true,
+            fallback.path().to_path_buf(),
+        );
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.add(Arc::new(skill_tool));
+
+        let definition = registry
+            .definition_for_cwd(SkillTool::NAME, Some(workspace_a.path()))
+            .unwrap();
+        assert_eq!(
+            names_from_definition(definition.clone()),
+            vec!["registry-a"]
+        );
+        let validator = jsonschema::validator_for(&definition.function.parameters).unwrap();
+        assert!(validator.validate(&json!({"name": "registry-a"})).is_ok());
+        assert!(validator.validate(&json!({"name": "registry-b"})).is_err());
+
+        let definitions = registry.definitions_for_cwd(Some(workspace_b.path()));
+        let definition = definitions
+            .into_iter()
+            .find(|definition| definition.function.name == SkillTool::NAME)
+            .unwrap();
+        assert_eq!(names_from_definition(definition), vec!["registry-b"]);
+    }
+
+    #[test]
+    fn test_context_aware_schema_hot_reload_is_workspace_local() {
+        let fallback = TempDir::new().unwrap();
+        let workspace_a = TempDir::new().unwrap();
+        let workspace_b = TempDir::new().unwrap();
+        write_skill(
+            &workspace_a.path().join(".qmt/skills"),
+            "a-first",
+            "A first",
+        );
+        write_skill(&workspace_b.path().join(".qmt/skills"), "b-only", "B only");
+
+        let tool = SkillTool::new_with_fallback(
+            Arc::new(Mutex::new(SkillRegistry::new())),
+            Arc::new(SkillPermissions::default()),
+            vec![SkillSource::Project(fallback.path().join(".qmt/skills"))],
+            true,
+            fallback.path().to_path_buf(),
+        );
+        assert_eq!(enum_for_cwd(&tool, workspace_a.path()), vec!["a-first"]);
+        assert_eq!(enum_for_cwd(&tool, workspace_b.path()), vec!["b-only"]);
+
+        write_skill(&workspace_a.path().join(".qmt/skills"), "a-late", "A late");
+        assert_eq!(
+            enum_for_cwd(&tool, workspace_a.path()),
+            vec!["a-first", "a-late"]
+        );
+        assert_eq!(enum_for_cwd(&tool, workspace_b.path()), vec!["b-only"]);
     }
 
     #[tokio::test]

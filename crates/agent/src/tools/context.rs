@@ -223,6 +223,15 @@ pub trait Tool: Send + Sync {
     /// Get the tool definition (schema, description, etc.)
     fn definition(&self) -> querymt::chat::Tool;
 
+    /// Get the tool definition for an effective workspace.
+    ///
+    /// Most tools have static schemas and use [`Self::definition`]. Dynamic
+    /// tools can override this method so schema advertisement and validation
+    /// reflect the current session working directory.
+    fn definition_for_cwd(&self, _cwd: Option<&Path>) -> querymt::chat::Tool {
+        self.definition()
+    }
+
     /// Capabilities this tool requires. Default: empty.
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[]

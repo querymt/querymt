@@ -329,10 +329,11 @@ impl AgentConfig {
     ) -> Vec<querymt::chat::Tool> {
         let mut tools = Vec::new();
         let config = tool_config_override.unwrap_or(&self.tool_config);
+        let cwd = runtime.and_then(|runtime| runtime.cwd.as_deref());
 
         match config.policy {
             ToolPolicy::BuiltInOnly => {
-                tools.extend(self.tool_registry.definitions());
+                tools.extend(self.tool_registry.definitions_for_cwd(cwd));
             }
             ToolPolicy::ProviderOnly => {
                 if let Some(provider_tools) = provider.tools() {
@@ -340,7 +341,7 @@ impl AgentConfig {
                 }
             }
             ToolPolicy::BuiltInAndProvider => {
-                tools.extend(self.tool_registry.definitions());
+                tools.extend(self.tool_registry.definitions_for_cwd(cwd));
                 if let Some(provider_tools) = provider.tools() {
                     tools.extend(provider_tools.iter().cloned::<querymt::chat::Tool>());
                 }
