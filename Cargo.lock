@@ -11496,7 +11496,7 @@ dependencies = [
  "similarity-core",
  "similarity-py",
  "similarity-rs",
- "stop-words 0.10.0",
+ "stop-words 0.10.1",
  "strsim 0.11.1",
  "syn 2.0.119",
  "tempfile",
@@ -14079,9 +14079,9 @@ dependencies = [
 
 [[package]]
 name = "stop-words"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68df56303396bcfb639455b3c166804aeb7994005010aab5e9e8a1277b8871d"
+checksum = "c1ed527ae13a020ac2404e32746ecee62d632aafe64f8e0df2bb3545ae96f6d1"
 dependencies = [
  "serde_json",
 ]
