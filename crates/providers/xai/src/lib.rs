@@ -498,7 +498,8 @@ enum XaiResponsesInputItem {
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        // The Responses API requires `summary` on every reasoning input item;
+        // an empty array is valid but the key must always be present.
         summary: Vec<XaiResponsesReasoningSummary>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
@@ -1088,7 +1089,7 @@ mod extism_exports {
 mod tests {
     use super::*;
     use querymt::auth::static_key;
-    use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
+    use querymt::chat::{ChatOutputStatus, MediaKind, MediaPart, StructuredStreamEvent};
 
     fn test_xai(api_key: &str) -> Xai {
         Xai {
@@ -1402,18 +1403,31 @@ mod tests {
                     None,
                     false,
                     vec![
-                        Content::text("ordinary output"),
-                        Content::Pdf {
-                            data: vec![1, 2, 3],
-                        },
-                        Content::Audio {
-                            mime_type: "audio/wav".to_string(),
-                            data: vec![4, 5],
-                        },
-                        Content::Image {
-                            mime_type: "image/png".to_string(),
-                            data: vec![6, 7, 8],
-                        },
+                        ToolResultPart::text("ordinary output"),
+                        ToolResultPart::attachment(
+                            MediaPart::new(
+                                MediaKind::Document,
+                                Some("application/pdf".parse().unwrap()),
+                                MediaSource::Inline { data: vec![1, 2, 3] },
+                            )
+                            .unwrap(),
+                        ),
+                        ToolResultPart::attachment(
+                            MediaPart::new(
+                                MediaKind::Audio,
+                                Some("audio/wav".parse().unwrap()),
+                                MediaSource::Inline { data: vec![4, 5] },
+                            )
+                            .unwrap(),
+                        ),
+                        ToolResultPart::attachment(
+                            MediaPart::new(
+                                MediaKind::Image,
+                                Some("image/png".parse().unwrap()),
+                                MediaSource::Inline { data: vec![6, 7, 8] },
+                            )
+                            .unwrap(),
+                        ),
                     ],
                 )
                 .build(),
@@ -1422,7 +1436,10 @@ mod tests {
                     "text-only".to_string(),
                     None,
                     false,
-                    vec![Content::text("first line"), Content::text("second line")],
+                    vec![
+                        ToolResultPart::text("first line"),
+                        ToolResultPart::text("second line"),
+                    ],
                 )
                 .build(),
         ];
@@ -1440,17 +1457,18 @@ mod tests {
 
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0]["call_id"], "rich-output");
+        // Inline attachments are forwarded as data URLs, preserving part order.
         assert_eq!(
             outputs[0]["output"],
             serde_json::json!([
                 {"type": "input_text", "text": "ordinary output"},
                 {
-                    "type": "input_text",
-                    "text": "[PDF tool output not yet serialized natively (3 bytes)]"
+                    "type": "input_image",
+                    "image_url": "data:application/pdf;base64,AQID"
                 },
                 {
-                    "type": "input_text",
-                    "text": "[Audio tool output not yet serialized natively (audio/wav: 2 bytes)]"
+                    "type": "input_image",
+                    "image_url": "data:audio/wav;base64,BAU="
                 },
                 {"type": "input_image", "image_url": "data:image/png;base64,BgcI"}
             ])
@@ -1583,6 +1601,45 @@ mod tests {
             Value::String(r#"{"path":"a.txt"}"#.to_string())
         );
         assert_eq!(input[4]["call_id"], Value::String("call_1".to_string()));
+    }
+
+    #[test]
+    fn responses_replay_reasoning_without_summary_serializes_empty_summary_array() {
+        use querymt::chat::{ChatOutputItem, ChatReasoningItem, Extensions};
+
+        let xai = test_xai("xai-key");
+        let output = ChatOutput {
+            provenance: Some(querymt::chat::ChatOutputProvenance {
+                provider: "xai".into(),
+                protocol: "responses".into(),
+                model: "grok-test".into(),
+                endpoint: Xai::responses_endpoint(),
+            }),
+            items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("rs_empty".to_string()),
+                summary: Vec::new(),
+                content: Vec::new(),
+                encrypted_content: Some("enc_payload".to_string()),
+                signature: None,
+                status: None,
+                extensions: Extensions::new(),
+            })],
+            ..ChatOutput::default()
+        };
+        let assistant = ChatMessage::from_assistant_output(output);
+
+        let messages = vec![ChatMessage::user().text("continue").build(), assistant];
+        let req = xai
+            .chat_request(&messages, None)
+            .expect("structured replay should build");
+        let body: Value = serde_json::from_slice(req.body()).unwrap();
+        let reasoning = &body["input"][1];
+
+        assert_eq!(reasoning["type"], Value::String("reasoning".to_string()));
+        // The Responses API requires `summary` on every reasoning input item,
+        // even when the model emitted no summary text.
+        assert_eq!(reasoning["summary"], Value::Array(Vec::new()));
+        assert_eq!(reasoning["id"], Value::String("rs_empty".to_string()));
     }
 
     #[test]
