@@ -586,6 +586,10 @@ pub enum StreamChunk {
         index: usize,
         /// The complete tool call with id, name, and parsed arguments
         tool_call: ToolCall,
+        /// Provider-scoped call metadata (e.g. a replay signature) that belongs
+        /// to the call's origin and is stripped by portable projection.
+        #[serde(default, skip_serializing_if = "Extensions::is_empty")]
+        extensions: Extensions,
     },
 
     /// Usage metadata containing token counts

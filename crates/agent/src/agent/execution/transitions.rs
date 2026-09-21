@@ -1847,6 +1847,7 @@ mod tests {
                         arguments: "{}".into(),
                     },
                 },
+                extensions: Default::default(),
             },
             terminal_event(ChatOutputStatus::Completed, Some(FinishReason::ToolCalls)),
         ];

@@ -647,6 +647,7 @@ mod tests {
                             arguments: r#"{"from":"Madrid","to":"Paris"}"#.into(),
                         },
                     },
+                    extensions: Default::default(),
                 })
                 .unwrap(),
             None

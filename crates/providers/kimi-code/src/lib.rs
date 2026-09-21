@@ -214,7 +214,7 @@ impl ChatStreamParser for KimiCodeStreamParser {
                         state.id.clone_from(id);
                     }
                 }
-                StreamChunk::ToolUseComplete { index, tool_call } if tool_call.id.is_empty() => {
+                StreamChunk::ToolUseComplete { index, tool_call, .. } if tool_call.id.is_empty() => {
                     tool_call.id = format!("{}:{index}", tool_call.function.name);
                 }
                 _ => {}

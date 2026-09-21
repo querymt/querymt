@@ -261,24 +261,49 @@ async fn canonical_output_part_round_trips_through_sqlite_reload() {
     assert!(matches!(reloaded.items[3], ChatOutputItem::Opaque(_)));
 
     // Reloaded history projects once into provider request content without
-    // duplicated parts. Without a native target the turn becomes canonical
-    // portable input: message text and call arguments, each exactly once.
+    // duplicated parts. Without a native target the turn becomes the canonical
+    // portable output: message text and call arguments, each exactly once, with
+    // the call ID retained for correlation and native/opaque state removed.
     let chat = history[0].to_chat_message().unwrap();
+    let portable = chat
+        .output()
+        .expect("portable projection retains canonical call correlation");
     assert!(
-        chat.output().is_none(),
+        !portable.requires_item_aware_fidelity(),
         "portable projection carries no native structured continuation"
+    );
+    assert!(
+        portable
+            .function_calls()
+            .any(|call| call.call_id == "call_1"),
+        "portable projection retains the call ID for call/result correlation"
+    );
+    assert_eq!(
+        portable.items.len(),
+        2,
+        "encrypted-only reasoning and opaque items are dropped"
+    );
+    let call = portable
+        .function_calls()
+        .next()
+        .expect("portable projection keeps the canonical function call");
+    assert_eq!(call.call_id, "call_1");
+    assert!(
+        call.item_id.is_none(),
+        "native item identity is stripped from the portable projection"
+    );
+    assert_eq!(
+        call.arguments, "{\"query\":\"rust\",\"raw\": 1 }",
+        "call arguments stay byte-exact"
     );
     let projected = chat.portable_input_parts();
     let text_parts = projected
         .iter()
         .filter(|part| part.as_text().is_some())
         .count();
-    let text = chat.text();
-    assert_eq!(text_parts, 2);
     assert_eq!(
-        text.matches("{\"query\":\"rust\",\"raw\": 1 }").count(),
-        1,
-        "call arguments projected exactly once"
+        text_parts, 1,
+        "message text projects to input; calls stay canonical"
     );
 }
 
@@ -728,6 +753,14 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
         .output()
         .expect("exactly compatible target preserves canonical output");
     assert_eq!(assistant_output.items.len(), 3);
+    assert_eq!(
+        assistant_output
+            .provenance
+            .as_ref()
+            .map(|provenance| provenance.endpoint.as_str()),
+        Some("https://api.openai.com/v1/responses"),
+        "native replay preserves provenance so provider codecs can gate on it"
+    );
     let ChatOutputItem::Reasoning(reasoning) = &assistant_output.items[0] else {
         panic!("expected reasoning item");
     };
@@ -763,8 +796,8 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
     assert_eq!(calls[0].id, "call_e2e");
     assert_eq!(calls[0].function.name, "lookup");
 
-    // Each structured item projects exactly once: the visible reasoning, the
-    // message text, and the call arguments become portable input text.
+    // Each structured item projects exactly once: visible reasoning and message
+    // text become portable input text, while the call stays canonical output.
     let projected = chat_messages[1].portable_input_parts();
     let text_parts: Vec<&str> = projected.iter().filter_map(|part| part.as_text()).collect();
     assert_eq!(
@@ -776,12 +809,12 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
         "message text projected exactly once"
     );
     assert_eq!(
-        text_parts
-            .iter()
-            .filter(|text| **text == raw_arguments)
+        assistant_output
+            .function_calls()
+            .filter(|call| call.arguments == raw_arguments)
             .count(),
         1,
-        "call arguments projected exactly once"
+        "call arguments stay canonical exactly once"
     );
 
     let tool_result = chat_messages[2]
@@ -814,8 +847,11 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
             None,
         )
         .unwrap();
+    let cross_endpoint_output = cross_endpoint
+        .output()
+        .expect("cross-endpoint target keeps the portable projection");
     assert!(
-        cross_endpoint.output().is_none(),
+        !cross_endpoint_output.requires_item_aware_fidelity(),
         "cross-endpoint target must not replay native continuation state"
     );
 
@@ -831,8 +867,11 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
             None,
         )
         .unwrap();
+    let cross_protocol_output = cross_protocol
+        .output()
+        .expect("cross-protocol target keeps the portable projection");
     assert!(
-        cross_protocol.output().is_none(),
+        !cross_protocol_output.requires_item_aware_fidelity(),
         "cross-protocol target must not replay native continuation state"
     );
 }
@@ -968,12 +1007,17 @@ async fn a_b_a_replay_scopes_opaque_state_to_its_origin() {
     // A's visible/portable content still reaches B.
     assert!(to_b_json.contains("provider-a answer"));
     assert!(to_b_json.contains("provider-a visible summary"));
-    // A's native call identity is provider-only state; the portable projection
-    // carries the call arguments instead of the native call ID.
+    // The portable projection keeps the call ID as the portable correlation key
+    // between a call and its result, while provider-native item identity is
+    // origin-scoped and never crosses to B.
     assert!(to_b_json.contains("rust"));
     assert!(
-        !to_b_json.contains("call_a1"),
-        "native item/call identity is not portable to B"
+        to_b_json.contains("call_a1"),
+        "portable call identity is retained for call/result correlation"
+    );
+    assert!(
+        !to_b_json.contains("item_a1"),
+        "native item identity is not portable to B"
     );
     // B's own turn keeps its native provider-only signature when the target is B.
     assert!(to_b_json.contains("provider-b-signature"));
@@ -1004,9 +1048,24 @@ async fn a_b_a_replay_scopes_opaque_state_to_its_origin() {
         !back_json.contains("provider-b-signature"),
         "B's provider-only signature must not be forwarded back to A"
     );
+    // B's portable call identity survives for call/result correlation, but its
+    // native item identity is not forwarded back to A.
+    assert!(
+        back_json.contains("call_b1"),
+        "B's portable call identity survives projection back to A"
+    );
+    assert!(
+        !back_json.contains("item_b1"),
+        "B's native item identity is not forwarded back to A"
+    );
+    assert!(
+        back_json.contains("call_a1"),
+        "A's native call identity is retained for its own replay"
+    );
 
-    // Chronological order and call/result dependencies are preserved. Native
-    // call IDs are provider-only, so ordering is checked via visible content.
+    // Chronological order and call/result dependencies are preserved. Ordering
+    // is checked via visible content so it does not depend on any provider's
+    // native identifiers.
     let a1_pos = back_json.find("provider-a answer").unwrap();
     let b1_pos = back_json.find("provider-b answer").unwrap();
     let a2_pos = back_json.rfind("provider-a answer").unwrap();
