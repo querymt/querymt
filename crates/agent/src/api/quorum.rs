@@ -535,17 +535,23 @@ impl QuorumBuilder {
                 }
 
                 if !tools.is_empty() {
-                    b = b.with_allowed_tools(tools.clone());
+                    // The resolved tool list contains local tool names plus
+                    // normalized MCP selectors. Infer the policy like the
+                    // single-agent path: any external tool spec or resolved
+                    // MCP selection needs BuiltInAndProvider so MCP tool
+                    // definitions reach the LLM; otherwise BuiltInOnly is
+                    // sufficient.
+                    let has_external_tools = tools.iter().any(|tool| tool.contains('.'));
+                    let policy = if has_external_tools || !delegate_mcp_servers.is_empty() {
+                        ToolPolicy::BuiltInAndProvider
+                    } else {
+                        ToolPolicy::BuiltInOnly
+                    };
+                    b = b.with_tool_policy(policy).with_allowed_tools(tools.clone());
                 }
 
                 // Attach resolved MCP servers through the existing lifecycle.
-                // An external tool spec also widens the policy so MCP tool
-                // definitions reach the LLM.
                 if !delegate_mcp_servers.is_empty() {
-                    let has_external_tools = tools.iter().any(|tool| tool.contains('.'));
-                    if has_external_tools {
-                        b = b.with_tool_policy(ToolPolicy::BuiltInAndProvider);
-                    }
                     b = b.with_mcp_servers(delegate_mcp_servers.clone());
                 }
 
@@ -759,19 +765,24 @@ impl QuorumBuilder {
             }
 
             if !planner_tools.is_empty() {
+                // The resolved tool list contains local tool names plus
+                // normalized MCP selectors. Infer the policy like the
+                // single-agent path: any external tool spec or resolved MCP
+                // selection needs BuiltInAndProvider so MCP tool definitions
+                // reach the LLM; otherwise BuiltInOnly is sufficient.
+                let has_external_tools = planner_tools.iter().any(|tool| tool.contains('.'));
+                let policy = if has_external_tools || !planner_mcp_servers.is_empty() {
+                    ToolPolicy::BuiltInAndProvider
+                } else {
+                    ToolPolicy::BuiltInOnly
+                };
                 b = b
-                    .with_tool_policy(ToolPolicy::BuiltInOnly)
+                    .with_tool_policy(policy)
                     .with_allowed_tools(planner_tools.clone());
             }
 
-            // Attach resolved MCP servers through the existing lifecycle. An
-            // external tool spec also widens the policy so MCP tool
-            // definitions reach the LLM.
+            // Attach resolved MCP servers through the existing lifecycle.
             if !planner_mcp_servers.is_empty() {
-                let has_external_tools = planner_tools.iter().any(|tool| tool.contains('.'));
-                if has_external_tools {
-                    b = b.with_tool_policy(ToolPolicy::BuiltInAndProvider);
-                }
                 b = b.with_mcp_servers(planner_mcp_servers.clone());
             }
 
@@ -1068,14 +1079,17 @@ impl super::agent::Agent {
         }
         planner_config.llm_config = Some(llm);
 
-        // Resolve planner tools (validates local tools and prepares for MCP)
+        // Resolve planner tools (validates local tools and prepares for MCP).
+        // The runtime tool list keeps the normalized resolved MCP selectors so
+        // build() can construct allowlists the runtime filter understands and
+        // widen the tool policy for MCP tool advertisement.
         let planner_resolved = resolve_tools(
             &config.planner.tools,
             &config.mcp,
             &[],
             &available_local_tool_names,
         )?;
-        planner_config.tools = planner_resolved.local_tools;
+        planner_config.tools = planner_resolved.runtime_tool_selectors();
         // Attach the resolved MCP servers so the planner's runtime starts them
         // through the existing stdio and streamable-http transports.
         planner_config.mcp_servers = planner_resolved
@@ -1124,7 +1138,10 @@ impl super::agent::Agent {
                 &delegate.mcp,
                 &available_local_tool_names,
             )?;
-            delegate_config.tools = delegate_resolved.local_tools;
+            // Keep the normalized resolved MCP selectors in the runtime tool
+            // list so build() can construct allowlists the runtime filter
+            // understands and widen the tool policy for MCP advertisement.
+            delegate_config.tools = delegate_resolved.runtime_tool_selectors();
             // Attach the resolved MCP servers so the delegate runtime starts
             // them through the existing stdio and streamable-http transports.
             delegate_config.mcp_servers = delegate_resolved
@@ -1977,5 +1994,186 @@ model = "gpt-4"
                 .iter()
                 .all(|delegate| delegate.mcp_servers.is_empty())
         );
+    }
+
+    // ---- #965: resolved MCP selectors survive into runtime tool lists ----
+
+    /// Like [`mcp_quorum_config`] but mixes local tools, a wildcard MCP
+    /// selection, and a specific MCP selection.
+    fn mcp_mixed_quorum_config() -> QuorumConfig {
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["shell", "stdio-tool.*", "http-tool.lookup"]
+
+[[mcp]]
+name = "stdio-tool"
+command = "stdio-cmd"
+transport = "stdio"
+
+[[mcp]]
+name = "http-tool"
+url = "https://example.test/mcp"
+transport = "http"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+tools = ["read_tool", "stdio-tool.fetch"]
+"#;
+        toml::from_str(toml).expect("parse mcp quorum config")
+    }
+
+    #[test]
+    fn quorum_planner_allowlist_preserves_mcp_selectors() {
+        let builder =
+            crate::api::agent::Agent::builder_from_quorum_config(mcp_quorum_config(), None)
+                .expect("builder_from_quorum_config");
+
+        let planner = builder.planner_config.expect("planner config");
+        assert!(
+            planner.tools.contains(&"stdio-tool.*".to_string()),
+            "planner tool list must keep the wildcard selector: {:?}",
+            planner.tools
+        );
+        assert!(
+            planner.tools.contains(&"http-tool.*".to_string()),
+            "planner tool list must keep the wildcard selector: {:?}",
+            planner.tools
+        );
+    }
+
+    #[test]
+    fn quorum_delegate_allowlist_preserves_mcp_selectors() {
+        let builder =
+            crate::api::agent::Agent::builder_from_quorum_config(mcp_quorum_config(), None)
+                .expect("builder_from_quorum_config");
+
+        let delegate = builder
+            .delegates
+            .iter()
+            .find(|delegate| delegate.id == "coder")
+            .expect("coder delegate");
+        assert_eq!(
+            delegate.tools,
+            vec!["stdio-tool.*".to_string()],
+            "delegate tool list must keep the wildcard selector"
+        );
+    }
+
+    #[test]
+    fn quorum_specific_mcp_selection_normalizes_to_runtime_names() {
+        let builder =
+            crate::api::agent::Agent::builder_from_quorum_config(mcp_mixed_quorum_config(), None)
+                .expect("builder_from_quorum_config");
+
+        let planner = builder.planner_config.expect("planner config");
+        // Wildcard selections keep the server-qualified form...
+        assert!(planner.tools.contains(&"stdio-tool.*".to_string()));
+        // ...while specific selections normalize to the bare provider tool
+        // name that MCP tools are advertised under (the runtime filter matches
+        // bare names, with the server tracked separately).
+        assert!(planner.tools.contains(&"lookup".to_string()));
+        assert!(!planner.tools.contains(&"http-tool.lookup".to_string()));
+        // Local tools survive alongside the selectors.
+        assert!(planner.tools.contains(&"shell".to_string()));
+
+        let delegate = builder
+            .delegates
+            .iter()
+            .find(|delegate| delegate.id == "coder")
+            .expect("coder delegate");
+        assert_eq!(
+            delegate.tools,
+            vec!["read_tool".to_string(), "fetch".to_string()],
+            "delegate keeps local tools and the normalized specific selection"
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_runtime_config_admits_resolved_mcp_tools() {
+        let (plugin_registry, _registry_dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
+        );
+        let infra = super::super::agent::AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        };
+
+        let agent =
+            crate::api::agent::Agent::builder_from_quorum_config(mcp_mixed_quorum_config(), None)
+                .expect("builder_from_quorum_config")
+                .infra(infra)
+                .build()
+                .await
+                .expect("quorum should build");
+
+        let planner = agent
+            .planner()
+            .expect("planner handle")
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local planner")
+            .config
+            .clone();
+
+        // Policy must admit provider tools so MCP tool definitions reach the
+        // LLM, and the allowlist must keep the normalized selectors.
+        assert_eq!(planner.tool_config.policy, ToolPolicy::BuiltInAndProvider);
+        let allowlist = planner.tool_config.allowlist.as_ref().expect("allowlist");
+        assert!(allowlist.contains("stdio-tool.*"));
+        assert!(allowlist.contains("lookup"));
+        assert!(allowlist.contains("shell"));
+        // The shared runtime filter admits wildcard MCP tools by server name
+        // and specific MCP tools by bare provider name.
+        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
+            &planner.tool_config,
+            "any_stdio_tool",
+            Some("stdio-tool")
+        ));
+        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
+            &planner.tool_config,
+            "lookup",
+            Some("http-tool")
+        ));
+        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
+            &planner.tool_config,
+            "other_http_tool",
+            Some("http-tool")
+        ));
+
+        let delegate = agent
+            .delegate("coder")
+            .expect("coder delegate")
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local delegate")
+            .config
+            .clone();
+
+        assert_eq!(delegate.tool_config.policy, ToolPolicy::BuiltInAndProvider);
+        let allowlist = delegate.tool_config.allowlist.as_ref().expect("allowlist");
+        assert!(allowlist.contains("fetch"));
+        assert!(allowlist.contains("read_tool"));
+        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
+            &delegate.tool_config,
+            "fetch",
+            Some("stdio-tool")
+        ));
+        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
+            &delegate.tool_config,
+            "unrelated",
+            Some("stdio-tool")
+        ));
     }
 }

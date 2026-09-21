@@ -26,6 +26,36 @@ pub struct ResolvedTools {
     pub mcp_servers: HashMap<String, (McpServerConfig, Option<Vec<String>>)>,
 }
 
+impl ResolvedTools {
+    /// Normalized tool selectors for the runtime tool list and allowlist.
+    ///
+    /// Local tool names pass through unchanged. Resolved MCP selections are
+    /// rendered in the form the runtime understands: a wildcard selection
+    /// becomes `server.*` (matched against the MCP server name during
+    /// filtering) and a specific selection becomes the bare provider tool
+    /// name that MCP tools are advertised under (the server is tracked
+    /// separately by the MCP runtime).
+    ///
+    /// Servers are emitted in sorted order so the list is deterministic
+    /// despite `mcp_servers` being a `HashMap`.
+    pub fn runtime_tool_selectors(&self) -> Vec<String> {
+        let mut selectors = self.local_tools.clone();
+        let mut servers: Vec<(&String, &Option<Vec<String>>)> = self
+            .mcp_servers
+            .iter()
+            .map(|(server, (_, tools))| (server, tools))
+            .collect();
+        servers.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (server, tools) in servers {
+            match tools {
+                None => selectors.push(format!("{server}.*")),
+                Some(names) => selectors.extend(names.iter().cloned()),
+            }
+        }
+        selectors
+    }
+}
+
 /// Resolve local and MCP tool specifications for an agent.
 pub fn resolve_tools(
     tools: &[String],
