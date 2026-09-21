@@ -193,7 +193,8 @@ pub async fn cancel_pending_elicitations_for_session(
         let mut pending = pending_map.lock().await;
         let ids = pending
             .iter()
-            .filter_map(|(id, entry)| (entry.session_id == session_id).then(|| id.clone()))
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| pending.remove(&id).map(|entry| entry.sender))
