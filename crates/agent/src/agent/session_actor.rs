@@ -481,6 +481,17 @@ impl Message<Cancel> for SessionActor {
     async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         debug!("Session {}: Cancel received", self.session_id);
         self.turn_state.token.cancel();
+        let cancelled_elicitations = crate::elicitation::cancel_pending_elicitations_for_session(
+            &self.config.pending_elicitations,
+            &self.session_id,
+        )
+        .await;
+        if cancelled_elicitations > 0 {
+            debug!(
+                "Session {}: cancelled {} pending elicitation(s)",
+                self.session_id, cancelled_elicitations
+            );
+        }
         if let Some(run) = &mut self.active_run {
             run.phase = RunPhase::Closing;
             let run_id = run.run_id.clone();

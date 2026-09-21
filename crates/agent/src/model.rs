@@ -877,9 +877,105 @@ impl AgentMessage {
     }
 }
 
+/// Repair persisted transcripts that contain assistant tool calls without an
+/// immediately following result. This keeps legacy or interrupted sessions
+/// acceptable to providers that strictly validate call/result pairing.
+pub(crate) fn repair_unmatched_tool_calls(messages: &mut Vec<AgentMessage>) -> usize {
+    let mut repaired = 0;
+    let mut pending = Vec::<ToolCall>::new();
+    let mut index = 0;
+
+    while index < messages.len() {
+        if !pending.is_empty() {
+            if messages[index].role == ChatRole::User {
+                let returned = messages[index]
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                pending.retain(|call| !returned.contains(call.id.as_str()));
+                if !pending.is_empty() {
+                    let mut results = cancelled_tool_result_parts(&pending);
+                    repaired += results.len();
+                    results.append(&mut messages[index].parts);
+                    messages[index].parts = results;
+                }
+                pending.clear();
+            } else {
+                let session_id = messages[index].session_id.clone();
+                let created_at = messages[index].created_at;
+                let parts = cancelled_tool_result_parts(&pending);
+                repaired += parts.len();
+                messages.insert(
+                    index,
+                    AgentMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id,
+                        role: ChatRole::User,
+                        parts,
+                        created_at,
+                        parent_message_id: None,
+                        source_provider: None,
+                        source_model: None,
+                    },
+                );
+                pending.clear();
+                index += 1;
+            }
+        }
+
+        if messages[index].role == ChatRole::Assistant {
+            pending = messages[index].function_calls();
+        }
+        index += 1;
+    }
+
+    if !pending.is_empty() {
+        let session_id = messages
+            .last()
+            .map(|message| message.session_id.clone())
+            .unwrap_or_default();
+        let parts = cancelled_tool_result_parts(&pending);
+        repaired += parts.len();
+        messages.push(AgentMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            role: ChatRole::User,
+            parts,
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        });
+    }
+
+    repaired
+}
+
+fn cancelled_tool_result_parts(calls: &[ToolCall]) -> Vec<MessagePart> {
+    calls
+        .iter()
+        .map(|call| MessagePart::ToolResult {
+            call_id: call.id.clone(),
+            content: vec![querymt::chat::ToolResultPart::text(
+                "Error: Cancelled before the tool returned a result",
+            )],
+            is_error: true,
+            tool_name: Some(call.function.name.clone()),
+            tool_arguments: Some(call.function.arguments.clone()),
+            compacted_at: None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AgentMessage, MessagePart, OutputTarget, PromptContentError};
+    use super::{
+        AgentMessage, MessagePart, OutputTarget, PromptContentError, repair_unmatched_tool_calls,
+    };
     use crate::acp::protocol::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
         ImageContent, TextContent, TextResourceContents,
@@ -1627,6 +1723,93 @@ mod tests {
             },
         }));
         assert_eq!(mixed.function_calls().len(), 1);
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_prepends_result_to_next_user_message() {
+        let assistant = AgentMessage {
+            id: "assistant".into(),
+            session_id: "s1".into(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::ToolUse(querymt::ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: querymt::FunctionCall {
+                    name: "question".into(),
+                    arguments: "{}".into(),
+                },
+            })],
+            created_at: 1,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let prompt = AgentMessage {
+            id: "user".into(),
+            session_id: "s1".into(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Text {
+                content: "continue".into(),
+            }],
+            created_at: 2,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let mut messages = vec![assistant, prompt];
+
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 1);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[1].parts[0],
+            MessagePart::ToolResult { call_id, is_error: true, .. } if call_id == "call_1"
+        ));
+        assert!(
+            matches!(&messages[1].parts[1], MessagePart::Text { content } if content == "continue")
+        );
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_preserves_matched_results() {
+        let mut messages = vec![
+            AgentMessage {
+                id: "assistant".into(),
+                session_id: "s1".into(),
+                role: ChatRole::Assistant,
+                parts: vec![MessagePart::ToolUse(querymt::ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                    },
+                })],
+                created_at: 1,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+            AgentMessage {
+                id: "result".into(),
+                session_id: "s1".into(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::ToolResult {
+                    call_id: "call_1".into(),
+                    content: vec![ToolResultPart::text("ok")],
+                    is_error: false,
+                    tool_name: Some("shell".into()),
+                    tool_arguments: Some("{}".into()),
+                    compacted_at: None,
+                }],
+                created_at: 2,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+        ];
+
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 0);
+        assert_eq!(messages[1].parts.len(), 1);
     }
 
     #[test]

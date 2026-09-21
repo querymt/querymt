@@ -1460,7 +1460,19 @@ pub(super) async fn transition_processing_tool_calls(
 
             let call = &remaining_calls[call_index];
             stateful_executed |= class == crate::tools::ToolExecutionClass::SerialStateful;
-            let result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge).await;
+            let cancel = exec_ctx.cancellation_token.clone();
+            let result = tokio::select! {
+                result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge) => result,
+                _ = cancel.cancelled() => Ok(ToolResult::new(
+                    call.id.clone(),
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: "Error: Cancelled by user".to_string(),
+                    }],
+                    true,
+                    Some(call.function.name.clone()),
+                    Some(call.function.arguments.clone()),
+                )),
+            };
             let mut clarification_applied = false;
             match result {
                 Ok(tool_result) => {
