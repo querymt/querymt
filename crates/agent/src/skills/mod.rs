@@ -55,11 +55,12 @@ pub(crate) fn build_skill_tool(config: &SkillsConfig, project_root: &Path) -> Ar
         }
     }
 
-    Arc::new(SkillTool::new(
+    Arc::new(SkillTool::new_with_fallback(
         Arc::new(Mutex::new(registry)),
         Arc::new(config.permissions.clone()),
         search_paths,
         config.include_external,
+        project_root.to_path_buf(),
     ))
 }
 

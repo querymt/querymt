@@ -2,6 +2,7 @@
 
 use crate::tools::context::Tool;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Registry for managing available tools
@@ -30,7 +31,24 @@ impl ToolRegistry {
     }
 
     pub fn definitions(&self) -> Vec<querymt::chat::Tool> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.definitions_for_cwd(None)
+    }
+
+    pub fn definitions_for_cwd(&self, cwd: Option<&Path>) -> Vec<querymt::chat::Tool> {
+        self.tools
+            .values()
+            .map(|tool| tool.definition_for_cwd(cwd))
+            .collect()
+    }
+
+    pub fn definition_for_cwd(
+        &self,
+        name: &str,
+        cwd: Option<&Path>,
+    ) -> Option<querymt::chat::Tool> {
+        self.tools
+            .get(name)
+            .map(|tool| tool.definition_for_cwd(cwd))
     }
 
     pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {

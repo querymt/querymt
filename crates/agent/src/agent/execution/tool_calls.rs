@@ -496,8 +496,8 @@ async fn validate_tool_arguments(
 ) -> anyhow::Result<()> {
     let schema = config
         .tool_registry
-        .find(tool_name)
-        .map(|tool| tool.definition().function.parameters)
+        .definition_for_cwd(tool_name, exec_ctx.cwd())
+        .map(|tool| tool.function.parameters)
         .or_else(|| {
             exec_ctx
                 .runtime
