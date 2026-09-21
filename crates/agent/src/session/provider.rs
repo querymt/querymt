@@ -773,10 +773,20 @@ impl SessionHandle {
 
     /// Get the effective session history (post-compaction, no snapshot-only messages)
     pub async fn get_effective_agent_history(&self) -> SessionResult<Vec<AgentMessage>> {
-        self.provider
+        let mut messages = self
+            .provider
             .history_store
             .get_effective_history(&self.session.public_id)
-            .await
+            .await?;
+        let repaired = crate::model::repair_unmatched_tool_calls(&mut messages);
+        if repaired > 0 {
+            log::warn!(
+                "Repaired {} unmatched tool call(s) while loading session {} history",
+                repaired,
+                self.session.public_id
+            );
+        }
+        Ok(messages)
     }
 
     /// Get the session history converted to standard ChatMessages for the LLM.

@@ -204,6 +204,7 @@ pub(super) async fn execute_tool_call(
     let event_sink = config.event_sink.clone();
     let session_id_clone = exec_ctx.session_id.clone();
     let pending_elicitations = config.pending_elicitations.clone();
+    let cancellation_token = exec_ctx.cancellation_token.clone();
     tokio::spawn(async move {
         while let Some(request) = elicitation_rx.recv().await {
             let elicitation_id = request.elicitation_id.clone();
@@ -214,6 +215,16 @@ pub(super) async fn execute_tool_call(
                 request.response_tx,
             )
             .await;
+            // Close the race where cancellation happens just before this request
+            // reaches the shared pending map.
+            if cancellation_token.is_cancelled() {
+                crate::elicitation::cancel_pending_elicitations_for_session(
+                    &pending_elicitations,
+                    &session_id_clone,
+                )
+                .await;
+                continue;
+            }
             // Durable: elicitation must be visible in UI replay.
             if let Err(err) = event_sink
                 .emit_durable(
