@@ -494,8 +494,8 @@ enum XaiResponsesFunctionOutput<'a> {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type")]
 enum XaiResponsesToolOutputPart<'a> {
-    #[serde(rename = "output_text")]
-    OutputText { text: Cow<'a, str> },
+    #[serde(rename = "input_text")]
+    InputText { text: Cow<'a, str> },
     #[serde(rename = "input_image")]
     InputImage { image_url: String },
 }
@@ -634,7 +634,7 @@ fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem
                     for c in content {
                         match c {
                             Content::Text { text } => {
-                                output_parts.push(XaiResponsesToolOutputPart::OutputText {
+                                output_parts.push(XaiResponsesToolOutputPart::InputText {
                                     text: Cow::Borrowed(text.as_str()),
                                 });
                                 text_only_parts.push(text.clone());
@@ -661,7 +661,7 @@ fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem
                                     "[PDF tool output not yet serialized natively ({} bytes)]",
                                     data.len()
                                 );
-                                output_parts.push(XaiResponsesToolOutputPart::OutputText {
+                                output_parts.push(XaiResponsesToolOutputPart::InputText {
                                     text: Cow::Owned(text),
                                 });
                             }
@@ -672,7 +672,7 @@ fn to_xai_responses_input(messages: &[ChatMessage]) -> Vec<XaiResponsesInputItem
                                     mime_type,
                                     data.len()
                                 );
-                                output_parts.push(XaiResponsesToolOutputPart::OutputText {
+                                output_parts.push(XaiResponsesToolOutputPart::InputText {
                                     text: Cow::Owned(text),
                                 });
                             }
@@ -1186,6 +1186,74 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("responses=experimental")
         );
+    }
+
+    #[test]
+    fn responses_request_serializes_rich_and_text_only_tool_outputs() {
+        let xai = test_xai("xai-key");
+        let messages = vec![
+            ChatMessage::user()
+                .tool_result(
+                    "rich-output".to_string(),
+                    None,
+                    false,
+                    vec![
+                        Content::text("ordinary output"),
+                        Content::Pdf {
+                            data: vec![1, 2, 3],
+                        },
+                        Content::Audio {
+                            mime_type: "audio/wav".to_string(),
+                            data: vec![4, 5],
+                        },
+                        Content::Image {
+                            mime_type: "image/png".to_string(),
+                            data: vec![6, 7, 8],
+                        },
+                    ],
+                )
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    "text-only".to_string(),
+                    None,
+                    false,
+                    vec![Content::text("first line"), Content::text("second line")],
+                )
+                .build(),
+        ];
+
+        let req = xai
+            .chat_request(&messages, None)
+            .expect("responses request should build");
+        let body: Value = serde_json::from_slice(req.body()).expect("body should be JSON");
+        let outputs: Vec<&Value> = body["input"]
+            .as_array()
+            .expect("input should be an array")
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0]["call_id"], "rich-output");
+        assert_eq!(
+            outputs[0]["output"],
+            serde_json::json!([
+                {"type": "input_text", "text": "ordinary output"},
+                {
+                    "type": "input_text",
+                    "text": "[PDF tool output not yet serialized natively (3 bytes)]"
+                },
+                {
+                    "type": "input_text",
+                    "text": "[Audio tool output not yet serialized natively (audio/wav: 2 bytes)]"
+                },
+                {"type": "input_image", "image_url": "data:image/png;base64,BgcI"}
+            ])
+        );
+        assert_eq!(outputs[1]["call_id"], "text-only");
+        assert_eq!(outputs[1]["output"], "first line\nsecond line");
+        assert!(outputs[1]["output"].is_string());
     }
 
     #[test]
