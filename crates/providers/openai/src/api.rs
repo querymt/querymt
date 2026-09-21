@@ -194,7 +194,8 @@ enum OpenAIResponsesInputItem<'a> {
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<Cow<'a, str>>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        // The Responses API requires `summary` on every reasoning input item;
+        // an empty array is valid but the key must always be present.
         summary: Vec<OpenAIResponsesReasoningSummary<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<Cow<'a, str>>,
@@ -3561,10 +3562,47 @@ mod tests {
 
     use super::{
         MultipartForm, OpenAIChatResponse, OpenAIToolUseState, classify_openai_http_error,
-        convert_chat_message_to_openai, openai_parse_chat, openai_parse_list_models,
-        parse_openai_sse_chunk,
+        convert_chat_message_to_openai, convert_structured_output_to_responses, openai_parse_chat,
+        openai_parse_list_models, parse_openai_sse_chunk,
     };
     use crate::OpenAI;
+
+    #[test]
+    fn responses_replay_reasoning_without_summary_serializes_empty_summary_array() {
+        use querymt::chat::{ChatOutputItem, ChatOutputProvenance, ChatReasoningItem, Extensions};
+
+        let output = ChatOutput {
+            provenance: Some(ChatOutputProvenance {
+                provider: "openai".to_string(),
+                protocol: "responses".to_string(),
+                model: "gpt-5".to_string(),
+                endpoint: "https://api.openai.com/v1/responses".to_string(),
+            }),
+            items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("rs_1".to_string()),
+                summary: Vec::new(),
+                content: Vec::new(),
+                encrypted_content: Some("enc_payload".to_string()),
+                signature: None,
+                status: None,
+                extensions: Extensions::new(),
+            })],
+            ..ChatOutput::default()
+        };
+
+        let mut out = Vec::new();
+        convert_structured_output_to_responses(&output, &mut out, true)
+            .expect("empty-summary reasoning must replay");
+        assert_eq!(out.len(), 1);
+        let value = serde_json::to_value(&out[0]).unwrap();
+
+        assert_eq!(value["type"], "reasoning");
+        // The Responses API requires `summary` on every reasoning input item,
+        // even when the model emitted no summary text.
+        assert_eq!(value["summary"], serde_json::json!([]));
+        assert_eq!(value["id"], "rs_1");
+        assert_eq!(value["encrypted_content"], "enc_payload");
+    }
 
     #[test]
     fn raw_images_serialize_as_ordered_data_urls() {

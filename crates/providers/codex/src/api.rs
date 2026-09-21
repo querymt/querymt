@@ -147,7 +147,8 @@ enum CodexInputItem<'a> {
     Reasoning {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<Cow<'a, str>>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
+        // The Responses API requires `summary` on every reasoning input item;
+        // an empty array is valid but the key must always be present.
         summary: Vec<CodexReasoningSummaryInput<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<Cow<'a, str>>,
@@ -1853,6 +1854,37 @@ mod tests {
             Value::String(r#"{"path":"a.txt"}"#.to_string())
         );
         assert_eq!(input[4]["call_id"], Value::String("call_1".to_string()));
+    }
+
+    #[test]
+    fn codex_replay_reasoning_without_summary_serializes_empty_summary_array() {
+        use querymt::chat::{ChatOutputItem, ChatReasoningItem, Extensions};
+
+        let cfg = test_codex("test-token");
+        let turn = structured_assistant_turn(vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+            id: Some("rs_empty".to_string()),
+            summary: Vec::new(),
+            content: Vec::new(),
+            encrypted_content: Some("enc_payload".to_string()),
+            signature: None,
+            status: None,
+            extensions: Extensions::new(),
+        })]);
+
+        let messages = vec![ChatMessage::user().text("continue").build(), turn];
+        let body: Value =
+            serde_json::from_slice(&codex_chat_body_json(&cfg, &messages, None).unwrap()).unwrap();
+        let reasoning = &body["input"][1];
+
+        assert_eq!(reasoning["type"], Value::String("reasoning".to_string()));
+        // The Responses API requires `summary` on every reasoning input item,
+        // even when the model emitted no summary text.
+        assert_eq!(reasoning["summary"], Value::Array(Vec::new()));
+        assert_eq!(reasoning["id"], Value::String("rs_empty".to_string()));
+        assert_eq!(
+            reasoning["encrypted_content"],
+            Value::String("enc_payload".to_string())
+        );
     }
 
     #[test]
