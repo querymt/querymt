@@ -1408,7 +1408,9 @@ mod tests {
                             MediaPart::new(
                                 MediaKind::Document,
                                 Some("application/pdf".parse().unwrap()),
-                                MediaSource::Inline { data: vec![1, 2, 3] },
+                                MediaSource::Inline {
+                                    data: vec![1, 2, 3],
+                                },
                             )
                             .unwrap(),
                         ),
@@ -1424,7 +1426,9 @@ mod tests {
                             MediaPart::new(
                                 MediaKind::Image,
                                 Some("image/png".parse().unwrap()),
-                                MediaSource::Inline { data: vec![6, 7, 8] },
+                                MediaSource::Inline {
+                                    data: vec![6, 7, 8],
+                                },
                             )
                             .unwrap(),
                         ),
