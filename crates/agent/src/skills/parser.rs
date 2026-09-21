@@ -33,13 +33,18 @@ pub fn parse_skill_file_ex(path: &Path, source: SkillSource, protocol: bool) -> 
         .with_context(|| format!("Failed to read {}", path.display()))?;
 
     let parsed = gray_matter::Matter::<gray_matter::engine::YAML>::new()
-        .parse::<SkillMetadata>(&content)
+        .parse::<gray_matter::Pod>(&content)
         .with_context(|| format!("Failed to parse file {}", path.display()))?;
 
     // Extract and validate frontmatter
-    let mut metadata: SkillMetadata = parsed
+    let data = parsed
         .data
         .ok_or_else(|| anyhow::anyhow!("Missing YAML frontmatter in {}", path.display()))?;
+    let mut metadata: SkillMetadata = serde_path_to_error::deserialize(&data).map_err(|error| {
+        let field = error.path().to_string();
+        anyhow::Error::new(error.into_inner())
+            .context(format!("Failed to deserialize skill metadata at {field}"))
+    })?;
 
     if protocol {
         apply_protocol_defaults(&mut metadata, path);
@@ -174,6 +179,60 @@ Content
                 .unwrap_err()
                 .to_string()
                 .contains("Missing YAML frontmatter")
+        );
+    }
+
+    #[test]
+    fn test_invalid_compatibility_reports_field_path() {
+        let dir = TempDir::new().unwrap();
+        let skill_path = dir.path().join("SKILL.md");
+        fs::write(
+            &skill_path,
+            r#"---
+name: test-skill
+description: A test skill
+compatibility: ["*"]
+---
+Content
+"#,
+        )
+        .unwrap();
+
+        let error = parse_skill_file(&skill_path, SkillSource::Global(dir.path().to_path_buf()))
+            .unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains(
+                "Failed to deserialize skill metadata at compatibility: Type error, expected: string"
+            ),
+            "unexpected error: {error_chain}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_allowed_tools_reports_field_path() {
+        let dir = TempDir::new().unwrap();
+        let skill_path = dir.path().join("SKILL.md");
+        fs::write(
+            &skill_path,
+            r#"---
+name: test-skill
+description: A test skill
+allowed-tools: ["read_tool"]
+---
+Content
+"#,
+        )
+        .unwrap();
+
+        let error = parse_skill_file(&skill_path, SkillSource::Global(dir.path().to_path_buf()))
+            .unwrap_err();
+        let error_chain = format!("{error:#}");
+        assert!(
+            error_chain.contains(
+                "Failed to deserialize skill metadata at allowed-tools: Type error, expected: string"
+            ),
+            "unexpected error: {error_chain}"
         );
     }
 
