@@ -1821,7 +1821,9 @@ mod tests {
 
         // ToolUseComplete with fully assembled arguments
         match &chunks[3] {
-            querymt::chat::StreamChunk::ToolUseComplete { index, tool_call, .. } => {
+            querymt::chat::StreamChunk::ToolUseComplete {
+                index, tool_call, ..
+            } => {
                 assert_eq!(*index, 0);
                 assert_eq!(tool_call.id, "toolu_01");
                 assert_eq!(tool_call.function.name, "read_file");
