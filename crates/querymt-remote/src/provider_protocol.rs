@@ -95,7 +95,7 @@ fn parse_finish_reason(reason: &str) -> FinishReason {
 
 impl fmt::Display for ProviderChatResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.output)
+        f.write_str(self.output.text().as_deref().unwrap_or("[no text]"))
     }
 }
 
