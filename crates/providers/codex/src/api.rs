@@ -578,7 +578,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
         }
 
         let is_user = matches!(msg.role, ChatRole::User);
-        let parts = msg.input_parts();
+        let parts = msg.portable_input_parts();
 
         // ── Pass 1: collect regular content blocks into a single message item ──
         // Tool results are emitted as separate API items in pass 2.

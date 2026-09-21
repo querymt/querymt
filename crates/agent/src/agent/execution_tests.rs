@@ -620,7 +620,7 @@ async fn test_parallel_tool_results_in_single_user_message() {
 
     // That single message should contain exactly 3 tool result parts.
     let tool_result_count = user_tool_result_messages[0]
-        .input_parts()
+        .portable_input_parts()
         .iter()
         .filter(|p| p.is_tool_result())
         .count();
@@ -1051,7 +1051,7 @@ async fn test_tool_binary_output_survives_follow_up_turn_until_compaction() {
         .expect("history should contain tool result message");
 
     let tool_result_content = tool_result_message
-        .input_parts()
+        .portable_input_parts()
         .into_iter()
         .find_map(|part| match part {
             querymt::chat::ChatInputPart::ToolResult(result) => Some(result),

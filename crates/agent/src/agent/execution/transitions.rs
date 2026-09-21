@@ -429,7 +429,7 @@ pub(super) async fn transition_call_llm(
     let output: ChatOutput = if tools.is_empty() {
         // No tools — always use the non-streaming simple submit path.
         let cancel = exec_ctx.cancellation_token.clone();
-        let resp = match super::llm_retry::call_with_retry(
+        match super::llm_retry::call_with_retry(
             config,
             session_id,
             &exec_ctx.cancellation_token,
@@ -452,9 +452,7 @@ pub(super) async fn transition_call_llm(
         {
             Ok(resp) => resp,
             Err(e) => return map_failed_llm_call(e, false, context),
-        };
-
-        resp
+        }
     } else {
         let provider = match super::llm_retry::call_with_retry(
             config,
@@ -910,7 +908,7 @@ pub(super) async fn transition_call_llm(
         } else {
             // === NON-STREAMING FALLBACK ===
             let cancel = exec_ctx.cancellation_token.clone();
-            let resp = match super::llm_retry::call_with_retry(
+            match super::llm_retry::call_with_retry(
                 config,
                 session_id,
                 &exec_ctx.cancellation_token,
@@ -935,9 +933,7 @@ pub(super) async fn transition_call_llm(
             {
                 Ok(resp) => resp,
                 Err(e) => return map_failed_llm_call(e, false, context),
-            };
-
-            resp
+            }
         }
     };
 

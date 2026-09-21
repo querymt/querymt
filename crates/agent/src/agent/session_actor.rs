@@ -1698,29 +1698,24 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
 
         // Map the single result part returned by render_read_output to the
         // appropriate ReadRemoteFileResponse variant.
-        for block in blocks {
-            match block {
-                querymt::chat::ToolResultPart::Attachment(media) => {
-                    return Ok(ReadRemoteFileResponse::Image {
-                        mime_type: media
-                            .media_type()
-                            .map(ToString::to_string)
-                            .unwrap_or_default(),
-                        base64_data: match media.source() {
-                            querymt::chat::MediaSource::Inline { data } => {
-                                base64::engine::general_purpose::STANDARD.encode(data)
-                            }
-                            _ => String::new(),
-                        },
-                    });
-                }
-                querymt::chat::ToolResultPart::Text { text } => {
-                    return Ok(ReadRemoteFileResponse::Text(text));
-                }
-            }
+        let Some(block) = blocks.into_iter().next() else {
+            return Ok(ReadRemoteFileResponse::Binary);
+        };
+        match block {
+            querymt::chat::ToolResultPart::Attachment(media) => Ok(ReadRemoteFileResponse::Image {
+                mime_type: media
+                    .media_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                base64_data: match media.source() {
+                    querymt::chat::MediaSource::Inline { data } => {
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    }
+                    _ => String::new(),
+                },
+            }),
+            querymt::chat::ToolResultPart::Text { text } => Ok(ReadRemoteFileResponse::Text(text)),
         }
-
-        Ok(ReadRemoteFileResponse::Binary)
     }
 }
 

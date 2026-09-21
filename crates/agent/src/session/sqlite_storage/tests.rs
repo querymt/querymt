@@ -268,7 +268,7 @@ async fn canonical_output_part_round_trips_through_sqlite_reload() {
         chat.output().is_none(),
         "portable projection carries no native structured continuation"
     );
-    let projected = chat.input_parts();
+    let projected = chat.portable_input_parts();
     let text_parts = projected
         .iter()
         .filter(|part| part.as_text().is_some())
@@ -435,7 +435,7 @@ async fn pruning_keeps_call_result_mapping_for_structured_turns() {
     // The result still references the original call ID with placeholder content.
     let chat = history[1].to_chat_message().unwrap();
     let result = chat
-        .input_parts()
+        .portable_input_parts()
         .into_iter()
         .find_map(|part| match part {
             querymt::chat::ChatInputPart::ToolResult(result) => Some(result),
@@ -765,7 +765,7 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
 
     // Each structured item projects exactly once: the visible reasoning, the
     // message text, and the call arguments become portable input text.
-    let projected = chat_messages[1].input_parts();
+    let projected = chat_messages[1].portable_input_parts();
     let text_parts: Vec<&str> = projected.iter().filter_map(|part| part.as_text()).collect();
     assert_eq!(
         text_parts
@@ -785,7 +785,7 @@ async fn structured_response_persist_reload_then_second_request_round_trips() {
     );
 
     let tool_result = chat_messages[2]
-        .input_parts()
+        .portable_input_parts()
         .into_iter()
         .find_map(|part| match part {
             querymt::chat::ChatInputPart::ToolResult(result) => Some(result),

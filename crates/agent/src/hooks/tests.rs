@@ -582,11 +582,17 @@ async fn context_replacement_is_request_only_and_chained() {
         })
         .await
         .unwrap();
-    assert_eq!(stored[0].input_parts()[0].as_text(), Some("stored"));
+    assert_eq!(
+        stored[0].portable_input_parts()[0].as_text(),
+        Some("stored")
+    );
     let projected = result.messages.unwrap();
-    assert_eq!(projected[0].input_parts()[0].as_text(), Some("projected"));
+    assert_eq!(
+        projected[0].portable_input_parts()[0].as_text(),
+        Some("projected")
+    );
     assert!(
-        projected[0].input_parts()[1]
+        projected[0].portable_input_parts()[1]
             .as_text()
             .unwrap()
             .contains("memory")

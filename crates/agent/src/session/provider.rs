@@ -903,7 +903,7 @@ impl SessionHandle {
             );
         }
 
-        for part in msg.input_parts() {
+        for part in msg.portable_input_parts() {
             match part {
                 querymt::chat::ChatInputPart::Text { text } => {
                     parts.push(MessagePart::Text { content: text });
@@ -973,7 +973,7 @@ impl SessionHandle {
         AgentMessage {
             id: uuid::Uuid::now_v7().to_string(),
             session_id,
-            role: msg.role.clone(),
+            role: msg.role,
             parts,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,

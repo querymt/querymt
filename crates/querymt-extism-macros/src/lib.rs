@@ -331,13 +331,7 @@ macro_rules! impl_extism_http_plugin {
 
             let out = chunks
                 .into_iter()
-                .map(|chunk| {
-                    let usage = match &chunk {
-                        StreamChunk::Usage(usage) => Some(usage.clone()),
-                        _ => None,
-                    };
-                    querymt::plugin::extism_impl::ExtismChatChunk { chunk, usage }
-                })
+                .map(|chunk| querymt::plugin::extism_impl::ExtismChatChunk { chunk })
                 .collect();
             Ok(Json(out))
         }
@@ -356,13 +350,7 @@ macro_rules! impl_extism_http_plugin {
 
             let out = chunks
                 .into_iter()
-                .map(|chunk| {
-                    let usage = match &chunk {
-                        StreamChunk::Usage(usage) => Some(usage.clone()),
-                        _ => None,
-                    };
-                    querymt::plugin::extism_impl::ExtismChatChunk { chunk, usage }
-                })
+                .map(|chunk| querymt::plugin::extism_impl::ExtismChatChunk { chunk })
                 .collect();
             Ok(Json(out))
         }

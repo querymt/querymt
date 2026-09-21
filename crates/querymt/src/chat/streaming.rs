@@ -9,7 +9,7 @@ use super::{
 use crate::Usage;
 
 /// Item-aware stream events. Providers emit metadata before semantic events to declare
-/// structured mode; legacy chunks may still accompany these events as UI projections.
+/// structured mode. Compatibility projections are produced only at explicit boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StructuredStreamEvent {
@@ -154,13 +154,6 @@ pub enum ChatStreamAccumulatorError {
     #[error("structured message delta references non-message output index {0}")]
     ExpectedMessage(usize),
     #[error(
-        "structured message delta references missing content index {content_index} at output index {output_index}"
-    )]
-    MissingMessagePart {
-        output_index: usize,
-        content_index: usize,
-    },
-    #[error(
         "structured message part at output index {output_index}, content index {content_index} was started more than once"
     )]
     ConflictingPartStart {
@@ -176,13 +169,6 @@ pub enum ChatStreamAccumulatorError {
     },
     #[error("structured reasoning delta references non-reasoning output index {0}")]
     ExpectedReasoning(usize),
-    #[error(
-        "structured reasoning delta references missing part index {part_index} at output index {output_index}"
-    )]
-    MissingReasoningPart {
-        output_index: usize,
-        part_index: usize,
-    },
     #[error("structured argument delta references non-function output index {0}")]
     ExpectedFunctionCall(usize),
     #[error("structured item at output index {output_index} changed identity")]
@@ -222,7 +208,7 @@ pub struct ChatStreamAccumulator {
     mode: AccumulationMode,
     output: ChatOutput,
     structured_items: BTreeMap<usize, ChatOutputItem>,
-    completed_items: BTreeMap<usize, ChatOutputItem>,
+    completed_items: BTreeSet<usize>,
     pending_legacy_calls: BTreeSet<usize>,
     terminal_detail: Option<String>,
     terminal_seen: bool,
@@ -234,7 +220,7 @@ impl Default for ChatStreamAccumulator {
             mode: AccumulationMode::Undecided,
             output: ChatOutput::default(),
             structured_items: BTreeMap::new(),
-            completed_items: BTreeMap::new(),
+            completed_items: BTreeSet::new(),
             pending_legacy_calls: BTreeSet::new(),
             terminal_detail: None,
             terminal_seen: false,
@@ -348,41 +334,50 @@ impl ChatStreamAccumulator {
     /// canonical output; incomplete and failed outcomes retain the available
     /// partial output alongside the classified terminal cause so partial items
     /// remain inspectable while unfinished calls are never executable.
-    pub fn finish(self) -> ChatStreamFinish {
-        let output = self.output();
-        match self.output.status {
+    pub fn finish(mut self) -> ChatStreamFinish {
+        let unfinished = if self.mode == AccumulationMode::Structured {
+            self.structured_items
+                .keys()
+                .filter(|index| !self.completed_items.contains(index))
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let incomplete_legacy_calls: Vec<usize> =
+            self.pending_legacy_calls.iter().copied().collect();
+        if self.mode == AccumulationMode::Structured {
+            self.output.items = self.structured_items.into_values().collect();
+        }
+        let status = self.output.status;
+        let terminal_detail = self.terminal_detail;
+        let output = self.output;
+
+        match status {
             Some(ChatOutputStatus::Completed) => {
-                if self.mode == AccumulationMode::Legacy && !self.pending_legacy_calls.is_empty() {
+                if !incomplete_legacy_calls.is_empty() {
                     return ChatStreamFinish::Failed {
                         error: ChatStreamAccumulatorError::IncompleteToolCalls(
-                            self.pending_legacy_calls.iter().copied().collect(),
+                            incomplete_legacy_calls,
                         ),
                         output,
                     };
                 }
-                if self.mode == AccumulationMode::Structured {
-                    let unfinished: Vec<usize> = self
-                        .structured_items
-                        .keys()
-                        .filter(|index| !self.completed_items.contains_key(index))
-                        .copied()
-                        .collect();
-                    if !unfinished.is_empty() {
-                        return ChatStreamFinish::Failed {
-                            error: ChatStreamAccumulatorError::IncompleteItems(unfinished),
-                            output,
-                        };
-                    }
+                if !unfinished.is_empty() {
+                    return ChatStreamFinish::Failed {
+                        error: ChatStreamAccumulatorError::IncompleteItems(unfinished),
+                        output,
+                    };
                 }
                 ChatStreamFinish::Completed(output)
             }
             Some(ChatOutputStatus::Incomplete) => ChatStreamFinish::Incomplete {
                 output,
-                detail: self.terminal_detail,
+                detail: terminal_detail,
             },
             Some(ChatOutputStatus::Failed) => ChatStreamFinish::Failed {
                 output,
-                error: ChatStreamAccumulatorError::FailedResponse(self.terminal_detail),
+                error: ChatStreamAccumulatorError::FailedResponse(terminal_detail),
             },
             Some(status) => ChatStreamFinish::Failed {
                 output,
@@ -390,11 +385,11 @@ impl ChatStreamAccumulator {
             },
             None => {
                 // An unfinished local-call set is a distinct terminal cause.
-                if self.mode == AccumulationMode::Legacy && !self.pending_legacy_calls.is_empty() {
+                if !incomplete_legacy_calls.is_empty() {
                     return ChatStreamFinish::Failed {
                         output,
                         error: ChatStreamAccumulatorError::IncompleteToolCalls(
-                            self.pending_legacy_calls.iter().copied().collect(),
+                            incomplete_legacy_calls,
                         ),
                     };
                 }
@@ -454,8 +449,8 @@ impl ChatStreamAccumulator {
                         output_index: *output_index,
                     });
                 }
-                if let Some(completed) = self.completed_items.get(output_index) {
-                    if completed != item {
+                if self.completed_items.contains(output_index) {
+                    if self.structured_items.get(output_index) != Some(item) {
                         return Err(ChatStreamAccumulatorError::ConflictingCompletion {
                             output_index: *output_index,
                         });
@@ -463,7 +458,7 @@ impl ChatStreamAccumulator {
                     return Ok(());
                 }
                 self.structured_items.insert(*output_index, item.clone());
-                self.completed_items.insert(*output_index, item.clone());
+                self.completed_items.insert(*output_index);
             }
             StructuredStreamEvent::MessagePartStarted {
                 output_index,
@@ -614,78 +609,11 @@ impl ChatStreamAccumulator {
     }
 
     fn ensure_item_open(&self, output_index: usize) -> Result<(), ChatStreamAccumulatorError> {
-        if self.completed_items.contains_key(&output_index) {
+        if self.completed_items.contains(&output_index) {
             Err(ChatStreamAccumulatorError::EventAfterItemCompletion { output_index })
         } else {
             Ok(())
         }
-    }
-}
-
-/// Explicit adapter that projects canonical output into legacy/UI chunks.
-///
-/// Legacy display, UI, and tool-oriented consumers attach through this adapter
-/// rather than receiving compatibility events interleaved with canonical ones.
-/// The projection exposes visible text, visible reasoning, supported local
-/// function calls, usage, and a terminal `Done`; it never interprets opaque
-/// items as executable content and is never fed back into canonical
-/// accumulation.
-pub struct LegacyStreamProjection;
-
-impl LegacyStreamProjection {
-    /// Project visible canonical content into legacy UI chunks.
-    ///
-    /// Calls are projected only for completed responses, and `Done` is emitted
-    /// only for a successful terminal response. Incomplete or failed output stays
-    /// inspectable without being misrepresented as executable completion.
-    pub fn project(output: &ChatOutput) -> Vec<StreamChunk> {
-        let mut chunks = Vec::new();
-
-        for item in &output.items {
-            match item {
-                ChatOutputItem::Message(message) => {
-                    for part in &message.parts {
-                        match part {
-                            ChatMessagePart::Text { text, .. } if !text.is_empty() => {
-                                chunks.push(StreamChunk::Text(text.clone()));
-                            }
-                            ChatMessagePart::Refusal { refusal, .. } if !refusal.is_empty() => {
-                                chunks.push(StreamChunk::Text(refusal.clone()));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                ChatOutputItem::Reasoning(reasoning) => {
-                    for part in reasoning.summary.iter().chain(&reasoning.content) {
-                        if !part.text.is_empty() {
-                            chunks.push(StreamChunk::Thinking(part.text.clone()));
-                        }
-                    }
-                }
-                ChatOutputItem::FunctionCall(call) if output.is_successful() => {
-                    if call.parse_arguments().is_ok() {
-                        chunks.push(StreamChunk::ToolUseComplete {
-                            index: chunks.len(),
-                            tool_call: call.to_tool_call(),
-                        });
-                    }
-                }
-                ChatOutputItem::FunctionCall(_) | ChatOutputItem::Opaque(_) => {}
-            }
-        }
-
-        if let Some(usage) = &output.usage {
-            chunks.push(StreamChunk::Usage(usage.clone()));
-        }
-
-        if output.is_successful() {
-            chunks.push(StreamChunk::Done {
-                finish_reason: output.finish_reason.unwrap_or(FinishReason::Stop),
-            });
-        }
-
-        chunks
     }
 }
 

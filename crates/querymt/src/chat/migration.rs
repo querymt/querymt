@@ -71,12 +71,30 @@ pub(super) enum Content {
     },
 }
 
-pub(super) fn output_matches_legacy_projection(
+/// Validate the shipped transitional `{ content, output }` record shape.
+///
+/// This format was emitted by released versions while structured output was
+/// introduced. It is decode-only compatibility: current serializers never emit
+/// `content`, but unchanged persisted records must remain readable until a
+/// separately announced storage migration removes that requirement.
+pub(super) fn normalize_transitional_output(
     content: &[Content],
-    output: &ChatOutput,
-    preserve_signatures: bool,
-) -> bool {
-    content == legacy_projection(output, preserve_signatures)
+    output: ChatOutput,
+) -> Result<ChatOutput, TransitionalMessageError> {
+    if content.is_empty()
+        || content == legacy_projection(&output, false)
+        || content == legacy_projection(&output, true)
+    {
+        Ok(output)
+    } else {
+        Err(TransitionalMessageError::StaleProjection)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(super) enum TransitionalMessageError {
+    #[error("message content does not match the structured output projection")]
+    StaleProjection,
 }
 
 fn legacy_projection(output: &ChatOutput, preserve_signatures: bool) -> Vec<Content> {
@@ -512,7 +530,7 @@ mod tests {
 
         let reloaded_user: ChatMessage = serde_json::from_value(saved_user).unwrap();
         let reloaded_assistant: ChatMessage = serde_json::from_value(saved_assistant).unwrap();
-        assert_eq!(reloaded_user.input_parts(), user.input_parts());
+        assert_eq!(reloaded_user.input(), user.input());
         assert_eq!(reloaded_assistant.output(), assistant.output());
 
         let portable = reloaded_assistant.into_portable();

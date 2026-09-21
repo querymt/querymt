@@ -748,7 +748,7 @@ impl HTTPChatProvider for Google {
         }
 
         for msg in messages {
-            let parts = msg.input_parts();
+            let parts = msg.portable_input_parts();
             let has_tool_result = parts.iter().any(ChatInputPart::is_tool_result);
             let role = if has_tool_result {
                 "function"

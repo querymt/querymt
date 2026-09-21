@@ -19,7 +19,7 @@ pub(crate) fn apply_message_to_request(
     msg: &ChatMessage,
 ) -> Result<RequestBuilder, LLMError> {
     let role = map_chat_role(&msg.role);
-    let parts = msg.input_parts();
+    let parts = msg.portable_input_parts();
     let text = parts
         .iter()
         .filter_map(|c| c.as_text())

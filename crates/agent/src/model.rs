@@ -3,8 +3,7 @@ use crate::agent::utils::truncate_to_bytes;
 use crate::index::merkle::DiffPaths;
 use base64::Engine as _;
 use querymt::chat::{
-    ChatInputPart, ChatOutput, ChatOutputItem, ChatReasoningItem, ChatReasoningPart, MediaKind,
-    MediaPart, MediaSource, MediaType,
+    ChatInputPart, ChatOutput, ChatOutputItem, MediaKind, MediaPart, MediaSource, MediaType,
 };
 use querymt::{
     ToolCall,
@@ -956,7 +955,7 @@ mod tests {
         .to_chat_message()
         .unwrap();
 
-        let parts = chat.input_parts();
+        let parts = chat.portable_input_parts();
         assert_eq!(parts.len(), 4);
         assert_eq!(parts[0].as_text(), Some("before"));
         assert!(matches!(
@@ -997,7 +996,7 @@ mod tests {
         .to_chat_message()
         .unwrap();
 
-        let parts = chat.input_parts();
+        let parts = chat.portable_input_parts();
         assert!(matches!(
             &parts[0],
             querymt::chat::ChatInputPart::Attachment(media)
@@ -1030,7 +1029,7 @@ mod tests {
         }];
         let chat = message.to_chat_message().unwrap();
         assert!(matches!(
-            &chat.input_parts()[0],
+            &chat.portable_input_parts()[0],
             querymt::chat::ChatInputPart::Attachment(media)
                 if media.kind == querymt::chat::MediaKind::Image
                     && media.media_type().map(ToString::to_string).as_deref()
@@ -1186,7 +1185,7 @@ mod tests {
         .to_chat_message_with_max_prompt_bytes(Some(4))
         .unwrap();
         assert!(matches!(
-            &chat.input_parts()[1],
+            &chat.portable_input_parts()[1],
             querymt::chat::ChatInputPart::Attachment(media)
                 if media.kind == querymt::chat::MediaKind::Image
         ));
@@ -1297,7 +1296,7 @@ mod tests {
         assert!(chat.has_tool_result());
         // The tool result part should contain the text
         let tr = chat
-            .input_parts()
+            .portable_input_parts()
             .into_iter()
             .find_map(|part| match part {
                 querymt::chat::ChatInputPart::ToolResult(result) => Some(result),
@@ -1332,7 +1331,7 @@ mod tests {
 
         let chat = msg.to_chat_message().unwrap();
         let tr = chat
-            .input_parts()
+            .portable_input_parts()
             .into_iter()
             .find_map(|part| match part {
                 querymt::chat::ChatInputPart::ToolResult(result) => Some(result),
@@ -1477,7 +1476,7 @@ mod tests {
         let chat = msg.to_chat_message().unwrap();
 
         // Must have 2 tool result parts + at least 1 text part (from snapshots).
-        let parts = chat.input_parts();
+        let parts = chat.portable_input_parts();
         let tool_result_count = parts.iter().filter(|p| p.is_tool_result()).count();
         assert_eq!(tool_result_count, 2);
 
@@ -1684,7 +1683,7 @@ mod tests {
         // The message text and the function call each appear exactly once as
         // canonical items.
         let text_parts = chat
-            .input_parts()
+            .portable_input_parts()
             .iter()
             .filter(|part| part.as_text() == Some("final answer"))
             .count();
@@ -1806,7 +1805,7 @@ mod tests {
             .unwrap();
         assert!(
             switched
-                .input_parts()
+                .portable_input_parts()
                 .iter()
                 .any(|part| part.as_text() == Some("visible reasoning"))
         );

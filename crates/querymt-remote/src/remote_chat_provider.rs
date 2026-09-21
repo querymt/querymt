@@ -102,7 +102,7 @@ where
             }
         };
 
-        Ok(chat_response.to_canonical_output())
+        Ok(chat_response.into_canonical_output())
     }
 
     async fn chat_stream_with_tools(

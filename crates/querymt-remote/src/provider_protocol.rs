@@ -1,23 +1,10 @@
 use querymt::ToolCall;
 use querymt::Usage;
 use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
+pub use querymt::chat::{ITEM_AWARE_CHAT_CONTRACT_VERSION, messages_require_item_aware_contract};
 use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-
-pub const ITEM_AWARE_CHAT_CONTRACT_VERSION: u32 = 1;
-
-/// Whether any message retains item-aware-only fidelity semantics.
-///
-/// Derived from the concrete retained semantics, not the mere presence of a
-/// canonical output value, so portable output can cross a legacy boundary.
-pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|message| {
-        message
-            .output()
-            .is_some_and(|output| output.requires_item_aware_fidelity())
-    })
-}
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct GetProviderContractInfo;
@@ -28,81 +15,103 @@ pub struct ProviderContractInfo {
     pub item_aware_chat_version: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ProviderChatResponse {
-    pub text: Option<String>,
-    pub thinking: Option<String>,
+    pub output: ChatOutput,
+}
+
+#[derive(Deserialize)]
+struct ProviderChatResponseDto {
     #[serde(default)]
-    pub tool_calls: Vec<ToolCall>,
-    pub usage: Option<Usage>,
-    pub finish_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output: Option<ChatOutput>,
+    text: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    usage: Option<Usage>,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    output: Option<ChatOutput>,
+}
+
+impl Serialize for ProviderChatResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("ProviderChatResponse", 6)?;
+        state.serialize_field("text", &self.output.text())?;
+        state.serialize_field("thinking", &self.output.thinking())?;
+        state.serialize_field("tool_calls", &self.output.tool_calls().unwrap_or_default())?;
+        state.serialize_field("usage", &self.output.usage)?;
+        state.serialize_field(
+            "finish_reason",
+            &self
+                .output
+                .finish_reason
+                .map(|reason| format!("{reason:?}")),
+        )?;
+        state.serialize_field("output", &self.output)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderChatResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let dto = ProviderChatResponseDto::deserialize(deserializer)?;
+        let output = dto.output.unwrap_or_else(|| {
+            let finish_reason = dto.finish_reason.as_deref().map(parse_finish_reason);
+            let tool_calls = (!dto.tool_calls.is_empty()).then_some(dto.tool_calls);
+            ChatOutput::from_projections(
+                dto.thinking,
+                dto.text,
+                tool_calls,
+                dto.usage,
+                finish_reason,
+            )
+        });
+        Ok(Self { output })
+    }
+}
+
+fn parse_finish_reason(reason: &str) -> FinishReason {
+    match reason {
+        "Stop" => FinishReason::Stop,
+        "Length" => FinishReason::Length,
+        "ContentFilter" => FinishReason::ContentFilter,
+        "ToolCalls" => FinishReason::ToolCalls,
+        "Error" => FinishReason::Error,
+        "Other" => FinishReason::Other,
+        _ => FinishReason::Unknown,
+    }
 }
 
 impl fmt::Display for ProviderChatResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.text {
-            Some(text) => write!(f, "{}", text),
-            None => write!(f, "[no text]"),
-        }
+        write!(f, "{}", self.output)
     }
 }
 
 impl ProviderChatResponse {
-    /// Project the canonical output, falling back to the legacy flat fields
-    /// when the peer only returned a legacy payload.
-    pub fn to_canonical_output(&self) -> ChatOutput {
-        if let Some(output) = &self.output {
-            return output.clone();
-        }
-
-        let finish_reason = self.finish_reason.as_deref().map(|reason| match reason {
-            "Stop" => FinishReason::Stop,
-            "Length" => FinishReason::Length,
-            "ContentFilter" => FinishReason::ContentFilter,
-            "ToolCalls" => FinishReason::ToolCalls,
-            "Error" => FinishReason::Error,
-            "Other" => FinishReason::Other,
-            _ => FinishReason::Unknown,
-        });
-        let tool_calls = if self.tool_calls.is_empty() {
-            None
-        } else {
-            Some(self.tool_calls.clone())
-        };
-
-        ChatOutput::from_projections(
-            self.thinking.clone(),
-            self.text.clone(),
-            tool_calls,
-            self.usage.clone(),
-            finish_reason,
-        )
+    pub fn into_canonical_output(self) -> ChatOutput {
+        self.output
     }
 
-    /// Authoritative ordered output when the peer returned one.
-    pub fn output(&self) -> Option<&ChatOutput> {
-        self.output.as_ref()
+    pub fn output(&self) -> &ChatOutput {
+        &self.output
     }
 }
 
 impl From<ChatOutput> for ProviderChatResponse {
     fn from(output: ChatOutput) -> Self {
-        let text = output.text();
-        let thinking = output.thinking();
-        let tool_calls = output.tool_calls().unwrap_or_default();
-        let usage = output.usage.clone();
-        let finish_reason = output.finish_reason.map(|reason| format!("{:?}", reason));
-
-        ProviderChatResponse {
-            text,
-            thinking,
-            tool_calls,
-            usage,
-            finish_reason,
-            output: Some(output),
-        }
+        ProviderChatResponse { output }
     }
 }
 
@@ -329,7 +338,7 @@ mod item_aware_tests {
             "finish_reason": "Stop"
         }))
         .expect("legacy response");
-        assert!(response.output.is_none());
+        assert_eq!(response.output.text().as_deref(), Some("legacy"));
 
         let legacy_history: ProviderChatRequest = serde_json::from_value(json!({
             "provider": "demo",
@@ -361,19 +370,19 @@ mod item_aware_tests {
             })],
             ..structured_message().output().expect("output").clone()
         };
-        let response = ProviderChatResponse {
-            text: None,
-            thinking: None,
-            tool_calls: Vec::new(),
-            usage: None,
-            finish_reason: Some("Stop".into()),
-            output: Some(output.clone()),
-        };
+        let response = ProviderChatResponse::from(output.clone());
         let encoded = serde_json::to_vec(&response).expect("serialize response");
+        let encoded_value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("response JSON");
+        assert_eq!(encoded_value.as_object().unwrap().len(), 6);
+        assert!(encoded_value.get("output").is_some());
+        assert!(encoded_value["tool_calls"].is_array());
+        assert!(encoded_value["finish_reason"].is_null());
+
         let decoded: ProviderChatResponse =
             serde_json::from_slice(&encoded).expect("deserialize response");
-        assert_eq!(decoded.output(), Some(&output));
-        let decoded_call = match &decoded.output().expect("output").items[0] {
+        assert_eq!(decoded.output(), &output);
+        let decoded_call = match &decoded.output().items[0] {
             ChatOutputItem::FunctionCall(call) => call,
             other => panic!("expected function call, got {other:?}"),
         };
@@ -479,18 +488,11 @@ mod item_aware_tests {
             ],
             ..ChatOutput::default()
         };
-        let response = ProviderChatResponse {
-            text: output.text(),
-            thinking: output.thinking(),
-            tool_calls: output.tool_calls().unwrap_or_default(),
-            usage: None,
-            finish_reason: Some("ToolCalls".into()),
-            output: Some(output.clone()),
-        };
+        let response = ProviderChatResponse::from(output.clone());
         let encoded = serde_json::to_vec(&response).expect("serialize response");
         let decoded: ProviderChatResponse =
             serde_json::from_slice(&encoded).expect("deserialize response");
-        let decoded_output = decoded.output().expect("structured output survives");
+        let decoded_output = decoded.output();
         assert_eq!(decoded_output.items.len(), 3);
 
         // Reload the structured turn into request history plus its tool result.
@@ -551,7 +553,7 @@ mod item_aware_tests {
 
         // The tool result still references the original call ID.
         let tool_result = decoded.messages[2]
-            .input_parts()
+            .portable_input_parts()
             .into_iter()
             .find_map(|part| match part {
                 querymt::chat::ChatInputPart::ToolResult(result) => Some(result),

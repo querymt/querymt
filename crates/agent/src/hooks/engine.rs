@@ -1841,7 +1841,11 @@ fn validate_message_projection(messages: &[querymt::chat::ChatMessage]) -> anyho
     }
     let mut pending_tool_ids = std::collections::BTreeSet::new();
     for message in messages {
-        if message.input_parts().is_empty() && message.output().is_none() {
+        if message
+            .input()
+            .is_none_or(<[querymt::chat::ChatInputPart]>::is_empty)
+            && message.output().is_none()
+        {
             anyhow::bail!("projection contains an empty message");
         }
         // Generated calls come from structured output.
@@ -1855,7 +1859,7 @@ fn validate_message_projection(messages: &[querymt::chat::ChatMessage]) -> anyho
             }
         }
         // Supplied results are canonical input parts.
-        for part in message.input_parts() {
+        for part in message.input().into_iter().flatten() {
             if let querymt::chat::ChatInputPart::ToolResult(result) = part
                 && !pending_tool_ids.remove(&result.call_id)
             {
@@ -1885,7 +1889,7 @@ fn preserves_tool_identities(
                     }
                 }
             }
-            for part in message.input_parts() {
+            for part in message.input().into_iter().flatten() {
                 if let querymt::chat::ChatInputPart::ToolResult(result) = part {
                     ids.insert(("result".to_string(), result.call_id.clone()));
                 }
@@ -1899,17 +1903,14 @@ fn preserves_tool_identities(
 fn estimate_chat_tokens(messages: &[querymt::chat::ChatMessage]) -> usize {
     messages
         .iter()
-        .map(|message| {
-            let parts = message.input_parts();
-            let parts_bytes: usize = parts
-                .iter()
-                .map(|part| serde_json::to_vec(part).map_or(0, |bytes| bytes.len() / 4))
-                .sum();
-            let output_bytes = message
-                .output()
-                .and_then(|output| serde_json::to_vec(output).ok())
-                .map_or(0, |bytes| bytes.len() / 4);
-            parts_bytes + output_bytes
+        .map(|message| match message.output() {
+            Some(output) => serde_json::to_vec(output).map_or(0, |bytes| bytes.len() / 4),
+            None => message.input().map_or(0, |parts| {
+                parts
+                    .iter()
+                    .map(|part| serde_json::to_vec(part).map_or(0, |bytes| bytes.len() / 4))
+                    .sum()
+            }),
         })
         .sum()
 }
@@ -1936,4 +1937,40 @@ fn record_hook_output(span: &tracing::Span, output: &CommandOutput, duration: Du
         span.record("exit_code", code);
     }
     span.record("duration_ms", duration.as_millis() as u64);
+}
+
+#[cfg(test)]
+mod token_estimate_tests {
+    use super::estimate_chat_tokens;
+    use querymt::chat::{ChatMessage, ChatOutput, FinishReason};
+
+    #[test]
+    fn structured_output_is_estimated_once() {
+        let output = ChatOutput::from_projections(
+            None,
+            Some("a sufficiently long assistant response".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        let message = ChatMessage::from_assistant_output(output.clone());
+        let expected = serde_json::to_vec(&output).unwrap().len() / 4;
+
+        assert_eq!(estimate_chat_tokens(&[message]), expected);
+    }
+
+    #[test]
+    fn canonical_input_parts_are_estimated_directly() {
+        let message = ChatMessage::user()
+            .text("a sufficiently long user prompt")
+            .build();
+        let expected: usize = message
+            .input()
+            .unwrap()
+            .iter()
+            .map(|part| serde_json::to_vec(part).unwrap().len() / 4)
+            .sum();
+
+        assert_eq!(estimate_chat_tokens(&[message]), expected);
+    }
 }

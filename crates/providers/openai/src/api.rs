@@ -220,82 +220,6 @@ enum OpenAIResponsesFunctionOutput<'a> {
     Parts(Vec<OpenAIResponsesToolOutputPart<'a>>),
 }
 
-/// Owned function output, safe to build from temporary canonical parts.
-#[derive(Serialize, Debug)]
-#[serde(untagged)]
-enum OpenAIResponsesFunctionOutputOwned {
-    Text(String),
-    Parts(Vec<OpenAIResponsesToolOutputPartOwned>),
-}
-
-/// Owned rich function-output part.
-#[derive(Serialize, Debug)]
-#[serde(tag = "type")]
-enum OpenAIResponsesToolOutputPartOwned {
-    #[serde(rename = "output_text")]
-    OutputText { text: String },
-    #[serde(rename = "input_image")]
-    InputImage {
-        image_url: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    #[serde(rename = "input_file")]
-    InputFile {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        filename: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        file_data: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        file_url: Option<String>,
-    },
-}
-
-impl OpenAIResponsesFunctionOutputOwned {
-    fn into_borrowed<'a>(self) -> OpenAIResponsesFunctionOutput<'a> {
-        match self {
-            OpenAIResponsesFunctionOutputOwned::Text(text) => {
-                OpenAIResponsesFunctionOutput::Text(Cow::Owned(text))
-            }
-            OpenAIResponsesFunctionOutputOwned::Parts(parts) => {
-                OpenAIResponsesFunctionOutput::Parts(
-                    parts
-                        .into_iter()
-                        .map(OpenAIResponsesToolOutputPartOwned::into_borrowed)
-                        .collect(),
-                )
-            }
-        }
-    }
-}
-
-impl OpenAIResponsesToolOutputPartOwned {
-    fn into_borrowed<'a>(self) -> OpenAIResponsesToolOutputPart<'a> {
-        match self {
-            OpenAIResponsesToolOutputPartOwned::OutputText { text } => {
-                OpenAIResponsesToolOutputPart::OutputText {
-                    text: Cow::Owned(text),
-                }
-            }
-            OpenAIResponsesToolOutputPartOwned::InputImage { image_url, detail } => {
-                OpenAIResponsesToolOutputPart::InputImage {
-                    image_url: Cow::Owned(image_url),
-                    detail: detail.map(Cow::Owned),
-                }
-            }
-            OpenAIResponsesToolOutputPartOwned::InputFile {
-                filename,
-                file_data,
-                file_url,
-            } => OpenAIResponsesToolOutputPart::InputFile {
-                filename: filename.map(Cow::Owned),
-                file_data: file_data.map(Cow::Owned),
-                file_url: file_url.map(Cow::Owned),
-            },
-        }
-    }
-}
-
 /// Ordered rich function-output part. Only fields valid for the selected
 /// endpoint and content position are emitted.
 #[derive(Serialize, Debug)]
@@ -629,24 +553,6 @@ struct OpenAIResponsesOutputContent {
     /// siblings.
     #[serde(default, flatten)]
     extra: Map<String, Value>,
-}
-
-/// Normalized non-streaming Responses result.
-#[derive(Debug)]
-struct OpenAIResponsesChatResponse {
-    output: ChatOutput,
-}
-
-impl std::fmt::Display for OpenAIResponsesChatResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "OpenAI Responses response")
-    }
-}
-
-impl From<OpenAIResponsesChatResponse> for ChatOutput {
-    fn from(response: OpenAIResponsesChatResponse) -> Self {
-        response.output
-    }
 }
 
 /// Individual choice within an OpenAI chat API response.
@@ -1231,7 +1137,7 @@ pub fn validate_chat_messages(messages: &[ChatMessage]) -> Result<(), LLMError> 
 
 fn validate_chat_completions_attachments(messages: &[ChatMessage]) -> Result<(), LLMError> {
     for message in messages {
-        for part in message.input_parts() {
+        for part in message.portable_input_parts() {
             match part {
                 ChatInputPart::Attachment(media) if media.kind != MediaKind::Image => {
                     return Err(LLMError::InvalidRequest(format!(
@@ -1390,16 +1296,16 @@ fn convert_chat_messages_to_responses<'a>(
         let is_user = matches!(msg.role, ChatRole::User);
         let role = Cow::Borrowed(if is_user { "user" } else { "assistant" });
         let mut content: Vec<OpenAIResponsesInputContent<'a>> = Vec::new();
-        for part in msg.input_parts() {
+        for part in msg.input().into_iter().flatten() {
             match part {
                 ChatInputPart::Text { text } if !text.is_empty() => {
                     content.push(if is_user {
                         OpenAIResponsesInputContent::InputText {
-                            text: Cow::Owned(text),
+                            text: Cow::Borrowed(text),
                         }
                     } else {
                         OpenAIResponsesInputContent::OutputText {
-                            text: Cow::Owned(text),
+                            text: Cow::Borrowed(text),
                         }
                     });
                 }
@@ -1417,11 +1323,11 @@ fn convert_chat_messages_to_responses<'a>(
                                     content_type,
                                     base64::engine::general_purpose::STANDARD.encode(data)
                                 )),
-                                detail: media.detail.clone().map(Cow::Owned),
+                                detail: media.detail.as_deref().map(Cow::Borrowed),
                             });
                         } else if media.kind == MediaKind::Document {
                             content.push(OpenAIResponsesInputContent::InputFile {
-                                filename: media.filename.clone().map(Cow::Owned),
+                                filename: media.filename.as_deref().map(Cow::Borrowed),
                                 file_data: Some(Cow::Owned(format!(
                                     "data:{};base64,{}",
                                     content_type,
@@ -1439,14 +1345,14 @@ fn convert_chat_messages_to_responses<'a>(
                     MediaSource::DataUrl { url } | MediaSource::Url { url } => {
                         if media.kind == MediaKind::Image {
                             content.push(OpenAIResponsesInputContent::InputImage {
-                                image_url: Cow::Owned(url.clone()),
-                                detail: media.detail.clone().map(Cow::Owned),
+                                image_url: Cow::Borrowed(url),
+                                detail: media.detail.as_deref().map(Cow::Borrowed),
                             });
                         } else if media.kind == MediaKind::Document {
                             content.push(OpenAIResponsesInputContent::InputFile {
-                                filename: media.filename.clone().map(Cow::Owned),
+                                filename: media.filename.as_deref().map(Cow::Borrowed),
                                 file_data: None,
-                                file_url: Some(Cow::Owned(url.clone())),
+                                file_url: Some(Cow::Borrowed(url)),
                             });
                         } else {
                             return Err(LLMError::InvalidRequest(format!(
@@ -1463,9 +1369,9 @@ fn convert_chat_messages_to_responses<'a>(
                 },
                 ChatInputPart::ToolResult(result) => {
                     flush_responses_message(out, role.clone(), &mut content);
-                    let output = responses_function_output_parts(&result.parts)?.into_borrowed();
+                    let output = responses_function_output_parts(&result.parts)?;
                     out.push(OpenAIResponsesInputItem::FunctionCallOutput {
-                        call_id: Cow::Owned(result.call_id.clone()),
+                        call_id: Cow::Borrowed(&result.call_id),
                         output,
                     });
                 }
@@ -1670,7 +1576,7 @@ fn responses_message_media<'a>(
 /// explicitly instead of being replaced by a textual placeholder.
 fn responses_function_output_parts(
     parts: &[ToolResultPart],
-) -> Result<OpenAIResponsesFunctionOutputOwned, LLMError> {
+) -> Result<OpenAIResponsesFunctionOutput<'static>, LLMError> {
     // Text-only results keep the compact string form.
     let is_text_only = parts
         .iter()
@@ -1681,14 +1587,16 @@ fn responses_function_output_parts(
             .filter_map(ToolResultPart::as_text)
             .collect::<Vec<_>>()
             .join("\n");
-        return Ok(OpenAIResponsesFunctionOutputOwned::Text(text));
+        return Ok(OpenAIResponsesFunctionOutput::Text(Cow::Owned(text)));
     }
 
-    let mut rich: Vec<OpenAIResponsesToolOutputPartOwned> = Vec::new();
+    let mut rich: Vec<OpenAIResponsesToolOutputPart<'static>> = Vec::new();
     for part in parts {
         match part {
             ToolResultPart::Text { text } => {
-                rich.push(OpenAIResponsesToolOutputPartOwned::OutputText { text: text.clone() });
+                rich.push(OpenAIResponsesToolOutputPart::OutputText {
+                    text: Cow::Owned(text.clone()),
+                });
             }
             ToolResultPart::Attachment(media) => match (&media.kind, media.source()) {
                 (MediaKind::Image, MediaSource::Inline { data }) => {
@@ -1698,19 +1606,19 @@ fn responses_function_output_parts(
                                 "inline tool-result image requires a MIME type".to_string(),
                             )
                         })?;
-                    rich.push(OpenAIResponsesToolOutputPartOwned::InputImage {
-                        image_url: format!(
+                    rich.push(OpenAIResponsesToolOutputPart::InputImage {
+                        image_url: Cow::Owned(format!(
                             "data:{};base64,{}",
                             media_type,
                             base64::engine::general_purpose::STANDARD.encode(data)
-                        ),
-                        detail: media.detail.clone(),
+                        )),
+                        detail: media.detail.clone().map(Cow::Owned),
                     });
                 }
                 (MediaKind::Image, MediaSource::DataUrl { url } | MediaSource::Url { url }) => {
-                    rich.push(OpenAIResponsesToolOutputPartOwned::InputImage {
-                        image_url: url.clone(),
-                        detail: media.detail.clone(),
+                    rich.push(OpenAIResponsesToolOutputPart::InputImage {
+                        image_url: Cow::Owned(url.clone()),
+                        detail: media.detail.clone().map(Cow::Owned),
                     });
                 }
                 (MediaKind::Document, MediaSource::Inline { data }) => {
@@ -1720,21 +1628,21 @@ fn responses_function_output_parts(
                                 "inline tool-result file requires a MIME type".to_string(),
                             )
                         })?;
-                    rich.push(OpenAIResponsesToolOutputPartOwned::InputFile {
-                        filename: media.filename.clone(),
-                        file_data: Some(format!(
+                    rich.push(OpenAIResponsesToolOutputPart::InputFile {
+                        filename: media.filename.clone().map(Cow::Owned),
+                        file_data: Some(Cow::Owned(format!(
                             "data:{};base64,{}",
                             media_type,
                             base64::engine::general_purpose::STANDARD.encode(data)
-                        )),
+                        ))),
                         file_url: None,
                     });
                 }
                 (MediaKind::Document, MediaSource::DataUrl { url } | MediaSource::Url { url }) => {
-                    rich.push(OpenAIResponsesToolOutputPartOwned::InputFile {
-                        filename: media.filename.clone(),
+                    rich.push(OpenAIResponsesToolOutputPart::InputFile {
+                        filename: media.filename.clone().map(Cow::Owned),
                         file_data: None,
-                        file_url: Some(url.clone()),
+                        file_url: Some(Cow::Owned(url.clone())),
                     });
                 }
                 (kind, source) => {
@@ -1751,7 +1659,7 @@ fn responses_function_output_parts(
         }
     }
 
-    Ok(OpenAIResponsesFunctionOutputOwned::Parts(rich))
+    Ok(OpenAIResponsesFunctionOutput::Parts(rich))
 }
 
 fn to_responses_tools(tools: &[Tool]) -> Result<Vec<OpenAIResponsesTool<'_>>, LLMError> {
@@ -2112,7 +2020,7 @@ pub fn openai_parse_responses_with<C: OpenAIProviderConfig>(
         endpoint: cfg.responses_endpoint(),
         ..codec_provider
     };
-    Ok(normalize_responses_response_with(parsed, codec_provider).into())
+    Ok(normalize_responses_response_with(parsed, codec_provider))
 }
 
 /// Normalize a decoded Responses response into provider-neutral structured output.
@@ -2159,12 +2067,6 @@ impl ResponsesCodecProvider {
 }
 
 /// Normalize a decoded Responses response into provider-neutral structured output
-/// using the default OpenAI provenance.
-fn normalize_responses_response(parsed: OpenAIResponsesResponse) -> OpenAIResponsesChatResponse {
-    normalize_responses_response_with(parsed, ResponsesCodecProvider::default())
-}
-
-/// Normalize a decoded Responses response into provider-neutral structured output
 /// while recording the supplied provider provenance.
 ///
 /// Accepts the raw response envelope so compatible providers (e.g. Codex) can
@@ -2178,13 +2080,13 @@ pub fn normalize_responses_envelope(
             message: format!("Failed to decode Responses API response: {error}"),
             raw_response: String::new(),
         })?;
-    Ok(normalize_responses_response_with(parsed, provider).into())
+    Ok(normalize_responses_response_with(parsed, provider))
 }
 
 fn normalize_responses_response_with(
     parsed: OpenAIResponsesResponse,
     provider: ResponsesCodecProvider,
-) -> OpenAIResponsesChatResponse {
+) -> ChatOutput {
     let status = parsed.status.as_deref();
     let failed = status == Some("failed");
     let incomplete = status == Some("incomplete");
@@ -2239,7 +2141,7 @@ fn normalize_responses_response_with(
         extensions: Extensions::new(),
     };
 
-    OpenAIResponsesChatResponse { output }
+    output
 }
 
 /// Map an incomplete terminal cause to a QueryMT finish reason.
@@ -2590,7 +2492,7 @@ fn convert_chat_message_to_openai<'a>(
         ChatRole::Assistant => Cow::Borrowed("assistant"),
     };
 
-    let parts = chat_msg.input_parts();
+    let parts = chat_msg.portable_input_parts();
 
     // Tool results must be emitted as separate `role: "tool"` messages.
     let has_tool_results = parts.iter().any(ChatInputPart::is_tool_result);

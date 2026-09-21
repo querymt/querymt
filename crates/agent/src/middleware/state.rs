@@ -1,4 +1,4 @@
-use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, ToolResultPart};
+use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason};
 use std::sync::Arc;
 
 use crate::events::StopType;
@@ -235,7 +235,7 @@ impl ConversationContext {
         {
             if let Some(mut latest) = messages.pop() {
                 for fragment in fragments {
-                    for part in fragment.input_parts() {
+                    for part in fragment.portable_input_parts() {
                         latest.push_input_part(part);
                     }
                 }
@@ -527,6 +527,7 @@ impl ExecutionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use querymt::chat::ToolResultPart;
 
     #[test]
     fn request_messages_keep_latest_feedback_after_context_fragments() {
@@ -572,8 +573,11 @@ mod tests {
 
         let messages = context.request_messages();
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].input_parts()[0].is_tool_result());
-        assert_eq!(messages[0].input_parts()[1].as_text(), Some("objective"));
+        assert!(messages[0].portable_input_parts()[0].is_tool_result());
+        assert_eq!(
+            messages[0].portable_input_parts()[1].as_text(),
+            Some("objective")
+        );
     }
 
     #[test]

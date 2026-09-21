@@ -441,3 +441,59 @@ other tasks are complete (59/60).
 - `cargo check -p querymt-mobile-ffi` has pre-existing compile errors
   (`RpcRequest` missing; `provider_lock`/`session_bridge` fields missing) that
   block any `--workspace` build. Unrelated to this change and untouched by it.
+
+## Post-implementation simplification pass
+
+The follow-up audit removed redundant core APIs and storage while preserving the
+shipped transitional history and Extism wire formats:
+
+- `{ content, output }` history decoding is isolated and documented as decode-only
+  compatibility; load/save tests verify canonical reserialization and stale
+  projection rejection.
+- stream completion tracks completed indexes without cloning every completed item,
+  and `finish` moves owned item state into the result.
+- unused display/projection wrappers, dead construction/accumulator errors, and the
+  ambiguous allocating `input_parts` compatibility alias were removed. Workspace
+  callers now choose borrowed `input()` or explicit `portable_input_parts()`.
+- message role/payload validation is shared by construction, replacement, and
+  deserialization. Existing `From<ChatOutput>` conveniences remain supported.
+- Extism response/chunk values keep one in-memory authority while custom serde
+  preserves the released flattened fields until the contract version changes.
+
+Legacy stream accumulation remains intentionally supported: OpenAI Chat
+Completions, Anthropic, Codex, Google, llama.cpp, MRS, and compatibility providers
+still emit legacy `StreamChunk` variants. Deleting dual-mode accumulation requires
+a coordinated provider migration and is not safe as an isolated core cleanup.
+
+Verification:
+
+- `cargo test -p querymt --lib --no-default-features` -> **112 passed**
+- `cargo test -p querymt --lib plugin::extism_impl:: --features extism_host --no-default-features` -> **14 passed**
+- `cargo check -p querymt --all-features --all-targets` -> 0 errors
+- `cargo check -p querymt-agent --all-targets` -> 0 errors (existing warnings)
+- `cargo check -p querymt-remote --all-targets --features kameo-mesh` -> 0 errors
+- `PYO3_PYTHON=/opt/homebrew/bin/python3 cargo check -p querymt-py --lib` -> 0 errors
+- affected provider `--all-targets` check (OpenAI, Anthropic, Google, Codex,
+  Ollama, xAI, Kimi, llama.cpp, MRS) -> 0 errors (existing warnings)
+- `cargo fmt --all -- --check` and `git diff --check` -> clean
+
+A final redundancy pass then:
+
+- corrected hook token estimation to count one authoritative payload instead of
+  adding structured output and its portable projection;
+- replaced hook/OpenAI input projection allocations with borrowed canonical input;
+- collapsed OpenAI Responses normalization to return `ChatOutput` directly and
+  removed duplicate owned/Cow output DTOs;
+- normalized remote responses into one in-memory `ChatOutput` while preserving the
+  released flattened response fields through custom serialization;
+- removed the unnecessary Extism chunk decode DTO; and
+- centralized item-aware contract detection/versioning in `querymt::chat`, with
+  transport modules retaining their existing re-exported names.
+
+Focused verification:
+
+- hook token-estimation regression tests -> **2 passed**
+- OpenAI native library suite -> **93 passed**
+- remote item-aware protocol suite -> **4 passed**
+- Extism-focused suite -> **14 passed**
+- QueryMT, agent, remote, and OpenAI all-target checks -> 0 errors (existing warnings)
