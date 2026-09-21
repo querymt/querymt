@@ -31,10 +31,11 @@ impl ResolvedTools {
     ///
     /// Local tool names pass through unchanged. Resolved MCP selections are
     /// rendered in the form the runtime understands: a wildcard selection
-    /// becomes `server.*` (matched against the MCP server name during
-    /// filtering) and a specific selection becomes the bare provider tool
-    /// name that MCP tools are advertised under (the server is tracked
-    /// separately by the MCP runtime).
+    /// becomes `server.*` and a specific selection stays `server.tool`, so
+    /// authorization is bound to the originating MCP server. This matters
+    /// because MCP tools are advertised under bare provider names that may
+    /// collide across servers; filtering matches qualified entries through
+    /// `crate::agent::tools::is_mcp_tool_allowed_with`.
     ///
     /// Servers are emitted in sorted order so the list is deterministic
     /// despite `mcp_servers` being a `HashMap`.
@@ -45,11 +46,13 @@ impl ResolvedTools {
             .iter()
             .map(|(server, (_, tools))| (server, tools))
             .collect();
-        servers.sort_by(|(a, _), (b, _)| a.cmp(b));
+        servers.sort_by_key(|(server, _)| *server);
         for (server, tools) in servers {
             match tools {
                 None => selectors.push(format!("{server}.*")),
-                Some(names) => selectors.extend(names.iter().cloned()),
+                Some(names) => {
+                    selectors.extend(names.iter().map(|name| format!("{server}.{name}")))
+                }
             }
         }
         selectors

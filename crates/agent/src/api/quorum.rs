@@ -2067,7 +2067,7 @@ tools = ["read_tool", "stdio-tool.fetch"]
     }
 
     #[test]
-    fn quorum_specific_mcp_selection_normalizes_to_runtime_names() {
+    fn quorum_specific_mcp_selection_stays_server_qualified() {
         let builder =
             crate::api::agent::Agent::builder_from_quorum_config(mcp_mixed_quorum_config(), None)
                 .expect("builder_from_quorum_config");
@@ -2075,11 +2075,11 @@ tools = ["read_tool", "stdio-tool.fetch"]
         let planner = builder.planner_config.expect("planner config");
         // Wildcard selections keep the server-qualified form...
         assert!(planner.tools.contains(&"stdio-tool.*".to_string()));
-        // ...while specific selections normalize to the bare provider tool
-        // name that MCP tools are advertised under (the runtime filter matches
-        // bare names, with the server tracked separately).
-        assert!(planner.tools.contains(&"lookup".to_string()));
-        assert!(!planner.tools.contains(&"http-tool.lookup".to_string()));
+        // ...and specific selections stay server-qualified so the originating
+        // server remains part of the authorization decision (MCP tools are
+        // advertised under bare names that can collide across servers).
+        assert!(planner.tools.contains(&"http-tool.lookup".to_string()));
+        assert!(!planner.tools.contains(&"lookup".to_string()));
         // Local tools survive alongside the selectors.
         assert!(planner.tools.contains(&"shell".to_string()));
 
@@ -2090,8 +2090,8 @@ tools = ["read_tool", "stdio-tool.fetch"]
             .expect("coder delegate");
         assert_eq!(
             delegate.tools,
-            vec!["read_tool".to_string(), "fetch".to_string()],
-            "delegate keeps local tools and the normalized specific selection"
+            vec!["read_tool".to_string(), "stdio-tool.fetch".to_string()],
+            "delegate keeps local tools and the qualified specific selection"
         );
     }
 
@@ -2128,14 +2128,18 @@ tools = ["read_tool", "stdio-tool.fetch"]
             .clone();
 
         // Policy must admit provider tools so MCP tool definitions reach the
-        // LLM, and the allowlist must keep the normalized selectors.
+        // LLM, and the allowlist must keep the server-qualified selectors.
         assert_eq!(planner.tool_config.policy, ToolPolicy::BuiltInAndProvider);
         let allowlist = planner.tool_config.allowlist.as_ref().expect("allowlist");
         assert!(allowlist.contains("stdio-tool.*"));
-        assert!(allowlist.contains("lookup"));
+        assert!(allowlist.contains("http-tool.lookup"));
+        assert!(
+            !allowlist.contains("lookup"),
+            "bare names must not be flattened into the allowlist"
+        );
         assert!(allowlist.contains("shell"));
-        // The shared runtime filter admits wildcard MCP tools by server name
-        // and specific MCP tools by bare provider name.
+        // The shared runtime filter admits wildcard MCP tools and specific
+        // MCP tools by their server-qualified allowlist entries.
         assert!(crate::agent::tools::is_mcp_tool_allowed_with(
             &planner.tool_config,
             "any_stdio_tool",
@@ -2145,6 +2149,13 @@ tools = ["read_tool", "stdio-tool.fetch"]
             &planner.tool_config,
             "lookup",
             Some("http-tool")
+        ));
+        // A same-named tool from a server the planner has no selection for is
+        // denied: the bare name is not in the allowlist (PR #967 regression).
+        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
+            &planner.tool_config,
+            "lookup",
+            Some("unattached-server")
         ));
         assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
             &planner.tool_config,
@@ -2163,17 +2174,146 @@ tools = ["read_tool", "stdio-tool.fetch"]
 
         assert_eq!(delegate.tool_config.policy, ToolPolicy::BuiltInAndProvider);
         let allowlist = delegate.tool_config.allowlist.as_ref().expect("allowlist");
-        assert!(allowlist.contains("fetch"));
+        assert!(allowlist.contains("stdio-tool.fetch"));
+        assert!(
+            !allowlist.contains("fetch"),
+            "bare names must not be flattened into the allowlist"
+        );
         assert!(allowlist.contains("read_tool"));
         assert!(crate::agent::tools::is_mcp_tool_allowed_with(
             &delegate.tool_config,
             "fetch",
             Some("stdio-tool")
         ));
+        // A bare built-in allowlist entry ("read_tool") cannot admit an MCP
+        // tool that happens to share the name.
+        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
+            &delegate.tool_config,
+            "read_tool",
+            Some("stdio-tool")
+        ));
         assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
             &delegate.tool_config,
             "unrelated",
             Some("stdio-tool")
+        ));
+    }
+
+    // ---- #967: specific MCP selectors must stay server-scoped when servers
+    // expose colliding bare tool names ----
+
+    /// Two MCP servers expose the same bare tool name (`lookup`). Selecting
+    /// only `alpha.lookup` must authorize alpha's tool and deny `beta.lookup`,
+    /// no matter which server's definition wins the runtime's bare-name index.
+    fn mcp_duplicate_tool_quorum_config() -> QuorumConfig {
+        let toml = r#"
+[quorum]
+cwd = "/tmp"
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["alpha.lookup"]
+
+[[mcp]]
+name = "alpha"
+url = "https://alpha.test/mcp"
+transport = "http"
+
+[[mcp]]
+name = "beta"
+url = "https://beta.test/mcp"
+transport = "http"
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+tools = ["beta.lookup"]
+"#;
+        toml::from_str(toml).expect("parse duplicate MCP tool quorum config")
+    }
+
+    #[tokio::test]
+    async fn quorum_duplicate_mcp_tool_names_authorize_per_server() {
+        let (plugin_registry, _registry_dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
+        );
+        let infra = super::super::agent::AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        };
+
+        let agent = crate::api::agent::Agent::builder_from_quorum_config(
+            mcp_duplicate_tool_quorum_config(),
+            None,
+        )
+        .expect("builder_from_quorum_config")
+        .infra(infra)
+        .build()
+        .await
+        .expect("quorum should build");
+
+        let planner = agent
+            .planner()
+            .expect("planner handle")
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local planner")
+            .config
+            .clone();
+
+        // The allowlist keeps the qualified selector only — no bare `lookup`.
+        let allowlist = planner.tool_config.allowlist.as_ref().expect("allowlist");
+        assert!(allowlist.contains("alpha.lookup"));
+        assert!(!allowlist.contains("lookup"));
+
+        // Alpha's tool is admitted...
+        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
+            &planner.tool_config,
+            "lookup",
+            Some("alpha")
+        ));
+        // ...while beta's same-named tool is denied, even if beta wins the
+        // runtime's bare-name tool index (previously admitted via the
+        // flattened bare entry).
+        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
+            &planner.tool_config,
+            "lookup",
+            Some("beta")
+        ));
+        // The bare built-in path cannot admit the MCP tool either.
+        assert!(!crate::agent::tools::is_tool_allowed_with(
+            &planner.tool_config,
+            "lookup"
+        ));
+
+        // The delegate's mirror selection (`beta.lookup`) gets the inverse.
+        let delegate = agent
+            .delegate("coder")
+            .expect("coder delegate")
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .expect("local delegate")
+            .config
+            .clone();
+        let allowlist = delegate.tool_config.allowlist.as_ref().expect("allowlist");
+        assert!(allowlist.contains("beta.lookup"));
+        assert!(!allowlist.contains("lookup"));
+        assert!(crate::agent::tools::is_mcp_tool_allowed_with(
+            &delegate.tool_config,
+            "lookup",
+            Some("beta")
+        ));
+        assert!(!crate::agent::tools::is_mcp_tool_allowed_with(
+            &delegate.tool_config,
+            "lookup",
+            Some("alpha")
         ));
     }
 }
