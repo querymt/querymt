@@ -30,7 +30,6 @@ use querymt::{
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use url::Url;
@@ -630,8 +629,10 @@ fn to_xai_responses_input(
 ) -> Result<Vec<XaiResponsesInputItem>, LLMError> {
     // Materialize all owned canonical parts up front so the borrowed input
     // items built below can reference stable storage that outlives the loop.
-    let owned_parts: Vec<Vec<ChatInputPart>> =
-        messages.iter().map(ChatMessage::input_parts).collect();
+    let owned_parts: Vec<Vec<ChatInputPart>> = messages
+        .iter()
+        .map(ChatMessage::portable_input_parts)
+        .collect();
 
     let mut inputs = Vec::with_capacity(messages.len());
 

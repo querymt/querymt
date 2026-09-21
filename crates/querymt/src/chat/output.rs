@@ -554,13 +554,6 @@ pub enum MediaNormalizationError {
     },
 }
 
-/// Display decision that lets renderers fall back without changing canonical media.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum MediaDisplayProjection<'a> {
-    Renderable(&'a MediaPart),
-    Attachment(&'a MediaPart),
-}
-
 impl MediaPart {
     pub fn new(
         kind: MediaKind,
@@ -623,17 +616,6 @@ impl MediaPart {
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
-    }
-
-    pub fn display_projection(
-        &self,
-        supports: impl FnOnce(MediaKind, Option<&MediaType>) -> bool,
-    ) -> MediaDisplayProjection<'_> {
-        if supports(self.kind, self.media_type.as_ref()) {
-            MediaDisplayProjection::Renderable(self)
-        } else {
-            MediaDisplayProjection::Attachment(self)
-        }
     }
 }
 
@@ -926,16 +908,6 @@ pub struct ChatOpaqueItem {
     pub payload: Value,
 }
 
-impl ChatOpaqueItem {
-    /// Derive display-only media through an explicit codec without changing canonical replay data.
-    pub fn media_display_projection(
-        &self,
-        recognize: impl FnOnce(&str, &Value) -> Option<MediaPart>,
-    ) -> Option<MediaPart> {
-        recognize(&self.original_type, &self.payload)
-    }
-}
-
 /// Debug output redacts the opaque payload: it is provider-only replay state,
 /// not display content.
 impl fmt::Debug for ChatOpaqueItem {
@@ -1166,16 +1138,6 @@ impl From<Box<MediaPart>> for ToolResultPart {
     }
 }
 
-/// Error returned when an invariant-bearing canonical value is constructed with
-/// inconsistent fields, whether directly or through deserialization.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ChatInputError {
-    #[error(transparent)]
-    Media(#[from] MediaNormalizationError),
-    #[error("message payload does not match the message role")]
-    RolePayloadMismatch,
-}
-
 // ---------------------------------------------------------------------------
 // Exclusive message payload
 // ---------------------------------------------------------------------------
@@ -1193,7 +1155,7 @@ pub enum ChatMessagePayload {
     /// projection of an assistant turn).
     Input(Vec<ChatInputPart>),
     /// Structured generated output (assistant turns).
-    Output(ChatOutput),
+    Output(Box<ChatOutput>),
 }
 
 impl ChatMessagePayload {
@@ -1204,7 +1166,7 @@ impl ChatMessagePayload {
 
     /// Build a structured output payload.
     pub fn output(output: ChatOutput) -> Self {
-        ChatMessagePayload::Output(output)
+        ChatMessagePayload::Output(Box::new(output))
     }
 
     /// Borrow the payload as canonical input parts, if this is an input payload.
@@ -1258,6 +1220,26 @@ mod tests {
     use crate::embedding::EmbeddingProvider;
     use crate::error::LLMError;
     use async_trait::async_trait;
+
+    #[test]
+    fn payload_output_box_round_trips_through_internally_tagged_serde() {
+        let payload = ChatMessagePayload::output(ChatOutput::from_projections(
+            None,
+            Some("boxed answer".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        ));
+
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json.get("kind").and_then(Value::as_str), Some("output"));
+
+        let restored: ChatMessagePayload = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, payload);
+        // Boxing keeps the payload comparable to the `Input` variant instead
+        // of reserving the whole `ChatOutput` inline for every message.
+        assert!(std::mem::size_of::<ChatMessagePayload>() < std::mem::size_of::<ChatOutput>());
+    }
 
     #[test]
     fn structured_output_serde_preserves_order_and_provider_data() {
@@ -1494,55 +1476,6 @@ mod tests {
             serde_json::from_value::<MediaPart>(conflicting).is_err(),
             "conflicting data URL media type must fail through serde"
         );
-    }
-
-    #[test]
-    fn unfamiliar_media_uses_attachment_display_fallback() {
-        let mut unfamiliar = MediaPart::new(
-            MediaKind::Image,
-            Some("image/x-future".parse().unwrap()),
-            MediaSource::Url {
-                url: "https://example.invalid/image".into(),
-            },
-        )
-        .unwrap();
-        unfamiliar.filename = Some("future.img".into());
-        assert!(matches!(
-            unfamiliar.display_projection(|_, media_type| {
-                media_type.is_some_and(|value| value.subtype() == "png")
-            }),
-            MediaDisplayProjection::Attachment(_)
-        ));
-        assert!(matches!(
-            unfamiliar.display_projection(|kind, _| kind == MediaKind::Image),
-            MediaDisplayProjection::Renderable(_)
-        ));
-
-        let opaque = ChatOpaqueItem {
-            original_type: "future_media".into(),
-            payload: serde_json::json!({"mime_type": "image/png", "data": "secret"}),
-        };
-        let recognized = opaque
-            .media_display_projection(|item_type, payload| {
-                (item_type == "future_media").then(|| {
-                    MediaPart::new(
-                        MediaKind::Image,
-                        payload["mime_type"]
-                            .as_str()
-                            .map(str::parse)
-                            .transpose()
-                            .unwrap(),
-                        MediaSource::Url {
-                            url: "https://example.invalid/recognized".into(),
-                        },
-                    )
-                    .unwrap()
-                })
-            })
-            .unwrap();
-        assert_eq!(recognized.kind, MediaKind::Image);
-        assert_eq!(opaque.original_type, "future_media");
-        assert_eq!(opaque.payload["data"], "secret");
     }
 
     /// MIME spelling/parameters, source form, filename/detail, and provider
@@ -1845,7 +1778,7 @@ mod tests {
                 }
             ]
         });
-        let message = crate::chat::ChatMessage::from(
+        let message = crate::chat::ChatMessage::from_assistant_output(
             serde_json::from_value::<ChatOutput>(fixture.clone()).unwrap(),
         );
 

@@ -819,7 +819,7 @@ impl ChatProvider for ExtismProvider {
             })
             .await?;
 
-        Ok(out.to_canonical_output())
+        Ok(out.into_canonical_output())
     }
 
     #[cfg_attr(
@@ -1393,7 +1393,7 @@ impl HTTPChatProvider for ExtismProvider {
             Ok(out.0)
         })?;
 
-        Ok(out.to_canonical_output())
+        Ok(out.into_canonical_output())
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1512,7 +1512,7 @@ impl HTTPLLMProvider for ExtismProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::StreamChunk;
+    use crate::{Usage, chat::StreamChunk};
 
     #[test]
     fn malformed_config_is_json_error() {
@@ -1591,12 +1591,23 @@ mod tests {
     fn decode_stream_item_returns_chunk_for_valid_payload() {
         let bytes = serde_json::to_vec(&crate::plugin::extism_impl::ExtismChatChunk {
             chunk: StreamChunk::Text("hello".into()),
-            usage: None,
         })
         .expect("serialize chunk");
 
         let chunk = decode_stream_item(Ok(bytes)).expect("chunk should decode");
         assert!(matches!(chunk, StreamChunk::Text(text) if text == "hello"));
+    }
+
+    #[test]
+    fn decode_stream_item_accepts_legacy_duplicate_usage_field() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "chunk": {"usage": Usage::default()},
+            "usage": Usage::default()
+        }))
+        .expect("serialize legacy chunk");
+
+        let chunk = decode_stream_item(Ok(bytes)).expect("legacy chunk should decode");
+        assert!(matches!(chunk, StreamChunk::Usage(_)));
     }
 
     #[test]

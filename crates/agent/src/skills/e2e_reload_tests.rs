@@ -92,7 +92,7 @@ async fn hot_reload_end_to_end_tracks_the_filesystem_across_model_requests() {
                         .iter()
                         .map(|message| {
                             message
-                                .input_parts()
+                                .portable_input_parts()
                                 .iter()
                                 .map(|part| match part {
                                     querymt::chat::ChatInputPart::Text { text } => text.clone(),

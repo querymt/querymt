@@ -268,7 +268,7 @@ impl KimiCode {
         let mut normalized = Vec::with_capacity(messages.len());
 
         for message in messages {
-            let parts = message.input_parts();
+            let parts = message.portable_input_parts();
             if parts.iter().any(|part| part.is_tool_result()) {
                 // Tool-result messages are split: the results stay on the original
                 // message, and any supplemental text becomes a following message.
@@ -291,7 +291,7 @@ impl KimiCode {
 
                 let tool_results = tool_results.build();
                 let supplemental = supplemental.build();
-                let has_supplemental = !supplemental.input_parts().is_empty();
+                let has_supplemental = !supplemental.portable_input_parts().is_empty();
                 normalized.push(tool_results);
 
                 if has_supplemental {

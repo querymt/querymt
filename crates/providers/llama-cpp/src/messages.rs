@@ -6,8 +6,8 @@
 
 use crate::config::LlamaCppConfig;
 use querymt::chat::{
-    ChatInputPart, ChatMessage, ChatMessagePart, ChatMessagePayload, ChatOutputItem, ChatRole,
-    MediaKind, MediaSource, ToolResultPart,
+    ChatInputPart, ChatMessage, ChatMessagePart, ChatOutputItem, ChatRole, MediaKind, MediaSource,
+    ToolResultPart,
 };
 use querymt::error::LLMError;
 use serde_json::Value;
@@ -79,7 +79,7 @@ pub(crate) fn messages_to_json(
                 })
                 .flatten()
                 .collect::<Vec<_>>(),
-            None => msg.input_parts(),
+            None => msg.portable_input_parts(),
         };
 
         // Visible reasoning is replayed from structured output.
@@ -255,7 +255,7 @@ pub(crate) fn messages_to_text(
     // Check for binary/attachment content - not supported in text-only mode.
     if messages
         .iter()
-        .flat_map(ChatMessage::input_parts)
+        .flat_map(ChatMessage::portable_input_parts)
         .any(|part| matches!(part, ChatInputPart::Attachment(_)))
     {
         return Err(LLMError::InvalidRequest(
@@ -294,7 +294,7 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 builder = builder.cache(cache);
             }
 
-            for part in msg.input_parts() {
+            for part in msg.portable_input_parts() {
                 match part {
                     ChatInputPart::Text { text } => {
                         builder = builder.part(ChatInputPart::text(text));

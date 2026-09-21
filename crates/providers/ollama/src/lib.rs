@@ -457,7 +457,7 @@ impl HTTPChatProvider for Ollama {
             }
             .to_string();
 
-            let parts = msg.input_parts();
+            let parts = msg.portable_input_parts();
             let text = parts
                 .iter()
                 .filter_map(|c| c.as_text())

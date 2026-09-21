@@ -1082,7 +1082,7 @@ mod tests {
             .build_compaction_messages(&[message], None)
             .unwrap();
         assert!(matches!(
-            &chat_messages[0].input_parts()[0],
+            &chat_messages[0].portable_input_parts()[0],
             querymt::chat::ChatInputPart::Attachment(media)
                 if media.kind == querymt::chat::MediaKind::Document
         ));

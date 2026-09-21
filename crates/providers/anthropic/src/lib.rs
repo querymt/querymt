@@ -900,7 +900,7 @@ impl HTTPChatProvider for Anthropic {
                     }
                 }
 
-                for part in m.input_parts() {
+                for part in m.portable_input_parts() {
                     match part {
                         ChatInputPart::Text { text } => {
                             // Avoid Anthropic API error: "text content blocks must be non-empty"

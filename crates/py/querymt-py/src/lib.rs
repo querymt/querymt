@@ -715,7 +715,7 @@ fn py_message_to_rust(message: &Bound<'_, PyDict>) -> Result<ChatMessage> {
     match role.as_str() {
         "assistant" => {
             if let Some(output) = output {
-                return Ok(ChatMessage::from(output));
+                return ChatMessage::try_from_assistant_output(output).map_err(Into::into);
             }
             if let Some(input) = input {
                 return Ok(ChatMessage::from_user_parts(input).with_role(ChatRole::Assistant));

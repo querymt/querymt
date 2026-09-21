@@ -282,7 +282,7 @@ pub(crate) fn extract_media(messages: &[ChatMessage]) -> Vec<MediaAttachment> {
     let mut attachments = Vec::new();
 
     for msg in messages {
-        for part in msg.input_parts() {
+        for part in msg.portable_input_parts() {
             match part {
                 ChatInputPart::Attachment(media) => match (&media.kind, media.source()) {
                     (MediaKind::Image, MediaSource::Inline { data }) => {

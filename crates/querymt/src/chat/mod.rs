@@ -15,17 +15,28 @@ mod migration;
 pub mod output;
 pub mod streaming;
 
+/// Version of the item-aware chat contract carried across serialized transports.
+pub const ITEM_AWARE_CHAT_CONTRACT_VERSION: u32 = 1;
+
+/// Whether any message retains semantics that require the item-aware contract.
+pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .output()
+            .is_some_and(ChatOutput::requires_item_aware_fidelity)
+    })
+}
+
 pub use output::{
-    ChatFunctionCallItem, ChatInputError, ChatInputPart, ChatMessageItem, ChatMessagePart,
-    ChatMessagePayload, ChatOpaqueItem, ChatOpaquePart, ChatOutput, ChatOutputItem,
-    ChatOutputProvenance, ChatOutputStatus, ChatReasoningItem, ChatReasoningPart,
-    ChatTextAnnotation, Extensions, MediaDisplayProjection, MediaKind, MediaNormalizationError,
-    MediaPart, MediaSource, MediaType, MediaTypeError, ToolResult, ToolResultPart,
-    empty_message_part,
+    ChatFunctionCallItem, ChatInputPart, ChatMessageItem, ChatMessagePart, ChatMessagePayload,
+    ChatOpaqueItem, ChatOpaquePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,
+    ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatTextAnnotation, Extensions,
+    MediaKind, MediaNormalizationError, MediaPart, MediaSource, MediaType, MediaTypeError,
+    ToolResult, ToolResultPart, empty_message_part,
 };
 pub use streaming::{
     ChatMessagePartDelta, ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish,
-    LegacyStreamProjection, ReasoningPartKind, StructuredStreamEvent,
+    ReasoningPartKind, StructuredStreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -117,7 +128,7 @@ pub fn extract_thinking(text: &str) -> (Option<String>, String) {
 }
 
 /// Role of a participant in a chat conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatRole {
     /// The user/human participant in the conversation
     User,
@@ -512,17 +523,13 @@ impl JsonSchema for ToolChoice {
 
 impl From<ChatOutput> for ChatMessage {
     fn from(output: ChatOutput) -> Self {
-        ChatMessage {
-            role: ChatRole::Assistant,
-            payload: ChatMessagePayload::Output(output),
-            cache: None,
-        }
+        ChatMessage::from_assistant_output(output)
     }
 }
 
 impl From<&ChatOutput> for ChatMessage {
     fn from(output: &ChatOutput) -> Self {
-        ChatMessage::from(output.clone())
+        ChatMessage::from_assistant_output(output.clone())
     }
 }
 
@@ -737,18 +744,16 @@ pub enum ChatMessageConsistencyError {
 }
 
 impl ChatMessage {
-    /// Validate that the payload matches the message role.
-    ///
-    /// Assistant input payloads are valid explicit portable projections. Only
-    /// structured output is role-restricted because it represents generated
-    /// assistant semantics.
-    pub fn validate_output_consistency(&self) -> Result<(), ChatMessageConsistencyError> {
-        match (&self.role, &self.payload) {
+    fn validate_role_payload(
+        role: &ChatRole,
+        payload: &ChatMessagePayload,
+    ) -> Result<(), ChatMessageConsistencyError> {
+        match (role, payload) {
             (ChatRole::Assistant, ChatMessagePayload::Output(output)) => {
                 if output.items.iter().any(|item| {
                     matches!(
                         item,
-                        ChatOutputItem::Message(message) if message.role != self.role
+                        ChatOutputItem::Message(message) if &message.role != role
                     )
                 }) {
                     return Err(ChatMessageConsistencyError::StructuredItemRoleMismatch);
@@ -762,23 +767,23 @@ impl ChatMessage {
         }
     }
 
+    /// Validate that the payload matches the message role.
+    ///
+    /// Assistant input payloads are valid explicit portable projections. Only
+    /// structured output is role-restricted because it represents generated
+    /// assistant semantics.
+    pub fn validate_output_consistency(&self) -> Result<(), ChatMessageConsistencyError> {
+        Self::validate_role_payload(&self.role, &self.payload)
+    }
+
     /// Replace the authoritative structured output payload.
     pub fn replace_output(
         &mut self,
         output: ChatOutput,
     ) -> Result<(), ChatMessageConsistencyError> {
-        if self.role != ChatRole::Assistant {
-            return Err(ChatMessageConsistencyError::StructuredOutputOnUserMessage);
-        }
-        if output.items.iter().any(|item| {
-            matches!(
-                item,
-                ChatOutputItem::Message(message) if message.role != self.role
-            )
-        }) {
-            return Err(ChatMessageConsistencyError::StructuredItemRoleMismatch);
-        }
-        self.payload = ChatMessagePayload::Output(output);
+        let payload = ChatMessagePayload::output(output);
+        Self::validate_role_payload(&self.role, &payload)?;
+        self.payload = payload;
         Ok(())
     }
 
@@ -799,7 +804,7 @@ impl ChatMessage {
         self.payload = match self.payload {
             ChatMessagePayload::Input(parts) => ChatMessagePayload::Input(parts),
             ChatMessagePayload::Output(output) => {
-                ChatMessagePayload::Output(output.into_portable())
+                ChatMessagePayload::output(output.into_portable())
             }
         };
         self
@@ -846,25 +851,9 @@ impl ChatMessage {
         self.payload.portable_parts()
     }
 
-    /// Compatibility alias for [`Self::portable_input_parts`].
-    pub fn input_parts(&self) -> Vec<ChatInputPart> {
-        self.portable_input_parts()
-    }
-
     /// Borrow the authoritative structured output, if this is an output turn.
     pub fn output(&self) -> Option<&ChatOutput> {
         self.payload.as_output()
-    }
-
-    /// Clear structured authority, converting to an empty portable input payload.
-    pub fn clear_output(&mut self) -> Option<ChatOutput> {
-        match std::mem::replace(&mut self.payload, ChatMessagePayload::Input(Vec::new())) {
-            ChatMessagePayload::Output(output) => Some(output),
-            other => {
-                self.payload = other;
-                None
-            }
-        }
     }
 
     /// Create a new builder for a user message.
@@ -888,11 +877,21 @@ impl ChatMessage {
 
     /// Convenience: create an assistant message from structured output.
     pub fn from_assistant_output(output: ChatOutput) -> Self {
-        ChatMessage {
+        Self::try_from_assistant_output(output)
+            .expect("assistant output message items must have the assistant role")
+    }
+
+    /// Create an assistant message while validating all role-bearing output items.
+    pub fn try_from_assistant_output(
+        output: ChatOutput,
+    ) -> Result<Self, ChatMessageConsistencyError> {
+        let payload = ChatMessagePayload::output(output);
+        Self::validate_role_payload(&ChatRole::Assistant, &payload)?;
+        Ok(ChatMessage {
             role: ChatRole::Assistant,
-            payload: ChatMessagePayload::Output(output),
+            payload,
             cache: None,
-        }
+        })
     }
 
     /// Extract concatenated text from canonical input parts or output text.
@@ -917,11 +916,6 @@ impl ChatMessage {
         self.output()
             .into_iter()
             .flat_map(|output| output.function_calls())
-    }
-
-    /// Compatibility projection of supported local function calls.
-    pub fn tool_uses(&self) -> Vec<&ChatFunctionCallItem> {
-        self.function_calls().collect()
     }
 
     /// Check whether the message carries any tool result input part.
@@ -970,28 +964,20 @@ impl<'de> Deserialize<'de> for ChatMessage {
 
         let payload = match (dto.output, dto.input, dto.content) {
             // Canonical exclusive shapes.
-            (Some(output), None, None) => ChatMessagePayload::Output(output),
+            (Some(output), None, None) => ChatMessagePayload::output(output),
             (None, Some(parts), None) => ChatMessagePayload::Input(parts),
             // Transitional `{ role, content, output }` records: `output` is
             // authoritative. Any non-empty `content` must be a projection of it,
             // otherwise the record is a stale duplicate representation.
-            (Some(output), None, Some(content)) if !content.is_empty() => {
-                let portable =
-                    migration::output_matches_legacy_projection(&content, &output, false);
-                let native = migration::output_matches_legacy_projection(&content, &output, true);
-                if !portable && !native {
-                    return Err(de::Error::custom(
-                        "message content does not match the structured output projection",
-                    ));
-                }
-                ChatMessagePayload::Output(output)
-            }
-            (Some(output), None, Some(_)) => ChatMessagePayload::Output(output),
+            (Some(output), None, Some(content)) => ChatMessagePayload::output(
+                migration::normalize_transitional_output(&content, output)
+                    .map_err(de::Error::custom)?,
+            ),
             // Legacy records. The role decides the path: an assistant turn is
             // generated output and collapses into exactly one `ChatOutput`,
             // while user/tool turns normalize into canonical input parts.
             (None, None, Some(content)) if dto.role == ChatRole::Assistant => {
-                ChatMessagePayload::Output(
+                ChatMessagePayload::output(
                     migration::normalize_legacy_assistant(content).map_err(de::Error::custom)?,
                 )
             }
@@ -1005,6 +991,8 @@ impl<'de> Deserialize<'de> for ChatMessage {
                 ));
             }
         };
+
+        ChatMessage::validate_role_payload(&dto.role, &payload).map_err(de::Error::custom)?;
 
         Ok(ChatMessage {
             role: dto.role,
@@ -1210,7 +1198,7 @@ impl ChatMessageBuilder {
     /// Build the canonical message.
     pub fn build(self) -> ChatMessage {
         let payload = if self.role == ChatRole::Assistant {
-            ChatMessagePayload::Output(ChatOutput {
+            ChatMessagePayload::output(ChatOutput {
                 items: self.output_items,
                 status: Some(ChatOutputStatus::Completed),
                 ..ChatOutput::default()
@@ -1265,7 +1253,7 @@ mod tests {
             .build();
 
         assert_eq!(msg.role, ChatRole::User);
-        assert_eq!(msg.input_parts().len(), 2);
+        assert_eq!(msg.input().unwrap().len(), 2);
         assert_eq!(msg.text(), "Hello");
     }
 
@@ -1326,7 +1314,7 @@ mod tests {
             .text("response")
             .build();
 
-        assert_eq!(msg.input_parts().len(), 1);
+        assert_eq!(msg.portable_input_parts().len(), 1);
         assert!(msg.thinking().is_none());
     }
 
@@ -1343,7 +1331,7 @@ mod tests {
         let output = msg.output().expect("assistant output payload");
         assert_eq!(output.tool_calls().unwrap().len(), 1);
         assert!(msg.has_tool_use());
-        assert_eq!(msg.tool_uses().len(), 1);
+        assert_eq!(msg.function_calls().count(), 1);
         assert!(!msg.has_tool_result());
         // The call is not also accepted as an ordinary input part variant.
         assert!(msg.payload.as_input().is_none());
@@ -1377,7 +1365,7 @@ mod tests {
         });
         let user_message: ChatMessage = serde_json::from_value(user_json).unwrap();
         assert_eq!(
-            user_message.input_parts(),
+            user_message.input().unwrap(),
             vec![ChatInputPart::text("hello")]
         );
         assert_eq!(
@@ -1405,6 +1393,53 @@ mod tests {
         assert!(saved.get("content").is_none());
         assert!(saved.get("output").is_some());
         assert!(saved.get("input").is_none());
+    }
+
+    #[test]
+    fn shipped_transitional_message_normalizes_and_resaves_canonically() {
+        let output = ChatOutput::from_projections(
+            Some("reasoning".into()),
+            Some("authoritative".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        let transitional = serde_json::json!({
+            "role": "Assistant",
+            "content": [
+                {"type": "thinking", "text": "reasoning"},
+                {"type": "text", "text": "authoritative"}
+            ],
+            "output": serde_json::to_value(&output).unwrap()
+        });
+
+        let message: ChatMessage = serde_json::from_value(transitional).unwrap();
+        assert_eq!(message.output(), Some(&output));
+        let saved = serde_json::to_value(message).unwrap();
+        assert!(saved.get("content").is_none());
+        assert_eq!(
+            saved.get("output"),
+            Some(&serde_json::to_value(output).unwrap())
+        );
+    }
+
+    #[test]
+    fn shipped_transitional_message_with_empty_projection_is_accepted() {
+        let output = ChatOutput::from_projections(
+            None,
+            Some("authoritative".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        let transitional = serde_json::json!({
+            "role": "Assistant",
+            "content": [],
+            "output": serde_json::to_value(&output).unwrap()
+        });
+
+        let message: ChatMessage = serde_json::from_value(transitional).unwrap();
+        assert_eq!(message.output(), Some(&output));
     }
 
     #[test]
@@ -1449,11 +1484,23 @@ mod tests {
             Err(ChatMessageConsistencyError::StructuredOutputOnUserMessage)
         );
 
+        assert!(matches!(
+            ChatMessage::try_from_assistant_output(output.clone()),
+            Err(ChatMessageConsistencyError::StructuredItemRoleMismatch)
+        ));
+
         let mut assistant = ChatMessage::from_assistant_output(ChatOutput::default());
         assert_eq!(
-            assistant.replace_output(output),
+            assistant.replace_output(output.clone()),
             Err(ChatMessageConsistencyError::StructuredItemRoleMismatch)
         );
+
+        let invalid_json = serde_json::json!({
+            "role": "Assistant",
+            "output": output
+        });
+        let error = serde_json::from_value::<ChatMessage>(invalid_json).unwrap_err();
+        assert!(error.to_string().contains("role does not match"));
     }
 
     #[test]
