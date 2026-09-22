@@ -16,7 +16,7 @@ use super::output::{
     ChatOutputItem, ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, MediaKind,
     MediaNormalizationError, MediaPart, MediaSource, ToolResult, ToolResultPart,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use serde_json::Value;
 
 /// A legacy content block within a message.
@@ -69,6 +69,50 @@ pub(super) enum Content {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mime_type: Option<String>,
     },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum CanonicalToolResultPart {
+    Text { text: String },
+    Attachment(Box<MediaPart>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ToolResultPartWire {
+    Canonical(CanonicalToolResultPart),
+    Legacy(Content),
+}
+
+impl<'de> Deserialize<'de> for ToolResultPart {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match ToolResultPartWire::deserialize(deserializer)? {
+            ToolResultPartWire::Canonical(CanonicalToolResultPart::Text { text })
+            | ToolResultPartWire::Legacy(Content::Text { text }) => {
+                Ok(ToolResultPart::Text { text })
+            }
+            ToolResultPartWire::Canonical(CanonicalToolResultPart::Attachment(media)) => {
+                Ok(ToolResultPart::Attachment(media))
+            }
+            ToolResultPartWire::Legacy(
+                media @ (Content::Image { .. }
+                | Content::ImageUrl { .. }
+                | Content::Pdf { .. }
+                | Content::Audio { .. }
+                | Content::ResourceLink { .. }),
+            ) => media_from_legacy(&media)
+                .map_err(de::Error::custom)?
+                .map(ToolResultPart::attachment)
+                .ok_or_else(|| de::Error::custom("unsupported legacy tool-result media")),
+            ToolResultPartWire::Legacy(_) => Err(de::Error::custom(
+                "generated content is not valid in a tool result",
+            )),
+        }
+    }
 }
 
 /// Validate the shipped transitional `{ content, output }` record shape.
@@ -418,6 +462,29 @@ mod tests {
 
     fn legacy_message_json(role: &str, content: serde_json::Value) -> String {
         serde_json::json!({ "role": role, "content": content }).to_string()
+    }
+
+    #[test]
+    fn legacy_image_tool_result_part_becomes_canonical_attachment() {
+        let part: ToolResultPart = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "mime_type": "image/png",
+            "data": [137, 80, 78, 71]
+        }))
+        .unwrap();
+
+        let media = part.as_attachment().expect("legacy image attachment");
+        assert_eq!(media.kind, MediaKind::Image);
+        assert_eq!(media.media_type().map(AsRef::as_ref), Some("image/png"));
+        assert_eq!(
+            media.source(),
+            &MediaSource::Inline {
+                data: vec![137, 80, 78, 71]
+            }
+        );
+
+        let canonical = serde_json::to_value(part).unwrap();
+        assert_eq!(canonical["type"], "attachment");
     }
 
     #[test]
