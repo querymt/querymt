@@ -56,9 +56,9 @@ cargo run --example qmtcode --features dashboard --profile coder --dashboard
 
 ### Switch Profiles
 
-In dashboard mode, use `Ctrl+X p` to open the profile switcher. This allows you to switch between available profiles without restarting.
+The embedded dashboard exposes available profiles in the new-session composer and in ACP session configuration controls. Existing sessions retain their bound profile.
 
-Alternatively, specify the profile when starting:
+Alternatively, specify the initial profile when starting:
 
 ```bash
 cargo run --example qmtcode --profile reviewer
@@ -279,14 +279,14 @@ let agent = from_config(ConfigSource::Toml(
 )).await?;
 ```
 
-### Dashboard Profile Switching
+### Dashboard Profile Selection
 
-Profiles can be selected when starting the dashboard. The profile determines the agent configuration for all sessions created in that dashboard session.
+Profiles can be selected when creating a session in the embedded dashboard. The selected profile determines that session's agent configuration.
 
 **Session behavior:**
-- New sessions use the current profile
+- New sessions use the profile selected in the composer
 - Existing sessions retain their original profile
-- To use a different profile, restart with `--profile <id>`
+- The `--profile <id>` option sets the initial profile for the process
 
 ## Creating Profiles
 

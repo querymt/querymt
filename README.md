@@ -89,10 +89,10 @@ It loads an agent from a TOML config file and supports several transports:
 
 - `--acp`: runs as an ACP stdio server for integrations and tooling
 - `--acp-ws`: runs a standalone ACP WebSocket server at `/acp/ws`
-- `--dashboard`: runs the existing React dashboard over `/ui/ws` and exposes ACP at `/acp/ws`
-- `--dashboard-ng`: runs the embedded Svelte dashboard over same-origin `/acp/ws`
+- `--api`: exposes ACP at `/acp/ws` and SFT export at `/api/export/sft`
+- `--dashboard`: serves the embedded Svelte dashboard over same-origin `/acp/ws`
 
-`--dashboard` and `--dashboard-ng` are mutually exclusive, as are the other transport flags.
+The transport flags are mutually exclusive.
 
 ### Quick start
 
@@ -102,31 +102,21 @@ From the workspace root:
 cd crates/agent
 
 # ACP stdio mode
-cargo run --example qmtcode --features dashboard -- --acp
+cargo run --example qmtcode -- --acp
+
+# Build the embedded Svelte dashboard from a sibling querymt-desktop checkout
+(cd ../../../querymt-desktop && npm ci && npm run build:embedded)
+export QMT_UI_DIST="$(realpath ../../../querymt-desktop/build-embedded)"
 
 # Dashboard mode (default http://127.0.0.1:3000)
 cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard mode on a custom address
 cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
-
-# Embedded Svelte dashboard from a local querymt-desktop build
-QMT_DASHBOARD_NG_DIST="$(realpath ../../querymt-desktop/build-embedded)" \
-  cargo run --example qmtcode --features dashboard-ng -- --dashboard-ng
 ```
 
 By default it reads config from `examples/confs/coder_agent.toml`.
 You can also pass your own config path before the mode flag.
-
-### Generate shared types
-
-From the workspace root:
-
-```bash
-scripts/generate-types.sh
-```
-
-This regenerates TypeScript (and Swift when the sibling iOS repo exists) typeshare outputs.
 
 ### macOS Silicon releases
 

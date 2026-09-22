@@ -38,12 +38,13 @@ The `crates/agent/examples/` directory contains runnable examples:
 ## qmtcode
 
 The primary example — a full-featured coding assistant with multiple run modes.
+Dashboard commands assume `QMT_UI_DIST` points to a querymt-desktop `build-embedded` artifact.
 
 ```bash
 # ACP stdio mode (for subprocess integration)
 cargo run --example qmtcode -- --acp
 
-# Web dashboard (default: http://127.0.0.1:3000)
+# Embedded Svelte dashboard over same-origin ACP (default: http://127.0.0.1:3000)
 cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard on custom address
@@ -261,17 +262,15 @@ cargo run --example replay_session -- <session-id>
 
 ## web_dashboard
 
-Starts a standalone web dashboard without using the `qmtcode` binary.
+Starts the embedded Svelte dashboard without using the `qmtcode` binary. The browser communicates with the agent through same-origin ACP at `/acp/ws`.
 
 ```bash
 cargo run --example web_dashboard --features dashboard
-cargo run --example web_dashboard --features dashboard -- --addr=0.0.0.0:8080
 ```
 
 **What it demonstrates:**
 - Starting the dashboard server directly
-- Attaching an agent to the dashboard
-- Custom bind address
+- Attaching an agent to the dashboard over ACP
 
 ---
 
@@ -969,10 +968,10 @@ Remote sessions are managed through the mesh network. See the [Mesh Networking G
    cargo run --example qmtcode --features "remote dashboard" -- --mesh --dashboard
    ```
 
-2. Use the dashboard UI to:
+2. Use the embedded dashboard's Mesh page to:
    - List available remote nodes
    - Create sessions on remote nodes
-   - Fork and resume remote sessions
+   - Attach and manage remote sessions
 
 ### Example: Remote Session via API
 
@@ -1007,13 +1006,12 @@ For complete remote session documentation, see [Mesh Networking Guide](mesh.md#s
 
 ## Scheduled Task Examples
 
-Schedules are created at runtime through the dashboard UI (Session > Schedules > Create Schedule) or via the WebSocket API. Here are the trigger JSON formats for different schedule types:
+Schedules are created at runtime through the `querymt/schedules/create` ACP extension. Here are request parameter examples for different schedule types:
 
 ### Example: Periodic Health Check (Interval)
 
 ```json
 {
-  "type": "create_schedule",
   "session_id": "<session-public-id>",
   "prompt": "Run system health check: verify services, check disk space, review logs for errors",
   "trigger": { "type": "interval", "seconds": 3600 },
@@ -1025,7 +1023,6 @@ Schedules are created at runtime through the dashboard UI (Session > Schedules >
 
 ```json
 {
-  "type": "create_schedule",
   "session_id": "<session-public-id>",
   "prompt": "Review recent file changes for code quality issues",
   "trigger": {
@@ -1043,7 +1040,6 @@ Schedules are created at runtime through the dashboard UI (Session > Schedules >
 
 ```json
 {
-  "type": "create_schedule",
   "session_id": "<session-public-id>",
   "prompt": "Generate daily standup summary: what was done yesterday, what's planned today, any blockers",
   "trigger": { "type": "interval", "seconds": 86400 }

@@ -15,7 +15,7 @@
 - Key packages:
   - `querymt` (core library)
   - `querymt-cli`
-  - `querymt-agent` (agent + optional UI under `crates/agent/ui`)
+  - `querymt-agent` (agent + optional embedded dashboard from `querymt-desktop`)
   - `querymt-service` (Axum service; bin `qmt-service`)
   - Provider crates under `crates/providers/*`
 - Toolchain: `rust-toolchain.toml` (stable + clippy + rustfmt; includes `wasm32-wasip1`).
@@ -38,11 +38,12 @@ When running any of the commands below, prefer delegating to a subagent when ava
 - `cargo check -p querymt-service`
 
 ### Agent crate (matches CI)
-- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth -- -D warnings`
+- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`
 
-### UI (agent dashboard)
-- `cd crates/agent/ui && bun install`
-- `cd crates/agent/ui && bun test`
+### Dashboard
+- The Svelte dashboard source lives in the separate `querymt-desktop` repository.
+- Dashboard builds require `QMT_UI_DIST` to point to its validated `build-embedded` artifact.
+- Nix builds provide this artifact through the pinned `querymt-desktop` flake input.
 
 ## Code Style Guidelines
 

@@ -676,7 +676,7 @@ mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 
 ## Scheduled Tasks Configuration
 
-QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime through the dashboard UI or API, not through static TOML configuration.
+QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime with the `querymt/schedules/create` ACP extension, not through static TOML configuration. The embedded dashboard discovers schedule capabilities through ACP.
 
 ### Schedule Types
 
@@ -714,11 +714,10 @@ Fire exactly once at a specified time. Trigger JSON format:
 
 ### Creating Schedules
 
-Schedules are created through the dashboard UI (Session > Schedules > Create Schedule) or via the WebSocket API using the `create_schedule` message:
+Create schedules with the `querymt/schedules/create` ACP extension:
 
 ```json
 {
-  "type": "create_schedule",
   "session_id": "<session-public-id>",
   "prompt": "Check for updates and summarize changes",
   "trigger": { "type": "interval", "seconds": 3600 },
@@ -756,7 +755,7 @@ If you have old configurations, note these changes:
 - Profiles added with `[profile]` section
 - Slash commands stored in `.qmt/commands/`
 - New tools: `index`, `get_symbol`, `get_function`, `replace_symbol`, `find_symbol_references`
-- Scheduled tasks created via dashboard UI/API, not TOML config
+- Scheduled tasks created via ACP extensions, not TOML config
 
 ### New Features Since Last Documentation Update
 
@@ -765,7 +764,7 @@ If you have old configurations, note these changes:
 3. **Internet Mesh**: iroh transport with invite tokens
 4. **Remote Sessions**: Forking, resuming, recovery
 5. **Code Intelligence Tools**: AST-aware code analysis
-6. **Scheduled Tasks**: Autonomous recurring work via dashboard/API
+6. **Scheduled Tasks**: Autonomous recurring work via ACP extensions
 7. **Language Intelligence**: VS Code integration via `language_query` tool
 8. **Streaming Stability**: Robust stream handling with reconnection
 9. **Multi-Transport**: LAN + Internet mesh simultaneously

@@ -911,7 +911,7 @@ let nodes = agent.list_remote_nodes().await;
 
 ### Attaching Existing Sessions
 
-Attach to a session running on another node via the dashboard UI or the `attach_remote_session` API.
+Attach to a session running on another node through the embedded ACP dashboard or the `attach_remote_session` API.
 
 ### Forking Sessions
 
