@@ -824,7 +824,7 @@ impl fmt::Debug for ChatReasoningItem {
             )
             .field("signature", &self.signature.as_ref().map(|_| "[REDACTED]"))
             .field("status", &self.status)
-            .field("extensions", &self.extensions)
+            .field("extensions", &"[REDACTED]")
             .finish()
     }
 }
@@ -863,7 +863,7 @@ impl ChatReasoningPart {
 }
 
 /// A function call retaining distinct provider item and call identities.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatFunctionCallItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_id: Option<String>,
@@ -875,6 +875,19 @@ pub struct ChatFunctionCallItem {
     pub status: Option<ChatOutputStatus>,
     #[serde(default, flatten)]
     pub extensions: Extensions,
+}
+
+impl fmt::Debug for ChatFunctionCallItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatFunctionCallItem")
+            .field("item_id", &self.item_id)
+            .field("call_id", &self.call_id)
+            .field("name", &self.name)
+            .field("arguments", &self.arguments)
+            .field("status", &self.status)
+            .field("extensions", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ChatFunctionCallItem {
@@ -1804,6 +1817,8 @@ mod tests {
         const ENCRYPTED: &str = "sentinel-encrypted-continuation";
         const SIGNATURE: &str = "sentinel-signature-value";
         const OPAQUE: &str = "sentinel-opaque-payload";
+        const REASONING_EXT: &str = "sentinel-reasoning-extension-secret";
+        const THOUGHT_SIG: &str = "sentinel-google-thought-signature";
 
         let fixture = serde_json::json!({
             "status": "completed",
@@ -1814,7 +1829,15 @@ mod tests {
                     "summary": [{"text": "visible summary"}],
                     "content": [],
                     "encrypted_content": ENCRYPTED,
-                    "signature": SIGNATURE
+                    "signature": SIGNATURE,
+                    "google_thought_signature": REASONING_EXT
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                    "google_thought_signature": THOUGHT_SIG
                 },
                 {
                     "type": "opaque",
@@ -1839,6 +1862,14 @@ mod tests {
             !debug.contains(OPAQUE),
             "opaque payloads must not appear in Debug output"
         );
+        assert!(
+            !debug.contains(REASONING_EXT),
+            "reasoning extensions must not appear in Debug output"
+        );
+        assert!(
+            !debug.contains(THOUGHT_SIG),
+            "function-call extensions must not appear in Debug output"
+        );
         // Visible summary text is display content and may still be shown.
         assert!(debug.contains("visible summary"));
 
@@ -1847,5 +1878,7 @@ mod tests {
         assert!(encoded.contains(ENCRYPTED));
         assert!(encoded.contains(SIGNATURE));
         assert!(encoded.contains(OPAQUE));
+        assert!(encoded.contains(REASONING_EXT));
+        assert!(encoded.contains(THOUGHT_SIG));
     }
 }

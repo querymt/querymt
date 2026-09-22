@@ -3452,7 +3452,7 @@ pub fn parse_openai_responses_sse_chunk(
                     StructuredStreamEvent::ReasoningPartDelta {
                         output_index,
                         part: ReasoningPartKind::Content,
-                        part_index: event.summary_index.unwrap_or(0),
+                        part_index: event.content_index.unwrap_or(0),
                         delta: delta.clone(),
                     },
                 ));

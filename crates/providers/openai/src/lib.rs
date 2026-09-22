@@ -1524,6 +1524,33 @@ mod tests {
     }
 
     #[test]
+    fn responses_reasoning_text_delta_uses_content_index() {
+        use querymt::chat::{ReasoningPartKind, StructuredStreamEvent};
+
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let events = parser
+            .parse_chunk(&sse(
+                r#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":1,"delta":"part-two"}"#,
+            ))
+            .unwrap();
+
+        assert!(
+            matches!(
+                &events[0],
+                StreamChunk::Structured(StructuredStreamEvent::ReasoningPartDelta {
+                    output_index: 0,
+                    part: ReasoningPartKind::Content,
+                    part_index: 1,
+                    delta,
+                }) if delta == "part-two"
+            ),
+            "reasoning content deltas must use content_index, got {:?}",
+            events[0]
+        );
+    }
+
+    #[test]
     fn responses_stream_completion_with_call_indicates_tool_calls() {
         use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
 

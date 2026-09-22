@@ -6,7 +6,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mockall::Sequence;
 use querymt::LLMParams;
-use querymt::chat::{FunctionTool, Tool, ToolResultPart};
+use querymt::chat::{
+    ChatFunctionCallItem, ChatOutput, ChatOutputItem, ChatOutputProvenance, ChatOutputStatus,
+    ChatReasoningItem, ChatReasoningPart, FinishReason, FunctionTool, Tool, ToolResultPart,
+};
 use querymt::error::LLMError;
 use serde_json::json;
 use tempfile::TempDir;
@@ -818,6 +821,103 @@ async fn test_single_tool_call_cycle() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
+}
+
+/// Same-turn tool loop must keep encrypted reasoning on the second request.
+///
+/// `store=false` Responses continuation needs `encrypted_content` on the
+/// assistant turn that is actually sent after the tool result. The live loop
+/// already has that output; converting it with no target portable-projects it
+/// away before `BeforeLlmCall`.
+#[tokio::test]
+async fn same_turn_tool_loop_keeps_encrypted_reasoning_on_second_request() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let mut seq = Sequence::new();
+    let second_request = Arc::new(StdMutex::new(Vec::new()));
+    let second_request_for_mock = second_request.clone();
+
+    const ENCRYPTED: &str = "encrypted-continuation";
+    let first_output = ChatOutput {
+        response_id: Some("resp_loop".into()),
+        status: Some(ChatOutputStatus::Completed),
+        finish_reason: Some(FinishReason::ToolCalls),
+        provenance: Some(ChatOutputProvenance {
+            provider: "mock".into(),
+            protocol: "responses".into(),
+            model: "mock-model".into(),
+            endpoint: "https://api.openai.com/v1/responses".into(),
+        }),
+        items: vec![
+            ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("rs_1".into()),
+                summary: vec![ChatReasoningPart::text("thinking")],
+                content: Vec::new(),
+                encrypted_content: Some(ENCRYPTED.into()),
+                signature: Some("sig".into()),
+                status: None,
+                extensions: Default::default(),
+            }),
+            ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("fc_1".into()),
+                call_id: "call-1".into(),
+                name: "remote_tool".into(),
+                arguments: "{}".into(),
+                status: None,
+                extensions: Default::default(),
+            }),
+        ],
+        ..ChatOutput::default()
+    };
+
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_| Ok(first_output.clone()));
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |messages| {
+            *second_request_for_mock.lock().unwrap() = messages.to_vec();
+            Ok(MockChatResponse::text_only("done").into())
+        });
+    harness
+        .provider_mut()
+        .await
+        .expect_call_tool()
+        .returning(|_, _| {
+            Ok(vec![querymt::chat::ToolResultPart::Text {
+                text: "tool output".to_string(),
+            }])
+        })
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+
+    let outcome = harness.run().await;
+    assert_eq!(outcome, CycleOutcome::Completed);
+
+    let second_request = second_request.lock().unwrap();
+    let encrypted = second_request.iter().find_map(|message| {
+        message.output()?.items.iter().find_map(|item| match item {
+            ChatOutputItem::Reasoning(reasoning) => reasoning.encrypted_content.clone(),
+            _ => None,
+        })
+    });
+    assert_eq!(
+        encrypted.as_deref(),
+        Some(ENCRYPTED),
+        "second same-turn request must keep encrypted reasoning on the outbound assistant turn"
+    );
 }
 
 #[tokio::test]
