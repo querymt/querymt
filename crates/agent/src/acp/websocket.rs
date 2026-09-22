@@ -513,7 +513,7 @@ pub(crate) fn router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
     Router::new().nest("/acp", websocket_router(WsServerState::new(agent)))
 }
 
-#[cfg(feature = "dashboard-ng")]
+#[cfg(feature = "dashboard")]
 pub(crate) fn same_origin_router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
     Router::new().nest(
         "/acp",

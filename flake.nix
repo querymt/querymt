@@ -5,6 +5,10 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    querymt-desktop = {
+      url = "github:querymt/querymt-desktop/9e3465bec59c2426b81de3a000b7836ead890db8";
+      flake = false;
+    };
   };
 
   outputs = inputs @ {
@@ -12,6 +16,7 @@
     nixpkgs,
     rust-overlay,
     flake-parts,
+    querymt-desktop,
     ...
   }:
     flake-parts.lib.mkFlake {inherit inputs;} {
@@ -62,28 +67,36 @@
           typeshare
           libgcc
           gdb
-          bun
         ];
 
-        agentUi = pkgs.buildNpmPackage {
-          pname = "querymt-agent-ui";
-          version = workspaceCargoToml.workspace.package.version;
-          src = ./crates/agent/ui;
+        dashboardPackageJson = builtins.fromJSON (builtins.readFile "${querymt-desktop}/package.json");
+        dashboardUi = pkgs.buildNpmPackage {
+          pname = "querymt-dashboard-ui";
+          version = dashboardPackageJson.version;
+          src = querymt-desktop;
           npmDeps = pkgs.importNpmLock {
-            npmRoot = ./crates/agent/ui;
+            npmRoot = querymt-desktop;
           };
           npmConfigHook = pkgs.importNpmLock.npmConfigHook;
-          npmBuildScript = "build";
+          preBuild = "npm run test:embedded";
+          npmBuildScript = "build:embedded";
+          QUERYMT_UI_REVISION = querymt-desktop.rev;
+          nativeBuildInputs = [pkgs.jq];
+          postBuild = ''
+            test -f build-embedded/index.html
+            test "$(jq -r .target build-embedded/querymt-ui.json)" = embedded
+            test "$(jq -r .acpWebSocketPath build-embedded/querymt-ui.json)" = /acp/ws
+          '';
           installPhase = ''
             runHook preInstall
-            mkdir -p $out/dist
-            cp -R dist/. $out/dist/
+            mkdir -p $out
+            cp -R build-embedded/. $out/
             runHook postInstall
           '';
         };
       in {
         packages = {
-          agent-ui = agentUi;
+          dashboard-ui = dashboardUi;
           default = self.packages.${system}.qmt;
 
           qmtcode = pkgs.rustPlatform.buildRustPackage {
@@ -110,7 +123,7 @@
             buildInputs = commonInputs;
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
-            QMT_UI_DIST = "${agentUi}/dist";
+            QMT_UI_DIST = "${dashboardUi}";
             # cargo-auditable currently fails on this workspace's `dep:` feature
             # metadata resolution; we can re-enable it later if embedded
             # dependency metadata in binaries becomes a requirement.

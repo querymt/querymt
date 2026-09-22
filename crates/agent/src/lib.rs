@@ -52,8 +52,6 @@ pub mod slash_commands;
 pub mod snapshot;
 pub mod tasks;
 pub mod tools;
-#[cfg(feature = "api")]
-pub mod ui;
 pub mod verification;
 pub mod workspace_query;
 

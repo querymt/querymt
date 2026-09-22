@@ -1217,7 +1217,7 @@ impl Agent {
 
     #[cfg(feature = "api")]
     pub fn server(&self) -> AgentServer {
-        let server = AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone());
+        let server = AgentServer::new(self.inner.clone(), self.storage.clone());
         if let Some(profiles) = self.profiles() {
             server.with_profiles(profiles)
         } else {
@@ -1551,6 +1551,6 @@ impl ChatRunner for Agent {
 
     #[cfg(feature = "api")]
     fn server(&self) -> AgentServer {
-        AgentServer::new(self.inner.clone(), self.storage.clone(), self.cwd.clone())
+        AgentServer::new(self.inner.clone(), self.storage.clone())
     }
 }

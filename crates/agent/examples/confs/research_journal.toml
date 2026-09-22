@@ -22,8 +22,7 @@
 #   #   "What do you already know about tokio?"
 #   #   "Consolidate your findings on async runtimes"
 #
-#   # Create an event-driven consolidation schedule via the dashboard UI:
-#   #   Session → Schedules → Create Schedule
+#   # Create an event-driven schedule with the `querymt/schedules/create` ACP extension:
 #   #   Prompt: "Run a consolidation cycle: list unconsolidated entries, group by topic, and consolidate related entries into insights."
 #   #   Trigger: Event-driven
 #   #     event_kinds: ["knowledge_ingested"]

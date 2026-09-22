@@ -18,8 +18,7 @@
 #
 #   cargo run --example qmtcode --features dashboard -- confs/watchdog.toml --dashboard
 #
-#   # Create a schedule via the dashboard UI:
-#   #   Session → Schedules → Create Schedule
+#   # Create a schedule with the `querymt/schedules/create` ACP extension:
 #   #   Prompt: "Run a health check cycle: audit TODOs, test count, dependencies, dead code, and documentation. Ingest findings and compare against previous cycles."
 #   #   Trigger: Interval, 1800 seconds (30 min)
 #   #   Max runs: 48 (24 hours of monitoring)

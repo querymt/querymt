@@ -18,17 +18,8 @@ pub(crate) enum SessionOperation {
     DiscardQueuedInput,
     RuntimeState,
     Cancel,
-    GetMode,
-    GetReasoningEffort,
     SetMode,
-    SetReasoningEffort,
     SetModel,
-    Undo,
-    Redo,
-    Fork,
-    FileIndex,
-    ReadFile,
-    EventRefresh,
 }
 
 impl SessionOperation {
@@ -39,39 +30,20 @@ impl SessionOperation {
             Self::DiscardQueuedInput => "discard_queued_input",
             Self::RuntimeState => "runtime_state",
             Self::Cancel => "cancel",
-            Self::GetMode => "get_mode",
-            Self::GetReasoningEffort => "get_reasoning_effort",
             Self::SetMode => "set_mode",
-            Self::SetReasoningEffort => "set_reasoning_effort",
             Self::SetModel => "set_model",
-            Self::Undo => "undo",
-            Self::Redo => "redo",
-            Self::Fork => "fork",
-            Self::FileIndex => "file_index",
-            Self::ReadFile => "read_file",
-            Self::EventRefresh => "event_refresh",
         }
     }
 
     pub(crate) fn safety(self) -> SessionOperationSafety {
         match self {
-            Self::DiscardQueuedInput
-            | Self::RuntimeState
-            | Self::GetMode
-            | Self::GetReasoningEffort
-            | Self::FileIndex
-            | Self::ReadFile
-            | Self::EventRefresh => SessionOperationSafety::Idempotent,
+            Self::DiscardQueuedInput | Self::RuntimeState => SessionOperationSafety::Idempotent,
             Self::SubmitInput { has_key: true } => SessionOperationSafety::IdempotentWithKey,
             Self::LegacyPrompt
             | Self::SubmitInput { has_key: false }
             | Self::Cancel
             | Self::SetMode
-            | Self::SetReasoningEffort
-            | Self::SetModel
-            | Self::Undo
-            | Self::Redo
-            | Self::Fork => SessionOperationSafety::NonIdempotent,
+            | Self::SetModel => SessionOperationSafety::NonIdempotent,
         }
     }
 
@@ -144,38 +116,6 @@ impl SessionOperationError {
         }
     }
 
-    pub(crate) fn into_agent_error(self) -> AgentError {
-        match self {
-            Self::Failed(error) => error,
-            Self::OutcomeUnknown {
-                session_id,
-                operation,
-                failure,
-            } => AgentError::TurnControl {
-                kind: "submission_outcome_unknown".to_string(),
-                message: format!(
-                    "{} outcome is unknown for session {} ({}; delivery={})",
-                    operation.as_str(),
-                    session_id,
-                    failure.kind.as_str(),
-                    failure.delivery.as_str()
-                ),
-            },
-            Self::NotFound { session_id } => AgentError::SessionNotFound { session_id },
-            Self::LocationConflict { session_id } => AgentError::Internal(format!(
-                "session_location_conflict: local row and remote bookmark both exist for {session_id}"
-            )),
-            Self::Storage {
-                session_id,
-                message,
-            } => AgentError::Internal(format!("failed to resolve session {session_id}: {message}")),
-            Self::Connect(error) => AgentError::TurnControl {
-                kind: error.code().to_string(),
-                message: error.to_string(),
-            },
-        }
-    }
-
     pub(crate) fn into_acp_error(self) -> Error {
         match self {
             Self::Connect(error) => error.to_acp_error(),
@@ -219,39 +159,6 @@ impl SessionOperationError {
 }
 
 impl LocalAgentHandle {
-    pub(crate) async fn refresh_remote_session_events(
-        &self,
-        session_id: &str,
-    ) -> Result<(), SessionOperationError> {
-        self.execute_session_operation(session_id, SessionOperation::EventRefresh, |session_ref| {
-            let sink = self.config.event_sink.clone();
-            let session_ref = session_ref.clone();
-            let session_id = session_id.to_owned();
-            Box::pin(async move {
-                let Some(node_id) = session_ref.remote_node_id().map(str::to_owned) else {
-                    return Ok(());
-                };
-                let cursor = sink
-                    .journal()
-                    .remote_sync_cursor(&session_id, &node_id)
-                    .await
-                    .map_err(|e| AgentError::Internal(e.to_string()))?;
-                let peer_label = session_ref.node_label().to_owned();
-                crate::agent::remote::event_backfill::backfill_remote_events(
-                    sink,
-                    session_ref,
-                    session_id,
-                    node_id,
-                    peer_label,
-                    0,
-                    cursor,
-                )
-                .await
-            })
-        })
-        .await
-    }
-
     pub(crate) async fn session_ref_for_operation(
         &self,
         session_id: &str,
@@ -518,7 +425,6 @@ mod tests {
         );
         assert!(SessionOperation::RuntimeState.can_retry_after_recovery(&unknown, false));
         assert!(SessionOperation::LegacyPrompt.can_retry_after_recovery(&not_delivered, false));
-        assert!(SessionOperation::Fork.can_retry_after_recovery(&not_delivered, false));
         assert!(
             SessionOperation::SubmitInput { has_key: true }
                 .can_retry_after_recovery(&not_delivered, false)
@@ -815,7 +721,7 @@ mod tests {
             .expect("save conflicting bookmark");
 
         let error = handle
-            .session_ref_for_operation(&session.public_id, SessionOperation::GetMode)
+            .session_ref_for_operation(&session.public_id, SessionOperation::RuntimeState)
             .await
             .err()
             .expect("conflict must fail");
@@ -862,22 +768,5 @@ mod tests {
                 assert!(!failure.proven_not_delivered());
             }
         }
-    }
-
-    #[test]
-    fn outcome_unknown_maps_to_structured_turn_control_error() {
-        let error = SessionOperationError::OutcomeUnknown {
-            session_id: "remote-session".to_string(),
-            operation: SessionOperation::LegacyPrompt,
-            failure: failure(
-                RemoteTransportFailureKind::ReplyTimeout,
-                DeliveryCertainty::Unknown,
-            ),
-        }
-        .into_agent_error();
-        assert!(matches!(
-            error,
-            AgentError::TurnControl { ref kind, .. } if kind == "submission_outcome_unknown"
-        ));
     }
 }

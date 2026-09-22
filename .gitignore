@@ -1,4 +1,5 @@
 /target
+/crates/agent/dashboard-dist/
 .env*
 
 /docs/site/*

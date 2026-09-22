@@ -7,7 +7,7 @@ description = "Agent and Session management for querymt"
 
 [features]
 default = ["plugin-loaders"]
-# Enables the API UI server for alternate clients over /ui/ws.
+# Enables the ACP WebSocket and SFT export API server without dashboard assets.
 api = []
 # QueryMT core runtime is always enabled; this remains as a compatibility alias
 # for embedders that want the agent without dynamic plugin loading.
@@ -16,13 +16,9 @@ plugin-host-only = ["agent-mcp", "agent-tracing"]
 plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins"]
 agent-mcp = ["querymt/mcp"]
 agent-tracing = ["querymt/tracing"]
-# Enables the web dashboard UI with React frontend assets.
-# Locally, the build script uses bun (or npm fallback) to build UI assets.
-# Packagers can bypass runtime installs by setting QMT_UI_DIST to a prebuilt dist/.
+# Embeds the prebuilt querymt-desktop Svelte dashboard served over same-origin ACP.
+# QMT_UI_DIST must point to its build-embedded artifact.
 dashboard = ["api", "plugin-loaders"]
-# Adds the embedded querymt-desktop Svelte dashboard while retaining the React dashboard.
-# QMT_DASHBOARD_NG_DIST must point to a prebuilt embedded frontend artifact.
-dashboard-ng = ["dashboard"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth"]
 

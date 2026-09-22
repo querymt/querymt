@@ -1,8 +1,7 @@
 //! Shared OCI plugin update logic.
 //!
-//! This module is compiled when dynamic plugin loaders are enabled so that
-//! both the ACP `querymt/updatePlugins` ext-method and the dashboard WebSocket
-//! handler can share the same core update loop.
+//! This module is compiled when dynamic plugin loaders are enabled and backs
+//! the ACP `querymt/updatePlugins` extension.
 
 use querymt::plugin::host::{OciProgressCallback, PluginRegistry};
 use serde::{Deserialize, Serialize};
