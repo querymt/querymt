@@ -2227,9 +2227,10 @@ mod tests {
 
         assert_eq!(reasoning["type"], "reasoning");
         assert_eq!(reasoning["summary"][0]["text"], "why");
-        assert_eq!(reasoning["content"][0]["type"], "reasoning_text");
-        assert_eq!(reasoning["content"][0]["text"], "because");
-        assert_eq!(reasoning["content"].as_array().unwrap().len(), 1);
+        assert!(
+            reasoning.get("content").is_none(),
+            "Responses input forbids a non-empty reasoning content array"
+        );
         assert_eq!(reasoning["encrypted_content"], "enc_payload");
     }
 
