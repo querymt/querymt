@@ -61,6 +61,28 @@ pub struct ExecutionMetrics {
     pub turns: u32,
 }
 
+/// One visible reasoning part stored with an assistant message.
+///
+/// Summary titles use `:summary:N`. Plaintext reasoning uses `:content:N`.
+/// Encrypted continuation is not included. The same `id` appends; a new `id`
+/// is a new part.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningPartStored {
+    pub id: String,
+    pub text: String,
+}
+
+/// Stable id for one provider summary part.
+pub fn reasoning_summary_part_id(item_id: &str, part_index: usize) -> String {
+    format!("{item_id}:summary:{part_index}")
+}
+
+/// Stable id for one provider plaintext reasoning part.
+pub fn reasoning_content_part_id(item_id: &str, part_index: usize) -> String {
+    format!("{item_id}:content:{part_index}")
+}
+
 /// Session limits configuration (exposed to UI)
 /// Typeshare-annotated: generated for TypeScript and Swift.
 #[typeshare]
@@ -247,6 +269,9 @@ pub enum AgentEventKind {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         thinking: Option<String>,
+        /// Visible summary parts. Historical events omit this and keep `thinking`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning_parts: Vec<ReasoningPartStored>,
         #[serde(skip_serializing_if = "Option::is_none")]
         message_id: Option<String>,
     },
@@ -261,6 +286,9 @@ pub enum AgentEventKind {
     AssistantThinkingDelta {
         content: String,
         message_id: String,
+        /// Stable summary part. The same id appends; a new id is a new part.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_id: Option<String>,
     },
     /// Ephemeral transport signal for remote streaming over mesh.
     RemoteStreamDisconnected {
@@ -1198,6 +1226,7 @@ mod tests {
         let kind = AgentEventKind::AssistantThinkingDelta {
             content: "hmm".into(),
             message_id: "m1".into(),
+            part_id: None,
         };
         assert_eq!(classify_durability(&kind), Durability::Ephemeral);
     }
@@ -1267,9 +1296,31 @@ mod tests {
         let kind = AgentEventKind::AssistantMessageStored {
             content: "hi".into(),
             thinking: None,
+            reasoning_parts: Vec::new(),
             message_id: None,
         };
         assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn historical_assistant_message_without_reasoning_parts_deserializes() {
+        let json =
+            r#"{"type":"assistant_message_stored","data":{"content":"hi","thinking":"old"}}"#;
+        let kind: AgentEventKind = serde_json::from_str(json).expect("old event");
+        match kind {
+            AgentEventKind::AssistantMessageStored {
+                content,
+                thinking,
+                reasoning_parts,
+                message_id,
+            } => {
+                assert_eq!(content, "hi");
+                assert_eq!(thinking.as_deref(), Some("old"));
+                assert!(reasoning_parts.is_empty());
+                assert!(message_id.is_none());
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
     }
 
     #[test]

@@ -198,8 +198,8 @@ impl ChatOutput {
         {
             items.push(ChatOutputItem::Reasoning(ChatReasoningItem {
                 id: None,
-                summary: vec![ChatReasoningPart::text(thinking)],
-                content: Vec::new(),
+                summary: Vec::new(),
+                content: vec![ChatReasoningPart::text(thinking)],
                 encrypted_content: None,
                 signature: None,
                 status: None,
@@ -858,6 +858,19 @@ impl ChatReasoningPart {
         Self {
             text: text.into(),
             extensions: Extensions::new(),
+        }
+    }
+
+    /// Responses `reasoning_text` that can be replayed natively.
+    ///
+    /// Legacy `{ "type": "text" }` parts stay readable but are not promoted.
+    pub fn reasoning_text_for_replay(&self) -> Option<&str> {
+        if self.text.is_empty() {
+            return None;
+        }
+        match self.extensions.get("type").and_then(Value::as_str) {
+            None | Some("reasoning_text") => Some(self.text.as_str()),
+            _ => None,
         }
     }
 }
@@ -1649,6 +1662,18 @@ mod tests {
         assert_eq!(output.status, Some(ChatOutputStatus::Completed));
         assert_eq!(output.usage.as_ref().unwrap().input_tokens, 3);
         assert!(output.items.iter().all(|item| !item.is_native()));
+        let ChatOutputItem::Reasoning(reasoning) = &output.items[0] else {
+            panic!("expected reasoning");
+        };
+        assert!(reasoning.summary.is_empty());
+        assert_eq!(
+            reasoning
+                .content
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thinking"]
+        );
     }
 
     fn reasoning_fixture(signature: Option<&str>) -> ChatReasoningItem {

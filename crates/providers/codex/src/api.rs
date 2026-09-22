@@ -150,6 +150,8 @@ enum CodexInputItem<'a> {
         // The Responses API requires `summary` on every reasoning input item;
         // an empty array is valid but the key must always be present.
         summary: Vec<CodexReasoningSummaryInput<'a>>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        content: Vec<CodexReasoningContentInput<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<Cow<'a, str>>,
     },
@@ -176,6 +178,19 @@ enum CodexReasoningSummaryKind {
 struct CodexReasoningSummaryInput<'a> {
     #[serde(rename = "type")]
     summary_type: CodexReasoningSummaryKind,
+    text: Cow<'a, str>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum CodexReasoningContentKind {
+    ReasoningText,
+}
+
+#[derive(Serialize, Debug)]
+struct CodexReasoningContentInput<'a> {
+    #[serde(rename = "type")]
+    content_type: CodexReasoningContentKind,
     text: Cow<'a, str>,
 }
 
@@ -806,11 +821,19 @@ fn convert_structured_output_to_codex<'a>(
                     summary: reasoning
                         .summary
                         .iter()
-                        .chain(&reasoning.content)
                         .filter(|part| !part.text.is_empty())
                         .map(|part| CodexReasoningSummaryInput {
                             summary_type: CodexReasoningSummaryKind::SummaryText,
                             text: Cow::Borrowed(part.text.as_str()),
+                        })
+                        .collect(),
+                    content: reasoning
+                        .content
+                        .iter()
+                        .filter_map(querymt::chat::ChatReasoningPart::reasoning_text_for_replay)
+                        .map(|text| CodexReasoningContentInput {
+                            content_type: CodexReasoningContentKind::ReasoningText,
+                            text: Cow::Borrowed(text),
                         })
                         .collect(),
                     encrypted_content: reasoning.encrypted_content.as_deref().map(Cow::Borrowed),
@@ -1882,6 +1905,49 @@ mod tests {
         // even when the model emitted no summary text.
         assert_eq!(reasoning["summary"], Value::Array(Vec::new()));
         assert_eq!(reasoning["id"], Value::String("rs_empty".to_string()));
+        assert_eq!(
+            reasoning["encrypted_content"],
+            Value::String("enc_payload".to_string())
+        );
+        assert!(
+            reasoning.get("content").is_none(),
+            "empty reasoning content must be omitted from replay"
+        );
+    }
+
+    #[test]
+    fn codex_replays_reasoning_content_separately_from_summary() {
+        use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart, Extensions};
+
+        let cfg = test_codex("test-token");
+        let mut legacy = ChatReasoningPart::text("legacy");
+        legacy
+            .extensions
+            .insert("type".to_string(), Value::String("text".to_string()));
+        let turn = structured_assistant_turn(vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+            id: Some("rs_1".to_string()),
+            summary: vec![ChatReasoningPart::text("why")],
+            content: vec![ChatReasoningPart::text("because"), legacy],
+            encrypted_content: Some("enc_payload".to_string()),
+            signature: None,
+            status: None,
+            extensions: Extensions::new(),
+        })]);
+
+        let messages = vec![ChatMessage::user().text("continue").build(), turn];
+        let body: Value =
+            serde_json::from_slice(&codex_chat_body_json(&cfg, &messages, None).unwrap()).unwrap();
+        let reasoning = &body["input"][1];
+
+        assert_eq!(reasoning["type"], Value::String("reasoning".to_string()));
+        assert_eq!(
+            reasoning["summary"],
+            serde_json::json!([{"type": "summary_text", "text": "why"}])
+        );
+        assert_eq!(
+            reasoning["content"],
+            serde_json::json!([{"type": "reasoning_text", "text": "because"}])
+        );
         assert_eq!(
             reasoning["encrypted_content"],
             Value::String("enc_payload".to_string())

@@ -1177,6 +1177,39 @@ mod tests {
     }
 
     #[test]
+    fn responses_normalizes_reasoning_text_content() {
+        let provider = responses_provider();
+        let body = serde_json::json!({
+            "id": "resp_content",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_content",
+                    "summary": [{"type": "summary_text", "text": "why"}],
+                    "content": [
+                        {"type": "reasoning_text", "text": "because"},
+                        {"type": "text", "text": "legacy"}
+                    ],
+                    "encrypted_content": "enc"
+                }
+            ]
+        });
+
+        let response = provider
+            .parse_chat(responses_json_response(body))
+            .expect("response should parse");
+        let querymt::chat::ChatOutputItem::Reasoning(reasoning) = &response.items[0] else {
+            panic!("expected reasoning item");
+        };
+        assert_eq!(reasoning.summary[0].text, "why");
+        assert_eq!(reasoning.content.len(), 2);
+        assert_eq!(reasoning.content[0].text, "because");
+        assert_eq!(reasoning.content[1].text, "legacy");
+        assert_eq!(reasoning.encrypted_content.as_deref(), Some("enc"));
+    }
+
+    #[test]
     fn responses_incomplete_retains_partial_output_and_cause() {
         let provider = responses_provider();
         let body = serde_json::json!({
@@ -1521,6 +1554,39 @@ mod tests {
             .expect("accumulation completes");
         assert_eq!(output.status, Some(ChatOutputStatus::Completed));
         assert_eq!(output.thinking().as_deref(), Some("thinking"));
+    }
+
+    #[test]
+    fn responses_reasoning_text_survives_output_item_done() {
+        use querymt::chat::{ChatOutputItem, ChatOutputStatus, ChatStreamAccumulator};
+
+        let provider = responses_provider();
+        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut accumulator = ChatStreamAccumulator::new();
+
+        for payload in [
+            r#"{"type":"response.created","response":{"id":"resp_r","model":"gpt-5"}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[]}}"#,
+            r#"{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"short"}"#,
+            r#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"delta":"raw thought"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"short"}],"content":[{"type":"reasoning_text","text":"raw thought"}]}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_r","status":"completed"}}"#,
+        ] {
+            for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
+                accumulator.push(&chunk).expect("accumulator accepts event");
+            }
+        }
+
+        let output = accumulator
+            .finish_success()
+            .expect("accumulation completes");
+        assert_eq!(output.status, Some(ChatOutputStatus::Completed));
+        let ChatOutputItem::Reasoning(reasoning) = &output.items[0] else {
+            panic!("expected reasoning item");
+        };
+        assert_eq!(reasoning.summary[0].text, "short");
+        assert_eq!(reasoning.content[0].text, "raw thought");
     }
 
     #[test]
@@ -2123,6 +2189,48 @@ mod tests {
         assert_eq!(input[5]["call_id"], Value::String("call_1".to_string()));
         let call_count = types.iter().filter(|t| **t == "function_call").count();
         assert_eq!(call_count, 2, "no duplicate projected function calls");
+    }
+
+    #[test]
+    fn responses_replays_reasoning_text_under_content() {
+        use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart, Extensions};
+
+        let provider = responses_provider();
+        let mut legacy = ChatReasoningPart::text("legacy");
+        legacy
+            .extensions
+            .insert("type".to_string(), Value::String("text".to_string()));
+        let output = querymt::chat::ChatOutput {
+            provenance: Some(querymt::chat::ChatOutputProvenance {
+                provider: "openai".into(),
+                protocol: "responses".into(),
+                model: "gpt-4o-mini".into(),
+                endpoint: "https://api.openai.com/v1/responses".into(),
+            }),
+            items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("rs_1".to_string()),
+                summary: vec![ChatReasoningPart::text("why")],
+                content: vec![ChatReasoningPart::text("because"), legacy],
+                encrypted_content: Some("enc_payload".to_string()),
+                signature: None,
+                status: None,
+                extensions: Extensions::new(),
+            })],
+            ..querymt::chat::ChatOutput::default()
+        };
+
+        let req = provider
+            .chat_request(&[ChatMessage::from_assistant_output(output)], None)
+            .expect("responses replay should build");
+        let body: Value = serde_json::from_slice(req.body()).unwrap();
+        let reasoning = &body["input"][0];
+
+        assert_eq!(reasoning["type"], "reasoning");
+        assert_eq!(reasoning["summary"][0]["text"], "why");
+        assert_eq!(reasoning["content"][0]["type"], "reasoning_text");
+        assert_eq!(reasoning["content"][0]["text"], "because");
+        assert_eq!(reasoning["content"].as_array().unwrap().len(), 1);
+        assert_eq!(reasoning["encrypted_content"], "enc_payload");
     }
 
     #[test]

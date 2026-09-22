@@ -301,6 +301,7 @@ mod tests {
                 AgentEventKind::AssistantMessageStored {
                     content: "hi there".to_string(),
                     thinking: None,
+                    reasoning_parts: Vec::new(),
                     message_id: None,
                 },
             ),
@@ -351,6 +352,7 @@ mod tests {
                 AgentEventKind::AssistantMessageStored {
                     content: "".to_string(),
                     thinking: None,
+                    reasoning_parts: Vec::new(),
                     message_id: None,
                 },
             ),
@@ -421,6 +423,7 @@ mod tests {
                 AgentEventKind::AssistantMessageStored {
                     content: "Here is the plan.".to_string(),
                     thinking: Some("visible summary only".to_string()),
+                    reasoning_parts: Vec::new(),
                     message_id: None,
                 },
             ),
@@ -554,6 +557,7 @@ mod tests {
                 AgentEventKind::AssistantMessageStored {
                     content: "response 1".to_string(),
                     thinking: None,
+                    reasoning_parts: Vec::new(),
                     message_id: None,
                 },
             ),
@@ -597,6 +601,7 @@ mod tests {
                 AgentEventKind::AssistantMessageStored {
                     content: "response 2".to_string(),
                     thinking: None,
+                    reasoning_parts: Vec::new(),
                     message_id: None,
                 },
             ),
@@ -632,6 +637,7 @@ mod tests {
                 AgentEventKind::AssistantMessageStored {
                     content: "answer".to_string(),
                     thinking: Some("let me think...".to_string()),
+                    reasoning_parts: Vec::new(),
                     message_id: None,
                 },
             ),

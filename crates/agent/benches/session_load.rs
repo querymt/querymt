@@ -340,6 +340,7 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
             AgentEventKind::AssistantMessageStored {
                 content: repeated_payload("assistant", index, 500),
                 thinking: None,
+                reasoning_parts: Vec::new(),
                 message_id: Some(format!("assistant-message-{index:06}")),
             },
         )
