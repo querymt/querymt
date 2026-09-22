@@ -660,15 +660,15 @@ fn append_legacy_message_text(items: &mut Vec<ChatOutputItem>, delta: &str) {
 
 fn append_legacy_reasoning(items: &mut Vec<ChatOutputItem>, delta: &str) {
     if let Some(ChatOutputItem::Reasoning(reasoning)) = items.last_mut()
-        && let Some(part) = reasoning.summary.last_mut()
+        && let Some(part) = reasoning.content.last_mut()
     {
         part.text.push_str(delta);
         return;
     }
     items.push(ChatOutputItem::Reasoning(super::ChatReasoningItem {
         id: None,
-        summary: vec![ChatReasoningPart::text(delta)],
-        content: Vec::new(),
+        summary: Vec::new(),
+        content: vec![ChatReasoningPart::text(delta)],
         encrypted_content: None,
         signature: None,
         status: None,
@@ -848,6 +848,31 @@ mod tests {
         assert!(matches!(output.items[1], ChatOutputItem::FunctionCall(_)));
         assert!(matches!(output.items[2], ChatOutputItem::Message(_)));
         assert_eq!(output.usage.unwrap().input_tokens, 5);
+    }
+
+    #[test]
+    fn legacy_thinking_accumulates_as_content_not_summary() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        accumulator
+            .push(&StreamChunk::Thinking("full ".into()))
+            .unwrap();
+        accumulator
+            .push(&StreamChunk::Thinking("thought".into()))
+            .unwrap();
+        let output = accumulator.output();
+        let ChatOutputItem::Reasoning(reasoning) = &output.items[0] else {
+            panic!("expected reasoning");
+        };
+        assert!(reasoning.summary.is_empty());
+        assert_eq!(
+            reasoning
+                .content
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["full thought"]
+        );
+        assert_eq!(output.thinking().as_deref(), Some("full thought"));
     }
 
     #[test]

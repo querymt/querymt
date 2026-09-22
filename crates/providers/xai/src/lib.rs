@@ -16,9 +16,9 @@ use querymt::{
     HTTPLLMProvider,
     auth::ApiKeyResolver,
     chat::{
-        ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatRole,
-        MediaSource, ReasoningEffort, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        ToolResultPart,
+        ChatInputPart, ChatMessage, ChatMessagePart, ChatOutput, ChatOutputItem, ChatReasoningPart,
+        ChatRole, MediaSource, ReasoningEffort, ReasoningPartKind, StreamChunk,
+        StructuredOutputFormat, StructuredStreamEvent, Tool, ToolChoice, ToolResultPart,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -243,12 +243,13 @@ impl HTTPChatProvider for Xai {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
-        if self.should_use_responses_api() {
+        let output = if self.should_use_responses_api() {
             let tool_state_buffer = Arc::new(Mutex::new(HashMap::new()));
-            codex_parse_chat_with_state(response, &tool_state_buffer)
+            codex_parse_chat_with_state(response, &tool_state_buffer)?
         } else {
-            openai_parse_chat(self, response)
-        }
+            openai_parse_chat(self, response)?
+        };
+        Ok(promote_xai_summary_plaintext(output))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -375,10 +376,11 @@ impl ChatStreamParser for XaiStreamParser {
                 );
                 self.responses_initialized = true;
             }
-            let chunks = qmt_openai::api::parse_openai_responses_sse_chunk(
-                chunk,
-                &mut self.responses_state,
-            )?;
+            let chunks =
+                retag_xai_stream_chunks(qmt_openai::api::parse_openai_responses_sse_chunk(
+                    chunk,
+                    &mut self.responses_state,
+                )?);
             if chunks.iter().any(|chunk| {
                 matches!(
                     chunk,
@@ -401,6 +403,90 @@ impl ChatStreamParser for XaiStreamParser {
         } else {
             Err(qmt_codex::api::codex_stream_closed_error())
         }
+    }
+}
+
+/// Grok dumps full thoughts into `summary[]` with empty `content` and no
+/// encrypted continuation. Those parts are ordinary reasoning, not titles.
+fn promote_xai_summary_plaintext(mut output: ChatOutput) -> ChatOutput {
+    output.items = output
+        .items
+        .into_iter()
+        .map(promote_xai_reasoning_item)
+        .collect();
+    output
+}
+
+fn promote_xai_reasoning_item(item: ChatOutputItem) -> ChatOutputItem {
+    let ChatOutputItem::Reasoning(mut reasoning) = item else {
+        return item;
+    };
+    if reasoning_has_plaintext(&reasoning.content)
+        || encrypted_present(&reasoning.encrypted_content)
+        || !reasoning_has_plaintext(&reasoning.summary)
+    {
+        return ChatOutputItem::Reasoning(reasoning);
+    }
+    reasoning.content = std::mem::take(&mut reasoning.summary);
+    ChatOutputItem::Reasoning(reasoning)
+}
+
+fn reasoning_has_plaintext(parts: &[ChatReasoningPart]) -> bool {
+    parts.iter().any(|part| !part.text.is_empty())
+}
+
+fn encrypted_present(encrypted: &Option<String>) -> bool {
+    encrypted.as_deref().is_some_and(|text| !text.is_empty())
+}
+
+fn retag_xai_stream_chunks(chunks: Vec<StreamChunk>) -> Vec<StreamChunk> {
+    chunks.into_iter().map(retag_xai_stream_chunk).collect()
+}
+
+fn retag_xai_stream_chunk(chunk: StreamChunk) -> StreamChunk {
+    match chunk {
+        StreamChunk::Structured(event) => {
+            StreamChunk::Structured(retag_xai_structured_event(event))
+        }
+        other => other,
+    }
+}
+
+fn retag_xai_structured_event(event: StructuredStreamEvent) -> StructuredStreamEvent {
+    match event {
+        StructuredStreamEvent::ReasoningPartStarted {
+            output_index,
+            part: ReasoningPartKind::Summary,
+            part_index,
+        } => StructuredStreamEvent::ReasoningPartStarted {
+            output_index,
+            part: ReasoningPartKind::Content,
+            part_index,
+        },
+        StructuredStreamEvent::ReasoningPartDelta {
+            output_index,
+            part: ReasoningPartKind::Summary,
+            part_index,
+            delta,
+        } => StructuredStreamEvent::ReasoningPartDelta {
+            output_index,
+            part: ReasoningPartKind::Content,
+            part_index,
+            delta,
+        },
+        StructuredStreamEvent::ItemStarted { output_index, item } => {
+            StructuredStreamEvent::ItemStarted {
+                output_index,
+                item: promote_xai_reasoning_item(item),
+            }
+        }
+        StructuredStreamEvent::ItemCompleted { output_index, item } => {
+            StructuredStreamEvent::ItemCompleted {
+                output_index,
+                item: promote_xai_reasoning_item(item),
+            }
+        }
+        other => other,
     }
 }
 
@@ -501,6 +587,8 @@ enum XaiResponsesInputItem {
         // The Responses API requires `summary` on every reasoning input item;
         // an empty array is valid but the key must always be present.
         summary: Vec<XaiResponsesReasoningSummary>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        content: Vec<XaiResponsesReasoningContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
     },
@@ -527,6 +615,19 @@ enum XaiResponsesReasoningSummaryKind {
 struct XaiResponsesReasoningSummary {
     #[serde(rename = "type")]
     summary_type: XaiResponsesReasoningSummaryKind,
+    text: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum XaiResponsesReasoningContentKind {
+    ReasoningText,
+}
+
+#[derive(Serialize, Debug)]
+struct XaiResponsesReasoningContent {
+    #[serde(rename = "type")]
+    content_type: XaiResponsesReasoningContentKind,
     text: String,
 }
 
@@ -802,11 +903,19 @@ fn convert_structured_output_to_xai(
                     summary: reasoning
                         .summary
                         .iter()
-                        .chain(&reasoning.content)
                         .filter(|part| !part.text.is_empty())
                         .map(|part| XaiResponsesReasoningSummary {
                             summary_type: XaiResponsesReasoningSummaryKind::SummaryText,
                             text: part.text.clone(),
+                        })
+                        .collect(),
+                    content: reasoning
+                        .content
+                        .iter()
+                        .filter_map(querymt::chat::ChatReasoningPart::reasoning_text_for_replay)
+                        .map(|text| XaiResponsesReasoningContent {
+                            content_type: XaiResponsesReasoningContentKind::ReasoningText,
+                            text: text.to_string(),
                         })
                         .collect(),
                     encrypted_content: reasoning.encrypted_content.clone(),
@@ -1644,6 +1753,60 @@ mod tests {
         // even when the model emitted no summary text.
         assert_eq!(reasoning["summary"], Value::Array(Vec::new()));
         assert_eq!(reasoning["id"], Value::String("rs_empty".to_string()));
+        assert!(
+            reasoning.get("content").is_none(),
+            "empty reasoning content must be omitted from replay"
+        );
+    }
+
+    #[test]
+    fn responses_replays_reasoning_content_separately_from_summary() {
+        use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart, Extensions};
+
+        let xai = test_xai("xai-key");
+        let mut legacy = ChatReasoningPart::text("legacy");
+        legacy
+            .extensions
+            .insert("type".to_string(), Value::String("text".to_string()));
+        let output = ChatOutput {
+            provenance: Some(querymt::chat::ChatOutputProvenance {
+                provider: "xai".into(),
+                protocol: "responses".into(),
+                model: "grok-test".into(),
+                endpoint: Xai::responses_endpoint(),
+            }),
+            items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: Some("rs_1".to_string()),
+                summary: vec![ChatReasoningPart::text("why")],
+                content: vec![ChatReasoningPart::text("because"), legacy],
+                encrypted_content: Some("enc_payload".to_string()),
+                signature: None,
+                status: None,
+                extensions: Extensions::new(),
+            })],
+            ..ChatOutput::default()
+        };
+        let assistant = ChatMessage::from_assistant_output(output);
+        let messages = vec![ChatMessage::user().text("continue").build(), assistant];
+        let req = xai
+            .chat_request(&messages, None)
+            .expect("structured replay should build");
+        let body: Value = serde_json::from_slice(req.body()).unwrap();
+        let reasoning = &body["input"][1];
+
+        assert_eq!(reasoning["type"], Value::String("reasoning".to_string()));
+        assert_eq!(
+            reasoning["summary"],
+            serde_json::json!([{"type": "summary_text", "text": "why"}])
+        );
+        assert_eq!(
+            reasoning["content"],
+            serde_json::json!([{"type": "reasoning_text", "text": "because"}])
+        );
+        assert_eq!(
+            reasoning["encrypted_content"],
+            Value::String("enc_payload".to_string())
+        );
     }
 
     #[test]
@@ -1724,5 +1887,116 @@ mod tests {
             .expect("completion request should build");
 
         assert_eq!(auth_header(&req), Some("Bearer resolver-token"));
+    }
+
+    #[test]
+    fn grok_summary_only_plaintext_is_promoted_to_content() {
+        use querymt::chat::{ChatReasoningItem, ChatReasoningPart, Extensions};
+
+        let item = promote_xai_reasoning_item(ChatOutputItem::Reasoning(ChatReasoningItem {
+            id: Some("rs_1".into()),
+            summary: vec![ChatReasoningPart::text("full thought")],
+            content: Vec::new(),
+            encrypted_content: None,
+            signature: None,
+            status: None,
+            extensions: Extensions::new(),
+        }));
+        let ChatOutputItem::Reasoning(reasoning) = item else {
+            panic!("expected reasoning");
+        };
+        assert!(reasoning.summary.is_empty());
+        assert_eq!(
+            reasoning
+                .content
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["full thought"]
+        );
+    }
+
+    #[test]
+    fn grok_does_not_promote_when_encrypted_or_content_exists() {
+        use querymt::chat::{ChatReasoningItem, ChatReasoningPart, Extensions};
+
+        let encrypted = promote_xai_reasoning_item(ChatOutputItem::Reasoning(ChatReasoningItem {
+            id: Some("rs_enc".into()),
+            summary: vec![ChatReasoningPart::text("title")],
+            content: Vec::new(),
+            encrypted_content: Some("enc".into()),
+            signature: None,
+            status: None,
+            extensions: Extensions::new(),
+        }));
+        let ChatOutputItem::Reasoning(reasoning) = encrypted else {
+            panic!("expected reasoning");
+        };
+        assert_eq!(reasoning.summary[0].text, "title");
+        assert!(reasoning.content.is_empty());
+
+        let both = promote_xai_reasoning_item(ChatOutputItem::Reasoning(ChatReasoningItem {
+            id: Some("rs_both".into()),
+            summary: vec![ChatReasoningPart::text("title")],
+            content: vec![ChatReasoningPart::text("because")],
+            encrypted_content: None,
+            signature: None,
+            status: None,
+            extensions: Extensions::new(),
+        }));
+        let ChatOutputItem::Reasoning(reasoning) = both else {
+            panic!("expected reasoning");
+        };
+        assert_eq!(reasoning.summary[0].text, "title");
+        assert_eq!(reasoning.content[0].text, "because");
+    }
+
+    #[test]
+    fn responses_stream_retags_summary_deltas_as_content() {
+        let mut parser = XaiStreamParser::new(true);
+        let chunks = parser
+            .parse_chunk(
+                br#"data: {"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"full thought"}
+
+"#,
+            )
+            .unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::Structured(StructuredStreamEvent::ReasoningPartDelta {
+                part: ReasoningPartKind::Content,
+                part_index: 0,
+                delta,
+                ..
+            }) if delta == "full thought"
+        )));
+    }
+
+    #[test]
+    fn responses_stream_promotes_summary_only_completed_item() {
+        let mut parser = XaiStreamParser::new(true);
+        let chunks = parser
+            .parse_chunk(
+                br#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"full thought"}]}}
+
+"#,
+            )
+            .unwrap();
+        let Some(StreamChunk::Structured(StructuredStreamEvent::ItemCompleted { item, .. })) =
+            chunks.into_iter().find(|chunk| {
+                matches!(
+                    chunk,
+                    StreamChunk::Structured(StructuredStreamEvent::ItemCompleted { .. })
+                )
+            })
+        else {
+            panic!("expected completed reasoning item");
+        };
+        let ChatOutputItem::Reasoning(reasoning) = item else {
+            panic!("expected reasoning");
+        };
+        assert_eq!(reasoning.id.as_deref(), Some("rs_1"));
+        assert!(reasoning.summary.is_empty());
+        assert_eq!(reasoning.content[0].text, "full thought");
     }
 }

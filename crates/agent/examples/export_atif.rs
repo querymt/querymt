@@ -44,6 +44,7 @@ fn main() {
             kind: AgentEventKind::AssistantMessageStored {
                 content: "I'll look up the current stock price for you.".to_string(),
                 thinking: None,
+                reasoning_parts: Vec::new(),
                 message_id: None,
             },
         },
@@ -109,6 +110,7 @@ fn main() {
             kind: AgentEventKind::AssistantMessageStored {
                 content: "The current price of Alphabet (GOOGL) is $142.50.".to_string(),
                 thinking: None,
+                reasoning_parts: Vec::new(),
                 message_id: None,
             },
         },

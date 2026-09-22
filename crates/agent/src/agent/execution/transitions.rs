@@ -11,7 +11,10 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
 use crate::agent::utils::u32_from_usize;
-use crate::events::{AgentEventKind, ExecutionMetrics, StopType};
+use crate::events::{
+    AgentEventKind, ExecutionMetrics, ReasoningPartStored, StopType, reasoning_content_part_id,
+    reasoning_summary_part_id,
+};
 use crate::middleware::{
     ExecutionState, LlmResponse, PreparedModelRequest, ToolCall as MiddlewareToolCall,
     ToolFunction, ToolResult, calculate_context_tokens,
@@ -24,12 +27,13 @@ use futures_util::future::join_all;
 use log::{debug, trace, warn};
 use querymt::ToolCall;
 use querymt::chat::{
-    CacheHint, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputStatus, ChatRole,
-    ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, FinishReason, StreamChunk,
-    StructuredStreamEvent,
+    CacheHint, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputItem, ChatOutputStatus,
+    ChatRole, ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, FinishReason,
+    ReasoningPartKind, StreamChunk, StructuredStreamEvent,
 };
 use querymt::error::LLMError;
 use querymt::error::{ProviderErrorKind, ProviderFailure};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -256,11 +260,30 @@ fn stream_accumulation_error(error: ChatStreamAccumulatorError) -> LLMError {
     )
 }
 
+/// Visible stream text, or one reasoning part. Encrypted continuation stays out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UiReasoningKind {
+    Summary,
+    Content,
+}
+
+/// Visible stream text, or one reasoning part.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UiStreamDelta<'a> {
+    Text(&'a str),
+    Reasoning {
+        output_index: usize,
+        part_index: usize,
+        kind: UiReasoningKind,
+        delta: &'a str,
+    },
+}
+
 /// Map a structured item delta onto the UI batching buffers.
 ///
-/// Returns `(is_thinking, delta)` for events that carry visible content; function
-/// argument deltas do not surface as assistant text.
-fn structured_delta_for_ui(event: &StructuredStreamEvent) -> Option<(bool, &str)> {
+/// Summary titles and plaintext reasoning keep their part index. Function
+/// argument deltas and encrypted continuation do not surface as assistant text.
+fn structured_delta_for_ui(event: &StructuredStreamEvent) -> Option<UiStreamDelta<'_>> {
     match event {
         StructuredStreamEvent::MessagePartDelta {
             delta: ChatMessagePartDelta::Text { delta },
@@ -269,9 +292,151 @@ fn structured_delta_for_ui(event: &StructuredStreamEvent) -> Option<(bool, &str)
         | StructuredStreamEvent::MessagePartDelta {
             delta: ChatMessagePartDelta::Refusal { delta },
             ..
-        } => Some((false, delta)),
-        StructuredStreamEvent::ReasoningPartDelta { delta, .. } => Some((true, delta)),
+        } => Some(UiStreamDelta::Text(delta)),
+        StructuredStreamEvent::ReasoningPartDelta {
+            output_index,
+            part,
+            part_index,
+            delta,
+        } => {
+            let kind = match part {
+                ReasoningPartKind::Summary => UiReasoningKind::Summary,
+                ReasoningPartKind::Content => UiReasoningKind::Content,
+            };
+            Some(UiStreamDelta::Reasoning {
+                output_index: *output_index,
+                part_index: *part_index,
+                kind,
+                delta,
+            })
+        }
         _ => None,
+    }
+}
+
+fn remember_reasoning_item_id(
+    ids: &mut HashMap<usize, String>,
+    output_index: usize,
+    item: &ChatOutputItem,
+) {
+    let ChatOutputItem::Reasoning(reasoning) = item else {
+        return;
+    };
+    let Some(id) = reasoning.id.as_deref().filter(|id| !id.is_empty()) else {
+        return;
+    };
+    ids.insert(output_index, id.to_string());
+}
+
+fn reasoning_ui_part_id(
+    ids: &HashMap<usize, String>,
+    output_index: usize,
+    part_index: usize,
+    kind: UiReasoningKind,
+) -> String {
+    let item_id = ids
+        .get(&output_index)
+        .map(String::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("output:{output_index}"));
+    match kind {
+        UiReasoningKind::Summary => reasoning_summary_part_id(&item_id, part_index),
+        UiReasoningKind::Content => reasoning_content_part_id(&item_id, part_index),
+    }
+}
+
+/// Keep the first id assigned to a reasoning part.
+///
+/// Item ids can arrive after the first delta. Changing the id then would split
+/// one part into two UI entries.
+fn pinned_reasoning_part_id(
+    pinned: &mut HashMap<(usize, usize, UiReasoningKind), String>,
+    ids: &HashMap<usize, String>,
+    output_index: usize,
+    part_index: usize,
+    kind: UiReasoningKind,
+) -> String {
+    pinned
+        .entry((output_index, part_index, kind))
+        .or_insert_with(|| reasoning_ui_part_id(ids, output_index, part_index, kind))
+        .clone()
+}
+
+/// Visible summary titles and plaintext reasoning. Encrypted continuation stays out.
+fn reasoning_parts_from_output(output: &ChatOutput) -> Vec<ReasoningPartStored> {
+    let mut parts = Vec::new();
+    for (output_index, item) in output.items.iter().enumerate() {
+        let ChatOutputItem::Reasoning(reasoning) = item else {
+            continue;
+        };
+        let item_id = reasoning
+            .id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("output:{output_index}"));
+        for (part_index, part) in reasoning.summary.iter().enumerate() {
+            if part.text.is_empty() {
+                continue;
+            }
+            parts.push(ReasoningPartStored {
+                id: reasoning_summary_part_id(&item_id, part_index),
+                text: part.text.clone(),
+            });
+        }
+        for (part_index, part) in reasoning.content.iter().enumerate() {
+            if part.text.is_empty() {
+                continue;
+            }
+            parts.push(ReasoningPartStored {
+                id: reasoning_content_part_id(&item_id, part_index),
+                text: part.text.clone(),
+            });
+        }
+    }
+    parts
+}
+
+/// Batched thinking text for one summary part. A new part id flushes the previous part.
+struct ThinkingPartBuffer {
+    part_id: Option<String>,
+    text: String,
+}
+
+impl ThinkingPartBuffer {
+    fn new() -> Self {
+        Self {
+            part_id: None,
+            text: String::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.part_id = None;
+        self.text.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.text.len()
+    }
+
+    /// Append `delta`. Returns the previous part when the part id changes.
+    fn push(&mut self, part_id: Option<String>, delta: &str) -> Option<(Option<String>, String)> {
+        if delta.is_empty() {
+            return None;
+        }
+        let flushed = if self.part_id != part_id && !self.text.is_empty() {
+            Some(self.take())
+        } else {
+            None
+        };
+        self.part_id = part_id;
+        self.text.push_str(delta);
+        flushed
+    }
+
+    fn take(&mut self) -> (Option<String>, String) {
+        (self.part_id.clone(), std::mem::take(&mut self.text))
     }
 }
 
@@ -499,11 +664,38 @@ pub(super) async fn transition_call_llm(
             // avoid per-token React state updates on fast local models.
             // Both legacy display chunks and structured item deltas feed them.
             let mut text_buffer = String::new();
-            let mut thinking_buffer = String::new();
+            let mut thinking_buffer = ThinkingPartBuffer::new();
+            let mut reasoning_item_ids: HashMap<usize, String> = HashMap::new();
+            // First id for a reasoning part sticks. A later item id must not split it.
+            let mut pinned_reasoning_part_ids: HashMap<(usize, usize, UiReasoningKind), String> =
+                HashMap::new();
             #[allow(unused_assignments)]
             let mut last_flush = Instant::now();
             const BATCH_INTERVAL: Duration = Duration::from_millis(50);
             const BATCH_CHARS: usize = 256;
+
+            macro_rules! emit_thinking_part {
+                ($part_id:expr, $text:expr) => {{
+                    let thinking_delta: String = $text;
+                    if !thinking_delta.is_empty() {
+                        debug!(
+                            "stream flush: session={} message_id={} thinking_delta_len={} part_id={:?}",
+                            session_id,
+                            message_id,
+                            thinking_delta.len(),
+                            $part_id
+                        );
+                        config.emit_event(
+                            session_id,
+                            AgentEventKind::AssistantThinkingDelta {
+                                content: thinking_delta,
+                                message_id: message_id.clone(),
+                                part_id: $part_id,
+                            },
+                        );
+                    }
+                }};
+            }
 
             macro_rules! flush_buffers {
                 ($reset_timer:expr) => {
@@ -523,21 +715,9 @@ pub(super) async fn transition_call_llm(
                             },
                         );
                     }
-                    if !thinking_buffer.is_empty() {
-                        let thinking_delta: String = thinking_buffer.drain(..).collect();
-                        debug!(
-                            "stream flush: session={} message_id={} thinking_delta_len={}",
-                            session_id,
-                            message_id,
-                            thinking_delta.len()
-                        );
-                        config.emit_event(
-                            session_id,
-                            AgentEventKind::AssistantThinkingDelta {
-                                content: thinking_delta,
-                                message_id: message_id.clone(),
-                            },
-                        );
+                    {
+                        let (part_id, thinking_delta) = thinking_buffer.take();
+                        emit_thinking_part!(part_id, thinking_delta);
                     }
                     if $reset_timer {
                         #[allow(unused_assignments)]
@@ -572,6 +752,8 @@ pub(super) async fn transition_call_llm(
                 }
                 text_buffer.clear();
                 thinking_buffer.clear();
+                reasoning_item_ids.clear();
+                pinned_reasoning_part_ids.clear();
                 last_flush = Instant::now();
 
                 let attempt = retry_budget
@@ -700,12 +882,38 @@ pub(super) async fn transition_call_llm(
                     // accumulator ignores them for canonical history.
                     match chunk {
                         StreamChunk::Structured(event) => {
-                            if let Some((is_thinking, delta)) = structured_delta_for_ui(&event) {
-                                if is_thinking {
-                                    thinking_buffer.push_str(delta);
-                                } else {
-                                    text_buffer.push_str(delta);
+                            if let StructuredStreamEvent::ItemStarted { output_index, item }
+                            | StructuredStreamEvent::ItemCompleted { output_index, item } =
+                                &event
+                            {
+                                remember_reasoning_item_id(
+                                    &mut reasoning_item_ids,
+                                    *output_index,
+                                    item,
+                                );
+                            }
+                            match structured_delta_for_ui(&event) {
+                                Some(UiStreamDelta::Text(delta)) => text_buffer.push_str(delta),
+                                Some(UiStreamDelta::Reasoning {
+                                    output_index,
+                                    part_index,
+                                    kind,
+                                    delta,
+                                }) => {
+                                    let part_id = pinned_reasoning_part_id(
+                                        &mut pinned_reasoning_part_ids,
+                                        &reasoning_item_ids,
+                                        output_index,
+                                        part_index,
+                                        kind,
+                                    );
+                                    if let Some((previous_id, previous_text)) =
+                                        thinking_buffer.push(Some(part_id), delta)
+                                    {
+                                        emit_thinking_part!(previous_id, previous_text);
+                                    }
                                 }
+                                None => {}
                             }
                             if matches!(event, StructuredStreamEvent::ResponseTerminal { .. }) {
                                 drained_usage =
@@ -733,7 +941,16 @@ pub(super) async fn transition_call_llm(
                                 message_id,
                                 delta.len()
                             );
-                            thinking_buffer.push_str(&delta);
+                            // Structured summary parts own the UI projection. A legacy
+                            // thinking chunk would glue or duplicate those parts.
+                            if !accumulator.is_structured() {
+                                let part_id = format!("{message_id}:thinking");
+                                if let Some((previous_id, previous_text)) =
+                                    thinking_buffer.push(Some(part_id), &delta)
+                                {
+                                    emit_thinking_part!(previous_id, previous_text);
+                                }
+                            }
                         }
                         StreamChunk::ThinkingSignature(signature) => {
                             trace!(
@@ -1150,11 +1367,17 @@ pub(super) async fn transition_after_llm(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
 
+    let reasoning_parts = response
+        .output
+        .as_ref()
+        .map(reasoning_parts_from_output)
+        .unwrap_or_default();
     config.emit_event(
         &exec_ctx.session_id,
         AgentEventKind::AssistantMessageStored {
             content: response.content.clone(),
             thinking: response.thinking.clone(),
+            reasoning_parts,
             message_id: Some(assistant_msg.id.clone()),
         },
     );
@@ -1903,9 +2126,116 @@ mod tests {
             delta: "why".into(),
         };
 
-        assert_eq!(structured_delta_for_ui(&text), Some((false, "hello")));
-        assert_eq!(structured_delta_for_ui(&refusal), Some((false, "no")));
-        assert_eq!(structured_delta_for_ui(&reasoning), Some((true, "why")));
+        assert_eq!(
+            structured_delta_for_ui(&text),
+            Some(UiStreamDelta::Text("hello"))
+        );
+        assert_eq!(
+            structured_delta_for_ui(&refusal),
+            Some(UiStreamDelta::Text("no"))
+        );
+        assert_eq!(
+            structured_delta_for_ui(&reasoning),
+            Some(UiStreamDelta::Reasoning {
+                output_index: 2,
+                part_index: 0,
+                kind: UiReasoningKind::Summary,
+                delta: "why",
+            })
+        );
+        let raw = StructuredStreamEvent::ReasoningPartDelta {
+            output_index: 2,
+            part: ReasoningPartKind::Content,
+            part_index: 0,
+            delta: "hidden".into(),
+        };
+        assert_eq!(
+            structured_delta_for_ui(&raw),
+            Some(UiStreamDelta::Reasoning {
+                output_index: 2,
+                part_index: 0,
+                kind: UiReasoningKind::Content,
+                delta: "hidden",
+            })
+        );
+    }
+
+    #[test]
+    fn pinned_reasoning_part_id_does_not_change_after_item_id_arrives() {
+        let mut pinned = HashMap::new();
+        let mut ids = HashMap::new();
+        let before = pinned_reasoning_part_id(&mut pinned, &ids, 0, 1, UiReasoningKind::Summary);
+        ids.insert(0, "rs_1".to_string());
+        let after = pinned_reasoning_part_id(&mut pinned, &ids, 0, 1, UiReasoningKind::Summary);
+        assert_eq!(before, "output:0:summary:1");
+        assert_eq!(after, before);
+        assert_eq!(
+            pinned_reasoning_part_id(&mut pinned, &ids, 0, 2, UiReasoningKind::Summary),
+            "rs_1:summary:2"
+        );
+        assert_eq!(
+            pinned_reasoning_part_id(&mut pinned, &ids, 0, 0, UiReasoningKind::Content),
+            "rs_1:content:0"
+        );
+    }
+
+    #[test]
+    fn summary_part_change_flushes_the_previous_part() {
+        let mut buffer = ThinkingPartBuffer::new();
+        assert!(
+            buffer
+                .push(Some("rs_1:summary:0".into()), "first")
+                .is_none()
+        );
+        let flushed = buffer
+            .push(Some("rs_1:summary:1".into()), "second")
+            .expect("part change flushes");
+        assert_eq!(flushed.0.as_deref(), Some("rs_1:summary:0"));
+        assert_eq!(flushed.1, "first");
+        assert_eq!(
+            buffer.take(),
+            (Some("rs_1:summary:1".into()), "second".into())
+        );
+    }
+
+    #[test]
+    fn reasoning_parts_keep_summary_and_content_identity() {
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::Reasoning(
+                querymt::chat::ChatReasoningItem {
+                    id: Some("rs_1".into()),
+                    summary: vec![
+                        querymt::chat::ChatReasoningPart::text("one"),
+                        querymt::chat::ChatReasoningPart::text(""),
+                        querymt::chat::ChatReasoningPart::text("two"),
+                    ],
+                    content: vec![querymt::chat::ChatReasoningPart::text("raw")],
+                    encrypted_content: Some("secret".into()),
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                },
+            )],
+            ..ChatOutput::default()
+        };
+        let parts = reasoning_parts_from_output(&output);
+        assert_eq!(
+            parts,
+            vec![
+                ReasoningPartStored {
+                    id: "rs_1:summary:0".into(),
+                    text: "one".into(),
+                },
+                ReasoningPartStored {
+                    id: "rs_1:summary:2".into(),
+                    text: "two".into(),
+                },
+                ReasoningPartStored {
+                    id: "rs_1:content:0".into(),
+                    text: "raw".into(),
+                },
+            ]
+        );
     }
 
     #[test]

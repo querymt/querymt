@@ -102,6 +102,8 @@ export type AgentEventKind =
 	| { type: "assistant_message_stored", data: {
 	content: string;
 	thinking?: string;
+	/** Visible summary parts. Historical events omit this and keep `thinking`. */
+	reasoning_parts?: ReasoningPartStored[];
 	message_id?: string;
 }}
 	/**
@@ -119,6 +121,8 @@ export type AgentEventKind =
 	| { type: "assistant_thinking_delta", data: {
 	content: string;
 	message_id: string;
+	/** Stable summary part. The same id appends; a new id is a new part. */
+	part_id?: string;
 }}
 	/** Ephemeral transport signal for remote streaming over mesh. */
 	| { type: "remote_stream_disconnected", data: {
@@ -1080,6 +1084,18 @@ export interface PluginUpdateResult {
 export interface ProviderCapabilityEntry {
 	provider: string;
 	supports_custom_models: boolean;
+}
+
+/**
+ * One visible reasoning part stored with an assistant message.
+ * 
+ * Summary titles use `:summary:N`. Plaintext reasoning uses `:content:N`.
+ * Encrypted continuation is not included. The same `id` appends; a new `id`
+ * is a new part.
+ */
+export interface ReasoningPartStored {
+	id: string;
+	text: string;
 }
 
 /** Recent model usage entry from event history. */

@@ -15,7 +15,7 @@ use crate::acp::protocol::{
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
 use crate::event_fanout::EventFanout;
-use crate::events::{AgentEvent, AgentEventKind, EventEnvelope};
+use crate::events::{AgentEvent, AgentEventKind, EventEnvelope, ReasoningPartStored};
 use crate::send_agent::SendAgent;
 use crate::session::domain::ForkOrigin;
 use serde::{Deserialize, Serialize};
@@ -624,6 +624,45 @@ where
     replay_agent_events_with_user_prompts(session_id, events, &HashMap::new())
 }
 
+fn thought_chunk(content: &str, message_id: &str, part_id: Option<&str>) -> ContentChunk {
+    let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(content.to_string())))
+        .message_id(MessageId::from(message_id.to_string()));
+    match part_id.filter(|part_id| !part_id.is_empty()) {
+        Some(part_id) => chunk.meta(serde_json::Map::from_iter([(
+            "querymt".to_string(),
+            serde_json::json!({ "reasoning_part_id": part_id }),
+        )])),
+        None => chunk,
+    }
+}
+
+fn stored_summary_updates(
+    content: &str,
+    message_id: Option<&str>,
+    reasoning_parts: &[ReasoningPartStored],
+) -> Vec<SessionUpdate> {
+    let mut updates = Vec::new();
+    if let Some(message_id) = message_id {
+        for part in reasoning_parts {
+            if part.text.is_empty() {
+                continue;
+            }
+            updates.push(SessionUpdate::AgentThoughtChunk(thought_chunk(
+                &part.text,
+                message_id,
+                Some(&part.id),
+            )));
+        }
+    }
+    if !content.is_empty() {
+        updates.push(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(content.to_string())))
+                .message_id(message_id.map(|id| MessageId::from(id.to_string()))),
+        ));
+    }
+    updates
+}
+
 fn user_prompt_chunk(
     message_id: &str,
     client_prompt_id: Option<&str>,
@@ -876,6 +915,15 @@ pub fn translate_replay_event_to_update(event: &EventEnvelope) -> Option<Session
 }
 
 pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
+    if let AgentEventKind::AssistantMessageStored {
+        content,
+        message_id,
+        reasoning_parts,
+        ..
+    } = event.kind()
+    {
+        return stored_summary_updates(content, message_id.as_deref(), reasoning_parts);
+    }
     translate_replay_event_to_update(event)
         .into_iter()
         .collect()
@@ -937,14 +985,16 @@ fn translate_event_to_update_for_mode(
         AgentEventKind::AssistantThinkingDelta {
             content,
             message_id,
+            part_id,
         } => {
             if content.is_empty() {
                 return None;
             }
-            Some(SessionUpdate::AgentThoughtChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                    .message_id(MessageId::from(message_id.clone())),
-            ))
+            Some(SessionUpdate::AgentThoughtChunk(thought_chunk(
+                content,
+                message_id,
+                part_id.as_deref(),
+            )))
         }
         AgentEventKind::ToolCallStart {
             tool_call_id,
@@ -2216,6 +2266,7 @@ mod tests {
             kind: AgentEventKind::AssistantMessageStored {
                 content: "answer".to_string(),
                 thinking: None,
+                reasoning_parts: Vec::new(),
                 message_id: Some("a-1".to_string()),
             },
         });
@@ -2273,6 +2324,7 @@ mod tests {
             kind: AgentEventKind::AssistantMessageStored {
                 content: "answer".to_string(),
                 thinking: None,
+                reasoning_parts: Vec::new(),
                 message_id: Some("a-1".to_string()),
             },
         });
@@ -2297,6 +2349,7 @@ mod tests {
             kind: AgentEventKind::AssistantMessageStored {
                 content: "answer".to_string(),
                 thinking: None,
+                reasoning_parts: Vec::new(),
                 message_id: Some("a-1".to_string()),
             },
         });
@@ -2332,6 +2385,22 @@ mod tests {
         assert!(translate_replay_event_to_update(&delta).is_none());
     }
 
+    fn thought_text(chunk: &ContentChunk) -> &str {
+        let ContentBlock::Text(text) = &chunk.content else {
+            panic!("expected text content");
+        };
+        text.text.as_str()
+    }
+
+    fn reasoning_part_id(chunk: &ContentChunk) -> Option<&str> {
+        chunk
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("querymt"))
+            .and_then(|querymt| querymt.get("reasoning_part_id"))
+            .and_then(serde_json::Value::as_str)
+    }
+
     #[test]
     fn live_translator_forwards_thinking_delta_as_agent_thought_chunk() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
@@ -2342,6 +2411,7 @@ mod tests {
             kind: AgentEventKind::AssistantThinkingDelta {
                 content: "thinking".to_string(),
                 message_id: "a-1".to_string(),
+                part_id: Some("rs_1:summary:0".to_string()),
             },
         });
 
@@ -2358,6 +2428,62 @@ mod tests {
             chunk.message_id.as_ref().map(|id| id.0.as_ref()),
             Some("a-1")
         );
+        assert_eq!(
+            chunk
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("querymt"))
+                .and_then(|querymt| querymt.get("reasoning_part_id"))
+                .and_then(serde_json::Value::as_str),
+            Some("rs_1:summary:0")
+        );
+    }
+
+    #[test]
+    fn replay_projects_each_summary_part_as_its_own_thought_chunk() {
+        let stored = EventEnvelope::Durable(DurableEvent {
+            event_id: "evt-stored".into(),
+            stream_seq: 1,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::AssistantMessageStored {
+                content: "answer".to_string(),
+                thinking: Some("one\n\ntwo".to_string()),
+                reasoning_parts: vec![
+                    ReasoningPartStored {
+                        id: "rs_1:summary:0".to_string(),
+                        text: "one".to_string(),
+                    },
+                    ReasoningPartStored {
+                        id: "rs_1:summary:1".to_string(),
+                        text: "two".to_string(),
+                    },
+                ],
+                message_id: Some("a-1".to_string()),
+            },
+        });
+
+        let updates = translate_replay_event_to_updates(&stored);
+        assert_eq!(updates.len(), 3);
+        let SessionUpdate::AgentThoughtChunk(first) = &updates[0] else {
+            panic!("expected first summary");
+        };
+        let SessionUpdate::AgentThoughtChunk(second) = &updates[1] else {
+            panic!("expected second summary");
+        };
+        let SessionUpdate::AgentMessageChunk(answer) = &updates[2] else {
+            panic!("expected answer");
+        };
+        assert_eq!(thought_text(first), "one");
+        assert_eq!(thought_text(second), "two");
+        assert_eq!(reasoning_part_id(first), Some("rs_1:summary:0"));
+        assert_eq!(reasoning_part_id(second), Some("rs_1:summary:1"));
+        let ContentBlock::Text(text) = &answer.content else {
+            panic!("expected answer text");
+        };
+        assert_eq!(text.text, "answer");
     }
 
     #[test]
@@ -2370,6 +2496,7 @@ mod tests {
             kind: AgentEventKind::AssistantThinkingDelta {
                 content: String::new(),
                 message_id: "a-1".to_string(),
+                part_id: None,
             },
         });
 
@@ -2405,6 +2532,7 @@ mod tests {
                     kind: AgentEventKind::AssistantMessageStored {
                         content: "hi".to_string(),
                         thinking: None,
+                        reasoning_parts: Vec::new(),
                         message_id: Some("a-1".to_string()),
                     },
                 },

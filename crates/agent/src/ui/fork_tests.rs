@@ -129,6 +129,7 @@ async fn fork_session_from_selected_message_succeeds() -> Result<()> {
             kind: AgentEventKind::AssistantMessageStored {
                 content: "Assistant kept in fork".to_string(),
                 thinking: None,
+                reasoning_parts: Vec::new(),
                 message_id: Some(assistant_message_id.clone()),
             },
         })

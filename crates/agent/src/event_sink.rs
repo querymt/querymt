@@ -591,6 +591,7 @@ mod tests {
             AgentEventKind::AssistantThinkingDelta {
                 content: "think".into(),
                 message_id: "m2".into(),
+                part_id: None,
             },
         );
         sink.emit_durable("s1", AgentEventKind::Cancelled)
