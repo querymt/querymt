@@ -1160,11 +1160,17 @@ pub(super) async fn transition_after_llm(
     );
 
     let mut messages = (*context.messages).to_vec();
-    messages.push(
+    // Same-turn continuation is still talking to the provider that just
+    // produced this output. Re-converting through `to_chat_message()` with no
+    // target treats the destination as unknown and portable-projects encrypted
+    // reasoning away before the tool result is appended.
+    messages.push(if let Some(output) = structured_output.clone() {
+        ChatMessage::from_assistant_output(output)
+    } else {
         assistant_msg
             .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid stored assistant content: {error}"))?,
-    );
+            .map_err(|error| anyhow::anyhow!("Invalid stored assistant content: {error}"))?
+    });
 
     let mut updated_stats = (*context.stats).clone();
     updated_stats.steps += 1;
