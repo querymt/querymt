@@ -1100,7 +1100,7 @@ impl ToolResult {
 }
 
 /// One ordered part of a tool result. Deliberately nonrecursive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolResultPart {
     /// Text result content.
