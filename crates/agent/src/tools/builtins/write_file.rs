@@ -1,7 +1,7 @@
 //! Write file tool implementation using ToolContext
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
@@ -52,6 +52,7 @@ impl ToolTrait for WriteFileTool {
                     },
                     "required": ["path", "content"]
                 }),
+                strict: None,
             },
         }
     }
@@ -64,7 +65,7 @@ impl ToolTrait for WriteFileTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let path_arg = args
             .get("path")
             .and_then(Value::as_str)
@@ -98,7 +99,7 @@ impl ToolTrait for WriteFileTool {
         });
 
         serde_json::to_string(&result)
-            .map(|s| vec![Content::text(s)])
+            .map(|s| vec![ToolResultPart::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
     }
 }
@@ -107,11 +108,11 @@ impl ToolTrait for WriteFileTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

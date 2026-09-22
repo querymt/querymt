@@ -18,7 +18,7 @@ use crate::middleware::{ExecutionState, ToolResult, WaitCondition};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
 use log::debug;
-use querymt::chat::{ChatRole, Content};
+use querymt::chat::ChatRole;
 use std::sync::Arc;
 use tracing::{Instrument, Span, info_span, instrument};
 use uuid::Uuid;
@@ -99,7 +99,9 @@ pub(super) async fn execute_tool_call(
             .unwrap_or_else(|| "tool blocked by hook".to_string());
         return Ok(ToolResult::new(
             call.id.clone(),
-            vec![Content::text(format!("Error: {}", reason))],
+            vec![querymt::chat::ToolResultPart::Text {
+                text: format!("Error: {}", reason),
+            }],
             true,
             Some(call.function.name.clone()),
             Some(serde_json::to_string(&args).unwrap_or_else(|_| call.function.arguments.clone())),
@@ -112,10 +114,9 @@ pub(super) async fn execute_tool_call(
     {
         return Ok(ToolResult::new(
             call.id.clone(),
-            vec![Content::text(format!(
-                "Error: invalid tool arguments: {}",
-                error
-            ))],
+            vec![querymt::chat::ToolResultPart::Text {
+                text: format!("Error: invalid tool arguments: {}", error),
+            }],
             true,
             Some(call.function.name.clone()),
             Some(serde_json::to_string(&args).unwrap_or_else(|_| call.function.arguments.clone())),
@@ -203,6 +204,7 @@ pub(super) async fn execute_tool_call(
     let event_sink = config.event_sink.clone();
     let session_id_clone = exec_ctx.session_id.clone();
     let pending_elicitations = config.pending_elicitations.clone();
+    let cancellation_token = exec_ctx.cancellation_token.clone();
     tokio::spawn(async move {
         while let Some(request) = elicitation_rx.recv().await {
             let elicitation_id = request.elicitation_id.clone();
@@ -213,6 +215,16 @@ pub(super) async fn execute_tool_call(
                 request.response_tx,
             )
             .await;
+            // Close the race where cancellation happens just before this request
+            // reaches the shared pending map.
+            if cancellation_token.is_cancelled() {
+                crate::elicitation::cancel_pending_elicitations_for_session(
+                    &pending_elicitations,
+                    &session_id_clone,
+                )
+                .await;
+                continue;
+            }
             // Durable: elicitation must be visible in UI replay.
             if let Err(err) = event_sink
                 .emit_durable(
@@ -264,10 +276,9 @@ pub(super) async fn execute_tool_call(
             mcp_server_name.as_deref(),
         ) {
             (
-                vec![Content::text(format!(
-                    "Error: tool '{}' is not allowed",
-                    call.function.name
-                ))],
+                vec![querymt::chat::ToolResultPart::Text {
+                    text: format!("Error: tool '{}' is not allowed", call.function.name),
+                }],
                 true,
                 "blocked",
             )
@@ -284,7 +295,9 @@ pub(super) async fn execute_tool_call(
             {
                 Ok(res) => (res, false, "builtin"),
                 Err(e) => (
-                    vec![Content::text(format!("Error: {}", e))],
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: format!("Error: {}", e),
+                    }],
                     true,
                     "builtin",
                 ),
@@ -302,7 +315,13 @@ pub(super) async fn execute_tool_call(
                 .await
             {
                 Ok(res) => (res, false, "mcp"),
-                Err(e) => (vec![Content::text(format!("Error: {}", e))], true, "mcp"),
+                Err(e) => (
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: format!("Error: {}", e),
+                    }],
+                    true,
+                    "mcp",
+                ),
             }
         } else if !ensure_tool_permission(
             config,
@@ -326,7 +345,9 @@ pub(super) async fn execute_tool_call(
         .map_err(|e| anyhow::anyhow!("Permission check failed: {}", e))?
         {
             (
-                vec![Content::text("Error: permission denied")],
+                vec![querymt::chat::ToolResultPart::Text {
+                    text: "Error: permission denied".to_string(),
+                }],
                 true,
                 "provider",
             )
@@ -344,7 +365,9 @@ pub(super) async fn execute_tool_call(
             {
                 Ok(res) => (res, false, "provider"),
                 Err(e) => (
-                    vec![Content::text(format!("Error: {}", e))],
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: format!("Error: {}", e),
+                    }],
                     true,
                     "provider",
                 ),
@@ -557,9 +580,9 @@ async fn truncate_model_tool_output(
     exec_ctx: &ExecutionContext,
     call_id: &str,
     tool_name: &str,
-    blocks: Vec<Content>,
+    blocks: Vec<querymt::chat::ToolResultPart>,
     is_error: bool,
-) -> Vec<Content> {
+) -> Vec<querymt::chat::ToolResultPart> {
     if is_error {
         return blocks;
     }
@@ -570,7 +593,7 @@ async fn truncate_model_tool_output(
     let policy = &config.execution_policy.tool_output;
     let raw_text = blocks
         .iter()
-        .filter_map(Content::as_text)
+        .filter_map(querymt::chat::ToolResultPart::as_text)
         .collect::<Vec<_>>()
         .join("\n");
     let truncation = truncate_output(
@@ -612,13 +635,15 @@ async fn truncate_model_tool_output(
         Some(&overflow),
         hint,
     );
-    let mut result: Vec<Content> = blocks
+    let mut result: Vec<querymt::chat::ToolResultPart> = blocks
         .into_iter()
         .filter(|block| block.as_text().is_none())
         .collect();
     result.insert(
         0,
-        Content::text(format!("{}{}", truncation.content, suffix)),
+        querymt::chat::ToolResultPart::Text {
+            text: format!("{}{}", truncation.content, suffix),
+        },
     );
     result
 }
@@ -971,10 +996,9 @@ pub(super) async fn record_tool_side_effects(
             let reason = pre_hook
                 .block_reason
                 .unwrap_or_else(|| "delegation blocked by hook".to_string());
-            result.content = vec![Content::text(format!(
-                "Delegation blocked by hook: {}",
-                reason
-            ))];
+            result.content = vec![querymt::chat::ToolResultPart::Text {
+                text: format!("Delegation blocked by hook: {}", reason),
+            }];
             result.is_error = false;
             return Ok(None);
         }

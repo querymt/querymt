@@ -2,7 +2,7 @@
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 pub struct KnowledgeStatsTool;
@@ -41,6 +41,7 @@ impl ToolTrait for KnowledgeStatsTool {
                     },
                     "required": []
                 }),
+                strict: None,
             },
         }
     }
@@ -53,7 +54,7 @@ impl ToolTrait for KnowledgeStatsTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         // Determine scope with policy validation
         let session_public_id = context
             .session_public_id()
@@ -121,7 +122,7 @@ impl ToolTrait for KnowledgeStatsTool {
             ));
         }
 
-        Ok(vec![Content::text(response)])
+        Ok(vec![ToolResultPart::text(response)])
     }
 }
 
@@ -129,11 +130,11 @@ impl ToolTrait for KnowledgeStatsTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

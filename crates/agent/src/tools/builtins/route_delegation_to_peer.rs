@@ -7,7 +7,7 @@ use crate::agent::remote::routing::{RouteTarget, RoutingActor, SetSessionTarget}
 use crate::tools::{Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
 use kameo::actor::ActorRef;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 /// Planner tool that routes a delegate's session to a named peer (or back to local).
@@ -51,6 +51,7 @@ impl ToolTrait for RouteDelegationToPeerTool {
                     },
                     "required": ["agent_id"]
                 }),
+                strict: None,
             },
         }
     }
@@ -59,7 +60,7 @@ impl ToolTrait for RouteDelegationToPeerTool {
         &self,
         args: Value,
         _context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let agent_id = args
             .get("agent_id")
             .and_then(Value::as_str)
@@ -97,7 +98,7 @@ impl ToolTrait for RouteDelegationToPeerTool {
             })),
         });
 
-        Ok(vec![Content::text(
+        Ok(vec![ToolResultPart::text(
             serde_json::to_string_pretty(&result).unwrap_or(status),
         )])
     }
@@ -107,11 +108,11 @@ impl ToolTrait for RouteDelegationToPeerTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

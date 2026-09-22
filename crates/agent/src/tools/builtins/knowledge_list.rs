@@ -2,7 +2,7 @@
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 pub struct KnowledgeListTool;
@@ -47,6 +47,7 @@ impl ToolTrait for KnowledgeListTool {
                     },
                     "required": []
                 }),
+                strict: None,
             },
         }
     }
@@ -59,7 +60,7 @@ impl ToolTrait for KnowledgeListTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         // Extract optional fields
         let limit = args["limit"].as_u64().unwrap_or(20) as usize;
         if !(1..=100).contains(&limit) {
@@ -97,7 +98,7 @@ impl ToolTrait for KnowledgeListTool {
 
         // Format response
         if entries.is_empty() {
-            return Ok(vec![Content::text(format!(
+            return Ok(vec![ToolResultPart::text(format!(
                 "No unconsolidated knowledge entries found for scope '{}'",
                 scope
             ))]);
@@ -136,7 +137,7 @@ impl ToolTrait for KnowledgeListTool {
         response
             .push_str("\nUse knowledge_consolidate with the public IDs to create consolidations.");
 
-        Ok(vec![Content::text(response)])
+        Ok(vec![ToolResultPart::text(response)])
     }
 }
 
@@ -144,11 +145,11 @@ impl ToolTrait for KnowledgeListTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

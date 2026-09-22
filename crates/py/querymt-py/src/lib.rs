@@ -1,4 +1,6 @@
-use ::querymt::chat::{ChatMessage, ChatRole, Content, FinishReason, StreamChunk, Tool};
+use ::querymt::chat::{
+    ChatInputPart, ChatMessage, ChatRole, FinishReason, MediaKind, StreamChunk, Tool,
+};
 use ::querymt::dynamic::PluginRegistryDynamicExt;
 use ::querymt::plugin::host::PluginRegistry;
 use ::querymt::{LLMBuilder, LLMProvider, ToolCall, Usage};
@@ -56,8 +58,8 @@ struct PyChatResponse {
     usage: Option<PyUsage>,
     #[pyo3(get)]
     tool_calls: Vec<PyToolCall>,
-    #[pyo3(get)]
-    content: Vec<PyContentBlock>,
+    /// Canonical structured output as JSON.
+    output: Option<Value>,
 }
 
 #[pyclass(name = "Usage", skip_from_py_object)]
@@ -86,14 +88,6 @@ struct PyToolCall {
     name: String,
     #[pyo3(get)]
     arguments: String,
-}
-
-#[pyclass(name = "ContentBlock", skip_from_py_object)]
-#[derive(Clone)]
-struct PyContentBlock {
-    #[pyo3(get)]
-    kind: String,
-    data: Value,
 }
 
 #[pyclass(name = "StreamChunk", skip_from_py_object)]
@@ -201,7 +195,7 @@ impl PyProvider {
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let response = provider.chat(&messages).await.map_err(into_py_err)?;
-            let response = chat_response_to_python(response.as_ref());
+            let response = chat_output_to_python(&response);
             Python::attach(|py| Py::new(py, response))
         })
     }
@@ -226,7 +220,7 @@ impl PyProvider {
                 .chat_with_tools(&messages, tools.as_deref())
                 .await
                 .map_err(into_py_err)?;
-            let response = chat_response_to_python(response.as_ref());
+            let response = chat_output_to_python(&response);
             Python::attach(|py| Py::new(py, response))
         })
     }
@@ -403,13 +397,13 @@ impl PyChatResponse {
     fn __str__(&self) -> String {
         self.text.clone().unwrap_or_default()
     }
-}
 
-#[pymethods]
-impl PyContentBlock {
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        json_to_python(py, &self.data)
+    fn output<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.output {
+            Some(value) => json_to_python(py, value),
+            None => Ok(py.None().into_bound(py).to_owned()),
+        }
     }
 }
 
@@ -440,24 +434,19 @@ impl PyChatStream {
     }
 }
 
-fn chat_response_to_python(response: &dyn ::querymt::chat::ChatResponse) -> PyChatResponse {
-    let message = ChatMessage::from(response);
+fn chat_output_to_python(output: &::querymt::chat::ChatOutput) -> PyChatResponse {
     PyChatResponse {
-        text: response.text(),
-        thinking: response.thinking(),
-        finish_reason: response.finish_reason().map(finish_reason_to_string),
-        usage: response.usage().map(usage_to_python),
-        tool_calls: response
+        text: output.text(),
+        thinking: output.thinking(),
+        finish_reason: output.finish_reason.map(finish_reason_to_string),
+        usage: output.usage.clone().map(usage_to_python),
+        tool_calls: output
             .tool_calls()
             .unwrap_or_default()
             .into_iter()
             .map(tool_call_to_python)
             .collect(),
-        content: message
-            .content
-            .iter()
-            .map(content_block_to_python)
-            .collect(),
+        output: serde_json::to_value(output).ok(),
     }
 }
 
@@ -493,25 +482,6 @@ fn tool_call_to_python(call: ToolCall) -> PyToolCall {
     }
 }
 
-fn content_block_to_python(content: &Content) -> PyContentBlock {
-    let data =
-        serde_json::to_value(content).unwrap_or_else(|_| Value::String(format!("{content}")));
-    let kind = match content {
-        Content::Text { .. } => "text",
-        Content::Image { .. } => "image",
-        Content::ImageUrl { .. } => "image_url",
-        Content::Pdf { .. } => "pdf",
-        Content::Audio { .. } => "audio",
-        Content::Thinking { .. } => "thinking",
-        Content::ToolUse { .. } => "tool_use",
-        Content::ToolResult { .. } => "tool_result",
-        Content::ResourceLink { .. } => "resource_link",
-    }
-    .to_string();
-
-    PyContentBlock { kind, data }
-}
-
 fn stream_to_python(
     mut stream: std::pin::Pin<
         Box<
@@ -537,6 +507,11 @@ fn stream_to_python(
 
 fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
     let (kind, data) = match chunk {
+        StreamChunk::Structured(event) => (
+            "structured",
+            // Serialization failure must not panic across the FFI boundary.
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
         StreamChunk::Text(text) => ("text", serde_json::json!({ "text": text })),
         StreamChunk::Thinking(text) => ("thinking", serde_json::json!({ "text": text })),
         StreamChunk::ThinkingSignature(signature) => (
@@ -554,7 +529,9 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
             "tool_use_input_delta",
             serde_json::json!({ "index": index, "partial_json": partial_json }),
         ),
-        StreamChunk::ToolUseComplete { index, tool_call } => (
+        StreamChunk::ToolUseComplete {
+            index, tool_call, ..
+        } => (
             "tool_use_complete",
             serde_json::json!({
                 "index": index,
@@ -698,38 +675,98 @@ fn py_message_to_rust(message: &Bound<'_, PyDict>) -> Result<ChatMessage> {
         .get_item("role")?
         .ok_or_else(|| anyhow!("message.role is required"))?
         .extract::<String>()?;
-    let content = message
-        .get_item("content")?
-        .ok_or_else(|| anyhow!("message.content is required"))?;
-    let blocks = py_content_to_rust(&content)?;
+
+    // Optional canonical structured output, passed through as JSON so Python
+    // callers can replay item-aware history losslessly. An assistant turn
+    // carries exactly one authoritative payload, so `output` takes precedence
+    // over any portable `content` projection.
+    let output = match message.get_item("output")? {
+        Some(value) if !value.is_none() => {
+            let json = python_to_json(&value)?;
+            Some(
+                serde_json::from_value::<::querymt::chat::ChatOutput>(json)
+                    .map_err(|e| anyhow!("message.output is not valid structured output: {e}"))?,
+            )
+        }
+        _ => None,
+    };
+
+    let input = match message.get_item("input")? {
+        Some(value) if !value.is_none() => {
+            let json = python_to_json(&value)?;
+            Some(
+                serde_json::from_value::<Vec<ChatInputPart>>(json)
+                    .map_err(|e| anyhow!("message.input is not valid canonical input: {e}"))?,
+            )
+        }
+        _ => None,
+    };
+    let content = message.get_item("content")?;
+
+    if output.is_some() && (input.is_some() || content.is_some()) {
+        return Err(anyhow!(
+            "message cannot mix canonical output with input or legacy content"
+        ));
+    }
+    if input.is_some() && content.is_some() {
+        return Err(anyhow!(
+            "message cannot mix canonical input with legacy content"
+        ));
+    }
 
     match role.as_str() {
-        "user" => Ok(ChatMessage::from_user(blocks)),
-        "assistant" => Ok(ChatMessage::from_assistant(blocks)),
-        "tool" => Ok(ChatMessage {
-            role: ChatRole::Assistant,
-            content: blocks,
-            cache: None,
-        }),
+        "assistant" => {
+            if let Some(output) = output {
+                return ChatMessage::try_from_assistant_output(output).map_err(Into::into);
+            }
+            if let Some(input) = input {
+                return Ok(ChatMessage::from_user_parts(input).with_role(ChatRole::Assistant));
+            }
+            let content = content.ok_or_else(|| anyhow!("assistant message requires output"))?;
+            let input_parts = py_content_to_rust(&content)?;
+            Ok(ChatMessage::from_user_parts(input_parts).with_role(ChatRole::Assistant))
+        }
+        "user" => {
+            if output.is_some() {
+                return Err(anyhow!("user messages cannot carry structured output"));
+            }
+            if let Some(input) = input {
+                return Ok(ChatMessage::from_user_parts(input));
+            }
+            let content = content.ok_or_else(|| anyhow!("user message requires input"))?;
+            let parts = py_content_to_rust(&content)?;
+            Ok(ChatMessage::from_user_parts(parts))
+        }
+        "tool" => {
+            if output.is_some() {
+                return Err(anyhow!("tool messages cannot carry structured output"));
+            }
+            if let Some(input) = input {
+                return Ok(ChatMessage::from_user_parts(input).with_role(ChatRole::Assistant));
+            }
+            let content = content.ok_or_else(|| anyhow!("tool message requires input"))?;
+            let parts = py_content_to_rust(&content)?;
+            Ok(ChatMessage::from_user_parts(parts).with_role(ChatRole::Assistant))
+        }
         other => Err(anyhow!("unsupported role '{}'", other)),
     }
 }
 
-fn py_content_to_rust(content: &Bound<'_, PyAny>) -> Result<Vec<Content>> {
+/// Read a legacy Python `content` value into canonical input parts.
+fn py_content_to_rust(content: &Bound<'_, PyAny>) -> Result<Vec<ChatInputPart>> {
     if let Ok(text) = content.extract::<String>() {
-        return Ok(vec![Content::text(text)]);
+        return Ok(vec![ChatInputPart::text(text)]);
     }
 
     if let Ok(blocks) = content.cast::<PyList>() {
-        let mut out = Vec::with_capacity(blocks.len());
+        let mut parts = Vec::new();
         for item in blocks.iter() {
             let dict = item
                 .cast::<PyDict>()
                 .map_err(|_| anyhow!("each content block must be a dict"))?;
-
-            out.push(py_block_to_rust(&dict)?);
+            parts.push(py_block_to_rust(&dict)?);
         }
-        return Ok(out);
+        return Ok(parts);
     }
 
     Err(anyhow!(
@@ -737,91 +774,179 @@ fn py_content_to_rust(content: &Bound<'_, PyAny>) -> Result<Vec<Content>> {
     ))
 }
 
-fn py_block_to_rust(block: &Bound<'_, PyDict>) -> Result<Content> {
+fn py_block_to_rust(block: &Bound<'_, PyDict>) -> Result<ChatInputPart> {
     let kind = block
         .get_item("type")?
         .ok_or_else(|| anyhow!("content block type is required"))?
         .extract::<String>()?;
 
     match kind.as_str() {
-        "text" => Ok(Content::text(
+        "text" => Ok(ChatInputPart::text(
             block
                 .get_item("text")?
                 .ok_or_else(|| anyhow!("text block requires 'text'"))?
                 .extract::<String>()?,
         )),
-        "thinking" => Ok(Content::Thinking {
-            text: block
-                .get_item("text")?
-                .ok_or_else(|| anyhow!("thinking block requires 'text'"))?
-                .extract::<String>()?,
-            signature: optional_string(block, "signature")?,
-        }),
-        "image" => Ok(Content::image(
-            block
+        "image" => Ok(inline_media_part(
+            MediaKind::Image,
+            &block
                 .get_item("mime_type")?
                 .ok_or_else(|| anyhow!("image block requires 'mime_type'"))?
                 .extract::<String>()?,
             decode_bytes(block, "data")?,
-        )),
-        "image_url" => Ok(Content::image_url(
+        )?),
+        "image_url" => Ok(url_media_part(
+            MediaKind::Image,
             block
                 .get_item("url")?
                 .ok_or_else(|| anyhow!("image_url block requires 'url'"))?
                 .extract::<String>()?,
-        )),
-        "pdf" => Ok(Content::pdf(decode_bytes(block, "data")?)),
-        "audio" => Ok(Content::audio(
-            block
+            None,
+        )?),
+        "pdf" => Ok(inline_media_part(
+            MediaKind::Document,
+            "application/pdf",
+            decode_bytes(block, "data")?,
+        )?),
+        "audio" => Ok(inline_media_part(
+            MediaKind::Audio,
+            &block
                 .get_item("mime_type")?
                 .ok_or_else(|| anyhow!("audio block requires 'mime_type'"))?
                 .extract::<String>()?,
             decode_bytes(block, "data")?,
-        )),
-        "tool_use" => {
-            let args = block
-                .get_item("arguments")?
-                .ok_or_else(|| anyhow!("tool_use block requires 'arguments'"))?;
-            Ok(Content::tool_use(
-                block
-                    .get_item("id")?
-                    .ok_or_else(|| anyhow!("tool_use block requires 'id'"))?
-                    .extract::<String>()?,
-                block
-                    .get_item("name")?
-                    .ok_or_else(|| anyhow!("tool_use block requires 'name'"))?
-                    .extract::<String>()?,
-                python_to_json(&args)?,
-            ))
-        }
-        "tool_result" => Ok(Content::ToolResult {
-            id: block
-                .get_item("id")?
-                .ok_or_else(|| anyhow!("tool_result block requires 'id'"))?
-                .extract::<String>()?,
-            name: optional_string(block, "name")?,
-            is_error: optional_bool(block, "is_error")?.unwrap_or(false),
-            content: py_nested_content(block, "content")?,
-        }),
-        "resource_link" => Ok(Content::ResourceLink {
-            uri: block
+        )?),
+        "resource_link" => Ok(url_media_part(
+            MediaKind::Other,
+            block
                 .get_item("uri")?
                 .ok_or_else(|| anyhow!("resource_link block requires 'uri'"))?
                 .extract::<String>()?,
-            name: optional_string(block, "name")?,
-            description: optional_string(block, "description")?,
-            mime_type: optional_string(block, "mime_type")?,
-        }),
+            optional_string(block, "name")?,
+        )?),
+        // Generated semantics: no ordinary-input representation. Rejected in a
+        // plain `content` list and only meaningful via `output`.
+        "thinking" | "tool_use" => Err(anyhow!(
+            "'{kind}' is generated content and cannot appear in message.content; \
+             pass it in the assistant message's structured 'output' instead"
+        )),
+        "tool_result" => py_tool_result_to_rust(block),
         other => Err(anyhow!("unsupported content block type '{}'", other)),
     }
 }
 
-fn py_nested_content(block: &Bound<'_, PyDict>, key: &str) -> Result<Vec<Content>> {
-    let block_type = block_type_name(block)?;
-    let value = block
-        .get_item(key)?
-        .ok_or_else(|| anyhow!("{} block requires '{}'", block_type, key))?;
-    py_content_to_rust(&value)
+/// Convert a `tool_result` block into a bounded correlated input part.
+///
+/// The inner parts are [`ToolResultPart`]s, which cannot nest another result, so
+/// nesting is rejected explicitly instead of recursing.
+fn py_tool_result_to_rust(block: &Bound<'_, PyDict>) -> Result<ChatInputPart> {
+    let mut result = ::querymt::chat::ToolResult::new(
+        block
+            .get_item("id")?
+            .ok_or_else(|| anyhow!("tool_result block requires 'id'"))?
+            .extract::<String>()?,
+    );
+    result.name = optional_string(block, "name")?;
+    result.is_error = optional_bool(block, "is_error")?.unwrap_or(false);
+
+    let content = block
+        .get_item("content")?
+        .ok_or_else(|| anyhow!("tool_result block requires 'content'"))?;
+
+    if let Ok(text) = content.extract::<String>() {
+        result
+            .parts
+            .push(::querymt::chat::ToolResultPart::text(text));
+        return Ok(ChatInputPart::tool_result(result));
+    }
+
+    let blocks = content
+        .cast::<PyList>()
+        .map_err(|_| anyhow!("tool_result content must be a string or a list of block dicts"))?;
+
+    for item in blocks.iter() {
+        let dict = item
+            .cast::<PyDict>()
+            .map_err(|_| anyhow!("each tool_result content block must be a dict"))?;
+        let kind = block_type_name(&dict)?;
+        match kind.as_str() {
+            "text" => result.parts.push(::querymt::chat::ToolResultPart::text(
+                dict.get_item("text")?
+                    .ok_or_else(|| anyhow!("text block requires 'text'"))?
+                    .extract::<String>()?,
+            )),
+            "image" | "pdf" | "audio" => {
+                let (kind, mime) = match kind.as_str() {
+                    "image" => (
+                        MediaKind::Image,
+                        Some(
+                            dict.get_item("mime_type")?
+                                .ok_or_else(|| anyhow!("image block requires 'mime_type'"))?
+                                .extract::<String>()?,
+                        ),
+                    ),
+                    "pdf" => (MediaKind::Document, Some("application/pdf".to_string())),
+                    _ => (
+                        MediaKind::Audio,
+                        Some(
+                            dict.get_item("mime_type")?
+                                .ok_or_else(|| anyhow!("audio block requires 'mime_type'"))?
+                                .extract::<String>()?,
+                        ),
+                    ),
+                };
+                result
+                    .parts
+                    .push(::querymt::chat::ToolResultPart::Attachment(Box::new(
+                        block_attachment(kind, mime, decode_bytes(&dict, "data")?)?,
+                    )));
+            }
+            other => {
+                return Err(anyhow!(
+                    "tool_result content cannot contain '{other}' blocks; \
+                     a tool result holds only text and media parts"
+                ));
+            }
+        }
+    }
+
+    Ok(ChatInputPart::tool_result(result))
+}
+
+/// Build a validated inline media input part.
+fn inline_media_part(kind: MediaKind, mime_type: &str, data: Vec<u8>) -> Result<ChatInputPart> {
+    Ok(ChatInputPart::attachment(block_attachment(
+        kind,
+        Some(mime_type.to_string()),
+        data,
+    )?))
+}
+
+/// Build a validated URL-sourced media input part.
+fn url_media_part(kind: MediaKind, url: String, filename: Option<String>) -> Result<ChatInputPart> {
+    let mut media =
+        ::querymt::chat::MediaPart::new(kind, None, ::querymt::chat::MediaSource::Url { url })
+            .map_err(|e| anyhow!("invalid media attachment: {e}"))?;
+    media.filename = filename;
+    Ok(ChatInputPart::attachment(media))
+}
+
+/// Build a validated inline attachment.
+fn block_attachment(
+    kind: MediaKind,
+    mime_type: Option<String>,
+    data: Vec<u8>,
+) -> Result<::querymt::chat::MediaPart> {
+    let media_type = mime_type
+        .map(|mime| mime.parse::<::querymt::chat::MediaType>())
+        .transpose()
+        .map_err(|e| anyhow!("invalid media type: {e}"))?;
+    ::querymt::chat::MediaPart::new(
+        kind,
+        media_type,
+        ::querymt::chat::MediaSource::Inline { data },
+    )
+    .map_err(|e| anyhow!("invalid media attachment: {e}"))
 }
 
 fn block_type_name(block: &Bound<'_, PyDict>) -> Result<String> {
@@ -908,132 +1033,73 @@ fn into_py_err(err: impl std::fmt::Display) -> PyErr {
 }
 
 #[pyfunction]
-#[pyo3(signature = (content))]
-fn user_message<'py>(py: Python<'py>, content: Py<PyAny>) -> PyResult<Bound<'py, PyDict>> {
-    message_dict(py, "user", content.bind(py))
+#[pyo3(signature = (input))]
+fn user_message<'py>(py: Python<'py>, input: Py<PyAny>) -> PyResult<Bound<'py, PyDict>> {
+    message_dict(py, "user", "input", input.bind(py))
 }
 
 #[pyfunction]
-#[pyo3(signature = (content))]
-fn assistant_message<'py>(py: Python<'py>, content: Py<PyAny>) -> PyResult<Bound<'py, PyDict>> {
-    message_dict(py, "assistant", content.bind(py))
+#[pyo3(signature = (output))]
+fn assistant_message<'py>(py: Python<'py>, output: Py<PyAny>) -> PyResult<Bound<'py, PyDict>> {
+    message_dict(py, "assistant", "output", output.bind(py))
 }
 
 #[pyfunction]
 #[pyo3(signature = (text))]
-fn text_block<'py>(py: Python<'py>, text: String) -> PyResult<Bound<'py, PyDict>> {
+fn text_part<'py>(py: Python<'py>, text: String) -> PyResult<Bound<'py, PyDict>> {
     block_dict(py, [("type", "text"), ("text", &text)])
 }
 
 #[pyfunction]
-#[pyo3(signature = (text, signature=None))]
-fn thinking_block<'py>(
+#[pyo3(signature = (kind, mime_type, data, filename=None, detail=None))]
+fn inline_attachment<'py>(
     py: Python<'py>,
-    text: String,
-    signature: Option<String>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let block = PyDict::new(py);
-    block.set_item("type", "thinking")?;
-    block.set_item("text", text)?;
-    if let Some(signature) = signature {
-        block.set_item("signature", signature)?;
-    }
-    Ok(block)
-}
-
-#[pyfunction]
-#[pyo3(signature = (mime_type, data))]
-fn image_block<'py>(
-    py: Python<'py>,
+    kind: String,
     mime_type: String,
     data: Py<PyAny>,
+    filename: Option<String>,
+    detail: Option<String>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    binary_block(py, "image", mime_type, data.bind(py))
+    let source = PyDict::new(py);
+    source.set_item("type", "inline")?;
+    source.set_item("data", data.bind(py).extract::<Vec<u8>>()?)?;
+    attachment_part(py, kind, Some(mime_type), source.as_any(), filename, detail)
 }
 
 #[pyfunction]
-#[pyo3(signature = (url))]
-fn image_url_block<'py>(py: Python<'py>, url: String) -> PyResult<Bound<'py, PyDict>> {
-    block_dict(py, [("type", "image_url"), ("url", &url)])
-}
-
-#[pyfunction]
-#[pyo3(signature = (data))]
-fn pdf_block<'py>(py: Python<'py>, data: Py<PyAny>) -> PyResult<Bound<'py, PyDict>> {
-    let block = PyDict::new(py);
-    block.set_item("type", "pdf")?;
-    block.set_item("data", data.bind(py))?;
-    Ok(block)
-}
-
-#[pyfunction]
-#[pyo3(signature = (mime_type, data))]
-fn audio_block<'py>(
+#[pyo3(signature = (kind, url, media_type=None, filename=None, detail=None))]
+fn url_attachment<'py>(
     py: Python<'py>,
-    mime_type: String,
-    data: Py<PyAny>,
+    kind: String,
+    url: String,
+    media_type: Option<String>,
+    filename: Option<String>,
+    detail: Option<String>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    binary_block(py, "audio", mime_type, data.bind(py))
+    let source = PyDict::new(py);
+    source.set_item("type", "url")?;
+    source.set_item("url", url)?;
+    attachment_part(py, kind, media_type, source.as_any(), filename, detail)
 }
 
 #[pyfunction]
-#[pyo3(signature = (id, name, arguments))]
-fn tool_use_block<'py>(
+#[pyo3(signature = (call_id, parts, name=None, is_error=false))]
+fn tool_result<'py>(
     py: Python<'py>,
-    id: String,
-    name: String,
-    arguments: Py<PyAny>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let block = PyDict::new(py);
-    block.set_item("type", "tool_use")?;
-    block.set_item("id", id)?;
-    block.set_item("name", name)?;
-    block.set_item("arguments", arguments.bind(py))?;
-    Ok(block)
-}
-
-#[pyfunction]
-#[pyo3(signature = (id, content, name=None, is_error=false))]
-fn tool_result_block<'py>(
-    py: Python<'py>,
-    id: String,
-    content: Py<PyAny>,
+    call_id: String,
+    parts: Py<PyAny>,
     name: Option<String>,
     is_error: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let block = PyDict::new(py);
-    block.set_item("type", "tool_result")?;
-    block.set_item("id", id)?;
+    let part = PyDict::new(py);
+    part.set_item("type", "tool_result")?;
+    part.set_item("call_id", call_id)?;
     if let Some(name) = name {
-        block.set_item("name", name)?;
+        part.set_item("name", name)?;
     }
-    block.set_item("is_error", is_error)?;
-    block.set_item("content", content.bind(py))?;
-    Ok(block)
-}
-
-#[pyfunction]
-#[pyo3(signature = (uri, name=None, description=None, mime_type=None))]
-fn resource_link_block<'py>(
-    py: Python<'py>,
-    uri: String,
-    name: Option<String>,
-    description: Option<String>,
-    mime_type: Option<String>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let block = PyDict::new(py);
-    block.set_item("type", "resource_link")?;
-    block.set_item("uri", uri)?;
-    if let Some(name) = name {
-        block.set_item("name", name)?;
-    }
-    if let Some(description) = description {
-        block.set_item("description", description)?;
-    }
-    if let Some(mime_type) = mime_type {
-        block.set_item("mime_type", mime_type)?;
-    }
-    Ok(block)
+    part.set_item("is_error", is_error)?;
+    part.set_item("parts", parts.bind(py))?;
+    Ok(part)
 }
 
 #[pyfunction]
@@ -1059,11 +1125,12 @@ fn function_tool<'py>(
 fn message_dict<'py>(
     py: Python<'py>,
     role: &str,
-    content: &Bound<'py, PyAny>,
+    payload_key: &str,
+    payload: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let msg = PyDict::new(py);
     msg.set_item("role", role)?;
-    msg.set_item("content", content)?;
+    msg.set_item(payload_key, payload)?;
     Ok(msg)
 }
 
@@ -1078,17 +1145,28 @@ fn block_dict<'py, const N: usize>(
     Ok(block)
 }
 
-fn binary_block<'py>(
+fn attachment_part<'py>(
     py: Python<'py>,
-    block_type: &str,
-    mime_type: String,
-    data: &Bound<'py, PyAny>,
+    kind: String,
+    media_type: Option<String>,
+    source: &Bound<'py, PyAny>,
+    filename: Option<String>,
+    detail: Option<String>,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let block = PyDict::new(py);
-    block.set_item("type", block_type)?;
-    block.set_item("mime_type", mime_type)?;
-    block.set_item("data", data)?;
-    Ok(block)
+    let part = PyDict::new(py);
+    part.set_item("type", "attachment")?;
+    part.set_item("kind", kind)?;
+    if let Some(media_type) = media_type {
+        part.set_item("media_type", media_type)?;
+    }
+    part.set_item("source", source)?;
+    if let Some(filename) = filename {
+        part.set_item("filename", filename)?;
+    }
+    if let Some(detail) = detail {
+        part.set_item("detail", detail)?;
+    }
+    Ok(part)
 }
 
 #[pymodule]
@@ -1101,19 +1179,13 @@ fn querymt(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyChatResponse>()?;
     module.add_class::<PyUsage>()?;
     module.add_class::<PyToolCall>()?;
-    module.add_class::<PyContentBlock>()?;
     module.add_class::<PyStreamChunk>()?;
     module.add_function(wrap_pyfunction!(user_message, module)?)?;
     module.add_function(wrap_pyfunction!(assistant_message, module)?)?;
-    module.add_function(wrap_pyfunction!(text_block, module)?)?;
-    module.add_function(wrap_pyfunction!(thinking_block, module)?)?;
-    module.add_function(wrap_pyfunction!(image_block, module)?)?;
-    module.add_function(wrap_pyfunction!(image_url_block, module)?)?;
-    module.add_function(wrap_pyfunction!(pdf_block, module)?)?;
-    module.add_function(wrap_pyfunction!(audio_block, module)?)?;
-    module.add_function(wrap_pyfunction!(tool_use_block, module)?)?;
-    module.add_function(wrap_pyfunction!(tool_result_block, module)?)?;
-    module.add_function(wrap_pyfunction!(resource_link_block, module)?)?;
+    module.add_function(wrap_pyfunction!(text_part, module)?)?;
+    module.add_function(wrap_pyfunction!(inline_attachment, module)?)?;
+    module.add_function(wrap_pyfunction!(url_attachment, module)?)?;
+    module.add_function(wrap_pyfunction!(tool_result, module)?)?;
     module.add_function(wrap_pyfunction!(function_tool, module)?)?;
     module.add(
         "__all__",
@@ -1126,19 +1198,13 @@ fn querymt(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
             "ChatResponse",
             "Usage",
             "ToolCall",
-            "ContentBlock",
             "StreamChunk",
             "user_message",
             "assistant_message",
-            "text_block",
-            "thinking_block",
-            "image_block",
-            "image_url_block",
-            "pdf_block",
-            "audio_block",
-            "tool_use_block",
-            "tool_result_block",
-            "resource_link_block",
+            "text_part",
+            "inline_attachment",
+            "url_attachment",
+            "tool_result",
             "function_tool",
         ],
     )?;
@@ -1167,6 +1233,11 @@ mod tests {
             let out = py_message_to_rust(&msg).unwrap();
             assert_eq!(out.role, ChatRole::User);
             assert_eq!(out.text(), "hello");
+
+            let saved = serde_json::to_value(&out).unwrap();
+            assert!(saved.get("content").is_none());
+            assert_eq!(saved["input"][0]["type"], "text");
+            assert_eq!(saved["input"][0]["text"], "hello");
         });
     }
 
@@ -1207,6 +1278,11 @@ mod tests {
             let out = py_message_to_rust(&msg).unwrap();
             assert_eq!(out.role, ChatRole::Assistant);
             assert!(out.has_tool_result());
+
+            let saved = serde_json::to_value(&out).unwrap();
+            assert!(saved.get("content").is_none());
+            assert_eq!(saved["input"][0]["type"], "tool_result");
+            assert_eq!(saved["input"][0]["parts"][0]["type"], "text");
         });
     }
 
@@ -1219,11 +1295,14 @@ mod tests {
             image.set_item("data", "aGVsbG8=").unwrap();
             let content = py_block_to_rust(&image).unwrap();
             match content {
-                Content::Image { mime_type, data } => {
-                    assert_eq!(mime_type, "image/png");
+                ChatInputPart::Attachment(media) => {
+                    let ::querymt::chat::MediaSource::Inline { data } = media.source() else {
+                        panic!("expected inline media");
+                    };
+                    assert_eq!(media.media_type().map(|m| m.as_ref()), Some("image/png"));
                     assert_eq!(data, b"hello");
                 }
-                other => panic!("unexpected content: {other:?}"),
+                _ => panic!("expected an inline image input part"),
             }
         });
     }

@@ -481,6 +481,17 @@ impl Message<Cancel> for SessionActor {
     async fn handle(&mut self, _msg: Cancel, _ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
         debug!("Session {}: Cancel received", self.session_id);
         self.turn_state.token.cancel();
+        let cancelled_elicitations = crate::elicitation::cancel_pending_elicitations_for_session(
+            &self.config.pending_elicitations,
+            &self.session_id,
+        )
+        .await;
+        if cancelled_elicitations > 0 {
+            debug!(
+                "Session {}: cancelled {} pending elicitation(s)",
+                self.session_id, cancelled_elicitations
+            );
+        }
         if let Some(run) = &mut self.active_run {
             run.phase = RunPhase::Closing;
             let run_id = run.run_id.clone();
@@ -1696,24 +1707,26 @@ impl Message<crate::agent::messages::ReadRemoteFile> for SessionActor {
             .await
             .map_err(FileProxyError::ReadError)?;
 
-        // Map the single Content block returned by render_read_output to the
+        // Map the single result part returned by render_read_output to the
         // appropriate ReadRemoteFileResponse variant.
-        for block in blocks {
-            match block {
-                querymt::chat::Content::Image { mime_type, data } => {
-                    return Ok(ReadRemoteFileResponse::Image {
-                        mime_type,
-                        base64_data: base64::engine::general_purpose::STANDARD.encode(&data),
-                    });
-                }
-                querymt::chat::Content::Text { text } => {
-                    return Ok(ReadRemoteFileResponse::Text(text));
-                }
-                _ => {}
-            }
+        let Some(block) = blocks.into_iter().next() else {
+            return Ok(ReadRemoteFileResponse::Binary);
+        };
+        match block {
+            querymt::chat::ToolResultPart::Attachment(media) => Ok(ReadRemoteFileResponse::Image {
+                mime_type: media
+                    .media_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+                base64_data: match media.source() {
+                    querymt::chat::MediaSource::Inline { data } => {
+                        base64::engine::general_purpose::STANDARD.encode(data)
+                    }
+                    _ => String::new(),
+                },
+            }),
+            querymt::chat::ToolResultPart::Text { text } => Ok(ReadRemoteFileResponse::Text(text)),
         }
-
-        Ok(ReadRemoteFileResponse::Binary)
     }
 }
 
@@ -3774,6 +3787,8 @@ mod tests {
             name: None,
             provider: "codex".to_string(),
             model: "gpt-5.4".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: Some(serde_json::json!({
                 "reasoning_effort": "medium"
             })),
@@ -3824,6 +3839,8 @@ mod tests {
                     name: None,
                     provider: "codex".to_string(),
                     model: "gpt-5.4".to_string(),
+                    protocol: String::new(),
+                    endpoint: String::new(),
                     params: Some(serde_json::json!({"reasoning_effort": "high"})),
                     created_at: Some(time::OffsetDateTime::now_utc()),
                     updated_at: Some(time::OffsetDateTime::now_utc()),

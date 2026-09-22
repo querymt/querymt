@@ -44,7 +44,7 @@ pub trait RemoteProviderBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, Tool};
+    use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, Tool};
     use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
@@ -66,7 +66,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _tools: Option<&[Tool]>,
-        ) -> Result<Box<dyn ChatResponse>, LLMError> {
+        ) -> Result<ChatOutput, LLMError> {
             Err(LLMError::NotImplemented("dummy".into()))
         }
 

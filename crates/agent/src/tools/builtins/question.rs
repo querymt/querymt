@@ -1,7 +1,7 @@
 //! Question tool for asking users structured questions
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -105,6 +105,7 @@ impl Tool for QuestionTool {
                     },
                     "required": ["questions"]
                 }),
+                strict: None,
             },
         }
     }
@@ -117,7 +118,7 @@ impl Tool for QuestionTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let questions_val = args
             .get("questions")
             .and_then(Value::as_array)
@@ -164,7 +165,7 @@ impl Tool for QuestionTool {
         });
 
         serde_json::to_string_pretty(&result)
-            .map(|s| vec![Content::text(s)])
+            .map(|s| vec![ToolResultPart::text(s)])
             .map_err(|e| ToolError::ProviderError(format!("Failed to serialize result: {}", e)))
     }
 }

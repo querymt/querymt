@@ -95,7 +95,9 @@ impl RemoteProviderStreamState {
     }
 
     fn note_terminal_if_done(&mut self, chunk: &StreamChunk) {
-        if matches!(chunk, StreamChunk::Done { .. }) {
+        // Both legacy `Done` and canonical structured response terminals are
+        // terminal; a canonical-only provider never sends a legacy `Done`.
+        if querymt::chat::chunk_is_terminal(chunk) {
             self.terminal_seen = true;
         }
     }
@@ -271,5 +273,30 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn canonical_structured_terminal_marks_stream_finished_without_legacy_done() {
+        use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
+
+        let mut state = RemoteProviderStreamState::new();
+        let started_at = Instant::now() - Duration::from_millis(10);
+
+        // A canonical-only stream never emits a legacy `Done`; the structured
+        // response terminal must close the stream promptly.
+        let (index, first_latency) = state.note_chunk_received(
+            &StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                usage: None,
+                finish_reason: Some(FinishReason::Stop),
+                detail: None,
+            }),
+            started_at,
+        );
+
+        assert_eq!(index, 1);
+        assert!(first_latency.is_some());
+        assert!(state.terminal_seen());
+        assert!(state.is_finished());
     }
 }

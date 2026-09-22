@@ -1,16 +1,17 @@
 use crate::{
     AttachStreamConsumer, CancelProviderStreamRequest, GenericProviderStreamRequest,
-    GetProviderCatalog, GetProviderStreamStatus, MeshHandle, MeshScopeId, NodeId,
-    ProviderCatalogActor, ProviderHostActor, ProviderStreamRouterActor, ProviderStreamStatus,
-    RegisterRequest, RemoteChatProvider, RemoteProviderClientConfig, RemoteProviderClientCore,
-    RemoteProviderClientTransport, StreamRelayMessage, remote_send_error_to_llm_error_no_handler,
-    scoped_provider_catalog, scoped_provider_host,
+    GetProviderCatalog, GetProviderContractInfo, GetProviderStreamStatus, MeshHandle, MeshScopeId,
+    NodeId, ProviderCatalogActor, ProviderContractInfo, ProviderHostActor,
+    ProviderStreamRouterActor, ProviderStreamStatus, RegisterRequest, RemoteChatProvider,
+    RemoteProviderClientConfig, RemoteProviderClientCore, RemoteProviderClientTransport,
+    StreamRelayMessage, remote_send_error_to_llm_error_no_handler, scoped_provider_catalog,
+    scoped_provider_host,
 };
 use async_trait::async_trait;
 use kameo::actor::Spawn;
 use libp2p::PeerId;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatProvider, StreamChunk, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -173,6 +174,25 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
 
     async fn lookup_host(&self, target_locator: &str) -> Result<Self::HostRef, LLMError> {
         self.lookup_provider_host(target_locator).await
+    }
+
+    async fn get_contract_info(
+        &self,
+        host: &Self::HostRef,
+        request: GetProviderContractInfo,
+    ) -> Result<ProviderContractInfo, LLMError> {
+        host.ask(&request)
+            .mailbox_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+            .reply_timeout(Self::PROVIDER_CONTROL_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| match crate::remote_send_error_base(error) {
+                Ok(error) => error,
+                Err(handler) => crate::decode_payload_handler_error(
+                    &serde_json::to_string(&handler.to_payload())
+                        .unwrap_or_else(|_| handler.to_string()),
+                ),
+            })
     }
 
     async fn prepare_stream_router(
@@ -403,7 +423,7 @@ impl ChatProvider for MeshChatProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn querymt::chat::ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         self.inner.chat_with_tools(messages, tools).await
     }
 

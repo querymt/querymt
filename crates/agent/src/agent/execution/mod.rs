@@ -356,7 +356,9 @@ pub(crate) async fn execute_cycle_state_machine(
     );
 
     loop {
-        if exec_ctx.cancellation_token.is_cancelled() {
+        if exec_ctx.cancellation_token.is_cancelled()
+            && !matches!(state, ExecutionState::ProcessingToolCalls { .. })
+        {
             info!("Session {}: CANCELLED at loop top", exec_ctx.session_id);
             return Ok(CycleOutcome::Cancelled);
         }
@@ -509,9 +511,10 @@ pub(crate) async fn execute_cycle_state_machine(
                         .map(|call| {
                             crate::middleware::ToolResult::new(
                                 call.id.clone(),
-                                vec![querymt::chat::Content::text(
-                                    "Skipped because new user steering was received",
-                                )],
+                                vec![querymt::chat::ToolResultPart::Text {
+                                    text: "Skipped because new user steering was received"
+                                        .to_string(),
+                                }],
                                 true,
                                 Some(call.function.name.clone()),
                                 Some(call.function.arguments.clone()),
@@ -531,22 +534,39 @@ pub(crate) async fn execute_cycle_state_machine(
                     continue;
                 }
                 let state = ExecutionState::ProcessingToolCalls {
-                    remaining_calls,
-                    results,
-                    context,
+                    remaining_calls: remaining_calls.clone(),
+                    results: results.clone(),
+                    context: context.clone(),
                 };
-                let state = driver
-                    .run_processing_tool_calls_cancellable(
-                        state,
-                        Some(&exec_ctx.runtime),
-                        &exec_ctx.cancellation_token,
-                    )
-                    .instrument(info_span!(
-                        "agent.execution.middleware.processing_tool_calls",
-                        session_id = %exec_ctx.session_id
-                    ))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                // Cancellation must not discard the pending-call state: the
+                // transition below synthesizes and persists matching results.
+                let state = if exec_ctx.cancellation_token.is_cancelled() {
+                    state
+                } else {
+                    let middleware_state = driver
+                        .run_processing_tool_calls_cancellable(
+                            state,
+                            Some(&exec_ctx.runtime),
+                            &exec_ctx.cancellation_token,
+                        )
+                        .instrument(info_span!(
+                            "agent.execution.middleware.processing_tool_calls",
+                            session_id = %exec_ctx.session_id
+                        ))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                    if matches!(middleware_state, ExecutionState::Cancelled)
+                        && exec_ctx.cancellation_token.is_cancelled()
+                    {
+                        ExecutionState::ProcessingToolCalls {
+                            remaining_calls,
+                            results,
+                            context,
+                        }
+                    } else {
+                        middleware_state
+                    }
+                };
                 match state {
                     ExecutionState::ProcessingToolCalls {
                         ref remaining_calls,
@@ -809,6 +829,7 @@ mod tests {
                 name: name.to_string(),
                 description: String::new(),
                 parameters: json!({"type": "object"}),
+                strict: None,
             },
         }
     }

@@ -77,17 +77,17 @@ Use them with `chat_with_tools(...)` or `chat_stream_with_tools(...)`.
 
 ## Helper Builders
 
-The module also exposes small helper builders:
+The module exposes canonical helper builders:
 
-- `querymt.user_message(...)`
-- `querymt.assistant_message(...)`
-- `querymt.text_block(...)`
-- `querymt.image_block(...)`
-- `querymt.image_url_block(...)`
-- `querymt.pdf_block(...)`
-- `querymt.audio_block(...)`
-- `querymt.thinking_block(...)`
-- `querymt.tool_use_block(...)`
-- `querymt.tool_result_block(...)`
-- `querymt.resource_link_block(...)`
+- `querymt.user_message(input_parts)` creates `{role: "user", input: [...]}`.
+- `querymt.assistant_message(output)` creates `{role: "assistant", output: {...}}`.
+- `querymt.text_part(...)`
+- `querymt.inline_attachment(...)`
+- `querymt.url_attachment(...)`
+- `querymt.tool_result(...)`
 - `querymt.function_tool(...)`
+
+Generated reasoning and function calls are represented only in canonical assistant
+`output`; there are no generated-content input builders. Attachments use one
+canonical shape instead of separate image, image-URL, PDF, audio, and
+resource-link block variants.

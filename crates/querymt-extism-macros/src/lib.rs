@@ -183,6 +183,13 @@ macro_rules! impl_extism_http_plugin {
         }
 
         #[plugin_fn]
+        pub fn item_aware_chat_contract_version() -> FnResult<Json<u32>> {
+            Ok(Json(
+                querymt::plugin::extism_impl::ITEM_AWARE_CHAT_CONTRACT_VERSION,
+            ))
+        }
+
+        #[plugin_fn]
         pub fn supports_streaming(Json(cfg): Json<$Config>) -> FnResult<Json<bool>> {
             Ok(Json(cfg.supports_streaming()))
         }
@@ -324,13 +331,7 @@ macro_rules! impl_extism_http_plugin {
 
             let out = chunks
                 .into_iter()
-                .map(|chunk| {
-                    let usage = match &chunk {
-                        StreamChunk::Usage(usage) => Some(usage.clone()),
-                        _ => None,
-                    };
-                    querymt::plugin::extism_impl::ExtismChatChunk { chunk, usage }
-                })
+                .map(|chunk| querymt::plugin::extism_impl::ExtismChatChunk { chunk })
                 .collect();
             Ok(Json(out))
         }
@@ -349,13 +350,7 @@ macro_rules! impl_extism_http_plugin {
 
             let out = chunks
                 .into_iter()
-                .map(|chunk| {
-                    let usage = match &chunk {
-                        StreamChunk::Usage(usage) => Some(usage.clone()),
-                        _ => None,
-                    };
-                    querymt::plugin::extism_impl::ExtismChatChunk { chunk, usage }
-                })
+                .map(|chunk| querymt::plugin::extism_impl::ExtismChatChunk { chunk })
                 .collect();
             Ok(Json(out))
         }

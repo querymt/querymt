@@ -27,15 +27,14 @@ async def main() -> None:
 
     messages = [
         querymt.user_message(
-            [querymt.text_block("What is the weather in Paris? Use the tool if needed.")]
+            [querymt.text_part("What is the weather in Paris? Use the tool if needed.")]
         )
     ]
 
     response = await provider.chat_with_tools(messages, TOOLS)
     print("text:", response.text)
     print("tool_calls:", [call.name for call in response.tool_calls])
-    for block in response.content:
-        print(block.kind, block.data)
+    print("output:", response.output)
 
 
 if __name__ == "__main__":

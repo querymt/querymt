@@ -3,7 +3,7 @@
 use crate::knowledge::{QueryOpts, RetrievalMode};
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 pub struct KnowledgeQueryTool;
@@ -61,6 +61,7 @@ impl ToolTrait for KnowledgeQueryTool {
                     },
                     "required": ["question"]
                 }),
+                strict: None,
             },
         }
     }
@@ -73,7 +74,7 @@ impl ToolTrait for KnowledgeQueryTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         // Extract required fields
         let question = args["question"]
             .as_str()
@@ -183,7 +184,7 @@ impl ToolTrait for KnowledgeQueryTool {
             response.push_str("No relevant knowledge found.");
         }
 
-        Ok(vec![Content::text(response)])
+        Ok(vec![ToolResultPart::text(response)])
     }
 }
 
@@ -191,11 +192,11 @@ impl ToolTrait for KnowledgeQueryTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

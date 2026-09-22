@@ -256,6 +256,7 @@ pub(super) async fn next_stream_chunk(
 
 pub(super) fn stream_chunk_commits_output(chunk: &StreamChunk) -> bool {
     match chunk {
+        StreamChunk::Structured(_) => true,
         StreamChunk::Text(text) | StreamChunk::Thinking(text) => !text.is_empty(),
         StreamChunk::ThinkingSignature(_) => true,
         StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseComplete { .. } => true,
@@ -427,7 +428,7 @@ mod tests {
         mock_plugin_registry, mock_session,
     };
     use querymt::LLMParams;
-    use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
+    use querymt::chat::{ChatOutput, FinishReason, StreamChunk};
     use querymt::error::{LLMError, ProviderErrorKind, ProviderFailure};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -737,8 +738,8 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                let resp: Box<dyn ChatResponse> =
-                    Box::new(crate::test_utils::MockChatResponse::text_only("hello"));
+                let resp: ChatOutput =
+                    crate::test_utils::MockChatResponse::text_only("hello").into();
                 Ok(resp)
             }
         })
@@ -787,7 +788,7 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err::<Box<dyn ChatResponse>, _>(LLMError::GenericError("fatal error".to_string()))
+                Err::<ChatOutput, _>(LLMError::GenericError("fatal error".to_string()))
             }
         })
         .await;
@@ -809,15 +810,13 @@ mod tests {
             async move {
                 let attempt = count.fetch_add(1, Ordering::SeqCst);
                 if attempt == 0 {
-                    Err::<Box<dyn ChatResponse>, _>(LLMError::HttpStatus {
+                    Err::<ChatOutput, _>(LLMError::HttpStatus {
                         status_code: 503,
                         message: "upstream connect error".to_string(),
                         retry_after_secs: Some(0),
                     })
                 } else {
-                    Ok::<Box<dyn ChatResponse>, _>(Box::new(
-                        crate::test_utils::MockChatResponse::text_only("ok"),
-                    ) as Box<dyn ChatResponse>)
+                    Ok::<ChatOutput, _>(crate::test_utils::MockChatResponse::text_only("ok").into())
                 }
             }
         })
@@ -834,9 +833,9 @@ mod tests {
         token.cancel();
 
         let result = call_with_retry(&config, "test-session", &token, || async {
-            Ok::<Box<dyn ChatResponse>, _>(Box::new(crate::test_utils::MockChatResponse::text_only(
-                "should not get here",
-            )) as Box<dyn ChatResponse>)
+            Ok::<ChatOutput, _>(
+                crate::test_utils::MockChatResponse::text_only("should not get here").into(),
+            )
         })
         .await;
 
@@ -859,7 +858,7 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err::<Box<dyn ChatResponse>, _>(LLMError::HttpStatus {
+                Err::<ChatOutput, _>(LLMError::HttpStatus {
                     status_code: 503,
                     message: "unavailable".to_string(),
                     retry_after_secs: Some(60),
@@ -889,14 +888,12 @@ mod tests {
             let attempt_count = Arc::clone(&attempt_count_for_call);
             async move {
                 if attempt_count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err::<Box<dyn ChatResponse>, _>(LLMError::RateLimited {
+                    Err::<ChatOutput, _>(LLMError::RateLimited {
                         message: "rate limited".into(),
                         retry_after_secs: Some(60),
                     })
                 } else {
-                    Ok::<Box<dyn ChatResponse>, _>(Box::new(
-                        crate::test_utils::MockChatResponse::text_only("ok"),
-                    ) as Box<dyn ChatResponse>)
+                    Ok::<ChatOutput, _>(crate::test_utils::MockChatResponse::text_only("ok").into())
                 }
             }
         })
@@ -933,14 +930,12 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Err::<Box<dyn ChatResponse>, _>(LLMError::from(
+                    Err::<ChatOutput, _>(LLMError::from(
                         ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "busy")
                             .with_retry_after_secs(Some(0)),
                     ))
                 } else {
-                    Ok::<Box<dyn ChatResponse>, _>(Box::new(
-                        crate::test_utils::MockChatResponse::text_only("ok"),
-                    ) as Box<dyn ChatResponse>)
+                    Ok::<ChatOutput, _>(crate::test_utils::MockChatResponse::text_only("ok").into())
                 }
             }
         })
@@ -978,7 +973,7 @@ mod tests {
         let token = CancellationToken::new();
 
         let result = call_with_retry(&config, "test-session", &token, || async {
-            Err::<Box<dyn ChatResponse>, _>(LLMError::AuthError("bad key".into()))
+            Err::<ChatOutput, _>(LLMError::AuthError("bad key".into()))
         })
         .await;
 
@@ -998,7 +993,7 @@ mod tests {
             token_clone.cancel();
         });
         let result = call_with_retry(&config, "test-session", &token, || async {
-            Err::<Box<dyn ChatResponse>, _>(LLMError::from(
+            Err::<ChatOutput, _>(LLMError::from(
                 ProviderFailure::new(ProviderErrorKind::ServerOverloaded, "busy")
                     .with_retry_after_secs(Some(60)),
             ))
@@ -1023,7 +1018,7 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err::<Box<dyn ChatResponse>, _>(LLMError::RateLimited {
+                Err::<ChatOutput, _>(LLMError::RateLimited {
                     message: "rate limited".to_string(),
                     retry_after_secs: Some(0), // 0s wait to keep test fast
                 })
@@ -1063,7 +1058,7 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err::<Box<dyn ChatResponse>, _>(LLMError::from(
+                Err::<ChatOutput, _>(LLMError::from(
                     ProviderFailure::new(
                         ProviderErrorKind::QuotaExceeded,
                         "You have hit your usage limit.",
@@ -1098,7 +1093,7 @@ mod tests {
             let count = call_count2.clone();
             async move {
                 count.fetch_add(1, Ordering::SeqCst);
-                Err::<Box<dyn ChatResponse>, _>(LLMError::AuthError("bad key".into()))
+                Err::<ChatOutput, _>(LLMError::AuthError("bad key".into()))
             }
         })
         .await;

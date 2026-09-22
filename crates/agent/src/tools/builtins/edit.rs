@@ -1,7 +1,7 @@
 //! Edit tool with fuzzy matching strategies
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 
 use crate::tools::builtins::edit_output;
@@ -560,6 +560,7 @@ impl Tool for EditTool {
                     },
                     "required": ["filePath", "oldString", "newString"]
                 }),
+                strict: None,
             },
         }
     }
@@ -572,7 +573,7 @@ impl Tool for EditTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let file_path_str = args
             .get("filePath")
             .and_then(Value::as_str)
@@ -621,7 +622,7 @@ impl Tool for EditTool {
         let file_output =
             edit_output::build_file_output_from_diff(&file_path, &content, &replacement.content);
         let output_text = edit_output::format_compact_receipt(&[file_output]);
-        Ok(vec![Content::text(output_text)])
+        Ok(vec![ToolResultPart::text(output_text)])
     }
 }
 
@@ -629,11 +630,11 @@ impl Tool for EditTool {
 mod tests {
     use super::*;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

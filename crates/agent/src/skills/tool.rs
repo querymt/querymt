@@ -4,7 +4,7 @@ use crate::skills::registry::SkillRegistry;
 use crate::skills::types::{Skill, SkillSource};
 use crate::tools::{Tool, ToolContext, ToolError};
 use async_trait::async_trait;
-use querymt::chat::Content;
+use querymt::chat::ToolResultPart;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -275,6 +275,7 @@ impl SkillTool {
                     },
                     "required": ["name"]
                 }),
+                strict: None,
             },
         }
     }
@@ -323,7 +324,11 @@ impl Tool for SkillTool {
         self.definition_for_workspace(cwd)
     }
 
-    async fn call(&self, args: Value, ctx: &dyn ToolContext) -> Result<Vec<Content>, ToolError> {
+    async fn call(
+        &self,
+        args: Value,
+        ctx: &dyn ToolContext,
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let name = args["name"]
             .as_str()
             .ok_or_else(|| ToolError::InvalidRequest("'name' parameter required".into()))?;
@@ -408,7 +413,7 @@ impl Tool for SkillTool {
             // TODO: Apply to session's active tool filter (Phase 5)
         }
 
-        Ok(vec![Content::text(output)])
+        Ok(vec![ToolResultPart::text(output)])
     }
 }
 
@@ -422,11 +427,11 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    fn first_text_block(blocks: Vec<querymt::chat::Content>) -> String {
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
         blocks
             .into_iter()
             .find_map(|b| match b {
-                querymt::chat::Content::Text { text } => Some(text),
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
                 _ => None,
             })
             .unwrap_or_default()

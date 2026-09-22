@@ -45,6 +45,7 @@ pub(crate) fn flush_tool_states(
                         arguments: state.arguments_buffer,
                     },
                 },
+                extensions: Default::default(),
             });
         }
     }

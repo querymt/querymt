@@ -7,7 +7,7 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatResponse, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
+        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -251,7 +251,7 @@ impl HTTPChatProvider for OpenRouter {
         openai_chat_request(&cfg, messages, tools)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         openai_parse_chat_with(
             self,
             normalize_openrouter_chat_error_response(response),

@@ -13,7 +13,7 @@ use crate::session::store::{
 use async_trait::async_trait;
 use mockall::mock;
 use querymt::LLMParams;
-use querymt::chat::{ChatMessage, ChatResponse, FinishReason, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, FinishReason, Tool};
 use querymt::completion::{CompletionRequest, CompletionResponse};
 use querymt::error::LLMError;
 use querymt::plugin::host::{PluginLoader, PluginType, ProviderConfig, ProviderPlugin};
@@ -246,12 +246,12 @@ mock! {
     #[async_trait]
     impl querymt::chat::ChatProvider for LlmProvider {
         fn supports_streaming(&self) -> bool;
-        async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError>;
+        async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError>;
         async fn chat_with_tools<'a, 'b, 'c>(
             &'a self,
             messages: &'b [ChatMessage],
             tools: Option<&'c [Tool]>,
-        ) -> Result<Box<dyn ChatResponse>, LLMError>;
+        ) -> Result<ChatOutput, LLMError>;
     }
 
     #[async_trait]
@@ -271,7 +271,7 @@ mock! {
             &'a self,
             name: &'b str,
             args: serde_json::Value,
-        ) -> Result<Vec<querymt::chat::Content>, LLMError>;
+        ) -> Result<Vec<querymt::chat::ToolResultPart>, LLMError>;
     }
 }
 
@@ -300,7 +300,7 @@ impl querymt::chat::ChatProvider for SharedLlmProvider {
         false
     }
 
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
         let provider = self.inner.lock().await;
         provider.chat(messages).await
     }
@@ -309,7 +309,7 @@ impl querymt::chat::ChatProvider for SharedLlmProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let provider = self.inner.lock().await;
         match tools {
             Some(_) => provider.chat_with_tools(messages, tools).await,
@@ -348,7 +348,7 @@ impl LLMProvider for SharedLlmProvider {
         &self,
         name: &str,
         args: serde_json::Value,
-    ) -> Result<Vec<querymt::chat::Content>, LLMError> {
+    ) -> Result<Vec<querymt::chat::ToolResultPart>, LLMError> {
         let provider = self.inner.lock().await;
         provider.call_tool(name, args).await
     }
@@ -461,7 +461,7 @@ impl PluginLoader for TestPluginLoader {
 }
 
 // ============================================================================
-// MockChatResponse - Mock implementation of ChatResponse
+// MockChatResponse - mock projection source for tests
 // ============================================================================
 
 #[derive(Debug)]
@@ -503,34 +503,35 @@ impl std::fmt::Display for MockChatResponse {
     }
 }
 
-impl ChatResponse for MockChatResponse {
-    fn text(&self) -> Option<String> {
-        if self.text.is_empty() {
+impl From<MockChatResponse> for ChatOutput {
+    fn from(response: MockChatResponse) -> Self {
+        let text = if response.text.is_empty() {
             None
         } else {
-            Some(self.text.clone())
-        }
-    }
+            Some(response.text.clone())
+        };
 
-    fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
-        if self.tool_calls.is_empty() {
+        let tool_calls = if response.tool_calls.is_empty() {
             None
         } else {
-            Some(self.tool_calls.clone())
-        }
-    }
+            Some(response.tool_calls.clone())
+        };
 
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
-    }
+        let finish_reason = if !response.tool_calls.is_empty() {
+            Some(FinishReason::ToolCalls)
+        } else if response.text.is_empty() {
+            Some(FinishReason::Stop)
+        } else {
+            None
+        };
 
-    fn finish_reason(&self) -> Option<FinishReason> {
-        if !self.tool_calls.is_empty() {
-            return Some(FinishReason::ToolCalls);
-        } else if self.text.is_empty() {
-            return Some(FinishReason::Stop);
-        }
-        None
+        ChatOutput::from_projections(
+            None,
+            text,
+            tool_calls,
+            response.usage.clone(),
+            finish_reason,
+        )
     }
 }
 
@@ -592,13 +593,13 @@ impl querymt::chat::ChatProvider for MockCompactionProvider {
         false
     }
 
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
         self.received_messages.lock().await.push(messages.to_vec());
 
         let mut responses = self.responses.lock().await;
         match responses.pop_front() {
-            Some(Ok(text)) => Ok(Box::new(MockChatResponse::text_only(&text))),
+            Some(Ok(text)) => Ok(MockChatResponse::text_only(&text).into()),
             Some(Err(e)) => Err(e),
             None => Err(LLMError::GenericError(
                 "No more mock responses available".to_string(),
@@ -610,7 +611,7 @@ impl querymt::chat::ChatProvider for MockCompactionProvider {
         &self,
         messages: &[ChatMessage],
         _tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         // For compaction testing, we don't use tools
         self.chat(messages).await
     }
@@ -644,7 +645,7 @@ impl LLMProvider for MockCompactionProvider {
         &self,
         _name: &str,
         _args: serde_json::Value,
-    ) -> Result<Vec<querymt::chat::Content>, LLMError> {
+    ) -> Result<Vec<querymt::chat::ToolResultPart>, LLMError> {
         Err(LLMError::NotImplemented(
             "MockCompactionProvider does not support tools".to_string(),
         ))

@@ -90,7 +90,7 @@ unsafe extern "C" fn host_log_callback(
     log::log!(target: target_str, log_level, "{}", message_str);
 }
 
-pub const NATIVE_PLUGIN_API: u32 = 1;
+pub use crate::plugin::NATIVE_PLUGIN_API;
 type PluginApiFn = unsafe extern "C" fn() -> u32;
 type PluginNameFn = unsafe extern "C" fn() -> *const c_char;
 
@@ -133,23 +133,24 @@ impl NativeLoader {
         locked: bool,
         required_api: Option<u32>,
     ) -> Result<(), LLMError> {
-        if let Some(required_api) = required_api {
-            unsafe {
-                let api = lib.get::<PluginApiFn>(b"querymt_plugin_api").map_err(|_| {
-                    LLMError::PluginError(format!(
-                        "Native plugin {} does not export required querymt_plugin_api",
-                        path.display()
-                    ))
-                })?;
-                if required_api != NATIVE_PLUGIN_API || api() != required_api {
-                    return Err(LLMError::PluginError(format!(
-                        "Native plugin {} uses API {}, configuration requires {}, host supports {}",
-                        path.display(),
-                        api(),
-                        required_api,
-                        NATIVE_PLUGIN_API
-                    )));
-                }
+        let required_api = required_api.unwrap_or(NATIVE_PLUGIN_API);
+        unsafe {
+            let api = lib.get::<PluginApiFn>(b"querymt_plugin_api").map_err(|_| {
+                LLMError::PluginError(format!(
+                    "Native plugin {} does not export required querymt_plugin_api; host requires API {}",
+                    path.display(),
+                    NATIVE_PLUGIN_API
+                ))
+            })?;
+            let plugin_api = api();
+            if required_api != NATIVE_PLUGIN_API || plugin_api != required_api {
+                return Err(LLMError::PluginError(format!(
+                    "Native plugin {} uses API {}, configuration requires {}, host supports {}",
+                    path.display(),
+                    plugin_api,
+                    required_api,
+                    NATIVE_PLUGIN_API
+                )));
             }
         }
 
@@ -306,27 +307,26 @@ mod tests {
     }
 
     #[test]
-    fn configured_api_rejects_missing_export() {
-        let error = validate_fixture("", false, Some(NATIVE_PLUGIN_API))
-            .expect_err("missing API export must fail");
+    fn every_native_plugin_rejects_missing_api_export() {
+        let error = validate_fixture("", false, None).expect_err("missing API export must fail");
         assert!(error.to_string().contains("querymt_plugin_api"));
     }
 
     #[test]
     fn configured_api_rejects_mismatch() {
         let error = validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 99 }",
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 1 }",
             false,
             Some(NATIVE_PLUGIN_API),
         )
         .expect_err("mismatched API must fail");
-        assert!(error.to_string().contains("uses API 99"));
+        assert!(error.to_string().contains("uses API 1"));
     }
 
     #[test]
     fn configured_api_accepts_match() {
         validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 1 }",
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 }",
             false,
             Some(NATIVE_PLUGIN_API),
         )
@@ -335,14 +335,19 @@ mod tests {
 
     #[test]
     fn locked_plugin_rejects_missing_name() {
-        let error = validate_fixture("", true, None).expect_err("missing name export must fail");
+        let error = validate_fixture(
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 }",
+            true,
+            None,
+        )
+        .expect_err("missing name export must fail");
         assert!(error.to_string().contains("querymt_plugin_name"));
     }
 
     #[test]
     fn locked_plugin_rejects_name_mismatch() {
         let error = validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"other_provider\".as_ptr() }",
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 } #[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"other_provider\".as_ptr() }",
             true,
             None,
         )
@@ -353,7 +358,7 @@ mod tests {
     #[test]
     fn locked_plugin_accepts_expected_name() {
         validate_fixture(
-            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"expected_provider\".as_ptr() }",
+            "#[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_api() -> u32 { 2 } #[unsafe(no_mangle)] pub extern \"C\" fn querymt_plugin_name() -> *const std::ffi::c_char { c\"expected_provider\".as_ptr() }",
             true,
             None,
         )

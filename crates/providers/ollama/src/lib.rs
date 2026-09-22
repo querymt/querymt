@@ -7,8 +7,8 @@ use http::{Method, Request, Response, header::AUTHORIZATION, header::CONTENT_TYP
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
-        StructuredOutputFormat, Tool, http::HTTPChatProvider,
+        ChatInputPart, ChatMessage, ChatOutput, ChatRole, FinishReason, MediaKind, MediaSource,
+        ReasoningEffort, StructuredOutputFormat, Tool, ToolResultPart, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -276,64 +276,62 @@ impl std::fmt::Display for OllamaResponse {
     }
 }
 
-impl ChatResponse for OllamaResponse {
-    fn text(&self) -> Option<String> {
+impl From<OllamaResponse> for ChatOutput {
+    fn from(response: OllamaResponse) -> Self {
         // FIXME: check empty string!
-        self.content
+        let text = response
+            .content
             .as_ref()
-            .or(self.response.as_ref())
-            .or(self.message.as_ref().map(|m| &m.content))
-            .map(|s| s.to_string())
-    }
+            .or(response.response.as_ref())
+            .or(response.message.as_ref().map(|m| &m.content))
+            .map(|s| s.to_string());
 
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        let msg = self.message.as_ref()?;
-        let calls = msg.tool_calls.as_ref()?;
-        Some(
-            calls
-                .iter()
-                .map(|otc| ToolCall {
-                    id: format!("call_{}", otc.function.name),
-                    call_type: "function".into(),
-                    function: FunctionCall {
-                        name: otc.function.name.clone(),
-                        arguments: serde_json::to_string(&otc.function.arguments)
-                            .unwrap_or_default(),
-                    },
-                })
-                .collect(),
-        )
-    }
+        let tool_calls = response.message.as_ref().and_then(|msg| {
+            msg.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|otc| ToolCall {
+                        id: format!("call_{}", otc.function.name),
+                        call_type: "function".into(),
+                        function: FunctionCall {
+                            name: otc.function.name.clone(),
+                            arguments: serde_json::to_string(&otc.function.arguments)
+                                .unwrap_or_default(),
+                        },
+                    })
+                    .collect()
+            })
+        });
 
-    fn usage(&self) -> Option<Usage> {
-        self.prompt_eval_count.map(|input_tokens| Usage {
+        let usage = response.prompt_eval_count.map(|input_tokens| Usage {
             input_tokens,
-            output_tokens: self.eval_count.unwrap_or(0),
+            output_tokens: response.eval_count.unwrap_or(0),
             ..Default::default()
-        })
-    }
+        });
 
-    fn finish_reason(&self) -> Option<FinishReason> {
-        if self.done {
+        let finish_reason = if response.done {
             // Check if there are tool calls - takes precedence over done_reason
             // because Ollama returns "stop" even when tool calls are present
-            if self
+            if response
                 .message
                 .as_ref()
                 .and_then(|m| m.tool_calls.as_ref())
                 .is_some_and(|tc| !tc.is_empty())
             {
-                return Some(FinishReason::ToolCalls);
+                Some(FinishReason::ToolCalls)
+            } else {
+                Some(match response.done_reason.as_deref() {
+                    Some("stop") => FinishReason::Stop,
+                    Some("length") => FinishReason::Length,
+                    Some("unload" | "load") => FinishReason::Other,
+                    Some(_) | None => FinishReason::Unknown,
+                })
             }
+        } else {
+            None
+        };
 
-            return Some(match self.done_reason.as_deref() {
-                Some("stop") => FinishReason::Stop,
-                Some("length") => FinishReason::Length,
-                Some("unload" | "load") => FinishReason::Other,
-                Some(_) | None => FinishReason::Unknown,
-            });
-        }
-        None
+        ChatOutput::from_projections(None, text, tool_calls, usage, finish_reason)
     }
 }
 
@@ -459,8 +457,8 @@ impl HTTPChatProvider for Ollama {
             }
             .to_string();
 
-            let text = msg
-                .content
+            let parts = msg.portable_input_parts();
+            let text = parts
                 .iter()
                 .filter_map(|c| c.as_text())
                 .collect::<Vec<_>>()
@@ -468,30 +466,39 @@ impl HTTPChatProvider for Ollama {
 
             let mut inline_images: Vec<String> = Vec::new();
 
-            for block in &msg.content {
-                match block {
-                    Content::Image { data, .. } => inline_images.push(BASE64.encode(data)),
-                    Content::ToolResult {
-                        id, name, content, ..
-                    } => {
-                        let output = content
-                            .iter()
-                            .filter_map(|c| c.as_text())
-                            .collect::<Vec<_>>()
-                            .join("\n");
+            for part in &parts {
+                match part {
+                    ChatInputPart::Attachment(media)
+                        if media.kind == MediaKind::Image
+                            && matches!(media.source(), MediaSource::Inline { .. }) =>
+                    {
+                        if let MediaSource::Inline { data } = media.source() {
+                            inline_images.push(BASE64.encode(data));
+                        }
+                    }
+                    ChatInputPart::ToolResult(result) => {
+                        let output = result.text_content();
                         chat_messages.push(OllamaChatMessage {
                             role: "tool".to_string(),
-                            name: name.clone(),
+                            name: result.name.clone(),
                             content: output,
                             images: None,
                         });
 
                         // If tool result contains images, emit a separate user image message
                         // because Ollama tool role only supports text content.
-                        let tool_images: Vec<String> = content
+                        let tool_images: Vec<String> = result
+                            .parts
                             .iter()
-                            .filter_map(|c| match c {
-                                Content::Image { data, .. } => Some(BASE64.encode(data)),
+                            .filter_map(|part| match part {
+                                ToolResultPart::Attachment(media)
+                                    if media.kind == MediaKind::Image =>
+                                {
+                                    match media.source() {
+                                        MediaSource::Inline { data } => Some(BASE64.encode(data)),
+                                        _ => None,
+                                    }
+                                }
                                 _ => None,
                             })
                             .collect();
@@ -499,7 +506,7 @@ impl HTTPChatProvider for Ollama {
                             chat_messages.push(OllamaChatMessage {
                                 role: "user".to_string(),
                                 name: None,
-                                content: format!("[Tool result image for {id}]"),
+                                content: format!("[Tool result image for {}]", result.call_id),
                                 images: Some(tool_images),
                             });
                         }
@@ -508,7 +515,7 @@ impl HTTPChatProvider for Ollama {
                 }
             }
 
-            let has_tool_result = msg.content.iter().any(|b| b.is_tool_result());
+            let has_tool_result = parts.iter().any(ChatInputPart::is_tool_result);
             if has_tool_result {
                 // Tool results are already emitted above.
                 // Keep non-empty text as normal role content to preserve context.
@@ -578,14 +585,14 @@ impl HTTPChatProvider for Ollama {
         Ok(self.maybe_add_auth(builder).body(req_json)?)
     }
 
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         debug_assert!(
             resp.status().is_success(),
             "parse_chat is success-only; adapter must classify non-success first"
         );
 
         let json_resp: OllamaResponse = serde_json::from_slice(resp.body())?;
-        Ok(Box::new(json_resp))
+        Ok(json_resp.into())
     }
 }
 

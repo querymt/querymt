@@ -1,6 +1,7 @@
+pub use crate::chat::{ITEM_AWARE_CHAT_CONTRACT_VERSION, messages_require_item_aware_contract};
 use crate::{
     ToolCall, Usage,
-    chat::{ChatMessage, ChatResponse, FinishReason, Tool},
+    chat::{ChatMessage, ChatOutput, FinishReason, Tool},
     completion::CompletionRequest,
     error::{LLMError, LLMErrorPayload},
     plugin::extism_impl::SerializableHttpResponse,
@@ -160,6 +161,8 @@ pub struct ExtismChatRequest<C> {
     pub cfg: C,
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<Tool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_aware_contract_version: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -347,59 +350,311 @@ impl ExtismTtsResponse {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+/// Canonical chat response crossing the Extism boundary.
+///
+/// The in-memory value has one authority. Serialization retains the shipped
+/// flattened projection alongside `output` until the contract version changes;
+/// deserialization accepts both old flattened and current canonical responses.
+#[derive(Debug)]
 pub struct ExtismChatResponse {
-    pub text: Option<String>,
-    pub tool_calls: Option<Vec<ToolCall>>,
-    pub thinking: Option<String>,
-    pub usage: Option<Usage>,
-    pub finish_reason: Option<FinishReason>,
+    pub output: ChatOutput,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Deserialize)]
+struct ExtismChatResponseDto {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCall>>,
+    #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    usage: Option<Usage>,
+    #[serde(default)]
+    finish_reason: Option<FinishReason>,
+    #[serde(default)]
+    output: Option<ChatOutput>,
+}
+
+impl Serialize for ExtismChatResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let mut state = serializer.serialize_struct("ExtismChatResponse", 6)?;
+        state.serialize_field("text", &self.output.text())?;
+        state.serialize_field("tool_calls", &self.output.tool_calls())?;
+        state.serialize_field("thinking", &self.output.thinking())?;
+        state.serialize_field("usage", &self.output.usage)?;
+        state.serialize_field("finish_reason", &self.output.finish_reason)?;
+        state.serialize_field("output", &self.output)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtismChatResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let dto = ExtismChatResponseDto::deserialize(deserializer)?;
+        Ok(Self {
+            output: dto.output.unwrap_or_else(|| {
+                ChatOutput::from_projections(
+                    dto.thinking,
+                    dto.text,
+                    dto.tool_calls,
+                    dto.usage,
+                    dto.finish_reason,
+                )
+            }),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExtismChatChunk {
     pub chunk: crate::chat::StreamChunk,
-    pub usage: Option<Usage>,
+}
+
+impl Serialize for ExtismChatChunk {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let usage = match &self.chunk {
+            crate::chat::StreamChunk::Usage(usage) => Some(usage),
+            _ => None,
+        };
+        let mut state = serializer.serialize_struct("ExtismChatChunk", 2)?;
+        state.serialize_field("chunk", &self.chunk)?;
+        state.serialize_field("usage", &usage)?;
+        state.end()
+    }
 }
 
 impl fmt::Display for ExtismChatResponse {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // If there’s a top‐level `text`, show that…
-        if let Some(ref txt) = self.text {
-            write!(f, "{}", txt)
-        } else {
-            // …otherwise Fall back to Debug or JSON:
-            write!(f, "{:?}", self)
-        }
+        write!(f, "{}", self.output)
     }
 }
 
-impl ChatResponse for ExtismChatResponse {
-    fn text(&self) -> Option<String> {
-        self.text.clone()
+impl ExtismChatResponse {
+    pub fn into_canonical_output(self) -> ChatOutput {
+        self.output
     }
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        self.tool_calls.clone()
-    }
-    fn thinking(&self) -> Option<String> {
-        self.thinking.clone()
-    }
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
-    }
-    fn finish_reason(&self) -> Option<FinishReason> {
-        self.finish_reason
+
+    pub fn output(&self) -> &ChatOutput {
+        &self.output
     }
 }
 
-impl From<Box<dyn ChatResponse>> for ExtismChatResponse {
-    fn from(r: Box<dyn ChatResponse>) -> Self {
-        ExtismChatResponse {
-            text: r.text(),
-            tool_calls: r.tool_calls(),
-            thinking: r.thinking(),
-            usage: r.usage(),
-            finish_reason: r.finish_reason(),
-        }
+impl From<ChatOutput> for ExtismChatResponse {
+    fn from(output: ChatOutput) -> Self {
+        ExtismChatResponse { output }
+    }
+}
+
+#[cfg(test)]
+mod item_aware_tests {
+    use super::*;
+    use crate::chat::{ChatOutput, ChatOutputStatus};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_extism_payloads_default_item_aware_fields() {
+        let request: ExtismChatRequest<serde_json::Value> = serde_json::from_value(json!({
+            "cfg": {},
+            "messages": [],
+            "tools": null
+        }))
+        .expect("legacy request");
+        assert_eq!(request.item_aware_contract_version, None);
+
+        let response: ExtismChatResponse = serde_json::from_value(json!({
+            "text": "legacy",
+            "tool_calls": null,
+            "thinking": null,
+            "usage": null,
+            "finish_reason": "Stop"
+        }))
+        .expect("legacy response");
+        assert_eq!(response.output.text().as_deref(), Some("legacy"));
+
+        let legacy_history: ExtismChatRequest<serde_json::Value> = serde_json::from_value(json!({
+            "cfg": {},
+            "messages": [{
+                "role": "User",
+                "content": [{"type": "text", "text": "hello"}]
+            }],
+            "tools": null
+        }))
+        .expect("legacy history request");
+        let saved = serde_json::to_value(&legacy_history).expect("serialize canonical request");
+        let message = &saved["messages"][0];
+        assert!(message.get("content").is_none());
+        assert_eq!(message["input"][0]["type"], "text");
+        assert_eq!(message["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn structured_extism_response_round_trips_losslessly() {
+        let output = ChatOutput {
+            response_id: Some("response-1".into()),
+            items: vec![crate::chat::ChatOutputItem::FunctionCall(
+                crate::chat::ChatFunctionCallItem {
+                    item_id: Some("item-1".into()),
+                    call_id: "call-1".into(),
+                    name: "lookup".into(),
+                    arguments: "{not valid json".into(),
+                    status: Some(ChatOutputStatus::Completed),
+                    extensions: Default::default(),
+                },
+            )],
+            status: Some(ChatOutputStatus::Completed),
+            extensions: [("provider_field".into(), json!({"nested": true}))]
+                .into_iter()
+                .collect(),
+            ..ChatOutput::default()
+        };
+        let response = ExtismChatResponse::from(output.clone());
+
+        let encoded = serde_json::to_vec(&response).expect("serialize response");
+        let encoded_value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("response JSON");
+        assert_eq!(encoded_value.as_object().unwrap().len(), 6);
+        assert!(encoded_value.get("output").is_some());
+        assert_eq!(encoded_value.get("text"), Some(&serde_json::Value::Null));
+        assert!(encoded_value["tool_calls"].is_array());
+
+        let decoded: ExtismChatResponse =
+            serde_json::from_slice(&encoded).expect("deserialize response");
+        assert_eq!(decoded.output(), &output);
+        let decoded_call = match &decoded.output().items[0] {
+            crate::chat::ChatOutputItem::FunctionCall(call) => call,
+            other => panic!("expected function call, got {other:?}"),
+        };
+        assert_eq!(decoded_call.item_id.as_deref(), Some("item-1"));
+        assert_eq!(decoded_call.call_id, "call-1");
+        assert_eq!(decoded_call.arguments, "{not valid json");
+    }
+
+    /// End-to-end over the Extism transport: a structured assistant response is
+    /// carried back as a request history item (response -> reload -> tool result
+    /// -> second request) with item/call IDs, raw arguments, and order intact.
+    #[test]
+    fn structured_extism_history_round_trips_into_second_request() {
+        use crate::chat::{
+            ChatFunctionCallItem, ChatMessage, ChatMessageItem, ChatMessagePart, ChatOutputItem,
+            ChatReasoningItem, ChatReasoningPart,
+        };
+
+        let raw_arguments = "{\"query\":\"rust\",\"limit\": 2 }";
+        let output = ChatOutput {
+            response_id: Some("resp-extism".into()),
+            status: Some(ChatOutputStatus::Completed),
+            items: vec![
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning-extism".into()),
+                    summary: vec![ChatReasoningPart::text("thinking")],
+                    content: Vec::new(),
+                    encrypted_content: Some("encrypted-continuation".into()),
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::Message(ChatMessageItem {
+                    id: Some("message-extism".into()),
+                    role: crate::chat::ChatRole::Assistant,
+                    phase: None,
+                    status: None,
+                    parts: vec![ChatMessagePart::Text {
+                        text: "running lookup".into(),
+                        annotations: Vec::new(),
+                        extensions: Default::default(),
+                    }],
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("fc-item-extism".into()),
+                    call_id: "call-extism".into(),
+                    name: "lookup".into(),
+                    arguments: raw_arguments.into(),
+                    status: None,
+                    extensions: Default::default(),
+                }),
+            ],
+            ..ChatOutput::default()
+        };
+
+        let assistant = ChatMessage::from_assistant_output(output);
+
+        // Second request carries the structured turn plus its tool result.
+        let mut tool_result = crate::chat::ToolResult::new("call-extism");
+        tool_result.name = Some("lookup".into());
+        tool_result.parts.push(crate::chat::ToolResultPart::Text {
+            text: "result payload".into(),
+        });
+        let result = ChatMessage::from_user_parts(vec![crate::chat::ChatInputPart::tool_result(
+            tool_result,
+        )]);
+        let request = ExtismChatRequest {
+            cfg: json!({}),
+            messages: vec![
+                ChatMessage::from_user_parts(vec![crate::chat::ChatInputPart::text("look it up")]),
+                assistant,
+                result,
+            ],
+            tools: None,
+            item_aware_contract_version: None,
+        };
+        assert!(
+            messages_require_item_aware_contract(&request.messages),
+            "structured history must advertise the item-aware contract"
+        );
+
+        let encoded = serde_json::to_vec(&request).expect("serialize request");
+        let decoded: ExtismChatRequest<serde_json::Value> =
+            serde_json::from_slice(&encoded).expect("deserialize request");
+
+        let reloaded = &decoded.messages[1];
+        let reloaded_output = reloaded.output().expect("structured output survives");
+        assert_eq!(
+            reloaded_output.items.len(),
+            3,
+            "no duplicate projected items across the plugin boundary"
+        );
+
+        let ChatOutputItem::Reasoning(reasoning) = &reloaded_output.items[0] else {
+            panic!("expected reasoning item");
+        };
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("encrypted-continuation"),
+            "encrypted continuation survives the plugin boundary"
+        );
+
+        let ChatOutputItem::FunctionCall(call) = &reloaded_output.items[2] else {
+            panic!("expected function call item");
+        };
+        assert_eq!(call.call_id, "call-extism");
+        assert_eq!(call.item_id.as_deref(), Some("fc-item-extism"));
+        assert_eq!(call.arguments, raw_arguments, "raw arguments byte-exact");
+
+        // The tool result references the original call ID.
+        let tool_result = decoded.messages[2]
+            .input()
+            .expect("canonical tool result input")
+            .iter()
+            .find_map(|part| match part {
+                crate::chat::ChatInputPart::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("tool result present");
+        assert_eq!(tool_result.call_id, "call-extism");
     }
 }

@@ -5,7 +5,7 @@ use crate::{
     adapters::LLMProviderFromHTTP,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatProvider, ChatResponse, StreamChunk, Tool,
+        ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{
@@ -20,8 +20,9 @@ use crate::{
             ExtismChatRequest, ExtismChatResponse, ExtismCompleteParseRequest,
             ExtismEmbedParseRequest, ExtismEmbedRequest, ExtismListModelsParseRequest,
             ExtismListModelsRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
-            ExtismTtsResponse, ExtismVoiceConfig, SerializableHttpRequest,
-            SerializableHttpResponse,
+            ExtismTtsResponse, ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION,
+            SerializableHttpRequest, SerializableHttpResponse,
+            messages_require_item_aware_contract,
         },
     },
     stt, tts,
@@ -587,6 +588,59 @@ pub struct ExtismProvider {
 }
 
 impl ExtismProvider {
+    fn item_aware_contract_version(&self) -> Result<Option<u32>, LLMError> {
+        self.call_short_blocking(
+            "item_aware_chat_contract_version",
+            Self::probe_item_aware_contract_version,
+        )
+    }
+
+    /// Probe the advertised item-aware contract version through an
+    /// already-locked plugin.
+    fn probe_item_aware_contract_version(plug: &mut Plugin) -> Result<Option<u32>, LLMError> {
+        if !plug.function_exists("item_aware_chat_contract_version") {
+            return Ok(None);
+        }
+        let version: Json<u32> = plug
+            .call_get_error_code("item_aware_chat_contract_version", ())
+            .map_err(|(e, code)| decode_plugin_error(e, code))?;
+        Ok(Some(version.0))
+    }
+
+    fn validate_item_aware_messages(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Option<u32>, LLMError> {
+        if !messages_require_item_aware_contract(messages) {
+            return Ok(None);
+        }
+        Self::ensure_item_aware_contract_version(self.item_aware_contract_version()?)
+    }
+
+    /// Same validation as [`Self::validate_item_aware_messages`], but probing
+    /// through an already-locked plugin so async entry points never
+    /// synchronously block on the plugin mutex.
+    fn validate_item_aware_messages_with_plugin(
+        plug: &mut Plugin,
+        messages: &[ChatMessage],
+    ) -> Result<Option<u32>, LLMError> {
+        if !messages_require_item_aware_contract(messages) {
+            return Ok(None);
+        }
+        Self::ensure_item_aware_contract_version(Self::probe_item_aware_contract_version(plug)?)
+    }
+
+    fn ensure_item_aware_contract_version(version: Option<u32>) -> Result<Option<u32>, LLMError> {
+        if version != Some(ITEM_AWARE_CHAT_CONTRACT_VERSION) {
+            return Err(LLMError::InvalidRequest(format!(
+                "Extism plugin does not support item-aware chat contract version {}; advertised version: {}",
+                ITEM_AWARE_CHAT_CONTRACT_VERSION,
+                version.map_or_else(|| "none".to_string(), |value| value.to_string())
+            )));
+        }
+        Ok(version)
+    }
+
     fn user_data_required(&self) -> Result<extism::UserData<functions::HostState>, LLMError> {
         self.user_data
             .clone()
@@ -727,7 +781,7 @@ impl ChatProvider for ExtismProvider {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let mut cfg = self.config.clone();
 
         // Refresh OAuth token if resolver is present
@@ -741,16 +795,23 @@ impl ChatProvider for ExtismProvider {
             }
         }
 
-        let arg = ExtismChatRequest {
-            cfg,
-            messages: messages.to_vec(),
-            tools: tools.map(|v| v.to_vec()),
-        };
+        let messages = messages.to_vec();
+        let tools = tools.map(|v| v.to_vec());
         // chat can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread to
         // avoid deadlocks on current-thread runtimes. Also wire cancellation so dropping the
         // future can interrupt host HTTP and release the plugin mutex.
         let out = self
             .call_blocking_with_cancel("chat", move |plug| {
+                // The item-aware contract probe runs here, with the plugin
+                // mutex already held, so the async executor never blocks on it.
+                let item_aware_contract_version =
+                    Self::validate_item_aware_messages_with_plugin(plug, &messages)?;
+                let arg = ExtismChatRequest {
+                    cfg,
+                    messages,
+                    tools,
+                    item_aware_contract_version,
+                };
                 let out: Json<ExtismChatResponse> = plug
                     .call_get_error_code("chat", Json(arg))
                     .map_err(|(e, code)| decode_plugin_error(e, code))?;
@@ -758,7 +819,7 @@ impl ChatProvider for ExtismProvider {
             })
             .await?;
 
-        Ok(Box::new(out) as Box<dyn ChatResponse>)
+        Ok(out.into_canonical_output())
     }
 
     #[cfg_attr(
@@ -813,11 +874,8 @@ impl ChatProvider for ExtismProvider {
         if let Some(obj) = cfg.as_object_mut() {
             obj.insert("stream".to_string(), serde_json::Value::Bool(true));
         }
-        let arg = ExtismChatRequest {
-            cfg,
-            messages: messages.to_vec(),
-            tools: tools.map(|v| v.to_vec()),
-        };
+        let messages = messages.to_vec();
+        let tools = tools.map(|v| v.to_vec());
 
         let caller_span = tracing::Span::current();
 
@@ -825,6 +883,30 @@ impl ChatProvider for ExtismProvider {
             let _guard = caller_span.enter();
             log::debug!("Extism plugin chat_stream thread started");
             let mut plug = plugin.lock().unwrap();
+
+            // The item-aware contract probe runs here, with the plugin mutex
+            // already held, so the async executor never blocks on it.
+            let arg = match Self::validate_item_aware_messages_with_plugin(&mut plug, &messages) {
+                Ok(item_aware_contract_version) => ExtismChatRequest {
+                    cfg,
+                    messages,
+                    tools,
+                    item_aware_contract_version,
+                },
+                Err(error) => {
+                    log::error!("chat_stream contract probe failed: {:#}", error);
+                    // Surface the failure like a plugin error and release the
+                    // stream wiring so the consumer sees the stream end.
+                    if let Ok(state) = user_data_clone.get() {
+                        let mut state_guard = state.lock().unwrap();
+                        if let Some(tx) = state_guard.yield_tx.take() {
+                            let _ = tx.send(Err(error));
+                        }
+                    }
+                    return;
+                }
+            };
+
             let res: Result<(), (extism::Error, i32)> =
                 plug.call_get_error_code("chat_stream", Json(arg));
 
@@ -1227,6 +1309,7 @@ impl HTTPChatProvider for ExtismProvider {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<http::Request<Vec<u8>>, LLMError> {
+        let item_aware_contract_version = self.validate_item_aware_messages(messages)?;
         let cfg = self.effective_config()?;
         self.call_short_blocking("chat_request", move |plug| {
             let req: Json<SerializableHttpRequest> = plug
@@ -1236,6 +1319,7 @@ impl HTTPChatProvider for ExtismProvider {
                         cfg,
                         messages: messages.to_vec(),
                         tools: tools.map(|v| v.to_vec()),
+                        item_aware_contract_version,
                     }),
                 )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
@@ -1262,6 +1346,7 @@ impl HTTPChatProvider for ExtismProvider {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<http::Request<Vec<u8>>, LLMError> {
+        let item_aware_contract_version = self.validate_item_aware_messages(messages)?;
         let cfg = self.effective_config()?;
         self.call_short_blocking("chat_stream_request", move |plug| {
             let req: Json<SerializableHttpRequest> = plug
@@ -1271,6 +1356,7 @@ impl HTTPChatProvider for ExtismProvider {
                         cfg,
                         messages: messages.to_vec(),
                         tools: tools.map(|v| v.to_vec()),
+                        item_aware_contract_version,
                     }),
                 )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
@@ -1292,7 +1378,7 @@ impl HTTPChatProvider for ExtismProvider {
         })
     }
 
-    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         let cfg = self.effective_config()?;
         let out = self.call_short_blocking("parse_chat_response", move |plug| {
             let out: Json<ExtismChatResponse> = plug
@@ -1307,7 +1393,7 @@ impl HTTPChatProvider for ExtismProvider {
             Ok(out.0)
         })?;
 
-        Ok(Box::new(out) as Box<dyn ChatResponse>)
+        Ok(out.into_canonical_output())
     }
 
     fn supports_streaming(&self) -> bool {
@@ -1426,7 +1512,7 @@ impl HTTPLLMProvider for ExtismProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::StreamChunk;
+    use crate::{Usage, chat::StreamChunk};
 
     #[test]
     fn malformed_config_is_json_error() {
@@ -1505,12 +1591,23 @@ mod tests {
     fn decode_stream_item_returns_chunk_for_valid_payload() {
         let bytes = serde_json::to_vec(&crate::plugin::extism_impl::ExtismChatChunk {
             chunk: StreamChunk::Text("hello".into()),
-            usage: None,
         })
         .expect("serialize chunk");
 
         let chunk = decode_stream_item(Ok(bytes)).expect("chunk should decode");
         assert!(matches!(chunk, StreamChunk::Text(text) if text == "hello"));
+    }
+
+    #[test]
+    fn decode_stream_item_accepts_legacy_duplicate_usage_field() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "chunk": {"usage": Usage::default()},
+            "usage": Usage::default()
+        }))
+        .expect("serialize legacy chunk");
+
+        let chunk = decode_stream_item(Ok(bytes)).expect("legacy chunk should decode");
+        assert!(matches!(chunk, StreamChunk::Usage(_)));
     }
 
     #[test]

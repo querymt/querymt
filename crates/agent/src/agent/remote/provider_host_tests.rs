@@ -120,6 +120,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
 
         let result = actor_ref.ask(req).await;
@@ -156,7 +157,7 @@ mod provider_host_tests {
         StreamChunkRelay, StreamRelayMessage,
     };
     use kameo::actor::Spawn;
-    use querymt::chat::{ChatResponse, FinishReason, StreamChunk};
+    use querymt::chat::{FinishReason, StreamChunk};
     use querymt::{FunctionCall, ToolCall};
     use querymt_remote::StreamReceiverActor;
 
@@ -164,31 +165,23 @@ mod provider_host_tests {
 
     #[test]
     fn test_provider_chat_response_text_roundtrip() {
-        let resp = ProviderChatResponse {
-            text: Some("hello world".to_string()),
-            thinking: None,
-            tool_calls: vec![],
-            usage: None,
-            finish_reason: Some("Stop".to_string()),
-        };
-        assert_eq!(resp.text(), Some("hello world".to_string()));
+        let resp: ProviderChatResponse = serde_json::from_value(serde_json::json!({
+            "text": "hello world",
+            "thinking": null,
+            "tool_calls": [],
+            "usage": null,
+            "finish_reason": "Stop"
+        }))
+        .expect("legacy response");
+        assert_eq!(resp.output.text().as_deref(), Some("hello world"));
     }
 
     // ── A.2 ──────────────────────────────────────────────────────────────────
 
     #[test]
     fn test_provider_chat_response_tool_calls_empty_is_none() {
-        let resp = ProviderChatResponse {
-            text: None,
-            thinking: None,
-            tool_calls: vec![],
-            usage: None,
-            finish_reason: None,
-        };
-        assert!(
-            resp.tool_calls().is_none(),
-            "empty tool_calls vec should yield None"
-        );
+        let resp = ProviderChatResponse::from(querymt::chat::ChatOutput::default());
+        assert!(resp.output.tool_calls().is_none());
     }
 
     // ── A.3 — Bug #7 ─────────────────────────────────────────────────────────
@@ -221,14 +214,15 @@ mod provider_host_tests {
             );
 
             // Confirm the client-side deserialization round-trips.
-            let resp = ProviderChatResponse {
-                text: None,
-                thinking: None,
-                tool_calls: vec![],
-                usage: None,
-                finish_reason: Some(expected_str.to_string()),
-            };
-            let roundtripped = resp.finish_reason().expect("should be Some");
+            let resp: ProviderChatResponse = serde_json::from_value(serde_json::json!({
+                "text": null,
+                "thinking": null,
+                "tool_calls": [],
+                "usage": null,
+                "finish_reason": expected_str
+            }))
+            .expect("legacy response");
+            let roundtripped = resp.output.finish_reason.expect("should be Some");
             // Compare via Debug string since FinishReason may not be PartialEq.
             assert_eq!(
                 format!("{:?}", roundtripped),
@@ -243,14 +237,15 @@ mod provider_host_tests {
 
     #[test]
     fn test_provider_chat_response_unknown_finish_reason() {
-        let resp = ProviderChatResponse {
-            text: None,
-            thinking: None,
-            tool_calls: vec![],
-            usage: None,
-            finish_reason: Some("GibberishReason".to_string()),
-        };
-        let reason = resp.finish_reason().expect("should be Some");
+        let resp: ProviderChatResponse = serde_json::from_value(serde_json::json!({
+            "text": null,
+            "thinking": null,
+            "tool_calls": [],
+            "usage": null,
+            "finish_reason": "GibberishReason"
+        }))
+        .expect("legacy response");
+        let reason = resp.output.finish_reason.expect("should be Some");
         assert_eq!(
             format!("{:?}", reason),
             format!("{:?}", FinishReason::Unknown)
@@ -261,29 +256,22 @@ mod provider_host_tests {
 
     #[test]
     fn test_provider_chat_response_serde_roundtrip() {
-        let original = ProviderChatResponse {
-            text: Some("serde test".to_string()),
-            thinking: Some("some thought".to_string()),
-            tool_calls: vec![],
-            usage: Some(querymt::Usage {
+        let output = querymt::chat::ChatOutput::from_projections(
+            Some("some thought".to_string()),
+            Some("serde test".to_string()),
+            None,
+            Some(querymt::Usage {
                 input_tokens: 10,
                 output_tokens: 5,
                 ..Default::default()
             }),
-            finish_reason: Some("Stop".to_string()),
-        };
-
+            Some(FinishReason::Stop),
+        );
+        let original = ProviderChatResponse::from(output.clone());
         let serialized = serde_json::to_string(&original).expect("serialize");
         let deserialized: ProviderChatResponse =
             serde_json::from_str(&serialized).expect("deserialize");
-
-        assert_eq!(deserialized.text, original.text);
-        assert_eq!(deserialized.thinking, original.thinking);
-        assert_eq!(deserialized.finish_reason, original.finish_reason);
-        assert_eq!(
-            deserialized.usage.as_ref().map(|u| u.input_tokens),
-            original.usage.as_ref().map(|u| u.input_tokens),
-        );
+        assert_eq!(deserialized.output, output);
     }
 
     // ── A.6 ──────────────────────────────────────────────────────────────────
@@ -358,6 +346,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
         let result = f.actor_ref.ask(req).await;
         // The ask returns Result<Result<ProviderChatResponse, AgentError>, SendError>
@@ -395,6 +384,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
 
         // Both calls fail for the same reason (provider not found).
@@ -571,22 +561,16 @@ mod provider_host_tests {
 
     #[test]
     fn test_provider_chat_response_display_impl() {
-        let with_text = ProviderChatResponse {
-            text: Some("my response".to_string()),
-            thinking: None,
-            tool_calls: vec![],
-            usage: None,
-            finish_reason: None,
-        };
+        let with_text = ProviderChatResponse::from(querymt::chat::ChatOutput::from_projections(
+            None,
+            Some("my response".to_string()),
+            None,
+            None,
+            None,
+        ));
         assert_eq!(with_text.to_string(), "my response");
 
-        let no_text = ProviderChatResponse {
-            text: None,
-            thinking: None,
-            tool_calls: vec![],
-            usage: None,
-            finish_reason: None,
-        };
+        let no_text = ProviderChatResponse::from(querymt::chat::ChatOutput::default());
         assert_eq!(no_text.to_string(), "[no text]");
     }
 
@@ -692,6 +676,7 @@ mod provider_host_tests {
                 "temperature": 0.3,
                 "n_ctx": 32768
             })),
+            item_aware_contract_version: None,
         };
 
         let json = serde_json::to_string(&req).expect("serialize");
@@ -770,6 +755,7 @@ mod provider_host_tests {
             messages: vec![],
             tools: None,
             params: None,
+            item_aware_contract_version: None,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(
@@ -974,14 +960,14 @@ mod provider_host_tests {
                 arguments: "{}".to_string(),
             },
         };
-        let resp = ProviderChatResponse {
-            text: None,
-            thinking: None,
-            tool_calls: vec![tc.clone()],
-            usage: None,
-            finish_reason: None,
-        };
-        let returned = resp.tool_calls().expect("should be Some");
+        let resp = ProviderChatResponse::from(querymt::chat::ChatOutput::from_projections(
+            None,
+            None,
+            Some(vec![tc]),
+            None,
+            None,
+        ));
+        let returned = resp.output.tool_calls().expect("should be Some");
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0].function.name, "my_tool");
     }

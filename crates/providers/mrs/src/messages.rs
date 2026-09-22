@@ -1,6 +1,8 @@
 use image::load_from_memory;
 use mistralrs::{AudioInput, Model, ModelCategory, RequestBuilder, TextMessageRole};
-use querymt::chat::{ChatMessage, ChatRole, Content};
+use querymt::chat::{
+    ChatInputPart, ChatMessage, ChatOutputItem, ChatRole, MediaKind, MediaSource, ToolResultPart,
+};
 use querymt::error::LLMError;
 
 use crate::tools::convert_tool_call;
@@ -17,8 +19,8 @@ pub(crate) fn apply_message_to_request(
     msg: &ChatMessage,
 ) -> Result<RequestBuilder, LLMError> {
     let role = map_chat_role(&msg.role);
-    let text = msg
-        .content
+    let parts = msg.portable_input_parts();
+    let text = parts
         .iter()
         .filter_map(|c| c.as_text())
         .collect::<Vec<_>>()
@@ -28,35 +30,50 @@ pub(crate) fn apply_message_to_request(
     let mut images = Vec::new();
     let mut audios: Vec<AudioInput> = Vec::new();
 
-    for block in &msg.content {
-        match block {
-            Content::ToolUse {
-                id,
-                name,
-                arguments,
-            } => {
-                let call = querymt::ToolCall {
-                    id: id.clone(),
-                    call_type: "function".to_string(),
-                    function: querymt::FunctionCall {
-                        name: name.clone(),
-                        arguments: serde_json::to_string(arguments).unwrap_or_default(),
-                    },
-                };
+    // Replay generated function calls from structured output.
+    if let Some(output) = msg.output() {
+        for item in &output.items {
+            if let ChatOutputItem::FunctionCall(call) = item {
+                let tool_call = call.to_tool_call();
                 let idx = tool_uses.len();
-                tool_uses.push(convert_tool_call(idx, &call));
+                tool_uses.push(convert_tool_call(idx, &tool_call));
             }
-            Content::ToolResult { id, content, .. } => {
-                let output = content
-                    .iter()
-                    .filter_map(|c| c.as_text())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                req = req.add_tool_message(output, id.clone());
+        }
+    }
+
+    for part in &parts {
+        match part {
+            ChatInputPart::Text { .. } => {}
+            ChatInputPart::Attachment(media) => match (&media.kind, media.source()) {
+                (MediaKind::Image, MediaSource::Inline { data }) => {
+                    let image = load_from_memory(data).map_err(|e| {
+                        LLMError::InvalidRequest(format!("invalid image payload: {e}"))
+                    })?;
+                    images.push(image);
+                }
+                (MediaKind::Audio, MediaSource::Inline { data }) => {
+                    let audio = AudioInput::from_bytes(data).map_err(|e| {
+                        LLMError::InvalidRequest(format!("invalid audio payload: {e}"))
+                    })?;
+                    audios.push(audio);
+                }
+                (_, MediaSource::DataUrl { .. } | MediaSource::Url { .. }) => {
+                    return Err(LLMError::InvalidRequest(
+                        "mistralrs provider does not support referenced media content".into(),
+                    ));
+                }
+                _ => {}
+            },
+            ChatInputPart::ToolResult(result) => {
+                let output = result.text_content();
+                req = req.add_tool_message(output, result.call_id.clone());
 
                 // ToolResult images are emitted as adjacent image messages.
-                for inner in content {
-                    if let Content::Image { data, .. } = inner {
+                for inner in &result.parts {
+                    if let ToolResultPart::Attachment(media) = inner
+                        && media.kind == MediaKind::Image
+                        && let MediaSource::Inline { data } = media.source()
+                    {
                         let image = load_from_memory(data).map_err(|e| {
                             LLMError::InvalidRequest(format!("invalid image payload: {e}"))
                         })?;
@@ -64,22 +81,6 @@ pub(crate) fn apply_message_to_request(
                     }
                 }
             }
-            Content::Image { data, .. } => {
-                let image = load_from_memory(data)
-                    .map_err(|e| LLMError::InvalidRequest(format!("invalid image payload: {e}")))?;
-                images.push(image);
-            }
-            Content::Audio { data, .. } => {
-                let audio = AudioInput::from_bytes(data)
-                    .map_err(|e| LLMError::InvalidRequest(format!("invalid audio payload: {e}")))?;
-                audios.push(audio);
-            }
-            Content::Pdf { .. } | Content::ImageUrl { .. } => {
-                return Err(LLMError::InvalidRequest(
-                    "mistralrs provider does not support PDF or image URL content".into(),
-                ));
-            }
-            _ => {}
         }
     }
 

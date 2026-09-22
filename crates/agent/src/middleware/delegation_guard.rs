@@ -144,8 +144,6 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
                 response: _,
                 ref context,
             } => {
-                use crate::model::MessagePart;
-
                 // Get the session history
                 let history = match self.store.get_history(&context.session_id).await {
                     Ok(h) => h,
@@ -158,11 +156,9 @@ impl MiddlewareDriver for DelegationGuardMiddleware {
                         return Ok(state);
                     }
 
-                    // Check for delegate tool calls
-                    for part in &last_msg.parts {
-                        if let MessagePart::ToolUse(tool_call) = part
-                            && tool_call.function.name == "delegate"
-                        {
+                    // Check for delegate tool calls (legacy parts or canonical output)
+                    for tool_call in last_msg.function_calls() {
+                        if tool_call.function.name == "delegate" {
                             // Parse the delegation arguments
                             if let Ok(args) = serde_json::from_str::<serde_json::Value>(
                                 &tool_call.function.arguments,

@@ -10,7 +10,7 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider, ToolCall,
     chat::{
-        ChatMessage, ChatResponse, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatMessage, ChatOutput, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -161,7 +161,7 @@ impl HTTPChatProvider for Mistral {
         openai_chat_request(self, messages, tools)
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 }

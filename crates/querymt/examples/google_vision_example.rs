@@ -47,7 +47,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ChatMessage::user()
             .text("Explain what you see in the image")
             .build(),
-        ChatMessage::user().image("image/jpeg", content).build(),
+        ChatMessage::user()
+            .image("image/jpeg".parse().unwrap(), content)
+            .build(),
     ];
 
     // Send chat request and handle the response

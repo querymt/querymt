@@ -130,11 +130,7 @@ impl<'a> PromptChain<'a> {
 
             let response_text = match step.mode {
                 ChainStepMode::Chat => {
-                    let messages = vec![crate::chat::ChatMessage {
-                        role: crate::chat::ChatRole::User,
-                        content: vec![crate::chat::Content::text(prompt)],
-                        cache: None,
-                    }];
+                    let messages = vec![crate::chat::ChatMessage::user().text(prompt).build()];
                     self.llm.chat(&messages).await?
                 }
                 ChainStepMode::Completion => {
@@ -142,7 +138,7 @@ impl<'a> PromptChain<'a> {
                     req.max_tokens = step.max_tokens;
                     req.temperature = step.temperature;
                     let resp = self.llm.complete(&req).await?;
-                    Box::new(resp)
+                    resp.into()
                 }
             };
 

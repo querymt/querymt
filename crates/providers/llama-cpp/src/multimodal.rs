@@ -11,7 +11,7 @@
 use crate::config::LlamaCppConfig;
 use llama_cpp_2::model::{LlamaModel, RopeType};
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdContext, MtmdContextParams, mtmd_default_marker};
-use querymt::chat::{ChatMessage, Content};
+use querymt::chat::{ChatInputPart, ChatMessage, MediaKind, MediaSource, ToolResultPart};
 use querymt::error::LLMError;
 use querymt_provider_common::{
     HfFileRef, ModelRef, ModelRefError, download_hf_file_sync, parse_model_ref, terminal_progress,
@@ -282,32 +282,44 @@ pub(crate) fn extract_media(messages: &[ChatMessage]) -> Vec<MediaAttachment> {
     let mut attachments = Vec::new();
 
     for msg in messages {
-        for block in &msg.content {
-            match block {
-                Content::Image { mime_type, data } => {
-                    attachments.push(MediaAttachment {
-                        data: data.clone(),
-                        mime: mime_type.clone(),
-                        is_audio: false,
-                    });
-                }
-                Content::ImageUrl { .. } => {
-                    // Future: fetch from URL
-                    log::warn!("ImageURL not yet supported, skipping");
-                }
-                Content::ToolResult { content, .. } => {
+        for part in msg.portable_input_parts() {
+            match part {
+                ChatInputPart::Attachment(media) => match (&media.kind, media.source()) {
+                    (MediaKind::Image, MediaSource::Inline { data }) => {
+                        attachments.push(MediaAttachment {
+                            data: data.clone(),
+                            mime: media
+                                .media_type()
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                            is_audio: false,
+                        });
+                    }
+                    (_, MediaSource::DataUrl { .. } | MediaSource::Url { .. }) => {
+                        // Future: fetch from URL
+                        log::warn!("Referenced media not yet supported, skipping");
+                    }
+                    _ => {}
+                },
+                ChatInputPart::ToolResult(result) => {
                     // Also extract images nested in tool results.
-                    for inner in content {
-                        if let Content::Image { mime_type, data } = inner {
+                    for inner in &result.parts {
+                        if let ToolResultPart::Attachment(media) = inner
+                            && media.kind == MediaKind::Image
+                            && let MediaSource::Inline { data } = media.source()
+                        {
                             attachments.push(MediaAttachment {
                                 data: data.clone(),
-                                mime: mime_type.clone(),
+                                mime: media
+                                    .media_type()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_default(),
                                 is_audio: false,
                             });
                         }
                     }
                 }
-                _ => {}
+                ChatInputPart::Text { .. } => {}
             }
         }
     }
@@ -318,19 +330,57 @@ pub(crate) fn extract_media(messages: &[ChatMessage]) -> Vec<MediaAttachment> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::chat::ChatRole;
+    use querymt::chat::{
+        ChatInputPart, MediaKind, MediaPart, MediaSource, MediaType, ToolResult, ToolResultPart,
+    };
 
-    fn user_msg(blocks: Vec<Content>) -> ChatMessage {
-        ChatMessage {
-            role: ChatRole::User,
-            content: blocks,
-            cache: None,
+    /// Build a canonical inline attachment input part.
+    fn attach(kind: MediaKind, mime: &str, data: Vec<u8>) -> ChatInputPart {
+        ChatInputPart::attachment(
+            MediaPart::new(
+                kind,
+                Some(mime.parse::<MediaType>().unwrap()),
+                MediaSource::Inline { data },
+            )
+            .expect("valid inline attachment"),
+        )
+    }
+
+    fn user_msg(parts: Vec<ChatInputPart>) -> ChatMessage {
+        let mut builder = ChatMessage::user();
+        for part in parts {
+            builder = builder.part(part);
         }
+        builder.build()
+    }
+
+    /// Build a tool-result input part wrapping the given result parts.
+    fn tool_result_msg(
+        call_id: &str,
+        name: Option<&str>,
+        parts: Vec<ToolResultPart>,
+    ) -> ChatInputPart {
+        let mut result = ToolResult::new(call_id.to_string());
+        result.name = name.map(str::to_string);
+        result.parts = parts;
+        ChatInputPart::tool_result(result)
+    }
+
+    /// Build an inline image result part.
+    fn image_result_part(mime: &str, data: Vec<u8>) -> ToolResultPart {
+        ToolResultPart::Attachment(Box::new(
+            MediaPart::new(
+                MediaKind::Image,
+                Some(mime.parse::<MediaType>().unwrap()),
+                MediaSource::Inline { data },
+            )
+            .expect("valid inline attachment"),
+        ))
     }
 
     #[test]
     fn extract_media_no_images() {
-        let messages = vec![user_msg(vec![Content::text("Hello")])];
+        let messages = vec![user_msg(vec![ChatInputPart::text("Hello")])];
         let media = extract_media(&messages);
         assert_eq!(media.len(), 0);
     }
@@ -338,8 +388,8 @@ mod tests {
     #[test]
     fn extract_media_single_image() {
         let messages = vec![user_msg(vec![
-            Content::image("image/jpeg", vec![0xFF, 0xD8, 0xFF]),
-            Content::text("Describe this"),
+            attach(MediaKind::Image, "image/jpeg", vec![0xFF, 0xD8, 0xFF]),
+            ChatInputPart::text("Describe this"),
         ])];
 
         let media = extract_media(&messages);
@@ -353,13 +403,13 @@ mod tests {
     fn extract_media_multiple_images_across_messages() {
         let messages = vec![
             user_msg(vec![
-                Content::image("image/jpeg", vec![0xFF, 0xD8, 0xFF]),
-                Content::text("First image"),
+                attach(MediaKind::Image, "image/jpeg", vec![0xFF, 0xD8, 0xFF]),
+                ChatInputPart::text("First image"),
             ]),
-            user_msg(vec![Content::text("Some text")]),
+            user_msg(vec![ChatInputPart::text("Some text")]),
             user_msg(vec![
-                Content::image("image/png", vec![0x89, 0x50, 0x4E, 0x47]),
-                Content::text("Second image"),
+                attach(MediaKind::Image, "image/png", vec![0x89, 0x50, 0x4E, 0x47]),
+                ChatInputPart::text("Second image"),
             ]),
         ];
 
@@ -372,10 +422,10 @@ mod tests {
     #[test]
     fn extract_media_multiple_images_in_single_message() {
         let messages = vec![user_msg(vec![
-            Content::image("image/png", vec![1]),
-            Content::image("image/jpeg", vec![2]),
-            Content::image("image/png", vec![3]),
-            Content::text("Three images"),
+            attach(MediaKind::Image, "image/png", vec![1]),
+            attach(MediaKind::Image, "image/jpeg", vec![2]),
+            attach(MediaKind::Image, "image/png", vec![3]),
+            ChatInputPart::text("Three images"),
         ])];
 
         let media = extract_media(&messages);
@@ -388,8 +438,17 @@ mod tests {
     #[test]
     fn extract_media_skips_image_url() {
         let messages = vec![user_msg(vec![
-            Content::image_url("https://example.com/photo.jpg"),
-            Content::text("Describe this"),
+            ChatInputPart::attachment(
+                MediaPart::new(
+                    MediaKind::Image,
+                    None,
+                    MediaSource::Url {
+                        url: "https://example.com/photo.jpg".to_string(),
+                    },
+                )
+                .expect("valid url media"),
+            ),
+            ChatInputPart::text("Describe this"),
         ])];
 
         let media = extract_media(&messages);
@@ -398,15 +457,14 @@ mod tests {
 
     #[test]
     fn extract_media_from_tool_result() {
-        let messages = vec![user_msg(vec![Content::ToolResult {
-            id: "call_1".to_string(),
-            name: Some("photos".to_string()),
-            is_error: false,
-            content: vec![
-                Content::text("metadata"),
-                Content::image("image/png", vec![0x89, 0x50]),
+        let messages = vec![user_msg(vec![tool_result_msg(
+            "call_1",
+            Some("photos"),
+            vec![
+                ToolResultPart::text("metadata"),
+                image_result_part("image/png", vec![0x89, 0x50]),
             ],
-        }])];
+        )])];
 
         let media = extract_media(&messages);
         assert_eq!(media.len(), 1);
@@ -416,16 +474,15 @@ mod tests {
 
     #[test]
     fn extract_media_tool_result_multiple_images() {
-        let messages = vec![user_msg(vec![Content::ToolResult {
-            id: "call_1".to_string(),
-            name: Some("photos_search".to_string()),
-            is_error: false,
-            content: vec![
-                Content::text("metadata"),
-                Content::image("image/png", vec![1]),
-                Content::image("image/jpeg", vec![2]),
+        let messages = vec![user_msg(vec![tool_result_msg(
+            "call_1",
+            Some("photos_search"),
+            vec![
+                ToolResultPart::text("metadata"),
+                image_result_part("image/png", vec![1]),
+                image_result_part("image/jpeg", vec![2]),
             ],
-        }])];
+        )])];
 
         let media = extract_media(&messages);
         assert_eq!(media.len(), 2);
@@ -435,15 +492,23 @@ mod tests {
 
     #[test]
     fn extract_media_tool_result_skips_image_url() {
-        let messages = vec![user_msg(vec![Content::ToolResult {
-            id: "call_1".to_string(),
-            name: Some("tool".to_string()),
-            is_error: false,
-            content: vec![
-                Content::text("result"),
-                Content::image_url("https://example.com/img.png"),
+        let messages = vec![user_msg(vec![tool_result_msg(
+            "call_1",
+            Some("tool"),
+            vec![
+                ToolResultPart::text("result"),
+                ToolResultPart::Attachment(Box::new(
+                    MediaPart::new(
+                        MediaKind::Image,
+                        None,
+                        MediaSource::Url {
+                            url: "https://example.com/img.png".to_string(),
+                        },
+                    )
+                    .expect("valid url media"),
+                )),
             ],
-        }])];
+        )])];
 
         let media = extract_media(&messages);
         assert_eq!(media.len(), 0);
@@ -498,25 +563,33 @@ mod tests {
         // Case: multiple top-level images + tool result with nested images
         let messages = vec![
             user_msg(vec![
-                Content::image("image/png", vec![1]),
-                Content::image("image/jpeg", vec![2]),
-                Content::text("Two images above"),
+                attach(MediaKind::Image, "image/png", vec![1]),
+                attach(MediaKind::Image, "image/jpeg", vec![2]),
+                ChatInputPart::text("Two images above"),
             ]),
-            user_msg(vec![Content::ToolResult {
-                id: "call_1".to_string(),
-                name: Some("photos".to_string()),
-                is_error: false,
-                content: vec![
-                    Content::text("metadata"),
-                    Content::image("image/png", vec![3]),
-                    Content::image("image/png", vec![4]),
+            user_msg(vec![tool_result_msg(
+                "call_1",
+                Some("photos"),
+                vec![
+                    ToolResultPart::text("metadata"),
+                    image_result_part("image/png", vec![3]),
+                    image_result_part("image/png", vec![4]),
                 ],
-            }]),
+            )]),
             user_msg(vec![
-                Content::image("image/png", vec![5]),
-                Content::text("One more"),
+                attach(MediaKind::Image, "image/png", vec![5]),
+                ChatInputPart::text("One more"),
                 // ImageUrl should be skipped in both paths
-                Content::image_url("https://example.com/skip.jpg"),
+                ChatInputPart::attachment(
+                    MediaPart::new(
+                        MediaKind::Image,
+                        None,
+                        MediaSource::Url {
+                            url: "https://example.com/skip.jpg".to_string(),
+                        },
+                    )
+                    .expect("valid url media"),
+                ),
             ]),
         ];
 

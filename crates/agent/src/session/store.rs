@@ -115,6 +115,18 @@ pub struct LLMConfig {
     pub name: Option<String>,
     pub provider: String,
     pub model: String,
+    /// Wire protocol the provider speaks (e.g. `responses`, `chat_completions`).
+    ///
+    /// Part of the native-replay target identity: provider-opaque state may
+    /// only be replayed when the protocol matches too.
+    #[serde(default)]
+    pub protocol: String,
+    /// Normalized endpoint the provider targets.
+    ///
+    /// Part of the native-replay target identity: encrypted reasoning must not
+    /// be forwarded to a different `base_url` that shares a model name.
+    #[serde(default)]
+    pub endpoint: String,
     pub params: Option<serde_json::Value>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub created_at: Option<OffsetDateTime>,

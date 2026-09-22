@@ -423,8 +423,9 @@ impl SessionForkHelper {
         })?;
 
         let parent_messages = store.get_history(parent_id).await?;
-        let truncated_messages: Vec<AgentMessage> =
+        let mut truncated_messages: Vec<AgentMessage> =
             parent_messages.into_iter().take(index + 1).collect();
+        crate::model::repair_unmatched_tool_calls(&mut truncated_messages);
 
         for message in truncated_messages {
             let mut child_message = message;
@@ -454,13 +455,15 @@ impl SessionForkHelper {
         let cutoff_time = progress_entry.created_at;
 
         let parent_messages = store.get_history(parent_id).await?;
-        for message in parent_messages {
-            if message.created_at <= cutoff_time.unix_timestamp() {
-                let mut child_message = message;
-                child_message.id = uuid::Uuid::now_v7().to_string();
-                child_message.session_id = child_id.to_string();
-                store.add_message(child_id, child_message).await?;
-            }
+        let mut truncated_messages = parent_messages
+            .into_iter()
+            .filter(|message| message.created_at <= cutoff_time.unix_timestamp())
+            .collect::<Vec<_>>();
+        crate::model::repair_unmatched_tool_calls(&mut truncated_messages);
+        for mut child_message in truncated_messages {
+            child_message.id = uuid::Uuid::now_v7().to_string();
+            child_message.session_id = child_id.to_string();
+            store.add_message(child_id, child_message).await?;
         }
 
         let progress_entries = store.list_progress_entries(parent_id, None).await?;

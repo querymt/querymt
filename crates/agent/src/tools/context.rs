@@ -242,11 +242,15 @@ pub trait Tool: Send + Sync {
     }
 
     /// Execute the tool with given arguments and context
+    ///
+    /// Returns canonical bounded [`querymt::chat::ToolResultPart`] values so the
+    /// tool-result boundary never passes through the legacy recursive content
+    /// representation.
     async fn call(
         &self,
         args: serde_json::Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<querymt::chat::Content>, ToolError>;
+    ) -> Result<Vec<querymt::chat::ToolResultPart>, ToolError>;
 
     /// Returns a context-aware hint to show when this tool's output is truncated.
     ///

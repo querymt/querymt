@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use futures::TryFutureExt;
 use mistralrs::{ChatCompletionResponse, RequestBuilder, ResponseOk};
-use querymt::chat::{ChatMessage, ChatProvider, ChatResponse, FinishReason, StreamChunk, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, FinishReason, StreamChunk, Tool};
 use querymt::error::LLMError;
 use querymt::{FunctionCall, ToolCall, Usage};
 use serde::Deserialize;
@@ -63,28 +63,25 @@ impl From<ChatCompletionResponse> for MistralChatResponse {
     }
 }
 
-impl ChatResponse for MistralChatResponse {
-    fn text(&self) -> Option<String> {
-        self.text.clone()
-    }
-    fn usage(&self) -> Option<querymt::Usage> {
-        self.usage.clone()
-    }
-    fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
-        self.tool_calls.clone()
-    }
-    fn thinking(&self) -> Option<String> {
-        None
-    }
-    fn finish_reason(&self) -> Option<querymt::chat::FinishReason> {
-        self.finish_reason
+impl From<MistralChatResponse> for ChatOutput {
+    fn from(response: MistralChatResponse) -> Self {
+        let finish_reason = response
+            .finish_reason
             .clone()
             .map(|reason| match reason.as_str() {
                 "stop" => querymt::chat::FinishReason::Stop,
                 "tool_calls" => querymt::chat::FinishReason::ToolCalls,
                 "length" => querymt::chat::FinishReason::Length,
                 _other => querymt::chat::FinishReason::Other,
-            })
+            });
+
+        ChatOutput::from_projections(
+            None,
+            response.text.clone(),
+            response.tool_calls.clone(),
+            response.usage.clone(),
+            finish_reason,
+        )
     }
 }
 
@@ -123,7 +120,7 @@ impl ChatProvider for MistralRS {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let req = build_chat_request(self, messages, tools)?;
         let response = self
             .mrs_model
@@ -132,7 +129,7 @@ impl ChatProvider for MistralRS {
             .await?;
 
         let response = MistralChatResponse::from(response);
-        Ok(Box::new(response))
+        Ok(response.into())
     }
 
     async fn chat_stream_with_tools(

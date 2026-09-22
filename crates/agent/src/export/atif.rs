@@ -693,6 +693,7 @@ mod tests {
                 name: "test_tool".to_string(),
                 description: "Test".to_string(),
                 parameters: serde_json::json!({}),
+                strict: None,
             },
         }];
 

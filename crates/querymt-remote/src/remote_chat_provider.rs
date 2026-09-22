@@ -1,7 +1,7 @@
 use crate::{RemoteProviderClientCore, RemoteProviderClientTransport, RemoteProviderStreamState};
 use futures_util::StreamExt;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatProvider, StreamChunk, Tool};
+use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -68,7 +68,7 @@ where
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn querymt::chat::ChatResponse>, LLMError> {
+    ) -> Result<ChatOutput, LLMError> {
         let provider_name = self.core.config().provider_name.clone();
         let model_name = self.core.config().model.clone();
         let target_locator = self.core.config().target_locator.clone();
@@ -102,7 +102,7 @@ where
             }
         };
 
-        Ok(Box::new(chat_response))
+        Ok(chat_response.into_canonical_output())
     }
 
     async fn chat_stream_with_tools(
@@ -185,6 +185,9 @@ where
             remote_router_ref,
             self.core.transport().stream_reconnect_grace().as_secs(),
         );
+        self.core
+            .validate_contract(&host_ref, stream_request.item_aware_contract_version)
+            .await?;
 
         tracing::debug!(
             target: "querymt_remote::provider::stream",
@@ -296,7 +299,7 @@ where
                         if let Some(first_chunk_ms) = first_chunk_ms {
                             setup_span.record("first_chunk_ms", first_chunk_ms);
                         }
-                        if let StreamChunk::Done { finish_reason } = &chunk {
+                        if querymt::chat::chunk_is_terminal(&chunk) {
                             tracing::info!(
                                 target: "querymt_remote::provider::stream",
                                 session_id = %session_id_for_stream,
@@ -308,9 +311,9 @@ where
                                 target_node = %target_for_stream,
                                 chunk_index,
                                 elapsed_ms = stream_start.elapsed().as_millis(),
-                                finish_reason = ?finish_reason,
+                                chunk = ?chunk,
                                 pending_chunks = stream_state.pending_chunks_len(),
-                                "stream done received from remote provider pending batch"
+                                "stream terminal received from remote provider pending batch"
                             );
                         }
                         return Some((Ok(chunk), (raw_stream, stream_state, renew_due)));

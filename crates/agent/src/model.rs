@@ -2,9 +2,12 @@ use crate::acp::protocol::{ContentBlock, EmbeddedResourceResource};
 use crate::agent::utils::truncate_to_bytes;
 use crate::index::merkle::DiffPaths;
 use base64::Engine as _;
+use querymt::chat::{
+    ChatInputPart, ChatOutput, ChatOutputItem, MediaKind, MediaPart, MediaSource, MediaType,
+};
 use querymt::{
     ToolCall,
-    chat::{ChatMessage, ChatRole, Content},
+    chat::{ChatMessage, ChatRole},
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read};
@@ -37,6 +40,10 @@ pub enum PromptContentError {
     AttachmentsTooLarge { bytes: usize, max_bytes: usize },
     #[error("text attachment at block {index} is not valid UTF-8")]
     InvalidTextResource { index: usize },
+    #[error("invalid media type at block {index}: {mime_type}")]
+    InvalidMediaType { index: usize, mime_type: String },
+    #[error("invalid media attachment at block {index}: {reason}")]
+    InvalidMedia { index: usize, reason: String },
 }
 
 pub fn prompt_contains_images(blocks: &[ContentBlock]) -> bool {
@@ -98,7 +105,7 @@ pub fn validate_prompt_blocks(blocks: &[ContentBlock]) -> Result<(), PromptConte
 pub fn convert_prompt_blocks(
     blocks: &[ContentBlock],
     max_text_bytes: Option<usize>,
-) -> Result<Vec<Content>, PromptContentError> {
+) -> Result<Vec<ChatInputPart>, PromptContentError> {
     if blocks.is_empty() {
         return Err(PromptContentError::EmptyPrompt);
     }
@@ -110,7 +117,7 @@ pub fn convert_prompt_blocks(
 
     for (index, block) in blocks.iter().enumerate() {
         match block {
-            ContentBlock::Text(text) => converted.push(Content::text(limit_text(
+            ContentBlock::Text(text) => converted.push(ChatInputPart::text(limit_text(
                 &text.text,
                 &mut remaining_text_bytes,
             ))),
@@ -118,13 +125,18 @@ pub fn convert_prompt_blocks(
                 let data = decode_attachment(index, &image.data)?;
                 validate_attachment_size(index, data.len(), &mut total_attachment_bytes)?;
                 validate_image(index, &image.mime_type, &mut image_count)?;
-                converted.push(Content::image(image.mime_type.clone(), data));
+                converted.push(inline_attachment(
+                    MediaKind::Image,
+                    &image.mime_type,
+                    data,
+                    index,
+                )?);
             }
             ContentBlock::Resource(resource) => match &resource.resource {
                 EmbeddedResourceResource::TextResourceContents(text) => {
                     validate_attachment_size(index, text.text.len(), &mut total_attachment_bytes)?;
                     let contextual = format!("[Embedded Resource: {}]\n{}", text.uri, text.text);
-                    converted.push(Content::text(limit_text(
+                    converted.push(ChatInputPart::text(limit_text(
                         &contextual,
                         &mut remaining_text_bytes,
                     )));
@@ -138,14 +150,24 @@ pub fn convert_prompt_blocks(
                         .unwrap_or("application/octet-stream");
                     if mime_type.starts_with("image/") {
                         validate_image(index, mime_type, &mut image_count)?;
-                        converted.push(Content::image(mime_type.to_string(), data));
+                        converted.push(inline_attachment(
+                            MediaKind::Image,
+                            mime_type,
+                            data,
+                            index,
+                        )?);
                     } else if mime_type == "application/pdf" {
-                        converted.push(Content::pdf(data));
+                        converted.push(inline_attachment(
+                            MediaKind::Document,
+                            mime_type,
+                            data,
+                            index,
+                        )?);
                     } else if mime_type.starts_with("text/") {
                         let text = String::from_utf8(data)
                             .map_err(|_| PromptContentError::InvalidTextResource { index })?;
                         let contextual = format!("[Embedded Resource: {}]\n{}", blob.uri, text);
-                        converted.push(Content::text(limit_text(
+                        converted.push(ChatInputPart::text(limit_text(
                             &contextual,
                             &mut remaining_text_bytes,
                         )));
@@ -155,29 +177,65 @@ pub fn convert_prompt_blocks(
                             blob.uri,
                             data.len()
                         );
-                        converted.push(Content::text(limit_text(
+                        converted.push(ChatInputPart::text(limit_text(
                             &marker,
                             &mut remaining_text_bytes,
                         )));
                     }
                 }
-                _ => converted.push(Content::text("[Unsupported embedded resource]")),
+                _ => converted.push(ChatInputPart::text("[Unsupported embedded resource]")),
             },
             ContentBlock::ResourceLink(link) => {
-                converted.push(Content::resource_link(link.uri.clone()));
+                let mut media = MediaPart::new(
+                    MediaKind::Other,
+                    None,
+                    MediaSource::Url {
+                        url: link.uri.clone(),
+                    },
+                )
+                .map_err(|error| PromptContentError::InvalidMedia {
+                    index,
+                    reason: error.to_string(),
+                })?;
+                media.filename = Some(link.name.clone());
+                converted.push(ChatInputPart::attachment(media));
             }
             ContentBlock::Audio(audio) => {
                 let marker = format!("[Audio attachment: {}]", audio.mime_type);
-                converted.push(Content::text(limit_text(
+                converted.push(ChatInputPart::text(limit_text(
                     &marker,
                     &mut remaining_text_bytes,
                 )));
             }
-            _ => converted.push(Content::text("[Unsupported content block]")),
+            _ => converted.push(ChatInputPart::text("[Unsupported content block]")),
         }
     }
 
     Ok(converted)
+}
+
+/// Build a validated inline attachment input part.
+fn inline_attachment(
+    kind: MediaKind,
+    mime_type: &str,
+    data: Vec<u8>,
+    index: usize,
+) -> Result<ChatInputPart, PromptContentError> {
+    let media_type: MediaType =
+        mime_type
+            .parse()
+            .map_err(|_| PromptContentError::InvalidMediaType {
+                index,
+                mime_type: mime_type.to_string(),
+            })?;
+    let media =
+        MediaPart::new(kind, Some(media_type), MediaSource::Inline { data }).map_err(|error| {
+            PromptContentError::InvalidMedia {
+                index,
+                reason: error.to_string(),
+            }
+        })?;
+    Ok(ChatInputPart::attachment(media))
 }
 
 fn validate_encoded_attachment(
@@ -302,6 +360,175 @@ fn limit_text(text: &str, remaining: &mut Option<usize>) -> String {
     limited
 }
 
+/// Whether the containing message's recorded legacy origin matches the target.
+///
+/// This is the only available signal for output that predates provenance
+/// tracking; it compares the provider and model the owning assistant turn was
+/// generated by against the projection target. A missing origin never matches.
+fn legacy_origin_matches(
+    target: Option<&OutputTarget>,
+    source_provider: Option<&str>,
+    source_model: Option<&str>,
+) -> bool {
+    match (target, source_provider, source_model) {
+        (Some(target), Some(provider), Some(model)) => {
+            target.provider == provider && target.model == model
+        }
+        _ => false,
+    }
+}
+
+/// Decide whether a structured output may replay provider-only state (such as
+/// reasoning signatures and opaque items) to the projection target.
+///
+/// Native replay is authorized only for an exactly compatible target: the
+/// recorded provenance must match the target's full provider/protocol/model/
+/// endpoint identity. A `None` target identity is treated as *unknown* and
+/// therefore not exactly compatible, so native state is dropped and only the
+/// portable projection is used.
+///
+/// Output without provenance predates provenance tracking. It may replay native
+/// state only when the caller accepts the legacy provider/model comparison *and*
+/// the containing message's recorded origin actually matches the target; a
+/// missing or mismatched origin degrades to the portable projection.
+fn native_replay_allowed(
+    output: &querymt::chat::ChatOutput,
+    target: Option<&OutputTarget>,
+    source_provider: Option<&str>,
+    source_model: Option<&str>,
+) -> bool {
+    let Some(target) = target else {
+        return false;
+    };
+    let Some(provenance) = output.provenance.as_ref() else {
+        return target.fallback_provider_model
+            && legacy_origin_matches(Some(target), source_provider, source_model);
+    };
+    !provenance.endpoint.is_empty()
+        && provenance.provider == target.provider
+        && provenance.protocol == target.protocol
+        && provenance.model == target.model
+        && provenance.endpoint == target.endpoint
+}
+
+/// Project a structured output for a projection target.
+///
+/// An authorized native target receives the canonical output unchanged (full
+/// provenance, opaque items, and provider-only continuation). Every other
+/// target receives the canonical portable downgrade, which strips origin-scoped
+/// state while retaining portable messages, visible reasoning, and call/result
+/// correlation by `call_id`.
+fn project_output_for_target(
+    output: &querymt::chat::ChatOutput,
+    target: Option<&OutputTarget>,
+    source_provider: Option<&str>,
+    source_model: Option<&str>,
+) -> querymt::chat::ChatOutput {
+    if native_replay_allowed(output, target, source_provider, source_model) {
+        output.clone()
+    } else {
+        output.clone().into_portable()
+    }
+}
+
+/// The projection target identity used to gate native provider state.
+///
+/// Carries the full provider/protocol/model/endpoint tuple so replay cannot
+/// forward encrypted reasoning to a different endpoint or protocol that merely
+/// shares a model name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputTarget {
+    pub provider: String,
+    pub protocol: String,
+    pub model: String,
+    pub endpoint: String,
+    /// Whether output that carries no provenance may still replay native state.
+    /// True only when the caller could not resolve protocol/endpoint identity
+    /// and explicitly accepts the legacy provider/model-only comparison.
+    pub fallback_provider_model: bool,
+}
+
+impl OutputTarget {
+    /// Best-effort target identity when only provider/model are known.
+    ///
+    /// Protocol and endpoint are left empty, which never authorizes native
+    /// replay for provenance-bearing output. Output without provenance is
+    /// still accepted by legacy comparison so pre-existing history keeps
+    /// working.
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            protocol: String::new(),
+            model: model.into(),
+            endpoint: String::new(),
+            fallback_provider_model: true,
+        }
+    }
+
+    pub fn with_protocol(mut self, protocol: impl Into<String>) -> Self {
+        self.protocol = protocol.into();
+        self
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+}
+
+/// Deserialize a persisted reasoning part, accepting both shapes.
+///
+/// Rows written before reasoning was widened carry a flat
+/// `{"content": "...", "signature": "..."}` pair; rows written after carry the
+/// full canonical item. The legacy shape is lifted into a canonical item with
+/// its text in `content` so old sessions keep loading unchanged.
+fn deserialize_reasoning_item<'de, D>(
+    deserializer: D,
+) -> Result<querymt::chat::ChatReasoningItem, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use querymt::chat::{ChatReasoningItem, ChatReasoningPart};
+
+    #[derive(Deserialize)]
+    struct LegacyReasoning {
+        #[serde(default)]
+        content: String,
+        #[serde(default)]
+        signature: Option<String>,
+    }
+
+    let value = serde_json::Value::deserialize(deserializer)?;
+
+    // Canonical items always carry at least one of the item-only fields; the
+    // legacy shape never has them.
+    let is_legacy = value.get("summary").is_none()
+        && value.get("encrypted_content").is_none()
+        && value.get("id").is_none();
+
+    if is_legacy {
+        let legacy: LegacyReasoning =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        return Ok(ChatReasoningItem {
+            id: None,
+            summary: Vec::new(),
+            content: if legacy.content.is_empty() {
+                Vec::new()
+            } else {
+                vec![ChatReasoningPart::text(legacy.content)]
+            },
+            encrypted_content: None,
+            signature: legacy.signature,
+            status: None,
+            extensions: Default::default(),
+        });
+    }
+
+    let item: ChatReasoningItem =
+        serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+    Ok(item)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum MessagePart {
@@ -318,9 +545,13 @@ pub enum MessagePart {
         blocks: Vec<ContentBlock>,
     },
     Reasoning {
-        content: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
+        /// Authoritative canonical reasoning for this turn.
+        ///
+        /// This carries the full item shape (summary, content, encrypted
+        /// continuation, item id, status, extensions) so persisted history keeps
+        /// fidelity the flat `(content, signature)` pair could not express.
+        #[serde(flatten, deserialize_with = "deserialize_reasoning_item")]
+        item: querymt::chat::ChatReasoningItem,
         time_ms: Option<u64>,
     },
     StepStart {
@@ -333,6 +564,14 @@ pub enum MessagePart {
         cost: Option<f64>,
     },
     ToolUse(ToolCall),
+    /// Canonical structured output for an item-aware assistant turn.
+    ///
+    /// This part is the authoritative record of generated items; text, reasoning,
+    /// and tool-use parts are not stored alongside it for the same turn.
+    /// Replay projects it exactly once through portable content.
+    Output {
+        output: querymt::chat::ChatOutput,
+    },
     HookContext {
         event_name: String,
         handler_id: String,
@@ -342,7 +581,7 @@ pub enum MessagePart {
     },
     ToolResult {
         call_id: String,
-        content: Vec<Content>,
+        content: Vec<querymt::chat::ToolResultPart>,
         is_error: bool,
         tool_name: Option<String>,
         tool_arguments: Option<String>,
@@ -392,6 +631,7 @@ impl MessagePart {
             MessagePart::StepStart { .. } => "step_start",
             MessagePart::StepFinish { .. } => "step_finish",
             MessagePart::ToolUse(_) => "tool_use",
+            MessagePart::Output { .. } => "output",
             MessagePart::HookContext { .. } => "hook_context",
             MessagePart::ToolResult { .. } => "tool_result",
             MessagePart::Patch { .. } => "patch",
@@ -454,6 +694,35 @@ impl AgentMessage {
         self.to_chat_message_with_target(None, None, None)
     }
 
+    /// Function calls represented by this message.
+    ///
+    /// Covers both legacy `ToolUse` parts and the canonical structured output
+    /// part, so call-scanning consumers (delegation detection, loop guards,
+    /// summaries) keep working for item-aware assistant turns. Call identities
+    /// are deduplicated preserving first occurrence and item order.
+    pub fn function_calls(&self) -> Vec<querymt::ToolCall> {
+        let mut calls = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for part in &self.parts {
+            match part {
+                MessagePart::ToolUse(call) => {
+                    if seen.insert(call.id.clone()) {
+                        calls.push(call.clone());
+                    }
+                }
+                MessagePart::Output { output } => {
+                    for call in output.tool_calls().unwrap_or_default() {
+                        if seen.insert(call.id.clone()) {
+                            calls.push(call);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        calls
+    }
+
     pub fn to_chat_message_with_max_prompt_bytes(
         &self,
         max_prompt_bytes: Option<usize>,
@@ -467,66 +736,90 @@ impl AgentMessage {
         target_model: Option<&str>,
         max_prompt_bytes: Option<usize>,
     ) -> Result<ChatMessage, PromptContentError> {
-        let mut blocks = Vec::new();
+        // A provider/model-only target cannot prove protocol/endpoint identity,
+        // so it authorizes native replay only through the legacy fallback.
+        let target = target_provider
+            .zip(target_model)
+            .map(|(provider, model)| OutputTarget::new(provider.to_string(), model.to_string()));
+        self.to_chat_message_with_output_target(target.as_ref(), max_prompt_bytes)
+    }
 
-        let preserve_provider_metadata = match (
-            target_provider,
-            target_model,
-            self.source_provider.as_deref(),
-            self.source_model.as_deref(),
-        ) {
-            (Some(tp), Some(tm), Some(sp), Some(sm)) => tp == sp && tm == sm,
-            _ => true,
-        };
+    /// Convert to a `ChatMessage`, authorizing native replay only for the full
+    /// provider/protocol/model/endpoint target identity.
+    pub fn to_chat_message_with_output_target(
+        &self,
+        target: Option<&OutputTarget>,
+        max_prompt_bytes: Option<usize>,
+    ) -> Result<ChatMessage, PromptContentError> {
+        let mut input_parts = Vec::new();
+        let mut output_items = Vec::new();
+        // A canonical `Output` part, when present, is the assistant turn's sole
+        // generated-content authority. Any legacy generated parts are ignored so
+        // the authoritative output is never merged with a stale projection.
+        let mut canonical_output: Option<ChatOutput> = None;
 
         for part in &self.parts {
             match part {
+                MessagePart::Text { content } if self.role == ChatRole::Assistant => {
+                    output_items.push(ChatOutputItem::Message(querymt::chat::ChatMessageItem {
+                        id: None,
+                        role: ChatRole::Assistant,
+                        phase: None,
+                        status: None,
+                        parts: vec![querymt::chat::ChatMessagePart::Text {
+                            text: content.clone(),
+                            annotations: Vec::new(),
+                            extensions: Default::default(),
+                        }],
+                        extensions: Default::default(),
+                    }));
+                }
                 MessagePart::Text { content } => {
-                    blocks.push(Content::text(content));
+                    input_parts.push(ChatInputPart::text(content.clone()))
                 }
-                MessagePart::Prompt {
-                    blocks: prompt_blocks,
+                MessagePart::Prompt { blocks } | MessagePart::Steering { blocks, .. } => {
+                    input_parts.extend(convert_prompt_blocks(blocks, max_prompt_bytes)?);
                 }
-                | MessagePart::Steering {
-                    blocks: prompt_blocks,
-                    ..
-                } => {
-                    blocks.extend(convert_prompt_blocks(prompt_blocks, max_prompt_bytes)?);
+                MessagePart::Reasoning { item, .. } => {
+                    let mut item = item.clone();
+                    let same_legacy_origin = legacy_origin_matches(
+                        target,
+                        self.source_provider.as_deref(),
+                        self.source_model.as_deref(),
+                    );
+                    if !same_legacy_origin {
+                        item.signature = None;
+                        item.encrypted_content = None;
+                        item.id = None;
+                        item.extensions.clear();
+                    }
+                    output_items.push(ChatOutputItem::Reasoning(item));
                 }
-                MessagePart::Reasoning {
-                    content, signature, ..
-                } => {
-                    blocks.push(Content::Thinking {
-                        text: content.clone(),
-                        signature: if preserve_provider_metadata {
-                            signature.clone()
-                        } else {
-                            None
+                MessagePart::ToolUse(call) => {
+                    output_items.push(ChatOutputItem::FunctionCall(
+                        querymt::chat::ChatFunctionCallItem {
+                            item_id: None,
+                            call_id: call.id.clone(),
+                            name: call.function.name.clone(),
+                            arguments: call.function.arguments.clone(),
+                            status: None,
+                            extensions: Default::default(),
                         },
-                    });
-                }
-                MessagePart::ToolUse(tc) => {
-                    blocks.push(Content::tool_use(
-                        &tc.id,
-                        &tc.function.name,
-                        serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or_else(|_| serde_json::Value::Object(Default::default())),
                     ));
                 }
-                MessagePart::HookContext {
-                    event_name,
-                    handler_id,
-                    tool_use_id,
-                    content,
-                } => {
-                    let tool_label = tool_use_id
-                        .as_deref()
-                        .map(|id| format!(" tool_use_id={}", id))
-                        .unwrap_or_default();
-                    blocks.push(Content::text(format!(
-                        "<hook-context event={} handler={}{}>\n{}\n</hook-context>",
-                        event_name, handler_id, tool_label, content
-                    )));
+                MessagePart::Output { output } => {
+                    // The canonical output is the sole generated-content
+                    // authority. When several output parts are present the first
+                    // wins; legacy generated parts accumulated into
+                    // `output_items` are discarded at the assistant return below.
+                    if canonical_output.is_none() {
+                        canonical_output = Some(project_output_for_target(
+                            output,
+                            target,
+                            self.source_provider.as_deref(),
+                            self.source_model.as_deref(),
+                        ));
+                    }
                 }
                 MessagePart::ToolResult {
                     call_id,
@@ -536,55 +829,184 @@ impl AgentMessage {
                     compacted_at,
                     ..
                 } => {
-                    let inner = if compacted_at.is_some() {
-                        vec![Content::text("[Old tool result content cleared]")]
+                    let parts = if compacted_at.is_some() {
+                        vec![querymt::chat::ToolResultPart::text(
+                            "[Old tool result content cleared]",
+                        )]
                     } else {
                         content.clone()
                     };
-                    blocks.push(Content::ToolResult {
-                        id: call_id.clone(),
-                        name: tool_name.clone(),
-                        is_error: *is_error,
-                        content: inner,
-                    });
+                    let mut result = querymt::chat::ToolResult::new(call_id.clone());
+                    result.name = tool_name.clone();
+                    result.is_error = *is_error;
+                    result.parts = parts;
+                    input_parts.push(ChatInputPart::tool_result(result));
+                }
+                MessagePart::HookContext {
+                    event_name,
+                    handler_id,
+                    tool_use_id,
+                    content,
+                } => {
+                    let tool_label = tool_use_id
+                        .as_deref()
+                        .map(|id| format!(" tool_use_id={id}"))
+                        .unwrap_or_default();
+                    input_parts.push(ChatInputPart::text(format!(
+                        "<hook-context event={event_name} handler={handler_id}{tool_label}>\n{content}\n</hook-context>"
+                    )));
                 }
                 MessagePart::Snapshot { changed_paths, .. } if !changed_paths.is_empty() => {
-                    blocks.push(Content::text(format!(
+                    input_parts.push(ChatInputPart::text(format!(
                         "\n[System: File changes: {}]",
                         changed_paths.summary()
                     )));
                 }
+                MessagePart::Compaction { summary, .. } if self.role == ChatRole::Assistant => {
+                    output_items.push(ChatOutputItem::Message(querymt::chat::ChatMessageItem {
+                        id: None,
+                        role: ChatRole::Assistant,
+                        phase: None,
+                        status: None,
+                        parts: vec![querymt::chat::ChatMessagePart::Text {
+                            text: summary.clone(),
+                            annotations: Vec::new(),
+                            extensions: Default::default(),
+                        }],
+                        extensions: Default::default(),
+                    }));
+                }
                 MessagePart::Compaction { summary, .. } => {
-                    blocks.push(Content::text(summary));
+                    input_parts.push(ChatInputPart::text(summary.clone()))
                 }
                 MessagePart::CompactionRequest { .. } => {
-                    blocks.push(Content::text("Summarize our conversation so far."));
+                    input_parts.push(ChatInputPart::text("Summarize our conversation so far."))
                 }
                 _ => {}
             }
         }
 
-        if self.role == ChatRole::User && blocks.iter().any(|block| block.is_tool_result()) {
-            blocks.sort_by_key(|block| if block.is_tool_result() { 0 } else { 1 });
+        if self.role == ChatRole::Assistant {
+            let output = canonical_output.unwrap_or_else(|| ChatOutput {
+                items: output_items,
+                status: Some(querymt::chat::ChatOutputStatus::Completed),
+                ..ChatOutput::default()
+            });
+            return Ok(ChatMessage::from_assistant_output(output));
         }
 
-        Ok(ChatMessage {
-            role: self.role.clone(),
-            content: blocks,
-            cache: None,
-        })
+        if input_parts.iter().any(ChatInputPart::is_tool_result) {
+            input_parts.sort_by_key(|part| !part.is_tool_result());
+        }
+        Ok(ChatMessage::from_user_parts(input_parts))
     }
+}
+
+/// Repair persisted transcripts that contain assistant tool calls without an
+/// immediately following result. This keeps legacy or interrupted sessions
+/// acceptable to providers that strictly validate call/result pairing.
+pub(crate) fn repair_unmatched_tool_calls(messages: &mut Vec<AgentMessage>) -> usize {
+    let mut repaired = 0;
+    let mut pending = Vec::<ToolCall>::new();
+    let mut index = 0;
+
+    while index < messages.len() {
+        if !pending.is_empty() {
+            if messages[index].role == ChatRole::User {
+                let returned = messages[index]
+                    .parts
+                    .iter()
+                    .filter_map(|part| match part {
+                        MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<std::collections::HashSet<_>>();
+                pending.retain(|call| !returned.contains(call.id.as_str()));
+                if !pending.is_empty() {
+                    let mut results = cancelled_tool_result_parts(&pending);
+                    repaired += results.len();
+                    results.append(&mut messages[index].parts);
+                    messages[index].parts = results;
+                }
+                pending.clear();
+            } else {
+                let session_id = messages[index].session_id.clone();
+                let created_at = messages[index].created_at;
+                let parts = cancelled_tool_result_parts(&pending);
+                repaired += parts.len();
+                messages.insert(
+                    index,
+                    AgentMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id,
+                        role: ChatRole::User,
+                        parts,
+                        created_at,
+                        parent_message_id: None,
+                        source_provider: None,
+                        source_model: None,
+                    },
+                );
+                pending.clear();
+                index += 1;
+            }
+        }
+
+        if messages[index].role == ChatRole::Assistant {
+            pending = messages[index].function_calls();
+        }
+        index += 1;
+    }
+
+    if !pending.is_empty() {
+        let session_id = messages
+            .last()
+            .map(|message| message.session_id.clone())
+            .unwrap_or_default();
+        let parts = cancelled_tool_result_parts(&pending);
+        repaired += parts.len();
+        messages.push(AgentMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id,
+            role: ChatRole::User,
+            parts,
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        });
+    }
+
+    repaired
+}
+
+fn cancelled_tool_result_parts(calls: &[ToolCall]) -> Vec<MessagePart> {
+    calls
+        .iter()
+        .map(|call| MessagePart::ToolResult {
+            call_id: call.id.clone(),
+            content: vec![querymt::chat::ToolResultPart::text(
+                "Error: Cancelled before the tool returned a result",
+            )],
+            is_error: true,
+            tool_name: Some(call.function.name.clone()),
+            tool_arguments: Some(call.function.arguments.clone()),
+            compacted_at: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentMessage, MessagePart, PromptContentError};
+    use super::{
+        AgentMessage, MessagePart, OutputTarget, PromptContentError, repair_unmatched_tool_calls,
+    };
     use crate::acp::protocol::{
         BlobResourceContents, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
         ImageContent, TextContent, TextResourceContents,
     };
     use base64::Engine as _;
-    use querymt::chat::{ChatRole, Content};
+    use querymt::chat::{ChatRole, ToolResultPart};
 
     fn prompt_message(blocks: Vec<ContentBlock>) -> AgentMessage {
         AgentMessage {
@@ -654,18 +1076,23 @@ mod tests {
         .to_chat_message()
         .unwrap();
 
-        assert_eq!(chat.content.len(), 4);
-        assert_eq!(chat.content[0].as_text(), Some("before"));
+        let parts = chat.portable_input_parts();
+        assert_eq!(parts.len(), 4);
+        assert_eq!(parts[0].as_text(), Some("before"));
         assert!(matches!(
-            &chat.content[1],
-            Content::Image { mime_type, data }
-                if mime_type == "image/png" && data == &[1, 2, 3]
+            &parts[1],
+            querymt::chat::ChatInputPart::Attachment(media)
+                if media.kind == querymt::chat::MediaKind::Image
+                    && media.media_type().map(ToString::to_string).as_deref()
+                        == Some("image/png")
         ));
-        assert_eq!(chat.content[2].as_text(), Some("after"));
+        assert_eq!(parts[2].as_text(), Some("after"));
         assert!(matches!(
-            &chat.content[3],
-            Content::Image { mime_type, data }
-                if mime_type == "image/jpeg" && data == &[4, 5]
+            &parts[3],
+            querymt::chat::ChatInputPart::Attachment(media)
+                if media.kind == querymt::chat::MediaKind::Image
+                    && media.media_type().map(ToString::to_string).as_deref()
+                        == Some("image/jpeg")
         ));
     }
 
@@ -690,18 +1117,25 @@ mod tests {
         .to_chat_message()
         .unwrap();
 
+        let parts = chat.portable_input_parts();
         assert!(matches!(
-            &chat.content[0],
-            Content::Image { mime_type, data }
-                if mime_type == "image/webp" && data == &[9, 8, 7]
+            &parts[0],
+            querymt::chat::ChatInputPart::Attachment(media)
+                if media.kind == querymt::chat::MediaKind::Image
+                    && media.media_type().map(ToString::to_string).as_deref()
+                        == Some("image/webp")
         ));
         assert_eq!(
-            chat.content[1].as_text(),
+            parts[1].as_text(),
             Some("[Embedded Resource: attachment:///notes.txt]\nnotes")
         );
-        assert!(matches!(&chat.content[2], Content::Pdf { data } if data == &[0x25, 0x50]));
+        assert!(matches!(
+            &parts[2],
+            querymt::chat::ChatInputPart::Attachment(media)
+                if media.kind == querymt::chat::MediaKind::Document
+        ));
         assert_eq!(
-            chat.content[3].as_text(),
+            parts[3].as_text(),
             Some("[Attached resource: attachment:///data.bin (application/octet-stream, 2 bytes)]")
         );
     }
@@ -716,9 +1150,11 @@ mod tests {
         }];
         let chat = message.to_chat_message().unwrap();
         assert!(matches!(
-            &chat.content[0],
-            Content::Image { mime_type, data }
-                if mime_type == "image/gif" && data == &[3, 1, 4]
+            &chat.portable_input_parts()[0],
+            querymt::chat::ChatInputPart::Attachment(media)
+                if media.kind == querymt::chat::MediaKind::Image
+                    && media.media_type().map(ToString::to_string).as_deref()
+                        == Some("image/gif")
         ));
     }
 
@@ -869,7 +1305,11 @@ mod tests {
         ])
         .to_chat_message_with_max_prompt_bytes(Some(4))
         .unwrap();
-        assert!(matches!(&chat.content[1], Content::Image { data, .. } if data == &[1, 2, 3, 4]));
+        assert!(matches!(
+            &chat.portable_input_parts()[1],
+            querymt::chat::ChatInputPart::Attachment(media)
+                if media.kind == querymt::chat::MediaKind::Image
+        ));
     }
 
     #[test]
@@ -961,7 +1401,7 @@ mod tests {
             role: ChatRole::User,
             parts: vec![MessagePart::ToolResult {
                 call_id: "call-1".to_string(),
-                content: vec![Content::text("tool output")],
+                content: vec![ToolResultPart::text("tool output")],
                 is_error: false,
                 tool_name: Some("shell".to_string()),
                 tool_arguments: Some("{}".to_string()),
@@ -975,22 +1415,19 @@ mod tests {
 
         let chat = msg.to_chat_message().unwrap();
         assert!(chat.has_tool_result());
-        // The tool result block should contain the text
-        let tr = chat.content.iter().find(|b| b.is_tool_result()).unwrap();
-        match tr {
-            Content::ToolResult {
-                id,
-                content,
-                is_error,
-                ..
-            } => {
-                assert_eq!(id, "call-1");
-                assert!(!is_error);
-                assert_eq!(content.len(), 1);
-                assert_eq!(content[0].as_text(), Some("tool output"));
-            }
-            _ => panic!("Expected ToolResult"),
-        }
+        // The tool result part should contain the text
+        let tr = chat
+            .portable_input_parts()
+            .into_iter()
+            .find_map(|part| match part {
+                querymt::chat::ChatInputPart::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(tr.call_id, "call-1");
+        assert!(!tr.is_error);
+        assert_eq!(tr.parts.len(), 1);
+        assert_eq!(tr.parts[0].as_text(), Some("tool output"));
     }
 
     #[test]
@@ -1001,7 +1438,7 @@ mod tests {
             role: ChatRole::User,
             parts: vec![MessagePart::ToolResult {
                 call_id: "call-1".to_string(),
-                content: vec![Content::text("original content")],
+                content: vec![ToolResultPart::text("original content")],
                 is_error: false,
                 tool_name: Some("shell".to_string()),
                 tool_arguments: Some("{}".to_string()),
@@ -1014,16 +1451,18 @@ mod tests {
         };
 
         let chat = msg.to_chat_message().unwrap();
-        let tr = chat.content.iter().find(|b| b.is_tool_result()).unwrap();
-        match tr {
-            Content::ToolResult { content, .. } => {
-                assert_eq!(
-                    content[0].as_text(),
-                    Some("[Old tool result content cleared]")
-                );
-            }
-            _ => panic!("Expected ToolResult"),
-        }
+        let tr = chat
+            .portable_input_parts()
+            .into_iter()
+            .find_map(|part| match part {
+                querymt::chat::ChatInputPart::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            tr.parts[0].as_text(),
+            Some("[Old tool result content cleared]")
+        );
     }
 
     #[test]
@@ -1033,8 +1472,15 @@ mod tests {
             session_id: "s1".to_string(),
             role: ChatRole::Assistant,
             parts: vec![MessagePart::Reasoning {
-                content: "reasoning".to_string(),
-                signature: Some("sig-123".to_string()),
+                item: ChatReasoningItem {
+                    id: None,
+                    summary: Vec::new(),
+                    content: vec![ChatReasoningPart::text("reasoning")],
+                    encrypted_content: None,
+                    signature: Some("sig-123".to_string()),
+                    status: None,
+                    extensions: Default::default(),
+                },
                 time_ms: None,
             }],
             created_at: 0,
@@ -1047,13 +1493,12 @@ mod tests {
             .to_chat_message_with_target(Some("anthropic"), Some("claude-sonnet-4-5"), None)
             .unwrap();
 
-        match &chat.content[0] {
-            Content::Thinking {
-                signature: Some(sig),
-                ..
-            } => assert_eq!(sig, "sig-123"),
-            _ => panic!("expected signed thinking block"),
-        }
+        // Signed legacy reasoning is retained as canonical output for same-origin
+        // replay.
+        assert_eq!(
+            chat.output().and_then(|output| output.signature()),
+            Some("sig-123".to_string())
+        );
     }
 
     #[test]
@@ -1063,8 +1508,15 @@ mod tests {
             session_id: "s1".to_string(),
             role: ChatRole::Assistant,
             parts: vec![MessagePart::Reasoning {
-                content: "reasoning".to_string(),
-                signature: Some("sig-123".to_string()),
+                item: ChatReasoningItem {
+                    id: None,
+                    summary: Vec::new(),
+                    content: vec![ChatReasoningPart::text("reasoning")],
+                    encrypted_content: None,
+                    signature: Some("sig-123".to_string()),
+                    status: None,
+                    extensions: Default::default(),
+                },
                 time_ms: None,
             }],
             created_at: 0,
@@ -1077,12 +1529,12 @@ mod tests {
             .to_chat_message_with_target(Some("anthropic"), Some("claude-opus-4-1"), None)
             .unwrap();
 
-        match &chat.content[0] {
-            Content::Thinking {
-                signature: None, ..
-            } => {}
-            _ => panic!("expected thinking block without signature"),
-        }
+        assert!(
+            chat.output()
+                .and_then(|output| output.signature())
+                .is_none(),
+            "signature must not survive a model switch"
+        );
     }
 
     /// When a single User message contains multiple ToolResult parts
@@ -1105,7 +1557,7 @@ mod tests {
             parts: vec![
                 MessagePart::ToolResult {
                     call_id: "call-a".to_string(),
-                    content: vec![Content::text("result a")],
+                    content: vec![ToolResultPart::text("result a")],
                     is_error: false,
                     tool_name: Some("edit".to_string()),
                     tool_arguments: None,
@@ -1121,7 +1573,7 @@ mod tests {
                 },
                 MessagePart::ToolResult {
                     call_id: "call-b".to_string(),
-                    content: vec![Content::text("result b")],
+                    content: vec![ToolResultPart::text("result b")],
                     is_error: false,
                     tool_name: Some("edit".to_string()),
                     tool_arguments: None,
@@ -1144,25 +1596,465 @@ mod tests {
 
         let chat = msg.to_chat_message().unwrap();
 
-        // Must have 2 ToolResult + at least 1 Text (from snapshots).
-        let tool_result_count = chat.content.iter().filter(|b| b.is_tool_result()).count();
+        // Must have 2 tool result parts + at least 1 text part (from snapshots).
+        let parts = chat.portable_input_parts();
+        let tool_result_count = parts.iter().filter(|p| p.is_tool_result()).count();
         assert_eq!(tool_result_count, 2);
 
-        // All ToolResult blocks must appear before any Text block.
-        let first_text_idx = chat
-            .content
-            .iter()
-            .position(|b| matches!(b, Content::Text { .. }));
-        let last_tool_result_idx = chat.content.iter().rposition(|b| b.is_tool_result());
+        // All tool result parts must appear before any text part.
+        let first_text_idx = parts.iter().position(|p| p.as_text().is_some());
+        let last_tool_result_idx = parts.iter().rposition(|p| p.is_tool_result());
 
         if let (Some(first_text), Some(last_tr)) = (first_text_idx, last_tool_result_idx) {
             assert!(
                 last_tr < first_text,
-                "all ToolResult blocks must come before any Text block, \
-                 but last ToolResult is at index {} and first Text at index {}",
+                "all tool result parts must come before any text part, \
+                 but last tool result is at index {} and first text at index {}",
                 last_tr,
                 first_text
             );
         }
+    }
+
+    // ── Canonical structured output part (tasks 4.2 / 4.4) ───────────────────
+
+    use querymt::chat::{
+        ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOpaqueItem, ChatOutput,
+        ChatOutputItem, ChatOutputProvenance, ChatReasoningItem, ChatReasoningPart,
+    };
+
+    fn structured_output() -> ChatOutput {
+        ChatOutput {
+            response_id: Some("resp_1".into()),
+            status: Some(querymt::chat::ChatOutputStatus::Completed),
+            finish_reason: Some(querymt::chat::FinishReason::ToolCalls),
+            provenance: Some(ChatOutputProvenance {
+                provider: "openai".into(),
+                protocol: "responses".into(),
+                model: "gpt-5".into(),
+                endpoint: "https://api.openai.com/v1/responses".into(),
+            }),
+            items: vec![
+                // Encrypted-only reasoning must survive storage/reload intact.
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: Some("reasoning_1".into()),
+                    summary: Vec::new(),
+                    content: Vec::new(),
+                    encrypted_content: Some("opaque-continuation".into()),
+                    signature: Some("sig-1".into()),
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                ChatOutputItem::Message(ChatMessageItem {
+                    id: Some("message_1".into()),
+                    role: ChatRole::Assistant,
+                    phase: None,
+                    status: None,
+                    parts: vec![ChatMessagePart::Text {
+                        text: "final answer".into(),
+                        annotations: Vec::new(),
+                        extensions: Default::default(),
+                    }],
+                    extensions: Default::default(),
+                }),
+                // Exact raw arguments, distinct item/call IDs.
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: Some("item_1".into()),
+                    call_id: "call_1".into(),
+                    name: "lookup".into(),
+                    arguments: "{\"query\":\"rust\",\"raw\": 1 }".into(),
+                    status: None,
+                    extensions: Default::default(),
+                }),
+                // Unknown items remain opaque.
+                ChatOutputItem::Opaque(ChatOpaqueItem {
+                    original_type: "future_action".into(),
+                    payload: serde_json::json!({"vendor": true}),
+                }),
+            ],
+            ..ChatOutput::default()
+        }
+    }
+
+    fn output_message(output: ChatOutput) -> AgentMessage {
+        AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::Output { output }],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        }
+    }
+
+    #[test]
+    fn function_calls_reads_legacy_parts_and_canonical_output() {
+        let legacy = AgentMessage {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: ChatRole::Assistant,
+            parts: vec![
+                MessagePart::ToolUse(querymt::ToolCall {
+                    id: "call_a".into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "delegate".into(),
+                        arguments: "{\"target_agent_id\":\"x\",\"objective\":\"y\"}".into(),
+                    },
+                }),
+                MessagePart::Text {
+                    content: "working".into(),
+                },
+            ],
+            created_at: 0,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        assert_eq!(legacy.function_calls().len(), 1);
+        assert_eq!(legacy.function_calls()[0].function.name, "delegate");
+
+        // Structured turn: calls live in the canonical output part.
+        let mut output = structured_output();
+        output
+            .items
+            .push(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("item_2".into()),
+                call_id: "call_1".into(), // duplicate identity of item_1
+                name: "lookup".into(),
+                arguments: "{}".into(),
+                status: None,
+                extensions: Default::default(),
+            }));
+        let structured = output_message(output);
+        let calls = structured.function_calls();
+        assert_eq!(calls.len(), 1, "duplicate call identity collapses");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(
+            calls[0].function.arguments,
+            "{\"query\":\"rust\",\"raw\": 1 }"
+        );
+
+        // Mixed legacy + structured in one message never duplicates identities.
+        let mut mixed = structured;
+        mixed.parts.push(MessagePart::ToolUse(querymt::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            function: querymt::FunctionCall {
+                name: "lookup".into(),
+                arguments: "{}".into(),
+            },
+        }));
+        assert_eq!(mixed.function_calls().len(), 1);
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_prepends_result_to_next_user_message() {
+        let assistant = AgentMessage {
+            id: "assistant".into(),
+            session_id: "s1".into(),
+            role: ChatRole::Assistant,
+            parts: vec![MessagePart::ToolUse(querymt::ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                function: querymt::FunctionCall {
+                    name: "question".into(),
+                    arguments: "{}".into(),
+                },
+            })],
+            created_at: 1,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let prompt = AgentMessage {
+            id: "user".into(),
+            session_id: "s1".into(),
+            role: ChatRole::User,
+            parts: vec![MessagePart::Text {
+                content: "continue".into(),
+            }],
+            created_at: 2,
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        let mut messages = vec![assistant, prompt];
+
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 1);
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(
+            &messages[1].parts[0],
+            MessagePart::ToolResult { call_id, is_error: true, .. } if call_id == "call_1"
+        ));
+        assert!(
+            matches!(&messages[1].parts[1], MessagePart::Text { content } if content == "continue")
+        );
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_preserves_matched_results() {
+        let mut messages = vec![
+            AgentMessage {
+                id: "assistant".into(),
+                session_id: "s1".into(),
+                role: ChatRole::Assistant,
+                parts: vec![MessagePart::ToolUse(querymt::ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                    },
+                })],
+                created_at: 1,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+            AgentMessage {
+                id: "result".into(),
+                session_id: "s1".into(),
+                role: ChatRole::User,
+                parts: vec![MessagePart::ToolResult {
+                    call_id: "call_1".into(),
+                    content: vec![ToolResultPart::text("ok")],
+                    is_error: false,
+                    tool_name: Some("shell".into()),
+                    tool_arguments: Some("{}".into()),
+                    compacted_at: None,
+                }],
+                created_at: 2,
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+        ];
+
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 0);
+        assert_eq!(messages[1].parts.len(), 1);
+    }
+
+    #[test]
+    fn output_part_serde_round_trip_preserves_opaque_and_raw_data() {
+        let part = MessagePart::Output {
+            output: structured_output(),
+        };
+        let encoded = serde_json::to_string(&part).unwrap();
+        let decoded: MessagePart = serde_json::from_str(&encoded).unwrap();
+
+        let MessagePart::Output { output } = decoded else {
+            panic!("expected Output part");
+        };
+        assert_eq!(output.items.len(), 4);
+
+        let ChatOutputItem::Reasoning(reasoning) = &output.items[0] else {
+            panic!("expected reasoning item");
+        };
+        assert_eq!(
+            reasoning.encrypted_content.as_deref(),
+            Some("opaque-continuation"),
+            "encrypted-only reasoning survives the round trip"
+        );
+        assert_eq!(reasoning.signature.as_deref(), Some("sig-1"));
+
+        let ChatOutputItem::FunctionCall(call) = &output.items[2] else {
+            panic!("expected function call item");
+        };
+        assert_eq!(call.item_id.as_deref(), Some("item_1"));
+        assert_eq!(call.call_id, "call_1");
+        assert_eq!(
+            call.arguments, "{\"query\":\"rust\",\"raw\": 1 }",
+            "raw arguments stay byte-exact"
+        );
+
+        assert!(matches!(output.items[3], ChatOutputItem::Opaque(_)));
+    }
+
+    #[test]
+    fn output_part_projects_once_without_duplicate_parts() {
+        // Same-origin replay keeps the authoritative structured output and does
+        // not duplicate it into a second portable projection.
+        let msg = output_message(structured_output());
+        let chat = msg
+            .to_chat_message_with_output_target(
+                Some(&full_target("openai", "responses", "gpt-5")),
+                None,
+            )
+            .unwrap();
+
+        let output = chat
+            .output()
+            .expect("same-origin target retains structured output");
+        // The message text and the function call each appear exactly once as
+        // canonical items.
+        let text_parts = chat
+            .portable_input_parts()
+            .iter()
+            .filter(|part| part.as_text() == Some("final answer"))
+            .count();
+        assert_eq!(text_parts, 1, "message text projected once");
+        let calls = output.tool_calls().unwrap();
+        assert_eq!(calls.len(), 1, "call projected once");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "lookup");
+        // Raw arguments are preserved byte-exact in canonical output.
+        assert_eq!(
+            calls[0].function.arguments,
+            "{\"query\":\"rust\",\"raw\": 1 }"
+        );
+    }
+
+    #[test]
+    fn output_part_never_projects_invalid_arguments_or_opaque_execution() {
+        let mut output = structured_output();
+        output
+            .items
+            .push(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: Some("item_2".into()),
+                call_id: "call_2".into(),
+                name: "lookup".into(),
+                arguments: "{invalid".into(),
+                status: None,
+                extensions: Default::default(),
+            }));
+        let msg = output_message(output);
+
+        // Portable projection (no native target) preserves typed calls for
+        // correlation and leaves argument validation to the executor.
+        let chat = msg.to_chat_message().unwrap();
+        assert!(
+            chat.output()
+                .unwrap()
+                .function_calls()
+                .any(|call| call.arguments == "{invalid"),
+            "invalid arguments remain byte-exact for explicit validation"
+        );
+        assert_eq!(
+            chat.output().unwrap().items.len(),
+            3,
+            "opaque items and reasoning without visible text are dropped"
+        );
+    }
+
+    #[test]
+    fn output_part_projection_does_not_leak_opaque_state_across_targets() {
+        let msg = output_message(structured_output());
+        let before = serde_json::to_string(&msg).unwrap();
+
+        // Same provider/model origin: reasoning signature may be forwarded.
+        let same = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-5"), None)
+            .unwrap();
+        // Visible reasoning is empty, so no thinking block is projected at all;
+        // opaque state must never appear as portable content either way.
+        assert!(
+            !serde_json::to_string(&same)
+                .unwrap()
+                .contains("opaque-continuation"),
+            "encrypted continuation is never projected into portable content"
+        );
+
+        // Different model: portable projection only.
+        let switched = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-4o"), None)
+            .unwrap();
+        assert!(switched.output().is_some());
+        assert!(
+            !serde_json::to_string(&switched)
+                .unwrap()
+                .contains("opaque-continuation")
+        );
+
+        // Stored original is never mutated by projection.
+        assert_eq!(serde_json::to_string(&msg).unwrap(), before);
+    }
+
+    #[test]
+    fn output_part_signature_follows_provenance_and_model_switch() {
+        let mut output = structured_output();
+        // Give the reasoning visible summary so thinking blocks are projected.
+        if let ChatOutputItem::Reasoning(reasoning) = &mut output.items[0] {
+            reasoning.summary = vec![ChatReasoningPart::text("visible reasoning")];
+        }
+        let msg = output_message(output);
+
+        // Only the exact provider/protocol/model/endpoint target retains native
+        // provider state (the reasoning signature).
+        let same_origin = msg
+            .to_chat_message_with_output_target(
+                Some(&full_target("openai", "responses", "gpt-5")),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            same_origin.output().and_then(|output| output.signature()),
+            Some("sig-1".to_string())
+        );
+        assert!(
+            same_origin.output().is_some(),
+            "native continuation preserved"
+        );
+
+        // A provider/model-only target cannot prove protocol/endpoint identity,
+        // so it degrades to the portable projection and drops the signature.
+        let same_model_only = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-5"), None)
+            .unwrap();
+        assert!(same_model_only.output().is_some());
+
+        let switched = msg
+            .to_chat_message_with_output_target(
+                Some(&full_target("openai", "responses", "gpt-4o")),
+                None,
+            )
+            .unwrap();
+        assert!(
+            switched
+                .portable_input_parts()
+                .iter()
+                .any(|part| part.as_text() == Some("visible reasoning"))
+        );
+        assert!(switched.output().is_some());
+    }
+
+    #[test]
+    fn output_part_without_provenance_uses_message_origin_for_native_replay() {
+        let mut output = structured_output();
+        output.provenance = None;
+        let mut msg = output_message(output);
+        msg.source_provider = Some("openai".into());
+        msg.source_model = Some("gpt-5".into());
+
+        // A matching legacy origin authorizes native replay through the fallback.
+        let same = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-5"), None)
+            .unwrap();
+        assert_eq!(
+            same.output().and_then(|output| output.signature()),
+            Some("sig-1".to_string()),
+            "matching message origin replays native state without provenance"
+        );
+
+        // A different provider/model degrades to the portable projection.
+        let other = msg
+            .to_chat_message_with_target(Some("openai"), Some("gpt-4o"), None)
+            .unwrap();
+        assert!(
+            !other
+                .output()
+                .expect("portable projection keeps portable output")
+                .requires_item_aware_fidelity(),
+            "mismatched message origin must not replay native state"
+        );
+    }
+
+    /// Build the exact target identity used by provenance-bearing fixtures.
+    fn full_target(provider: &str, protocol: &str, model: &str) -> OutputTarget {
+        OutputTarget::new(provider, model)
+            .with_protocol(protocol)
+            .with_endpoint("https://api.openai.com/v1/responses")
     }
 }

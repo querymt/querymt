@@ -38,6 +38,7 @@ async-trait.workspace = true
 uuid = { version = "1.0", optional = true, features = ["v4"] }
 schemars.workspace = true
 base64.workspace = true
+mime.workspace = true
 futures = "0.3"
 url.workspace = true
 http.workspace = true

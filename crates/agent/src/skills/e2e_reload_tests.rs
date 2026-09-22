@@ -92,10 +92,10 @@ async fn hot_reload_end_to_end_tracks_the_filesystem_across_model_requests() {
                         .iter()
                         .map(|message| {
                             message
-                                .content
+                                .portable_input_parts()
                                 .iter()
                                 .map(|part| match part {
-                                    querymt::chat::Content::Text { text } => text.clone(),
+                                    querymt::chat::ChatInputPart::Text { text } => text.clone(),
                                     other => format!("{other:?}"),
                                 })
                                 .collect::<Vec<_>>()
@@ -125,13 +125,12 @@ async fn hot_reload_end_to_end_tracks_the_filesystem_across_model_requests() {
 
                 let action = script.lock().unwrap().pop_front().unwrap_or(Action::Text);
                 match action {
-                    Action::Text => Ok(Box::new(MockChatResponse::text_only("done"))
-                        as Box<dyn querymt::chat::ChatResponse>),
-                    Action::LoadSkill(id) => Ok(Box::new(MockChatResponse::with_tools(
+                    Action::Text => Ok(MockChatResponse::text_only("done").into()),
+                    Action::LoadSkill(id) => Ok(MockChatResponse::with_tools(
                         "Loading skill",
                         vec![skill_tool_call(&id)],
-                    ))
-                        as Box<dyn querymt::chat::ChatResponse>),
+                    )
+                    .into()),
                 }
             },
         );

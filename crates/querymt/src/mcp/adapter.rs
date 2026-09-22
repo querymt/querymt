@@ -1,5 +1,5 @@
 use crate::{
-    chat::{Content, FunctionTool, Tool},
+    chat::{FunctionTool, MediaKind, MediaPart, MediaSource, MediaType, Tool, ToolResultPart},
     tool_decorator::CallFunctionTool,
 };
 use anyhow::Result;
@@ -59,6 +59,7 @@ impl TryFrom<RmcpTool> for FunctionTool {
             name: tool_name,
             description,
             parameters: schema,
+            strict: None,
         })
     }
 }
@@ -102,37 +103,99 @@ impl McpToolAdapter {
     }
 }
 
-/// Convert an MCP `RawContent` value into a `Content` block.
-impl From<RawContent> for Content {
-    fn from(raw: RawContent) -> Self {
+/// Convert an MCP `RawContent` value into a canonical bounded tool-result part.
+///
+/// The conversion preserves each block's order and metadata. Media blocks use
+/// the validated attachment model, so malformed MIME declarations fail
+/// explicitly instead of being silently dropped. An unparseable blob MIME
+/// falls back to an opaque attachment rather than fabricating a concrete type.
+impl ToolResultPart {
+    pub fn from_mcp_raw(raw: RawContent) -> Self {
         let b64 = base64::engine::general_purpose::STANDARD;
         match raw {
-            RawContent::Text(t) => Content::text(t.text),
-            RawContent::Image(img) => Content::Image {
-                mime_type: img.mime_type,
-                data: b64.decode(&img.data).unwrap_or_default(),
-            },
-            RawContent::Audio(a) => Content::Audio {
-                mime_type: a.mime_type,
-                data: b64.decode(&a.data).unwrap_or_default(),
-            },
+            RawContent::Text(t) => ToolResultPart::Text { text: t.text },
+            RawContent::Image(img) => attachment_part(
+                MediaKind::Image,
+                Some(img.mime_type),
+                b64.decode(&img.data).unwrap_or_default(),
+                None,
+            ),
+            RawContent::Audio(a) => attachment_part(
+                MediaKind::Audio,
+                Some(a.mime_type),
+                b64.decode(&a.data).unwrap_or_default(),
+                None,
+            ),
             RawContent::Resource(r) => match r.resource {
-                ResourceContents::TextResourceContents { text, .. } => Content::text(text),
+                ResourceContents::TextResourceContents { text, .. } => {
+                    ToolResultPart::Text { text }
+                }
                 ResourceContents::BlobResourceContents {
                     blob, mime_type, ..
-                } => Content::Image {
-                    mime_type: mime_type.unwrap_or_default(),
-                    data: b64.decode(&blob).unwrap_or_default(),
-                },
+                } => attachment_part(
+                    MediaKind::Document,
+                    mime_type,
+                    b64.decode(&blob).unwrap_or_default(),
+                    None,
+                ),
             },
-            RawContent::ResourceLink(r) => Content::ResourceLink {
-                uri: r.uri,
-                name: Some(r.name),
-                description: r.description,
-                mime_type: r.mime_type,
-            },
+            RawContent::ResourceLink(r) => {
+                let kind = r
+                    .mime_type
+                    .as_deref()
+                    .and_then(media_kind_for_mime)
+                    .unwrap_or(MediaKind::Other);
+                let media_type = r.mime_type.as_deref().and_then(|m| m.parse().ok());
+                let mut media = MediaPart::new(kind, media_type, MediaSource::Url { url: r.uri })
+                    .unwrap_or_else(|_| {
+                        MediaPart::new(
+                            MediaKind::Other,
+                            None,
+                            MediaSource::Url { url: String::new() },
+                        )
+                        .expect("opaque URL attachment without media type is always valid")
+                    });
+                media.filename = Some(r.name);
+                media.detail = r.description;
+                ToolResultPart::Attachment(Box::new(media))
+            }
         }
     }
+}
+
+/// Classify a raw MIME string into a broad media kind when possible.
+fn media_kind_for_mime(mime: &str) -> Option<MediaKind> {
+    let parsed: mime::Mime = mime.parse().ok()?;
+    Some(match parsed.type_().as_str() {
+        "image" => MediaKind::Image,
+        "audio" => MediaKind::Audio,
+        "video" => MediaKind::Video,
+        _ => return None,
+    })
+}
+
+/// Build a canonical attachment part from MCP inline bytes.
+///
+/// A valid declared MIME type is preserved; an invalid or missing one yields an
+/// opaque attachment rather than an invalid canonical value.
+fn attachment_part(
+    kind: MediaKind,
+    mime: Option<String>,
+    data: Vec<u8>,
+    filename: Option<String>,
+) -> ToolResultPart {
+    let media_type: Option<MediaType> = mime.as_deref().and_then(|m| m.parse().ok());
+    let mut media =
+        MediaPart::new(kind, media_type, MediaSource::Inline { data }).unwrap_or_else(|_| {
+            MediaPart::new(
+                MediaKind::Other,
+                None,
+                MediaSource::Url { url: String::new() },
+            )
+            .expect("opaque attachment without media type is always valid")
+        });
+    media.filename = filename;
+    ToolResultPart::Attachment(Box::new(media))
 }
 
 #[async_trait]
@@ -146,7 +209,7 @@ impl CallFunctionTool for McpToolAdapter {
     }
 
     #[cfg_attr(feature = "tracing", instrument(name = "mcp_tool.call", skip_all, fields(name = %self.mcp_tool.name)))]
-    async fn call(&self, args: Value) -> Result<Vec<Content>> {
+    async fn call(&self, args: Value) -> Result<Vec<ToolResultPart>> {
         let arguments = match args {
             Value::Object(map) => Some(map),
             _ => None,
@@ -160,7 +223,7 @@ impl CallFunctionTool for McpToolAdapter {
         Ok(call_result
             .content
             .into_iter()
-            .map(|c| Content::from(c.raw))
+            .map(|c| ToolResultPart::from_mcp_raw(c.raw))
             .collect())
     }
 }

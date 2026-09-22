@@ -53,10 +53,10 @@ pub fn test_context_with_user_messages(
     user_message_count: usize,
 ) -> Arc<ConversationContext> {
     let messages: Vec<ChatMessage> = (0..user_message_count)
-        .map(|i| ChatMessage {
-            role: ChatRole::User,
-            content: vec![querymt::chat::Content::text(format!("User message {}", i))],
-            cache: None,
+        .map(|i| {
+            ChatMessage::user()
+                .text(format!("User message {}", i))
+                .build()
         })
         .collect();
 
@@ -123,6 +123,8 @@ pub fn mock_llm_config() -> LLMConfig {
         name: Some("test-config".to_string()),
         provider: "mock".to_string(),
         model: "mock-model".to_string(),
+        protocol: String::new(),
+        endpoint: String::new(),
         params: None,
         created_at: Some(OffsetDateTime::now_utc()),
         updated_at: Some(OffsetDateTime::now_utc()),

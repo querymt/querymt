@@ -1844,15 +1844,14 @@ pub fn extract_session_summary_from_history(history: &[AgentMessage]) -> String 
     let mut agent_responses = Vec::new();
 
     for message in history {
+        // Function calls from both legacy parts and canonical structured output.
+        for tool_call in message.function_calls() {
+            let args_preview =
+                extract_tool_args_preview(&tool_call.function.name, &tool_call.function.arguments);
+            tools_used.push(format!("{} ({})", tool_call.function.name, args_preview));
+        }
         for part in &message.parts {
             match part {
-                MessagePart::ToolUse(tool_call) => {
-                    let args_preview = extract_tool_args_preview(
-                        &tool_call.function.name,
-                        &tool_call.function.arguments,
-                    );
-                    tools_used.push(format!("{} ({})", tool_call.function.name, args_preview));
-                }
                 MessagePart::ToolResult {
                     tool_name: Some(name),
                     tool_arguments: Some(args),
@@ -1873,6 +1872,16 @@ pub fn extract_session_summary_from_history(history: &[AgentMessage]) -> String 
                     if message.role == ChatRole::Assistant && !content.trim().is_empty() =>
                 {
                     agent_responses.push(content.clone());
+                }
+                MessagePart::Output { output } if message.role == ChatRole::Assistant => {
+                    // Structured turn: the visible assistant text lives in the
+                    // canonical output; project it the same way
+                    // DelegationSummarizer::format_conversation does.
+                    if let Some(text) = output.text()
+                        && !text.trim().is_empty()
+                    {
+                        agent_responses.push(text);
+                    }
                 }
                 _ => {}
             }

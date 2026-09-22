@@ -3,7 +3,7 @@
 
 use crate::{
     LLMProvider,
-    chat::{ChatMessage, ChatRole, Content},
+    chat::{ChatInputPart, ChatMessage, ToolResult},
     completion::CompletionRequest,
     error::LLMError,
 };
@@ -219,11 +219,7 @@ impl<'a> MultiPromptChain<'a> {
             // 3) Execute
             let mut response = match step.mode {
                 MultiChainStepMode::Chat => {
-                    let mut step_messages = vec![ChatMessage {
-                        role: ChatRole::User,
-                        content: vec![Content::text(prompt_text)],
-                        cache: None,
-                    }];
+                    let mut step_messages = vec![ChatMessage::user().text(prompt_text).build()];
 
                     let mut final_response_text = String::new();
                     const MAX_TOOL_ITERATIONS: usize = 5;
@@ -233,10 +229,10 @@ impl<'a> MultiPromptChain<'a> {
                         let response = llm.chat_with_tools(&step_messages, llm.tools()).await?;
 
                         let response_text = response.text();
-                        let tool_calls = response.tool_calls();
+                        let tool_calls = response.executable_tool_calls();
 
-                        // Build assistant response as Content blocks
-                        let assistant_msg: ChatMessage = response.as_ref().into();
+                        // Carry the canonical structured turn into history
+                        let assistant_msg: ChatMessage = response.clone().into();
                         step_messages.push(assistant_msg);
 
                         // If there are tool calls, execute them. Otherwise, we're done.
@@ -250,28 +246,25 @@ impl<'a> MultiPromptChain<'a> {
                                 let args: serde_json::Value =
                                     serde_json::from_str(&call.function.arguments)?;
 
-                                let result_content =
-                                    llm.call_tool(&call.function.name, args).await?;
+                                let parts = llm.call_tool(&call.function.name, args).await?;
 
-                                Ok::<Content, LLMError>(Content::ToolResult {
-                                    id: call.id.clone(),
-                                    name: Some(call.function.name.clone()),
-                                    is_error: false,
-                                    content: result_content,
-                                })
+                                let mut result = ToolResult::new(call.id.clone());
+                                result.name = Some(call.function.name.clone());
+                                result.parts = parts;
+                                Ok::<ChatInputPart, LLMError>(ChatInputPart::tool_result(result))
                             });
 
-                            let tool_result_blocks = futures::future::join_all(tool_futures)
+                            let tool_result_parts = futures::future::join_all(tool_futures)
                                 .await
                                 .into_iter()
-                                .collect::<Result<Vec<Content>, LLMError>>()?;
+                                .collect::<Result<Vec<ChatInputPart>, LLMError>>()?;
 
                             // Add tool results back into the conversation history.
-                            step_messages.push(ChatMessage {
-                                role: ChatRole::User,
-                                content: tool_result_blocks,
-                                cache: None,
-                            });
+                            let mut user = ChatMessage::user();
+                            for part in tool_result_parts {
+                                user = user.part(part);
+                            }
+                            step_messages.push(user.build());
 
                             // Continue the loop to allow the LLM to process the tool results.
                         } else {

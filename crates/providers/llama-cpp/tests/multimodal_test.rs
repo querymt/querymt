@@ -23,10 +23,24 @@
 //! ```
 
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
-use querymt::chat::{ChatMessage, Content, FunctionTool, Tool};
+use querymt::chat::{
+    ChatInputPart, ChatMessage, FunctionTool, MediaKind, MediaPart, MediaSource, Tool,
+};
 use querymt_utils::str_utils::truncate_str;
 use serde_json::json;
 use std::env;
+
+/// Build an inline JPEG attachment input part.
+fn jpeg_part(image_data: Vec<u8>) -> ChatInputPart {
+    ChatInputPart::attachment(
+        MediaPart::new(
+            MediaKind::Image,
+            Some("image/jpeg".parse().expect("valid media type")),
+            MediaSource::Inline { data: image_data },
+        )
+        .expect("valid inline attachment"),
+    )
+}
 
 /// Returns (model, mmproj_path_opt, image_path) or None to skip.
 fn test_env() -> Option<(String, Option<String>, String)> {
@@ -95,6 +109,7 @@ fn weather_tool() -> Tool {
                 },
                 "required": ["location"]
             }),
+            strict: None,
         },
     }
 }
@@ -109,14 +124,14 @@ async fn test_vision_chat_basic() {
     let provider = make_provider(model, mmproj_path);
     let image_data = std::fs::read(&image_path).expect("Failed to read test image");
 
-    let messages = vec![ChatMessage::from_user(vec![
-        Content::image("image/jpeg", image_data),
-        Content::text("What's in this image?"),
+    let messages = vec![ChatMessage::from_user_parts(vec![
+        jpeg_part(image_data),
+        ChatInputPart::text("What's in this image?"),
     ])];
 
     let response = provider.chat(&messages).await.expect("Chat failed");
     let text = response.text().unwrap_or_default();
-    let usage = response.usage().unwrap_or_default();
+    let usage = response.usage.clone().unwrap_or_default();
 
     assert!(!text.is_empty(), "Response should not be empty");
     assert!(text.len() > 10, "Response should be substantial");
@@ -140,9 +155,9 @@ async fn test_vision_streaming() {
     let provider = make_provider(model, mmproj_path);
     let image_data = std::fs::read(&image_path).expect("Failed to read test image");
 
-    let messages = vec![ChatMessage::from_user(vec![
-        Content::image("image/jpeg", image_data),
-        Content::text("Describe this image briefly."),
+    let messages = vec![ChatMessage::from_user_parts(vec![
+        jpeg_part(image_data),
+        ChatInputPart::text("Describe this image briefly."),
     ])];
 
     let mut stream = provider
@@ -191,9 +206,9 @@ async fn test_vision_chat_with_tools() {
     let image_data = std::fs::read(&image_path).expect("Failed to read test image");
     let tools = vec![weather_tool()];
 
-    let messages = vec![ChatMessage::from_user(vec![
-        Content::image("image/jpeg", image_data),
-        Content::text("Describe the scene and call get_weather for the location you infer."),
+    let messages = vec![ChatMessage::from_user_parts(vec![
+        jpeg_part(image_data),
+        ChatInputPart::text("Describe the scene and call get_weather for the location you infer."),
     ])];
 
     let response = provider
@@ -201,7 +216,7 @@ async fn test_vision_chat_with_tools() {
         .await
         .expect("Chat with tools failed");
 
-    let usage = response.usage().unwrap_or_default();
+    let usage = response.usage.clone().unwrap_or_default();
     assert!(usage.input_tokens > 0, "Should have input tokens");
     assert!(
         usage.output_tokens > 0 || response.tool_calls().is_some(),
@@ -222,9 +237,9 @@ async fn test_vision_streaming_with_tools() {
     let image_data = std::fs::read(&image_path).expect("Failed to read test image");
     let tools = vec![weather_tool()];
 
-    let messages = vec![ChatMessage::from_user(vec![
-        Content::image("image/jpeg", image_data),
-        Content::text("Analyze this image and use get_weather if a location is obvious."),
+    let messages = vec![ChatMessage::from_user_parts(vec![
+        jpeg_part(image_data),
+        ChatInputPart::text("Analyze this image and use get_weather if a location is obvious."),
     ])];
 
     let mut stream = provider
@@ -270,14 +285,19 @@ async fn test_text_only_with_vision_model() {
 
     let provider = make_provider(model, mmproj_path);
 
-    let messages = vec![ChatMessage::from_user(vec![Content::text("What is 2+2?")])];
+    let messages = vec![ChatMessage::from_user_parts(vec![ChatInputPart::text(
+        "What is 2+2?",
+    )])];
 
     let response = provider.chat(&messages).await.expect("Chat failed");
     let text = response.text().unwrap_or_default();
 
     assert!(!text.is_empty(), "Should get text response");
     assert!(
-        response.usage().map_or(false, |u| u.output_tokens > 0),
+        response
+            .usage
+            .as_ref()
+            .map_or(false, |u| u.output_tokens > 0),
         "Should generate tokens"
     );
 

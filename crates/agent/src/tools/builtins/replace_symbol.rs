@@ -5,7 +5,7 @@
 //! hash-based stale-write protection.
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -110,6 +110,7 @@ impl Tool for ReplaceSymbolTool {
                     },
                     "required": ["replacements"]
                 }),
+                strict: None,
             },
         }
     }
@@ -122,7 +123,7 @@ impl Tool for ReplaceSymbolTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let root = resolve_root(&args, context)?;
         let requests = parse_replacements(&args)?;
 
@@ -238,7 +239,7 @@ impl Tool for ReplaceSymbolTool {
 
         // Phase 4: Format compact output
         let output = format_results(&results);
-        Ok(vec![Content::text(output)])
+        Ok(vec![ToolResultPart::text(output)])
     }
 }
 
@@ -406,9 +407,9 @@ mod tests {
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
-    fn text_content(contents: Vec<Content>) -> String {
+    fn text_content(contents: Vec<ToolResultPart>) -> String {
         match contents.into_iter().next().unwrap() {
-            Content::Text { text } => text,
+            ToolResultPart::Text { text } => text,
             _ => panic!("expected text content"),
         }
     }

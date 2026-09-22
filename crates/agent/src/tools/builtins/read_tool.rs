@@ -1,7 +1,7 @@
 //! Read tool implementation using ToolContext
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool};
+use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
@@ -62,6 +62,7 @@ impl ToolTrait for ReadTool {
                     },
                     "required": ["path"]
                 }),
+                strict: None,
             },
         }
     }
@@ -80,7 +81,7 @@ impl ToolTrait for ReadTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -121,7 +122,7 @@ impl ToolTrait for ReadTool {
 mod tests {
     use super::*;
     use crate::tools::AgentToolContext;
-    use querymt::chat::Content;
+    use querymt::chat::ToolResultPart;
     use serde_json::json;
     use std::fs;
     use std::io::Write;
@@ -137,14 +138,14 @@ mod tests {
         file_path
     }
 
-    /// Extract the text from the first Content::Text block, panicking if absent.
-    fn first_text(blocks: &[Content]) -> &str {
+    /// Extract the text from the first text tool-result part, panicking if absent.
+    fn first_text(blocks: &[ToolResultPart]) -> &str {
         for b in blocks {
-            if let Content::Text { text } = b {
+            if let ToolResultPart::Text { text } = b {
                 return text.as_str();
             }
         }
-        panic!("no Content::Text block found in result: {:?}", blocks);
+        panic!("no text tool-result part found in result: {:?}", blocks);
     }
 
     // ── text file tests ──────────────────────────────────────────────────────
@@ -273,13 +274,21 @@ mod tests {
 
         let result = tool.call(args, &context).await.unwrap();
 
-        assert_eq!(result.len(), 1, "expected exactly one content block");
+        assert_eq!(result.len(), 1, "expected exactly one tool-result part");
         match &result[0] {
-            Content::Image { mime_type, data } => {
-                assert_eq!(mime_type, "image/png");
-                assert_eq!(data, MINIMAL_PNG);
+            ToolResultPart::Attachment(media) => {
+                assert_eq!(
+                    media.media_type().map(ToString::to_string),
+                    Some("image/png".to_string())
+                );
+                match media.source() {
+                    querymt::chat::MediaSource::Inline { data } => {
+                        assert_eq!(data, MINIMAL_PNG)
+                    }
+                    other => panic!("expected inline image source, got {:?}", other),
+                }
             }
-            other => panic!("expected Content::Image, got {:?}", other),
+            other => panic!("expected image attachment part, got {:?}", other),
         }
     }
 
@@ -304,8 +313,11 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         match &result[0] {
-            Content::Image { mime_type, .. } => assert_eq!(mime_type, "image/jpeg"),
-            other => panic!("expected Content::Image, got {:?}", other),
+            ToolResultPart::Attachment(media) => assert_eq!(
+                media.media_type().map(ToString::to_string),
+                Some("image/jpeg".to_string())
+            ),
+            other => panic!("expected image attachment part, got {:?}", other),
         }
     }
 

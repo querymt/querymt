@@ -181,6 +181,36 @@ pub async fn has_pending_elicitation_for_session(
     pending.values().any(|entry| entry.session_id == session_id)
 }
 
+/// Cancel and remove every pending elicitation owned by a session.
+///
+/// Senders are removed while holding the map lock, then notified after the lock
+/// is released so cancellation cannot deadlock with response handling.
+pub async fn cancel_pending_elicitations_for_session(
+    pending_map: &PendingElicitationMap,
+    session_id: &str,
+) -> usize {
+    let senders = {
+        let mut pending = pending_map.lock().await;
+        let ids = pending
+            .iter()
+            .filter(|(_, entry)| entry.session_id == session_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| pending.remove(&id).map(|entry| entry.sender))
+            .collect::<Vec<_>>()
+    };
+
+    let count = senders.len();
+    for sender in senders {
+        let _ = sender.send(ElicitationResponse {
+            action: ElicitationAction::Cancel,
+            content: None,
+        });
+    }
+    count
+}
+
 async fn take_from_pending_map(
     pending_map: &PendingElicitationMap,
     elicitation_id: &str,
@@ -558,6 +588,25 @@ mod tests {
 
         assert!(has_pending_elicitation_for_session(&map, "s-track").await);
         assert!(!has_pending_elicitation_for_session(&map, "other-session").await);
+    }
+
+    #[tokio::test]
+    async fn cancelling_session_resolves_only_its_pending_elicitations() {
+        let map: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, _second_rx) = oneshot::channel();
+        insert_pending_elicitation(&map, "first".into(), "session-a".into(), first_tx).await;
+        insert_pending_elicitation(&map, "second".into(), "session-b".into(), second_tx).await;
+
+        assert_eq!(
+            cancel_pending_elicitations_for_session(&map, "session-a").await,
+            1
+        );
+        let response = first_rx.await.unwrap();
+        assert_eq!(response.action, ElicitationAction::Cancel);
+        assert!(response.content.is_none());
+        assert!(!has_pending_elicitation_for_session(&map, "session-a").await);
+        assert!(has_pending_elicitation_for_session(&map, "session-b").await);
     }
 
     #[tokio::test]

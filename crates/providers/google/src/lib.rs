@@ -46,8 +46,9 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatResponse, ChatRole, Content, FinishReason, ReasoningEffort,
-        StructuredOutputFormat, Tool, ToolChoice,
+        ChatFunctionCallItem, ChatInputPart, ChatMessage, ChatOutput, ChatOutputItem, ChatRole,
+        Extensions, FinishReason, MediaSource, ReasoningEffort, StructuredOutputFormat, Tool,
+        ToolChoice,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -62,6 +63,61 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 use url::Url;
+
+/// Scoped extension key carrying a function call's provider-only thought
+/// signature.
+///
+/// The signature is origin-scoped replay state. It is deliberately kept out of
+/// the portable `call_id` (which is call/result correlation identity) so that
+/// [`querymt::chat::ChatOutput::into_portable`] strips it without disturbing
+/// call/result correlation.
+const GOOGLE_THOUGHT_SIGNATURE: &str = "google_thought_signature";
+
+/// Build a canonical function-call item for a Google response call.
+///
+/// Google correlates tool results by function name and returns no call ID, so a
+/// plain local identifier is minted per call. The provider's `thoughtSignature`,
+/// when present, is carried in scoped extensions.
+fn google_function_call_item(
+    call: &GoogleFunctionCall,
+    thought_signature: Option<&str>,
+    index: usize,
+) -> ChatOutputItem {
+    let mut extensions = Extensions::new();
+    if let Some(signature) = thought_signature {
+        extensions.insert(
+            GOOGLE_THOUGHT_SIGNATURE.to_string(),
+            Value::String(signature.to_string()),
+        );
+    }
+    ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+        item_id: None,
+        call_id: format!("call_{}_{}", call.name, index),
+        name: call.name.clone(),
+        arguments: serde_json::to_string(&call.args).unwrap_or_default(),
+        status: None,
+        extensions,
+    })
+}
+
+/// Provider thought signature to echo when replaying a function call.
+///
+/// Current output stores it in scoped extensions. The legacy
+/// `call_{name}:{signature}` encoding is decoded only so histories persisted
+/// before the split remain resumable.
+fn google_replay_signature(call: &ChatFunctionCallItem) -> Option<String> {
+    if let Some(signature) = call
+        .extensions
+        .get(GOOGLE_THOUGHT_SIGNATURE)
+        .and_then(Value::as_str)
+    {
+        return Some(signature.to_string());
+    }
+    let expected_prefix = format!("call_{}:", call.name);
+    call.call_id
+        .strip_prefix(&expected_prefix)
+        .map(str::to_string)
+}
 
 /// Client for interacting with Google's Gemini API.
 ///
@@ -148,7 +204,7 @@ struct GoogleSystemInstruction<'a> {
 struct GoogleContentPart<'a> {
     /// The actual text content
     #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a str>,
+    text: Option<std::borrow::Cow<'a, str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     inline_data: Option<GoogleInlineData>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,9 +218,9 @@ struct GoogleContentPart<'a> {
 }
 
 impl<'a> GoogleContentPart<'a> {
-    fn text(text: &'a str) -> Self {
+    fn text(text: impl Into<std::borrow::Cow<'a, str>>) -> Self {
         Self {
-            text: Some(text),
+            text: Some(text.into()),
             inline_data: None,
             function_call: None,
             function_response: None,
@@ -173,9 +229,9 @@ impl<'a> GoogleContentPart<'a> {
         }
     }
 
-    fn thought(text: &'a str) -> Self {
+    fn thought(text: impl Into<std::borrow::Cow<'a, str>>) -> Self {
         Self {
-            text: Some(text),
+            text: Some(text.into()),
             inline_data: None,
             function_call: None,
             function_response: None,
@@ -274,7 +330,7 @@ struct GoogleChatResponse {
 
 impl std::fmt::Display for GoogleChatResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.text(), self.tool_calls()) {
+        match (self.text_projection(), self.tool_calls_projection()) {
             (Some(text), Some(tool_calls)) => {
                 for call in tool_calls {
                     write!(f, "{:?}", call)?;
@@ -320,8 +376,8 @@ struct GoogleResponseContent {
     function_calls: Option<Vec<GoogleFunctionCall>>,
 }
 
-impl ChatResponse for GoogleChatResponse {
-    fn text(&self) -> Option<String> {
+impl GoogleChatResponse {
+    fn text_projection(&self) -> Option<String> {
         self.candidates.first().map(|c| {
             c.content
                 .parts
@@ -332,7 +388,7 @@ impl ChatResponse for GoogleChatResponse {
         })
     }
 
-    fn thinking(&self) -> Option<String> {
+    fn thinking_projection(&self) -> Option<String> {
         self.candidates.first().and_then(|c| {
             let thoughts: String = c
                 .content
@@ -349,7 +405,7 @@ impl ChatResponse for GoogleChatResponse {
         })
     }
 
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+    fn tool_calls_projection(&self) -> Option<Vec<ToolCall>> {
         self.candidates.first().and_then(|c| {
             // First check for function calls at the part level (new API format)
             let part_function_calls: Vec<ToolCall> = c
@@ -358,11 +414,7 @@ impl ChatResponse for GoogleChatResponse {
                 .iter()
                 .filter_map(|part| {
                     part.function_call.as_ref().map(|f| {
-                        let id = if let Some(sig) = &part.thought_signature {
-                            format!("call_{}:{}", f.name, sig)
-                        } else {
-                            format!("call_{}", f.name)
-                        };
+                        let id = format!("call_{}", f.name);
 
                         ToolCall {
                             id,
@@ -416,12 +468,51 @@ impl ChatResponse for GoogleChatResponse {
         })
     }
 
-    fn usage(&self) -> Option<Usage> {
-        self.usage.clone()
+    /// Canonical function-call items for this response.
+    ///
+    /// Prefers part-level calls (which may carry a per-call thought signature)
+    /// and falls back to the older content-level shapes. Each call's
+    /// provider-only signature is preserved in scoped extensions rather than the
+    /// portable `call_id`.
+    fn function_call_items(&self) -> Vec<ChatOutputItem> {
+        let Some(candidate) = self.candidates.first() else {
+            return Vec::new();
+        };
+
+        let mut items: Vec<ChatOutputItem> = candidate
+            .content
+            .parts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, part)| {
+                part.function_call.as_ref().map(|function_call| {
+                    google_function_call_item(
+                        function_call,
+                        part.thought_signature.as_deref(),
+                        index,
+                    )
+                })
+            })
+            .collect();
+
+        if !items.is_empty() {
+            return items;
+        }
+
+        if let Some(function_call) = &candidate.content.function_call {
+            items.push(google_function_call_item(function_call, None, 0));
+        }
+        if let Some(function_calls) = &candidate.content.function_calls {
+            for (index, function_call) in function_calls.iter().enumerate() {
+                items.push(google_function_call_item(function_call, None, index));
+            }
+        }
+
+        items
     }
 
-    fn finish_reason(&self) -> Option<FinishReason> {
-        if self.tool_calls().is_some() {
+    fn finish_reason_projection(&self) -> Option<FinishReason> {
+        if !self.function_call_items().is_empty() {
             return Some(FinishReason::ToolCalls);
         }
 
@@ -447,6 +538,22 @@ impl ChatResponse for GoogleChatResponse {
             Some("FINISH_REASON_UNSPECIFIED") => Some(FinishReason::Unknown),
             _ => None,
         }
+    }
+}
+
+impl From<GoogleChatResponse> for ChatOutput {
+    fn from(response: GoogleChatResponse) -> Self {
+        let text = response.text_projection();
+        let thinking = response.thinking_projection();
+        let usage = response.usage.clone();
+        let finish_reason = response.finish_reason_projection();
+
+        // Function calls are appended canonically so their provider-only
+        // thought signatures stay in scoped extensions; `from_projections`
+        // cannot carry them.
+        let mut output = ChatOutput::from_projections(thinking, text, None, usage, finish_reason);
+        output.items.extend(response.function_call_items());
+        output
     }
 }
 
@@ -740,7 +847,8 @@ impl HTTPChatProvider for Google {
         }
 
         for msg in messages {
-            let has_tool_result = msg.content.iter().any(|b| b.is_tool_result());
+            let parts = msg.portable_input_parts();
+            let has_tool_result = parts.iter().any(ChatInputPart::is_tool_result);
             let role = if has_tool_result {
                 "function"
             } else {
@@ -750,79 +858,82 @@ impl HTTPChatProvider for Google {
                 }
             };
 
-            let mut parts = Vec::new();
+            let mut google_parts = Vec::new();
 
-            for block in &msg.content {
-                match block {
-                    Content::Text { text } => {
+            // Replay generated function calls / reasoning from structured output.
+            if let Some(output) = msg.output() {
+                for item in &output.items {
+                    match item {
+                        ChatOutputItem::FunctionCall(call) => {
+                            // Echo the provider signature only when it is present
+                            // as scoped origin state; portable projection strips it.
+                            let signature = google_replay_signature(call);
+                            let arguments = call.parse_arguments().unwrap_or(Value::Null);
+                            google_parts.push(GoogleContentPart::function_call(
+                                call.name.clone(),
+                                arguments,
+                                signature,
+                            ));
+                        }
+                        ChatOutputItem::Reasoning(reasoning) => {
+                            for part in reasoning.summary.iter().chain(&reasoning.content) {
+                                if !part.text.is_empty() {
+                                    google_parts.push(GoogleContentPart::thought(&part.text));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Canonical input parts are consumed directly; text parts own their
+            // strings so the borrowed Google parts below stay valid.
+            for part in &parts {
+                match part {
+                    ChatInputPart::Text { text } => {
                         if !text.is_empty() {
-                            parts.push(GoogleContentPart::text(text));
+                            google_parts.push(GoogleContentPart::text(text.clone()));
                         }
                     }
-                    Content::Thinking { text, .. } => {
-                        if !text.is_empty() {
-                            parts.push(GoogleContentPart::thought(text));
+                    ChatInputPart::Attachment(media) => match media.source() {
+                        MediaSource::Inline { data } => {
+                            if let Some(media_type) = media.media_type() {
+                                google_parts.push(GoogleContentPart::inline_data(
+                                    media_type.to_string(),
+                                    BASE64.encode(data),
+                                ));
+                            }
                         }
-                    }
-                    Content::Image { mime_type, data } => {
-                        parts.push(GoogleContentPart::inline_data(
-                            mime_type.clone(),
-                            BASE64.encode(data),
-                        ));
-                    }
-                    Content::Pdf { data } => {
-                        parts.push(GoogleContentPart::inline_data(
-                            "application/pdf".to_string(),
-                            BASE64.encode(data),
-                        ));
-                    }
-                    Content::ImageUrl { url } => {
-                        // Google input parts do not expose a direct image URL field,
-                        // so preserve the reference as text.
-                        parts.push(GoogleContentPart::text(url));
-                    }
-                    Content::ToolUse {
-                        id,
-                        name,
-                        arguments,
-                    } => {
-                        let expected_prefix = format!("call_{}:", name);
-                        let signature = if id.starts_with(&expected_prefix) {
-                            Some(id[expected_prefix.len()..].to_string())
-                        } else {
-                            None
-                        };
-                        parts.push(GoogleContentPart::function_call(
-                            name.clone(),
-                            arguments.clone(),
-                            signature,
-                        ));
-                    }
-                    Content::ToolResult {
-                        id, name, content, ..
-                    } => {
-                        let text = content
-                            .iter()
-                            .filter_map(|c| c.as_text())
-                            .collect::<Vec<_>>()
-                            .join("\n");
+                        MediaSource::DataUrl { url } | MediaSource::Url { url } => {
+                            // Google input parts do not expose a direct image URL
+                            // field, so preserve the reference as text.
+                            google_parts.push(GoogleContentPart::text(url.clone()));
+                        }
+                        MediaSource::ProviderFile { .. } => {}
+                    },
+                    ChatInputPart::ToolResult(result) => {
+                        let text = result.text_content();
                         let payload = if text.is_empty() {
                             Value::Null
                         } else {
                             Value::String(text)
                         };
-                        parts.push(GoogleContentPart::function_response(
-                            name.clone().unwrap_or_else(|| id.clone()),
+                        google_parts.push(GoogleContentPart::function_response(
+                            result
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| result.call_id.clone()),
                             payload,
                         ));
-                    }
-                    Content::Audio { .. } | Content::ResourceLink { .. } => {
-                        // Unsupported in Google request format today.
                     }
                 }
             }
 
-            chat_contents.push(GoogleChatContent { role, parts });
+            chat_contents.push(GoogleChatContent {
+                role,
+                parts: google_parts,
+            });
         }
 
         // Add system message if present
@@ -918,7 +1029,7 @@ impl HTTPChatProvider for Google {
         cfg.chat_request(messages, tools)
     }
 
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, LLMError> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
         debug_assert!(
             resp.status().is_success(),
             "parse_chat is success-only; adapter must classify non-success first"
@@ -928,7 +1039,7 @@ impl HTTPChatProvider for Google {
             serde_json::from_slice(resp.body());
 
         match json_resp {
-            Ok(response) => Ok(Box::new(response)),
+            Ok(response) => Ok(response.into()),
             Err(e) => {
                 // Return a more descriptive error with the raw response
                 Err(LLMError::ResponseFormatError {
@@ -1303,11 +1414,14 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
 
             // Extract tool calls
             if let Some(function_call) = &part.function_call {
-                let id = if let Some(sig) = &part.thought_signature {
-                    format!("call_{}:{}", function_call.name, sig)
-                } else {
-                    format!("call_{}", function_call.name)
-                };
+                let mut extensions = Extensions::new();
+                if let Some(signature) = &part.thought_signature {
+                    extensions.insert(
+                        GOOGLE_THOUGHT_SIGNATURE.to_string(),
+                        Value::String(signature.clone()),
+                    );
+                }
+                let id = format!("call_{}_{}", function_call.name, index);
 
                 chunks.push(querymt::chat::StreamChunk::ToolUseStart {
                     index,
@@ -1326,6 +1440,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
                                 .unwrap_or_default(),
                         },
                     },
+                    extensions,
                 });
             }
         }
@@ -1349,6 +1464,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
                         arguments: serde_json::to_string(&fc.args).unwrap_or_default(),
                     },
                 },
+                extensions: Default::default(),
             });
         }
 
@@ -1371,6 +1487,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
                             arguments: serde_json::to_string(&fc.args).unwrap_or_default(),
                         },
                     },
+                    extensions: Default::default(),
                 });
             }
         }
@@ -1741,5 +1858,90 @@ mod tests {
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
+    }
+
+    fn function_call_response(thought_signature: Option<&str>) -> GoogleChatResponse {
+        GoogleChatResponse {
+            candidates: vec![GoogleCandidate {
+                content: GoogleResponseContent {
+                    parts: vec![GoogleResponsePart {
+                        text: None,
+                        function_call: Some(GoogleFunctionCall {
+                            name: "lookup".into(),
+                            args: serde_json::json!({"q": "rust"}),
+                        }),
+                        thought: false,
+                        thought_signature: thought_signature.map(str::to_string),
+                    }],
+                    function_call: None,
+                    function_calls: None,
+                },
+                finish_reason: Some("STOP".into()),
+                index: 0,
+            }],
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn thought_signature_is_scoped_not_embedded_in_call_id() {
+        let output: ChatOutput = function_call_response(Some("sig-123")).into();
+        let call = output
+            .function_calls()
+            .next()
+            .expect("expected a function call");
+        assert!(
+            !call.call_id.contains("sig-123"),
+            "provider signature must not be embedded in the portable call ID"
+        );
+        assert_eq!(
+            call.extensions.get(GOOGLE_THOUGHT_SIGNATURE),
+            Some(&Value::String("sig-123".into())),
+            "signature is carried as scoped origin state"
+        );
+        assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+
+        // Portable projection strips the signature without touching call_id.
+        let portable = output.clone().into_portable();
+        let portable_call = portable
+            .function_calls()
+            .next()
+            .expect("portable output keeps the call");
+        assert_eq!(
+            portable_call.call_id, call.call_id,
+            "portable projection keeps call identity for correlation"
+        );
+        assert!(
+            !portable_call
+                .extensions
+                .contains_key(GOOGLE_THOUGHT_SIGNATURE),
+            "portable projection strips the provider-only signature"
+        );
+    }
+
+    #[test]
+    fn google_replay_signature_reads_scoped_extension_and_legacy_id() {
+        let mut call = ChatFunctionCallItem {
+            item_id: None,
+            call_id: "call_lookup_0".into(),
+            name: "lookup".into(),
+            arguments: "{}".into(),
+            status: None,
+            extensions: Extensions::new(),
+        };
+        assert_eq!(google_replay_signature(&call), None);
+        call.extensions.insert(
+            GOOGLE_THOUGHT_SIGNATURE.into(),
+            Value::String("scoped".into()),
+        );
+        assert_eq!(google_replay_signature(&call), Some("scoped".into()));
+
+        // Histories persisted before the split still decode the legacy prefix.
+        let legacy = ChatFunctionCallItem {
+            call_id: "call_lookup:legacy-sig".into(),
+            extensions: Extensions::new(),
+            ..call.clone()
+        };
+        assert_eq!(google_replay_signature(&legacy), Some("legacy-sig".into()));
     }
 }

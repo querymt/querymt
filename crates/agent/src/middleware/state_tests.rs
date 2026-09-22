@@ -4,7 +4,7 @@ use crate::middleware::{
     WaitCondition, WaitReason,
 };
 use crate::test_utils::{mock_tool_call, test_context};
-use querymt::chat::{ChatMessage, ChatRole, Content, FinishReason};
+use querymt::chat::{ChatMessage, ChatRole, FinishReason, ToolResultPart};
 use std::sync::Arc;
 
 #[test]
@@ -139,21 +139,9 @@ fn test_execution_state_context_accessors() {
 #[test]
 fn test_conversation_context_counts_user_messages() {
     let messages = vec![
-        ChatMessage {
-            role: ChatRole::User,
-            content: vec![Content::text("one")],
-            cache: None,
-        },
-        ChatMessage {
-            role: ChatRole::Assistant,
-            content: vec![Content::text("two")],
-            cache: None,
-        },
-        ChatMessage {
-            role: ChatRole::User,
-            content: vec![Content::text("three")],
-            cache: None,
-        },
+        ChatMessage::user().text("one").build(),
+        ChatMessage::assistant().text("two").build(),
+        ChatMessage::user().text("three").build(),
     ];
     let stats = AgentStats {
         turns: 2,
@@ -208,7 +196,7 @@ fn test_llm_response_has_tool_calls() {
 fn test_tool_result_with_snapshot() {
     let result = ToolResult::new(
         "call-1".to_string(),
-        vec![Content::text("ok")],
+        vec![ToolResultPart::text("ok")],
         false,
         Some("tool".to_string()),
         Some("{}".to_string()),

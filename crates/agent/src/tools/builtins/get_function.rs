@@ -3,7 +3,7 @@
 //! Supports multi-file batched reads via the `paths` array.
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -66,6 +66,7 @@ impl Tool for GetFunctionTool {
                     },
                     "required": ["paths", "names"]
                 }),
+                strict: None,
             },
         }
     }
@@ -78,7 +79,7 @@ impl Tool for GetFunctionTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let path_strs = parse_paths(&args)?;
         let names = parse_names(&args)?;
         let context_lines = args
@@ -113,7 +114,7 @@ impl Tool for GetFunctionTool {
             ));
         }
 
-        Ok(vec![Content::text(file_results.join("\n\n"))])
+        Ok(vec![ToolResultPart::text(file_results.join("\n\n"))])
     }
 }
 
@@ -244,9 +245,9 @@ mod tests {
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
-    fn text_content(contents: Vec<Content>) -> String {
+    fn text_content(contents: Vec<ToolResultPart>) -> String {
         match contents.into_iter().next().unwrap() {
-            Content::Text { text } => text,
+            ToolResultPart::Text { text } => text,
             _ => panic!("expected text content"),
         }
     }

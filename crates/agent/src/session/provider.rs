@@ -1,6 +1,6 @@
 #[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
-use crate::model::{AgentMessage, MessagePart};
+use crate::model::{AgentMessage, MessagePart, OutputTarget};
 use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
@@ -11,7 +11,7 @@ use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatResponse, ChatRole, Content},
+    chat::{ChatMessage, ChatOutput, ChatRole},
     error::LLMError,
 };
 use std::sync::Arc;
@@ -773,26 +773,44 @@ impl SessionHandle {
 
     /// Get the effective session history (post-compaction, no snapshot-only messages)
     pub async fn get_effective_agent_history(&self) -> SessionResult<Vec<AgentMessage>> {
-        self.provider
+        let mut messages = self
+            .provider
             .history_store
             .get_effective_history(&self.session.public_id)
-            .await
+            .await?;
+        let repaired = crate::model::repair_unmatched_tool_calls(&mut messages);
+        if repaired > 0 {
+            log::warn!(
+                "Repaired {} unmatched tool call(s) while loading session {} history",
+                repaired,
+                self.session.public_id
+            );
+        }
+        Ok(messages)
     }
 
     /// Get the session history converted to standard ChatMessages for the LLM.
     pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
         let agent_msgs = self.get_effective_agent_history().await?;
+        // Build the full target identity so native provider state (encrypted
+        // reasoning, opaque items) may only replay to the exact same
+        // provider/protocol/model/endpoint; any other target gets the portable
+        // projection.
+        let target = self.llm_config.as_ref().map(|cfg| {
+            let mut target = OutputTarget::new(cfg.provider.clone(), cfg.model.clone());
+            target.protocol = cfg.protocol.clone();
+            target.endpoint = cfg.endpoint.clone();
+            target
+        });
+        let max_prompt_bytes = self
+            .execution_config
+            .as_ref()
+            .and_then(|cfg| cfg.max_prompt_bytes);
         agent_msgs
             .iter()
             .map(|message| {
                 message
-                    .to_chat_message_with_target(
-                        self.llm_config.as_ref().map(|cfg| cfg.provider.as_str()),
-                        self.llm_config.as_ref().map(|cfg| cfg.model.as_str()),
-                        self.execution_config
-                            .as_ref()
-                            .and_then(|cfg| cfg.max_prompt_bytes),
-                    )
+                    .to_chat_message_with_output_target(target.as_ref(), max_prompt_bytes)
                     .map_err(|error| SessionError::InvalidOperation(error.to_string()))
             })
             .collect()
@@ -811,22 +829,19 @@ impl SessionHandle {
         &self,
         name: &str,
         args: serde_json::Value,
-    ) -> Result<Vec<Content>, LLMError> {
+    ) -> Result<Vec<querymt::chat::ToolResultPart>, LLMError> {
         let provider = self.provider().await?;
         provider.call_tool(name, args).await
     }
 
     /// Submit messages to the LLM without auto-saving
-    pub async fn submit_request(
-        &self,
-        messages: &[ChatMessage],
-    ) -> Result<Box<dyn ChatResponse>, LLMError> {
+    pub async fn submit_request(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
         let provider = self.provider().await?;
         provider.chat(messages).await
     }
 
     /// Higher-level chat interface (used by CLI) that handles conversion and storage
-    pub async fn chat(&self, messages: &[ChatMessage]) -> SessionResult<Box<dyn ChatResponse>> {
+    pub async fn chat(&self, messages: &[ChatMessage]) -> SessionResult<ChatOutput> {
         // 1. Store incoming messages (User or Tool Result)
         for msg in messages {
             let agent_msg = self.convert_chat_to_agent(msg);
@@ -840,7 +855,7 @@ impl SessionHandle {
         let response = self.submit_request(&llm_messages).await?;
 
         // 4. Store response
-        let response_msg: ChatMessage = response.as_ref().into();
+        let response_msg: ChatMessage = response.clone().into();
         let agent_response = self.convert_chat_to_agent(&response_msg);
         self.add_message(agent_response).await?;
 
@@ -879,55 +894,60 @@ impl SessionHandle {
     pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {
         let mut parts = Vec::new();
 
-        for block in &msg.content {
-            match block {
-                Content::Text { text } => {
-                    parts.push(MessagePart::Text {
-                        content: text.clone(),
-                    });
+        // A structured assistant turn stores its canonical output once; the
+        // projected content blocks are not duplicated as additional parts.
+        if msg.role == ChatRole::Assistant
+            && let Some(output) = msg.output()
+        {
+            parts.push(MessagePart::Output {
+                output: output.clone(),
+            });
+            let source_provider = self.llm_config.as_ref().map(|cfg| cfg.provider.clone());
+            let source_model = self.llm_config.as_ref().map(|cfg| cfg.model.clone());
+            return Self::finish_agent_message(
+                self.session.public_id.clone(),
+                source_provider,
+                source_model,
+                msg,
+                parts,
+            );
+        }
+
+        for part in msg.portable_input_parts() {
+            match part {
+                querymt::chat::ChatInputPart::Text { text } => {
+                    parts.push(MessagePart::Text { content: text });
                 }
-                Content::Thinking { text, signature } => {
-                    parts.push(MessagePart::Reasoning {
-                        content: text.clone(),
-                        signature: signature.clone(),
-                        time_ms: None,
-                    });
+                querymt::chat::ChatInputPart::Attachment(media) => {
+                    // Attachments render as a display projection.
+                    let desc = match media.source() {
+                        querymt::chat::MediaSource::Inline { data } => format!(
+                            "[Attachment: {}, {} bytes]",
+                            media
+                                .media_type()
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                            data.len()
+                        ),
+                        querymt::chat::MediaSource::DataUrl { url }
+                        | querymt::chat::MediaSource::Url { url } => {
+                            format!("[Attached resource: {url}]")
+                        }
+                        querymt::chat::MediaSource::ProviderFile { file_id, .. } => {
+                            format!("[Provider file: {file_id}]")
+                        }
+                    };
+                    parts.push(MessagePart::Text { content: desc });
                 }
-                Content::ToolUse {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    parts.push(MessagePart::ToolUse(querymt::ToolCall {
-                        id: id.clone(),
-                        call_type: "function".to_string(),
-                        function: querymt::FunctionCall {
-                            name: name.clone(),
-                            arguments: arguments.to_string(),
-                        },
-                    }));
-                }
-                Content::ToolResult {
-                    id,
-                    name,
-                    is_error,
-                    content,
-                } => {
+                querymt::chat::ChatInputPart::ToolResult(result) => {
                     parts.push(MessagePart::ToolResult {
-                        call_id: id.clone(),
-                        content: content.clone(),
-                        is_error: *is_error,
-                        tool_name: name.clone(),
+                        call_id: result.call_id,
+                        content: result.parts,
+                        is_error: result.is_error,
+                        tool_name: result.name,
                         tool_arguments: None,
                         compacted_at: None,
                     });
-                }
-                _ => {
-                    // Image, ImageUrl, Pdf, Audio, ResourceLink — store as text description
-                    let desc = block.to_string();
-                    if !desc.is_empty() {
-                        parts.push(MessagePart::Text { content: desc });
-                    }
                 }
             }
         }
@@ -943,10 +963,27 @@ impl SessionHandle {
             None
         };
 
+        Self::finish_agent_message(
+            self.session.public_id.clone(),
+            source_provider,
+            source_model,
+            msg,
+            parts,
+        )
+    }
+
+    /// Assemble the AgentMessage envelope for converted chat content.
+    fn finish_agent_message(
+        session_id: String,
+        source_provider: Option<String>,
+        source_model: Option<String>,
+        msg: &ChatMessage,
+        parts: Vec<MessagePart>,
+    ) -> AgentMessage {
         AgentMessage {
             id: uuid::Uuid::now_v7().to_string(),
-            session_id: self.session.public_id.clone(),
-            role: msg.role.clone(),
+            session_id,
+            role: msg.role,
             parts,
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -1153,7 +1190,7 @@ impl<'a> ProviderRequest<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatResponse, FinishReason, StreamChunk};
+    use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
@@ -1176,6 +1213,8 @@ pub mod tests {
             name: None,
             provider: "remote-provider".to_string(),
             model: "model-b".to_string(),
+            protocol: String::new(),
+            endpoint: String::new(),
             params: None,
             created_at: None,
             updated_at: None,
@@ -1252,7 +1291,7 @@ pub mod tests {
         }
     }
 
-    // ChatResponse implementation
+    // ChatOutput projection source for tests
     #[derive(Debug)]
     struct MockChatResponse {
         content: String,
@@ -1264,25 +1303,15 @@ pub mod tests {
         }
     }
 
-    impl ChatResponse for MockChatResponse {
-        fn text(&self) -> Option<String> {
-            Some(self.content.clone())
-        }
-
-        fn thinking(&self) -> Option<String> {
-            None
-        }
-
-        fn usage(&self) -> Option<querymt::Usage> {
-            None
-        }
-
-        fn finish_reason(&self) -> Option<FinishReason> {
-            Some(FinishReason::Stop)
-        }
-
-        fn tool_calls(&self) -> Option<Vec<querymt::ToolCall>> {
-            None
+    impl From<MockChatResponse> for ChatOutput {
+        fn from(response: MockChatResponse) -> Self {
+            ChatOutput::from_projections(
+                None,
+                Some(response.content.clone()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            )
         }
     }
 
@@ -1292,10 +1321,11 @@ pub mod tests {
             &self,
             _messages: &[ChatMessage],
             _tools: Option<&[querymt::chat::Tool]>,
-        ) -> Result<Box<dyn ChatResponse>, LLMError> {
-            Ok(Box::new(MockChatResponse {
+        ) -> Result<ChatOutput, LLMError> {
+            Ok(MockChatResponse {
                 content: self.response_text.clone(),
-            }))
+            }
+            .into())
         }
 
         async fn chat_stream_with_tools(

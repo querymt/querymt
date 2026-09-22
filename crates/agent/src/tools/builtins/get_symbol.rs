@@ -4,7 +4,7 @@
 //! Supports `context_mode=relevant` to include imports and parent symbol context.
 
 use async_trait::async_trait;
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -86,6 +86,7 @@ impl Tool for GetSymbolTool {
                     },
                     "required": ["requests"]
                 }),
+                strict: None,
             },
         }
     }
@@ -98,7 +99,7 @@ impl Tool for GetSymbolTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let context_lines = args
             .get("context_lines")
             .and_then(Value::as_u64)
@@ -157,7 +158,7 @@ impl Tool for GetSymbolTool {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        Ok(vec![Content::text(output)])
+        Ok(vec![ToolResultPart::text(output)])
     }
 }
 
@@ -454,9 +455,9 @@ mod tests {
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
-    fn text_content(contents: Vec<Content>) -> String {
+    fn text_content(contents: Vec<ToolResultPart>) -> String {
         match contents.into_iter().next().unwrap() {
-            Content::Text { text } => text,
+            ToolResultPart::Text { text } => text,
             _ => panic!("expected text content"),
         }
     }

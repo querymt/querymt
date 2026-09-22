@@ -1,10 +1,6 @@
 use async_trait::async_trait;
 
-use crate::{
-    ToolCall, Usage,
-    chat::{ChatResponse, FinishReason},
-    error::LLMError,
-};
+use crate::{chat::ChatOutput, error::LLMError};
 use serde::{Deserialize, Serialize};
 
 pub mod http;
@@ -29,18 +25,9 @@ pub struct CompletionResponse {
     pub text: String,
 }
 
-impl ChatResponse for CompletionResponse {
-    fn text(&self) -> Option<String> {
-        Some(self.text.clone())
-    }
-    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
-        None
-    }
-    fn usage(&self) -> Option<Usage> {
-        None
-    }
-    fn finish_reason(&self) -> Option<FinishReason> {
-        None
+impl From<CompletionResponse> for ChatOutput {
+    fn from(response: CompletionResponse) -> Self {
+        ChatOutput::from_projections(None, Some(response.text), None, None, None)
     }
 }
 

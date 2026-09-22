@@ -11,281 +11,42 @@ use futures::Stream;
 use std::pin::Pin;
 
 pub mod http;
+mod migration;
+pub mod output;
+pub mod streaming;
+
+/// Version of the item-aware chat contract carried across serialized transports.
+pub const ITEM_AWARE_CHAT_CONTRACT_VERSION: u32 = 1;
+
+/// Whether any message retains semantics that require the item-aware contract.
+pub fn messages_require_item_aware_contract(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .output()
+            .is_some_and(ChatOutput::requires_item_aware_fidelity)
+    })
+}
+
+pub use output::{
+    ChatFunctionCallItem, ChatInputPart, ChatMessageItem, ChatMessagePart, ChatMessagePayload,
+    ChatOpaqueItem, ChatOpaquePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,
+    ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatTextAnnotation, Extensions,
+    MediaKind, MediaNormalizationError, MediaPart, MediaSource, MediaType, MediaTypeError,
+    ToolResult, ToolResultPart, empty_message_part,
+};
+pub use streaming::{
+    ChatMessagePartDelta, ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish,
+    ReasoningPartKind, StructuredStreamEvent,
+};
 
 // ---------------------------------------------------------------------------
-// Content — a single content block within a message
+// Content — the legacy recursive content block
 // ---------------------------------------------------------------------------
-
-/// A content block within a message.
-///
-/// Messages are composed of one or more `Content` blocks, allowing mixed content
-/// such as text, images, tool calls, and tool results within a single message.
-/// This aligns with how major LLM APIs (Anthropic, OpenAI, Google, MCP) model
-/// message content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum Content {
-    /// Plain text
-    Text { text: String },
-    /// Base64-encoded image
-    Image { mime_type: String, data: Vec<u8> },
-    /// Image referenced by URL
-    ImageUrl { url: String },
-    /// PDF document
-    Pdf { data: Vec<u8> },
-    /// Audio data
-    Audio { mime_type: String, data: Vec<u8> },
-    /// Model reasoning / chain-of-thought
-    Thinking {
-        text: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        signature: Option<String>,
-    },
-    /// Tool invocation requested by the model
-    ToolUse {
-        id: String,
-        name: String,
-        arguments: serde_json::Value,
-    },
-    /// Result of a tool invocation (can itself contain mixed content)
-    ToolResult {
-        id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        is_error: bool,
-        content: Vec<Content>,
-    },
-    /// A link to a resource, identified by URI.
-    /// Carries optional metadata (name, description, MIME type).
-    ResourceLink {
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        description: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        mime_type: Option<String>,
-    },
-}
-
-impl Content {
-    /// Create a text content block.
-    pub fn text(s: impl Into<String>) -> Self {
-        Content::Text { text: s.into() }
-    }
-
-    /// Create an image content block.
-    pub fn image(mime: impl Into<String>, data: Vec<u8>) -> Self {
-        Content::Image {
-            mime_type: mime.into(),
-            data,
-        }
-    }
-
-    /// Create an image URL content block.
-    pub fn image_url(url: impl Into<String>) -> Self {
-        Content::ImageUrl { url: url.into() }
-    }
-
-    /// Create a PDF content block.
-    pub fn pdf(data: Vec<u8>) -> Self {
-        Content::Pdf { data }
-    }
-
-    /// Create an audio content block.
-    pub fn audio(mime: impl Into<String>, data: Vec<u8>) -> Self {
-        Content::Audio {
-            mime_type: mime.into(),
-            data,
-        }
-    }
-
-    /// Create a thinking content block.
-    pub fn thinking(s: impl Into<String>) -> Self {
-        Content::Thinking {
-            text: s.into(),
-            signature: None,
-        }
-    }
-
-    /// Create a tool use content block.
-    pub fn tool_use(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        arguments: serde_json::Value,
-    ) -> Self {
-        Content::ToolUse {
-            id: id.into(),
-            name: name.into(),
-            arguments,
-        }
-    }
-
-    /// Create a tool result content block.
-    pub fn tool_result(id: impl Into<String>, content: Vec<Content>) -> Self {
-        Content::ToolResult {
-            id: id.into(),
-            name: None,
-            is_error: false,
-            content,
-        }
-    }
-
-    /// Create a resource link content block.
-    pub fn resource_link(uri: impl Into<String>) -> Self {
-        Content::ResourceLink {
-            uri: uri.into(),
-            name: None,
-            description: None,
-            mime_type: None,
-        }
-    }
-
-    /// Create an error tool result content block.
-    pub fn tool_result_error(id: impl Into<String>, content: Vec<Content>) -> Self {
-        Content::ToolResult {
-            id: id.into(),
-            name: None,
-            is_error: true,
-            content,
-        }
-    }
-
-    /// Returns the text if this is a `Text` block.
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Content::Text { text } => Some(text),
-            _ => None,
-        }
-    }
-
-    /// Returns true if this is a `ToolUse` block.
-    pub fn is_tool_use(&self) -> bool {
-        matches!(self, Content::ToolUse { .. })
-    }
-
-    /// Returns true if this is a `ToolResult` block.
-    pub fn is_tool_result(&self) -> bool {
-        matches!(self, Content::ToolResult { .. })
-    }
-}
-
-impl PartialEq for Content {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Content::Text { text: a }, Content::Text { text: b }) => a == b,
-            (
-                Content::Image {
-                    mime_type: ma,
-                    data: da,
-                },
-                Content::Image {
-                    mime_type: mb,
-                    data: db,
-                },
-            ) => ma == mb && da == db,
-            (Content::ImageUrl { url: a }, Content::ImageUrl { url: b }) => a == b,
-            (Content::Pdf { data: a }, Content::Pdf { data: b }) => a == b,
-            (
-                Content::Audio {
-                    mime_type: ma,
-                    data: da,
-                },
-                Content::Audio {
-                    mime_type: mb,
-                    data: db,
-                },
-            ) => ma == mb && da == db,
-            (
-                Content::Thinking {
-                    text: a,
-                    signature: sa,
-                },
-                Content::Thinking {
-                    text: b,
-                    signature: sb,
-                },
-            ) => a == b && sa == sb,
-            (
-                Content::ToolUse {
-                    id: ia,
-                    name: na,
-                    arguments: aa,
-                },
-                Content::ToolUse {
-                    id: ib,
-                    name: nb,
-                    arguments: ab,
-                },
-            ) => ia == ib && na == nb && aa == ab,
-            (
-                Content::ToolResult {
-                    id: ia,
-                    name: na,
-                    is_error: ea,
-                    content: ca,
-                },
-                Content::ToolResult {
-                    id: ib,
-                    name: nb,
-                    is_error: eb,
-                    content: cb,
-                },
-            ) => ia == ib && na == nb && ea == eb && ca == cb,
-            (
-                Content::ResourceLink {
-                    uri: ua,
-                    name: na,
-                    description: da,
-                    mime_type: ma,
-                },
-                Content::ResourceLink {
-                    uri: ub,
-                    name: nb,
-                    description: db,
-                    mime_type: mb,
-                },
-            ) => ua == ub && na == nb && da == db && ma == mb,
-            _ => false,
-        }
-    }
-}
-
-impl Eq for Content {}
-
-impl fmt::Display for Content {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Content::Text { text } => write!(f, "{}", text),
-            Content::Image { mime_type, data } => {
-                write!(f, "[Image: {}, {} bytes]", mime_type, data.len())
-            }
-            Content::ImageUrl { url } => write!(f, "[Image URL: {}]", url),
-            Content::Pdf { data } => write!(f, "[PDF: {} bytes]", data.len()),
-            Content::Audio { mime_type, data } => {
-                write!(f, "[Audio: {}, {} bytes]", mime_type, data.len())
-            }
-            Content::Thinking { text, .. } => write!(f, "[Thinking: {}]", text),
-            Content::ToolUse { id, name, .. } => write!(f, "[ToolUse: {} ({})]", name, id),
-            Content::ToolResult {
-                id,
-                is_error,
-                content,
-                ..
-            } => {
-                let label = if *is_error { "ToolError" } else { "ToolResult" };
-                write!(f, "[{}: {}, {} blocks]", label, id, content.len())
-            }
-            Content::ResourceLink { uri, name, .. } => {
-                if let Some(name) = name {
-                    write!(f, "[Resource: {} ({})]", name, uri)
-                } else {
-                    write!(f, "[Resource: {}]", uri)
-                }
-            }
-        }
-    }
-}
+//
+// The legacy `Content` type now lives in `migration` and is crate-private: it is
+// reachable only for reading old persisted histories and serialized transports.
+// Canonical values are `ChatInputPart` (supplied input) and `ChatOutput`
+// (generated output).
 
 /// Extract `<think>...</think>` blocks from text, returning (thinking, clean_content).
 ///
@@ -367,7 +128,7 @@ pub fn extract_thinking(text: &str) -> (Option<String>, String) {
 }
 
 /// Role of a participant in a chat conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatRole {
     /// The user/human participant in the conversation
     User,
@@ -414,19 +175,40 @@ pub enum ReasoningEffort {
 
 /// A single message in a chat conversation.
 ///
-/// Messages contain a role (user or assistant) and a vector of `Content` blocks,
-/// allowing mixed content such as text, images, tool calls, and tool results
-/// within a single message. This aligns with how major LLM APIs model messages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Each turn carries exactly one authoritative payload: canonical input parts
+/// (user/tool-result turns) or structured output (assistant turns). Portable and
+/// display projections are derived on demand from structured output and are
+/// never stored as an independently mutable second source of truth.
+#[derive(Debug, Clone)]
 pub struct ChatMessage {
     /// The role of who sent this message (user or assistant)
     pub role: ChatRole,
-    /// Content blocks for this message.
-    pub content: Vec<Content>,
+    /// The exclusive authoritative payload for this turn.
+    payload: ChatMessagePayload,
     /// Optional cache hint. Providers that support caching (e.g., Anthropic)
     /// will translate this into provider-specific cache breakpoint markers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheHint>,
+}
+
+/// Serialization writes only the canonical exclusive payload. Legacy `content`
+/// is never emitted; new records carry either `input` or `output`.
+impl Serialize for ChatMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ChatMessage", 3)?;
+        state.serialize_field("role", &self.role)?;
+        match &self.payload {
+            ChatMessagePayload::Input(parts) => state.serialize_field("input", parts)?,
+            ChatMessagePayload::Output(output) => state.serialize_field("output", output)?,
+        }
+        if self.cache.is_some() {
+            state.serialize_field("cache", &self.cache)?;
+        }
+        state.end()
+    }
 }
 
 /// Represents a parameter in a function tool
@@ -466,6 +248,9 @@ pub struct FunctionTool {
     pub description: String,
     /// The parameters schema for the function
     pub parameters: Value,
+    /// Whether the provider should enforce strict schema adherence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// Defines rules for structured output responses based on [OpenAI's structured output requirements](https://platform.openai.com/docs/api-reference/chat/create#chat-create-response_format).
@@ -548,9 +333,12 @@ const _: () = {
         (size + align - 1) & !(align - 1)
     }
 
-    // FunctionTool = name (String) + description (String) + parameters (Value)
-    // No padding needed: String fields are adjacent, then Value at end
-    const EXPECTED_FUNCTION_TOOL_SIZE: usize = STRING_SIZE + STRING_SIZE + VALUE_SIZE;
+    // FunctionTool = name + description + parameters + optional strictness, rounded
+    // up to Value's alignment.
+    const EXPECTED_FUNCTION_TOOL_SIZE: usize = align_up(
+        STRING_SIZE + STRING_SIZE + VALUE_SIZE + std::mem::size_of::<Option<bool>>(),
+        VALUE_ALIGN,
+    );
 
     // Tool = tool_type (String) + function (FunctionTool)
     // Need to align String to FunctionTool's alignment (which matches Value's alignment)
@@ -733,52 +521,15 @@ impl JsonSchema for ToolChoice {
     }
 }
 
-pub trait ChatResponse: std::fmt::Debug + std::fmt::Display + Send {
-    fn text(&self) -> Option<String>;
-    fn tool_calls(&self) -> Option<Vec<ToolCall>>;
-    fn finish_reason(&self) -> Option<FinishReason>;
-    fn thinking(&self) -> Option<String> {
-        None
-    }
-    fn usage(&self) -> Option<Usage>;
-}
-
-impl From<&dyn ChatResponse> for ChatMessage {
-    fn from(response: &dyn ChatResponse) -> Self {
-        let mut content = Vec::new();
-
-        if let Some(t) = response.thinking()
-            && !t.is_empty()
-        {
-            content.push(Content::thinking(t));
-        }
-        if let Some(text) = response.text()
-            && !text.is_empty()
-        {
-            content.push(Content::text(text));
-        }
-        if let Some(calls) = response.tool_calls() {
-            for call in calls {
-                content.push(Content::ToolUse {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    arguments: serde_json::from_str(&call.function.arguments)
-                        .unwrap_or_else(|_| Value::Object(Default::default())),
-                });
-            }
-        }
-
-        ChatMessage {
-            role: ChatRole::Assistant,
-            content,
-            cache: None,
-        }
+impl From<ChatOutput> for ChatMessage {
+    fn from(output: ChatOutput) -> Self {
+        ChatMessage::from_assistant_output(output)
     }
 }
 
-impl From<Box<dyn ChatResponse>> for ChatMessage {
-    fn from(response: Box<dyn ChatResponse>) -> Self {
-        ChatMessage::from(response.as_ref())
+impl From<&ChatOutput> for ChatMessage {
+    fn from(output: &ChatOutput) -> Self {
+        ChatMessage::from_assistant_output(output.clone())
     }
 }
 
@@ -796,6 +547,9 @@ pub enum FinishReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamChunk {
+    /// Item-aware response metadata, lifecycle, delta, or snapshot event.
+    Structured(StructuredStreamEvent),
+
     /// Text content delta
     Text(String),
 
@@ -832,6 +586,10 @@ pub enum StreamChunk {
         index: usize,
         /// The complete tool call with id, name, and parsed arguments
         tool_call: ToolCall,
+        /// Provider-scoped call metadata (e.g. a replay signature) that belongs
+        /// to the call's origin and is stripped by portable projection.
+        #[serde(default, skip_serializing_if = "Extensions::is_empty")]
+        extensions: Extensions,
     },
 
     /// Usage metadata containing token counts
@@ -840,7 +598,7 @@ pub enum StreamChunk {
     /// Stream ended with finish reason
     Done {
         /// The typed finish reason from the provider, mapped at emission time
-        /// using the same logic as `ChatResponse::finish_reason()`.
+        /// using the same logic as the canonical output finish reason.
         finish_reason: FinishReason,
     },
 }
@@ -880,11 +638,15 @@ pub trait ChatProvider: Send + Sync {
     /// Basic chat interaction without tools.
     ///
     /// This is a convenience method that delegates to `chat_with_tools` with `None` for tools.
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<Box<dyn ChatResponse>, LLMError> {
+    async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
         self.chat_with_tools(messages, None).await
     }
 
     /// Chat interaction with tools.
+    ///
+    /// Returns the authoritative item-aware [`ChatOutput`]. Text, visible
+    /// reasoning, executable function calls, usage, and finish reason are
+    /// derived projections of that value.
     ///
     /// # Arguments
     ///
@@ -895,7 +657,7 @@ pub trait ChatProvider: Send + Sync {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
-    ) -> Result<Box<dyn ChatResponse>, LLMError>;
+    ) -> Result<ChatOutput, LLMError>;
 
     /// Basic streaming chat interaction.
     ///
@@ -933,6 +695,21 @@ pub trait ChatProvider: Send + Sync {
     }
 }
 
+/// Whether a stream chunk is a semantic terminal.
+///
+/// Both the legacy `Done` marker and the canonical structured
+/// [`StructuredStreamEvent::ResponseTerminal`] are terminals. Transports must
+/// treat either as terminal for acknowledgement, buffering, lifecycle
+/// completion, and receiver shutdown; they must not wait for a legacy `Done`
+/// that a canonical-only provider will never send.
+pub fn chunk_is_terminal(chunk: &StreamChunk) -> bool {
+    matches!(
+        chunk,
+        StreamChunk::Done { .. }
+            | StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal { .. })
+    )
+}
+
 impl fmt::Display for ReasoningEffort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -961,7 +738,128 @@ impl std::str::FromStr for ReasoningEffort {
     }
 }
 
+/// Validation failure for a message whose role and payload conflict.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatMessageConsistencyError {
+    #[error("structured output is only valid on assistant messages")]
+    StructuredOutputOnUserMessage,
+    #[error("structured message item role does not match its assistant envelope")]
+    StructuredItemRoleMismatch,
+}
+
 impl ChatMessage {
+    fn validate_role_payload(
+        role: &ChatRole,
+        payload: &ChatMessagePayload,
+    ) -> Result<(), ChatMessageConsistencyError> {
+        match (role, payload) {
+            (ChatRole::Assistant, ChatMessagePayload::Output(output)) => {
+                if output.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        ChatOutputItem::Message(message) if &message.role != role
+                    )
+                }) {
+                    return Err(ChatMessageConsistencyError::StructuredItemRoleMismatch);
+                }
+                Ok(())
+            }
+            (ChatRole::User, ChatMessagePayload::Output(_)) => {
+                Err(ChatMessageConsistencyError::StructuredOutputOnUserMessage)
+            }
+            (_, ChatMessagePayload::Input(_)) => Ok(()),
+        }
+    }
+
+    /// Validate that the payload matches the message role.
+    ///
+    /// Assistant input payloads are valid explicit portable projections. Only
+    /// structured output is role-restricted because it represents generated
+    /// assistant semantics.
+    pub fn validate_output_consistency(&self) -> Result<(), ChatMessageConsistencyError> {
+        Self::validate_role_payload(&self.role, &self.payload)
+    }
+
+    /// Replace the authoritative structured output payload.
+    pub fn replace_output(
+        &mut self,
+        output: ChatOutput,
+    ) -> Result<(), ChatMessageConsistencyError> {
+        let payload = ChatMessagePayload::output(output);
+        Self::validate_role_payload(&self.role, &payload)?;
+        self.payload = payload;
+        Ok(())
+    }
+
+    /// Replace the authoritative payload with portable input parts.
+    ///
+    /// This is valid for both user turns and explicitly downgraded assistant
+    /// turns. Any previous structured continuation is discarded.
+    pub fn replace_input(&mut self, parts: Vec<ChatInputPart>) {
+        self.payload = ChatMessagePayload::Input(parts);
+    }
+
+    /// Explicitly remove origin-scoped continuation from structured output.
+    ///
+    /// Portable message, reasoning, and function-call semantics remain canonical
+    /// output so call IDs and names survive cross-provider replay. The discarded
+    /// identities and encrypted state cannot be restored afterwards.
+    pub fn into_portable(mut self) -> Self {
+        self.payload = match self.payload {
+            ChatMessagePayload::Input(parts) => ChatMessagePayload::Input(parts),
+            ChatMessagePayload::Output(output) => {
+                ChatMessagePayload::output(output.into_portable())
+            }
+        };
+        self
+    }
+
+    /// Borrow the authoritative payload.
+    pub fn payload(&self) -> &ChatMessagePayload {
+        &self.payload
+    }
+
+    /// Borrow authoritative input parts without allocating.
+    pub fn input(&self) -> Option<&[ChatInputPart]> {
+        self.payload.as_input()
+    }
+
+    /// Append an input part to an input payload.
+    ///
+    /// Returns `false` (leaving the message unchanged) if the payload is
+    /// structured output, since the two forms are exclusive.
+    pub fn push_input_part(&mut self, part: ChatInputPart) -> bool {
+        match &mut self.payload {
+            ChatMessagePayload::Input(parts) => {
+                parts.push(part);
+                true
+            }
+            ChatMessagePayload::Output(_) => false,
+        }
+    }
+
+    /// Set the message role.
+    ///
+    /// A structured output payload cannot be moved onto a user turn; in that
+    /// case the output is projected to portable input parts instead.
+    pub fn with_role(mut self, role: ChatRole) -> Self {
+        if role == ChatRole::User && self.payload.is_output() {
+            self.payload = ChatMessagePayload::Input(self.payload.into_portable());
+        }
+        self.role = role;
+        self
+    }
+
+    /// Create an owned lossy portable projection of this message's payload.
+    pub fn portable_input_parts(&self) -> Vec<ChatInputPart> {
+        self.payload.portable_parts()
+    }
+
+    /// Borrow the authoritative structured output, if this is an output turn.
+    pub fn output(&self) -> Option<&ChatOutput> {
+        self.payload.as_output()
+    }
+
     /// Create a new builder for a user message.
     pub fn user() -> ChatMessageBuilder {
         ChatMessageBuilder::new(ChatRole::User)
@@ -972,64 +870,151 @@ impl ChatMessage {
         ChatMessageBuilder::new(ChatRole::Assistant)
     }
 
-    /// Convenience: create a user message from content blocks.
-    pub fn from_user(content: Vec<Content>) -> Self {
+    /// Convenience: create a user message from canonical input parts.
+    pub fn from_user_parts(parts: Vec<ChatInputPart>) -> Self {
         ChatMessage {
             role: ChatRole::User,
-            content,
+            payload: ChatMessagePayload::Input(parts),
             cache: None,
         }
     }
 
-    /// Convenience: create an assistant message from content blocks.
-    pub fn from_assistant(content: Vec<Content>) -> Self {
-        ChatMessage {
+    /// Convenience: create an assistant message from structured output.
+    pub fn from_assistant_output(output: ChatOutput) -> Self {
+        Self::try_from_assistant_output(output)
+            .expect("assistant output message items must have the assistant role")
+    }
+
+    /// Create an assistant message while validating all role-bearing output items.
+    pub fn try_from_assistant_output(
+        output: ChatOutput,
+    ) -> Result<Self, ChatMessageConsistencyError> {
+        let payload = ChatMessagePayload::output(output);
+        Self::validate_role_payload(&ChatRole::Assistant, &payload)?;
+        Ok(ChatMessage {
             role: ChatRole::Assistant,
-            content,
+            payload,
             cache: None,
+        })
+    }
+
+    /// Extract concatenated text from canonical input parts or output text.
+    pub fn text(&self) -> String {
+        match &self.payload {
+            ChatMessagePayload::Input(parts) => parts
+                .iter()
+                .filter_map(|part| part.as_text())
+                .collect::<Vec<_>>()
+                .join(""),
+            ChatMessagePayload::Output(output) => output.text().unwrap_or_default(),
         }
     }
 
-    /// Extract concatenated text from all `Content::Text` blocks.
-    pub fn text(&self) -> String {
-        self.content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    /// Check if the message contains any `Content::ToolUse` blocks.
+    /// Check whether the message carries a supported local function call.
     pub fn has_tool_use(&self) -> bool {
-        self.content.iter().any(|b| b.is_tool_use())
+        self.function_calls().next().is_some()
     }
 
-    /// Extract all `Content::ToolUse` blocks.
-    pub fn tool_uses(&self) -> Vec<&Content> {
-        self.content.iter().filter(|b| b.is_tool_use()).collect()
+    /// Iterate over canonical generated function-call items without allocation.
+    pub fn function_calls(&self) -> impl Iterator<Item = &ChatFunctionCallItem> {
+        self.output()
+            .into_iter()
+            .flat_map(|output| output.function_calls())
     }
 
-    /// Check if the message contains any `Content::ToolResult` blocks.
+    /// Check whether the message carries any tool result input part.
     pub fn has_tool_result(&self) -> bool {
-        self.content.iter().any(|b| b.is_tool_result())
+        match &self.payload {
+            ChatMessagePayload::Input(parts) => parts.iter().any(ChatInputPart::is_tool_result),
+            ChatMessagePayload::Output(_) => false,
+        }
     }
 
-    /// Extract the first thinking block text, if any.
-    pub fn thinking(&self) -> Option<&str> {
-        self.content.iter().find_map(|b| match b {
-            Content::Thinking { text, .. } => Some(text.as_str()),
-            _ => None,
+    /// Extract visible reasoning text, if any.
+    pub fn thinking(&self) -> Option<String> {
+        match &self.payload {
+            ChatMessagePayload::Input(_) => None,
+            ChatMessagePayload::Output(output) => output.thinking(),
+        }
+    }
+}
+
+/// Deserialization DTO accepting canonical and legacy message records.
+///
+/// Old `{ role, content }` records, the transitional
+/// `{ role, content, output }` shape, and the canonical `{ role, input }` or
+/// `{ role, output }` shape all normalize into the exclusive payload here,
+/// once, at the migration boundary. A transitional record whose `content` and
+/// `output` disagree is rejected as a stale duplicate representation.
+#[derive(Deserialize)]
+struct ChatMessageDto {
+    role: ChatRole,
+    #[serde(default)]
+    content: Option<Vec<migration::Content>>,
+    #[serde(default)]
+    cache: Option<CacheHint>,
+    #[serde(default)]
+    output: Option<ChatOutput>,
+    #[serde(default)]
+    input: Option<Vec<ChatInputPart>>,
+}
+
+impl<'de> Deserialize<'de> for ChatMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let dto = ChatMessageDto::deserialize(deserializer)?;
+
+        let payload = match (dto.output, dto.input, dto.content) {
+            // Canonical exclusive shapes.
+            (Some(output), None, None) => ChatMessagePayload::output(output),
+            (None, Some(parts), None) => ChatMessagePayload::Input(parts),
+            // Transitional `{ role, content, output }` records: `output` is
+            // authoritative. Any non-empty `content` must be a projection of it,
+            // otherwise the record is a stale duplicate representation.
+            (Some(output), None, Some(content)) => ChatMessagePayload::output(
+                migration::normalize_transitional_output(&content, output)
+                    .map_err(de::Error::custom)?,
+            ),
+            // Legacy records. The role decides the path: an assistant turn is
+            // generated output and collapses into exactly one `ChatOutput`,
+            // while user/tool turns normalize into canonical input parts.
+            (None, None, Some(content)) if dto.role == ChatRole::Assistant => {
+                ChatMessagePayload::output(
+                    migration::normalize_legacy_assistant(content).map_err(de::Error::custom)?,
+                )
+            }
+            (None, None, Some(content)) => ChatMessagePayload::Input(
+                migration::normalize_legacy_input(&content).map_err(de::Error::custom)?,
+            ),
+            (None, None, None) => ChatMessagePayload::Input(Vec::new()),
+            _ => {
+                return Err(de::Error::custom(
+                    "message record mixes exclusive payload representations",
+                ));
+            }
+        };
+
+        ChatMessage::validate_role_payload(&dto.role, &payload).map_err(de::Error::custom)?;
+
+        Ok(ChatMessage {
+            role: dto.role,
+            payload,
+            cache: dto.cache,
         })
     }
 }
 
 /// Builder for ChatMessage.
 ///
-/// Accumulates `Content` blocks and produces a `ChatMessage`.
+/// Accumulates canonical input parts and produces a `ChatMessage`.
 #[derive(Debug)]
 pub struct ChatMessageBuilder {
     role: ChatRole,
-    content: Vec<Content>,
+    parts: Vec<ChatInputPart>,
+    /// Ordered generated output items (reasoning, messages, function calls).
+    output_items: Vec<ChatOutputItem>,
     cache: Option<CacheHint>,
 }
 
@@ -1038,71 +1023,173 @@ impl ChatMessageBuilder {
     pub fn new(role: ChatRole) -> Self {
         Self {
             role,
-            content: Vec::new(),
+            parts: Vec::new(),
+            output_items: Vec::new(),
             cache: None,
         }
     }
 
-    /// Append a text content block. If called multiple times, multiple text blocks are added.
-    pub fn text(mut self, s: impl Into<String>) -> Self {
-        self.content.push(Content::text(s));
-        self
+    fn push_message_part(&mut self, part: ChatMessagePart) {
+        if let Some(ChatOutputItem::Message(message)) = self.output_items.last_mut() {
+            message.parts.push(part);
+            return;
+        }
+        self.output_items
+            .push(ChatOutputItem::Message(ChatMessageItem {
+                id: None,
+                role: ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![part],
+                extensions: Default::default(),
+            }));
     }
 
-    /// Append a thinking/reasoning content block.
-    /// Empty strings are ignored.
-    pub fn thinking(mut self, s: impl Into<String>) -> Self {
-        let t = s.into();
-        if !t.is_empty() {
-            self.content.push(Content::thinking(t));
+    /// Append text in message order.
+    pub fn text(mut self, s: impl Into<String>) -> Self {
+        let text = s.into();
+        if self.role == ChatRole::Assistant {
+            self.push_message_part(ChatMessagePart::Text {
+                text,
+                annotations: Vec::new(),
+                extensions: Default::default(),
+            });
+        } else {
+            self.parts.push(ChatInputPart::text(text));
         }
         self
     }
 
-    /// Append an image content block.
-    pub fn image(mut self, mime: impl Into<String>, data: Vec<u8>) -> Self {
-        self.content.push(Content::image(mime, data));
+    /// Append visible reasoning text.
+    pub fn thinking(mut self, s: impl Into<String>) -> Self {
+        let text = s.into();
+        if text.is_empty() {
+            return self;
+        }
+        if self.role == ChatRole::Assistant {
+            self.output_items
+                .push(ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: None,
+                    summary: Vec::new(),
+                    content: vec![ChatReasoningPart::text(text)],
+                    encrypted_content: None,
+                    signature: None,
+                    status: None,
+                    extensions: Default::default(),
+                }));
+        } else {
+            self.parts.push(ChatInputPart::text(text));
+        }
         self
     }
 
-    /// Append an image URL content block.
-    pub fn image_url(mut self, url: impl Into<String>) -> Self {
-        self.content.push(Content::image_url(url));
+    /// Append a validated inline image.
+    pub fn image(self, media_type: MediaType, data: Vec<u8>) -> Self {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            Some(media_type),
+            MediaSource::Inline { data },
+        )
+        .expect("typed inline image satisfies media invariants");
+        self.attachment(media)
+    }
+
+    /// Parse and append an inline image, returning malformed MIME explicitly.
+    pub fn try_image(
+        self,
+        mime: impl AsRef<str>,
+        data: Vec<u8>,
+    ) -> Result<Self, MediaNormalizationError> {
+        let media_type = mime.as_ref().parse()?;
+        let media = MediaPart::new(
+            MediaKind::Image,
+            Some(media_type),
+            MediaSource::Inline { data },
+        )?;
+        Ok(self.attachment(media))
+    }
+
+    /// Append an image referenced by URL.
+    pub fn image_url(self, url: impl Into<String>) -> Self {
+        let media = MediaPart::new(MediaKind::Image, None, MediaSource::Url { url: url.into() })
+            .expect("URL attachment without MIME is valid");
+        self.attachment(media)
+    }
+
+    /// Append an inline PDF document.
+    pub fn pdf(self, data: Vec<u8>) -> Self {
+        let media = MediaPart::new(
+            MediaKind::Document,
+            Some("application/pdf".parse().expect("static MIME is valid")),
+            MediaSource::Inline { data },
+        )
+        .expect("typed inline PDF satisfies media invariants");
+        self.attachment(media)
+    }
+
+    /// Append a validated attachment without changing its generated/input role.
+    pub fn attachment(mut self, media: MediaPart) -> Self {
+        if self.role == ChatRole::Assistant {
+            self.push_message_part(ChatMessagePart::Media(Box::new(media)));
+        } else {
+            self.parts.push(ChatInputPart::attachment(media));
+        }
         self
     }
 
-    /// Append a PDF content block.
-    pub fn pdf(mut self, data: Vec<u8>) -> Self {
-        self.content.push(Content::pdf(data));
-        self
-    }
-
-    /// Append a tool use content block.
+    /// Append a generated function call.
     pub fn tool_use(mut self, id: impl Into<String>, name: impl Into<String>, args: Value) -> Self {
-        self.content.push(Content::tool_use(id, name, args));
+        assert_eq!(
+            self.role,
+            ChatRole::Assistant,
+            "function calls can only be built on assistant messages"
+        );
+        self.output_items
+            .push(ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                item_id: None,
+                call_id: id.into(),
+                name: name.into(),
+                arguments: args.to_string(),
+                status: None,
+                extensions: Default::default(),
+            }));
         self
     }
 
-    /// Append a tool result content block.
+    /// Append an already constructed correlated tool result.
+    pub fn tool_result_value(mut self, result: ToolResult) -> Self {
+        assert_eq!(
+            self.role,
+            ChatRole::User,
+            "tool results can only be built on user messages"
+        );
+        self.parts.push(ChatInputPart::tool_result(result));
+        self
+    }
+
+    /// Append a correlated tool result from its component fields.
     pub fn tool_result(
-        mut self,
+        self,
         id: String,
         name: Option<String>,
         is_error: bool,
-        inner: Vec<Content>,
+        parts: Vec<ToolResultPart>,
     ) -> Self {
-        self.content.push(Content::ToolResult {
-            id,
-            name,
-            is_error,
-            content: inner,
-        });
-        self
+        let mut result = ToolResult::new(id);
+        result.name = name;
+        result.is_error = is_error;
+        result.parts = parts;
+        self.tool_result_value(result)
     }
 
-    /// Append an arbitrary content block.
-    pub fn block(mut self, block: Content) -> Self {
-        self.content.push(block);
+    /// Append an arbitrary canonical input part.
+    pub fn part(mut self, part: ChatInputPart) -> Self {
+        assert_eq!(
+            self.role,
+            ChatRole::User,
+            "canonical input parts can only be appended to user messages; use attachment() or text() for assistant output"
+        );
+        self.parts.push(part);
         self
     }
 
@@ -1112,11 +1199,20 @@ impl ChatMessageBuilder {
         self
     }
 
-    /// Build the ChatMessage.
+    /// Build the canonical message.
     pub fn build(self) -> ChatMessage {
+        let payload = if self.role == ChatRole::Assistant {
+            ChatMessagePayload::output(ChatOutput {
+                items: self.output_items,
+                status: Some(ChatOutputStatus::Completed),
+                ..ChatOutput::default()
+            })
+        } else {
+            ChatMessagePayload::Input(self.parts)
+        };
         ChatMessage {
             role: self.role,
-            content: self.content,
+            payload,
             cache: self.cache,
         }
     }
@@ -1154,46 +1250,65 @@ mod tests {
     }
 
     #[test]
-    fn content_text_constructor() {
-        let c = Content::text("hello");
-        assert_eq!(
-            c,
-            Content::Text {
-                text: "hello".into()
-            }
-        );
-        assert_eq!(c.as_text(), Some("hello"));
-    }
-
-    #[test]
-    fn content_tool_result_constructor() {
-        let c = Content::tool_result("id1", vec![Content::text("ok")]);
-        match c {
-            Content::ToolResult {
-                id,
-                name,
-                is_error,
-                content,
-            } => {
-                assert_eq!(id, "id1");
-                assert_eq!(name, None);
-                assert!(!is_error);
-                assert_eq!(content.len(), 1);
-            }
-            _ => panic!("expected ToolResult"),
-        }
-    }
-
-    #[test]
     fn builder_produces_correct_blocks() {
         let msg = ChatMessage::user()
             .text("Hello")
-            .image("image/png", vec![1, 2, 3])
+            .image("image/png".parse().unwrap(), vec![1, 2, 3])
             .build();
 
         assert_eq!(msg.role, ChatRole::User);
-        assert_eq!(msg.content.len(), 2);
+        assert_eq!(msg.input().unwrap().len(), 2);
         assert_eq!(msg.text(), "Hello");
+    }
+
+    #[test]
+    fn assistant_builder_preserves_text_attachment_and_call_order() {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            Some("image/png".parse().unwrap()),
+            MediaSource::Inline {
+                data: vec![1, 2, 3],
+            },
+        )
+        .unwrap();
+        let message = ChatMessage::assistant()
+            .text("before")
+            .attachment(media)
+            .tool_use("call_1", "lookup", serde_json::json!({"q": "rust"}))
+            .text("after")
+            .build();
+
+        let output = message.output().expect("assistant output");
+        assert_eq!(output.items.len(), 3);
+        let ChatOutputItem::Message(first) = &output.items[0] else {
+            panic!("expected first message item");
+        };
+        assert_eq!(first.parts.len(), 2);
+        assert!(matches!(first.parts[1], ChatMessagePart::Media(_)));
+        assert!(matches!(output.items[1], ChatOutputItem::FunctionCall(_)));
+        assert!(matches!(output.items[2], ChatOutputItem::Message(_)));
+    }
+
+    #[test]
+    fn portable_assistant_message_remains_valid_and_keeps_calls() {
+        let message = ChatMessage::assistant()
+            .thinking("visible")
+            .tool_use("call_1", "lookup", serde_json::json!({"q": "rust"}))
+            .build()
+            .into_portable();
+
+        assert!(message.validate_output_consistency().is_ok());
+        let output = message.output().expect("portable canonical output");
+        assert!(!output.requires_item_aware_fidelity());
+        assert_eq!(output.function_calls().count(), 1);
+    }
+
+    #[test]
+    fn invalid_builder_mime_is_explicit() {
+        let error = ChatMessage::user()
+            .try_image("not a mime", vec![1])
+            .expect_err("invalid MIME must not be ignored");
+        assert!(matches!(error, MediaNormalizationError::MediaType(_)));
     }
 
     #[test]
@@ -1203,43 +1318,193 @@ mod tests {
             .text("response")
             .build();
 
-        assert_eq!(msg.content.len(), 1);
+        assert_eq!(msg.portable_input_parts().len(), 1);
         assert!(msg.thinking().is_none());
     }
 
     #[test]
     fn chat_message_has_tool_use() {
+        // Generated function calls live only in structured output. The
+        // assistant builder records them there rather than as ordinary input,
+        // so they are never silently dropped.
         let msg = ChatMessage::assistant()
             .text("Let me search")
             .tool_use("t1", "search", serde_json::json!({"q": "rust"}))
             .build();
 
+        let output = msg.output().expect("assistant output payload");
+        assert_eq!(output.tool_calls().unwrap().len(), 1);
         assert!(msg.has_tool_use());
-        assert_eq!(msg.tool_uses().len(), 1);
+        assert_eq!(msg.function_calls().count(), 1);
         assert!(!msg.has_tool_result());
+        // The call is not also accepted as an ordinary input part variant.
+        assert!(msg.payload.as_input().is_none());
     }
 
     #[test]
-    fn content_serde_roundtrip() {
-        let blocks = vec![
-            Content::text("hello"),
-            Content::image("image/png", vec![1, 2]),
-            Content::ToolUse {
-                id: "t1".into(),
-                name: "search".into(),
-                arguments: serde_json::json!({"q": "test"}),
-            },
-            Content::ToolResult {
-                id: "t1".into(),
-                name: Some("search".into()),
-                is_error: false,
-                content: vec![Content::text("found it")],
-            },
-        ];
+    fn function_tool_omits_unspecified_strictness() {
+        let legacy = serde_json::json!({
+            "name": "lookup",
+            "description": "Look up data",
+            "parameters": {"type": "object"}
+        });
 
-        let json = serde_json::to_string(&blocks).unwrap();
-        let roundtripped: Vec<Content> = serde_json::from_str(&json).unwrap();
-        assert_eq!(blocks, roundtripped);
+        let tool: FunctionTool = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(tool.strict, None);
+        assert_eq!(serde_json::to_value(&tool).unwrap(), legacy);
+
+        let strict = FunctionTool {
+            strict: Some(true),
+            ..tool
+        };
+        assert_eq!(serde_json::to_value(strict).unwrap()["strict"], true);
+    }
+
+    #[test]
+    fn old_message_json_normalizes_to_canonical_payload() {
+        // A legacy user turn normalizes into canonical input parts.
+        let user_json = serde_json::json!({
+            "role": "User",
+            "content": [{"type": "text", "text": "hello"}]
+        });
+        let user_message: ChatMessage = serde_json::from_value(user_json).unwrap();
+        assert_eq!(
+            user_message.input().unwrap(),
+            vec![ChatInputPart::text("hello")]
+        );
+        assert_eq!(
+            serde_json::to_value(&user_message).unwrap(),
+            serde_json::json!({
+                "role": "User",
+                "input": [{"type": "text", "text": "hello"}]
+            })
+        );
+
+        // A legacy assistant turn is generated output and collapses into one
+        // authoritative `ChatOutput` payload, not independently mutable input.
+        let assistant_json = serde_json::json!({
+            "role": "Assistant",
+            "content": [{"type": "text", "text": "hi there"}]
+        });
+        let assistant_message: ChatMessage = serde_json::from_value(assistant_json).unwrap();
+        let output = assistant_message
+            .output()
+            .expect("assistant output payload");
+        assert_eq!(output.text().as_deref(), Some("hi there"));
+        assert!(assistant_message.payload.as_input().is_none());
+        // Canonical serialization emits only the exclusive canonical payload.
+        let saved = serde_json::to_value(&assistant_message).unwrap();
+        assert!(saved.get("content").is_none());
+        assert!(saved.get("output").is_some());
+        assert!(saved.get("input").is_none());
+    }
+
+    #[test]
+    fn shipped_transitional_message_normalizes_and_resaves_canonically() {
+        let output = ChatOutput::from_projections(
+            Some("reasoning".into()),
+            Some("authoritative".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        let transitional = serde_json::json!({
+            "role": "Assistant",
+            "content": [
+                {"type": "thinking", "text": "reasoning"},
+                {"type": "text", "text": "authoritative"}
+            ],
+            "output": serde_json::to_value(&output).unwrap()
+        });
+
+        let message: ChatMessage = serde_json::from_value(transitional).unwrap();
+        assert_eq!(message.output(), Some(&output));
+        let saved = serde_json::to_value(message).unwrap();
+        assert!(saved.get("content").is_none());
+        assert_eq!(
+            saved.get("output"),
+            Some(&serde_json::to_value(output).unwrap())
+        );
+    }
+
+    #[test]
+    fn shipped_transitional_message_with_empty_projection_is_accepted() {
+        let output = ChatOutput::from_projections(
+            None,
+            Some("authoritative".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        let transitional = serde_json::json!({
+            "role": "Assistant",
+            "content": [],
+            "output": serde_json::to_value(&output).unwrap()
+        });
+
+        let message: ChatMessage = serde_json::from_value(transitional).unwrap();
+        assert_eq!(message.output(), Some(&output));
+    }
+
+    #[test]
+    fn transitional_message_with_stale_projection_is_rejected() {
+        let output = ChatOutput::from_projections(
+            None,
+            Some("authoritative".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        let stale = serde_json::json!({
+            "role": "Assistant",
+            "content": [{"type": "text", "text": "stale edit"}],
+            "output": serde_json::to_value(&output).unwrap()
+        });
+
+        let err = serde_json::from_value::<ChatMessage>(stale).unwrap_err();
+        assert!(err.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn structured_output_rejects_user_and_mismatched_item_roles() {
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::Message(ChatMessageItem {
+                id: None,
+                role: ChatRole::User,
+                phase: None,
+                status: None,
+                parts: vec![ChatMessagePart::Text {
+                    text: "wrong role".into(),
+                    annotations: Vec::new(),
+                    extensions: Extensions::new(),
+                }],
+                extensions: Extensions::new(),
+            })],
+            ..ChatOutput::default()
+        };
+        let mut user = ChatMessage::from_user_parts(Vec::new());
+        assert_eq!(
+            user.replace_output(output.clone()),
+            Err(ChatMessageConsistencyError::StructuredOutputOnUserMessage)
+        );
+
+        assert!(matches!(
+            ChatMessage::try_from_assistant_output(output.clone()),
+            Err(ChatMessageConsistencyError::StructuredItemRoleMismatch)
+        ));
+
+        let mut assistant = ChatMessage::from_assistant_output(ChatOutput::default());
+        assert_eq!(
+            assistant.replace_output(output.clone()),
+            Err(ChatMessageConsistencyError::StructuredItemRoleMismatch)
+        );
+
+        let invalid_json = serde_json::json!({
+            "role": "Assistant",
+            "output": output
+        });
+        let error = serde_json::from_value::<ChatMessage>(invalid_json).unwrap_err();
+        assert!(error.to_string().contains("role does not match"));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use ignore::{WalkBuilder, types::TypesBuilder};
-use querymt::chat::{Content, FunctionTool, Tool as ChatTool};
+use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -83,6 +83,7 @@ impl Tool for FindSymbolReferencesTool {
                     },
                     "required": ["paths", "symbols"]
                 }),
+                strict: None,
             },
         }
     }
@@ -95,7 +96,7 @@ impl Tool for FindSymbolReferencesTool {
         &self,
         args: Value,
         context: &dyn ToolContext,
-    ) -> Result<Vec<Content>, ToolError> {
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
         let root = resolve_root(&args, context)?;
         let search_paths = parse_paths(&args)?;
         let symbols = parse_symbols(&args)?;
@@ -140,7 +141,7 @@ impl Tool for FindSymbolReferencesTool {
         matches.truncate(max_results);
 
         let output = format_matches(&matches, &root, truncated);
-        Ok(vec![Content::text(output)])
+        Ok(vec![ToolResultPart::text(output)])
     }
 }
 
@@ -313,9 +314,9 @@ mod tests {
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
 
-    fn text_content(contents: Vec<Content>) -> String {
+    fn text_content(contents: Vec<ToolResultPart>) -> String {
         match contents.into_iter().next().unwrap() {
-            Content::Text { text } => text,
+            ToolResultPart::Text { text } => text,
             _ => panic!("expected text content"),
         }
     }

@@ -90,7 +90,12 @@ pub fn process_input(input: &[u8], prompt: String) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     if let Some(mime) = detect_image_mime(input) {
         messages.push(ChatMessage::user().text(prompt.clone()).build());
-        messages.push(ChatMessage::user().image(mime, input.to_vec()).build());
+        messages.push(
+            ChatMessage::user()
+                .try_image(mime, input.to_vec())
+                .expect("detected image MIME is valid")
+                .build(),
+        );
     } else if !input.is_empty() {
         let input_str = String::from_utf8_lossy(input);
         messages.push(
