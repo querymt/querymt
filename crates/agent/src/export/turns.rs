@@ -4,7 +4,7 @@
 //! structured, consumer-friendly representation of the conversation.
 //! Both the ATIF exporter and the SFT exporter build on this.
 
-use crate::events::{AgentEvent, AgentEventKind};
+use crate::events::{AgentEvent, AgentEventKind, ReasoningPartStored};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -155,6 +155,15 @@ pub fn materialize_turns(events: &[AgentEvent]) -> (Vec<Turn>, SessionMeta) {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+fn joined_reasoning_parts(parts: &[ReasoningPartStored]) -> Option<String> {
+    let texts: Vec<&str> = parts
+        .iter()
+        .map(|part| part.text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect();
+    (!texts.is_empty()).then(|| texts.join("\n\n"))
+}
+
 /// Find the `LlmRequestEnd` event that closes the span starting at `start_idx`.
 fn find_llm_request_end(events: &[AgentEvent], start_idx: usize) -> Option<usize> {
     for (idx, event) in events.iter().enumerate().skip(start_idx + 1) {
@@ -201,6 +210,7 @@ fn extract_turn(
             AgentEventKind::AssistantMessageStored {
                 content,
                 thinking: think,
+                reasoning_parts,
                 ..
             } => {
                 if !content.is_empty() {
@@ -208,6 +218,8 @@ fn extract_turn(
                 }
                 if let Some(t) = think {
                     thinking = Some(t.clone());
+                } else if let Some(text) = joined_reasoning_parts(reasoning_parts) {
+                    thinking = Some(text);
                 }
             }
 
@@ -270,7 +282,7 @@ fn extract_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventOrigin, ExecutionMetrics};
+    use crate::events::{EventOrigin, ExecutionMetrics, ReasoningPartStored};
 
     fn make_event(seq: i64, ts: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
@@ -662,5 +674,49 @@ mod tests {
         assert_eq!(turns[0].thinking.as_deref(), Some("let me think..."));
         // No user_content for this turn
         assert!(turns[0].user_content.is_none());
+    }
+
+    #[test]
+    fn materialize_thinking_from_reasoning_parts() {
+        let events = vec![
+            make_event(1, 100, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                2,
+                101,
+                AgentEventKind::AssistantMessageStored {
+                    content: "answer".to_string(),
+                    thinking: None,
+                    reasoning_parts: vec![
+                        ReasoningPartStored {
+                            id: "rs_1:summary:0".into(),
+                            text: "one".into(),
+                        },
+                        ReasoningPartStored {
+                            id: "rs_1:content:0".into(),
+                            text: "raw".into(),
+                        },
+                    ],
+                    message_id: None,
+                },
+            ),
+            make_event(
+                3,
+                102,
+                AgentEventKind::LlmRequestEnd {
+                    usage: None,
+                    tool_calls: 0,
+                    finish_reason: Some(querymt::chat::FinishReason::Stop),
+                    cost_usd: None,
+                    cumulative_cost_usd: None,
+                    context_tokens: 0,
+                    metrics: ExecutionMetrics::default(),
+                },
+            ),
+        ];
+
+        let (turns, _) = materialize_turns(&events);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].assistant_content, "answer");
+        assert_eq!(turns[0].thinking.as_deref(), Some("one\n\nraw"));
     }
 }
