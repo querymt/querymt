@@ -297,14 +297,14 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
             for part in msg.portable_input_parts() {
                 match part {
                     ChatInputPart::Text { text } => {
-                        builder = builder.part(ChatInputPart::text(text));
+                        builder = builder.text(text);
                     }
                     ChatInputPart::ToolResult(result) => {
-                        builder = builder.part(ChatInputPart::text(format!(
+                        builder = builder.text(format!(
                             "[ToolResult: {}] {}",
                             result.call_id,
                             result.text_content().replace('\n', "\\n")
-                        )));
+                        ));
                     }
                     ChatInputPart::Attachment(_) => {
                         // Unreachable: binary content is rejected before this point.
@@ -318,10 +318,10 @@ fn normalize_messages_to_text(messages: &[ChatMessage]) -> Vec<ChatMessage> {
                 for item in &output.items {
                     match item {
                         ChatOutputItem::FunctionCall(call) => {
-                            builder = builder.part(ChatInputPart::text(format!(
+                            builder = builder.text(format!(
                                 "[ToolUse: {} ({}) args={}]",
                                 call.name, call.call_id, call.arguments
-                            )));
+                            ));
                         }
                         _ => {}
                     }
