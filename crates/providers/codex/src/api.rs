@@ -149,9 +149,8 @@ enum CodexInputItem<'a> {
         id: Option<Cow<'a, str>>,
         // The Responses API requires `summary` on every reasoning input item;
         // an empty array is valid but the key must always be present.
+        // `content` is output-only (maxItems: 0 on input) and must be omitted.
         summary: Vec<CodexReasoningSummaryInput<'a>>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        content: Vec<CodexReasoningContentInput<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<Cow<'a, str>>,
     },
@@ -178,19 +177,6 @@ enum CodexReasoningSummaryKind {
 struct CodexReasoningSummaryInput<'a> {
     #[serde(rename = "type")]
     summary_type: CodexReasoningSummaryKind,
-    text: Cow<'a, str>,
-}
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "snake_case")]
-enum CodexReasoningContentKind {
-    ReasoningText,
-}
-
-#[derive(Serialize, Debug)]
-struct CodexReasoningContentInput<'a> {
-    #[serde(rename = "type")]
-    content_type: CodexReasoningContentKind,
     text: Cow<'a, str>,
 }
 
@@ -800,11 +786,11 @@ fn convert_structured_output_to_codex<'a>(
     for item in &output.items {
         match item {
             ChatOutputItem::Reasoning(reasoning) => {
-                if !native_replay
-                    && (reasoning.id.is_some()
-                        || reasoning.encrypted_content.is_some()
-                        || reasoning.signature.is_some())
-                {
+                // Responses input reasoning items require `content` to be empty
+                // (`maxItems: 0`). Native continuation is summary + encrypted
+                // payload. Legacy plaintext thinking has no provenance or
+                // encrypted state, so flatten it to assistant output_text.
+                if !native_replay {
                     let visible = reasoning.visible_text();
                     if !visible.is_empty() {
                         out.push(CodexInputItem::Message {
@@ -825,15 +811,6 @@ fn convert_structured_output_to_codex<'a>(
                         .map(|part| CodexReasoningSummaryInput {
                             summary_type: CodexReasoningSummaryKind::SummaryText,
                             text: Cow::Borrowed(part.text.as_str()),
-                        })
-                        .collect(),
-                    content: reasoning
-                        .content
-                        .iter()
-                        .filter_map(querymt::chat::ChatReasoningPart::reasoning_text_for_replay)
-                        .map(|text| CodexReasoningContentInput {
-                            content_type: CodexReasoningContentKind::ReasoningText,
-                            text: Cow::Borrowed(text),
                         })
                         .collect(),
                     encrypted_content: reasoning.encrypted_content.as_deref().map(Cow::Borrowed),
@@ -1916,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_replays_reasoning_content_separately_from_summary() {
+    fn codex_native_reasoning_replay_omits_content_array() {
         use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart, Extensions};
 
         let cfg = test_codex("test-token");
@@ -1944,14 +1921,68 @@ mod tests {
             reasoning["summary"],
             serde_json::json!([{"type": "summary_text", "text": "why"}])
         );
-        assert_eq!(
-            reasoning["content"],
-            serde_json::json!([{"type": "reasoning_text", "text": "because"}])
+        assert!(
+            reasoning.get("content").is_none(),
+            "Responses input forbids a non-empty reasoning content array"
         );
         assert_eq!(
             reasoning["encrypted_content"],
             Value::String("enc_payload".to_string())
         );
+    }
+
+    #[test]
+    fn codex_legacy_plaintext_reasoning_flattens_to_assistant_text() {
+        use querymt::chat::{
+            ChatFunctionCallItem, ChatOutputItem, ChatReasoningItem, ChatReasoningPart, Extensions,
+        };
+
+        let cfg = test_codex("test-token");
+        let output = ChatOutput {
+            items: vec![
+                ChatOutputItem::Reasoning(ChatReasoningItem {
+                    id: None,
+                    summary: Vec::new(),
+                    content: vec![ChatReasoningPart::text(
+                        "**Inspecting git status before rebasing**",
+                    )],
+                    encrypted_content: None,
+                    signature: None,
+                    status: None,
+                    extensions: Extensions::new(),
+                }),
+                ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+                    item_id: None,
+                    call_id: "call_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: r#"{"command":"git status"}"#.to_string(),
+                    status: None,
+                    extensions: Extensions::new(),
+                }),
+            ],
+            ..ChatOutput::default()
+        };
+        let messages = vec![
+            ChatMessage::user().text("rebase onto main").build(),
+            ChatMessage::from_assistant_output(output),
+        ];
+        let body: Value =
+            serde_json::from_slice(&codex_chat_body_json(&cfg, &messages, None).unwrap()).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let types: Vec<&str> = input
+            .iter()
+            .map(|item| item["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, vec!["message", "message", "function_call"]);
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(
+            input[1]["content"],
+            serde_json::json!([{
+                "type": "output_text",
+                "text": "**Inspecting git status before rebasing**"
+            }])
+        );
+        assert_eq!(input[2]["call_id"], "call_1");
     }
 
     #[test]

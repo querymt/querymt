@@ -196,9 +196,8 @@ enum OpenAIResponsesInputItem<'a> {
         id: Option<Cow<'a, str>>,
         // The Responses API requires `summary` on every reasoning input item;
         // an empty array is valid but the key must always be present.
+        // `content` is output-only (maxItems: 0 on input) and must be omitted.
         summary: Vec<OpenAIResponsesReasoningSummary<'a>>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        content: Vec<OpenAIResponsesReasoningContent<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<Cow<'a, str>>,
     },
@@ -257,19 +256,6 @@ enum OpenAIResponsesReasoningSummaryKind {
 struct OpenAIResponsesReasoningSummary<'a> {
     #[serde(rename = "type")]
     summary_type: OpenAIResponsesReasoningSummaryKind,
-    text: Cow<'a, str>,
-}
-
-#[derive(Serialize, Debug)]
-#[serde(rename_all = "snake_case")]
-enum OpenAIResponsesReasoningContentKind {
-    ReasoningText,
-}
-
-#[derive(Serialize, Debug)]
-struct OpenAIResponsesReasoningContent<'a> {
-    #[serde(rename = "type")]
-    content_type: OpenAIResponsesReasoningContentKind,
     text: Cow<'a, str>,
 }
 
@@ -1409,11 +1395,11 @@ fn convert_structured_output_to_responses<'a>(
     for item in &output.items {
         match item {
             ChatOutputItem::Reasoning(reasoning) => {
-                let has_native_state = reasoning.id.is_some()
-                    || reasoning.encrypted_content.is_some()
-                    || reasoning.signature.is_some()
-                    || !reasoning.extensions.is_empty();
-                if has_native_state && !native_replay {
+                // Responses input reasoning items require `content` to be empty
+                // (`maxItems: 0`). Native continuation is summary + encrypted
+                // payload. Legacy plaintext thinking has no provenance or
+                // encrypted state, so flatten it to assistant output_text.
+                if !native_replay {
                     let visible = reasoning.visible_text();
                     if !visible.is_empty() {
                         out.push(OpenAIResponsesInputItem::Message {
@@ -1434,15 +1420,6 @@ fn convert_structured_output_to_responses<'a>(
                         .map(|part| OpenAIResponsesReasoningSummary {
                             summary_type: OpenAIResponsesReasoningSummaryKind::SummaryText,
                             text: Cow::Borrowed(part.text.as_str()),
-                        })
-                        .collect(),
-                    content: reasoning
-                        .content
-                        .iter()
-                        .filter_map(ChatReasoningPart::reasoning_text_for_replay)
-                        .map(|text| OpenAIResponsesReasoningContent {
-                            content_type: OpenAIResponsesReasoningContentKind::ReasoningText,
-                            text: Cow::Borrowed(text),
                         })
                         .collect(),
                     encrypted_content: reasoning.encrypted_content.as_deref().map(Cow::Borrowed),
@@ -3697,7 +3674,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_replay_emits_reasoning_content_separately_from_summary() {
+    fn responses_native_reasoning_replay_omits_content_array() {
         use querymt::chat::{
             ChatOutputItem, ChatOutputProvenance, ChatReasoningItem, ChatReasoningPart, Extensions,
         };
@@ -3729,7 +3706,7 @@ mod tests {
 
         let mut out = Vec::new();
         convert_structured_output_to_responses(&output, &mut out, true)
-            .expect("reasoning content must replay");
+            .expect("native reasoning must replay");
         let value = serde_json::to_value(&out[0]).unwrap();
 
         assert_eq!(value["type"], "reasoning");
@@ -3737,11 +3714,40 @@ mod tests {
             value["summary"],
             serde_json::json!([{"type": "summary_text", "text": "why"}])
         );
-        assert_eq!(
-            value["content"],
-            serde_json::json!([{"type": "reasoning_text", "text": "because"}])
+        assert!(
+            value.get("content").is_none(),
+            "Responses input forbids a non-empty reasoning content array"
         );
         assert_eq!(value["encrypted_content"], "enc_payload");
+    }
+
+    #[test]
+    fn responses_legacy_plaintext_reasoning_flattens_to_assistant_text() {
+        use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart, Extensions};
+
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: vec![ChatReasoningPart::text("old thought")],
+                encrypted_content: None,
+                signature: None,
+                status: None,
+                extensions: Extensions::new(),
+            })],
+            ..ChatOutput::default()
+        };
+
+        let mut out = Vec::new();
+        convert_structured_output_to_responses(&output, &mut out, false)
+            .expect("legacy reasoning must flatten");
+        let value = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(value["type"], "message");
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(
+            value["content"],
+            serde_json::json!([{"type": "output_text", "text": "old thought"}])
+        );
     }
 
     #[test]
