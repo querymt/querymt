@@ -314,7 +314,7 @@ pub enum LLMError {
     InvalidUrl(String),
 
     /// Handles standard I/O errors.
-    #[error("I/O Error")]
+    #[error("I/O Error: {0}")]
     IoError(#[from] std::io::Error),
 }
 
@@ -880,6 +880,18 @@ impl From<FromUtf8Error> for LLMError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn io_error_display_keeps_the_underlying_cause() {
+        // The cause used to be dropped (`I/O Error`), which made mesh
+        // connectivity failures indistinguishable from a bare I/O fault.
+        let error = LLMError::IoError(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ));
+        assert_eq!(error.to_string(), "I/O Error: timed out");
+        assert!(error.is_retryable());
+    }
 
     // ── duration_to_secs ─────────────────────────────────────────────────
 

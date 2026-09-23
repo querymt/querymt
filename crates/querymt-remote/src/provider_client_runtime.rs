@@ -9,6 +9,30 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// Stable label for the failing error class, used in handshake diagnostics.
+///
+/// Keeps transport failures distinguishable from semantic rejections in logs so
+/// an operator can tell a mesh outage apart from a protocol mismatch.
+fn error_kind_label(error: &LLMError) -> &'static str {
+    match error {
+        LLMError::Transport { kind, .. } => match kind {
+            TransportErrorKind::ConnectionRefused => "transport_connection_refused",
+            TransportErrorKind::ConnectionReset => "transport_connection_reset",
+            TransportErrorKind::Timeout => "transport_timeout",
+            TransportErrorKind::ConnectionClosed => "transport_connection_closed",
+            TransportErrorKind::Dns => "transport_dns",
+            TransportErrorKind::Tls => "transport_tls",
+            TransportErrorKind::ProtocolMismatch => "transport_protocol_mismatch",
+            TransportErrorKind::Other => "transport_other",
+        },
+        LLMError::IoError { .. } => "io_error",
+        LLMError::InvalidRequest(_) => "invalid_request",
+        LLMError::ProviderError(_) => "provider_error",
+        LLMError::Cancelled => "cancelled",
+        _ => "other",
+    }
+}
+
 #[async_trait]
 pub trait RemoteProviderClientTransport: Send + Sync {
     type HostRef: Clone + Send + Sync + 'static;
@@ -120,53 +144,82 @@ where
             .await;
     }
 
+    /// Perform the mesh contract handshake and verify protocol compatibility.
+    ///
+    /// The handshake is unconditional (cached after the first success) so
+    /// wire-incompatible peers fail fast with an actionable message instead of
+    /// opaque MessagePack decoding errors later. Connectivity failures are
+    /// preserved as transport errors — a mesh timeout is not a provider
+    /// rejection and must stay retryable.
     pub async fn validate_contract(
         &self,
         host: &TTransport::HostRef,
         required_version: Option<u32>,
     ) -> Result<(), LLMError> {
-        // The handshake is unconditional: it doubles as the mesh wire-protocol
-        // version check, so wire-incompatible peers fail fast with a clear
-        // message instead of opaque MessagePack decoding errors later.
-        let info = self
+        let started = std::time::Instant::now();
+        let info = match self
             .contract_info
             .get_or_try_init(|| async {
                 self.transport
                     .get_contract_info(host, GetProviderContractInfo)
                     .await
-                    .map_err(|error| match error {
-                        // Transport failures keep their classification so upstream
-                        // retry policies still treat them as retryable connection
-                        // errors rather than contract problems.
-                        err @ LLMError::Transport { .. } => err,
-                        error => LLMError::InvalidRequest(format!(
-                            "remote provider peer failed the mesh protocol handshake: {error}"
-                        )),
-                    })
             })
-            .await?;
+            .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                // Only successful handshakes are cached, so a later attempt can
+                // still negotiate once connectivity returns.
+                tracing::warn!(
+                    target: "querymt_remote::provider_client_runtime",
+                    error = %error,
+                    error_kind = error_kind_label(&error),
+                    retryable = error.is_retryable(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "remote provider contract handshake failed"
+                );
+                return Err(error);
+            }
+        };
+
         match info.protocol_version {
             Some(version) if version == crate::provider_protocol::MESH_PROTOCOL_VERSION => {}
             other => {
-                return Err(LLMError::InvalidRequest(format!(
+                let error = LLMError::InvalidRequest(format!(
                     "remote provider peer speaks mesh protocol version {}, but this build requires {}; upgrade both peers to the same querymt build",
                     other.map_or_else(
                         || "unknown (peer predates protocol versioning)".to_string(),
                         |version| version.to_string()
                     ),
                     crate::provider_protocol::MESH_PROTOCOL_VERSION
-                )));
+                ));
+                tracing::warn!(
+                    target: "querymt_remote::provider_client_runtime",
+                    peer_protocol_version = ?info.protocol_version,
+                    required_protocol_version = crate::provider_protocol::MESH_PROTOCOL_VERSION,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "remote provider mesh protocol mismatch"
+                );
+                return Err(error);
             }
         }
         let Some(required_version) = required_version else {
             return Ok(());
         };
         if info.item_aware_chat_version != Some(required_version) {
-            return Err(LLMError::InvalidRequest(format!(
+            let error = LLMError::InvalidRequest(format!(
                 "remote provider peer cannot advertise item-aware chat contract version {required_version}: advertised version: {}",
                 info.item_aware_chat_version
                     .map_or_else(|| "none".to_string(), |value| value.to_string())
-            )));
+            ));
+            tracing::warn!(
+                target: "querymt_remote::provider_client_runtime",
+                advertised = ?info.item_aware_chat_version,
+                required = required_version,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "remote provider item-aware contract mismatch"
+            );
+            return Err(error);
         }
         Ok(())
     }
@@ -554,6 +607,7 @@ mod tests {
     struct TestTransport {
         contract_info: ProviderContractInfo,
         contract_calls: AtomicUsize,
+        contract_error: Option<TransportErrorKind>,
     }
 
     #[async_trait]
@@ -582,9 +636,14 @@ mod tests {
             _request: GetProviderContractInfo,
         ) -> Result<ProviderContractInfo, LLMError> {
             self.contract_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(self.contract_info.clone())
+            match self.contract_error {
+                Some(kind) => Err(LLMError::Transport {
+                    kind,
+                    message: "handshake transport failure".to_string(),
+                }),
+                None => Ok(self.contract_info.clone()),
+            }
         }
-
         async fn prepare_stream_router(
             &self,
             _session_id: &str,
@@ -648,9 +707,17 @@ mod tests {
     fn core_with_contract(
         contract_info: ProviderContractInfo,
     ) -> (Arc<TestTransport>, RemoteProviderClientCore<TestTransport>) {
+        core_with_contract_and_error(contract_info, None)
+    }
+
+    fn core_with_contract_and_error(
+        contract_info: ProviderContractInfo,
+        contract_error: Option<TransportErrorKind>,
+    ) -> (Arc<TestTransport>, RemoteProviderClientCore<TestTransport>) {
         let transport = Arc::new(TestTransport {
             contract_info,
             contract_calls: AtomicUsize::new(0),
+            contract_error,
         });
         let core = RemoteProviderClientCore::new(
             Arc::clone(&transport),
@@ -683,5 +750,50 @@ mod tests {
         assert!(matches!(error, LLMError::InvalidRequest(_)));
         assert!(error.to_string().contains("predates protocol versioning"));
         assert!(error.to_string().contains("upgrade both peers"));
+    }
+
+    #[tokio::test]
+    async fn handshake_transport_failure_is_not_reported_as_invalid_request() {
+        // Regression: a mesh I/O timeout used to be wrapped as
+        // `InvalidRequest`, which made the client report
+        // "Provider rejected the request" for a connectivity problem.
+        let transport_error = TransportErrorKind::ConnectionClosed;
+        let (transport, core) = core_with_contract_and_error(
+            ProviderContractInfo {
+                item_aware_chat_version: None,
+                protocol_version: Some(MESH_PROTOCOL_VERSION),
+            },
+            Some(transport_error),
+        );
+
+        let error = core.validate_contract(&(), None).await.unwrap_err();
+        assert!(matches!(
+            error,
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                ..
+            }
+        ));
+        assert!(error.is_retryable());
+        assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_handshake_is_not_cached_so_a_later_attempt_can_negotiate() {
+        let (transport, core) = core_with_contract_and_error(
+            ProviderContractInfo {
+                item_aware_chat_version: None,
+                protocol_version: Some(MESH_PROTOCOL_VERSION),
+            },
+            Some(TransportErrorKind::Timeout),
+        );
+
+        assert!(core.validate_contract(&(), None).await.is_err());
+        assert!(core.validate_contract(&(), None).await.is_err());
+        assert_eq!(
+            transport.contract_calls.load(Ordering::SeqCst),
+            2,
+            "each failed handshake must retry rather than cache the failure"
+        );
     }
 }
