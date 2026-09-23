@@ -141,7 +141,9 @@ pub struct LlamaCppConfig {
     /// Model-based speculative decoding.
     ///
     /// Mainline supports `type: "mtp"`. When no sidecar model is configured,
-    /// the target GGUF must contain bundled NextN/MTP tensors.
+    /// the target GGUF must contain bundled NextN/MTP tensors. Bundled tensors
+    /// are only loaded into the target model in that case (upstream keeps
+    /// `load_mtp` off by default).
     pub speculative: Option<SpeculativeConfig>,
     /// Offload the standard sampler chain to the backend context.
     ///
@@ -182,6 +184,15 @@ pub struct SpeculativeConfig {
 }
 
 impl SpeculativeConfig {
+    /// Whether MTP should use the tensors bundled in the target GGUF.
+    ///
+    /// True only when no sidecar model is configured; llama-cpp-2 keeps
+    /// `load_mtp` disabled by default, so the provider must opt in when the
+    /// target model is loaded.
+    pub(crate) fn uses_bundled_mtp(&self) -> bool {
+        self.model.is_none()
+    }
+
     pub(crate) fn params(&self) -> Result<llama_cpp_2::speculative::MtpSpeculativeParams, String> {
         let n_max = self.n_max.unwrap_or(3);
         let n_min = self.n_min.unwrap_or(0);
