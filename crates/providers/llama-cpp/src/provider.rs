@@ -1,5 +1,5 @@
 use crate::backend::{install_abort_callback, llama_backend};
-use crate::config::{DEFAULT_MAX_TOKENS, LlamaCppConfig, LlamaCppLogMode};
+use crate::config::{DEFAULT_MAX_TOKENS, LlamaCppConfig, LlamaCppLogMode, SpeculativeConfig};
 use crate::context::estimate_context_memory;
 use crate::generation::{
     build_prompt, build_prompt_with, build_raw_prompt, generate, generate_streaming_with_thinking,
@@ -36,6 +36,8 @@ pub(crate) struct ModelCacheKey {
     pub model_path: String,
     /// Number of GPU layers (affects Metal/CUDA offloading).
     pub n_gpu_layers: Option<u32>,
+    /// Whether bundled MTP (NextN) tensors are loaded into the target model.
+    pub load_mtp: bool,
     /// Resolved MTP sidecar path, when configured.
     pub mtp_model_path: Option<String>,
     /// Sidecar GPU layers.
@@ -48,6 +50,30 @@ pub(crate) struct CachedModel {
     pub model: Arc<LlamaModel>,
     pub multimodal: Option<Arc<MultimodalContext>>,
     pub mtp_model: Option<Arc<LlamaModel>>,
+}
+
+/// Whether MTP speculative decoding should use tensors bundled in the target GGUF.
+///
+/// llama-cpp-2 keeps `load_mtp` off by default, so the provider must opt in
+/// when the target model is loaded. Only meaningful for MTP without a
+/// sidecar model.
+fn bundled_mtp_requested(cfg: &LlamaCppConfig) -> bool {
+    cfg.speculative
+        .as_ref()
+        .is_some_and(SpeculativeConfig::uses_bundled_mtp)
+}
+
+/// Model-load params for the target model: GPU offload plus opt-in loading of
+/// bundled MTP tensors.
+fn target_model_params(n_gpu_layers: Option<u32>, load_mtp: bool) -> LlamaModelParams {
+    let mut params = LlamaModelParams::default();
+    if let Some(n) = n_gpu_layers {
+        params = params.with_n_gpu_layers(n);
+    }
+    if load_mtp {
+        params = params.with_load_mtp(true);
+    }
+    params
 }
 
 /// The main llama.cpp provider.
@@ -103,13 +129,13 @@ impl LlamaCppProvider {
             )));
         }
 
-        let mut params = LlamaModelParams::default();
-        if let Some(n_gpu_layers) = cfg.n_gpu_layers {
-            params = params.with_n_gpu_layers(n_gpu_layers);
-        }
         let model = Arc::new(
-            LlamaModel::load_from_file(&*backend, &model_path, &params)
-                .map_err(|e| LLMError::ProviderError(e.to_string()))?,
+            LlamaModel::load_from_file(
+                &*backend,
+                &model_path,
+                &target_model_params(cfg.n_gpu_layers, bundled_mtp_requested(&cfg)),
+            )
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?,
         );
 
         let mtp_model =
@@ -182,6 +208,7 @@ impl LlamaCppProvider {
         let key = ModelCacheKey {
             model_path: model_path.to_string_lossy().to_string(),
             n_gpu_layers: cfg.n_gpu_layers,
+            load_mtp: bundled_mtp_requested(&cfg),
             mtp_model_path: mtp_model_path
                 .as_ref()
                 .map(|p| p.to_string_lossy().to_string()),
@@ -212,13 +239,13 @@ impl LlamaCppProvider {
                 model_path.display()
             )));
         }
-        let mut params = LlamaModelParams::default();
-        if let Some(n) = cfg.n_gpu_layers {
-            params = params.with_n_gpu_layers(n);
-        }
         let model = Arc::new(
-            LlamaModel::load_from_file(&backend, model_path, &params)
-                .map_err(|e| LLMError::ProviderError(e.to_string()))?,
+            LlamaModel::load_from_file(
+                &backend,
+                model_path,
+                &target_model_params(cfg.n_gpu_layers, key.load_mtp),
+            )
+            .map_err(|e| LLMError::ProviderError(e.to_string()))?,
         );
 
         let mtp_model = if let Some(path) = &key.mtp_model_path {
@@ -640,3 +667,104 @@ impl EmbeddingProvider for LlamaCppProvider {
 }
 
 impl LLMProvider for LlamaCppProvider {}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModelCacheKey, bundled_mtp_requested, target_model_params};
+    use crate::config::{LlamaCppConfig, SpeculativeConfig, SpeculativeType};
+
+    fn base_config() -> LlamaCppConfig {
+        LlamaCppConfig {
+            model: "/path/to/model.gguf".to_string(),
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            min_p: None,
+            top_k: None,
+            repeat_penalty: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            penalty_last_n: None,
+            system: Vec::new(),
+            n_ctx: None,
+            n_batch: None,
+            n_ubatch: None,
+            n_threads: None,
+            n_threads_batch: None,
+            n_gpu_layers: None,
+            seed: None,
+            chat_template: None,
+            use_chat_template: None,
+            add_bos: None,
+            log: None,
+            enable_thinking: None,
+            reasoning_effort: None,
+            preserve_reasoning: None,
+            flash_attention: None,
+            kv_cache_type_k: None,
+            kv_cache_type_v: None,
+            mmproj_path: None,
+            media_marker: None,
+            mmproj_threads: None,
+            mmproj_use_gpu: None,
+            text_only: None,
+            speculative: None,
+            backend_sampling: None,
+            json_schema: None,
+        }
+    }
+
+    fn speculative(model: Option<&str>) -> Option<SpeculativeConfig> {
+        Some(SpeculativeConfig {
+            kind: SpeculativeType::Mtp,
+            model: model.map(str::to_string),
+            n_max: None,
+            n_min: None,
+            p_min: None,
+            n_gpu_layers: None,
+        })
+    }
+
+    #[test]
+    fn bundled_mtp_only_without_sidecar() {
+        let mut cfg = base_config();
+        assert!(!bundled_mtp_requested(&cfg), "no speculative config");
+
+        cfg.speculative = speculative(None);
+        assert!(bundled_mtp_requested(&cfg), "bundled MTP without sidecar");
+
+        cfg.speculative = speculative(Some("draft.gguf"));
+        assert!(!bundled_mtp_requested(&cfg), "sidecar overrides bundled");
+    }
+
+    #[test]
+    fn target_params_enable_mtp_only_when_requested() {
+        assert!(
+            !target_model_params(None, false).load_mtp(),
+            "load_mtp stays off by default"
+        );
+        assert!(
+            target_model_params(Some(33), true).load_mtp(),
+            "load_mtp enabled when requested"
+        );
+        assert_eq!(
+            target_model_params(Some(33), false).n_gpu_layers(),
+            33,
+            "gpu layers preserved"
+        );
+    }
+
+    #[test]
+    fn cache_key_distinguishes_bundled_mtp() {
+        let base = ModelCacheKey {
+            model_path: "/path/to/model.gguf".to_string(),
+            n_gpu_layers: None,
+            load_mtp: false,
+            mtp_model_path: None,
+            mtp_n_gpu_layers: None,
+        };
+        let mut with_mtp = base.clone();
+        with_mtp.load_mtp = true;
+        assert_ne!(base, with_mtp, "load_mtp must invalidate the cache key");
+    }
+}
