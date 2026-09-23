@@ -85,6 +85,7 @@ where
 {
     transport: Arc<TTransport>,
     config: RemoteProviderClientConfig,
+    contract_info: tokio::sync::OnceCell<ProviderContractInfo>,
 }
 
 impl<TTransport> RemoteProviderClientCore<TTransport>
@@ -92,7 +93,11 @@ where
     TTransport: RemoteProviderClientTransport + 'static,
 {
     pub fn new(transport: Arc<TTransport>, config: RemoteProviderClientConfig) -> Self {
-        Self { transport, config }
+        Self {
+            transport,
+            config,
+            contract_info: tokio::sync::OnceCell::new(),
+        }
     }
 
     pub fn config(&self) -> &RemoteProviderClientConfig {
@@ -124,18 +129,22 @@ where
         // version check, so wire-incompatible peers fail fast with a clear
         // message instead of opaque MessagePack decoding errors later.
         let info = self
-            .transport
-            .get_contract_info(host, GetProviderContractInfo)
-            .await
-            .map_err(|error| match error {
-                // Transport failures keep their classification so upstream
-                // retry policies still treat them as retryable connection
-                // errors rather than contract problems.
-                err @ LLMError::Transport { .. } => err,
-                error => LLMError::InvalidRequest(format!(
-                    "remote provider peer failed the mesh protocol handshake: {error}"
-                )),
-            })?;
+            .contract_info
+            .get_or_try_init(|| async {
+                self.transport
+                    .get_contract_info(host, GetProviderContractInfo)
+                    .await
+                    .map_err(|error| match error {
+                        // Transport failures keep their classification so upstream
+                        // retry policies still treat them as retryable connection
+                        // errors rather than contract problems.
+                        err @ LLMError::Transport { .. } => err,
+                        error => LLMError::InvalidRequest(format!(
+                            "remote provider peer failed the mesh protocol handshake: {error}"
+                        )),
+                    })
+            })
+            .await?;
         match info.protocol_version {
             Some(version) if version == crate::provider_protocol::MESH_PROTOCOL_VERSION => {}
             other => {
@@ -533,5 +542,146 @@ where
             kind: TransportErrorKind::Timeout,
             message: format!("reconnect grace expired after {:?}", reconnect_grace),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider_protocol::MESH_PROTOCOL_VERSION;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestTransport {
+        contract_info: ProviderContractInfo,
+        contract_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RemoteProviderClientTransport for TestTransport {
+        type HostRef = ();
+        type RouterRef = ();
+        type RemoteRouterRef = ();
+
+        async fn local_peer_id_display(&self) -> String {
+            "local".into()
+        }
+
+        async fn target_peer_id_display(&self, _target_locator: &str) -> String {
+            "remote".into()
+        }
+
+        async fn invalidate_cached_host(&self, _target_locator: &str) {}
+
+        async fn lookup_host(&self, _target_locator: &str) -> Result<Self::HostRef, LLMError> {
+            Ok(())
+        }
+
+        async fn get_contract_info(
+            &self,
+            _host: &Self::HostRef,
+            _request: GetProviderContractInfo,
+        ) -> Result<ProviderContractInfo, LLMError> {
+            self.contract_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.contract_info.clone())
+        }
+
+        async fn prepare_stream_router(
+            &self,
+            _session_id: &str,
+            _request_id: &str,
+            _consumer_tx: tokio::sync::mpsc::Sender<StreamRelayMessage>,
+        ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError> {
+            unreachable!("not used by contract tests")
+        }
+
+        async fn send_chat_request(
+            &self,
+            _host: &Self::HostRef,
+            _request: &ProviderChatRequest,
+        ) -> Result<ProviderChatResponse, LLMError> {
+            unreachable!("not used by contract tests")
+        }
+
+        async fn send_stream_request(
+            &self,
+            _host: &Self::HostRef,
+            _request: ProviderStreamRequest<Self::RemoteRouterRef>,
+        ) -> Result<(), LLMError> {
+            unreachable!("not used by contract tests")
+        }
+
+        async fn cancel_stream(
+            &self,
+            _host: &Self::HostRef,
+            _request: CancelProviderStreamRequest,
+        ) -> Result<(), LLMError> {
+            Ok(())
+        }
+
+        async fn renew_stream_lease(
+            &self,
+            _host: &Self::HostRef,
+            _session_id: &str,
+            _request_id: &str,
+            _lease_ttl_secs: u64,
+        ) -> Result<bool, LLMError> {
+            Ok(true)
+        }
+
+        async fn get_stream_status(
+            &self,
+            _host: &Self::HostRef,
+            _request: GetProviderStreamStatus,
+        ) -> Result<Option<ProviderStreamStatus>, LLMError> {
+            Ok(None)
+        }
+
+        async fn is_target_peer_alive(&self, _target_locator: &str) -> bool {
+            true
+        }
+
+        fn stream_reconnect_grace(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
+        }
+    }
+
+    fn core_with_contract(
+        contract_info: ProviderContractInfo,
+    ) -> (Arc<TestTransport>, RemoteProviderClientCore<TestTransport>) {
+        let transport = Arc::new(TestTransport {
+            contract_info,
+            contract_calls: AtomicUsize::new(0),
+        });
+        let core = RemoteProviderClientCore::new(
+            Arc::clone(&transport),
+            RemoteProviderClientConfig::new("peer", "llama_cpp", "model"),
+        );
+        (transport, core)
+    }
+
+    #[tokio::test]
+    async fn contract_handshake_is_cached_after_success() {
+        let (transport, core) = core_with_contract(ProviderContractInfo {
+            item_aware_chat_version: None,
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+        });
+
+        core.validate_contract(&(), None).await.unwrap();
+        core.validate_contract(&(), None).await.unwrap();
+
+        assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_protocol_version_fails_with_upgrade_guidance() {
+        let (_transport, core) = core_with_contract(ProviderContractInfo {
+            item_aware_chat_version: None,
+            protocol_version: None,
+        });
+
+        let error = core.validate_contract(&(), None).await.unwrap_err();
+        assert!(matches!(error, LLMError::InvalidRequest(_)));
+        assert!(error.to_string().contains("predates protocol versioning"));
+        assert!(error.to_string().contains("upgrade both peers"));
     }
 }

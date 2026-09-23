@@ -5,10 +5,9 @@ use thiserror::Error;
 /// Structured host-side failure report sent back to the requesting peer.
 ///
 /// [`Self::ProviderChat`] carries the original [`LLMErrorPayload`] by value so
-/// the payload never has to survive a lossy string round-trip. Serializing the
-/// payload to a `String` and parsing it back used to be the only channel, which
-/// meant any parse failure silently replaced the real provider error with an
-/// opaque serde complaint (e.g. `invalid type: map, expected field identifier`).
+/// the payload does not need an unnecessary JSON-to-string-to-JSON round trip.
+/// Wire-codec failures remain transport errors and are classified separately;
+/// they must not be mistaken for errors returned by the provider itself.
 #[derive(Debug, Clone, Error, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RemoteProviderHostError {
     #[error("provider chat failed ({operation})")]
@@ -93,13 +92,14 @@ mod tests {
     }
 
     #[test]
-    fn payload_survives_the_wire_round_trip() {
+    fn payload_survives_the_mesh_wire_round_trip() {
         let original = LLMError::ProviderError("boom".to_string());
         let host_error = RemoteProviderHostError::provider_chat("chat_with_tools", &original);
 
-        let encoded = serde_json::to_string(&host_error).expect("host error serializes");
+        // Mirror kameo's handler-error codec exactly.
+        let encoded = rmp_serde::to_vec_named(&host_error).expect("host error serializes");
         let decoded: RemoteProviderHostError =
-            serde_json::from_str(&encoded).expect("host error deserializes");
+            rmp_serde::decode::from_slice(&encoded).expect("host error deserializes");
 
         let recovered = LLMError::from_payload(decoded.to_payload());
         assert!(matches!(recovered, LLMError::ProviderError(message) if message == "boom"));

@@ -653,6 +653,43 @@ mod rmp_wire_tests {
     }
 
     #[test]
+    fn stream_request_with_cache_less_messages_round_trips_over_rmp() {
+        let request = ProviderStreamRequest {
+            provider: "llama_cpp".into(),
+            model: "hf:demo/model.gguf".into(),
+            messages: vec![
+                ChatMessage::from_user_parts(vec![ChatInputPart::text("preamble")]),
+                ChatMessage::from_user_parts(vec![ChatInputPart::text("question")]),
+            ],
+            tools: None,
+            session_id: "session-1".into(),
+            request_id: "request-1".into(),
+            stream_router_ref: 7_u64,
+            reconnect_grace_secs: 30,
+            heartbeat_interval_secs: 10,
+            lease_ttl_secs: 60,
+            params: None,
+            item_aware_contract_version: None,
+        };
+        assert_rmp_round_trip_equal(&request);
+    }
+
+    #[test]
+    fn provider_contract_info_round_trips_and_legacy_payload_defaults_version() {
+        let current = ProviderContractInfo {
+            item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+        };
+        assert_rmp_round_trip_equal(&current);
+
+        let legacy: ProviderContractInfo = serde_json::from_value(serde_json::json!({
+            "item_aware_chat_version": ITEM_AWARE_CHAT_CONTRACT_VERSION
+        }))
+        .expect("legacy contract info");
+        assert_eq!(legacy.protocol_version, None);
+    }
+
+    #[test]
     fn provider_chat_response_round_trips_over_rmp() {
         let response = ProviderChatResponse::from(ChatOutput::from_projections(
             None,

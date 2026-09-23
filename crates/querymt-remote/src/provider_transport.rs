@@ -147,15 +147,18 @@ pub fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Res
                 message: "remote actor not running".to_string(),
             })
         }
-        RemoteSendError::UnknownActor { .. } | RemoteSendError::UnknownMessage { .. } => {
-            Ok(LLMError::Transport {
-                kind: TransportErrorKind::ConnectionClosed,
-                message: "remote actor unavailable".to_string(),
-            })
-        }
-        RemoteSendError::BadActorType => {
-            Ok(LLMError::ProviderError("bad remote actor type".to_string()))
-        }
+        RemoteSendError::UnknownActor { .. } => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ConnectionClosed,
+            message: "remote actor unavailable".to_string(),
+        }),
+        RemoteSendError::UnknownMessage { .. } => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message: "remote peer does not support the requested mesh message; upgrade both peers to compatible querymt builds".to_string(),
+        }),
+        RemoteSendError::BadActorType => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message: "remote actor type does not match the local mesh protocol; upgrade both peers to compatible querymt builds".to_string(),
+        }),
         RemoteSendError::MailboxFull => Ok(LLMError::Transport {
             kind: TransportErrorKind::Other,
             message: "remote mailbox full".to_string(),
@@ -174,9 +177,10 @@ pub fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Res
             kind: TransportErrorKind::ConnectionClosed,
             message: "connection closed".to_string(),
         }),
-        RemoteSendError::UnsupportedProtocols => Ok(LLMError::ProviderError(
-            "remote protocol unsupported".to_string(),
-        )),
+        RemoteSendError::UnsupportedProtocols => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message: "remote peer does not support a compatible mesh transport protocol".to_string(),
+        }),
         RemoteSendError::SerializeMessage(err) => Ok(LLMError::Transport {
             kind: TransportErrorKind::ProtocolMismatch,
             message: format!(
@@ -233,7 +237,6 @@ pub fn should_retry_remote_send<E>(error: &kameo::error::RemoteSendError<E>) -> 
         RemoteSendError::ActorNotRunning
             | RemoteSendError::ActorStopped
             | RemoteSendError::UnknownActor { .. }
-            | RemoteSendError::UnknownMessage { .. }
             | RemoteSendError::DialFailure
             | RemoteSendError::ConnectionClosed
     )
@@ -341,7 +344,7 @@ mod tests {
                 actor_remote_id: Cow::Borrowed("actor"),
             }
         ));
-        assert!(should_retry_remote_send::<String>(
+        assert!(!should_retry_remote_send::<String>(
             &RemoteSendError::UnknownMessage {
                 actor_remote_id: Cow::Borrowed("actor"),
                 message_remote_id: Cow::Borrowed("message"),
@@ -373,7 +376,26 @@ mod tests {
         ));
 
         let err = remote_send_error_base::<String>(RemoteSendError::BadActorType).unwrap();
-        assert!(matches!(err, LLMError::ProviderError(ref msg) if msg == "bad remote actor type"));
+        assert!(matches!(
+            err,
+            LLMError::Transport {
+                kind: TransportErrorKind::ProtocolMismatch,
+                ..
+            }
+        ));
+
+        let err = remote_send_error_base::<String>(RemoteSendError::UnknownMessage {
+            actor_remote_id: Cow::Borrowed("actor"),
+            message_remote_id: Cow::Borrowed("message"),
+        })
+        .unwrap();
+        assert!(matches!(
+            err,
+            LLMError::Transport {
+                kind: TransportErrorKind::ProtocolMismatch,
+                ..
+            }
+        ));
 
         let err = remote_send_error_base::<String>(RemoteSendError::SerializeReply(
             "serialize fail".to_string(),
@@ -409,6 +431,15 @@ mod tests {
         };
         assert_eq!(*kind, TransportErrorKind::ProtocolMismatch);
         assert!(!err.is_retryable());
+        let restored = LLMError::from_payload(err.to_payload());
+        assert!(!restored.is_retryable());
+        assert!(matches!(
+            restored,
+            LLMError::Transport {
+                kind: TransportErrorKind::ProtocolMismatch,
+                ..
+            }
+        ));
         assert!(message.contains("decode a remote provider message"));
         assert!(message.contains("incompatible querymt build"));
     }
