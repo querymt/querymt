@@ -160,9 +160,36 @@ where
         let info = match self
             .contract_info
             .get_or_try_init(|| async {
-                self.transport
+                let info = self
+                    .transport
                     .get_contract_info(host, GetProviderContractInfo)
-                    .await
+                    .await?;
+                // Validate inside the init closure so a peer with a missing or
+                // incompatible protocol version is never cached: a later call
+                // re-fetches and can succeed once the peer is upgraded.
+                match info.protocol_version {
+                    Some(version) if version == crate::provider_protocol::MESH_PROTOCOL_VERSION => {
+                        Ok(info)
+                    }
+                    other => {
+                        let error = LLMError::InvalidRequest(format!(
+                            "remote provider peer speaks mesh protocol version {}, but this build requires {}; upgrade both peers to the same querymt build",
+                            other.map_or_else(
+                                || "unknown (peer predates protocol versioning)".to_string(),
+                                |version| version.to_string()
+                            ),
+                            crate::provider_protocol::MESH_PROTOCOL_VERSION
+                        ));
+                        tracing::warn!(
+                            target: "querymt_remote::provider_client_runtime",
+                            peer_protocol_version = ?info.protocol_version,
+                            required_protocol_version = crate::provider_protocol::MESH_PROTOCOL_VERSION,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "remote provider mesh protocol mismatch"
+                        );
+                        Err(error)
+                    }
+                }
             })
             .await
         {
@@ -182,27 +209,6 @@ where
             }
         };
 
-        match info.protocol_version {
-            Some(version) if version == crate::provider_protocol::MESH_PROTOCOL_VERSION => {}
-            other => {
-                let error = LLMError::InvalidRequest(format!(
-                    "remote provider peer speaks mesh protocol version {}, but this build requires {}; upgrade both peers to the same querymt build",
-                    other.map_or_else(
-                        || "unknown (peer predates protocol versioning)".to_string(),
-                        |version| version.to_string()
-                    ),
-                    crate::provider_protocol::MESH_PROTOCOL_VERSION
-                ));
-                tracing::warn!(
-                    target: "querymt_remote::provider_client_runtime",
-                    peer_protocol_version = ?info.protocol_version,
-                    required_protocol_version = crate::provider_protocol::MESH_PROTOCOL_VERSION,
-                    elapsed_ms = started.elapsed().as_millis() as u64,
-                    "remote provider mesh protocol mismatch"
-                );
-                return Err(error);
-            }
-        }
         let Some(required_version) = required_version else {
             return Ok(());
         };
@@ -605,7 +611,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestTransport {
-        contract_info: ProviderContractInfo,
+        contract_info: std::sync::Mutex<ProviderContractInfo>,
         contract_calls: AtomicUsize,
         contract_error: Option<TransportErrorKind>,
     }
@@ -641,7 +647,7 @@ mod tests {
                     kind,
                     message: "handshake transport failure".to_string(),
                 }),
-                None => Ok(self.contract_info.clone()),
+                None => Ok(self.contract_info.lock().unwrap().clone()),
             }
         }
         async fn prepare_stream_router(
@@ -715,7 +721,7 @@ mod tests {
         contract_error: Option<TransportErrorKind>,
     ) -> (Arc<TestTransport>, RemoteProviderClientCore<TestTransport>) {
         let transport = Arc::new(TestTransport {
-            contract_info,
+            contract_info: std::sync::Mutex::new(contract_info),
             contract_calls: AtomicUsize::new(0),
             contract_error,
         });
@@ -795,5 +801,31 @@ mod tests {
             2,
             "each failed handshake must retry rather than cache the failure"
         );
+    }
+
+    #[tokio::test]
+    async fn mismatched_protocol_version_is_not_cached_so_a_later_attempt_can_negotiate() {
+        let (transport, core) = core_with_contract(ProviderContractInfo {
+            item_aware_chat_version: None,
+            protocol_version: Some(MESH_PROTOCOL_VERSION + 1),
+        });
+
+        let error = core.validate_contract(&(), None).await.unwrap_err();
+        assert!(matches!(error, LLMError::InvalidRequest(_)));
+        assert!(error.to_string().contains("upgrade both peers"));
+        assert_eq!(
+            transport.contract_calls.load(Ordering::SeqCst),
+            1,
+            "a protocol mismatch must not be cached"
+        );
+
+        // The peer upgrades and now speaks the current protocol version; the
+        // next handshake must re-fetch instead of replaying the stale error.
+        *transport.contract_info.lock().unwrap() = ProviderContractInfo {
+            item_aware_chat_version: None,
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+        };
+        core.validate_contract(&(), None).await.unwrap();
+        assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);
     }
 }

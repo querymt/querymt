@@ -120,6 +120,13 @@ pub(crate) fn remap_legacy_oversize_eof(error: LLMError, encoded_bytes: u64) -> 
             source.kind() == std::io::ErrorKind::UnexpectedEof
                 && legacy_limit_eof_message(source.to_string().as_str())
         }
+        // remote_send_error_base converts RemoteSendError::Io — whose display
+        // is the raw io error text — into a ConnectionClosed transport error,
+        // so the legacy decode EOF arrives in this shape.
+        LLMError::Transport {
+            kind: TransportErrorKind::ConnectionClosed,
+            message,
+        } => legacy_limit_eof_message(message),
         _ => false,
     };
     if is_legacy_eof && encoded_bytes > LEGACY_MESH_REQUEST_SIZE_MAXIMUM {
@@ -299,6 +306,41 @@ mod tests {
             LEGACY_MESH_REQUEST_SIZE_MAXIMUM + 1,
         );
         assert!(matches!(unrelated, LLMError::IoError(_)));
+    }
+
+    #[test]
+    fn transport_connection_closed_legacy_eof_is_remapped_after_error_base_conversion() {
+        // remote_send_error_base turns RemoteSendError::Io (whose display is
+        // the raw io error text) into a retryable ConnectionClosed transport
+        // error; the legacy oversize EOF must still be remapped.
+        let legacy_eof = remote_send_error_to_llm_error_no_handler(RemoteSendError::Io(Some(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Eof { name: \"enum\", expect: Small(1) }",
+            ),
+        )));
+        assert!(matches!(
+            legacy_eof,
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                ..
+            }
+        ));
+        let remapped = remap_legacy_oversize_eof(legacy_eof, LEGACY_MESH_REQUEST_SIZE_MAXIMUM + 1);
+        assert!(matches!(remapped, LLMError::InvalidRequest(_)));
+        assert!(!remapped.is_retryable());
+        assert!(remapped.to_string().contains("must be upgraded"));
+
+        // Genuine disconnects keep their retryable transport classification.
+        let disconnect = remap_legacy_oversize_eof(
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                message: "connection closed".to_string(),
+            },
+            LEGACY_MESH_REQUEST_SIZE_MAXIMUM + 1,
+        );
+        assert!(matches!(disconnect, LLMError::Transport { .. }));
+        assert!(disconnect.is_retryable());
     }
 
     #[test]
