@@ -1,4 +1,4 @@
-use querymt::error::{LLMError, LLMErrorPayload, TransportErrorKind};
+use querymt::error::{LLMError, TransportErrorKind};
 #[cfg(any(feature = "kameo-mesh", test))]
 use serde::Serialize;
 #[cfg(any(feature = "kameo-mesh", test))]
@@ -177,11 +177,32 @@ pub fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Res
         RemoteSendError::UnsupportedProtocols => Ok(LLMError::ProviderError(
             "remote protocol unsupported".to_string(),
         )),
-        RemoteSendError::SerializeMessage(err)
-        | RemoteSendError::DeserializeMessage(err)
-        | RemoteSendError::SerializeReply(err)
-        | RemoteSendError::SerializeHandlerError(err)
-        | RemoteSendError::DeserializeHandlerError(err) => Ok(LLMError::ProviderError(err)),
+        RemoteSendError::SerializeMessage(err) => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message: format!(
+                "failed to encode the remote provider request for the mesh wire format: {err}; the remote peer may be running an incompatible querymt build"
+            ),
+        }),
+        RemoteSendError::DeserializeMessage(err) => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message: format!(
+                "failed to decode a remote provider message from the mesh wire format: {err}; the remote peer may be running an incompatible querymt build"
+            ),
+        }),
+        RemoteSendError::SerializeReply(err) | RemoteSendError::SerializeHandlerError(err) => {
+            Ok(LLMError::Transport {
+                kind: TransportErrorKind::ProtocolMismatch,
+                message: format!(
+                    "remote provider peer failed to encode its reply for the mesh wire format: {err}; the remote peer may be running an incompatible querymt build"
+                ),
+            })
+        }
+        RemoteSendError::DeserializeHandlerError(err) => Ok(LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message: format!(
+                "failed to decode the remote provider error from the mesh wire format: {err}; the remote peer may be running an incompatible querymt build"
+            ),
+        }),
         RemoteSendError::SwarmNotBootstrapped => Ok(LLMError::Transport {
             kind: TransportErrorKind::Other,
             message: "swarm not bootstrapped".to_string(),
@@ -202,12 +223,6 @@ pub fn remote_send_error_to_llm_error_no_handler(
         Ok(err) => err,
         Err(never) => match never {},
     }
-}
-
-pub fn decode_payload_handler_error(reason: &str) -> LLMError {
-    serde_json::from_str::<LLMErrorPayload>(reason)
-        .map(LLMError::from_payload)
-        .unwrap_or_else(|_| LLMError::ProviderError(reason.to_string()))
 }
 
 pub fn should_retry_remote_send<E>(error: &kameo::error::RemoteSendError<E>) -> bool {
@@ -364,7 +379,16 @@ mod tests {
             "serialize fail".to_string(),
         ))
         .unwrap();
-        assert!(matches!(err, LLMError::ProviderError(ref msg) if msg == "serialize fail"));
+        let LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message,
+        } = &err
+        else {
+            panic!("expected protocol mismatch transport error, got {err:?}")
+        };
+        assert!(message.contains("encode its reply"));
+        assert!(message.contains("serialize fail"));
+        assert!(!err.is_retryable());
     }
 
     #[test]
@@ -375,25 +399,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_payload_handler_error_parses_json_payload_when_available() {
-        let payload = serde_json::to_string(&LLMErrorPayload::Transport {
-            kind: TransportErrorKind::ConnectionClosed,
-            message: "lost link".to_string(),
-        })
+    fn wire_protocol_failures_map_to_non_retryable_protocol_mismatch() {
+        let err = remote_send_error_base::<String>(RemoteSendError::DeserializeMessage(
+            "invalid type: map, expected field identifier".to_string(),
+        ))
         .unwrap();
-        let err = decode_payload_handler_error(&payload);
-        assert!(matches!(
-            err,
-            LLMError::Transport {
-                kind: TransportErrorKind::ConnectionClosed,
-                ref message,
-            } if message == "lost link"
-        ));
-
-        let fallback = decode_payload_handler_error("plain failure");
-        assert!(matches!(
-            fallback,
-            LLMError::ProviderError(ref message) if message == "plain failure"
-        ));
+        let LLMError::Transport { kind, message } = &err else {
+            panic!("expected transport error, got {err:?}")
+        };
+        assert_eq!(*kind, TransportErrorKind::ProtocolMismatch);
+        assert!(!err.is_retryable());
+        assert!(message.contains("decode a remote provider message"));
+        assert!(message.contains("incompatible querymt build"));
     }
 }

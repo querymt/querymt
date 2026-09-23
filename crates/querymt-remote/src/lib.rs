@@ -102,8 +102,7 @@ pub use provider_stream_router::{
 };
 pub use provider_stream_state::RemoteProviderStreamState;
 pub use provider_transport::{
-    decode_payload_handler_error, remote_send_error_base,
-    remote_send_error_to_llm_error_no_handler, should_retry_remote_send,
+    remote_send_error_base, remote_send_error_to_llm_error_no_handler, should_retry_remote_send,
 };
 pub use remote_chat_provider::RemoteChatProvider;
 #[cfg(feature = "kameo-mesh")]

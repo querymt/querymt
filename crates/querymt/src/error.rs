@@ -12,6 +12,11 @@ pub enum TransportErrorKind {
     ConnectionClosed,
     Dns,
     Tls,
+    /// A mesh peer could not encode or decode a message under the current
+    /// wire protocol — typically a querymt version mismatch between peers.
+    /// Never transient: retrying cannot succeed until both peers run
+    /// compatible builds.
+    ProtocolMismatch,
     Other,
 }
 
@@ -538,6 +543,10 @@ impl LLMError {
     pub fn is_retryable(&self) -> bool {
         match self {
             // Always retry: transient infrastructure
+            Self::Transport {
+                kind: TransportErrorKind::ProtocolMismatch,
+                ..
+            } => false,
             Self::Transport { .. } => true,
             Self::HttpError(_) => true, // unclassified HTTP transport error — could be transient
             Self::RateLimited { .. } => true,

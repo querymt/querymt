@@ -9,10 +9,23 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct GetProviderContractInfo;
 
+/// Wire-protocol generation advertised by mesh provider hosts.
+///
+/// Bump whenever a remote message, reply, or error type changes shape in a
+/// way peers built from older revisions cannot decode. Clients verify this
+/// via [`GetProviderContractInfo`] before the first provider call and fail
+/// fast with an actionable message on mismatch instead of surfacing opaque
+/// MessagePack decoding complaints.
+pub const MESH_PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderContractInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_chat_version: Option<u32>,
+    /// Wire-protocol generation of the answering peer. Absent on peers built
+    /// before protocol versioning; the client treats that as a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

@@ -120,9 +120,9 @@ where
         host: &TTransport::HostRef,
         required_version: Option<u32>,
     ) -> Result<(), LLMError> {
-        let Some(required_version) = required_version else {
-            return Ok(());
-        };
+        // The handshake is unconditional: it doubles as the mesh wire-protocol
+        // version check, so wire-incompatible peers fail fast with a clear
+        // message instead of opaque MessagePack decoding errors later.
         let info = self
             .transport
             .get_contract_info(host, GetProviderContractInfo)
@@ -133,12 +133,28 @@ where
                 // errors rather than contract problems.
                 err @ LLMError::Transport { .. } => err,
                 error => LLMError::InvalidRequest(format!(
-                    "remote provider peer cannot advertise item-aware chat contract version {required_version}: {error}"
+                    "remote provider peer failed the mesh protocol handshake: {error}"
                 )),
             })?;
+        match info.protocol_version {
+            Some(version) if version == crate::provider_protocol::MESH_PROTOCOL_VERSION => {}
+            other => {
+                return Err(LLMError::InvalidRequest(format!(
+                    "remote provider peer speaks mesh protocol version {}, but this build requires {}; upgrade both peers to the same querymt build",
+                    other.map_or_else(
+                        || "unknown (peer predates protocol versioning)".to_string(),
+                        |version| version.to_string()
+                    ),
+                    crate::provider_protocol::MESH_PROTOCOL_VERSION
+                )));
+            }
+        }
+        let Some(required_version) = required_version else {
+            return Ok(());
+        };
         if info.item_aware_chat_version != Some(required_version) {
             return Err(LLMError::InvalidRequest(format!(
-                "remote provider peer does not support item-aware chat contract version {required_version}; advertised version: {}",
+                "remote provider peer cannot advertise item-aware chat contract version {required_version}: advertised version: {}",
                 info.item_aware_chat_version
                     .map_or_else(|| "none".to_string(), |value| value.to_string())
             )));

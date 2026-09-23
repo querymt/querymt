@@ -178,6 +178,7 @@ impl Message<GetProviderContractInfo> for ProviderHostActor {
     ) -> Self::Reply {
         Ok(ProviderContractInfo {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
         })
     }
 }
