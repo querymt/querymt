@@ -15,7 +15,8 @@
 #
 # ## Usage
 #
-#   cargo run --example qmtcode --features dashboard -- confs/research_journal.toml --dashboard
+#   QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+#     cargo run -p querymt-agent --example qmtcode --features dashboard -- crates/agent/examples/confs/research_journal.toml --dashboard
 #
 #   # Then in a session, try:
 #   #   "Research how Rust async runtimes compare"

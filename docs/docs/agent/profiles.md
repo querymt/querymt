@@ -51,7 +51,8 @@ cargo run --example qmtcode --profile coder
 cargo run --example qmtcode --profiles-dir ./my-profiles --profile custom
 
 # Use profile with dashboard
-cargo run --example qmtcode --features dashboard --profile coder --dashboard
+QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+  cargo run --example qmtcode --features dashboard --profile coder --dashboard
 ```
 
 ### Switch Profiles
@@ -249,7 +250,8 @@ cargo run --example qmtcode --profile coder --acp
 cargo run --example qmtcode --profile coder --api=0.0.0.0:8080
 
 # Use profile with dashboard
-cargo run --example qmtcode --features dashboard --profile coder --dashboard
+QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+  cargo run --example qmtcode --features dashboard --profile coder --dashboard
 
 # Use profile with mesh
 cargo run --example qmtcode --features remote --profile coder --mesh

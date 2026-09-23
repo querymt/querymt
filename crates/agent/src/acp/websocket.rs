@@ -63,18 +63,10 @@ pub(crate) struct WsServerState {
     pub(crate) session_owners: SessionOwnerMap,
     pub(crate) connection_bridges: Arc<Mutex<HashMap<String, ClientBridgeSender>>>,
     session_reconciliation_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
-    require_same_origin: bool,
 }
 
 impl WsServerState {
     pub(crate) fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
-        Self::with_same_origin(agent, false)
-    }
-
-    fn with_same_origin(
-        agent: Arc<crate::agent::LocalAgentHandle>,
-        require_same_origin: bool,
-    ) -> Self {
         Self {
             event_sources: collect_event_sources(&agent),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
@@ -82,7 +74,6 @@ impl WsServerState {
             session_owners: SessionOwnerMap::default(),
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
             session_reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
-            require_same_origin,
             agent,
         }
     }
@@ -517,8 +508,20 @@ pub(crate) fn router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
 pub(crate) fn same_origin_router(agent: Arc<crate::agent::LocalAgentHandle>) -> Router {
     Router::new().nest(
         "/acp",
-        websocket_router(WsServerState::with_same_origin(agent, true)),
+        websocket_router(WsServerState::new(agent))
+            .route_layer(axum::middleware::from_fn(enforce_same_origin)),
     )
+}
+
+#[cfg(feature = "dashboard")]
+async fn enforce_same_origin(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !has_allowed_websocket_origin(request.headers()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
 }
 
 fn websocket_router(state: WsServerState) -> Router {
@@ -527,14 +530,7 @@ fn websocket_router(state: WsServerState) -> Router {
         .with_state(state)
 }
 
-async fn websocket_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<WsServerState>,
-    headers: HeaderMap,
-) -> Response {
-    if state.require_same_origin && !has_allowed_websocket_origin(&headers) {
-        return StatusCode::FORBIDDEN.into_response();
-    }
+async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<WsServerState>) -> Response {
     ws.on_upgrade(|socket| handle_websocket_connection(socket, state))
         .into_response()
 }

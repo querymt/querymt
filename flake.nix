@@ -196,6 +196,7 @@
           {
             default = pkgs.mkShell {
               buildInputs = commonInputs;
+              QMT_UI_DIST = "${dashboardUi}";
 
               shellHook =
                 /*

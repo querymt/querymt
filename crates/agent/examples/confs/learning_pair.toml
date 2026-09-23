@@ -15,7 +15,8 @@
 #
 # ## Usage
 #
-#   cargo run --example qmtcode --features dashboard -- confs/learning_pair.toml --dashboard
+#   QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+#     cargo run -p querymt-agent --example qmtcode --features dashboard -- crates/agent/examples/confs/learning_pair.toml --dashboard
 #
 #   # The planner will automatically query knowledge before planning tasks.
 #   # Try across multiple sessions — knowledge persists.

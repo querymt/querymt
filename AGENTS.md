@@ -38,12 +38,13 @@ When running any of the commands below, prefer delegating to a subagent when ava
 - `cargo check -p querymt-service`
 
 ### Agent crate (matches CI)
-- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`
+- `QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`
 
 ### Dashboard
 - The Svelte dashboard source lives in the separate `querymt-desktop` repository.
 - Dashboard builds require `QMT_UI_DIST` to point to its validated `build-embedded` artifact.
-- Nix builds provide this artifact through the pinned `querymt-desktop` flake input.
+- The default `nix develop` shell exports `QMT_UI_DIST` from the pinned `querymt-desktop` flake input, so plain Cargo commands work inside that shell.
+- Outside the default dev shell, set `QMT_UI_DIST` explicitly as shown in the clippy command above; `nix build .#dashboard-ui --no-link --print-out-paths` provides the pinned artifact.
 
 ## Code Style Guidelines
 

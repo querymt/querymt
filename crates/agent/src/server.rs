@@ -302,16 +302,19 @@ mod dashboard_tests {
         String::from_utf8(body.to_vec()).expect("UTF-8 response")
     }
 
-    fn websocket_request(uri: &str, host: &str) -> Request<Body> {
-        Request::builder()
+    fn websocket_request(uri: &str, host: &str, origin: Option<&str>) -> Request<Body> {
+        let request = Request::builder()
             .uri(uri)
             .header(header::HOST, host)
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, "websocket")
             .header(header::SEC_WEBSOCKET_VERSION, "13")
-            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
-            .body(Body::empty())
-            .expect("WebSocket request")
+            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
+        let request = match origin {
+            Some(origin) => request.header(header::ORIGIN, origin),
+            None => request,
+        };
+        request.body(Body::empty()).expect("WebSocket request")
     }
 
     #[tokio::test]
@@ -353,15 +356,30 @@ mod dashboard_tests {
 
         let acp_ws = dashboard
             .clone()
-            .oneshot(websocket_request("/acp/ws", "127.0.0.1:3000"))
+            .oneshot(websocket_request("/acp/ws", "127.0.0.1:3000", None))
             .await
             .expect("ACP websocket route");
         // Direct router calls do not provide hyper's OnUpgrade extension, so a
         // matched WebSocket route rejects the otherwise valid handshake with 426.
         assert_eq!(acp_ws.status(), StatusCode::UPGRADE_REQUIRED);
 
+        let cross_origin_acp_ws = dashboard
+            .clone()
+            .oneshot(websocket_request(
+                "/acp/ws",
+                "127.0.0.1:3000",
+                Some("http://evil.example"),
+            ))
+            .await
+            .expect("cross-origin dashboard ACP websocket route");
+        assert_eq!(cross_origin_acp_ws.status(), StatusCode::FORBIDDEN);
+
         let legacy_ws = dashboard
-            .oneshot(websocket_request(removed_ui_ws_path, "127.0.0.1:3000"))
+            .oneshot(websocket_request(
+                removed_ui_ws_path,
+                "127.0.0.1:3000",
+                None,
+            ))
             .await
             .expect("dashboard SPA fallback");
         assert_eq!(legacy_ws.status(), StatusCode::OK);
@@ -378,8 +396,23 @@ mod dashboard_tests {
         let api = AgentServer::new(fixture.handle.clone(), fixture.storage.clone())
             .build_app(ServerMode::Api)
             .expect("API router");
+        let cross_origin_acp_ws = api
+            .clone()
+            .oneshot(websocket_request(
+                "/acp/ws",
+                "127.0.0.1:3000",
+                Some("http://evil.example"),
+            ))
+            .await
+            .expect("unrestricted API ACP websocket route");
+        assert_eq!(cross_origin_acp_ws.status(), StatusCode::UPGRADE_REQUIRED);
+
         let legacy_ws = api
-            .oneshot(websocket_request(removed_ui_ws_path, "127.0.0.1:3000"))
+            .oneshot(websocket_request(
+                removed_ui_ws_path,
+                "127.0.0.1:3000",
+                None,
+            ))
             .await
             .expect("missing legacy websocket route");
         assert_eq!(legacy_ws.status(), StatusCode::NOT_FOUND);

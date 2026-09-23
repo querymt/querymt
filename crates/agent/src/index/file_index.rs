@@ -1,6 +1,6 @@
 //! File index for workspace file listing and watching
 //!
-//! Provides real-time file indexing with file system watching for UI autocomplete
+//! Provides real-time file indexing with file system watching for client autocomplete
 //! and incremental function index updates.
 
 use arc_swap::ArcSwap;

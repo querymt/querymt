@@ -33,6 +33,22 @@ fn git_describe_or_pkg_version() -> String {
 }
 
 #[cfg(feature = "dashboard")]
+fn emit_rerun_if_changed_files(dir: &Path) -> std::io::Result<()> {
+    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            emit_rerun_if_changed_files(&path)?;
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dashboard")]
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
@@ -61,6 +77,8 @@ fn prepare_dashboard() {
         panic!("{ENV_NAME} is not a directory: {dist_path}");
     }
     println!("cargo:rerun-if-changed={}", dist_src.display());
+    emit_rerun_if_changed_files(dist_src)
+        .unwrap_or_else(|err| panic!("Failed to walk dashboard assets: {err}"));
     validate_dashboard_manifest(dist_src);
 
     let dist_dst = Path::new("dashboard-dist");

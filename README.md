@@ -96,23 +96,19 @@ The transport flags are mutually exclusive.
 
 ### Quick start
 
-From the workspace root:
+From the workspace root. The default `nix develop` shell exports the pinned dashboard artifact as `QMT_UI_DIST`; the explicit assignments below make dashboard commands work outside that shell too.
 
 ```bash
-cd crates/agent
-
 # ACP stdio mode
 cargo run --example qmtcode -- --acp
 
-# Build the embedded Svelte dashboard from a sibling querymt-desktop checkout
-(cd ../../../querymt-desktop && npm ci && npm run build:embedded)
-export QMT_UI_DIST="$(realpath ../../../querymt-desktop/build-embedded)"
-
 # Dashboard mode (default http://127.0.0.1:3000)
-cargo run --example qmtcode --features dashboard -- --dashboard
+QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+  cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard mode on a custom address
-cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
+QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+  cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 ```
 
 By default it reads config from `examples/confs/coder_agent.toml`.

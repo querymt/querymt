@@ -5,8 +5,11 @@
 //!
 //! ## Usage
 //!
+//! From the workspace root, the default `nix develop` shell supplies `QMT_UI_DIST`.
+//! Outside that shell, use the pinned dashboard package:
+//!
 //! ```bash
-//! QMT_UI_DIST="$(realpath /path/to/querymt-desktop/build-embedded)" \
+//! QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
 //!   cargo run --example web_dashboard --features dashboard
 //! ```
 //!
@@ -30,7 +33,8 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(not(feature = "dashboard"))]
 fn main() {
     eprintln!(
-        "This example requires the `dashboard` feature. \
-         Set QMT_UI_DIST and run with: cargo run --example web_dashboard --features dashboard"
+        "This example requires the `dashboard` feature. Outside `nix develop`, run: \
+         QMT_UI_DIST=$(nix build .#dashboard-ui --no-link --print-out-paths) \
+         cargo run --example web_dashboard --features dashboard"
     );
 }

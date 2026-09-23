@@ -163,8 +163,8 @@ impl OAuthService {
 
     /// Query authentication status for all configured providers (or a single one).
     ///
-    /// This is the shared implementation behind both the UI `list_auth_providers`
-    /// message and the ACP `_querymt/auth/status` extension method.
+    /// This is the shared implementation for the ACP `_querymt/auth/status`
+    /// extension method.
     pub async fn auth_status(&self, provider_filter: Option<&str>) -> Vec<AuthProviderStatus> {
         let registry = self.config.provider.plugin_registry();
         let store = crate::auth::SecretStore::new().ok();

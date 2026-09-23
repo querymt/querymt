@@ -12,10 +12,11 @@
 //! cargo run --example qmtcode --features api -- --api
 //! cargo run --example qmtcode --features api -- --api=0.0.0.0:8080
 //!
-//! # Embedded Svelte dashboard mode
-//! QMT_UI_DIST="$(realpath /path/to/querymt-desktop/build-embedded)" \
+//! # Embedded Svelte dashboard mode (from the workspace root)
+//! # `nix develop` supplies QMT_UI_DIST; outside it, use the pinned package:
+//! QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
 //!   cargo run --example qmtcode --features dashboard -- --dashboard
-//! QMT_UI_DIST="$(realpath /path/to/querymt-desktop/build-embedded)" \
+//! QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
 //!   cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 //!
 //! # Mesh mode: LAN plus any previously joined/hosted Iroh meshes
@@ -24,8 +25,10 @@
 //! cargo run --example qmtcode --features remote -- --mesh --mesh-no-lan
 //!
 //! # Dashboard mode with mesh enabled
-//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
-//! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh --mesh-no-lan
+//! QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+//!   cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
+//! QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
+//!   cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh --mesh-no-lan
 //!
 //! # Internet mesh: host and print a new invite token
 //! cargo run --example qmtcode --features "remote" -- --mesh --mesh-invite
