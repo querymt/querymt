@@ -49,14 +49,14 @@ fn validate_item_aware_request(
         return Ok(());
     }
     if advertised_version != Some(ITEM_AWARE_CHAT_CONTRACT_VERSION) {
-        return Err(RemoteProviderHostError::ProviderChat {
-            operation: "contract_check".to_string(),
-            reason: format!(
+        return Err(RemoteProviderHostError::provider_chat_message(
+            "contract_check",
+            format!(
                 "item-aware history requires contract version {}; request advertised {}",
                 ITEM_AWARE_CHAT_CONTRACT_VERSION,
                 advertised_version.map_or_else(|| "none".to_string(), |value| value.to_string())
             ),
-        });
+        ));
     }
     Ok(())
 }
@@ -178,6 +178,7 @@ impl Message<GetProviderContractInfo> for ProviderHostActor {
     ) -> Self::Reply {
         Ok(ProviderContractInfo {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
         })
     }
 }
@@ -221,11 +222,7 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
             let response = provider
                 .chat_with_tools(&msg.messages, tools_slice)
                 .await
-                .map_err(|e| RemoteProviderHostError::ProviderChat {
-                    operation: "chat_with_tools".to_string(),
-                    reason: serde_json::to_string(&e.to_payload())
-                        .unwrap_or_else(|_| e.to_string()),
-                })?;
+                .map_err(|e| RemoteProviderHostError::provider_chat("chat_with_tools", &e))?;
 
             let tool_calls = response.tool_calls().unwrap_or_default();
             let finish_reason = response.finish_reason.map(|r| format!("{:?}", r));
@@ -326,10 +323,8 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                 let stream = provider
                     .chat_stream_with_tools(&msg.messages, tools_slice)
                     .await
-                    .map_err(|e| RemoteProviderHostError::ProviderChat {
-                        operation: "chat_stream_with_tools".to_string(),
-                        reason: serde_json::to_string(&e.to_payload())
-                            .unwrap_or_else(|_| e.to_string()),
+                    .map_err(|e| {
+                        RemoteProviderHostError::provider_chat("chat_stream_with_tools", &e)
                     })?;
 
                 Ok::<_, RemoteProviderHostError>((provider, stream))

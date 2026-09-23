@@ -301,6 +301,15 @@ mod mesh_provider_tests {
                 actor_remote_id: "actor".into(),
             }
         ));
+        // Timeouts are replayable under the resumable provider-stream retry
+        // policy (streams recover through stream leases), so reply and network
+        // timeouts count as retryable connectivity failures.
+        assert!(should_retry_remote_send::<()>(
+            &RemoteSendError::NetworkTimeout
+        ));
+        assert!(should_retry_remote_send::<()>(
+            &RemoteSendError::ReplyTimeout
+        ));
     }
 
     #[test]
@@ -309,9 +318,6 @@ mod mesh_provider_tests {
 
         assert!(!should_retry_remote_send::<()>(
             &RemoteSendError::MailboxFull
-        ));
-        assert!(!should_retry_remote_send::<()>(
-            &RemoteSendError::ReplyTimeout
         ));
         assert!(!should_retry_remote_send::<()>(
             &RemoteSendError::BadActorType

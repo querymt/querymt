@@ -9,10 +9,23 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct GetProviderContractInfo;
 
+/// Wire-protocol generation advertised by mesh provider hosts.
+///
+/// Bump whenever a remote message, reply, or error type changes shape in a
+/// way peers built from older revisions cannot decode. Clients verify this
+/// via [`GetProviderContractInfo`] before the first provider call and fail
+/// fast with an actionable message on mismatch instead of surfacing opaque
+/// MessagePack decoding complaints.
+pub const MESH_PROTOCOL_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderContractInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_chat_version: Option<u32>,
+    /// Wire-protocol generation of the answering peer. Absent on peers built
+    /// before protocol versioning; the client treats that as a mismatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -561,5 +574,173 @@ mod item_aware_tests {
             })
             .expect("tool result present");
         assert_eq!(tool_result.call_id, "call-remote");
+    }
+}
+
+/// Round trips that use kameo's exact wire codec pair: the client encodes
+/// messages with [`rmp_serde::to_vec_named`] and the host decodes them with
+/// [`rmp_serde::decode::from_slice`]. MessagePack writes the map header with
+/// the *declared* field count before any entry, so a manual `Serialize` impl
+/// whose declared length diverges from the fields it actually writes corrupts
+/// the stream. serde_json cannot catch that class of bug because JSON ignores
+/// the declared length entirely.
+#[cfg(test)]
+mod rmp_wire_tests {
+    use super::*;
+    use querymt::chat::{CacheHint, ChatInputPart};
+
+    fn assert_rmp_round_trip_equal<T>(value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let encoded = rmp_serde::to_vec_named(value).expect("rmp named encode");
+        let decoded: T = rmp_serde::decode::from_slice(&encoded).expect("rmp decode");
+        let original = serde_json::to_value(value).expect("original json value");
+        let decoded = serde_json::to_value(&decoded).expect("decoded json value");
+        assert_eq!(original, decoded);
+    }
+
+    fn chat_request(messages: Vec<ChatMessage>) -> ProviderChatRequest {
+        ProviderChatRequest {
+            provider: "llama_cpp".into(),
+            model: "hf:demo/model.gguf".into(),
+            messages,
+            tools: None,
+            params: None,
+            item_aware_contract_version: None,
+        }
+    }
+
+    /// Regression: `ChatMessage::serialize` used to declare three fields while
+    /// writing only two whenever no cache hint was set. rmp-serde trusts the
+    /// declared map length, so decoding a multi-message request consumed the
+    /// second message's map header as a field identifier and failed with
+    /// `invalid type: map, expected field identifier` on the remote host.
+    #[test]
+    fn chat_request_with_two_cache_less_messages_round_trips_over_rmp() {
+        let messages = vec![
+            ChatMessage::from_user_parts(vec![ChatInputPart::text("preamble")]),
+            ChatMessage::from_user_parts(vec![ChatInputPart::text("question")]),
+        ];
+        assert_rmp_round_trip_equal(&chat_request(messages));
+    }
+
+    #[test]
+    fn chat_request_with_mixed_cache_hints_round_trips_over_rmp() {
+        let messages = vec![
+            ChatMessage::user()
+                .text("cached prefix")
+                .cache(CacheHint::Ephemeral {
+                    ttl_seconds: Some(300),
+                })
+                .build(),
+            ChatMessage::from_user_parts(vec![ChatInputPart::text("follow-up")]),
+        ];
+        assert_rmp_round_trip_equal(&chat_request(messages));
+    }
+
+    #[test]
+    fn single_chat_messages_round_trip_over_rmp() {
+        assert_rmp_round_trip_equal(&ChatMessage::from_user_parts(vec![ChatInputPart::text(
+            "solo",
+        )]));
+        assert_rmp_round_trip_equal(
+            &ChatMessage::user()
+                .text("cached")
+                .cache(CacheHint::Ephemeral { ttl_seconds: None })
+                .build(),
+        );
+    }
+
+    #[test]
+    fn stream_request_with_cache_less_messages_round_trips_over_rmp() {
+        let request = ProviderStreamRequest {
+            provider: "llama_cpp".into(),
+            model: "hf:demo/model.gguf".into(),
+            messages: vec![
+                ChatMessage::from_user_parts(vec![ChatInputPart::text("preamble")]),
+                ChatMessage::from_user_parts(vec![ChatInputPart::text("question")]),
+            ],
+            tools: None,
+            session_id: "session-1".into(),
+            request_id: "request-1".into(),
+            stream_router_ref: 7_u64,
+            reconnect_grace_secs: 30,
+            heartbeat_interval_secs: 10,
+            lease_ttl_secs: 60,
+            params: None,
+            item_aware_contract_version: None,
+        };
+        assert_rmp_round_trip_equal(&request);
+    }
+
+    #[test]
+    fn provider_contract_info_round_trips_and_legacy_payload_defaults_version() {
+        let current = ProviderContractInfo {
+            item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+        };
+        assert_rmp_round_trip_equal(&current);
+
+        let legacy: ProviderContractInfo = serde_json::from_value(serde_json::json!({
+            "item_aware_chat_version": ITEM_AWARE_CHAT_CONTRACT_VERSION
+        }))
+        .expect("legacy contract info");
+        assert_eq!(legacy.protocol_version, None);
+    }
+
+    #[test]
+    fn provider_chat_response_round_trips_over_rmp() {
+        let response = ProviderChatResponse::from(ChatOutput::from_projections(
+            None,
+            Some("hello".to_string()),
+            None,
+            None,
+            None,
+        ));
+        let decoded = {
+            let encoded = rmp_serde::to_vec_named(&response).expect("rmp named encode");
+            let decoded: ProviderChatResponse =
+                rmp_serde::decode::from_slice(&encoded).expect("rmp decode");
+            decoded
+        };
+        assert_eq!(decoded.output.text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn stream_relay_messages_round_trip_over_rmp() {
+        let provider_error = || LLMErrorPayload::ProviderError {
+            message: "provider exploded".into(),
+            kind: None,
+            code: None,
+            error_type: None,
+            request_id: None,
+            retry_after_secs: None,
+        };
+        let messages = vec![
+            StreamRelayMessage::Chunk(StreamChunk::Text("delta".into())),
+            StreamRelayMessage::ChunkBatch(vec![
+                StreamChunk::Text("a".into()),
+                StreamChunk::Text("b".into()),
+            ]),
+            StreamRelayMessage::Heartbeat {
+                phase: ProviderStreamPhase::Streaming,
+                elapsed_ms: 1,
+                idle_ms: 2,
+                chunk_count: 3,
+            },
+            StreamRelayMessage::ProviderError {
+                error: provider_error(),
+            },
+            StreamRelayMessage::TransportFailed {
+                error: LLMErrorPayload::Transport {
+                    kind: querymt::error::TransportErrorKind::ConnectionClosed,
+                    message: "link lost".into(),
+                },
+            },
+        ];
+        for message in &messages {
+            assert_rmp_round_trip_equal(message);
+        }
     }
 }

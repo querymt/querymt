@@ -1,4 +1,4 @@
-use querymt::error::{LLMError, LLMErrorPayload, TransportErrorKind};
+use querymt::error::{LLMError, TransportErrorKind};
 #[cfg(any(feature = "kameo-mesh", test))]
 use serde::Serialize;
 #[cfg(any(feature = "kameo-mesh", test))]
@@ -120,6 +120,13 @@ pub(crate) fn remap_legacy_oversize_eof(error: LLMError, encoded_bytes: u64) -> 
             source.kind() == std::io::ErrorKind::UnexpectedEof
                 && legacy_limit_eof_message(source.to_string().as_str())
         }
+        // remote_send_error_base converts RemoteSendError::Io — whose display
+        // is the raw io error text — into a ConnectionClosed transport error,
+        // so the legacy decode EOF arrives in this shape.
+        LLMError::Transport {
+            kind: TransportErrorKind::ConnectionClosed,
+            message,
+        } => legacy_limit_eof_message(message),
         _ => false,
     };
     if is_legacy_eof && encoded_bytes > LEGACY_MESH_REQUEST_SIZE_MAXIMUM {
@@ -137,62 +144,70 @@ fn legacy_limit_eof_message(message: &str) -> bool {
     message == "Eof { name: \"enum\", expect: Small(1) }"
 }
 
-pub fn remote_send_error_base<E>(error: kameo::error::RemoteSendError<E>) -> Result<LLMError, E> {
+/// Map a kameo remote send error into a provider-pipeline [`LLMError`].
+///
+/// Classification is delegated to [`crate::transport_failure::classify_remote_send_error`],
+/// which is the single source of truth for remote-send semantics. Duplicating
+/// the match here previously let connectivity failures such as
+/// `RemoteSendError::Io` degrade into `LLMError::IoError` — whose display
+/// dropped the underlying cause — and made a mesh timeout look like a provider
+/// rejection.
+///
+/// Handler errors are returned as `Err(E)` so callers keep the structured
+/// provider payload.
+pub fn remote_send_error_base<E: std::fmt::Display>(
+    error: kameo::error::RemoteSendError<E>,
+) -> Result<LLMError, E> {
+    match crate::transport_failure::classify_remote_send_error(error) {
+        Ok(failure) => Ok(transport_failure_to_llm_error(failure)),
+        Err(handler) => Err(handler),
+    }
+}
+
+/// Convert a classified remote transport failure into the provider-facing
+/// error type, keeping the transport failure retryable instead of turning it
+/// into a semantic rejection.
+fn transport_failure_to_llm_error(
+    failure: crate::transport_failure::RemoteTransportFailure,
+) -> LLMError {
+    use crate::transport_failure::RemoteTransportFailureKind as Kind;
+
+    let kind = match failure.kind {
+        Kind::ActorUnavailable | Kind::ConnectionClosed => TransportErrorKind::ConnectionClosed,
+        Kind::DialFailure => TransportErrorKind::ConnectionRefused,
+        Kind::MailboxFull => TransportErrorKind::Other,
+        Kind::NetworkTimeout | Kind::ReplyTimeout => TransportErrorKind::Timeout,
+        // Wire/protocol incompatibilities are never transient; replaying them
+        // cannot succeed until both peers run compatible builds.
+        Kind::ProtocolMismatch | Kind::Serialization => TransportErrorKind::ProtocolMismatch,
+    };
+
+    LLMError::Transport {
+        kind,
+        message: failure.message,
+    }
+}
+
+/// Provider-streaming retry policy for remote sends.
+///
+/// Provider streams are resumable through stream leases, so compared with the
+/// session-command policy in [`crate::transport_failure::classify_remote_send_error`]
+/// more variants are safe to replay here. Protocol and serialization failures
+/// stay non-retryable: they are deterministic, not transient.
+pub fn should_retry_remote_send<E>(error: &kameo::error::RemoteSendError<E>) -> bool {
     use kameo::error::RemoteSendError;
 
-    match error {
-        RemoteSendError::ActorNotRunning | RemoteSendError::ActorStopped => {
-            Ok(LLMError::Transport {
-                kind: TransportErrorKind::ConnectionClosed,
-                message: "remote actor not running".to_string(),
-            })
-        }
-        RemoteSendError::UnknownActor { .. } | RemoteSendError::UnknownMessage { .. } => {
-            Ok(LLMError::Transport {
-                kind: TransportErrorKind::ConnectionClosed,
-                message: "remote actor unavailable".to_string(),
-            })
-        }
-        RemoteSendError::BadActorType => {
-            Ok(LLMError::ProviderError("bad remote actor type".to_string()))
-        }
-        RemoteSendError::MailboxFull => Ok(LLMError::Transport {
-            kind: TransportErrorKind::Other,
-            message: "remote mailbox full".to_string(),
-        }),
-        RemoteSendError::ReplyTimeout | RemoteSendError::NetworkTimeout => {
-            Ok(LLMError::Transport {
-                kind: TransportErrorKind::Timeout,
-                message: "network timeout".to_string(),
-            })
-        }
-        RemoteSendError::DialFailure => Ok(LLMError::Transport {
-            kind: TransportErrorKind::ConnectionRefused,
-            message: "dial failure".to_string(),
-        }),
-        RemoteSendError::ConnectionClosed => Ok(LLMError::Transport {
-            kind: TransportErrorKind::ConnectionClosed,
-            message: "connection closed".to_string(),
-        }),
-        RemoteSendError::UnsupportedProtocols => Ok(LLMError::ProviderError(
-            "remote protocol unsupported".to_string(),
-        )),
-        RemoteSendError::SerializeMessage(err)
-        | RemoteSendError::DeserializeMessage(err)
-        | RemoteSendError::SerializeReply(err)
-        | RemoteSendError::SerializeHandlerError(err)
-        | RemoteSendError::DeserializeHandlerError(err) => Ok(LLMError::ProviderError(err)),
-        RemoteSendError::SwarmNotBootstrapped => Ok(LLMError::Transport {
-            kind: TransportErrorKind::Other,
-            message: "swarm not bootstrapped".to_string(),
-        }),
-        RemoteSendError::Io(Some(err)) => Ok(LLMError::from(err)),
-        RemoteSendError::Io(None) => Ok(LLMError::Transport {
-            kind: TransportErrorKind::Other,
-            message: "remote IO failure".to_string(),
-        }),
-        RemoteSendError::HandlerError(err) => Err(err),
-    }
+    matches!(
+        error,
+        RemoteSendError::ActorNotRunning
+            | RemoteSendError::ActorStopped
+            | RemoteSendError::UnknownActor { .. }
+            | RemoteSendError::DialFailure
+            | RemoteSendError::ConnectionClosed
+            | RemoteSendError::NetworkTimeout
+            | RemoteSendError::ReplyTimeout
+            | RemoteSendError::Io(_)
+    )
 }
 
 pub fn remote_send_error_to_llm_error_no_handler(
@@ -202,26 +217,6 @@ pub fn remote_send_error_to_llm_error_no_handler(
         Ok(err) => err,
         Err(never) => match never {},
     }
-}
-
-pub fn decode_payload_handler_error(reason: &str) -> LLMError {
-    serde_json::from_str::<LLMErrorPayload>(reason)
-        .map(LLMError::from_payload)
-        .unwrap_or_else(|_| LLMError::ProviderError(reason.to_string()))
-}
-
-pub fn should_retry_remote_send<E>(error: &kameo::error::RemoteSendError<E>) -> bool {
-    use kameo::error::RemoteSendError;
-
-    matches!(
-        error,
-        RemoteSendError::ActorNotRunning
-            | RemoteSendError::ActorStopped
-            | RemoteSendError::UnknownActor { .. }
-            | RemoteSendError::UnknownMessage { .. }
-            | RemoteSendError::DialFailure
-            | RemoteSendError::ConnectionClosed
-    )
 }
 
 #[cfg(test)]
@@ -314,6 +309,41 @@ mod tests {
     }
 
     #[test]
+    fn transport_connection_closed_legacy_eof_is_remapped_after_error_base_conversion() {
+        // remote_send_error_base turns RemoteSendError::Io (whose display is
+        // the raw io error text) into a retryable ConnectionClosed transport
+        // error; the legacy oversize EOF must still be remapped.
+        let legacy_eof = remote_send_error_to_llm_error_no_handler(RemoteSendError::Io(Some(
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Eof { name: \"enum\", expect: Small(1) }",
+            ),
+        )));
+        assert!(matches!(
+            legacy_eof,
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                ..
+            }
+        ));
+        let remapped = remap_legacy_oversize_eof(legacy_eof, LEGACY_MESH_REQUEST_SIZE_MAXIMUM + 1);
+        assert!(matches!(remapped, LLMError::InvalidRequest(_)));
+        assert!(!remapped.is_retryable());
+        assert!(remapped.to_string().contains("must be upgraded"));
+
+        // Genuine disconnects keep their retryable transport classification.
+        let disconnect = remap_legacy_oversize_eof(
+            LLMError::Transport {
+                kind: TransportErrorKind::ConnectionClosed,
+                message: "connection closed".to_string(),
+            },
+            LEGACY_MESH_REQUEST_SIZE_MAXIMUM + 1,
+        );
+        assert!(matches!(disconnect, LLMError::Transport { .. }));
+        assert!(disconnect.is_retryable());
+    }
+
+    #[test]
     fn retry_classifier_only_retries_connection_recovery_cases() {
         assert!(should_retry_remote_send::<String>(
             &RemoteSendError::ActorNotRunning
@@ -326,7 +356,7 @@ mod tests {
                 actor_remote_id: Cow::Borrowed("actor"),
             }
         ));
-        assert!(should_retry_remote_send::<String>(
+        assert!(!should_retry_remote_send::<String>(
             &RemoteSendError::UnknownMessage {
                 actor_remote_id: Cow::Borrowed("actor"),
                 message_remote_id: Cow::Borrowed("message"),
@@ -358,13 +388,41 @@ mod tests {
         ));
 
         let err = remote_send_error_base::<String>(RemoteSendError::BadActorType).unwrap();
-        assert!(matches!(err, LLMError::ProviderError(ref msg) if msg == "bad remote actor type"));
+        assert!(matches!(
+            err,
+            LLMError::Transport {
+                kind: TransportErrorKind::ProtocolMismatch,
+                ..
+            }
+        ));
+
+        let err = remote_send_error_base::<String>(RemoteSendError::UnknownMessage {
+            actor_remote_id: Cow::Borrowed("actor"),
+            message_remote_id: Cow::Borrowed("message"),
+        })
+        .unwrap();
+        assert!(matches!(
+            err,
+            LLMError::Transport {
+                kind: TransportErrorKind::ProtocolMismatch,
+                ..
+            }
+        ));
 
         let err = remote_send_error_base::<String>(RemoteSendError::SerializeReply(
             "serialize fail".to_string(),
         ))
         .unwrap();
-        assert!(matches!(err, LLMError::ProviderError(ref msg) if msg == "serialize fail"));
+        let LLMError::Transport {
+            kind: TransportErrorKind::ProtocolMismatch,
+            message,
+        } = &err
+        else {
+            panic!("expected protocol mismatch transport error, got {err:?}")
+        };
+        assert!(message.contains("failed to serialize reply"));
+        assert!(message.contains("serialize fail"));
+        assert!(!err.is_retryable());
     }
 
     #[test]
@@ -375,25 +433,95 @@ mod tests {
     }
 
     #[test]
-    fn decode_payload_handler_error_parses_json_payload_when_available() {
-        let payload = serde_json::to_string(&LLMErrorPayload::Transport {
-            kind: TransportErrorKind::ConnectionClosed,
-            message: "lost link".to_string(),
-        })
+    fn wire_protocol_failures_map_to_non_retryable_protocol_mismatch() {
+        let err = remote_send_error_base::<String>(RemoteSendError::DeserializeMessage(
+            "invalid type: map, expected field identifier".to_string(),
+        ))
         .unwrap();
-        let err = decode_payload_handler_error(&payload);
+        let LLMError::Transport { kind, message } = &err else {
+            panic!("expected transport error, got {err:?}")
+        };
+        assert_eq!(*kind, TransportErrorKind::ProtocolMismatch);
+        assert!(!err.is_retryable());
+        let restored = LLMError::from_payload(err.to_payload());
+        assert!(!restored.is_retryable());
         assert!(matches!(
-            err,
+            restored,
             LLMError::Transport {
-                kind: TransportErrorKind::ConnectionClosed,
-                ref message,
-            } if message == "lost link"
+                kind: TransportErrorKind::ProtocolMismatch,
+                ..
+            }
         ));
+        assert!(message.contains("failed to deserialize message"));
+        assert!(message.contains("invalid type: map, expected field identifier"));
+    }
 
-        let fallback = decode_payload_handler_error("plain failure");
-        assert!(matches!(
-            fallback,
-            LLMError::ProviderError(ref message) if message == "plain failure"
+    #[test]
+    fn io_failures_stay_retryable_transport_errors_with_cause() {
+        // A mesh I/O failure (for example an inbound stream timing out) is a
+        // connectivity problem: it must stay retryable and keep kameo's message
+        // instead of degrading into an opaque provider rejection.
+        let err = remote_send_error_base::<String>(RemoteSendError::Io(Some(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out",
+        ))))
+        .unwrap();
+        let LLMError::Transport { kind, message } = &err else {
+            panic!("expected transport error, got {err:?}")
+        };
+        assert_eq!(*kind, TransportErrorKind::ConnectionClosed);
+        assert!(err.is_retryable());
+        assert!(message.contains("timed out"));
+
+        let none = remote_send_error_base::<String>(RemoteSendError::Io(None)).unwrap();
+        assert!(none.is_retryable());
+        assert!(matches!(none, LLMError::Transport { .. }));
+    }
+
+    #[test]
+    fn connectivity_failures_stay_retryable_transport_errors() {
+        let cases = [
+            (RemoteSendError::NetworkTimeout, TransportErrorKind::Timeout),
+            (RemoteSendError::ReplyTimeout, TransportErrorKind::Timeout),
+            (
+                RemoteSendError::DialFailure,
+                TransportErrorKind::ConnectionRefused,
+            ),
+            (
+                RemoteSendError::ConnectionClosed,
+                TransportErrorKind::ConnectionClosed,
+            ),
+            (
+                RemoteSendError::ActorNotRunning,
+                TransportErrorKind::ConnectionClosed,
+            ),
+        ];
+        for (error, expected_kind) in cases {
+            let err = remote_send_error_base::<String>(error).unwrap();
+            let LLMError::Transport { kind, .. } = &err else {
+                panic!("expected transport error, got {err:?}")
+            };
+            assert_eq!(*kind, expected_kind);
+            assert!(err.is_retryable(), "{err:?} should stay retryable");
+        }
+    }
+
+    #[test]
+    fn provider_stream_retry_policy_replays_connectivity_but_not_protocol_failures() {
+        assert!(should_retry_remote_send::<String>(&RemoteSendError::Io(
+            Some(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out"
+            ))
+        )));
+        assert!(should_retry_remote_send::<String>(
+            &RemoteSendError::NetworkTimeout
+        ));
+        assert!(!should_retry_remote_send::<String>(
+            &RemoteSendError::DeserializeMessage("bad wire".to_string())
+        ));
+        assert!(!should_retry_remote_send::<String>(
+            &RemoteSendError::BadActorType
         ));
     }
 }

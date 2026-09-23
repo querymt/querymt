@@ -188,10 +188,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
             .await
             .map_err(|error| match crate::remote_send_error_base(error) {
                 Ok(error) => error,
-                Err(handler) => crate::decode_payload_handler_error(
-                    &serde_json::to_string(&handler.to_payload())
-                        .unwrap_or_else(|_| handler.to_string()),
-                ),
+                Err(handler) => LLMError::from_payload(handler.to_payload()),
             })
     }
 
@@ -247,10 +244,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
             .await
             .map_err(|e| match crate::remote_send_error_base(e) {
                 Ok(err) => crate::provider_transport::remap_legacy_oversize_eof(err, encoded_bytes),
-                Err(handler) => crate::decode_payload_handler_error(
-                    &serde_json::to_string(&handler.to_payload())
-                        .unwrap_or_else(|_| handler.to_string()),
-                ),
+                Err(handler) => LLMError::from_payload(handler.to_payload()),
             })
     }
 

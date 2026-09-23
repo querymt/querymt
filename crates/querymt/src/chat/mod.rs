@@ -198,7 +198,13 @@ impl Serialize for ChatMessage {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ChatMessage", 3)?;
+        // The declared field count must match the fields actually written:
+        // rmp-serde (the mesh wire codec) emits the map header from this count
+        // and cannot correct it, so a conditional field here previously
+        // corrupted multi-message payloads on the wire
+        // (`invalid type: map, expected field identifier` on the remote host).
+        let field_count = 2 + usize::from(self.cache.is_some());
+        let mut state = serializer.serialize_struct("ChatMessage", field_count)?;
         state.serialize_field("role", &self.role)?;
         match &self.payload {
             ChatMessagePayload::Input(parts) => state.serialize_field("input", parts)?,
