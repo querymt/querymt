@@ -267,13 +267,12 @@ impl HTTPLLMProvider for Codex {
 
 fn codex_models() -> Vec<String> {
     vec![
-        "gpt-5.3-codex-spark".to_string(),
-        "gpt-5.4".to_string(),
-        "gpt-5.4-mini".to_string(),
         "gpt-5.5".to_string(),
         "gpt-5.6-luna".to_string(),
         "gpt-5.6-terra".to_string(),
         "gpt-5.6-sol".to_string(),
+        "gpt-6-luna".to_string(),
+        "gpt-6-sol".to_string(),
         "gpt-6-astra".to_string(),
     ]
 }
