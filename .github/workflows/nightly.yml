@@ -91,7 +91,8 @@ jobs:
         uses: actions/download-artifact@v8
         with:
           path: artifacts/
-          pattern: '*-*'
+          # Match qmt-* and qmtcode-*, but not the internal dashboard-ui artifact.
+          pattern: 'qmt*-*'
           merge-multiple: true
 
       # Delete the existing nightly tag and release to ensure fresh artifacts
