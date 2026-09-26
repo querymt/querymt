@@ -620,6 +620,36 @@ async fn acp_list_sessions_pages_workspace_sessions_without_cross_workspace_leak
             .cloned()
             .collect::<Vec<_>>(),
     );
+    let trailing_cwd = PathBuf::from(format!("{}/", workspace.display()));
+    let trailing_page = AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        AcpListSessionsRequest::new().cwd(trailing_cwd.clone()),
+    )
+    .await?;
+    assert_eq!(trailing_page.total_count, 12);
+    assert_eq!(trailing_page.sessions.len(), 10);
+    assert!(
+        trailing_page
+            .sessions
+            .iter()
+            .all(|session| session.cwd == workspace)
+    );
+
+    let group_page = agent
+        .sessions()
+        .list_group(
+            Some(trailing_cwd.display().to_string()),
+            ListSessionsOptions {
+                limit: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(group_page.total_count, 12);
+    assert_eq!(group_page.groups[0].cwd.as_deref(), workspace.to_str());
+    assert_eq!(group_page.groups[0].sessions.len(), 1);
+    assert!(group_page.next_cursor.is_some());
+
     let next_cursor = first_page
         .next_cursor
         .expect("workspace page should continue");

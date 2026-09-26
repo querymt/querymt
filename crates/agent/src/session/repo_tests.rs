@@ -5,7 +5,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
 
@@ -71,13 +70,58 @@ mod tests {
         #[tokio::test]
         async fn create_session_with_cwd() {
             let repo = make_repo();
-            let cwd = PathBuf::from("/tmp/workspace");
+            let root = std::env::current_dir()
+                .unwrap()
+                .ancestors()
+                .last()
+                .unwrap()
+                .to_path_buf();
+            let cwd = root.join("tmp/workspace");
             let session = repo
                 .create_session(None, Some(cwd.clone()), None, None)
                 .await
                 .unwrap();
             let fetched = repo.get_session(&session.public_id).await.unwrap().unwrap();
             assert_eq!(fetched.cwd, Some(cwd));
+        }
+
+        #[tokio::test]
+        async fn create_session_normalizes_cwd_without_requiring_it_to_exist() {
+            let repo = make_repo();
+            let base = std::env::current_dir().unwrap();
+            let cwd = base.join("missing-workspace");
+            let path = format!("{}/./", cwd.display());
+            let session = repo
+                .create_session(None, Some(path.into()), None, None)
+                .await
+                .unwrap();
+            assert_eq!(session.cwd.as_deref(), Some(cwd.as_path()));
+            assert_eq!(
+                repo.get_session(&session.public_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cwd,
+                Some(cwd)
+            );
+
+            let root_path = base.ancestors().last().unwrap().to_path_buf();
+            let root = repo
+                .create_session(None, Some(root_path.clone()), None, None)
+                .await
+                .unwrap();
+            assert_eq!(root.cwd, Some(root_path));
+        }
+
+        #[tokio::test]
+        async fn create_session_resolves_relative_cwd() {
+            let repo = make_repo();
+            let session = repo
+                .create_session(None, Some("relative/./workspace/".into()), None, None)
+                .await
+                .unwrap();
+            let expected = std::env::current_dir().unwrap().join("relative/workspace");
+            assert_eq!(session.cwd, Some(expected));
         }
 
         #[tokio::test]

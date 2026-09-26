@@ -42,7 +42,7 @@ pub fn is_no_cwd_path(path: &Path) -> bool {
 /// - Empty path -> `Ok(None)`
 /// - Sentinel path -> `Ok(None)`
 /// - Non-absolute path -> `Err(invalid_params)`
-/// - Valid absolute path -> `Ok(Some(path))`
+/// - Valid absolute path -> `Ok(Some(normalized path))`
 pub fn acp_cwd_to_optional(cwd: &Path) -> Result<Option<PathBuf>, crate::acp::protocol::Error> {
     if cwd.as_os_str().is_empty() || cwd == no_cwd_path() {
         return Ok(None);
@@ -57,7 +57,7 @@ pub fn acp_cwd_to_optional(cwd: &Path) -> Result<Option<PathBuf>, crate::acp::pr
         );
     }
 
-    Ok(Some(cwd.to_path_buf()))
+    Ok(Some(cwd.components().collect()))
 }
 
 #[cfg(test)]
@@ -101,6 +101,21 @@ mod tests {
         };
         let result = acp_cwd_to_optional(&cwd).unwrap();
         assert_eq!(result, Some(cwd));
+    }
+
+    #[test]
+    fn absolute_path_with_trailing_slash_is_normalized() {
+        let cwd = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\test\project\")
+        } else {
+            PathBuf::from("/home/user/project/./")
+        };
+        let expected = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\test\project")
+        } else {
+            PathBuf::from("/home/user/project")
+        };
+        assert_eq!(acp_cwd_to_optional(&cwd).unwrap(), Some(expected));
     }
 
     #[test]
