@@ -8,6 +8,7 @@ on:
       - flake.lock
       - Cargo.toml
       - Cargo.lock
+      - crates/agent/embedded-ui-revision
       - .github/workflows/nix.yml
   pull_request:
     paths:
@@ -15,6 +16,7 @@ on:
       - flake.lock
       - Cargo.toml
       - Cargo.lock
+      - crates/agent/embedded-ui-revision
       - .github/workflows/nix.yml
 
 jobs:

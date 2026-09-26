@@ -14,9 +14,8 @@ on:
         default: false
       dashboard_revision:
         description: 'Published querymt-desktop revision to embed'
-        required: false
+        required: true
         type: string
-        default: '52a5132319fee1fde3bcf8969b717203a96f1741'
 
 permissions:
   contents: read

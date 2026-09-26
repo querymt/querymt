@@ -10,12 +10,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  resolve-ui:
+    name: Resolve dashboard revision
+    runs-on: ubuntu-latest
+    outputs:
+      revision: ${{ steps.pin.outputs.revision }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+      - name: Read embedded UI pin
+        id: pin
+        run: |
+          revision=$(tr -d '[:space:]' < crates/agent/embedded-ui-revision)
+          test -n "$revision"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build Release Binaries
+    needs: resolve-ui
     uses: ./.github/workflows/build.yml
     with:
       version_name: ${{ github.ref_name }}
       is_nightly: false
+      dashboard_revision: ${{ needs.resolve-ui.outputs.revision }}
 
   release:
     name: Create GitHub Release

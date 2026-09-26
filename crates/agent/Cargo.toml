@@ -17,6 +17,7 @@ plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins"]
 agent-mcp = ["querymt/mcp"]
 agent-tracing = ["querymt/tracing"]
 # Embeds the pinned querymt-desktop Svelte dashboard served over same-origin ACP.
+# Default source revision is crates/agent/embedded-ui-revision.
 # QMT_UI_DIST and QMT_UI_REVISION optionally override the default source build.
 dashboard = ["api", "plugin-loaders", "dep:flate2", "dep:tar", "dep:ureq"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)

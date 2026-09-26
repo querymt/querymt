@@ -18,237 +18,244 @@
     flake-parts,
     querymt-desktop,
     ...
-  }:
-    flake-parts.lib.mkFlake {inherit inputs;} {
-      systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
-      perSystem = {system, ...}: let
-        overlays = [(import rust-overlay)];
-        nixpkgsConfig = {
-          allowUnfree = true;
-        };
-
-        pkgs = import nixpkgs {
-          inherit system overlays;
-          config = nixpkgsConfig;
-        };
-
-        pkgsCuda =
-          if pkgs.stdenv.isLinux
-          then
-            import nixpkgs {
-              inherit system overlays;
-              config =
-                nixpkgsConfig
-                // {
-                  cudaSupport = true;
-                  cudaCapabilities = ["5.2" "6.0" "6.1" "7.0" "7.5" "8.0" "8.6"];
-                  cudaVersion = "12";
-                };
-            }
-          else null;
-
-        rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
-          extensions = ["rust-src"];
-        };
-
-        workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-
-        commonInputs = with pkgs; [
-          rustToolchain
-          openssl
-          cmake
-          ninja
-          gnumake
-          nodejs
-          dbus
-          clang
-          llvmPackages.libclang
-          rust-bindgen
-          pkg-config
-          typeshare
-          libgcc
-          gdb
-        ];
-
-        dashboardPackageJson = builtins.fromJSON (builtins.readFile "${querymt-desktop}/package.json");
-        dashboardUi = pkgs.buildNpmPackage {
-          pname = "querymt-dashboard-ui";
-          version = dashboardPackageJson.version;
-          src = querymt-desktop;
-          npmDeps = pkgs.importNpmLock {
-            npmRoot = querymt-desktop;
+  }: let
+    pinnedDesktopRevision = builtins.replaceStrings ["\n" "\r"] ["" ""] (
+      builtins.readFile ./crates/agent/embedded-ui-revision
+    );
+  in
+    if querymt-desktop.rev != pinnedDesktopRevision
+    then throw "querymt-desktop flake input ${querymt-desktop.rev} does not match crates/agent/embedded-ui-revision (${pinnedDesktopRevision})"
+    else
+      flake-parts.lib.mkFlake {inherit inputs;} {
+        systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
+        perSystem = {system, ...}: let
+          overlays = [(import rust-overlay)];
+          nixpkgsConfig = {
+            allowUnfree = true;
           };
-          npmConfigHook = pkgs.importNpmLock.npmConfigHook;
-          preBuild = "npm run test:embedded";
-          npmBuildScript = "build:embedded";
-          QUERYMT_UI_REVISION = querymt-desktop.rev;
-          nativeBuildInputs = [pkgs.jq];
-          postBuild = ''
-            test -f build-embedded/index.html
-            test "$(jq -r .target build-embedded/querymt-ui.json)" = embedded
-            test "$(jq -r .acpWebSocketPath build-embedded/querymt-ui.json)" = /acp/ws
-            test "$(jq -r .revision build-embedded/querymt-ui.json)" = "$QUERYMT_UI_REVISION"
-          '';
-          installPhase = ''
-            runHook preInstall
-            mkdir -p $out
-            cp -R build-embedded/. $out/
-            runHook postInstall
-          '';
-        };
-      in {
-        packages = {
-          dashboard-ui = dashboardUi;
-          default = self.packages.${system}.qmt;
 
-          qmtcode = pkgs.rustPlatform.buildRustPackage {
-            pname = "qmtcode";
-            version = workspaceCargoToml.workspace.package.version;
-            src = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
+          pkgs = import nixpkgs {
+            inherit system overlays;
+            config = nixpkgsConfig;
+          };
+
+          pkgsCuda =
+            if pkgs.stdenv.isLinux
+            then
+              import nixpkgs {
+                inherit system overlays;
+                config =
+                  nixpkgsConfig
+                  // {
+                    cudaSupport = true;
+                    cudaCapabilities = ["5.2" "6.0" "6.1" "7.0" "7.5" "8.0" "8.6"];
+                    cudaVersion = "12";
+                  };
+              }
+            else null;
+
+          rustToolchain = (pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml).override {
+            extensions = ["rust-src"];
+          };
+
+          workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+
+          commonInputs = with pkgs; [
+            rustToolchain
+            openssl
+            cmake
+            ninja
+            gnumake
+            nodejs
+            dbus
+            clang
+            llvmPackages.libclang
+            rust-bindgen
+            pkg-config
+            typeshare
+            libgcc
+            gdb
+          ];
+
+          dashboardPackageJson = builtins.fromJSON (builtins.readFile "${querymt-desktop}/package.json");
+          dashboardUi = pkgs.buildNpmPackage {
+            pname = "querymt-dashboard-ui";
+            version = dashboardPackageJson.version;
+            src = querymt-desktop;
+            npmDeps = pkgs.importNpmLock {
+              npmRoot = querymt-desktop;
             };
-            cargoBuildFlags = [
-              "-p"
-              "querymt-agent"
-              "--example"
-              "qmtcode"
-              "--features"
-              "dashboard,oauth,dbus-secret-service,remote"
-            ];
-            nativeBuildInputs = [
-              pkgs.pkg-config
-              pkgs.cmake
-              pkgs.gnumake
-            ];
-            buildInputs = commonInputs;
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
-            QMT_UI_DIST = "${dashboardUi}";
-            # cargo-auditable currently fails on this workspace's `dep:` feature
-            # metadata resolution; we can re-enable it later if embedded
-            # dependency metadata in binaries becomes a requirement.
-            auditable = false;
-            # Temporarily disable checkPhase: the current workspace-level cargo
-            # test/check path is broken for this package in Nix and needs follow-up
-            # to scope/fix checks before re-enabling.
-            doCheck = false;
-            buildPhase = "cargoBuildHook";
+            npmConfigHook = pkgs.importNpmLock.npmConfigHook;
+            preBuild = "npm run test:embedded";
+            npmBuildScript = "build:embedded";
+            QUERYMT_UI_REVISION = querymt-desktop.rev;
+            nativeBuildInputs = [pkgs.jq];
+            postBuild = ''
+              test -f build-embedded/index.html
+              test "$(jq -r .target build-embedded/querymt-ui.json)" = embedded
+              test "$(jq -r .acpWebSocketPath build-embedded/querymt-ui.json)" = /acp/ws
+              test "$(jq -r .revision build-embedded/querymt-ui.json)" = "$QUERYMT_UI_REVISION"
+            '';
             installPhase = ''
               runHook preInstall
-              mkdir -p $out/bin
-              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/qmtcode $out/bin/qmtcode
+              mkdir -p $out
+              cp -R build-embedded/. $out/
               runHook postInstall
             '';
           };
+        in {
+          packages = {
+            dashboard-ui = dashboardUi;
+            default = self.packages.${system}.qmt;
 
-          qmt = pkgs.rustPlatform.buildRustPackage {
-            pname = "qmt";
-            version = workspaceCargoToml.workspace.package.version;
-            src = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              allowBuiltinFetchGit = true;
-            };
-            cargoBuildFlags = [
-              "-p"
-              "querymt-cli"
-              "--bin"
-              "qmt"
-            ];
-            nativeBuildInputs = [
-              pkgs.pkg-config
-              pkgs.cmake
-              pkgs.gnumake
-            ];
-            buildInputs = commonInputs;
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-            BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
-            # cargo-auditable currently fails on this workspace's `dep:` feature
-            # metadata resolution; we can re-enable it later if embedded
-            # dependency metadata in binaries becomes a requirement.
-            auditable = false;
-            # Temporarily disable checkPhase: the current workspace-level cargo
-            # test/check path is broken for this package in Nix and needs follow-up
-            # to scope/fix checks before re-enabling.
-            doCheck = false;
-            buildPhase = "cargoBuildHook";
-            installPhase = ''
-              runHook preInstall
-              mkdir -p $out/bin
-              install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/qmt $out/bin/qmt
-              runHook postInstall
-            '';
-          };
-        };
-
-        apps = {
-          qmtcode = {
-            type = "app";
-            program = "${self.packages.${system}.qmtcode}/bin/qmtcode";
-          };
-          qmt = {
-            type = "app";
-            program = "${self.packages.${system}.qmt}/bin/qmt";
-          };
-        };
-
-        devShells =
-          {
-            default = pkgs.mkShell {
+            qmtcode = pkgs.rustPlatform.buildRustPackage {
+              pname = "qmtcode";
+              version = workspaceCargoToml.workspace.package.version;
+              src = ./.;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+                allowBuiltinFetchGit = true;
+              };
+              cargoBuildFlags = [
+                "-p"
+                "querymt-agent"
+                "--example"
+                "qmtcode"
+                "--features"
+                "dashboard,oauth,dbus-secret-service,remote"
+              ];
+              nativeBuildInputs = [
+                pkgs.pkg-config
+                pkgs.cmake
+                pkgs.gnumake
+              ];
               buildInputs = commonInputs;
-
-              shellHook =
-                /*
-                bash
-                */
-                ''
-                  export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-                  export PS1="(env:querymt) $PS1"
-                '';
-            };
-          }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            vulkan = pkgs.mkShell {
-              buildInputs = commonInputs ++ (with pkgs; [vulkan-loader]);
-
-              shellHook =
-                /*
-                bash
-                */
-                ''
-                  export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
-                  export LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath (with pkgs; [gcc.cc.lib vulkan-loader])}:$LIBRARY_PATH"
-                  export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath (with pkgs; [gcc.cc.lib vulkan-loader])}:$LD_LIBRARY_PATH"
-
-                  export PS1="(env:querymt-vulkan) $PS1"
-                '';
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+              QMT_UI_DIST = "${dashboardUi}";
+              # cargo-auditable currently fails on this workspace's `dep:` feature
+              # metadata resolution; we can re-enable it later if embedded
+              # dependency metadata in binaries becomes a requirement.
+              auditable = false;
+              # Temporarily disable checkPhase: the current workspace-level cargo
+              # test/check path is broken for this package in Nix and needs follow-up
+              # to scope/fix checks before re-enabling.
+              doCheck = false;
+              buildPhase = "cargoBuildHook";
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out/bin
+                install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/qmtcode $out/bin/qmtcode
+                runHook postInstall
+              '';
             };
 
-            cuda = pkgsCuda.mkShell {
-              buildInputs =
-                commonInputs
-                ++ (with pkgsCuda; [
-                  cudaPackages.cudatoolkit
-                  cudaPackages.libcublas.static
-                ]);
-
-              shellHook =
-                /*
-                bash
-                */
-                ''
-                  export LIBCLANG_PATH="${pkgsCuda.llvmPackages.libclang.lib}/lib"
-                  export CUDA_PATH="${pkgsCuda.cudaPackages.cudatoolkit}"
-                  export LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages.cudatoolkit])}:$LIBRARY_PATH"
-                  export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages.cudatoolkit])}:$LD_LIBRARY_PATH"
-                  export RUSTFLAGS="-L native=$CUDA_PATH/lib -L native=${pkgsCuda.cudaPackages.libcublas.static}/lib"
-
-                  export PS1="(env:querymt-cuda) $PS1"
-                '';
+            qmt = pkgs.rustPlatform.buildRustPackage {
+              pname = "qmt";
+              version = workspaceCargoToml.workspace.package.version;
+              src = ./.;
+              cargoLock = {
+                lockFile = ./Cargo.lock;
+                allowBuiltinFetchGit = true;
+              };
+              cargoBuildFlags = [
+                "-p"
+                "querymt-cli"
+                "--bin"
+                "qmt"
+              ];
+              nativeBuildInputs = [
+                pkgs.pkg-config
+                pkgs.cmake
+                pkgs.gnumake
+              ];
+              buildInputs = commonInputs;
+              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+              BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.stdenv.cc.libc.dev}/include";
+              # cargo-auditable currently fails on this workspace's `dep:` feature
+              # metadata resolution; we can re-enable it later if embedded
+              # dependency metadata in binaries becomes a requirement.
+              auditable = false;
+              # Temporarily disable checkPhase: the current workspace-level cargo
+              # test/check path is broken for this package in Nix and needs follow-up
+              # to scope/fix checks before re-enabling.
+              doCheck = false;
+              buildPhase = "cargoBuildHook";
+              installPhase = ''
+                runHook preInstall
+                mkdir -p $out/bin
+                install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/qmt $out/bin/qmt
+                runHook postInstall
+              '';
             };
           };
+
+          apps = {
+            qmtcode = {
+              type = "app";
+              program = "${self.packages.${system}.qmtcode}/bin/qmtcode";
+            };
+            qmt = {
+              type = "app";
+              program = "${self.packages.${system}.qmt}/bin/qmt";
+            };
+          };
+
+          devShells =
+            {
+              default = pkgs.mkShell {
+                buildInputs = commonInputs;
+
+                shellHook =
+                  /*
+                  bash
+                  */
+                  ''
+                    export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+                    export PS1="(env:querymt) $PS1"
+                  '';
+              };
+            }
+            // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+              vulkan = pkgs.mkShell {
+                buildInputs = commonInputs ++ (with pkgs; [vulkan-loader]);
+
+                shellHook =
+                  /*
+                  bash
+                  */
+                  ''
+                    export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+                    export LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath (with pkgs; [gcc.cc.lib vulkan-loader])}:$LIBRARY_PATH"
+                    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath (with pkgs; [gcc.cc.lib vulkan-loader])}:$LD_LIBRARY_PATH"
+
+                    export PS1="(env:querymt-vulkan) $PS1"
+                  '';
+              };
+
+              cuda = pkgsCuda.mkShell {
+                buildInputs =
+                  commonInputs
+                  ++ (with pkgsCuda; [
+                    cudaPackages.cudatoolkit
+                    cudaPackages.libcublas.static
+                  ]);
+
+                shellHook =
+                  /*
+                  bash
+                  */
+                  ''
+                    export LIBCLANG_PATH="${pkgsCuda.llvmPackages.libclang.lib}/lib"
+                    export CUDA_PATH="${pkgsCuda.cudaPackages.cudatoolkit}"
+                    export LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages.cudatoolkit])}:$LIBRARY_PATH"
+                    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgsCuda.lib.makeLibraryPath (with pkgsCuda; [gcc.cc.lib cudaPackages.cudatoolkit])}:$LD_LIBRARY_PATH"
+                    export RUSTFLAGS="-L native=$CUDA_PATH/lib -L native=${pkgsCuda.cudaPackages.libcublas.static}/lib"
+
+                    export PS1="(env:querymt-cuda) $PS1"
+                  '';
+              };
+            };
+        };
       };
-    };
 }

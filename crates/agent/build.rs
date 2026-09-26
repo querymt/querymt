@@ -3,7 +3,9 @@
 mod embedded_ui;
 
 #[cfg(feature = "dashboard")]
-const PINNED_UI_REVISION: &str = "52a5132319fee1fde3bcf8969b717203a96f1741";
+fn pinned_ui_revision() -> &'static str {
+    include_str!("embedded-ui-revision").trim()
+}
 
 fn main() {
     emit_build_version();
@@ -37,6 +39,7 @@ fn git_describe_or_pkg_version() -> String {
 
 #[cfg(feature = "dashboard")]
 fn prepare_dashboard() {
+    println!("cargo:rerun-if-changed=embedded-ui-revision");
     println!("cargo:rerun-if-env-changed=QMT_UI_DIST");
     println!("cargo:rerun-if-env-changed=QMT_UI_REVISION");
 
@@ -58,7 +61,7 @@ fn prepare_dashboard() {
         std::path::Path::new(&out_dir),
         ui_dist.as_deref(),
         revision.as_deref(),
-        PINNED_UI_REVISION,
+        pinned_ui_revision(),
     )
     .unwrap_or_else(|err| panic!("failed to prepare embedded UI: {err}"));
 
