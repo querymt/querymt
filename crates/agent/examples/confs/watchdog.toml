@@ -16,8 +16,7 @@
 #
 # ## Usage
 #
-#   QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-#     cargo run -p querymt-agent --example qmtcode --features dashboard -- crates/agent/examples/confs/watchdog.toml --dashboard
+#   cargo run -p querymt-agent --example qmtcode --features dashboard -- crates/agent/examples/confs/watchdog.toml --dashboard
 #
 #   # Create a schedule with the `querymt/schedules/create` ACP extension:
 #   #   Prompt: "Run a health check cycle: audit TODOs, test count, dependencies, dead code, and documentation. Ingest findings and compare against previous cycles."

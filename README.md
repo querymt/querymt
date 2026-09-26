@@ -96,20 +96,20 @@ The transport flags are mutually exclusive.
 
 ### Quick start
 
-From the workspace root. The default `nix develop` shell exports the pinned dashboard artifact as `QMT_UI_DIST`; the explicit assignments below make dashboard commands work outside that shell too.
+Run these commands from the workspace root. The `dashboard` feature automatically resolves and builds the pinned querymt-desktop UI; this source build requires Node.js and npm.
 
 ```bash
 # ACP stdio mode
 cargo run --example qmtcode -- --acp
 
 # Dashboard mode (default http://127.0.0.1:3000)
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard mode on a custom address
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
+cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 ```
+
+For advanced use, `QMT_UI_DIST` can select a prebuilt local directory/archive, while a plain `QMT_UI_REVISION` selects a Git SHA, tag, or ref to build instead of the pinned revision.
 
 By default it reads config from `examples/confs/coder_agent.toml`.
 You can also pass your own config path before the mode flag.

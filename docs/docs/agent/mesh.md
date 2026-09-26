@@ -58,8 +58,7 @@ cargo run --example qmtcode --features remote -- --mesh
 cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/9001
 
 # Start with dashboard and mesh
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
+cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 ```
 
 ### Connecting to a Mesh
@@ -1597,8 +1596,7 @@ cargo run --features remote -- --mesh
 cargo run --features remote -- --mesh=/ip4/0.0.0.0/tcp/9001
 
 # Start with dashboard and mesh
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --features "dashboard remote" -- --dashboard --mesh
+cargo run --features "dashboard remote" -- --dashboard --mesh
 
 # Connect to specific peer
 cargo run --features remote -- --mesh=/ip4/192.168.1.100/tcp/9000

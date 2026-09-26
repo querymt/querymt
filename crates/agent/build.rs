@@ -1,7 +1,10 @@
 #[cfg(feature = "dashboard")]
-use std::fs;
+#[path = "build_support/embedded_ui.rs"]
+mod embedded_ui;
+
 #[cfg(feature = "dashboard")]
-use std::path::Path;
+const PINNED_UI_REVISION: &str = "6096eb9741ac080062f164a9aa565718796bf5d7";
+
 fn main() {
     emit_build_version();
 
@@ -33,84 +36,38 @@ fn git_describe_or_pkg_version() -> String {
 }
 
 #[cfg(feature = "dashboard")]
-fn emit_rerun_if_changed_files(dir: &Path) -> std::io::Result<()> {
-    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            emit_rerun_if_changed_files(&path)?;
-        } else {
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dashboard")]
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dashboard")]
 fn prepare_dashboard() {
-    const ENV_NAME: &str = "QMT_UI_DIST";
-    println!("cargo:rerun-if-env-changed={ENV_NAME}");
+    println!("cargo:rerun-if-env-changed=QMT_UI_DIST");
+    println!("cargo:rerun-if-env-changed=QMT_UI_REVISION");
 
-    let dist_path = std::env::var(ENV_NAME)
-        .unwrap_or_else(|_| panic!("{ENV_NAME} must point to a prebuilt embedded dashboard"));
-    let dist_src = Path::new(&dist_path);
-    if !dist_src.is_dir() {
-        panic!("{ENV_NAME} is not a directory: {dist_path}");
-    }
-    println!("cargo:rerun-if-changed={}", dist_src.display());
-    emit_rerun_if_changed_files(dist_src)
-        .unwrap_or_else(|err| panic!("Failed to walk dashboard assets: {err}"));
-    validate_dashboard_manifest(dist_src);
+    let out_dir =
+        std::env::var_os("OUT_DIR").unwrap_or_else(|| panic!("Cargo did not set OUT_DIR"));
+    let ui_dist = std::env::var_os("QMT_UI_DIST");
+    let revision = if ui_dist.is_some() {
+        None
+    } else {
+        match std::env::var("QMT_UI_REVISION") {
+            Ok(revision) => Some(revision),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("QMT_UI_REVISION must be valid UTF-8")
+            }
+            Err(std::env::VarError::NotPresent) => None,
+        }
+    };
+    let prepared = embedded_ui::prepare_ui(
+        std::path::Path::new(&out_dir),
+        ui_dist.as_deref(),
+        revision.as_deref(),
+        PINNED_UI_REVISION,
+    )
+    .unwrap_or_else(|err| panic!("failed to prepare embedded UI: {err}"));
 
-    let dist_dst = Path::new("dashboard-dist");
-    if dist_dst.exists() {
-        fs::remove_dir_all(dist_dst)
-            .unwrap_or_else(|err| panic!("Failed to remove existing dashboard assets: {err}"));
+    for path in prepared.watched_paths {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
-    copy_dir_all(dist_src, dist_dst)
-        .unwrap_or_else(|err| panic!("Failed to copy dashboard assets: {err}"));
-    println!("cargo:warning=Using prebuilt dashboard from {ENV_NAME}");
-}
-
-#[cfg(feature = "dashboard")]
-fn validate_dashboard_manifest(dist: &Path) {
-    if !dist.join("index.html").is_file() {
-        panic!("QMT_UI_DIST must contain index.html");
-    }
-
-    let manifest_path = dist.join("querymt-ui.json");
-    let manifest = fs::read_to_string(&manifest_path)
-        .unwrap_or_else(|err| panic!("Failed to read {}: {err}", manifest_path.display()));
-    let manifest: serde_json::Value = serde_json::from_str(&manifest)
-        .unwrap_or_else(|err| panic!("Invalid {}: {err}", manifest_path.display()));
-
-    let target = manifest.get("target").and_then(serde_json::Value::as_str);
-    if target != Some("embedded") {
-        panic!("querymt-ui.json target must be 'embedded', got {target:?}");
-    }
-    let acp_path = manifest
-        .get("acpWebSocketPath")
-        .and_then(serde_json::Value::as_str);
-    if acp_path != Some("/acp/ws") {
-        panic!("querymt-ui.json acpWebSocketPath must be '/acp/ws', got {acp_path:?}");
-    }
+    println!(
+        "cargo:rustc-env=QMT_UI_EMBED_DIR={}",
+        prepared.embed_dir.display()
+    );
+    println!("cargo:warning={}", prepared.source_log);
 }

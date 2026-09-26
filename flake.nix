@@ -6,7 +6,7 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
     querymt-desktop = {
-      url = "github:querymt/querymt-desktop/9e3465bec59c2426b81de3a000b7836ead890db8";
+      url = "github:querymt/querymt-desktop/6096eb9741ac080062f164a9aa565718796bf5d7";
       flake = false;
     };
   };
@@ -59,6 +59,7 @@
           cmake
           ninja
           gnumake
+          nodejs
           dbus
           clang
           llvmPackages.libclang
@@ -86,6 +87,7 @@
             test -f build-embedded/index.html
             test "$(jq -r .target build-embedded/querymt-ui.json)" = embedded
             test "$(jq -r .acpWebSocketPath build-embedded/querymt-ui.json)" = /acp/ws
+            test "$(jq -r .revision build-embedded/querymt-ui.json)" = "$QUERYMT_UI_REVISION"
           '';
           installPhase = ''
             runHook preInstall
@@ -196,7 +198,6 @@
           {
             default = pkgs.mkShell {
               buildInputs = commonInputs;
-              QMT_UI_DIST = "${dashboardUi}";
 
               shellHook =
                 /*

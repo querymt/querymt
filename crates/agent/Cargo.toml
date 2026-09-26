@@ -16,9 +16,9 @@ plugin-host-only = ["agent-mcp", "agent-tracing"]
 plugin-loaders = ["plugin-host-only", "querymt/dynamic-plugins"]
 agent-mcp = ["querymt/mcp"]
 agent-tracing = ["querymt/tracing"]
-# Embeds the prebuilt querymt-desktop Svelte dashboard served over same-origin ACP.
-# QMT_UI_DIST must point to its build-embedded artifact.
-dashboard = ["api", "plugin-loaders"]
+# Embeds the pinned querymt-desktop Svelte dashboard served over same-origin ACP.
+# QMT_UI_DIST and QMT_UI_REVISION optionally override the default source build.
+dashboard = ["api", "plugin-loaders", "dep:flate2", "dep:tar", "dep:ureq"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth"]
 
@@ -73,7 +73,7 @@ imara-diff = "0.2"
 rmcp = { version = "1.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "transport-async-rw", "elicitation", "reqwest"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 # NOTE: Enabled `debug-embed` for testing debug builds on mobile.
-rust-embed = { version = "8.6", features = ["axum", "include-exclude", "debug-embed"] }
+rust-embed = { version = "8.6", features = ["axum", "include-exclude", "debug-embed", "interpolate-folder-path", "deterministic-timestamps"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 mime_guess = "2.0"
 futures-util = "0.3"
@@ -147,10 +147,18 @@ name = "querymt_agent"
 path = "src/lib.rs"
 
 [build-dependencies]
+flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
+hex = "0.4"
 serde_json.workspace = true
+sha2 = "0.11"
+tar = { version = "0.4", optional = true, default-features = false }
+ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 mockall = "0.15"
+tar = { version = "0.4", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 env_logger = "0.11"
 tempfile = "3.0"
 clap = { version = "4.5", features = ["derive"] }
@@ -160,6 +168,10 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 http.workspace = true
 jsonschema = "0.57"
 tower = { version = "0.5", features = ["util"] }
+
+[[test]]
+name = "embedded_ui_resolver"
+path = "build_support/embedded_ui.rs"
 
 [[bench]]
 name = "agent_startup"

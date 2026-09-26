@@ -17,7 +17,7 @@ jobs:
       version_name: ${{ github.ref_name }}
       is_nightly: false
       # Keep stable releases reproducible against a verified querymt-desktop commit.
-      dashboard_revision: '9e3465bec59c2426b81de3a000b7836ead890db8'
+      dashboard_revision: '6096eb9741ac080062f164a9aa565718796bf5d7'
 
   release:
     name: Create GitHub Release

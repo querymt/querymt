@@ -38,30 +38,26 @@ The `crates/agent/examples/` directory contains runnable examples:
 ## qmtcode
 
 The primary example — a full-featured coding assistant with multiple run modes.
-The default `nix develop` shell supplies the pinned dashboard artifact as `QMT_UI_DIST`. The explicit assignments below resolve that same artifact for plain Cargo commands outside the dev shell.
+The `dashboard` feature automatically resolves and builds the pinned querymt-desktop UI; this source build requires Node.js and npm.
 
 ```bash
 # ACP stdio mode (for subprocess integration)
 cargo run --example qmtcode -- --acp
 
 # Embedded Svelte dashboard over same-origin ACP (default: http://127.0.0.1:3000)
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Dashboard on custom address
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
+cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 
 # Mesh-only mode (runs until Ctrl+C)
 cargo run --example qmtcode --features remote -- --mesh
 
 # Dashboard + mesh (cross-machine sessions)
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
+cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 
 # Use a custom config file
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- path/to/config.toml --dashboard
+cargo run --example qmtcode --features dashboard -- path/to/config.toml --dashboard
 ```
 
 **Key behaviors:**
@@ -269,8 +265,7 @@ cargo run --example replay_session -- <session-id>
 Starts the embedded Svelte dashboard without using the `qmtcode` binary. The browser communicates with the agent through same-origin ACP at `/acp/ws`.
 
 ```bash
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example web_dashboard --features dashboard
+cargo run --example web_dashboard --features dashboard
 ```
 
 **What it demonstrates:**
@@ -471,8 +466,7 @@ system = [{ file = "../prompts/coder.md" }]
 cargo run --example qmtcode -- --acp
 
 # Single agent - web dashboard
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Multi-agent delegation
 cargo run --example auto_delegation_example
@@ -494,8 +488,7 @@ cargo run --example morning_brief
 
 ```bash
 # Build optimized binary
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo build --release --example qmtcode --features dashboard
+cargo build --release --example qmtcode --features dashboard
 
 # Clear macOS quarantine flag
 xattr -dr com.apple.quarantine target/release/examples/qmtcode
@@ -678,8 +671,7 @@ tools = ["edit", "write_file", "shell"]
 **Usage:**
 ```bash
 # Start mesh node with dashboard
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features "remote dashboard" -- --mesh --dashboard
+cargo run --example qmtcode --features "remote dashboard" -- --mesh --dashboard
 ```
 
 For complete mesh documentation, see [Mesh Networking Guide](mesh.md).
@@ -701,8 +693,7 @@ cargo run --example qmtcode --profile coder
 cargo run --example qmtcode --profiles-dir ./my-profiles --profile custom
 
 # Use profile with dashboard
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard --profile coder --dashboard
+cargo run --example qmtcode --features dashboard --profile coder --dashboard
 ```
 
 ### Example: Coder Profile (`~/.qmt/profiles/coder.toml`)
@@ -974,7 +965,6 @@ Remote sessions are managed through the mesh network. See the [Mesh Networking G
 
 1. Start a mesh node with dashboard:
    ```bash
-   QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
      cargo run --example qmtcode --features "remote dashboard" -- --mesh --dashboard
    ```
 
@@ -1074,8 +1064,7 @@ For complete agent configurations designed for scheduled use, see:
 cargo run --example qmtcode -- --acp
 
 # Single agent - web dashboard
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- --dashboard
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Multi-agent delegation
 cargo run --example auto_delegation_example
@@ -1099,8 +1088,7 @@ cargo run --example qmtcode --features remote -- --mesh
 cargo run --example qmtcode --profile coder
 
 # Dashboard with mesh
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
+cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 ```
 
 ---

@@ -170,10 +170,8 @@ QueryMT implements a 3-layer context management system:
 ### Quick Start
 
 ```bash
-# From the workspace root, run the coder agent with the embedded dashboard.
-# The default `nix develop` shell already exports the same QMT_UI_DIST.
-QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" \
-  cargo run --example qmtcode --features dashboard -- --dashboard
+# From the workspace root, run the coder agent with the pinned embedded dashboard.
+cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Run as ACP stdio server
 cargo run --example qmtcode -- --acp

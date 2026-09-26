@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "dashboard")]
 #[derive(RustEmbed)]
-#[folder = "dashboard-dist/"]
+#[folder = "$QMT_UI_EMBED_DIR"]
 struct DashboardAssets;
 
 pub struct AgentServer {

@@ -38,13 +38,14 @@ When running any of the commands below, prefer delegating to a subagent when ava
 - `cargo check -p querymt-service`
 
 ### Agent crate (matches CI)
-- `QMT_UI_DIST="$(nix build .#dashboard-ui --no-link --print-out-paths)" cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`
+- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`
 
 ### Dashboard
 - The Svelte dashboard source lives in the separate `querymt-desktop` repository.
-- Dashboard builds require `QMT_UI_DIST` to point to its validated `build-embedded` artifact.
-- The default `nix develop` shell exports `QMT_UI_DIST` from the pinned `querymt-desktop` flake input, so plain Cargo commands work inside that shell.
-- Outside the default dev shell, set `QMT_UI_DIST` explicitly as shown in the clippy command above; `nix build .#dashboard-ui --no-link --print-out-paths` provides the pinned artifact.
+- Automatic pinned-source dashboard builds require Node.js and npm, then run the embedded tests/build.
+- `QMT_UI_DIST` optionally selects a prebuilt local directory or `.tar.gz` archive and takes priority over other UI selection.
+- A plain `QMT_UI_REVISION` selects a Git SHA, tag, or ref to build from source.
+- Content-pinned release forms are `sha256:<64hex>` (latest release) and `<release>@sha256:<64hex>` (including `latest@sha256:<64hex>`).
 
 ## Code Style Guidelines
 

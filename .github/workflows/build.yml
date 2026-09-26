@@ -14,8 +14,9 @@ on:
         default: false
       dashboard_revision:
         description: 'Published querymt-desktop revision to embed'
-        required: true
+        required: false
         type: string
+        default: '6096eb9741ac080062f164a9aa565718796bf5d7'
 
 permissions:
   contents: read
@@ -51,6 +52,8 @@ jobs:
           test -f build-embedded/index.html
           test "$(jq -r .target build-embedded/querymt-ui.json)" = embedded
           test "$(jq -r .acpWebSocketPath build-embedded/querymt-ui.json)" = /acp/ws
+          test "$(git rev-parse HEAD)" = "$QUERYMT_UI_REVISION"
+          test "$(jq -r .revision build-embedded/querymt-ui.json)" = "$QUERYMT_UI_REVISION"
 
       - name: Upload embedded dashboard
         uses: actions/upload-artifact@v7
