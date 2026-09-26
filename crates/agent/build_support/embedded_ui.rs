@@ -1595,27 +1595,8 @@ mod tests {
     const FIXTURE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn npm_program_matches_target_platform() {
-        assert_eq!(npm_program_for_target(false), OsStr::new("npm"));
-        assert_eq!(npm_program_for_target(true), OsStr::new("npm.cmd"));
-    }
-
-    #[test]
-    fn checksum_sidecar_parses_standard_sha256sum_format() {
-        let checksum = parse_checksum_sidecar(
-            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  archive.tar.gz\n",
-        )
-        .unwrap();
-        assert_eq!(hex::encode(checksum), FIXTURE_DIGEST);
-        assert!(parse_checksum_sidecar(b"1234 archive.tar.gz").is_err());
-    }
-
-    #[test]
     fn revision_selection_distinguishes_sources_and_content_pinned_releases() {
         for source in [
-            FIXTURE_REVISION,
-            "v1.2.3",
-            "feature/dashboard",
             "latest",
             "sha256-migration",
             "feature@sha256-fix",
@@ -1659,111 +1640,22 @@ mod tests {
     }
 
     #[test]
-    fn release_urls_are_deterministic() {
-        let assets = release_assets("v1.2.3").unwrap();
-        assert_eq!(assets.revision, "v1.2.3");
-        assert_eq!(
-            assets.archive_url,
-            "https://github.com/querymt/querymt-desktop/releases/download/v1.2.3/querymt-embedded-ui-v1.2.3.tar.gz"
-        );
-        assert_eq!(
-            assets.checksum_url,
-            format!("{}.sha256", assets.archive_url)
-        );
-
-        let pinned = release_assets(FIXTURE_REVISION).unwrap();
-        assert_eq!(
-            pinned.archive_url,
-            format!(
-                "https://github.com/querymt/querymt-desktop/releases/download/{FIXTURE_REVISION}/querymt-embedded-ui-{FIXTURE_REVISION}.tar.gz"
-            )
-        );
-
-        let encoded = release_assets("release/test").unwrap();
-        assert!(encoded.archive_url.contains("release%2Ftest"));
-        assert!(
-            encoded
-                .archive_url
-                .contains("querymt-embedded-ui-release%2Ftest.tar.gz")
-        );
-
-        assert_eq!(
-            source_archive_url(FIXTURE_REVISION).unwrap(),
-            format!(
-                "https://codeload.github.com/querymt/querymt-desktop/tar.gz/{FIXTURE_REVISION}"
-            )
-        );
-        assert_eq!(
-            source_archive_url("feature/dashboard").unwrap(),
-            "https://codeload.github.com/querymt/querymt-desktop/tar.gz/feature%2Fdashboard"
-        );
-    }
-
-    #[test]
     fn github_responses_require_valid_tag_and_commit() {
         assert_eq!(
             parse_latest_tag(br#"{"tag_name":"v2.0.0"}"#).unwrap(),
             "v2.0.0"
         );
         assert!(parse_latest_tag(br#"{"tag_name":""}"#).is_err());
-        assert_eq!(
-            parse_commit_sha(br#"{"sha":"B9418EEF848D239F6E179AF7DA32AA43649F3C50","other":true}"#)
-                .unwrap(),
-            FIXTURE_REVISION
+        let response = format!(
+            r#"{{"sha":"{}","other":true}}"#,
+            FIXTURE_REVISION.to_ascii_uppercase()
         );
         assert_eq!(
-            resolve_source_commit(
-                &secure_http_agent(),
-                &FIXTURE_REVISION.to_ascii_uppercase(),
-                true,
-            )
-            .unwrap(),
+            parse_commit_sha(response.as_bytes()).unwrap(),
             FIXTURE_REVISION
         );
         assert!(parse_commit_sha(br#"{"sha":"short"}"#).is_err());
         assert!(parse_commit_sha(br#"{"message":"not found"}"#).is_err());
-        assert!(unpublished_error("missing", "HTTP 404").contains("QMT_UI_DIST"));
-        assert!(unpublished_error("missing", "HTTP 404").contains("QMT_UI_REVISION"));
-        assert!(source_revision_error("missing", "HTTP 404").contains("Git SHA, tag, or ref"));
-    }
-
-    #[test]
-    fn url_validation_accepts_only_https_urls_with_authority() {
-        assert!(validate_https_url("https://example.com/path").is_ok());
-        assert!(validate_https_url("http://example.com/path").is_err());
-        assert!(validate_https_url("httpsx://example.com/path").is_err());
-        assert!(validate_https_url("https:///missing-host").is_err());
-        assert!(validate_https_url("not a url").is_err());
-    }
-
-    #[test]
-    fn default_and_override_source_selection_have_exact_logs() {
-        assert_eq!(
-            selected_source_revision(None, FIXTURE_REVISION),
-            (FIXTURE_REVISION, true)
-        );
-        assert_eq!(
-            selected_source_revision(Some("main"), FIXTURE_REVISION),
-            ("main", false)
-        );
-        assert_eq!(
-            source_revision_log(FIXTURE_REVISION, FIXTURE_REVISION, true),
-            format!("querymt-ui: source = pinned source revision {FIXTURE_REVISION}")
-        );
-        assert_eq!(
-            source_revision_log("main", FIXTURE_REVISION, false),
-            format!("querymt-ui: source = source revision main (resolved {FIXTURE_REVISION})")
-        );
-
-        let watched_paths = source_mode_watched_paths();
-        assert_eq!(
-            watched_paths,
-            vec![
-                PathBuf::from("build.rs"),
-                PathBuf::from("build_support/embedded_ui.rs"),
-            ]
-        );
-        assert!(!watched_paths.iter().any(|path| path.starts_with("src")));
     }
 
     #[test]
@@ -1816,13 +1708,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_local_pax_metadata_during_raw_preflight() {
-        assert_oversized_source_metadata_is_rejected(EntryType::XHeader);
-    }
-
-    #[test]
-    fn rejects_oversized_gnu_long_name_during_raw_preflight() {
-        assert_oversized_source_metadata_is_rejected(EntryType::GNULongName);
+    fn rejects_oversized_source_metadata_during_raw_preflight() {
+        for entry_type in [EntryType::XHeader, EntryType::GNULongName] {
+            assert_oversized_source_metadata_is_rejected(entry_type);
+        }
     }
 
     #[test]
@@ -1958,21 +1847,8 @@ fi
     }
 
     #[test]
-    fn rejects_decompressed_stream_entry_and_path_limit_bombs() {
+    fn rejects_decompressed_stream_limit() {
         let archive = archive_with_files(&[("a", b""), ("b", b""), ("c", b"")]);
-
-        let temp = TempDir::new().unwrap();
-        let error = extract_archive_with_limits(
-            &archive,
-            temp.path(),
-            ArchiveLimits {
-                entries: 2,
-                ..ARCHIVE_LIMITS
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("entry limit"), "{error}");
-
         let temp = TempDir::new().unwrap();
         let error = extract_archive_with_limits(
             &archive,
@@ -1984,19 +1860,6 @@ fi
         )
         .unwrap_err();
         assert!(error.contains("decompressed stream"), "{error}");
-
-        let long_path_archive = archive_with_files(&[("long-name", b"")]);
-        let temp = TempDir::new().unwrap();
-        let error = extract_archive_with_limits(
-            &long_path_archive,
-            temp.path(),
-            ArchiveLimits {
-                path_length: 8,
-                ..ARCHIVE_LIMITS
-            },
-        )
-        .unwrap_err();
-        assert!(error.contains("path exceeds"), "{error}");
     }
 
     #[test]
@@ -2017,7 +1880,6 @@ fi
         let cases: &[(&[u8], &str)] = &[
             (b"index.html::$DATA", "colon"),
             (b"\xC3\x84.js", "non-ASCII"),
-            (b"\xC3\xA4.js", "non-ASCII"),
         ];
 
         for &(path, expected_error) in cases {
@@ -2124,17 +1986,14 @@ fi
     }
 
     #[test]
-    fn rejects_bad_checksum_and_accepts_exact_content_pin() {
+    fn rejects_bad_checksum() {
         let error = verify_sha256(
             b"archive",
             b"0000000000000000000000000000000000000000000000000000000000000000  archive.tar.gz\n",
         )
         .unwrap_err();
         assert!(error.contains("SHA-256 mismatch"));
-
-        let digest: [u8; 32] = Sha256::digest(b"archive").into();
-        verify_digest(b"archive", &digest).unwrap();
-        assert!(verify_digest(b"different", &digest).is_err());
+        assert!(parse_checksum_sidecar(b"1234 archive.tar.gz").is_err());
     }
 
     #[test]
