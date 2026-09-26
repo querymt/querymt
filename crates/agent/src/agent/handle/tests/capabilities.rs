@@ -1,5 +1,42 @@
 use super::*;
 
+#[test]
+fn legacy_capabilities_fixture_has_no_recovery_contract() {
+    let legacy = serde_json::json!({
+        "querymt_control_version": 1,
+        "agent": {
+            "id": "legacy-agent",
+            "display_name": "Legacy QueryMT Agent",
+            "kind": "local"
+        },
+        "transport": {
+            "acp": true,
+            "stdio": false,
+            "websocket": true,
+            "mesh": false,
+            "mesh_transport": "none"
+        },
+        "features": {
+            "mesh": false,
+            "mesh_invites": false,
+            "remote_sessions": false,
+            "schedules": true,
+            "remote_schedules": false,
+            "profiles": false,
+            "auth": true,
+            "models": true,
+            "steering": true
+        },
+        "methods": ["querymt/capabilities"],
+        "notifications": []
+    });
+
+    let capabilities: crate::control::capabilities::CapabilitiesInfo =
+        serde_json::from_value(legacy).expect("deserialize legacy capabilities");
+
+    assert!(capabilities.elicitation_recovery.is_none());
+}
+
 #[tokio::test]
 async fn test_querymt_capabilities_lists_control_surface() {
     let f = HandleFixture::new().await;
@@ -54,6 +91,20 @@ async fn test_querymt_capabilities_lists_control_surface() {
         );
     }
     assert_eq!(result["features"]["auth"], true);
+    assert_eq!(result["elicitation_recovery"]["version"], 1);
+    for method in [
+        "querymt/elicitation/listPendingSessions",
+        "querymt/elicitation/attachSession",
+    ] {
+        assert!(
+            result["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|advertised| advertised == method),
+            "missing recovery method {method}"
+        );
+    }
     let notifications = result["notifications"]
         .as_array()
         .expect("notifications array");

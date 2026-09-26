@@ -203,15 +203,27 @@ pub(super) async fn execute_tool_call(
 
     let event_sink = config.event_sink.clone();
     let session_id_clone = exec_ctx.session_id.clone();
+    let run_id_clone = exec_ctx.turn_id().unwrap_or_default().to_string();
+    let tool_call_id_clone = call.id.clone();
     let pending_elicitations = config.pending_elicitations.clone();
     let cancellation_token = exec_ctx.cancellation_token.clone();
     tokio::spawn(async move {
         while let Some(request) = elicitation_rx.recv().await {
             let elicitation_id = request.elicitation_id.clone();
-            crate::elicitation::insert_pending_elicitation(
+            crate::elicitation::register_pending_elicitation(
                 &pending_elicitations,
                 elicitation_id.clone(),
-                session_id_clone.clone(),
+                crate::elicitation::PendingElicitationRegistration {
+                    session_id: session_id_clone.clone(),
+                    form: crate::elicitation::PendingElicitationForm {
+                        message: request.message.clone(),
+                        requested_schema: request.requested_schema.clone(),
+                        source: request.source.clone(),
+                    },
+                    owner_authority: None,
+                    run_id: Some(run_id_clone.clone()),
+                    tool_call_id: Some(tool_call_id_clone.clone()),
+                },
                 request.response_tx,
             )
             .await;
@@ -242,6 +254,14 @@ pub(super) async fn execute_tool_call(
                 log::warn!("failed to emit ElicitationRequested: {}", err);
             }
         }
+
+        crate::elicitation::remove_pending_elicitations_for_tool(
+            &pending_elicitations,
+            &session_id_clone,
+            &run_id_clone,
+            &tool_call_id_clone,
+        )
+        .await;
     });
 
     let tool_context = exec_ctx

@@ -415,14 +415,13 @@ fn spawn_event_bridge_forwarder(
                                     Ok(response) => response,
                                     Err(err) => {
                                         log::warn!(
-                                            "Native ACP elicitation {} failed: {}",
+                                            "Native ACP elicitation {} ended without a user response: {}",
                                             elicitation_id,
                                             err
                                         );
-                                        crate::elicitation::ElicitationResponse {
-                                            action: crate::elicitation::ElicitationAction::Cancel,
-                                            content: None,
-                                        }
+                                        // Transport failure is not user cancellation. Leave the
+                                        // shared waiter available for an authorized re-delivery.
+                                        return;
                                     }
                                 };
 
@@ -1254,6 +1253,82 @@ mod stdio_tests {
         assert_eq!(cancelled.action, ElicitationAction::Cancel);
         assert_eq!(declined.content, None);
         assert_eq!(cancelled.content, None);
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_error_keeps_original_elicitation_waiter_pending() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = "stdio-recoverable-session";
+        let elicitation_id = "stdio-recoverable-elicitation";
+        let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
+        crate::elicitation::insert_pending_elicitation(
+            &fixture.handle.pending_elicitations(),
+            elicitation_id.to_string(),
+            session_id.to_string(),
+            waiter_tx,
+        )
+        .await;
+
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(4);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let forwarder = spawn_event_bridge_forwarder(
+            fixture.config.event_sink.fanout().clone(),
+            ClientBridgeSender::new(bridge_tx),
+            fixture.handle.clone(),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            shutdown_tx,
+        );
+        tokio::task::yield_now().await;
+        fixture
+            .config
+            .event_sink
+            .fanout()
+            .publish(crate::events::EventEnvelope::Ephemeral(
+                crate::events::EphemeralEvent {
+                    session_id: session_id.to_string(),
+                    timestamp: 0,
+                    origin: crate::events::EventOrigin::Local,
+                    source_node: None,
+                    kind: crate::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id: elicitation_id.to_string(),
+                        session_id: session_id.to_string(),
+                        message: "Choose".to_string(),
+                        requested_schema: serde_json::json!({"type": "object"}),
+                        source: "builtin:question".to_string(),
+                    },
+                },
+            ));
+
+        let message = timeout(Duration::from_secs(2), bridge_rx.recv())
+            .await
+            .expect("elicitation should reach stdio bridge")
+            .expect("bridge channel should remain open");
+        let ClientBridgeMessage::Elicit { response_tx, .. } = message else {
+            panic!("expected elicitation bridge message");
+        };
+        response_tx
+            .send(Err(
+                agent_client_protocol::Error::internal_error().data("disconnected")
+            ))
+            .expect("forwarder should await the result");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            fixture
+                .handle
+                .pending_elicitations()
+                .lock()
+                .await
+                .contains_key(elicitation_id)
+        );
+        assert!(matches!(
+            waiter_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        forwarder.abort();
     }
 
     #[tokio::test(flavor = "multi_thread")]
