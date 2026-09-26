@@ -1591,7 +1591,7 @@ mod tests {
     use tar::{Builder, EntryType, Header};
     use tempfile::TempDir;
 
-    const FIXTURE_REVISION: &str = "6096eb9741ac080062f164a9aa565718796bf5d7";
+    const FIXTURE_REVISION: &str = "52a5132319fee1fde3bcf8969b717203a96f1741";
     const FIXTURE_DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]

@@ -3,7 +3,7 @@
 mod embedded_ui;
 
 #[cfg(feature = "dashboard")]
-const PINNED_UI_REVISION: &str = "6096eb9741ac080062f164a9aa565718796bf5d7";
+const PINNED_UI_REVISION: &str = "52a5132319fee1fde3bcf8969b717203a96f1741";
 
 fn main() {
     emit_build_version();
