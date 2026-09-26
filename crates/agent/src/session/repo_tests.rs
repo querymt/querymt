@@ -5,7 +5,6 @@
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
 
@@ -71,7 +70,13 @@ mod tests {
         #[tokio::test]
         async fn create_session_with_cwd() {
             let repo = make_repo();
-            let cwd = PathBuf::from("/tmp/workspace");
+            let root = std::env::current_dir()
+                .unwrap()
+                .ancestors()
+                .last()
+                .unwrap()
+                .to_path_buf();
+            let cwd = root.join("tmp/workspace");
             let session = repo
                 .create_session(None, Some(cwd.clone()), None, None)
                 .await
@@ -100,11 +105,12 @@ mod tests {
                 Some(cwd)
             );
 
+            let root_path = base.ancestors().last().unwrap().to_path_buf();
             let root = repo
-                .create_session(None, Some("/".into()), None, None)
+                .create_session(None, Some(root_path.clone()), None, None)
                 .await
                 .unwrap();
-            assert_eq!(root.cwd, Some("/".into()));
+            assert_eq!(root.cwd, Some(root_path));
         }
 
         #[tokio::test]

@@ -3023,8 +3023,9 @@ async fn journal_ordering_is_monotonic_per_stream() {
 // ViewStore — scoped session browsing tests
 // ══════════════════════════════════════════════════════════════════════
 
+#[cfg(unix)]
 #[tokio::test]
-async fn migration_merges_legacy_trailing_slash_workspace_groups() {
+async fn migration_merges_legacy_noncanonical_workspace_groups() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("sessions.db");
     let storage = SqliteStorage::connect(db_path.clone()).await.unwrap();
@@ -3033,6 +3034,10 @@ async fn migration_merges_legacy_trailing_slash_workspace_groups() {
         .await
         .unwrap();
     let legacy = storage
+        .create_session(None, Some("/workspace".into()), None, None)
+        .await
+        .unwrap();
+    let legacy_dot = storage
         .create_session(None, Some("/workspace".into()), None, None)
         .await
         .unwrap();
@@ -3050,6 +3055,11 @@ async fn migration_merges_legacy_trailing_slash_workspace_groups() {
         conn.execute(
             "UPDATE sessions SET cwd = '/workspace//' WHERE public_id = ?1",
             [&legacy.public_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sessions SET cwd = '/workspace/./' WHERE public_id = ?1",
+            [&legacy_dot.public_id],
         )
         .unwrap();
         conn.execute(
@@ -3076,15 +3086,15 @@ async fn migration_merges_legacy_trailing_slash_workspace_groups() {
         .browse_session_groups(None, 10, 10, SessionScope::Root)
         .await
         .unwrap();
-    assert_eq!(total, 4);
+    assert_eq!(total, 5);
     assert!(next.is_none());
     assert_eq!(groups.len(), 3);
     let merged = groups
         .iter()
         .find(|group| group.cwd.as_deref() == Some("/workspace"))
         .unwrap();
-    assert_eq!(merged.total_count, Some(2));
-    assert_eq!(merged.sessions.len(), 2);
+    assert_eq!(merged.total_count, Some(3));
+    assert_eq!(merged.sessions.len(), 3);
     assert!(groups.iter().any(|group| group.cwd.as_deref() == Some("/")));
     assert!(
         groups
@@ -3092,20 +3102,22 @@ async fn migration_merges_legacy_trailing_slash_workspace_groups() {
             .any(|group| group.cwd.as_deref() == Some("relative/workspace/"))
     );
     let (page, count) = view
-        .list_group_sessions(Some("/workspace".into()), None, 1, SessionScope::Root)
+        .list_group_sessions(Some("/workspace".into()), None, 2, SessionScope::Root)
         .await
         .unwrap();
-    assert_eq!(count, 2);
+    assert_eq!(count, 3);
+    assert_eq!(page.sessions.len(), 2);
     assert!(page.next_cursor.is_some());
     let (last_page, _) = view
         .list_group_sessions(
             Some("/workspace".into()),
             page.next_cursor,
-            1,
+            2,
             SessionScope::Root,
         )
         .await
         .unwrap();
+    assert_eq!(last_page.sessions.len(), 1);
     assert!(last_page.next_cursor.is_none());
     assert_eq!(
         storage
@@ -3119,6 +3131,15 @@ async fn migration_merges_legacy_trailing_slash_workspace_groups() {
     assert_eq!(
         storage
             .get_session(&plain.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cwd,
+        Some("/workspace".into())
+    );
+    assert_eq!(
+        storage
+            .get_session(&legacy_dot.public_id)
             .await
             .unwrap()
             .unwrap()
