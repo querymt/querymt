@@ -92,7 +92,20 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0020_dotagents_automation_bindings",
         apply: migration_0020_dotagents_automation_bindings,
     },
+    Migration {
+        version: "0021_normalize_session_cwd_slashes",
+        apply: migration_0021_normalize_session_cwd_slashes,
+    },
 ];
+
+fn migration_0021_normalize_session_cwd_slashes(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "UPDATE sessions SET cwd = CASE WHEN trim(cwd, '/') = '' THEN '/' ELSE rtrim(cwd, '/') END
+         WHERE cwd LIKE '/%' AND cwd GLOB '*/' AND cwd != '/';",
+    )
+}
 
 /// Protocol-owned automation session bindings.
 ///
