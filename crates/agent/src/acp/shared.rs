@@ -271,6 +271,8 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
 pub struct RpcDispatchContext {
     pub session_hooks: Option<Arc<dyn AcpSessionHooks>>,
     pub session_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
+    pub elicitation_recovery:
+        Option<crate::control::elicitation_recovery::ElicitationRecoveryRegistry>,
 }
 
 async fn attach_rpc_session<S: SendAgent>(
@@ -1210,11 +1212,28 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
             let method = req.method.clone();
             match method.as_str() {
                 m if m == AGENT_METHOD_NAMES.initialize => {
-                    match serde_json::from_value(req.params) {
-                        Ok(params) => agent
-                            .initialize(params)
-                            .await
-                            .map(|r| serde_json::to_value(r).unwrap()),
+                    match serde_json::from_value::<crate::acp::protocol::InitializeRequest>(
+                        req.params,
+                    ) {
+                        Ok(params) => {
+                            let supports_form_elicitation = params
+                                .client_capabilities
+                                .elicitation
+                                .as_ref()
+                                .is_some_and(|elicitation| elicitation.form.is_some());
+                            let response = agent.initialize(params).await;
+                            if response.is_ok()
+                                && let Some(registry) = context.elicitation_recovery.as_ref()
+                            {
+                                registry
+                                    .record_client_capabilities(
+                                        conn_id,
+                                        supports_form_elicitation,
+                                    )
+                                    .await;
+                            }
+                            response.map(|r| serde_json::to_value(r).unwrap())
+                        }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -1502,49 +1521,48 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         content: params.content,
                                     };
 
-                                    let query_agent =
-                                        agent.as_any().downcast_ref::<AgentHandle>();
-                                    let mut tx = if let (Some(query_agent), Some(session_id)) =
-                                        (query_agent, params.session_id.as_deref())
+                                    if let Some(query_agent) =
+                                        agent.as_any().downcast_ref::<AgentHandle>()
                                     {
-                                        crate::elicitation::take_pending_elicitation_sender_for_session(
+                                        match crate::elicitation::resolve_elicitation_from_connection(
                                             query_agent,
-                                            session_id,
+                                            params.session_id.as_deref(),
                                             &params.elicitation_id,
+                                            conn_id,
+                                            response,
                                         )
-                                        .await
+                                        .await?
+                                        {
+                                            crate::elicitation::ElicitationResolution::Resolved => {
+                                                Ok(serde_json::Value::Null)
+                                            }
+                                            crate::elicitation::ElicitationResolution::StaleDelivery => {
+                                                Err(crate::control::elicitation_recovery::elicitation_recovery_denied(
+                                                    crate::control::elicitation_recovery::ElicitationRecoveryDenialReason::Unauthorized,
+                                                ))
+                                            }
+                                            crate::elicitation::ElicitationResolution::NotFound => {
+                                                Err(Error::internal_error().data(serde_json::json!({
+                                                    "message": "No pending elicitation for this elicitation_id",
+                                                    "elicitationId": params.elicitation_id,
+                                                    "sessionId": params.session_id,
+                                                })))
+                                            }
+                                        }
                                     } else {
-                                        None
-                                    };
-
-                                    if tx.is_none() {
-                                        tx = {
-                                            let mut pending = pending_elicitations.lock().await;
-                                            pending
-                                                .remove(&params.elicitation_id)
-                                                .map(|entry| entry.sender)
-                                        };
-                                    }
-
-                                    if tx.is_none()
-                                        && let Some(query_agent) = query_agent
-                                    {
-                                        tx = crate::elicitation::take_pending_elicitation_sender(
-                                            query_agent,
-                                            &params.elicitation_id,
-                                        )
-                                        .await;
-                                    }
-
-                                    if let Some(tx) = tx {
-                                        let _ = tx.send(response);
-                                        Ok(serde_json::Value::Null)
-                                    } else {
-                                        Err(Error::internal_error().data(serde_json::json!({
-                                            "message": "No pending elicitation for this elicitation_id",
-                                            "elicitationId": params.elicitation_id,
-                                            "sessionId": params.session_id,
-                                        })))
+                                        let sender = pending_elicitations
+                                            .lock()
+                                            .await
+                                            .remove(&params.elicitation_id)
+                                            .map(|entry| entry.sender);
+                                        if let Some(sender) = sender {
+                                            let _ = sender.send(response);
+                                            Ok(serde_json::Value::Null)
+                                        } else {
+                                            Err(Error::internal_error().data(
+                                                "No pending elicitation for this elicitation_id",
+                                            ))
+                                        }
                                     }
                                 }
                                 Err(e) => Err(e),
@@ -1553,6 +1571,58 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
+                }
+
+                m if normalize_querymt_ext_method(m)
+                    == crate::control::elicitation_recovery::ELICITATION_RECOVERY_LIST_PENDING_METHOD =>
+                {
+                    let registry = context.elicitation_recovery.as_ref().ok_or_else(|| {
+                        crate::control::elicitation_recovery::elicitation_recovery_denied(
+                            crate::control::elicitation_recovery::ElicitationRecoveryDenialReason::InsecureTransport,
+                        )
+                    })?;
+                    let request = serde_json::from_value(req.params).map_err(|error| {
+                        Error::invalid_params().data(serde_json::json!({"error": error.to_string()}))
+                    })?;
+                    let local_agent = agent.as_any().downcast_ref::<AgentHandle>().ok_or_else(|| {
+                        Error::internal_error().data("Recovery requires a local agent")
+                    })?;
+                    registry
+                        .list_pending_sessions(conn_id, &request, local_agent)
+                        .await
+                        .and_then(|response| {
+                            serde_json::to_value(response).map_err(Error::into_internal_error)
+                        })
+                }
+
+                m if normalize_querymt_ext_method(m)
+                    == crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD =>
+                {
+                    let registry = context.elicitation_recovery.as_ref().ok_or_else(|| {
+                        crate::control::elicitation_recovery::elicitation_recovery_denied(
+                            crate::control::elicitation_recovery::ElicitationRecoveryDenialReason::InsecureTransport,
+                        )
+                    })?;
+                    let request: crate::control::elicitation_recovery::AttachPendingElicitationSessionRequest =
+                        serde_json::from_value(req.params).map_err(|error| {
+                            Error::invalid_params().data(serde_json::json!({"error": error.to_string()}))
+                        })?;
+                    let local_agent = agent.as_any().downcast_ref::<AgentHandle>().ok_or_else(|| {
+                        Error::internal_error().data("Recovery requires a local agent")
+                    })?;
+                    let response = registry
+                        .authorize_attach(conn_id, &request, local_agent)
+                        .await?;
+                    attach_rpc_session(
+                        agent,
+                        session_owners,
+                        conn_id,
+                        &context,
+                        &request.session_id,
+                        true,
+                    )
+                    .await?;
+                    serde_json::to_value(response).map_err(Error::into_internal_error)
                 }
 
                 // Forward QueryMT extension methods to the agent's ext_method handler.
@@ -3210,6 +3280,7 @@ mod tests {
                 remote_session: false,
             })),
             session_bridge: None,
+            elicitation_recovery: None,
         };
 
         for session_id in ["s-load-new", "s-load-existing"] {
@@ -3277,6 +3348,7 @@ mod tests {
                 remote_session: true,
             })),
             session_bridge: None,
+            elicitation_recovery: None,
         };
 
         for (method, params) in [
@@ -3366,6 +3438,7 @@ mod tests {
                         "conn-lifecycle",
                     ),
                 ),
+                elicitation_recovery: None,
             },
         )
         .await;
@@ -3422,6 +3495,7 @@ mod tests {
                         "conn-prompt",
                     ),
                 ),
+                elicitation_recovery: None,
             },
         )
         .await;
@@ -3552,6 +3626,7 @@ mod tests {
             RpcDispatchContext {
                 session_hooks: None,
                 session_bridge: None,
+                elicitation_recovery: None,
             },
         )
         .await;
@@ -3618,6 +3693,7 @@ mod tests {
             RpcDispatchContext {
                 session_hooks: None,
                 session_bridge: None,
+                elicitation_recovery: None,
             },
         )
         .await
@@ -4363,10 +4439,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         fixture.delegate.pending_elicitations().lock().await.insert(
             elicitation_id.clone(),
-            crate::elicitation::PendingElicitation {
-                session_id: "delegate-session".to_string(),
-                sender: tx,
-            },
+            crate::elicitation::PendingElicitation::for_test("delegate-session", tx),
         );
 
         let session_owners = SessionOwnerMap::default();

@@ -36,7 +36,7 @@ use crate::event_fanout::EventFanout;
 use axum::{
     Router,
     extract::{
-        State,
+        ConnectInfo, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header},
@@ -62,6 +62,8 @@ pub(crate) struct WsServerState {
     pub(crate) event_sources: Vec<Arc<EventFanout>>,
     pub(crate) session_owners: SessionOwnerMap,
     pub(crate) connection_bridges: Arc<Mutex<HashMap<String, ClientBridgeSender>>>,
+    pub(crate) elicitation_recovery:
+        crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
     session_reconciliation_locks: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
     require_same_origin: bool,
 }
@@ -81,6 +83,7 @@ impl WsServerState {
             pending_elicitations: agent.pending_elicitations(),
             session_owners: SessionOwnerMap::default(),
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
+            elicitation_recovery: Default::default(),
             session_reconciliation_locks: Arc::new(Mutex::new(HashMap::new())),
             require_same_origin,
             agent,
@@ -243,6 +246,27 @@ async fn wait_for_websocket_response(
     result
 }
 
+async fn wait_for_websocket_elicitation_response(
+    pending: PendingWsResponse,
+    pending_requests: PendingWsRequestMap,
+    connection_cancel: CancellationToken,
+) -> Result<serde_json::Value, Error> {
+    let result = tokio::select! {
+        _ = connection_cancel.cancelled() => {
+            Err(Error::internal_error().data("WebSocket connection closed"))
+        }
+        response = pending.response_rx => {
+            match response {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) => Err(Error::internal_error().data(error)),
+                Err(_) => Err(Error::internal_error().data("WebSocket response channel dropped")),
+            }
+        }
+    };
+    pending_requests.lock().await.remove(&pending.request_key);
+    result
+}
+
 pub(crate) async fn run_websocket_bridge(
     rx: mpsc::Receiver<ClientBridgeMessage>,
     tx: mpsc::Sender<String>,
@@ -365,11 +389,10 @@ pub(crate) async fn run_websocket_bridge_with_timeout(
                         let pending_requests = pending_requests.clone();
                         let connection_cancel = connection_cancel.clone();
                         tokio::spawn(async move {
-                            let result = wait_for_websocket_response(
+                            let result = wait_for_websocket_elicitation_response(
                                 pending,
                                 pending_requests,
                                 connection_cancel,
-                                request_timeout,
                             )
                             .await
                             .and_then(convert_elicitation_response_value);
@@ -417,40 +440,115 @@ async fn send_websocket_ext_notification(
     tx.send(json).await.map_err(|_| ())
 }
 
-async fn resolve_websocket_elicitation(
-    agent: &crate::agent::LocalAgentHandle,
-    session_id: String,
-    elicitation_id: String,
-    response: crate::elicitation::ElicitationResponse,
-) {
-    match crate::elicitation::take_pending_elicitation_sender_for_session(
-        agent,
-        &session_id,
-        &elicitation_id,
+pub(crate) async fn deliver_claimed_websocket_elicitation(
+    agent: Arc<crate::agent::LocalAgentHandle>,
+    claim: crate::elicitation::ClaimedElicitationDelivery,
+    connection_id: String,
+    tx: mpsc::Sender<String>,
+    pending_requests: PendingWsRequestMap,
+    request_counter: Arc<AtomicU64>,
+    connection_cancel: CancellationToken,
+) -> Result<(), Error> {
+    let request = create_elicitation_request(
+        claim.elicitation_id.clone(),
+        claim.session_id.clone(),
+        claim.form.message.clone(),
+        claim.form.requested_schema.clone(),
+        claim.form.source.clone(),
+    )?;
+    let pending = send_websocket_request(
+        &tx,
+        &pending_requests,
+        &request_counter,
+        &connection_id,
+        "elicitation/create",
+        &request,
     )
-    .await
-    {
-        Some(sender) => {
-            if sender.send(response).is_err() {
+    .await?;
+
+    tokio::spawn(async move {
+        let response =
+            wait_for_websocket_elicitation_response(pending, pending_requests, connection_cancel)
+                .await
+                .and_then(convert_elicitation_response_value);
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
                 log::warn!(
-                    "WebSocket elicitation receiver dropped: session_id={} elicitation_id={}",
-                    session_id,
-                    elicitation_id
+                    "WebSocket elicitation delivery ended without a user response: session_id={} elicitation_id={} error={}",
+                    claim.session_id,
+                    claim.elicitation_id,
+                    error
                 );
-            } else {
-                log::debug!(
-                    "WebSocket elicitation response delivered: session_id={} elicitation_id={}",
-                    session_id,
-                    elicitation_id
-                );
+                return;
+            }
+        };
+        let outcome = match response.action {
+            crate::elicitation::ElicitationAction::Accept => "accept",
+            crate::elicitation::ElicitationAction::Decline => "decline",
+            crate::elicitation::ElicitationAction::Cancel => "cancel",
+        };
+        match crate::elicitation::resolve_claimed_elicitation(
+            agent.as_ref(),
+            &claim.session_id,
+            &claim.elicitation_id,
+            &connection_id,
+            claim.delivery_generation,
+            response,
+        )
+        .await
+        {
+            Ok(crate::elicitation::ElicitationResolution::Resolved) => {
+                let _ = send_websocket_notification(
+                    &tx,
+                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
+                    &serde_json::json!({
+                        "session_id": claim.session_id,
+                        "elicitation_id": claim.elicitation_id,
+                        "outcome": outcome,
+                    }),
+                )
+                .await;
+            }
+            Ok(crate::elicitation::ElicitationResolution::StaleDelivery) => {
+                let _ = send_websocket_notification(
+                    &tx,
+                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
+                    &serde_json::json!({
+                        "session_id": claim.session_id,
+                        "elicitation_id": claim.elicitation_id,
+                        "outcome": "superseded",
+                    }),
+                )
+                .await;
+            }
+            Ok(crate::elicitation::ElicitationResolution::NotFound) => {
+                let _ = send_websocket_notification(
+                    &tx,
+                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
+                    &serde_json::json!({
+                        "session_id": claim.session_id,
+                        "elicitation_id": claim.elicitation_id,
+                        "outcome": "completed_elsewhere",
+                    }),
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = send_websocket_notification(
+                    &tx,
+                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION,
+                    &serde_json::json!({
+                        "session_id": claim.session_id,
+                        "elicitation_id": claim.elicitation_id,
+                        "message": error.message,
+                    }),
+                )
+                .await;
             }
         }
-        None => log::warn!(
-            "No pending WebSocket elicitation found: session_id={} elicitation_id={}",
-            session_id,
-            elicitation_id
-        ),
-    }
+    });
+    Ok(())
 }
 
 /// Run a standalone WebSocket ACP server.
@@ -500,9 +598,12 @@ pub async fn serve_websocket(
     log::info!("Press Ctrl+C to stop");
 
     // Run with graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown::signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown::signal())
+    .await?;
 
     log::info!("WebSocket ACP server shutdown complete");
     Ok(())
@@ -530,13 +631,21 @@ fn websocket_router(state: WsServerState) -> Router {
 async fn websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<WsServerState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
     if state.require_same_origin && !has_allowed_websocket_origin(&headers) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(|socket| handle_websocket_connection(socket, state))
-        .into_response()
+    let secure_recovery_transport = is_loopback_websocket_peer(Some(peer));
+    ws.on_upgrade(move |socket| {
+        handle_websocket_connection(socket, state, secure_recovery_transport)
+    })
+    .into_response()
+}
+
+pub(crate) fn is_loopback_websocket_peer(peer: Option<std::net::SocketAddr>) -> bool {
+    peer.is_some_and(|peer| peer.ip().is_loopback())
 }
 
 pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap) -> bool {
@@ -562,9 +671,17 @@ pub(crate) fn has_allowed_websocket_origin(headers: &HeaderMap) -> bool {
 }
 
 /// Handle a WebSocket connection lifecycle
-async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
+async fn handle_websocket_connection(
+    socket: WebSocket,
+    state: WsServerState,
+    secure_recovery_transport: bool,
+) {
     let conn_id = Uuid::new_v4().to_string();
     log::info!("New WebSocket connection: {}", conn_id);
+    state
+        .elicitation_recovery
+        .register_connection(conn_id.clone(), secure_recovery_transport)
+        .await;
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::channel::<String>(100);
@@ -613,27 +730,86 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
     let state_receive = state.clone();
     let tx_receive = tx.clone();
     let pending_receive = pending_requests.clone();
+    let request_counter_receive = request_counter.clone();
+    let connection_cancel_receive = connection_cancel.clone();
     let bridge_receive = session_bridge;
     let mut receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
             match result {
                 Ok(Message::Text(text)) => match serde_json::from_str::<InboundWsMessage>(&text) {
                     Ok(InboundWsMessage::Request(request)) => {
-                        tokio::spawn(dispatch_rpc_message_with_context(
-                            RpcDispatchState {
-                                agent: state_receive.agent.clone(),
-                                session_owners: state_receive.session_owners.clone(),
-                                pending_permissions: state_receive.pending_permissions.clone(),
-                                pending_elicitations: state_receive.pending_elicitations.clone(),
-                                conn_id: conn_id_receive.clone(),
-                                tx: tx_receive.clone(),
-                            },
-                            request,
-                            RpcDispatchContext {
-                                session_hooks: None,
-                                session_bridge: Some(bridge_receive.clone()),
-                            },
-                        ));
+                        let attach_session = (request.method.trim_start_matches('_')
+                            == crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD)
+                            .then(|| {
+                                serde_json::from_value::<crate::control::elicitation_recovery::AttachPendingElicitationSessionRequest>(
+                                    request.params.clone(),
+                                )
+                                .ok()
+                                .map(|request| request.session_id)
+                            })
+                            .flatten();
+                        let state_dispatch = state_receive.clone();
+                        let conn_id_dispatch = conn_id_receive.clone();
+                        let tx_dispatch = tx_receive.clone();
+                        let pending_dispatch = pending_receive.clone();
+                        let counter_dispatch = request_counter_receive.clone();
+                        let cancel_dispatch = connection_cancel_receive.clone();
+                        let bridge_dispatch = bridge_receive.clone();
+                        tokio::spawn(async move {
+                            dispatch_rpc_message_with_context(
+                                RpcDispatchState {
+                                    agent: state_dispatch.agent.clone(),
+                                    session_owners: state_dispatch.session_owners.clone(),
+                                    pending_permissions: state_dispatch.pending_permissions.clone(),
+                                    pending_elicitations: state_dispatch
+                                        .pending_elicitations
+                                        .clone(),
+                                    conn_id: conn_id_dispatch.clone(),
+                                    tx: tx_dispatch.clone(),
+                                },
+                                request,
+                                RpcDispatchContext {
+                                    session_hooks: None,
+                                    session_bridge: Some(bridge_dispatch),
+                                    elicitation_recovery: Some(
+                                        state_dispatch.elicitation_recovery.clone(),
+                                    ),
+                                },
+                            )
+                            .await;
+                            if let Some(session_id) = attach_session
+                                && state_dispatch
+                                    .session_owners
+                                    .lock()
+                                    .await
+                                    .get(&session_id)
+                                    .is_some_and(|owners| owners.contains(&conn_id_dispatch))
+                            {
+                                for claim in crate::elicitation::claimed_elicitation_deliveries(
+                                    state_dispatch.agent.as_ref(),
+                                    &session_id,
+                                    &conn_id_dispatch,
+                                )
+                                .await
+                                {
+                                    if let Err(error) = deliver_claimed_websocket_elicitation(
+                                        state_dispatch.agent.clone(),
+                                        claim,
+                                        conn_id_dispatch.clone(),
+                                        tx_dispatch.clone(),
+                                        pending_dispatch.clone(),
+                                        counter_dispatch.clone(),
+                                        cancel_dispatch.clone(),
+                                    )
+                                    .await
+                                    {
+                                        log::warn!(
+                                            "Failed to re-deliver attached elicitation: {error}"
+                                        );
+                                    }
+                                }
+                            }
+                        });
                     }
                     Ok(InboundWsMessage::Response { id, result, error }) => {
                         route_websocket_response(&pending_receive, id, result, error).await;
@@ -668,6 +844,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: WsServerState) {
     bridge_task.abort();
 
     cancel_pending_websocket_requests(&pending_requests).await;
+    state.elicitation_recovery.remove_connection(&conn_id).await;
     reconcile_websocket_disconnect(&state, &conn_id).await;
     log::info!("WebSocket connection closed: {}", conn_id);
 }
@@ -889,9 +1066,7 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                 if let crate::events::AgentEventKind::ElicitationRequested {
                     elicitation_id,
                     session_id,
-                    message,
-                    requested_schema,
-                    source,
+                    ..
                 } = event.kind()
                 {
                     let key = (session_id.clone(), elicitation_id.clone());
@@ -899,107 +1074,59 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                         continue;
                     }
 
-                    let request = match create_elicitation_request(
-                        elicitation_id.clone(),
-                        session_id.clone(),
-                        message.clone(),
-                        requested_schema.clone(),
-                        source.clone(),
-                    ) {
-                        Ok(request) => request,
-                        Err(err) => {
-                            log::warn!(
-                                "Invalid WebSocket elicitation request: session_id={} elicitation_id={} error={}",
-                                session_id,
-                                elicitation_id,
-                                err
-                            );
-                            resolve_websocket_elicitation(
-                                &state_events.agent,
-                                session_id.clone(),
-                                elicitation_id.clone(),
-                                crate::elicitation::ElicitationResponse {
-                                    action: crate::elicitation::ElicitationAction::Cancel,
-                                    content: None,
-                                },
-                            )
-                            .await;
-                            continue;
+                    if let Some(resume_authority) = state_events
+                        .elicitation_recovery
+                        .issue_for_session(&conn_id_events, session_id, state_events.agent.as_ref())
+                        .await
+                    {
+                        let notification = crate::control::elicitation_recovery::ElicitationRecoveryAuthorityNotification {
+                            version: crate::control::elicitation_recovery::ELICITATION_RECOVERY_VERSION,
+                            session_id: session_id.clone(),
+                            resume_authority,
+                        };
+                        if send_websocket_notification(
+                            &tx_events,
+                            crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION,
+                            &notification,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
                         }
-                    };
+                    }
 
-                    let pending = match send_websocket_request(
-                        &tx_events,
-                        &pending_events,
-                        &request_counter,
-                        &conn_id_events,
-                        "elicitation/create",
-                        &request,
+                    let Some(claim) = state_events
+                        .elicitation_recovery
+                        .claim_live_delivery(
+                            &conn_id_events,
+                            session_id,
+                            elicitation_id,
+                            state_events.agent.as_ref(),
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = deliver_claimed_websocket_elicitation(
+                        state_events.agent.clone(),
+                        claim,
+                        conn_id_events.clone(),
+                        tx_events.clone(),
+                        pending_events.clone(),
+                        request_counter.clone(),
+                        connection_cancel.clone(),
                     )
                     .await
                     {
-                        Ok(pending) => pending,
-                        Err(err) => {
-                            log::warn!("Failed to send WebSocket elicitation: {err}");
-                            resolve_websocket_elicitation(
-                                &state_events.agent,
-                                session_id.clone(),
-                                elicitation_id.clone(),
-                                crate::elicitation::ElicitationResponse {
-                                    action: crate::elicitation::ElicitationAction::Cancel,
-                                    content: None,
-                                },
-                            )
-                            .await;
-                            break;
-                        }
-                    };
-
-                    let agent = state_events.agent.clone();
-                    let session_id = session_id.clone();
-                    let elicitation_id = elicitation_id.clone();
-                    let pending_requests = pending_events.clone();
-                    let cancel = connection_cancel.clone();
-                    tokio::spawn(async move {
-                        let response = match wait_for_websocket_response(
-                            pending,
-                            pending_requests,
-                            cancel,
-                            WEBSOCKET_REQUEST_TIMEOUT,
-                        )
-                        .await
-                        {
-                            Ok(value) => match convert_elicitation_response_value(value) {
-                                Ok(response) => response,
-                                Err(err) => {
-                                    log::warn!(
-                                        "Invalid WebSocket elicitation response: session_id={} elicitation_id={} error={}",
-                                        session_id,
-                                        elicitation_id,
-                                        err
-                                    );
-                                    crate::elicitation::ElicitationResponse {
-                                        action: crate::elicitation::ElicitationAction::Cancel,
-                                        content: None,
-                                    }
-                                }
-                            },
-                            Err(error) => {
-                                log::warn!(
-                                    "WebSocket elicitation request failed: session_id={} elicitation_id={} error={}",
-                                    session_id,
-                                    elicitation_id,
-                                    error
-                                );
-                                crate::elicitation::ElicitationResponse {
-                                    action: crate::elicitation::ElicitationAction::Cancel,
-                                    content: None,
-                                }
-                            }
-                        };
-                        resolve_websocket_elicitation(&agent, session_id, elicitation_id, response)
-                            .await;
-                    });
+                        log::warn!(
+                            "Failed to deliver WebSocket elicitation: session_id={} elicitation_id={} error={}",
+                            session_id,
+                            elicitation_id,
+                            error
+                        );
+                        break;
+                    }
                     continue;
                 }
 

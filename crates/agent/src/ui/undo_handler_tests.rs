@@ -685,10 +685,7 @@ async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()
     let (tx, rx) = tokio::sync::oneshot::channel();
     fixture.delegate.pending_elicitations().lock().await.insert(
         elicitation_id.clone(),
-        crate::elicitation::PendingElicitation {
-            session_id: "delegate-session".to_string(),
-            sender: tx,
-        },
+        crate::elicitation::PendingElicitation::for_test("delegate-session", tx),
     );
 
     handle_elicitation_response(
@@ -709,6 +706,66 @@ async fn test_elicitation_response_routes_to_delegate_pending_map() -> Result<()
         Some(serde_json::json!({"selection": "allow_once"}))
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_recovered_elicitation_claim_and_resolution_route_to_delegate() -> Result<()> {
+    let fixture = DelegateTestFixture::new().await.unwrap();
+    let elicitation_id = "delegate-recovery-42";
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    crate::elicitation::register_pending_elicitation(
+        &fixture.delegate.pending_elicitations(),
+        elicitation_id.to_string(),
+        crate::elicitation::PendingElicitationRegistration {
+            session_id: "delegate-session".to_string(),
+            form: crate::elicitation::PendingElicitationForm {
+                message: "Choose".to_string(),
+                requested_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"selection": {"type": "string"}},
+                    "required": ["selection"]
+                }),
+                source: "delegate:question".to_string(),
+            },
+            owner_authority: Some("delegate-authority".to_string()),
+            run_id: Some("delegate-run".to_string()),
+            tool_call_id: Some("delegate-tool".to_string()),
+        },
+        tx,
+    )
+    .await;
+
+    let claim = crate::elicitation::claim_pending_elicitation_deliveries(
+        fixture.planner.as_ref(),
+        "delegate-session",
+        None,
+        "delegate-authority",
+        "replacement",
+    )
+    .await
+    .pop()
+    .expect("delegate waiter should be discoverable from primary agent");
+    assert_eq!(claim.elicitation_id, elicitation_id);
+    assert_eq!(
+        crate::elicitation::resolve_claimed_elicitation(
+            fixture.planner.as_ref(),
+            "delegate-session",
+            elicitation_id,
+            "replacement",
+            claim.delivery_generation,
+            crate::elicitation::ElicitationResponse {
+                action: ElicitationAction::Accept,
+                content: Some(serde_json::json!({"selection": "delegate"})),
+            },
+        )
+        .await?,
+        crate::elicitation::ElicitationResolution::Resolved
+    );
+    assert_eq!(
+        rx.await?.content,
+        Some(serde_json::json!({"selection": "delegate"}))
+    );
     Ok(())
 }
 
@@ -760,10 +817,7 @@ system = "inline"
     let (tx, rx) = tokio::sync::oneshot::channel();
     profile_agent.pending_elicitations().lock().await.insert(
         elicitation_id.clone(),
-        crate::elicitation::PendingElicitation {
-            session_id: session_id.clone(),
-            sender: tx,
-        },
+        crate::elicitation::PendingElicitation::for_test(session_id.clone(), tx),
     );
 
     handle_elicitation_response(

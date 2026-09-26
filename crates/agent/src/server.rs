@@ -85,13 +85,16 @@ impl AgentServer {
             }
             ServerMode::Api => log::info!("API server listening on http://{}", addr),
         }
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                crate::acp::shutdown::signal().await;
-                shutdown_token.cancel();
-                log::info!("Received shutdown signal, stopping UI server...");
-            })
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            crate::acp::shutdown::signal().await;
+            shutdown_token.cancel();
+            log::info!("Received shutdown signal, stopping UI server...");
+        })
+        .await?;
 
         // Request shutdown without waiting for background drains.
         if let Some(profiles) = profiles {
