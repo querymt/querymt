@@ -6,6 +6,7 @@ use crate::session::repository::SessionRepository;
 use crate::session::store::Session;
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
@@ -88,6 +89,7 @@ impl SessionRepository for SqliteSessionRepository {
         parent_session_id: Option<String>,
         fork_origin: Option<ForkOrigin>,
     ) -> SessionResult<Session> {
+        let cwd = cwd.map(|cwd| normalize_session_cwd(&cwd)).transpose()?;
         let now = OffsetDateTime::now_utc();
         let now_str = format_rfc3339(&now);
         let public_id = Uuid::now_v7().to_string();
@@ -330,6 +332,17 @@ impl SessionRepository for SqliteSessionRepository {
         })
         .await
     }
+}
+
+fn normalize_session_cwd(cwd: &Path) -> SessionResult<PathBuf> {
+    let absolute = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| SessionError::InvalidOperation(format!("Failed to resolve cwd: {e}")))?
+            .join(cwd)
+    };
+    Ok(absolute.components().collect())
 }
 
 fn format_rfc3339(dt: &OffsetDateTime) -> String {

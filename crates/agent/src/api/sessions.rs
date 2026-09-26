@@ -225,7 +225,7 @@ impl AgentSessions {
             SessionListMode::Group => {
                 let cwd_value = match cwd.as_deref() {
                     Some("__none__") => None,
-                    _ => cwd,
+                    _ => cwd.map(normalize_group_cwd),
                 };
                 let (group, total) = view_store
                     .list_group_sessions(cwd_value, cursor, page_limit, session_scope)
@@ -304,7 +304,9 @@ impl AgentSessions {
         request: AcpListSessionsRequest,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let cursor = AcpSessionCursor::parse(request.cursor.as_deref())?;
-        let requested_cwd = request.cwd.map(|cwd| cwd.display().to_string());
+        let requested_cwd = request
+            .cwd
+            .map(|cwd| normalize_group_cwd(cwd.display().to_string()));
         let session_scope = acp_session_scope_from_meta(request.meta.as_ref());
         // ACP workspace requests load incrementally; global discovery remains a larger flat page.
         let limit = if requested_cwd.is_some() { 10 } else { 100 };
@@ -814,6 +816,15 @@ impl From<SessionListItem> for SessionSummary {
             connection_state: None,
             runtime_state: None,
         }
+    }
+}
+
+fn normalize_group_cwd(cwd: String) -> String {
+    let path = std::path::Path::new(&cwd);
+    if path.is_absolute() {
+        path.components().collect::<PathBuf>().display().to_string()
+    } else {
+        cwd
     }
 }
 

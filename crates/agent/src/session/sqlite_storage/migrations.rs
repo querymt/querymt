@@ -1,5 +1,6 @@
 use rusqlite::{Connection, params};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 use crate::session::schema;
@@ -92,7 +93,36 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0020_dotagents_automation_bindings",
         apply: migration_0020_dotagents_automation_bindings,
     },
+    Migration {
+        version: "0021_normalize_session_cwd_slashes",
+        apply: migration_0021_normalize_session_cwd_slashes,
+    },
 ];
+
+fn migration_0021_normalize_session_cwd_slashes(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, cwd FROM sessions WHERE cwd IS NOT NULL")?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?
+    };
+
+    for (id, cwd) in rows {
+        let path = Path::new(&cwd);
+        if path.is_absolute() {
+            let normalized: PathBuf = path.components().collect();
+            let normalized = normalized.to_string_lossy().into_owned();
+            if normalized != cwd {
+                conn.execute(
+                    "UPDATE sessions SET cwd = ?1 WHERE id = ?2",
+                    params![normalized, id],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Protocol-owned automation session bindings.
 ///
