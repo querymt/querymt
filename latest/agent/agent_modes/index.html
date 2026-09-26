@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.64">
+      <meta name="generator" content="zensical-0.0.65">
     
     
       
@@ -2279,10 +2279,7 @@
 </code></pre></div></td></tr></table></div></p>
 <h2 id="switching-modes">Switching Modes</h2>
 <h3 id="via-dashboard-interactive">Via Dashboard (Interactive)</h3>
-<p>In the web dashboard, press:
-- <strong>Ctrl+M</strong> (Linux/Windows)
-- <strong>Cmd+M</strong> (macOS)</p>
-<p>The mode indicator in the header shows the current mode.</p>
+<p>The embedded dashboard exposes the agent mode as an ACP session configuration option. Use the mode control in the session composer to select Build, Plan, or Review.</p>
 <h3 id="via-api">Via API</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-5-2"> 2</a></span>
@@ -2335,9 +2332,9 @@
     P[Plan Mode]
     R[Review Mode]
 
-    B --&gt;|"Ctrl+M"| P
-    P --&gt;|"Ctrl+M"| R
-    R --&gt;|"Ctrl+M"| B</code></pre>
+    B --&gt;|"Select Plan"| P
+    P --&gt;|"Select Review"| R
+    R --&gt;|"Select Build"| B</code></pre>
 <h2 id="mode-aware-behavior">Mode-Aware Behavior</h2>
 <h3 id="tool-access">Tool Access</h3>
 <table>
@@ -2569,15 +2566,15 @@
 <h3 id="agent-still-making-changes-in-planreview-mode">Agent Still Making Changes in Plan/Review Mode</h3>
 <ol>
 <li>Check that <code>AgentModeMiddleware</code> is in the middleware stack</li>
-<li>Verify the mode is actually set (check mode indicator)</li>
+<li>Verify the mode is actually set in the session configuration</li>
 <li>Check logs for mode-related warnings</li>
 <li>Ensure mutating tools are in the <code>mutating_tools</code> list</li>
 </ol>
 <h3 id="mode-not-switching">Mode Not Switching</h3>
 <ol>
-<li>Verify dashboard is running with <code>--dashboard</code> feature</li>
-<li>Check keyboard shortcut (Ctrl+M / Cmd+M)</li>
-<li>Try switching via API instead</li>
+<li>Verify the dashboard was built with the <code>dashboard</code> feature and started with <code>--dashboard</code></li>
+<li>Check that the mode session configuration option is available</li>
+<li>Try switching via the ACP API instead</li>
 <li>Check for middleware errors in logs</li>
 </ol>
 <h3 id="permission-errors-in-build-mode">Permission Errors in Build Mode</h3>

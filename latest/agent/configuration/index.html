@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.64">
+      <meta name="generator" content="zensical-0.0.65">
     
     
       
@@ -3194,7 +3194,7 @@
 <a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="scheduled-tasks-configuration">Scheduled Tasks Configuration</h2>
-<p>QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime through the dashboard UI or API, not through static TOML configuration.</p>
+<p>QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime with the <code>querymt/schedules/create</code> ACP extension, not through static TOML configuration. The embedded dashboard discovers schedule capabilities through ACP.</p>
 <h3 id="schedule-types">Schedule Types</h3>
 <h4 id="interval-schedules">Interval Schedules</h4>
 <p>Run tasks at fixed intervals. Trigger JSON format:</p>
@@ -3225,7 +3225,7 @@
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-30-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-30-1" name="__codelineno-30-1"></a><span class="p">{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"once_at"</span><span class="p">,</span><span class="w"> </span><span class="nt">"at"</span><span class="p">:</span><span class="w"> </span><span class="s2">"2026-06-01T09:00:00Z"</span><span class="w"> </span><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="creating-schedules">Creating Schedules</h3>
-<p>Schedules are created through the dashboard UI (Session &gt; Schedules &gt; Create Schedule) or via the WebSocket API using the <code>create_schedule</code> message:</p>
+<p>Create schedules with the <code>querymt/schedules/create</code> ACP extension:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-31-1">1</a></span>
 <span class="normal"><a href="#__codelineno-31-2">2</a></span>
 <span class="normal"><a href="#__codelineno-31-3">3</a></span>
@@ -3233,16 +3233,14 @@
 <span class="normal"><a href="#__codelineno-31-5">5</a></span>
 <span class="normal"><a href="#__codelineno-31-6">6</a></span>
 <span class="normal"><a href="#__codelineno-31-7">7</a></span>
-<span class="normal"><a href="#__codelineno-31-8">8</a></span>
-<span class="normal"><a href="#__codelineno-31-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a><span class="p">{</span>
-<a id="__codelineno-31-2" name="__codelineno-31-2"></a><span class="w">  </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"create_schedule"</span><span class="p">,</span>
-<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;session-public-id&gt;"</span><span class="p">,</span>
-<a id="__codelineno-31-4" name="__codelineno-31-4"></a><span class="w">  </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Check for updates and summarize changes"</span><span class="p">,</span>
-<a id="__codelineno-31-5" name="__codelineno-31-5"></a><span class="w">  </span><span class="nt">"trigger"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"interval"</span><span class="p">,</span><span class="w"> </span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">3600</span><span class="w"> </span><span class="p">},</span>
-<a id="__codelineno-31-6" name="__codelineno-31-6"></a><span class="w">  </span><span class="nt">"max_steps"</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span><span class="p">,</span>
-<a id="__codelineno-31-7" name="__codelineno-31-7"></a><span class="w">  </span><span class="nt">"max_cost_usd"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.10</span><span class="p">,</span>
-<a id="__codelineno-31-8" name="__codelineno-31-8"></a><span class="w">  </span><span class="nt">"max_runs"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
-<a id="__codelineno-31-9" name="__codelineno-31-9"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-31-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-31-1" name="__codelineno-31-1"></a><span class="p">{</span>
+<a id="__codelineno-31-2" name="__codelineno-31-2"></a><span class="w">  </span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;session-public-id&gt;"</span><span class="p">,</span>
+<a id="__codelineno-31-3" name="__codelineno-31-3"></a><span class="w">  </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Check for updates and summarize changes"</span><span class="p">,</span>
+<a id="__codelineno-31-4" name="__codelineno-31-4"></a><span class="w">  </span><span class="nt">"trigger"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"interval"</span><span class="p">,</span><span class="w"> </span><span class="nt">"seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">3600</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-31-5" name="__codelineno-31-5"></a><span class="w">  </span><span class="nt">"max_steps"</span><span class="p">:</span><span class="w"> </span><span class="mi">50</span><span class="p">,</span>
+<a id="__codelineno-31-6" name="__codelineno-31-6"></a><span class="w">  </span><span class="nt">"max_cost_usd"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.10</span><span class="p">,</span>
+<a id="__codelineno-31-7" name="__codelineno-31-7"></a><span class="w">  </span><span class="nt">"max_runs"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span>
+<a id="__codelineno-31-8" name="__codelineno-31-8"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="example-configurations-for-scheduled-agents">Example Configurations for Scheduled Agents</h3>
 <p>See <code>examples/confs/watchdog.toml</code>, <code>examples/confs/standup_bot.toml</code>, and <code>examples/confs/research_journal.toml</code> for agent configurations designed for scheduled use. These agents are configured with appropriate execution limits for autonomous scheduled cycles.</p>
@@ -3264,7 +3262,7 @@
 - Profiles added with <code>[profile]</code> section
 - Slash commands stored in <code>.qmt/commands/</code>
 - New tools: <code>index</code>, <code>get_symbol</code>, <code>get_function</code>, <code>replace_symbol</code>, <code>find_symbol_references</code>
-- Scheduled tasks created via dashboard UI/API, not TOML config</p>
+- Scheduled tasks created via ACP extensions, not TOML config</p>
 <h3 id="new-features-since-last-documentation-update">New Features Since Last Documentation Update</h3>
 <ol>
 <li><strong>Profiles</strong>: Save and switch between configurations</li>
@@ -3272,7 +3270,7 @@
 <li><strong>Internet Mesh</strong>: iroh transport with invite tokens</li>
 <li><strong>Remote Sessions</strong>: Forking, resuming, recovery</li>
 <li><strong>Code Intelligence Tools</strong>: AST-aware code analysis</li>
-<li><strong>Scheduled Tasks</strong>: Autonomous recurring work via dashboard/API</li>
+<li><strong>Scheduled Tasks</strong>: Autonomous recurring work via ACP extensions</li>
 <li><strong>Language Intelligence</strong>: VS Code integration via <code>language_query</code> tool</li>
 <li><strong>Streaming Stability</strong>: Robust stream handling with reconnection</li>
 <li><strong>Multi-Transport</strong>: LAN + Internet mesh simultaneously</li>
