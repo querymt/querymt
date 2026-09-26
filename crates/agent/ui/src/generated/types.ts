@@ -524,6 +524,25 @@ export interface Artifact {
 	created_at: string;
 }
 
+/**
+ * Attaches the current connection to one authorized pending session.
+ * 
+ * A successful response is followed by fresh standard ACP `elicitation/create` requests.
+ * Deliberately omits `Debug` to keep the authority out of ordinary logs.
+ */
+export interface AttachPendingElicitationSessionRequest {
+	version: number;
+	session_id: string;
+	resume_authority: string;
+}
+
+export interface AttachPendingElicitationSessionResponse {
+	version: number;
+	session_id: string;
+	/** Stable opaque identities used by the desktop to reconcile its inbox snapshot. */
+	elicitation_ids: string[];
+}
+
 export interface AttachRemoteSessionRequest {
 	node_id: string;
 	session_id: string;
@@ -723,6 +742,14 @@ export interface ControlFeatureInfo {
 	steering: boolean;
 }
 
+/** Advertised only when the agent has the complete recovery implementation enabled. */
+export interface ElicitationRecoveryCapability {
+	version: number;
+	authority_notification: string;
+	list_pending_method: string;
+	attach_method: string;
+}
+
 export interface CapabilitiesInfo {
 	querymt_control_version: number;
 	agent: ControlAgentInfo;
@@ -730,6 +757,7 @@ export interface CapabilitiesInfo {
 	features: ControlFeatureInfo;
 	methods: string[];
 	notifications: string[];
+	elicitation_recovery?: ElicitationRecoveryCapability;
 }
 
 /** Knowledge consolidation DTO for the UI (read-only). */
@@ -887,6 +915,29 @@ export interface DurableEvent {
 }
 
 /**
+ * Sent only on the protected connection that originally received the question.
+ * 
+ * Deliberately omits `Debug`: the authority is an in-memory bearer secret and must not be logged.
+ */
+export interface ElicitationRecoveryAuthorityNotification {
+	version: number;
+	session_id: string;
+	resume_authority: string;
+}
+
+export enum ElicitationRecoveryDenialReason {
+	Unauthorized = "unauthorized",
+	AuthorityExpired = "authority_expired",
+	InsecureTransport = "insecure_transport",
+	CapabilityMismatch = "capability_mismatch",
+}
+
+export interface ElicitationRecoveryErrorData {
+	category: string;
+	reason: ElicitationRecoveryDenialReason;
+}
+
+/**
  * An ephemeral event — live delivery only, no persistence, no sequence.
  * Typeshare-annotated: generated for TypeScript and Swift.
  */
@@ -944,6 +995,21 @@ export interface KnowledgeEntryInfo {
 	importance: number;
 	consolidated_at?: string;
 	created_at: string;
+}
+
+/**
+ * Requests the pending session IDs authorized by a process-lifetime bearer secret.
+ * 
+ * Deliberately omits `Debug` to keep the authority out of ordinary logs.
+ */
+export interface ListPendingElicitationSessionsRequest {
+	version: number;
+	resume_authority: string;
+}
+
+export interface ListPendingElicitationSessionsResponse {
+	version: number;
+	session_ids: string[];
 }
 
 export interface ListSchedulesControlRequest {
