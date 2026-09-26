@@ -44,6 +44,9 @@ pub struct CapabilitiesInfo {
     pub features: ControlFeatureInfo,
     pub methods: Vec<String>,
     pub notifications: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elicitation_recovery:
+        Option<crate::control::elicitation_recovery::ElicitationRecoveryCapability>,
 }
 
 pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
@@ -100,6 +103,8 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/resume".to_string(),
         "querymt/schedules/trigger".to_string(),
         "querymt/schedules/delete".to_string(),
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_LIST_PENDING_METHOD.to_string(),
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD.to_string(),
     ];
 
     if agent.profiles().is_some() {
@@ -136,6 +141,12 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/changed".to_string(),
         crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE.to_string(),
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION
+            .to_string(),
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION
+            .to_string(),
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION
+            .to_string(),
     ];
     if agent.profiles().is_some() {
         notifications
@@ -174,5 +185,8 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         },
         methods,
         notifications,
+        elicitation_recovery: Some(
+            crate::control::elicitation_recovery::ElicitationRecoveryCapability::default(),
+        ),
     }
 }
