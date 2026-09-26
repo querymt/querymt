@@ -999,7 +999,7 @@ impl SessionHandle {
 /// the credential resolution logic to determine the order in which OAuth,
 /// stored API key, and environment variable sources are tried.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "dashboard", typeshare::typeshare)]
+#[typeshare::typeshare]
 #[serde(rename_all = "snake_case")]
 pub enum AuthMethod {
     #[serde(rename = "oauth")]
@@ -1043,7 +1043,7 @@ pub(crate) fn preferred_auth_method(provider_name: &str) -> Option<AuthMethod> {
 ///
 /// The three credential sources are:
 /// - **OAuth**: token from the system keyring (requires `oauth` feature)
-/// - **Stored key**: API key set via the dashboard UI (stored in SecretStore under `env_var_name`)
+/// - **Stored key**: API key set through ACP auth controls (stored in SecretStore under `env_var_name`)
 /// - **Env var**: environment variable (e.g. `OPENAI_API_KEY`)
 ///
 /// `env_var_name` may be `None` for OAuth-only providers (e.g. Codex). In that case

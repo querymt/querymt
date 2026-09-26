@@ -13,11 +13,10 @@
 #
 # ## Usage
 #
-#   # Start the dashboard (schedule is created via UI or API)
-#   cargo run --example qmtcode --features dashboard -- confs/standup_bot.toml --dashboard
+#   # Start the embedded ACP dashboard
+#   cargo run -p querymt-agent --example qmtcode --features dashboard -- crates/agent/examples/confs/standup_bot.toml --dashboard
 #
-#   # Then create a schedule via the dashboard UI:
-#   #   Session → Schedules → Create Schedule
+#   # Then create a schedule with the `querymt/schedules/create` ACP extension:
 #   #   Prompt: "Run a standup cycle: analyze recent git activity, ingest findings, and report."
 #   #   Trigger: Interval, 86400 seconds (daily)
 #   #   Max runs: 30 (one month trial)

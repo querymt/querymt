@@ -15,7 +15,7 @@
 - Key packages:
   - `querymt` (core library)
   - `querymt-cli`
-  - `querymt-agent` (agent + optional UI under `crates/agent/ui`)
+  - `querymt-agent` (agent + optional embedded dashboard from `querymt-desktop`)
   - `querymt-service` (Axum service; bin `qmt-service`)
   - Provider crates under `crates/providers/*`
 - Toolchain: `rust-toolchain.toml` (stable + clippy + rustfmt; includes `wasm32-wasip1`).
@@ -38,11 +38,14 @@ When running any of the commands below, prefer delegating to a subagent when ava
 - `cargo check -p querymt-service`
 
 ### Agent crate (matches CI)
-- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth -- -D warnings`
+- `cargo clippy -p querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`
 
-### UI (agent dashboard)
-- `cd crates/agent/ui && bun install`
-- `cd crates/agent/ui && bun test`
+### Dashboard
+- The Svelte dashboard source lives in the separate `querymt-desktop` repository.
+- Automatic pinned-source dashboard builds require Node.js and npm, then run the embedded tests/build.
+- `QMT_UI_DIST` optionally selects a prebuilt local directory or `.tar.gz` archive and takes priority over other UI selection.
+- A plain `QMT_UI_REVISION` selects a Git SHA, tag, or ref to build from source.
+- Content-pinned release forms are `sha256:<64hex>` (latest release) and `<release>@sha256:<64hex>` (including `latest@sha256:<64hex>`).
 
 ## Code Style Guidelines
 

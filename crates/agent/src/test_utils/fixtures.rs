@@ -3,7 +3,6 @@
 //! Three composable tiers:
 //! - [`TestStorage`] — raw storage only (fastest, no agent)
 //! - [`TestAgent`] — storage + AgentConfig + AgentHandle
-//! - [`TestServerState`] — agent + ServerState + connection helpers
 
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::agent::agent_config_builder::AgentConfigBuilder;
@@ -137,67 +136,5 @@ impl TestAgent {
             .await
             .expect("create session")
             .public_id
-    }
-}
-
-// ── Tier 3 ── agent + ServerState ────────────────────────────────────────────
-
-/// Agent + ServerState for UI/handler tests.
-#[cfg(feature = "api")]
-pub struct TestServerState {
-    pub agent: TestAgent,
-    pub(crate) state: crate::ui::ServerState,
-}
-
-#[cfg(feature = "api")]
-impl TestServerState {
-    /// Default server state backed by `TestAgent::with_observer()`.
-    pub async fn new() -> Self {
-        let agent = TestAgent::with_observer().await;
-        let state = crate::ui::ServerState {
-            agent: agent.handle.clone(),
-            view_store: agent.storage.view_store().expect("view store"),
-            session_store: agent.storage.session_store(),
-            default_cwd: None,
-            event_sources: vec![],
-            profiles: None,
-            connections: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            connection_senders: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            session_agents: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            session_cwds: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            workspace_manager: crate::index::WorkspaceIndexManagerActor::new(
-                crate::index::WorkspaceIndexManagerConfig::default(),
-            ),
-            oauth_service: agent.handle.oauth_service.clone(),
-            shutdown_token: tokio_util::sync::CancellationToken::new(),
-            #[cfg(feature = "remote")]
-            remote_node_cache: Arc::new(tokio::sync::Mutex::new(None)),
-        };
-        Self { agent, state }
-    }
-
-    /// Insert a default connection and return (tx, rx) channel pair.
-    pub async fn add_connection(
-        &self,
-        conn_id: &str,
-    ) -> (
-        tokio::sync::mpsc::Sender<String>,
-        tokio::sync::mpsc::Receiver<String>,
-    ) {
-        let (tx, rx) = tokio::sync::mpsc::channel(32);
-        let mut connections = self.state.connections.lock().await;
-        connections.insert(
-            conn_id.to_string(),
-            crate::ui::ConnectionState {
-                routing_mode: crate::ui::RoutingMode::Single,
-                active_agent_id: "primary".to_string(),
-                sessions: std::collections::HashMap::new(),
-                subscribed_sessions: std::collections::HashSet::new(),
-                session_cursors: std::collections::HashMap::new(),
-                current_workspace_root: None,
-                file_index_forwarder: None,
-            },
-        );
-        (tx, rx)
     }
 }

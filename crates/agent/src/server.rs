@@ -1,5 +1,4 @@
 use crate::api::ProfileRuntimeHandle;
-use crate::ui::UiServer;
 use crate::{acp::AcpServer, session::StorageBackend};
 use axum::Router;
 use axum::routing::get;
@@ -10,24 +9,16 @@ use axum::{
 };
 #[cfg(feature = "dashboard")]
 use rust_embed::RustEmbed;
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "dashboard")]
 #[derive(RustEmbed)]
-#[folder = "ui/dist/"]
+#[folder = "$QMT_UI_EMBED_DIR"]
 struct DashboardAssets;
-
-#[cfg(feature = "dashboard-ng")]
-#[derive(RustEmbed)]
-#[folder = "ui/dashboard-ng-dist/"]
-struct DashboardNgAssets;
 
 pub struct AgentServer {
     agent: Arc<crate::agent::LocalAgentHandle>,
     storage: Arc<dyn StorageBackend>,
-    default_cwd: Option<PathBuf>,
     profiles: Option<ProfileRuntimeHandle>,
 }
 
@@ -35,8 +26,6 @@ pub struct AgentServer {
 pub enum ServerMode {
     #[cfg(feature = "dashboard")]
     Dashboard,
-    #[cfg(feature = "dashboard-ng")]
-    DashboardNg,
     Api,
 }
 
@@ -44,12 +33,10 @@ impl AgentServer {
     pub fn new(
         agent: Arc<crate::agent::LocalAgentHandle>,
         storage: Arc<dyn StorageBackend>,
-        default_cwd: Option<PathBuf>,
     ) -> Self {
         Self {
             agent,
             storage,
-            default_cwd,
             profiles: None,
         }
     }
@@ -71,25 +58,19 @@ impl AgentServer {
 
     pub async fn run(self, addr: &str, mode: ServerMode) -> anyhow::Result<()> {
         let profiles = self.profiles.clone();
-        let shutdown_token = CancellationToken::new();
-        let app = self.build_app(mode, shutdown_token.clone())?;
+        let app = self.build_app(mode)?;
         let agent = self.agent.clone();
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         match mode {
             #[cfg(feature = "dashboard")]
             ServerMode::Dashboard => log::info!("UI dashboard listening on http://{}", addr),
-            #[cfg(feature = "dashboard-ng")]
-            ServerMode::DashboardNg => {
-                log::info!("Next-generation UI dashboard listening on http://{}", addr)
-            }
             ServerMode::Api => log::info!("API server listening on http://{}", addr),
         }
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 crate::acp::shutdown::signal().await;
-                shutdown_token.cancel();
-                log::info!("Received shutdown signal, stopping UI server...");
+                log::info!("Received shutdown signal, stopping server...");
             })
             .await?;
 
@@ -102,62 +83,23 @@ impl AgentServer {
         Ok(())
     }
 
-    fn build_app(
-        &self,
-        mode: ServerMode,
-        shutdown_token: CancellationToken,
-    ) -> anyhow::Result<Router> {
+    fn build_app(&self, mode: ServerMode) -> anyhow::Result<Router> {
         let acp_router = match mode {
-            #[cfg(feature = "dashboard-ng")]
-            ServerMode::DashboardNg => {
-                crate::acp::websocket::same_origin_router(self.agent.clone())
-            }
-            _ => AcpServer::new(self.agent.clone()).router(),
+            #[cfg(feature = "dashboard")]
+            ServerMode::Dashboard => crate::acp::websocket::same_origin_router(self.agent.clone()),
+            ServerMode::Api => AcpServer::new(self.agent.clone()).router(),
         };
         let export_storage = self.storage.clone();
-        let mut app = acp_router.route(
+        let app = acp_router.route(
             "/api/export/sft",
             get(move |query| handle_sft_export(query, export_storage)),
         );
-
-        let serve_legacy_ui = match mode {
-            #[cfg(feature = "dashboard-ng")]
-            ServerMode::DashboardNg => false,
-            _ => true,
-        };
-        if serve_legacy_ui {
-            let view_store = self.storage.view_store().ok_or_else(|| {
-                anyhow::anyhow!("ViewStore is required to serve the UI websocket API")
-            })?;
-            let ui_server = match self.profiles.clone() {
-                Some(profiles) => UiServer::with_profiles(
-                    self.agent.clone(),
-                    view_store,
-                    self.storage.session_store().clone(),
-                    self.default_cwd.clone(),
-                    profiles,
-                    shutdown_token.clone(),
-                ),
-                None => UiServer::new(
-                    self.agent.clone(),
-                    view_store,
-                    self.storage.session_store().clone(),
-                    self.default_cwd.clone(),
-                    shutdown_token,
-                ),
-            };
-            app = app.nest("/ui", ui_server.router());
-        }
 
         Ok(match mode {
             #[cfg(feature = "dashboard")]
             ServerMode::Dashboard => app
                 .route("/", get(dashboard_index_handler))
                 .fallback(dashboard_static_handler),
-            #[cfg(feature = "dashboard-ng")]
-            ServerMode::DashboardNg => app
-                .route("/", get(dashboard_ng_index_handler))
-                .fallback(dashboard_ng_static_handler),
             ServerMode::Api => app,
         })
     }
@@ -171,16 +113,6 @@ async fn dashboard_index_handler() -> impl IntoResponse {
 #[cfg(feature = "dashboard")]
 async fn dashboard_static_handler(uri: axum::http::Uri) -> impl IntoResponse {
     serve_static_path::<DashboardAssets>(&uri)
-}
-
-#[cfg(feature = "dashboard-ng")]
-async fn dashboard_ng_index_handler() -> impl IntoResponse {
-    serve_asset::<DashboardNgAssets>("index.html")
-}
-
-#[cfg(feature = "dashboard-ng")]
-async fn dashboard_ng_static_handler(uri: axum::http::Uri) -> impl IntoResponse {
-    serve_static_path::<DashboardNgAssets>(&uri)
 }
 
 #[cfg(feature = "dashboard")]
@@ -356,7 +288,7 @@ async fn handle_sft_export(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-#[cfg(all(test, feature = "dashboard-ng"))]
+#[cfg(all(test, feature = "dashboard"))]
 mod dashboard_tests {
     use super::*;
     use axum::body::Body;
@@ -370,61 +302,43 @@ mod dashboard_tests {
         String::from_utf8(body.to_vec()).expect("UTF-8 response")
     }
 
-    fn websocket_request(uri: &str, host: &str) -> Request<Body> {
-        Request::builder()
+    fn websocket_request(uri: &str, host: &str, origin: Option<&str>) -> Request<Body> {
+        let request = Request::builder()
             .uri(uri)
             .header(header::HOST, host)
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, "websocket")
             .header(header::SEC_WEBSOCKET_VERSION, "13")
-            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==")
-            .body(Body::empty())
-            .expect("WebSocket request")
+            .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
+        let request = match origin {
+            Some(origin) => request.header(header::ORIGIN, origin),
+            None => request,
+        };
+        request.body(Body::empty()).expect("WebSocket request")
     }
 
-    #[cfg(feature = "dashboard-ng")]
     #[tokio::test]
-    async fn dashboard_modes_serve_distinct_assets_and_routes() {
+    async fn dashboard_serves_embedded_assets_and_acp_only() {
+        let removed_ui_ws_path = "/ui/ws";
         let fixture = crate::test_utils::TestAgent::new().await;
-        let server = AgentServer::new(fixture.handle.clone(), fixture.storage.clone(), None);
+        let server = AgentServer::new(fixture.handle.clone(), fixture.storage.clone());
         let dashboard = server
-            .build_app(ServerMode::Dashboard, CancellationToken::new())
-            .expect("legacy dashboard router");
+            .build_app(ServerMode::Dashboard)
+            .expect("dashboard router");
 
         let response = dashboard
             .clone()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
-            .expect("legacy dashboard response");
+            .expect("dashboard response");
         assert_eq!(response.status(), StatusCode::OK);
         assert!(
             response_text(response)
                 .await
-                .contains("QueryMT Agent Dashboard")
+                .contains("<title>QueryMT</title>")
         );
-        let legacy_ws = dashboard
-            .oneshot(websocket_request("/ui/ws", "127.0.0.1:3000"))
-            .await
-            .expect("legacy websocket route");
-        // Direct router calls do not provide hyper's OnUpgrade extension, so a
-        // matched WebSocket route rejects the otherwise valid handshake with 426.
-        assert_eq!(legacy_ws.status(), StatusCode::UPGRADE_REQUIRED);
 
-        let server = AgentServer::new(fixture.handle.clone(), fixture.storage.clone(), None);
-        let dashboard_ng = server
-            .build_app(ServerMode::DashboardNg, CancellationToken::new())
-            .expect("next-generation dashboard router");
-        let response = dashboard_ng
-            .clone()
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .expect("next-generation dashboard response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response_text(response).await;
-        assert!(body.contains("<title>QueryMT</title>"));
-        assert!(!body.contains("QueryMT Agent Dashboard"));
-
-        let manifest = dashboard_ng
+        let manifest = dashboard
             .clone()
             .oneshot(
                 Request::builder()
@@ -440,27 +354,68 @@ mod dashboard_tests {
         assert_eq!(manifest["target"], "embedded");
         assert_eq!(manifest["acpWebSocketPath"], "/acp/ws");
 
-        let acp_ws = dashboard_ng
+        let acp_ws = dashboard
             .clone()
-            .oneshot(websocket_request("/acp/ws", "127.0.0.1:3000"))
+            .oneshot(websocket_request("/acp/ws", "127.0.0.1:3000", None))
             .await
             .expect("ACP websocket route");
+        // Direct router calls do not provide hyper's OnUpgrade extension, so a
+        // matched WebSocket route rejects the otherwise valid handshake with 426.
         assert_eq!(acp_ws.status(), StatusCode::UPGRADE_REQUIRED);
-        let legacy_ws = dashboard_ng
-            .oneshot(
-                Request::builder()
-                    .uri("/ui/ws")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+
+        let cross_origin_acp_ws = dashboard
+            .clone()
+            .oneshot(websocket_request(
+                "/acp/ws",
+                "127.0.0.1:3000",
+                Some("http://evil.example"),
+            ))
             .await
-            .expect("legacy websocket fallback");
+            .expect("cross-origin dashboard ACP websocket route");
+        assert_eq!(cross_origin_acp_ws.status(), StatusCode::FORBIDDEN);
+
+        let legacy_ws = dashboard
+            .oneshot(websocket_request(
+                removed_ui_ws_path,
+                "127.0.0.1:3000",
+                None,
+            ))
+            .await
+            .expect("dashboard SPA fallback");
         assert_eq!(legacy_ws.status(), StatusCode::OK);
+        assert_eq!(
+            legacy_ws.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
         assert!(
             response_text(legacy_ws)
                 .await
                 .contains("<title>QueryMT</title>")
         );
+
+        let api = AgentServer::new(fixture.handle.clone(), fixture.storage.clone())
+            .build_app(ServerMode::Api)
+            .expect("API router");
+        let cross_origin_acp_ws = api
+            .clone()
+            .oneshot(websocket_request(
+                "/acp/ws",
+                "127.0.0.1:3000",
+                Some("http://evil.example"),
+            ))
+            .await
+            .expect("unrestricted API ACP websocket route");
+        assert_eq!(cross_origin_acp_ws.status(), StatusCode::UPGRADE_REQUIRED);
+
+        let legacy_ws = api
+            .oneshot(websocket_request(
+                removed_ui_ws_path,
+                "127.0.0.1:3000",
+                None,
+            ))
+            .await
+            .expect("missing legacy websocket route");
+        assert_eq!(legacy_ws.status(), StatusCode::NOT_FOUND);
     }
 }
 

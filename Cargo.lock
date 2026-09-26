@@ -11490,6 +11490,7 @@ dependencies = [
  "dirs 7.0.0",
  "env_logger",
  "fast_html2md",
+ "flate2",
  "futures-util",
  "gix",
  "glob",
@@ -11545,6 +11546,7 @@ dependencies = [
  "stop-words 0.10.1",
  "strsim 0.11.1",
  "syn 2.0.119",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -11571,6 +11573,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "typeshare",
+ "ureq 3.3.0",
  "uuid 1.26.1",
  "whatlang",
 ]
@@ -12647,6 +12650,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rust-embed-utils",
+ "shellexpand",
  "syn 2.0.119",
  "walkdir",
 ]

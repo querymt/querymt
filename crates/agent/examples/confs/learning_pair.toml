@@ -15,13 +15,12 @@
 #
 # ## Usage
 #
-#   cargo run --example qmtcode --features dashboard -- confs/learning_pair.toml --dashboard
+#   cargo run -p querymt-agent --example qmtcode --features dashboard -- crates/agent/examples/confs/learning_pair.toml --dashboard
 #
 #   # The planner will automatically query knowledge before planning tasks.
 #   # Try across multiple sessions — knowledge persists.
 #
-#   # Create a consolidation schedule via the dashboard UI:
-#   #   Session → Schedules → Create Schedule
+#   # Create a consolidation schedule with the `querymt/schedules/create` ACP extension:
 #   #   Prompt: "Run a knowledge consolidation cycle: list unconsolidated entries, group by topic, and consolidate related entries into project-level insights about architecture, patterns, and lessons learned."
 #   #   Trigger: Interval, 3600 seconds (hourly)
 #   #   Max steps: 15

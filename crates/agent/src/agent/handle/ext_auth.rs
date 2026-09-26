@@ -34,7 +34,7 @@ impl LocalAgentHandle {
         })?;
         let result = self
             .oauth_service
-            .start_flow("acp", &parsed.provider, None)
+            .start_flow("acp", &parsed.provider)
             .await
             .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e})))?;
         ext_json_response(&result)

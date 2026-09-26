@@ -7,7 +7,7 @@ The `querymt-agent` crate is a high-level agent runtime for QueryMaTe, providing
 QueryMT Agent is a Rust library that enables you to:
 
 - **Build AI agents** with configurable tools, models, and behaviors
-- **Run agents in multiple modes**: ACP stdio, web dashboard, or mesh networking
+- **Run agents in multiple modes**: ACP stdio, embedded Svelte dashboard over ACP, or mesh networking
 - **Support multi-agent workflows** with planner-delegate delegation patterns
 - **Manage context efficiently** with automatic compaction and pruning
 - **Enable cross-machine collaboration** via libp2p mesh networking
@@ -71,7 +71,7 @@ QueryMT Agent supports three runtime modes, switchable at runtime:
 | **Plan** | Read-only, planning focus | Analyzing and planning before implementation |
 | **Review** | Read-only, code review | Reviewing code quality and providing feedback |
 
-Switch modes with `Ctrl+M` (or `Cmd+M` on macOS) in dashboard mode.
+The embedded dashboard exposes modes through the ACP session configuration controls.
 
 ## Execution Flow
 
@@ -170,8 +170,7 @@ QueryMT implements a 3-layer context management system:
 ### Quick Start
 
 ```bash
-# Run the coder agent example with dashboard
-cd crates/agent
+# From the workspace root, run the coder agent with the pinned embedded dashboard.
 cargo run --example qmtcode --features dashboard -- --dashboard
 
 # Run as ACP stdio server

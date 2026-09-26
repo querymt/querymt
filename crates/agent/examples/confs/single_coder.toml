@@ -5,8 +5,7 @@
 #   - Plan mode: Read-only, explores and plans before implementation
 #   - Review mode: Read-only, reviews code quality and provides feedback
 #
-# Switch modes at runtime with Ctrl+M (or Cmd+M on macOS).
-# The mode indicator in the UI header shows the current mode.
+# Switch modes at runtime through the ACP session configuration controls.
 
 [profile]
 id = "default"
@@ -62,7 +61,7 @@ auto = true
 
 # Mode-aware middleware: injects reminders when in Plan or Review mode.
 # In Build mode (default), no reminder is injected — full read/write access.
-# Switch modes at runtime with Ctrl+M / Cmd+M.
+# Switch modes through the ACP session configuration controls.
 [[middleware]]
 type = "agent_mode"
 default = "build"

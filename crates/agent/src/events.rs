@@ -608,8 +608,8 @@ pub enum AgentEventKind {
     },
     /// Emitted on the remote node once its workspace index has finished
     /// building and is available via `GetFileIndex`.  Flows through the
-    /// EventForwarder → EventRelayActor → local EventSink chain so the
-    /// local UI server can react without polling.
+    /// EventForwarder → EventRelayActor → local EventSink chain so local
+    /// clients can react without polling.
     WorkspaceIndexReady {
         workspace_root: String,
     },

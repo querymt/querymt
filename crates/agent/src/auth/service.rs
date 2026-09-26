@@ -1,9 +1,8 @@
 //! Shared OAuth / auth service layer.
 //!
 //! This module contains transport-agnostic business logic for OAuth flows,
-//! provider status queries, and credential management. Both the UI WebSocket
-//! handlers and the ACP `ext_method` handlers call into these functions so
-//! that the core auth logic lives in exactly one place.
+//! provider status queries, and credential management used by ACP extension
+//! handlers.
 
 use crate::agent::agent_config::AgentConfig;
 use crate::model_inventory::ModelInventory;
@@ -41,12 +40,6 @@ pub type OAuthFlowMap = Arc<Mutex<HashMap<String, PendingOAuthFlow>>>;
 
 /// Thread-safe slot for the single active callback listener.
 pub type CallbackListenerSlot = Arc<Mutex<Option<ActiveOAuthCallbackListener>>>;
-
-/// Optional callback invoked when auto callback-listener completion finishes.
-///
-/// Used by UI transport to push websocket updates when redirect-based OAuth
-/// completes in the background. ACP passes `None`.
-pub type AutoCompleteNotifier = Arc<dyn Fn(CompleteFlowResult) + Send + Sync>;
 
 /// Result sent from the HTTP callback handler back to the listener task.
 #[cfg(feature = "oauth")]
@@ -170,8 +163,8 @@ impl OAuthService {
 
     /// Query authentication status for all configured providers (or a single one).
     ///
-    /// This is the shared implementation behind both the UI `list_auth_providers`
-    /// message and the ACP `_querymt/auth/status` extension method.
+    /// This is the shared implementation for the ACP `_querymt/auth/status`
+    /// extension method.
     pub async fn auth_status(&self, provider_filter: Option<&str>) -> Vec<AuthProviderStatus> {
         let registry = self.config.provider.plugin_registry();
         let store = crate::auth::SecretStore::new().ok();
@@ -276,12 +269,7 @@ impl OAuthService {
     /// On receiving the callback it will call [`Self::complete_flow`] server-side,
     /// persist credentials, and invalidate caches so ACP clients can discover
     /// completion via [`Self::auth_status`].
-    pub async fn start_flow(
-        &self,
-        owner: &str,
-        provider: &str,
-        auto_complete_notifier: Option<AutoCompleteNotifier>,
-    ) -> Result<StartFlowResult, String> {
+    pub async fn start_flow(&self, owner: &str, provider: &str) -> Result<StartFlowResult, String> {
         #[cfg(feature = "oauth")]
         {
             let provider_name = provider.trim().to_lowercase();
@@ -323,14 +311,11 @@ impl OAuthService {
 
             // Auto-spawn callback listener for redirect flows.
             if flow_kind == crate::auth::OAuthFlowKind::RedirectCode {
-                self.spawn_callback_listener(
-                    FlowIdentity {
-                        flow_id: flow_id.clone(),
-                        owner: owner.to_string(),
-                        provider: provider_name.clone(),
-                    },
-                    auto_complete_notifier,
-                )
+                self.spawn_callback_listener(FlowIdentity {
+                    flow_id: flow_id.clone(),
+                    owner: owner.to_string(),
+                    provider: provider_name.clone(),
+                })
                 .await;
             }
 
@@ -344,7 +329,7 @@ impl OAuthService {
 
         #[cfg(not(feature = "oauth"))]
         {
-            let _ = (owner, provider, auto_complete_notifier);
+            let _ = (owner, provider);
             Err("OAuth support is not enabled in this build".to_string())
         }
     }
@@ -353,10 +338,8 @@ impl OAuthService {
 
     /// Complete an OAuth login flow by exchanging the authorization code for tokens.
     ///
-    /// This is called:
-    /// - By the UI when the user pastes the callback URL / code.
-    /// - Internally by the callback listener when it receives the redirect.
-    /// - By ACP clients via `_querymt/auth/complete`.
+    /// This is called by the callback listener or by ACP clients through
+    /// `_querymt/auth/complete`.
     pub async fn complete_flow(
         &self,
         owner: &str,
@@ -786,28 +769,10 @@ impl OAuthService {
         self.model_inventory.invalidate_all().await;
     }
 
-    // ── cleanup_owner ─────────────────────────────────────────────────────
-
-    /// Clean up all OAuth state for a disconnecting owner (connection).
-    ///
-    /// Called when a UI WebSocket or ACP connection closes.
-    pub async fn cleanup_owner(&self, owner: &str) {
-        // Stop the listener if it belongs to this owner.
-        stop_listener_for_owner(&self.listener_slot, owner).await;
-
-        // Remove all pending flows for this owner.
-        let mut map = self.flows.lock().await;
-        map.retain(|_, f| f.owner != owner);
-    }
-
     // ── Callback listener lifecycle ───────────────────────────────────────
 
     #[cfg(feature = "oauth")]
-    async fn spawn_callback_listener(
-        &self,
-        identity: FlowIdentity,
-        auto_complete_notifier: Option<AutoCompleteNotifier>,
-    ) {
+    async fn spawn_callback_listener(&self, identity: FlowIdentity) {
         let previous = {
             let active = self.listener_slot.lock().await;
             active
@@ -845,7 +810,7 @@ impl OAuthService {
         let provider = identity.provider.clone();
 
         let task = tokio::spawn(async move {
-            run_callback_listener_task(svc, identity, auto_complete_notifier, stop_rx).await;
+            run_callback_listener_task(svc, identity, stop_rx).await;
         });
 
         let mut active = self.listener_slot.lock().await;
@@ -967,7 +932,6 @@ async fn wait_for_oauth_callback(
 async fn run_callback_listener_task(
     svc: OAuthService,
     identity: FlowIdentity,
-    auto_complete_notifier: Option<AutoCompleteNotifier>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     use axum::{
@@ -1170,19 +1134,6 @@ async fn run_callback_listener_task(
             svc.config.invalidate_provider_cache().await;
             svc.model_inventory.invalidate_all().await;
 
-            let completion = CompleteFlowResult {
-                provider: provider.clone(),
-                success: true,
-                message: format!(
-                    "Successfully authenticated with {}",
-                    oauth_provider.display_name()
-                ),
-            };
-
-            if let Some(notifier) = auto_complete_notifier.as_ref() {
-                notifier(completion);
-            }
-
             log::info!(
                 "OAuth callback flow completed successfully for provider '{}' (flow '{}')",
                 provider,
@@ -1190,15 +1141,6 @@ async fn run_callback_listener_task(
             );
         }
         Err(err) => {
-            let completion = CompleteFlowResult {
-                provider: provider.clone(),
-                success: false,
-                message: err.clone(),
-            };
-            if let Some(notifier) = auto_complete_notifier.as_ref() {
-                notifier(completion);
-            }
-
             log::warn!(
                 "OAuth callback token exchange failed for '{}': {}",
                 provider,
@@ -1250,21 +1192,6 @@ async fn stop_listener_for_flow(
             let mut map = flows.lock().await;
             map.remove(&active.flow_id);
         }
-        let _ = active.stop_tx.send(());
-        let _ = active.task.await;
-    }
-}
-
-async fn stop_listener_for_owner(listener_slot: &CallbackListenerSlot, owner: &str) {
-    let active = {
-        let mut slot = listener_slot.lock().await;
-        if slot.as_ref().is_some_and(|l| l.owner == owner) {
-            slot.take()
-        } else {
-            None
-        }
-    };
-    if let Some(active) = active {
         let _ = active.stop_tx.send(());
         let _ = active.task.await;
     }

@@ -1,6 +1,6 @@
 //! QMT Code Agent Example
 //!
-//! Multi-mode agent that can run as ACP stdio server, API server, either web dashboard, or mesh node.
+//! Multi-mode agent that can run as ACP stdio server, API server, embedded web dashboard, or mesh node.
 //!
 //! ## Usage
 //!
@@ -8,17 +8,13 @@
 //! # ACP stdio mode
 //! cargo run --example qmtcode -- --acp
 //!
-//! # API server mode (for alternate UIs like qmtui)
+//! # API server mode (ACP WebSocket and SFT export)
 //! cargo run --example qmtcode --features api -- --api
 //! cargo run --example qmtcode --features api -- --api=0.0.0.0:8080
 //!
-//! # Web dashboard mode
+//! # Embedded Svelte dashboard mode (from the workspace root)
 //! cargo run --example qmtcode --features dashboard -- --dashboard
 //! cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
-//!
-//! # Embedded Svelte dashboard mode
-//! QMT_DASHBOARD_NG_DIST="$(realpath ../querymt-desktop/build-embedded)" \
-//!   cargo run --example qmtcode --features dashboard-ng -- --dashboard-ng
 //!
 //! # Mesh mode: LAN plus any previously joined/hosted Iroh meshes
 //! cargo run --example qmtcode --features remote -- --mesh
@@ -70,14 +66,10 @@ const DEFAULT_MESH_STREAM_RECONNECT_GRACE: std::time::Duration =
     about = "Run QueryMT coder agent in ACP mode, API mode, dashboard mode, or as a mesh node"
 )]
 #[command(
-    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --acp-ws\n  qmtcode --acp-ws=0.0.0.0:42069\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --dashboard-ng\n  qmtcode --dashboard-ng=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode --mesh --mesh-invite\n  qmtcode --mesh --mesh-invite=\"My Mesh\"\n  qmtcode --mesh-join=qmt://mesh/join/TOKEN\n  qmtcode path/to/config.toml --acp"
+    after_help = "Examples:\n  qmtcode --acp\n  qmtcode --acp-ws\n  qmtcode --acp-ws=0.0.0.0:42069\n  qmtcode --api\n  qmtcode --api=0.0.0.0:8080\n  qmtcode --dashboard\n  qmtcode --dashboard=0.0.0.0:8080\n  qmtcode --mesh\n  qmtcode --mesh=/ip4/0.0.0.0/tcp/9001\n  qmtcode --api --mesh\n  qmtcode --mesh --mesh-invite\n  qmtcode --mesh --mesh-invite=\"My Mesh\"\n  qmtcode --mesh-join=qmt://mesh/join/TOKEN\n  qmtcode path/to/config.toml --acp"
 )]
 #[cfg_attr(
-    all(feature = "api", feature = "dashboard", feature = "dashboard-ng"),
-    command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "api", "dashboard", "dashboard_ng"]).multiple(false)))
-)]
-#[cfg_attr(
-    all(feature = "api", feature = "dashboard", not(feature = "dashboard-ng")),
+    all(feature = "api", feature = "dashboard"),
     command(group(ArgGroup::new("transport").args(["acp", "acp_ws", "api", "dashboard"]).multiple(false)))
 )]
 #[cfg_attr(
@@ -129,15 +121,10 @@ struct Cli {
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     api: Option<String>,
 
-    /// Run web dashboard; optionally set bind address
+    /// Run the embedded Svelte dashboard over ACP; optionally set bind address
     #[cfg(feature = "dashboard")]
     #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
     dashboard: Option<String>,
-
-    /// Run the embedded Svelte dashboard; optionally set bind address
-    #[cfg(feature = "dashboard-ng")]
-    #[arg(long, value_name = "addr", num_args = 0..=1, default_missing_value = DEFAULT_SERVER_ADDR)]
-    dashboard_ng: Option<String>,
 
     /// Enable mesh networking for cross-machine sessions.
     ///
@@ -398,10 +385,6 @@ async fn run(
     let is_dashboard = cli.dashboard.is_some();
     #[cfg(not(feature = "dashboard"))]
     let is_dashboard = false;
-    #[cfg(feature = "dashboard-ng")]
-    let is_dashboard_ng = cli.dashboard_ng.is_some();
-    #[cfg(not(feature = "dashboard-ng"))]
-    let is_dashboard_ng = false;
     #[cfg(feature = "remote")]
     let has_mesh_join = cli.mesh_join.is_some();
     #[cfg(not(feature = "remote"))]
@@ -450,9 +433,9 @@ async fn run(
         return Ok(());
     }
 
-    if !is_acp && !is_acp_ws && !is_api && !is_dashboard && !is_dashboard_ng && !has_mesh {
+    if !is_acp && !is_acp_ws && !is_api && !is_dashboard && !has_mesh {
         return Err(
-            "No mode selected. Use --acp, --acp-ws, --api, --dashboard, --dashboard-ng, --mesh, or --mesh-join."
+            "No mode selected. Use --acp, --acp-ws, --api, --dashboard, --mesh, or --mesh-join."
                 .into(),
         );
     }
@@ -708,17 +691,6 @@ async fn run(
         {
             return Err("--dashboard requires the `dashboard` feature.".into());
         }
-    } else if is_dashboard_ng {
-        #[cfg(feature = "dashboard-ng")]
-        {
-            let addr = cli.dashboard_ng.as_deref().unwrap_or(DEFAULT_SERVER_ADDR);
-            log::info!("Starting next-generation dashboard at http://{}", addr);
-            runner.server().run(addr, ServerMode::DashboardNg).await?;
-        }
-        #[cfg(not(feature = "dashboard-ng"))]
-        {
-            return Err("--dashboard-ng requires the `dashboard-ng` feature.".into());
-        }
     } else {
         eprintln!("Mesh node running. Press Ctrl+C to stop.");
         tokio::signal::ctrl_c().await?;
@@ -940,17 +912,10 @@ system = "inline"
         assert!(Cli::try_parse_from(["qmtcode", "--acp", "--acp-ws"]).is_err());
     }
 
-    #[cfg(feature = "dashboard-ng")]
+    #[cfg(feature = "dashboard")]
     #[test]
-    fn dashboard_ng_flag_defaults_to_localhost() {
-        let cli =
-            Cli::try_parse_from(["qmtcode", "--dashboard-ng"]).expect("CLI args should parse");
-        assert_eq!(cli.dashboard_ng.as_deref(), Some(DEFAULT_SERVER_ADDR));
-    }
-
-    #[cfg(feature = "dashboard-ng")]
-    #[test]
-    fn dashboard_and_dashboard_ng_are_mutually_exclusive() {
-        assert!(Cli::try_parse_from(["qmtcode", "--dashboard", "--dashboard-ng"]).is_err());
+    fn dashboard_flag_defaults_to_localhost() {
+        let cli = Cli::try_parse_from(["qmtcode", "--dashboard"]).expect("CLI args should parse");
+        assert_eq!(cli.dashboard.as_deref(), Some(DEFAULT_SERVER_ADDR));
     }
 }

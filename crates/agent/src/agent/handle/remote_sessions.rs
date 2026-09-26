@@ -259,57 +259,6 @@ impl LocalAgentHandle {
         .map_err(Self::map_remote_node_manager_error)
     }
 
-    #[cfg(feature = "remote")]
-    pub(crate) async fn fork_remote_session_operation(
-        self: &Arc<Self>,
-        source_session_id: &str,
-        message_id: &str,
-    ) -> Result<crate::agent::remote::ForkRemoteSessionResponse, agent_client_protocol::Error> {
-        self.execute_session_operation(
-            source_session_id,
-            super::session_operation::SessionOperation::Fork,
-            |session_ref| {
-                let agent = self.clone();
-                let source_session_id = source_session_id.to_owned();
-                let message_id = message_id.to_owned();
-                let node_id = session_ref.remote_node_id().map(str::to_owned);
-                Box::pin(async move {
-                    let node_id = node_id.ok_or_else(|| {
-                        crate::error::AgentError::Internal("remote fork requires owner node".into())
-                    })?;
-                    let manager = agent.find_node_manager(&node_id).await.map_err(|e| {
-                        crate::error::AgentError::from_transport_failure(
-                            querymt_remote::RemoteTransportFailure::new(
-                                querymt_remote::RemoteTransportFailureKind::ActorUnavailable,
-                                querymt_remote::DeliveryCertainty::NotDelivered,
-                                e.to_string(),
-                            ),
-                        )
-                    })?;
-                    querymt_remote::ask_remote_with_timeout(
-                        &manager,
-                        &crate::agent::remote::ForkRemoteSession {
-                            source_session_id,
-                            message_id,
-                        },
-                        Self::remote_request_timeout(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        match querymt_remote::classify_remote_send_error(e) {
-                            Ok(failure) => {
-                                crate::error::AgentError::from_transport_failure(failure)
-                            }
-                            Err(handler) => handler,
-                        }
-                    })
-                })
-            },
-        )
-        .await
-        .map_err(|e| e.into_acp_error())
-    }
-
     /// Fork a session on a remote node and return the forked child's live session ref.
     #[cfg(feature = "remote")]
     pub async fn fork_remote_session(

@@ -1,9 +1,11 @@
 //! Web Dashboard Example
 //!
-//! Demonstrates the web-based UI for interacting with an agent.
-//! Requires the `dashboard` feature to be enabled.
+//! Demonstrates the embedded Svelte UI over same-origin ACP WebSocket.
+//! Requires the `dashboard` feature, which resolves the pinned querymt-desktop UI.
 //!
 //! ## Usage
+//!
+//! From the workspace root:
 //!
 //! ```bash
 //! cargo run --example web_dashboard --features dashboard
@@ -29,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(not(feature = "dashboard"))]
 fn main() {
     eprintln!(
-        "This example requires the `dashboard` feature. \
-         Run with: cargo run --example web_dashboard --features dashboard"
+        "This example requires the `dashboard` feature. Run: \
+         cargo run --example web_dashboard --features dashboard"
     );
 }

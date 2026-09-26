@@ -1,6 +1,6 @@
 //! File index for workspace file listing and watching
 //!
-//! Provides real-time file indexing with file system watching for UI autocomplete
+//! Provides real-time file indexing with file system watching for client autocomplete
 //! and incremental function index updates.
 
 use arc_swap::ArcSwap;
@@ -1412,54 +1412,6 @@ mod tests {
         );
 
         println!("\n✓ .gitignore correctly respected with Override patterns");
-    }
-
-    /// Test that the fix works on the actual UI directory with real node_modules
-    #[tokio::test]
-    #[ignore] // Only run manually since it depends on external directory structure
-    async fn test_ui_directory_node_modules_ignored() {
-        use std::path::PathBuf;
-
-        let ui_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui");
-
-        if !ui_path.exists() {
-            println!("UI directory doesn't exist, skipping test");
-            return;
-        }
-
-        println!("\n=== Testing Real UI Directory ===");
-        println!("Path: {:?}", ui_path);
-
-        let config = FileIndexConfig::default();
-        let overrides = compile_overrides(&ui_path, &config).unwrap();
-        let index = build_file_index(&ui_path, &config, &overrides).unwrap();
-
-        println!("\nTotal files indexed: {}", index.files.len());
-
-        let node_modules_files: Vec<_> = index
-            .files
-            .iter()
-            .filter(|f| f.path.contains("node_modules"))
-            .collect();
-
-        println!(
-            "Files containing 'node_modules': {}",
-            node_modules_files.len()
-        );
-
-        if !node_modules_files.is_empty() {
-            println!("\nFirst 10 node_modules files:");
-            for file in node_modules_files.iter().take(10) {
-                println!("  {}", file.path);
-            }
-        }
-
-        assert!(
-            node_modules_files.is_empty(),
-            "node_modules should be ignored via .gitignore in UI directory"
-        );
-
-        println!("\n✓ UI directory correctly ignores node_modules");
     }
 
     /// Test that CreateKind::Any events are properly handled

@@ -65,10 +65,28 @@
         "type": "github"
       }
     },
+    "querymt-desktop": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790384856,
+        "narHash": "sha256-0Z2HkMiwLMEb91YDUG8UkFiJ3SWfH75Q/O+haIilgmw=",
+        "owner": "querymt",
+        "repo": "querymt-desktop",
+        "rev": "52a5132319fee1fde3bcf8969b717203a96f1741",
+        "type": "github"
+      },
+      "original": {
+        "owner": "querymt",
+        "repo": "querymt-desktop",
+        "rev": "52a5132319fee1fde3bcf8969b717203a96f1741",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "flake-parts": "flake-parts",
         "nixpkgs": "nixpkgs",
+        "querymt-desktop": "querymt-desktop",
         "rust-overlay": "rust-overlay"
       }
     },

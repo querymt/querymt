@@ -169,11 +169,7 @@ Agent: [In Review mode]
 
 ### Via Dashboard (Interactive)
 
-In the web dashboard, press:
-- **Ctrl+M** (Linux/Windows)
-- **Cmd+M** (macOS)
-
-The mode indicator in the header shows the current mode.
+The embedded dashboard exposes the agent mode as an ACP session configuration option. Use the mode control in the session composer to select Build, Plan, or Review.
 
 ### Via API
 
@@ -221,9 +217,9 @@ flowchart LR
     P[Plan Mode]
     R[Review Mode]
 
-    B -->|"Ctrl+M"| P
-    P -->|"Ctrl+M"| R
-    R -->|"Ctrl+M"| B
+    B -->|"Select Plan"| P
+    P -->|"Select Review"| R
+    R -->|"Select Build"| B
 ```
 
 ## Mode-Aware Behavior
@@ -391,15 +387,15 @@ When switching modes, communicate with the user:
 ### Agent Still Making Changes in Plan/Review Mode
 
 1. Check that `AgentModeMiddleware` is in the middleware stack
-2. Verify the mode is actually set (check mode indicator)
+2. Verify the mode is actually set in the session configuration
 3. Check logs for mode-related warnings
 4. Ensure mutating tools are in the `mutating_tools` list
 
 ### Mode Not Switching
 
-1. Verify dashboard is running with `--dashboard` feature
-2. Check keyboard shortcut (Ctrl+M / Cmd+M)
-3. Try switching via API instead
+1. Verify the dashboard was built with the `dashboard` feature and started with `--dashboard`
+2. Check that the mode session configuration option is available
+3. Try switching via the ACP API instead
 4. Check for middleware errors in logs
 
 ### Permission Errors in Build Mode
