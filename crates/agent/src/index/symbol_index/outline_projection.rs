@@ -20,6 +20,8 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
     let mut macros = Vec::new();
     let mut constants = Vec::new();
     let mut split_interface_enum_sections = false;
+    let mut sections = Vec::new();
+    let mut markup = Vec::new();
 
     for symbol in symbols {
         if symbol.kind == SymbolKind::Test {
@@ -68,6 +70,12 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
                     || is_nix_module_signature(&symbol.signature)
                 {
                     modules.push(symbol_to_entry(symbol, options));
+                } else if symbol.signature.starts_with('#') || symbol.signature.starts_with('[') {
+                    // Markdown headings, TOML `[table]`/`[[array]]` headers.
+                    sections.push(symbol_to_entry(symbol, options));
+                } else if symbol.signature.starts_with("{#") || symbol.signature.starts_with('<') {
+                    // Svelte template structure (elements, blocks, `<style>`).
+                    markup.push(symbol_to_entry(symbol, options));
                 } else {
                     types.push(symbol_to_entry(symbol, options));
                 }
@@ -88,31 +96,33 @@ pub fn symbols_to_sections(symbols: &[SymbolEntry], options: &IndexOptions) -> V
         }
     }
 
-    let mut sections = Vec::new();
-    push_section(&mut sections, "package", package);
-    push_section(&mut sections, "includes", includes);
-    push_section(&mut sections, "imports", imports);
-    push_section(&mut sections, "usings", usings);
-    push_section(&mut sections, "requires", requires);
-    push_section(&mut sections, "namespaces", namespaces);
-    push_section(&mut sections, "modules", modules);
+    let mut sections_out = Vec::new();
+    push_section(&mut sections_out, "package", package);
+    push_section(&mut sections_out, "includes", includes);
+    push_section(&mut sections_out, "imports", imports);
+    push_section(&mut sections_out, "usings", usings);
+    push_section(&mut sections_out, "requires", requires);
+    push_section(&mut sections_out, "namespaces", namespaces);
+    push_section(&mut sections_out, "modules", modules);
+    push_section(&mut sections_out, "sections", sections);
     if split_interface_enum_sections {
-        push_section(&mut sections, "types", types);
-        push_section(&mut sections, "interfaces", interfaces);
-        push_section(&mut sections, "enums", enums);
+        push_section(&mut sections_out, "types", types);
+        push_section(&mut sections_out, "interfaces", interfaces);
+        push_section(&mut sections_out, "enums", enums);
     } else {
         types.extend(interfaces);
         types.extend(enums);
-        push_section(&mut sections, "types", types);
+        push_section(&mut sections_out, "types", types);
     }
-    push_section(&mut sections, "classes", classes);
-    push_section(&mut sections, "traits", traits);
-    push_section(&mut sections, "impls", impls);
-    push_section(&mut sections, "functions", functions);
-    push_section(&mut sections, "macros", macros);
-    push_section(&mut sections, "constants", constants);
-    push_section(&mut sections, "tests", tests);
-    sections
+    push_section(&mut sections_out, "classes", classes);
+    push_section(&mut sections_out, "traits", traits);
+    push_section(&mut sections_out, "impls", impls);
+    push_section(&mut sections_out, "functions", functions);
+    push_section(&mut sections_out, "macros", macros);
+    push_section(&mut sections_out, "constants", constants);
+    push_section(&mut sections_out, "markup", markup);
+    push_section(&mut sections_out, "tests", tests);
+    sections_out
 }
 
 fn collect_namespace_members(

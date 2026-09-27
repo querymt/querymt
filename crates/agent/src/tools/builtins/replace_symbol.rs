@@ -449,6 +449,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replaces_svelte_script_function() {
+        // Symbols extracted from embedded `<script>` content must carry
+        // whole-file coordinates so replacement hits the right byte range.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("Counter.svelte");
+        tokio::fs::write(
+            &path,
+            "<script lang=\"ts\">\n  let count = 0;\n\n  function increment(): void {\n    count += 1;\n  }\n</script>\n\n<button on:click={increment}>{count}</button>\n",
+        )
+        .await
+        .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(dir.path().to_path_buf()));
+        let tool = ReplaceSymbolTool::new();
+
+        let result = text_content(
+            tool.call(
+                json!({
+                    "replacements": [{
+                        "path": "Counter.svelte",
+                        "symbol": "increment",
+                        "newText": "function increment(): void {\n    count += 2;\n}"
+                    }],
+                    "root": dir.path()
+                }),
+                &context,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let written = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(written.contains("count += 2;"));
+        assert!(!written.contains("count += 1;"));
+        // The markup after the script must remain untouched.
+        assert!(written.contains("<button on:click={increment}>{count}</button>"));
+        assert!(result.contains("increment"));
+    }
+
+    #[tokio::test]
     async fn replaces_struct() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("lib.rs");

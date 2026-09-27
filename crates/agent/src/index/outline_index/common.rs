@@ -121,6 +121,15 @@ pub fn get_language_for_extension(ext: &str) -> Option<&'static str> {
         "ex" | "exs" => Some("elixir"),
         "nix" => Some("nix"),
         "lua" => Some("lua"),
+        "svelte" => Some("svelte"),
+        "sh" | "bash" => Some("bash"),
+        "php" => Some("php"),
+        "kt" | "kts" => Some("kotlin"),
+        "swift" => Some("swift"),
+        "json" => Some("json"),
+        "yaml" | "yml" => Some("yaml"),
+        "toml" => Some("toml"),
+        "md" | "markdown" => Some("markdown"),
         _ => None,
     }
 }

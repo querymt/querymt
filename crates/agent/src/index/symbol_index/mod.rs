@@ -874,6 +874,585 @@ end
     }
 
     #[test]
+    fn bash_symbols_include_imports_consts_functions_and_tests() {
+        let source = r#"#!/usr/bin/env bash
+set -euo pipefail
+
+source ./lib.sh
+. ./other.sh
+
+MAX_RETRIES=5
+name="hello"
+
+run_build() {
+  echo "building"
+}
+
+function deploy {
+  echo "deploying"
+}
+
+test_pipeline() {
+  run_build
+}
+"#;
+        let index = SymbolIndex::from_source(source, "bash").unwrap();
+
+        assert_eq!(
+            index
+                .find_by_name("./lib.sh", Some(SymbolKind::Import))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("./other.sh", Some(SymbolKind::Import))
+                .len(),
+            1
+        );
+
+        let max_retries = index.find_by_name("MAX_RETRIES", Some(SymbolKind::Const));
+        assert_eq!(max_retries.len(), 1);
+        assert_eq!(max_retries[0].start_line, 7);
+
+        let run_build = index.find_by_name("run_build", Some(SymbolKind::Function));
+        assert_eq!(run_build.len(), 1);
+        assert_eq!(run_build[0].start_line, 10);
+        assert_eq!(run_build[0].end_line, 12);
+
+        assert_eq!(
+            index
+                .find_by_name("deploy", Some(SymbolKind::Function))
+                .len(),
+            1
+        );
+
+        let test = index.find_by_name("test_pipeline", Some(SymbolKind::Test));
+        assert_eq!(test.len(), 1);
+        assert_eq!(test[0].start_line, 18);
+        assert_eq!(test[0].end_line, 20);
+    }
+
+    #[test]
+    fn php_symbols_include_namespaces_classes_functions_imports_and_consts() {
+        let source = r#"<?php
+namespace App\Services;
+
+use App\Models\User;
+
+const MAX_ITEMS = 10;
+
+class UserService {
+    public function find(int $id): ?User {
+        return null;
+    }
+}
+
+interface Repository {
+    public function find(int $id);
+}
+
+trait Loggable {
+    public function log(string $msg): void {}
+}
+
+enum Status: string {
+    case Active = 'active';
+}
+
+function helper(string $name): string {
+    return $name;
+}
+"#;
+        let index = SymbolIndex::from_source(source, "php").unwrap();
+
+        let namespace = index.find_by_name("App\\Services", Some(SymbolKind::Module));
+        assert_eq!(namespace.len(), 1);
+        assert_eq!(namespace[0].start_line, 2);
+
+        let import = index.find_by_name("App\\Models\\User", Some(SymbolKind::Import));
+        let import = if import.is_empty() {
+            index.find_by_name("use App\\Models\\User;", Some(SymbolKind::Import))
+        } else {
+            import
+        };
+        assert_eq!(import.len(), 1);
+        assert_eq!(import[0].start_line, 4);
+
+        let max_items = index.find_by_name("MAX_ITEMS", Some(SymbolKind::Const));
+        assert_eq!(max_items.len(), 1);
+        assert_eq!(max_items[0].start_line, 6);
+
+        let class = index.find_by_name("UserService", Some(SymbolKind::Class));
+        assert_eq!(class.len(), 1);
+        assert_eq!(class[0].start_line, 8);
+        assert!(
+            class[0]
+                .children
+                .iter()
+                .any(|child| child.qualified_name == "UserService::find"
+                    && child.kind == SymbolKind::Method)
+        );
+
+        assert_eq!(
+            index
+                .find_by_name("Repository", Some(SymbolKind::Interface))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("Loggable", Some(SymbolKind::Trait))
+                .len(),
+            1
+        );
+
+        let status = index.find_by_name("Status", Some(SymbolKind::Enum));
+        assert_eq!(status.len(), 1);
+        assert!(
+            status[0]
+                .children
+                .iter()
+                .any(|child| child.name == "Active" && child.kind == SymbolKind::EnumVariant)
+        );
+
+        let helper = index.find_by_name("helper", Some(SymbolKind::Function));
+        assert_eq!(helper.len(), 1);
+        assert_eq!(helper[0].start_line, 26);
+    }
+
+    #[test]
+    fn kotlin_symbols_include_imports_consts_classes_interfaces_functions_and_typealiases() {
+        let source = r#"package com.example
+
+import kotlin.math.PI
+
+const val MAX = 10
+val globalName: String = "x"
+var mutableCount: Int = 1
+
+typealias UserId = String
+
+class UserService(val repo: Repo) {
+    fun find(id: UserId): String? = null
+}
+
+object Singleton {
+    val answer = 42
+}
+
+interface Repository {
+    fun find(id: String): String?
+}
+
+enum class Status { ACTIVE, INACTIVE }
+
+fun helper(name: String): String {
+    return name
+}
+"#;
+        let index = SymbolIndex::from_source(source, "kotlin").unwrap();
+
+        let import = index.find_by_name("import kotlin.math.PI", Some(SymbolKind::Import));
+        assert_eq!(import.len(), 1);
+        assert_eq!(import[0].start_line, 3);
+
+        let max = index.find_by_name("MAX", Some(SymbolKind::Const));
+        assert_eq!(max.len(), 1);
+        assert_eq!(max[0].start_line, 5);
+        assert_eq!(
+            index
+                .find_by_name("globalName", Some(SymbolKind::Const))
+                .len(),
+            1
+        );
+        assert_eq!(
+            index
+                .find_by_name("mutableCount", Some(SymbolKind::Const))
+                .len(),
+            1
+        );
+
+        let type_alias = index.find_by_name("UserId", Some(SymbolKind::TypeAlias));
+        assert_eq!(type_alias.len(), 1);
+        assert_eq!(type_alias[0].start_line, 9);
+
+        let class = index.find_by_name("UserService", Some(SymbolKind::Class));
+        assert_eq!(class.len(), 1);
+        assert_eq!(class[0].start_line, 11);
+        assert!(
+            class[0]
+                .children
+                .iter()
+                .any(|child| child.qualified_name == "UserService::find"
+                    && child.kind == SymbolKind::Method)
+        );
+
+        assert_eq!(
+            index
+                .find_by_name("Singleton", Some(SymbolKind::Class))
+                .len(),
+            1
+        );
+
+        let interface = index.find_by_name("Repository", Some(SymbolKind::Interface));
+        assert_eq!(interface.len(), 1);
+        assert_eq!(interface[0].start_line, 19);
+
+        let status = index.find_by_name("Status", Some(SymbolKind::Enum));
+        assert_eq!(status.len(), 1);
+        assert!(
+            status[0]
+                .children
+                .iter()
+                .any(|child| child.name == "ACTIVE" && child.kind == SymbolKind::EnumVariant)
+        );
+
+        let helper = index.find_by_name("helper", Some(SymbolKind::Function));
+        assert_eq!(helper.len(), 1);
+        assert_eq!(helper[0].start_line, 25);
+    }
+
+    #[test]
+    fn swift_symbols_include_imports_consts_types_protocols_extensions_and_functions() {
+        let source = r#"import Foundation
+
+let maxRetries = 5
+var counter = 0
+
+public class UserService {
+    var name: String = ""
+    func find(_ id: Int) -> String? { return nil }
+}
+
+struct Config {
+    var retries: Int
+}
+
+enum Status {
+    case active, inactive
+}
+
+protocol Repository {
+    func find(_ id: Int) -> String?
+}
+
+extension UserService: Repository {
+    func find(_ id: Int) -> String? { return nil }
+}
+
+typealias Handler = (Int) -> Void
+
+func helper(name: String) -> String {
+    return name
+}
+"#;
+        let index = SymbolIndex::from_source(source, "swift").unwrap();
+
+        let import = index.find_by_name("import Foundation", Some(SymbolKind::Import));
+        assert_eq!(import.len(), 1);
+        assert_eq!(import[0].start_line, 1);
+
+        let max_retries = index.find_by_name("maxRetries", Some(SymbolKind::Const));
+        assert_eq!(max_retries.len(), 1);
+        assert_eq!(max_retries[0].start_line, 3);
+        assert_eq!(
+            index.find_by_name("counter", Some(SymbolKind::Const)).len(),
+            1
+        );
+
+        let class = index.find_by_name("UserService", Some(SymbolKind::Class));
+        assert_eq!(class.len(), 1);
+        assert_eq!(class[0].start_line, 6);
+        assert!(
+            class[0]
+                .children
+                .iter()
+                .any(|child| child.qualified_name == "UserService::find"
+                    && child.kind == SymbolKind::Method)
+        );
+
+        let config = index.find_by_name("Config", Some(SymbolKind::Struct));
+        assert_eq!(config.len(), 1);
+        assert!(
+            config[0]
+                .children
+                .iter()
+                .any(|child| child.name == "retries" && child.kind == SymbolKind::Field)
+        );
+
+        let status = index.find_by_name("Status", Some(SymbolKind::Enum));
+        assert_eq!(status.len(), 1);
+        assert!(
+            status[0]
+                .children
+                .iter()
+                .any(|child| child.kind == SymbolKind::EnumVariant)
+        );
+
+        let protocol = index.find_by_name("Repository", Some(SymbolKind::Trait));
+        assert_eq!(protocol.len(), 1);
+        assert_eq!(protocol[0].start_line, 19);
+
+        let extension = index.find_by_name("UserService", Some(SymbolKind::Impl));
+        assert_eq!(extension.len(), 1);
+        assert_eq!(extension[0].start_line, 23);
+
+        let type_alias = index.find_by_name("Handler", Some(SymbolKind::TypeAlias));
+        assert_eq!(type_alias.len(), 1);
+
+        let helper = index.find_by_name("helper", Some(SymbolKind::Function));
+        assert_eq!(helper.len(), 1);
+        assert_eq!(helper[0].start_line, 29);
+    }
+
+    #[test]
+    fn svelte_symbols_include_script_imports_functions_consts_and_markup() {
+        let source = r#"<script lang="ts">
+  import Widget from './Widget.svelte';
+  let count = 0;
+  function increment(): void {
+    count += 1;
+  }
+</script>
+
+<script context="module">
+  export const VERSION = 1;
+  function boot(): void {}
+</script>
+
+<Widget prop={count} on:click={increment} />
+
+{#if count > 0}
+  <p>positive</p>
+{:else}
+  <p>zero</p>
+{/if}
+
+{#each items as item}
+  <span>{item}</span>
+{/each}
+
+{#snippet row(item)}
+  <li>{item}</li>
+{/snippet}
+
+<style>
+  p { color: red; }
+</style>
+"#;
+        let index = SymbolIndex::from_source(source, "svelte").unwrap();
+
+        // Imports are named by their full statement text (shared TS extractor).
+        let imports: Vec<&SymbolEntry> = index
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Import)
+            .collect();
+        assert_eq!(imports.len(), 1);
+        assert!(imports[0].name.contains("Widget"));
+        assert_eq!(imports[0].start_line, 2);
+
+        let count = index.find_by_name("count", Some(SymbolKind::Const));
+        assert_eq!(count.len(), 1);
+        assert_eq!(count[0].start_line, 3);
+
+        let increment = index.find_by_name("increment", Some(SymbolKind::Function));
+        assert_eq!(increment.len(), 1);
+        assert_eq!(increment[0].start_line, 4);
+
+        // Module script symbols share the same section mapping.
+        let version = index.find_by_name("VERSION", Some(SymbolKind::Const));
+        assert_eq!(version.len(), 1);
+        assert_eq!(version[0].start_line, 10);
+        let boot = index.find_by_name("boot", Some(SymbolKind::Function));
+        assert_eq!(boot.len(), 1);
+        assert_eq!(boot[0].start_line, 11);
+
+        // `{#snippet}` declarations are functions.
+        let snippet = index.find_by_name("row", Some(SymbolKind::Function));
+        assert_eq!(snippet.len(), 1);
+        assert_eq!(snippet[0].signature, "{#snippet row(item)}");
+        assert_eq!(snippet[0].start_line, 26);
+
+        // Top-level structure is reported as markup-prefixed Module entries.
+        let markup: Vec<&SymbolEntry> = index
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module && s.signature.starts_with('<'))
+            .collect();
+        assert!(
+            markup
+                .iter()
+                .any(|s| s.signature == "<Widget prop on:click>")
+        );
+        assert!(markup.iter().any(|s| s.signature == "<style>"));
+
+        let blocks: Vec<&SymbolEntry> = index
+            .symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Module && s.signature.starts_with("{#"))
+            .collect();
+        assert!(blocks.iter().any(|s| s.signature == "{#if count > 0}"));
+        assert!(
+            blocks
+                .iter()
+                .any(|s| s.signature.starts_with("{#each items as item}"))
+        );
+    }
+
+    #[test]
+    fn svelte_script_symbol_coordinates_are_absolute() {
+        let source = r#"<script>
+  let pad = 1;
+
+  function resize(delta: number): void {
+    pad += delta;
+  }
+</script>
+
+<p>{pad}</p>
+"#;
+        let index = SymbolIndex::from_source(source, "svelte").unwrap();
+        let resize = index.find_by_name("resize", Some(SymbolKind::Function));
+        assert_eq!(resize.len(), 1);
+        // Declared on file line 4 (inside the script on line 1).
+        assert_eq!(resize[0].start_line, 4);
+        assert_eq!(resize[0].end_line, 6);
+
+        // Byte offsets must be valid whole-file char boundaries (UTF-8 safe),
+        // and slicing the whole file by the symbol's byte range must yield the
+        // declaration.
+        assert!(source.is_char_boundary(resize[0].start_byte));
+        assert!(source.is_char_boundary(resize[0].end_byte));
+        let sliced =
+            super::extractors::safe_slice(source, resize[0].start_byte, resize[0].end_byte);
+        assert!(sliced.starts_with("function resize"));
+        assert!(sliced.contains("pad += delta"));
+    }
+
+    #[test]
+    fn json_symbols_include_top_level_keys_with_nested_children() {
+        let source = r#"{
+    "name": "demo",
+    "retries": 3,
+    "server": {
+        "host": "localhost",
+        "port": 8080
+    },
+    "tags": ["a", "b"]
+}
+"#;
+        let index = SymbolIndex::from_source(source, "json").unwrap();
+
+        let name = index.find_by_name("name", Some(SymbolKind::Const));
+        assert_eq!(name.len(), 1);
+        assert_eq!(name[0].signature, "name: \"demo\"");
+
+        let server = index.find_by_name("server", Some(SymbolKind::Const));
+        assert_eq!(server.len(), 1);
+        assert!(
+            server[0]
+                .children
+                .iter()
+                .any(|child| child.name == "host" && child.kind == SymbolKind::Const)
+        );
+        assert!(server[0].children.iter().any(|child| child.name == "port"));
+
+        let tags = index.find_by_name("tags", Some(SymbolKind::Const));
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].signature, "tags: [2 items]");
+    }
+
+    #[test]
+    fn yaml_symbols_include_top_level_keys_nested_mappings_and_sequences() {
+        let source = "name: demo\nretries: 3\nserver:\n  host: localhost\n  port: 8080\ntags:\n  - a\n  - b\nnested:\n  deep:\n    key: value\n";
+        let index = SymbolIndex::from_source(source, "yaml").unwrap();
+
+        let name = index.find_by_name("name", Some(SymbolKind::Const));
+        assert_eq!(name.len(), 1);
+        assert_eq!(name[0].signature, "name: demo");
+        assert_eq!(name[0].start_line, 1);
+
+        let server = index.find_by_name("server", Some(SymbolKind::Const));
+        assert_eq!(server.len(), 1);
+        assert!(server[0].children.iter().any(|child| child.name == "host"));
+        assert!(server[0].children.iter().any(|child| child.name == "port"));
+
+        let tags = index.find_by_name("tags", Some(SymbolKind::Const));
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].signature, "tags: [2 items]");
+
+        let nested = index.find_by_name("nested", Some(SymbolKind::Const));
+        assert_eq!(nested.len(), 1);
+        let deep = &nested[0].children[0];
+        assert_eq!(deep.name, "deep");
+        assert!(deep.children.iter().any(|child| child.name == "key"));
+    }
+
+    #[test]
+    fn toml_symbols_include_root_pairs_tables_and_arrays() {
+        let source = "name = \"demo\"\nretries = 3\n\n[server]\nhost = \"localhost\"\nport = 8080\n\n[[servers]]\nhost = \"a\"\n\n[servers.env]\nkey = \"v\"\n";
+        let index = SymbolIndex::from_source(source, "toml").unwrap();
+
+        let name = index.find_by_name("name", Some(SymbolKind::Const));
+        assert_eq!(name.len(), 1);
+        assert_eq!(name[0].signature, "name = \"demo\"");
+
+        // The key is the symbol name; the `[table]` header is the signature.
+        let server = index.find_by_name("server", Some(SymbolKind::Module));
+        assert_eq!(server.len(), 1);
+        assert_eq!(server[0].signature, "[server]");
+        assert_eq!(server[0].start_line, 4);
+        assert!(server[0].children.iter().any(|child| child.name == "host"));
+        assert!(server[0].children.iter().any(|child| child.name == "port"));
+
+        let servers = index.find_by_name("servers", Some(SymbolKind::Module));
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].signature, "[[servers]]");
+        assert!(servers[0].children.iter().any(|child| child.name == "host"));
+
+        let env = index.find_by_name("servers.env", Some(SymbolKind::Module));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].signature, "[servers.env]");
+        assert!(env[0].children.iter().any(|child| child.name == "key"));
+    }
+
+    #[test]
+    fn markdown_symbols_nest_headings_by_level() {
+        let source = "# Title\n\nIntro text here.\n\n## Section One\n\nSome content.\n\n### Sub Section\n\nMore content.\n\nSection Two\n-----------\n\nSetext body.\n";
+        let index = SymbolIndex::from_source(source, "markdown").unwrap();
+
+        let title = index.find_by_name("# Title", Some(SymbolKind::Module));
+        assert_eq!(title.len(), 1);
+        assert_eq!(title[0].start_line, 1);
+
+        let section_one = index.find_by_name("## Section One", Some(SymbolKind::Module));
+        assert_eq!(section_one.len(), 1);
+        assert_eq!(section_one[0].start_line, 5);
+        assert!(
+            title[0]
+                .children
+                .iter()
+                .any(|child| child.signature == "## Section One")
+        );
+
+        let sub = index.find_by_name("### Sub Section", Some(SymbolKind::Module));
+        assert_eq!(sub.len(), 1);
+        assert!(
+            section_one[0]
+                .children
+                .iter()
+                .any(|child| child.signature == "### Sub Section")
+        );
+
+        // Setext heading is folded in with an ATX-equivalent level.
+        let section_two = index.find_by_name("## Section Two", Some(SymbolKind::Module));
+        assert_eq!(section_two.len(), 1);
+        assert_eq!(section_two[0].start_line, 13);
+    }
+
+    #[test]
     fn elixir_defimpl_names_include_for_target() {
         let source = r#"defimpl MyProto, for: Atom do
   def render(value), do: value
