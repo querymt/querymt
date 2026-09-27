@@ -51,7 +51,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error = "0.1"
 schemars.workspace = true
-jsonschema = "0.57"
+jsonschema = "0.58"
 tokio = { version = "1.0", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip", "brotli", "deflate"] }
 rusqlite = { version = "0.40", features = ["bundled", "uuid", "time"] }
@@ -179,7 +179,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"
 criterion = { version = "0.8", features = ["async_tokio"] }
 http.workspace = true
-jsonschema = "0.57"
+jsonschema = "0.58"
 tower = { version = "0.5", features = ["util"] }
 
 [[test]]
