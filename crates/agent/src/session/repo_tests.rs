@@ -68,6 +68,37 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn set_session_name_persists_and_clears_title() {
+            let repo = make_repo();
+            let session = repo
+                .create_session(Some("original".to_string()), None, None, None)
+                .await
+                .unwrap();
+
+            // Rename persists the title and reports the stored activity time.
+            let updated_at = repo
+                .set_session_name(&session.public_id, Some("renamed".to_string()))
+                .await
+                .unwrap();
+            assert!(!updated_at.is_empty());
+            let fetched = repo.get_session(&session.public_id).await.unwrap().unwrap();
+            assert_eq!(fetched.name.as_deref(), Some("renamed"));
+
+            // Explicit clear persists NULL.
+            repo.set_session_name(&session.public_id, None)
+                .await
+                .unwrap();
+            let fetched = repo.get_session(&session.public_id).await.unwrap().unwrap();
+            assert!(fetched.name.is_none());
+
+            // Unknown sessions fail, so no metadata update could be emitted.
+            let missing = repo
+                .set_session_name("does-not-exist", Some("x".to_string()))
+                .await;
+            assert!(missing.is_err());
+        }
+
+        #[tokio::test]
         async fn create_session_with_cwd() {
             let repo = make_repo();
             let root = std::env::current_dir()

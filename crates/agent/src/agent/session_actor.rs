@@ -3728,6 +3728,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mode_change_emits_config_snapshot_once() {
+        let f = ActorFixture::new().await;
+        let mut rx = f.config.event_sink.fanout().subscribe();
+
+        f.actor_ref
+            .tell(SetMode {
+                mode: AgentMode::Plan,
+            })
+            .await
+            .expect("tell SetMode");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let mut snapshots = 0;
+        while let Ok(envelope) = rx.try_recv() {
+            if let crate::events::AgentEventKind::SessionConfigChanged { mode, .. } =
+                envelope.kind()
+            {
+                assert_eq!(*mode, AgentMode::Plan);
+                snapshots += 1;
+            }
+        }
+        assert_eq!(snapshots, 1, "expected one config snapshot for the change");
+    }
+
+    #[tokio::test]
+    async fn test_noop_mode_change_emits_no_config_snapshot() {
+        let f = ActorFixture::new().await;
+        // Establish the committed control state first.
+        f.actor_ref
+            .tell(SetMode {
+                mode: AgentMode::Plan,
+            })
+            .await
+            .expect("tell SetMode");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let mut rx = f.config.event_sink.fanout().subscribe();
+        // Same mode again: no effective change, so no snapshot.
+        f.actor_ref
+            .tell(SetMode {
+                mode: AgentMode::Plan,
+            })
+            .await
+            .expect("tell SetMode");
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        while let Ok(envelope) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    envelope.kind(),
+                    crate::events::AgentEventKind::SessionConfigChanged { .. }
+                        | crate::events::AgentEventKind::SessionModeChanged { .. }
+                ),
+                "no-op transitions must not emit configuration updates"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_set_provider_unknown_fails() {
         let f = ActorFixture::new().await;
         let result = f

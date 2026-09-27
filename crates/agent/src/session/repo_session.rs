@@ -205,7 +205,11 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(())
     }
 
-    async fn set_session_name(&self, session_id: &str, name: Option<String>) -> SessionResult<String> {
+    async fn set_session_name(
+        &self,
+        session_id: &str,
+        name: Option<String>,
+    ) -> SessionResult<String> {
         let session_id = session_id.to_string();
         let updated_at = format_rfc3339(&OffsetDateTime::now_utc());
         let updated_at_for_write = updated_at.clone();

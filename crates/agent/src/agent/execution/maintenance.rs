@@ -317,22 +317,16 @@ pub(super) async fn run_ai_compaction(
         result.original_token_count,
     );
 
-    exec_ctx
-        .add_message(request_msg)
-        .await
-        .map_err(|e| {
-            let error = anyhow::anyhow!("Failed to store compaction request: {}", e);
-            emit_compaction_failure(config, session_id, &compaction_id, &error);
-            error
-        })?;
-    exec_ctx
-        .add_message(summary_msg)
-        .await
-        .map_err(|e| {
-            let error = anyhow::anyhow!("Failed to store compaction summary: {}", e);
-            emit_compaction_failure(config, session_id, &compaction_id, &error);
-            error
-        })?;
+    exec_ctx.add_message(request_msg).await.map_err(|e| {
+        let error = anyhow::anyhow!("Failed to store compaction request: {}", e);
+        emit_compaction_failure(config, session_id, &compaction_id, &error);
+        error
+    })?;
+    exec_ctx.add_message(summary_msg).await.map_err(|e| {
+        let error = anyhow::anyhow!("Failed to store compaction summary: {}", e);
+        emit_compaction_failure(config, session_id, &compaction_id, &error);
+        error
+    })?;
 
     let filtered_messages = exec_ctx
         .session_handle

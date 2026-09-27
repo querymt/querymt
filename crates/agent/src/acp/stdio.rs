@@ -34,7 +34,6 @@ use crate::acp::protocol::{
 use crate::acp::shared::{
     AcpLiveEventTranslator, QMT_NOTIFICATION_DELEGATION_UPDATE, QMT_NOTIFICATION_INPUT_STATE,
     convert_elicitation_response, create_elicitation_request, input_state_from_event,
-    replay_agent_events_with_user_prompts,
 };
 use crate::acp::shutdown;
 use crate::event_fanout::EventFanout;
@@ -90,19 +89,14 @@ fn session_load_span(req: &LoadSessionRequest) -> tracing::Span {
     span
 }
 
-async fn prepare_session_load(
-    agent: &Arc<crate::agent::LocalAgentHandle>,
-    req: LoadSessionRequest,
+pub(crate) async fn replay_loaded_session(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
     capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
-) -> Result<AcpSessionLoadOutcome, acp::Error> {
-    let session_id = req.session_id.to_string();
-    let response = agent
-        .load_session(req)
-        .instrument(info_span!("agent.session_load", session.id = %session_id))
-        .await?;
+) -> Result<(Vec<SessionNotification>, usize), acp::Error> {
     let session_ref = {
         let registry = agent.registry.lock().await;
-        registry.get(&session_id).cloned()
+        registry.get(session_id).cloned()
     };
     let (events, prompt_blocks) = match session_ref {
         Some(session_ref) => match session_ref
@@ -122,8 +116,7 @@ async fn prepare_session_load(
                             "sessionId": session_id,
                         }))
                     })?;
-                let prompt_blocks = stored_user_prompt_blocks(history);
-                (events, prompt_blocks)
+                (events, stored_user_prompt_blocks(history))
             }
             Err(err) => {
                 tracing::warn!(session.id = %session_id, error = %err, "failed to load ACP replay events");
@@ -136,17 +129,31 @@ async fn prepare_session_load(
         }
     };
     let event_count = events.len();
-    let notifications =
-        async {
-            crate::acp::shared::replay_agent_events_materialized(
-                &session_id,
-                events,
-                &prompt_blocks,
-                capabilities,
-            )
-        }
-        .instrument(info_span!("acp.replay.translate", session.id = %session_id))
-        .await;
+    let notifications = async {
+        crate::acp::shared::replay_agent_events_materialized(
+            session_id,
+            events,
+            &prompt_blocks,
+            capabilities,
+        )
+    }
+    .instrument(info_span!("acp.replay.translate", session.id = %session_id))
+    .await;
+    Ok((notifications, event_count))
+}
+
+async fn prepare_session_load(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    req: LoadSessionRequest,
+    capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
+) -> Result<AcpSessionLoadOutcome, acp::Error> {
+    let session_id = req.session_id.to_string();
+    let response = agent
+        .load_session(req)
+        .instrument(info_span!("agent.session_load", session.id = %session_id))
+        .await?;
+    let (notifications, event_count) =
+        replay_loaded_session(agent.as_ref(), &session_id, capabilities).await?;
     tracing::Span::current().record("session.load.event_count", event_count as i64);
     tracing::Span::current().record(
         "session.load.replay_notification_count",
@@ -172,19 +179,6 @@ pub async fn load_session_with_replay(
     )
     .instrument(span)
     .await
-}
-
-/// Load a session and prepare materialized replay notifications using the
-/// connection's negotiated Preview capability snapshot.
-pub async fn load_session_with_replay_capabilities(
-    agent: &Arc<crate::agent::LocalAgentHandle>,
-    req: LoadSessionRequest,
-    capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
-) -> Result<AcpSessionLoadOutcome, acp::Error> {
-    let span = session_load_span(&req);
-    prepare_session_load(agent, req, capabilities)
-        .instrument(span)
-        .await
 }
 
 async fn advertise_available_commands(
@@ -500,10 +494,11 @@ fn spawn_event_bridge_forwarder(
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let delegation_update = translator.translate_delegation_update(&event);
-                        let session_updates = delegation_update
-                            .is_none()
-                            .then(|| translator.translate_updates(&event))
-                            .unwrap_or_default();
+                        let session_updates = if delegation_update.is_none() {
+                            translator.translate_updates(&event)
+                        } else {
+                            Vec::new()
+                        };
                         (delegation_update, session_updates)
                     };
                     let result =
@@ -955,8 +950,8 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
 mod stdio_tests {
     use super::{
         AcpLiveEventTranslator, CancelNotification, ClientBridgeMessage, PromptRequest,
-        agent_ext_request, create_elicitation_request, replay_agent_events_with_user_prompts,
-        run_bridge_task, spawn_event_bridge_forwarder, stored_user_prompt_blocks,
+        agent_ext_request, create_elicitation_request, run_bridge_task,
+        spawn_event_bridge_forwarder, stored_user_prompt_blocks,
     };
     use crate::acp::client_bridge::ClientBridgeSender;
     use crate::acp::protocol::{
@@ -964,6 +959,7 @@ mod stdio_tests {
         ElicitationAction as AcpElicitationAction, ElicitationContentValue, ImageContent,
         PromptResponse, SessionId, SessionNotification, SessionUpdate, StopReason, TextContent,
     };
+    use crate::acp::shared::replay_agent_events_with_user_prompts;
     use crate::elicitation::ElicitationAction;
     use agent_client_protocol::{Agent, ByteStreams, Client, JsonRpcMessage};
     use std::collections::BTreeMap;

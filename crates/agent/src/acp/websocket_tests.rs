@@ -29,6 +29,13 @@ use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
+/// Fresh connection-scoped translator for event-forwarder test fixtures.
+fn test_translator() -> Arc<std::sync::Mutex<super::shared::AcpLiveEventTranslator>> {
+    Arc::new(std::sync::Mutex::new(
+        super::shared::AcpLiveEventTranslator::new(),
+    ))
+}
+
 #[tokio::test]
 async fn standalone_websocket_uses_canonical_acp_path() {
     let fixture = crate::test_utils::TestAgent::new().await;
@@ -87,6 +94,102 @@ fn dashboard_websocket_origin_must_match_host() {
         HeaderValue::from_static("https://attacker.example"),
     );
     assert!(!has_allowed_websocket_origin(&headers));
+}
+
+#[tokio::test]
+async fn websocket_event_forwarder_preserves_multi_update_order() {
+    use crate::acp::shared::AcpSessionUpdateCapabilities;
+
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let session_id = "ordered-session";
+    state
+        .session_owners
+        .lock()
+        .await
+        .insert(session_id.to_string(), HashSet::from(["conn".to_string()]));
+
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(8);
+    let cancel = CancellationToken::new();
+    // A capable translator projects one event into two ordered updates.
+    let translator = Arc::new(std::sync::Mutex::new(
+        super::shared::AcpLiveEventTranslator::new(),
+    ));
+    translator
+        .lock()
+        .unwrap()
+        .set_capabilities(AcpSessionUpdateCapabilities {
+            plan_operations: false,
+            notices: false,
+            compaction: true,
+        });
+
+    spawn_event_forwarders(
+        state,
+        ConnectionEventState {
+            conn_id: "conn".to_string(),
+            tx: wire_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+        },
+        translator,
+    );
+
+    let publish = |seq: i64, kind: AgentEventKind| {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: format!("evt-{seq}"),
+            stream_seq: seq,
+            timestamp: seq,
+            session_id: session_id.to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        })
+    };
+
+    fixture.config.event_sink.fanout().publish(publish(
+        1,
+        AgentEventKind::ProviderChanged {
+            provider: "local".to_string(),
+            model: "m".to_string(),
+            config_id: 1,
+            context_limit: Some(1_000),
+            provider_node_id: None,
+        },
+    ));
+    fixture.config.event_sink.fanout().publish(publish(
+        2,
+        AgentEventKind::CompactionEnd {
+            summary: "done".to_string(),
+            summary_len: 4,
+            compaction_id: Some("c-1".to_string()),
+            context_tokens: Some(10),
+        },
+    ));
+
+    let first: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("first update")
+            .expect("wire open"),
+    )
+    .unwrap();
+    let second: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("second update")
+            .expect("wire open"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        first["params"]["update"]["sessionUpdate"],
+        "compaction_update"
+    );
+    assert_eq!(second["params"]["update"]["sessionUpdate"], "usage_update");
+    assert_eq!(second["params"]["update"]["used"], 10);
 }
 
 fn elicitation_event(session_id: &str, elicitation_id: &str) -> EventEnvelope {
@@ -155,6 +258,7 @@ async fn websocket_event_forwarder_issues_authority_only_on_capable_loopback_con
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
     fixture
         .config
@@ -240,6 +344,7 @@ async fn unauthorized_subscriber_receives_no_elicitation_content() {
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
     fixture
         .config
@@ -289,6 +394,7 @@ async fn websocket_event_forwarder_sends_native_elicitation_and_resolves_respons
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
 
     fixture
@@ -358,6 +464,7 @@ async fn websocket_event_forwarder_emits_owned_delegation_update() {
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
 
     let delegation = crate::session::domain::Delegation {
@@ -430,6 +537,7 @@ async fn websocket_event_forwarder_emits_owned_input_state() {
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
 
     fixture
@@ -485,6 +593,7 @@ async fn websocket_connections_receive_global_extension_notifications() {
                 request_counter: Arc::new(AtomicU64::new(1)),
                 connection_cancel: cancel.clone(),
             },
+            test_translator(),
         );
         receivers.push(wire_rx);
         cancellations.push(cancel);
@@ -531,6 +640,7 @@ async fn websocket_connections_receive_model_refresh_notifications() {
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
 
     let refresh = fixture.handle.model_inventory.trigger_refresh().await;
@@ -1210,6 +1320,7 @@ async fn websocket_disconnect_keeps_original_elicitation_waiter_pending() {
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
     fixture
         .config
@@ -1696,6 +1807,7 @@ async fn websocket_event_forwarder_deduplicates_elicitation_requests() {
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
         },
+        test_translator(),
     );
 
     let event = elicitation_event("ws-session", "duplicate");

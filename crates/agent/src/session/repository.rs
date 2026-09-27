@@ -28,7 +28,11 @@ pub trait SessionRepository: Send + Sync {
     /// Persist a session title (RFC 3339 `updated_at` bump included) and
     /// return the persisted last-activity timestamp. `None` explicitly clears
     /// the title. Callers emit metadata updates only after this succeeds.
-    async fn set_session_name(&self, session_id: &str, name: Option<String>) -> SessionResult<String> {
+    async fn set_session_name(
+        &self,
+        session_id: &str,
+        name: Option<String>,
+    ) -> SessionResult<String> {
         let _ = (session_id, name);
         Err(crate::session::error::SessionError::InvalidOperation(
             "set_session_name is not supported by this store".to_string(),

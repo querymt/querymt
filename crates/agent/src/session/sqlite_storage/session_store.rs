@@ -219,7 +219,11 @@ impl SessionStore for SqliteStorage {
         repo.get_session(session_id).await
     }
 
-    async fn set_session_name(&self, session_id: &str, name: Option<String>) -> SessionResult<String> {
+    async fn set_session_name(
+        &self,
+        session_id: &str,
+        name: Option<String>,
+    ) -> SessionResult<String> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
         repo.set_session_name(session_id, name).await
     }

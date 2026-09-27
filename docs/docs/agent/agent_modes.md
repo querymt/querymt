@@ -199,6 +199,80 @@ agent.notify_session(SessionNotification::SetAgentMode {
 })?;
 ```
 
+## ACP Session Updates
+
+QueryMT publishes the session state it already tracks so ACP clients stay
+synchronized. Stable updates are emitted to every ACP v1 client; Preview
+updates are emitted only when the client advertises the matching capability
+during `initialize`.
+
+### Stable updates
+
+| Update | Emitted when |
+|--------|--------------|
+| `current_mode_update` | The active session mode changes |
+| `config_option_update` | Mode, model, profile, or reasoning effort changes; always carries the complete option set |
+| `session_info_update` | A session title or last-activity timestamp is persisted |
+| `usage_update` | Provider request usage or a post-compaction context size becomes available |
+| `plan` | Legacy plan replacement for clients without plan operations |
+
+A mode change produces `current_mode_update` first, followed by
+`config_option_update`. `usage_update` reports `used` as the tokens currently
+occupying model context (cached tokens included) and `size` as the active
+model's effective context limit; the update is omitted when the limit is
+unknown, and cumulative USD cost is included only when available.
+
+### Preview (capability-gated) updates
+
+| Update | Client capability | Notes |
+|--------|-------------------|-------|
+| `plan_update` / `plan_removed` | `plan` (top level) | Item-based plan with the stable ID `querymt-todos` |
+| `notice` | `session.notices` | Advisory hook notices only; never conversation history |
+| `compaction_update` / `compaction_summary_chunk` | `session.compaction` | ID-addressed compaction lifecycle |
+
+Omitted and `null` capability fields mean unsupported. Capabilities are parsed
+per connection, so one client's Preview support never affects another client.
+
+A fully capable client advertises all three during `initialize`:
+
+```json
+{
+  "clientCapabilities": {
+    "plan": {},
+    "session": {
+      "notices": {},
+      "compaction": {}
+    }
+  }
+}
+```
+
+Leaving any of these fields out (or setting them to `null`) treats that Preview
+surface as unsupported for that connection.
+
+### Fallbacks
+
+Clients without plan operations receive the legacy full-replacement `plan`
+update (an empty snapshot stays an empty replacement because v1 has no removal
+primitive). Clients without compaction support receive neither
+`compaction_update` nor `compaction_summary_chunk`. Notices fall back to the
+event source's existing user-visible behavior.
+
+### Replay semantics
+
+When session history is replayed (for example on `session/load`), QueryMT
+materializes current state instead of replaying every historical event:
+
+- One current mode/config snapshot, one folded metadata patch, and the latest
+  valid `usage_update`.
+- The current todo plan using its stable ID.
+- Terminal compactions with their original IDs and final summaries.
+- Notices, historical compaction summary chunks, and obsolete in-progress
+  compaction states are never replayed.
+
+Replay applies the connection's capabilities after materialization, so
+unsupported Preview variants are never sent.
+
 ### Via Configuration
 
 Set default mode in configuration:

@@ -11,11 +11,12 @@ impl LocalAgentHandle {
         title: Option<String>,
     ) -> Result<String, Error> {
         let updated_at = self
+            .config
             .provider
             .history_store()
             .set_session_name(session_id, title.clone())
             .await
-            .map_err(Error::from)?;
+            .map_err(|error| Error::from(crate::error::AgentError::from(error)))?;
         self.emit_event(
             session_id,
             crate::events::AgentEventKind::SessionMetadataUpdated {

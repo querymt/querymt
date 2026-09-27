@@ -9,8 +9,8 @@ use crate::acp::protocol::{
     ClientCapabilities, CompactionId, CompactionStatus, CompactionSummaryChunk, CompactionUpdate,
     ConfigOptionUpdate, Content, ContentBlock, ContentChunk, CreateElicitationRequest,
     CreateElicitationResponse, CurrentModeUpdate, ElicitationAction as AcpElicitationAction,
-    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Error, MaybeUndefined, MessageId,
-    Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId,
+    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Error, MaybeUndefined,
+    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId,
     PlanRemoved, PlanUpdate, PlanUpdateContent, RequestPermissionOutcome, SessionId,
     SessionInfoUpdate, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
     ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
@@ -724,7 +724,7 @@ where
     let materialized = materialize_replay_state(&events, capabilities);
     let mut notifications = Vec::new();
     let session = crate::acp::protocol::SessionId::from(session_id.to_string());
-    let mut push = |update: SessionUpdate, notifications: &mut Vec<_>| {
+    let push = |update: SessionUpdate, notifications: &mut Vec<_>| {
         notifications.push(crate::acp::protocol::SessionNotification::new(
             session.clone(),
             update,
@@ -763,10 +763,7 @@ where
         if let Some(updated_at) = materialized.metadata_updated_at {
             update.updated_at = MaybeUndefined::Value(updated_at);
         }
-        push(
-            SessionUpdate::SessionInfoUpdate(update),
-            &mut notifications,
-        );
+        push(SessionUpdate::SessionInfoUpdate(update), &mut notifications);
     }
 
     // 3. Latest valid usage snapshot.
@@ -809,10 +806,7 @@ where
             if let Some(error) = &terminal.error {
                 update = update.error(error.clone());
             }
-            push(
-                SessionUpdate::CompactionUpdate(update),
-                &mut notifications,
-            );
+            push(SessionUpdate::CompactionUpdate(update), &mut notifications);
         }
     }
 
@@ -827,9 +821,7 @@ where
                     .iter()
                     .cloned()
                     .map(|block| {
-                        SessionUpdate::UserMessageChunk(user_prompt_chunk(
-                            message_id, None, block,
-                        ))
+                        SessionUpdate::UserMessageChunk(user_prompt_chunk(message_id, None, block))
                     })
                     .collect::<Vec<_>>()
             }),
@@ -905,18 +897,16 @@ fn materialize_replay_state(
                     state.usage_used = None;
                 }
             }
-            AgentEventKind::CompactionStart { compaction_id, .. } => {
-                match compaction_id {
-                    Some(id) => open_legacy_start = None,
-                    None => {
-                        legacy_counter += 1;
-                        open_legacy_start = Some(format!(
-                            "querymt-compaction-legacy-{}",
-                            envelope.seq().max(legacy_counter as i64)
-                        ));
-                    }
+            AgentEventKind::CompactionStart { compaction_id, .. } => match compaction_id {
+                Some(_) => open_legacy_start = None,
+                None => {
+                    legacy_counter += 1;
+                    open_legacy_start = Some(format!(
+                        "querymt-compaction-legacy-{}",
+                        envelope.seq().max(legacy_counter as i64)
+                    ));
                 }
-            }
+            },
             AgentEventKind::CompactionEnd {
                 compaction_id,
                 summary,
@@ -933,7 +923,9 @@ fn materialize_replay_state(
                         )
                     }),
                 };
-                state.compactions.retain(|c: &ReplayCompactionTerminal| c.id != id);
+                state
+                    .compactions
+                    .retain(|c: &ReplayCompactionTerminal| c.id != id);
                 state.compactions.push(ReplayCompactionTerminal {
                     id: id.clone(),
                     status: CompactionStatus::Completed,
@@ -1161,6 +1153,14 @@ impl AcpLiveEventTranslator {
             .collect()
     }
 
+    /// Single-notification adapter over [`Self::translate_notifications`].
+    ///
+    /// Prefer the plural form in delivery loops so no projected update is
+    /// dropped when one event produces several ordered notifications.
+    pub fn translate_notification(&mut self, event: &EventEnvelope) -> Option<serde_json::Value> {
+        self.translate_notifications(event).into_iter().next()
+    }
+
     /// Translates one internal event into zero or more ordered session updates.
     pub fn translate_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
         match event.kind() {
@@ -1224,6 +1224,14 @@ impl AcpLiveEventTranslator {
         }
     }
 
+    /// Single-update adapter over [`Self::translate_updates`].
+    ///
+    /// Prefer the plural form; one event may produce several ordered updates
+    /// (for example a terminal compaction followed by a usage snapshot).
+    pub fn translate_update(&mut self, event: &EventEnvelope) -> Option<SessionUpdate> {
+        self.translate_updates(event).into_iter().next()
+    }
+
     /// Live-only projection for stateful session updates plus fallthrough to
     /// the shared stateless translation.
     fn translate_live_event(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
@@ -1257,10 +1265,7 @@ impl AcpLiveEventTranslator {
                 vec![SessionUpdate::SessionInfoUpdate(update)]
             }
             AgentEventKind::ProviderChanged { context_limit, .. } => {
-                self.usage
-                    .entry(session_id)
-                    .or_default()
-                    .context_limit = *context_limit;
+                self.usage.entry(session_id).or_default().context_limit = *context_limit;
                 Vec::new()
             }
             AgentEventKind::LlmRequestEnd {
@@ -1391,18 +1396,15 @@ impl AcpLiveEventTranslator {
         if self.capabilities.plan_operations {
             if entries.is_empty() {
                 if self.announced_todo_plans.remove(session_id) {
-                    return vec![SessionUpdate::PlanRemoved(PlanRemoved::new(
-                        PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
-                    ))];
+                    return vec![SessionUpdate::PlanRemoved(PlanRemoved::new(PlanId::from(
+                        QUERYMT_TODO_PLAN_ID.to_string(),
+                    )))];
                 }
                 return Vec::new();
             }
             self.announced_todo_plans.insert(session_id.to_owned());
             return vec![SessionUpdate::PlanUpdate(PlanUpdate::new(
-                PlanUpdateContent::items(
-                    PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
-                    entries,
-                ),
+                PlanUpdateContent::items(PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()), entries),
             ))];
         }
         vec![SessionUpdate::Plan(Plan::new(entries))]
@@ -1903,12 +1905,12 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     )
                                     .await?;
                                     let mut value = serde_json::to_value(r).unwrap();
-                                    if let (Some(hooks), Some(local_agent)) = (
-                                        context.session_hooks.as_ref(),
-                                        agent.as_any().downcast_ref::<AgentHandle>(),
-                                    ) && let Err(error) = hooks
-                                        .on_session_loaded(local_agent, &session_id, &mut value)
-                                        .await
+                                    let local_agent = agent.as_any().downcast_ref::<AgentHandle>();
+                                    if let (Some(hooks), Some(local_agent)) =
+                                        (context.session_hooks.as_ref(), local_agent)
+                                        && let Err(error) = hooks
+                                            .on_session_loaded(local_agent, &session_id, &mut value)
+                                            .await
                                     {
                                         if ownership_inserted {
                                             unsubscribe_connection(
@@ -1919,6 +1921,46 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                             .await;
                                         }
                                         return Err(error);
+                                    }
+                                    if let Some(local_agent) = local_agent {
+                                        let capabilities = context
+                                            .translator
+                                            .as_ref()
+                                            .map(|translator| {
+                                                translator
+                                                    .lock()
+                                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                    .capabilities()
+                                            })
+                                            .unwrap_or_default();
+                                        let replay =
+                                            crate::acp::stdio::replay_loaded_session(
+                                                local_agent,
+                                                &session_id,
+                                                &capabilities,
+                                            )
+                                            .await;
+                                        let (replay, _) = match replay {
+                                            Ok(replay) => replay,
+                                            Err(error) => {
+                                                if ownership_inserted {
+                                                    unsubscribe_connection(
+                                                        session_owners,
+                                                        &session_id,
+                                                        conn_id,
+                                                    )
+                                                    .await;
+                                                }
+                                                return Err(error);
+                                            }
+                                        };
+                                        notifications.extend(replay.into_iter().map(|params| {
+                                            serde_json::json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "session/update",
+                                                "params": params,
+                                            })
+                                        }));
                                     }
                                     if let Some(notification) =
                                         available_commands_session_update(agent, &session_id).await
@@ -1968,11 +2010,19 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     }
                 }
                 m if m == AGENT_METHOD_NAMES.session_close => {
-                    match serde_json::from_value(req.params) {
-                        Ok(params) => agent
-                            .close_session(params)
-                            .await
-                            .map(|r| serde_json::to_value(r).unwrap()),
+                    match serde_json::from_value::<crate::acp::protocol::CloseSessionRequest>(req.params)
+                    {
+                        Ok(params) => {
+                            let session_id = params.session_id.to_string();
+                            let result = agent.close_session(params).await;
+                            if result.is_ok()
+                                && let Some(translator) = context.translator.as_ref()
+                                && let Ok(mut translator) = translator.lock()
+                            {
+                                translator.forget_session(&session_id);
+                            }
+                            result.map(|r| serde_json::to_value(r).unwrap())
+                        }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -2433,6 +2483,8 @@ mod tests {
     use crate::agent::core::AgentMode;
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
+    use crate::session::backend::StorageBackend;
+    use crate::session::projection::NewDurableEvent;
     use crate::test_utils::DelegateTestFixture;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -4260,6 +4312,156 @@ mod tests {
         .await
     }
 
+    async fn dispatch_session_load_with_capabilities(
+        agent: &crate::agent::LocalAgentHandle,
+        session_id: &str,
+        capabilities: AcpSessionUpdateCapabilities,
+    ) -> RpcDispatchOutput {
+        let translator = Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new()));
+        translator.lock().unwrap().set_capabilities(capabilities);
+        let session_owners = SessionOwnerMap::default();
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        handle_rpc_message_with_context(
+            agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-1",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_load.to_string(),
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": "/tmp",
+                    "mcpServers": [],
+                }),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                session_hooks: None,
+                session_bridge: None,
+                elicitation_recovery: None,
+                translator: Some(translator),
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_materialized_updates_for_connection_capabilities() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        for kind in [
+            AgentEventKind::ToolCallStart {
+                tool_call_id: "todo-1".to_string(),
+                tool_name: "todowrite".to_string(),
+                arguments: serde_json::json!({
+                    "todos": [{
+                        "content": "ship replay",
+                        "status": "in_progress",
+                        "priority": "high"
+                    }]
+                })
+                .to_string(),
+            },
+            AgentEventKind::CompactionStart {
+                token_estimate: 10,
+                compaction_id: Some("compaction-1".to_string()),
+            },
+            AgentEventKind::CompactionSummaryChunk {
+                compaction_id: "compaction-1".to_string(),
+                content: "streamed summary".to_string(),
+            },
+            AgentEventKind::CompactionEnd {
+                summary: "final summary".to_string(),
+                summary_len: 13,
+                compaction_id: Some("compaction-1".to_string()),
+                context_tokens: Some(5),
+            },
+            AgentEventKind::HookNotice {
+                event_name: "post_tool".to_string(),
+                message: "live only".to_string(),
+                is_error: false,
+            },
+        ] {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .expect("persist replay event");
+        }
+
+        let capable = dispatch_session_load_with_capabilities(
+            fixture.handle.as_ref(),
+            &session_id,
+            AcpSessionUpdateCapabilities {
+                plan_operations: true,
+                notices: true,
+                compaction: true,
+            },
+        )
+        .await;
+        assert!(capable.response.unwrap().error.is_none());
+        let capable_updates: Vec<&serde_json::Value> = capable
+            .notifications
+            .iter()
+            .filter_map(|notification| notification["params"].get("update"))
+            .collect();
+        assert!(capable_updates.iter().any(|update| {
+            update["sessionUpdate"] == "plan_update"
+                && update["plan"]["planId"] == QUERYMT_TODO_PLAN_ID
+        }));
+        assert!(capable_updates.iter().any(|update| {
+            update["sessionUpdate"] == "compaction_update"
+                && update["compactionId"] == "compaction-1"
+                && update["status"] == "completed"
+        }));
+        assert!(capable_updates.iter().all(|update| {
+            !matches!(
+                update["sessionUpdate"].as_str(),
+                Some("notice" | "compaction_summary_chunk")
+            )
+        }));
+
+        let legacy = dispatch_session_load_with_capabilities(
+            fixture.handle.as_ref(),
+            &session_id,
+            AcpSessionUpdateCapabilities::default(),
+        )
+        .await;
+        assert!(legacy.response.unwrap().error.is_none());
+        let legacy_updates: Vec<&serde_json::Value> = legacy
+            .notifications
+            .iter()
+            .filter_map(|notification| notification["params"].get("update"))
+            .collect();
+        assert!(
+            legacy_updates
+                .iter()
+                .any(|update| update["sessionUpdate"] == "plan")
+        );
+        assert!(legacy_updates.iter().all(|update| {
+            !matches!(
+                update["sessionUpdate"].as_str(),
+                Some(
+                    "plan_update"
+                        | "plan_removed"
+                        | "notice"
+                        | "compaction_update"
+                        | "compaction_summary_chunk"
+                )
+            )
+        }));
+    }
+
     #[tokio::test]
     async fn session_new_load_and_resume_advertise_slash_commands() {
         let mut registry = crate::slash_commands::SlashCommandRegistry::new();
@@ -5273,5 +5475,1140 @@ mod tests {
                 Some("refusal")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod session_update_tests {
+    use super::*;
+    use crate::agent::core::AgentMode;
+    use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
+    use std::collections::HashMap;
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    fn envelope(seq: i64, kind: AgentEventKind) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: format!("evt-{seq}"),
+            stream_seq: seq,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        })
+    }
+
+    fn agent_event(seq: i64, kind: AgentEventKind) -> AgentEvent {
+        AgentEvent {
+            seq,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        }
+    }
+
+    fn plan_ops() -> AcpSessionUpdateCapabilities {
+        AcpSessionUpdateCapabilities {
+            plan_operations: true,
+            notices: true,
+            compaction: true,
+        }
+    }
+
+    fn todo_args(entries: &[(&str, &str)]) -> String {
+        let todos: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(content, status)| {
+                serde_json::json!({"content": content, "status": status, "priority": "medium"})
+            })
+            .collect();
+        serde_json::json!({"todos": todos}).to_string()
+    }
+
+    fn todo_start(args: &str) -> EventEnvelope {
+        envelope(
+            1,
+            AgentEventKind::ToolCallStart {
+                tool_call_id: "tc-1".to_string(),
+                tool_name: "todowrite".to_string(),
+                arguments: args.to_string(),
+            },
+        )
+    }
+
+    fn usage_end(seq: i64, context_tokens: u64, cumulative_cost: Option<f64>) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::LlmRequestEnd {
+                usage: None,
+                tool_calls: 0,
+                finish_reason: None,
+                cost_usd: None,
+                cumulative_cost_usd: cumulative_cost,
+                context_tokens,
+                metrics: Default::default(),
+            },
+        )
+    }
+
+    fn provider_changed(seq: i64, limit: Option<u64>) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::ProviderChanged {
+                provider: "local".to_string(),
+                model: "m".to_string(),
+                config_id: 1,
+                context_limit: limit,
+                provider_node_id: None,
+            },
+        )
+    }
+
+    // ── 1.2 Capability snapshot ────────────────────────────────────────────
+
+    #[test]
+    fn capability_snapshot_covers_every_combination() {
+        let none = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new(),
+        );
+        assert_eq!(none, AcpSessionUpdateCapabilities::default());
+
+        // Top-level plan capability.
+        let plan_only = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new()
+                .plan(crate::acp::protocol::PlanCapabilities::default()),
+        );
+        assert!(plan_only.plan_operations && !plan_only.notices && !plan_only.compaction);
+
+        // Session-scoped notices and compaction.
+        let session_scoped = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new().session(
+                crate::acp::protocol::ClientSessionCapabilities::new()
+                    .notices(crate::acp::protocol::NoticeCapabilities::new())
+                    .compaction(crate::acp::protocol::CompactionCapabilities::new()),
+            ),
+        );
+        assert!(!session_scoped.plan_operations);
+        assert!(session_scoped.notices && session_scoped.compaction);
+    }
+
+    #[test]
+    fn capability_snapshot_treats_omitted_and_null_as_unsupported() {
+        let omitted = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new(),
+        );
+        assert_eq!(omitted, AcpSessionUpdateCapabilities::default());
+
+        let null_session = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new().session(None),
+        );
+        assert!(!null_session.notices && !null_session.compaction);
+    }
+
+    #[test]
+    fn capability_snapshot_matches_documented_client_capabilities_json() {
+        // Mirrors the JSON advertised in the ACP documentation.
+        let capabilities: crate::acp::protocol::ClientCapabilities =
+            serde_json::from_value(serde_json::json!({
+                "plan": {},
+                "session": {"notices": {}, "compaction": {}}
+            }))
+            .expect("documented capabilities deserialize");
+
+        let snapshot = AcpSessionUpdateCapabilities::from_client_capabilities(&capabilities);
+        assert_eq!(snapshot, plan_ops());
+    }
+
+    #[test]
+    fn capability_snapshot_is_isolated_between_connections() {
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let mut legacy = AcpLiveEventTranslator::new();
+        legacy.set_capabilities(AcpSessionUpdateCapabilities::default());
+
+        let args = todo_args(&[("a", "pending")]);
+        assert!(matches!(
+            capable.translate_updates(&todo_start(&args)).as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+        assert!(matches!(
+            legacy.translate_updates(&todo_start(&args)).as_slice(),
+            [SessionUpdate::Plan(_)]
+        ));
+    }
+
+    #[test]
+    fn mixed_capability_clients_receive_only_supported_preview_variants() {
+        let mut full = AcpLiveEventTranslator::new();
+        full.set_capabilities(plan_ops());
+        let mut compaction_only = AcpLiveEventTranslator::new();
+        compaction_only.set_capabilities(AcpSessionUpdateCapabilities {
+            plan_operations: false,
+            notices: false,
+            compaction: true,
+        });
+        let mut legacy = AcpLiveEventTranslator::new();
+
+        let notice = envelope(
+            1,
+            AgentEventKind::HookNotice {
+                event_name: "hook".to_string(),
+                message: "m".to_string(),
+                is_error: false,
+            },
+        );
+        assert!(matches!(
+            full.translate_updates(&notice).as_slice(),
+            [SessionUpdate::Notice(_)]
+        ));
+        assert!(compaction_only.translate_updates(&notice).is_empty());
+        assert!(legacy.translate_updates(&notice).is_empty());
+
+        let plan = todo_start(&todo_args(&[("a", "pending")]));
+        assert!(matches!(
+            full.translate_updates(&plan).as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+        // Compaction-only clients fall back to the legacy plan replacement.
+        assert!(matches!(
+            compaction_only.translate_updates(&plan).as_slice(),
+            [SessionUpdate::Plan(_)]
+        ));
+
+        let compaction = envelope(
+            3,
+            AgentEventKind::CompactionStart {
+                token_estimate: 1,
+                compaction_id: Some("c".to_string()),
+            },
+        );
+        assert!(matches!(
+            full.translate_updates(&compaction).as_slice(),
+            [SessionUpdate::CompactionUpdate(_)]
+        ));
+        assert!(matches!(
+            compaction_only.translate_updates(&compaction).as_slice(),
+            [SessionUpdate::CompactionUpdate(_)]
+        ));
+        assert!(legacy.translate_updates(&compaction).is_empty());
+
+        // Stable configuration updates reach every client regardless of
+        // Preview support.
+        let config = envelope(
+            4,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Build,
+                reasoning_effort: None,
+            },
+        );
+        for translator in [&mut full, &mut compaction_only, &mut legacy] {
+            assert!(matches!(
+                translator.translate_updates(&config).as_slice(),
+                [SessionUpdate::ConfigOptionUpdate(_)]
+            ));
+        }
+    }
+
+    // ── 1.3 Zero-to-many ordering ──────────────────────────────────────────
+
+    #[test]
+    fn multiple_updates_retain_order() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&provider_changed(1, Some(200_000)));
+
+        // Terminal compaction plus a reduced usage snapshot in one event.
+        let updates = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionEnd {
+                summary: "short".to_string(),
+                summary_len: 5,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: Some(1_000),
+            },
+        ));
+        assert!(matches!(updates[0], SessionUpdate::CompactionUpdate(_)));
+        assert!(matches!(updates[1], SessionUpdate::UsageUpdate(_)));
+    }
+
+    #[test]
+    fn mode_change_orders_current_mode_before_config_replacements() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::SessionModeChanged {
+                mode: AgentMode::Plan,
+            },
+        ));
+        assert!(matches!(
+            updates.as_slice(),
+            [SessionUpdate::CurrentModeUpdate(_)]
+        ));
+
+        let updates = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Plan,
+                reasoning_effort: Some("high".to_string()),
+            },
+        ));
+        let [SessionUpdate::ConfigOptionUpdate(config)] = updates.as_slice() else {
+            panic!("expected config option update");
+        };
+        let mode = config
+            .config_options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "mode")
+            .expect("mode option");
+        assert_eq!(
+            serde_json::to_value(mode).unwrap()["currentValue"],
+            serde_json::json!("plan")
+        );
+    }
+
+    // ── 1.4 Serialization discriminators ───────────────────────────────────
+
+    #[test]
+    fn session_update_discriminators_match_acp_v1_wire_shape() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+
+        let mode_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    1,
+                    AgentEventKind::SessionModeChanged {
+                        mode: AgentMode::Build,
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(mode_json["sessionUpdate"], "current_mode_update");
+        assert_eq!(mode_json["currentModeId"], "build");
+
+        let config_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    2,
+                    AgentEventKind::SessionConfigChanged {
+                        mode: AgentMode::Build,
+                        reasoning_effort: None,
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(config_json["sessionUpdate"], "config_option_update");
+        assert!(config_json["configOptions"].is_array());
+
+        let info_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    3,
+                    AgentEventKind::SessionMetadataUpdated {
+                        title: Some(Some("Renamed".to_string())),
+                        updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(info_json["sessionUpdate"], "session_info_update");
+        assert_eq!(info_json["title"], "Renamed");
+        assert_eq!(info_json["updatedAt"], "2026-01-01T00:00:00Z");
+
+        translator.translate_updates(&provider_changed(4, Some(100)));
+        let usage_json = serde_json::to_value(
+            translator
+                .translate_updates(&usage_end(5, 42, Some(0.5)))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(usage_json["sessionUpdate"], "usage_update");
+        assert_eq!(usage_json["used"], 42);
+        assert_eq!(usage_json["size"], 100);
+        assert_eq!(usage_json["cost"]["amount"], 0.5);
+        assert_eq!(usage_json["cost"]["currency"], "USD");
+
+        let plan_json = serde_json::to_value(
+            translator
+                .translate_updates(&todo_start(&todo_args(&[("a", "pending")])))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(plan_json["sessionUpdate"], "plan_update");
+        assert_eq!(plan_json["plan"]["type"], "items");
+        assert_eq!(plan_json["plan"]["planId"], QUERYMT_TODO_PLAN_ID);
+
+        // Remove the announced plan so a removal variant is produced.
+        let removed_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    7,
+                    AgentEventKind::ToolCallStart {
+                        tool_call_id: "tc-2".to_string(),
+                        tool_name: "todowrite".to_string(),
+                        arguments: todo_args(&[]).to_string(),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(removed_json["sessionUpdate"], "plan_removed");
+        assert_eq!(removed_json["planId"], QUERYMT_TODO_PLAN_ID);
+
+        let notice_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    8,
+                    AgentEventKind::HookNotice {
+                        event_name: "pre_compaction".to_string(),
+                        message: "careful".to_string(),
+                        is_error: false,
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(notice_json["sessionUpdate"], "notice");
+        assert_eq!(notice_json["severity"], "info");
+        assert_eq!(notice_json["title"], "pre_compaction");
+        assert_eq!(notice_json["description"], "careful");
+
+        let compaction_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    9,
+                    AgentEventKind::CompactionStart {
+                        token_estimate: 10,
+                        compaction_id: Some("c-1".to_string()),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(compaction_json["sessionUpdate"], "compaction_update");
+        assert_eq!(compaction_json["compactionId"], "c-1");
+        assert_eq!(compaction_json["status"], "in_progress");
+
+        let chunk_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    10,
+                    AgentEventKind::CompactionSummaryChunk {
+                        compaction_id: "c-1".to_string(),
+                        content: "summary text".to_string(),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(chunk_json["sessionUpdate"], "compaction_summary_chunk");
+        assert_eq!(chunk_json["compactionId"], "c-1");
+        assert_eq!(chunk_json["content"]["type"], "text");
+    }
+
+    // ── 2.4 Metadata patch semantics ───────────────────────────────────────
+
+    #[test]
+    fn metadata_patches_cover_title_timestamp_omission_and_clear() {
+        let mut translator = AcpLiveEventTranslator::new();
+
+        let title_only = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::SessionMetadataUpdated {
+                title: Some(Some("T".to_string())),
+                updated_at: None,
+            },
+        ));
+        let json = serde_json::to_value(&title_only[0]).unwrap();
+        assert_eq!(json["title"], "T");
+        assert!(json.get("updatedAt").is_none());
+
+        let timestamp_only = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::SessionMetadataUpdated {
+                title: None,
+                updated_at: Some("2026-02-03T04:05:06Z".to_string()),
+            },
+        ));
+        let json = serde_json::to_value(&timestamp_only[0]).unwrap();
+        assert!(json.get("title").is_none());
+        assert_eq!(json["updatedAt"], "2026-02-03T04:05:06Z");
+
+        let cleared = translator.translate_updates(&envelope(
+            3,
+            AgentEventKind::SessionMetadataUpdated {
+                title: Some(None),
+                updated_at: None,
+            },
+        ));
+        let json = serde_json::to_value(&cleared[0]).unwrap();
+        assert!(json["title"].is_null());
+    }
+
+    // ── 3.1/3.2 Usage meter ────────────────────────────────────────────────
+
+    #[test]
+    fn usage_uses_latest_limit_and_includes_cost_and_cached_tokens() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        // Cached tokens are already included in context_tokens.
+        let updates = translator.translate_updates(&usage_end(2, 12_345, Some(1.25)));
+        let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
+            panic!("expected usage update");
+        };
+        assert_eq!(usage.used, 12_345);
+        assert_eq!(usage.size, 100_000);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+
+        // A different known limit applies to the next snapshot. A request
+        // without a fresh cost value keeps the last cumulative session cost.
+        translator.translate_updates(&provider_changed(3, Some(50_000)));
+        let updates = translator.translate_updates(&usage_end(4, 100, None));
+        let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
+            panic!("expected usage update");
+        };
+        assert_eq!(usage.size, 50_000);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+
+        // With no cost observed anywhere, the cost field stays omitted.
+        let mut fresh = AcpLiveEventTranslator::new();
+        fresh.translate_updates(&provider_changed(1, Some(50_000)));
+        let updates = fresh.translate_updates(&usage_end(2, 100, None));
+        let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
+            panic!("expected usage update");
+        };
+        assert!(usage.cost.is_none());
+    }
+
+    #[test]
+    fn usage_is_suppressed_when_limit_is_unknown() {
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(
+            translator
+                .translate_updates(&usage_end(1, 10, None))
+                .is_empty()
+        );
+
+        translator.translate_updates(&provider_changed(2, None));
+        assert!(
+            translator
+                .translate_updates(&usage_end(3, 10, None))
+                .is_empty()
+        );
+
+        // Zero is not a meaningful effective limit.
+        translator.translate_updates(&provider_changed(4, Some(0)));
+        assert!(
+            translator
+                .translate_updates(&usage_end(5, 10, None))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn usage_state_is_cleared_on_session_close() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(1_000)));
+        assert!(
+            !translator
+                .translate_updates(&usage_end(2, 10, None))
+                .is_empty()
+        );
+
+        translator.forget_session("s-1");
+        assert!(
+            translator
+                .translate_updates(&usage_end(3, 10, None))
+                .is_empty()
+        );
+    }
+
+    // ── 3.3 Compaction reduces context ─────────────────────────────────────
+
+    #[test]
+    fn compaction_completion_projects_reduced_usage() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        translator.translate_updates(&usage_end(2, 90_000, Some(2.0)));
+
+        let updates = translator.translate_updates(&envelope(
+            3,
+            AgentEventKind::CompactionEnd {
+                summary: "s".to_string(),
+                summary_len: 1,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: Some(1_000),
+            },
+        ));
+        let SessionUpdate::UsageUpdate(usage) = &updates[1] else {
+            panic!("expected usage update after compaction");
+        };
+        assert_eq!(usage.used, 1_000);
+        assert_eq!(usage.size, 100_000);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 2.0);
+    }
+
+    // ── 4.1/4.2 Plan lifecycle ─────────────────────────────────────────────
+
+    #[test]
+    fn capable_client_plan_lifecycle_create_update_remove_recreate() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+
+        let created = translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+        let [SessionUpdate::PlanUpdate(update)] = created.as_slice() else {
+            panic!("expected plan update");
+        };
+        let PlanUpdateContent::Items(items) = &update.plan else {
+            panic!("expected item-based plan");
+        };
+        assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
+        assert_eq!(items.entries.len(), 1);
+
+        let updated = translator.translate_updates(&todo_start(&todo_args(&[
+            ("a", "completed"),
+            ("b", "in_progress"),
+        ])));
+        let [SessionUpdate::PlanUpdate(update)] = updated.as_slice() else {
+            panic!("expected plan update");
+        };
+        let PlanUpdateContent::Items(items) = &update.plan else {
+            panic!("expected item-based plan");
+        };
+        assert_eq!(items.entries.len(), 2);
+
+        let removed = translator.translate_updates(&todo_start(&todo_args(&[])));
+        assert!(matches!(
+            removed.as_slice(),
+            [SessionUpdate::PlanRemoved(_)]
+        ));
+
+        // Repeated empty snapshots do not emit duplicate removals.
+        assert!(
+            translator
+                .translate_updates(&todo_start(&todo_args(&[])))
+                .is_empty()
+        );
+
+        // Recreating the plan works after removal.
+        let recreated = translator.translate_updates(&todo_start(&todo_args(&[("c", "pending")])));
+        assert!(matches!(
+            recreated.as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+    }
+
+    #[test]
+    fn legacy_client_keeps_full_replacement_plan_and_empty_plan() {
+        let mut translator = AcpLiveEventTranslator::new();
+
+        let created = translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+        let [SessionUpdate::Plan(plan)] = created.as_slice() else {
+            panic!("expected legacy plan");
+        };
+        assert_eq!(plan.entries.len(), 1);
+
+        let emptied = translator.translate_updates(&todo_start(&todo_args(&[])));
+        let [SessionUpdate::Plan(plan)] = emptied.as_slice() else {
+            panic!("expected legacy empty replacement");
+        };
+        assert!(plan.entries.is_empty());
+    }
+
+    #[test]
+    fn malformed_todowrite_emits_nothing() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        assert!(
+            translator
+                .translate_updates(&todo_start("not json"))
+                .is_empty()
+        );
+    }
+
+    // ── 4.3 Notices ────────────────────────────────────────────────────────
+
+    #[test]
+    fn notices_are_gated_and_map_severity() {
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(
+            legacy
+                .translate_updates(&envelope(
+                    1,
+                    AgentEventKind::HookNotice {
+                        event_name: "hook".to_string(),
+                        message: "m".to_string(),
+                        is_error: true,
+                    },
+                ))
+                .is_empty()
+        );
+
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let error = capable.translate_updates(&envelope(
+            1,
+            AgentEventKind::HookNotice {
+                event_name: "hook".to_string(),
+                message: "m".to_string(),
+                is_error: true,
+            },
+        ));
+        let SessionUpdate::Notice(notice) = &error[0] else {
+            panic!("expected notice");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Error);
+        assert_eq!(notice.description.as_deref(), Some("m"));
+
+        let info = capable.translate_updates(&envelope(
+            2,
+            AgentEventKind::HookNotice {
+                event_name: String::new(),
+                message: "m".to_string(),
+                is_error: false,
+            },
+        ));
+        let SessionUpdate::Notice(notice) = &info[0] else {
+            panic!("expected notice");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert!(!notice.title.is_empty());
+    }
+
+    // ── 5.3 Compaction lifecycle projection ────────────────────────────────
+
+    #[test]
+    fn compaction_updates_require_capability_and_valid_ordering() {
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(
+            legacy
+                .translate_updates(&envelope(
+                    1,
+                    AgentEventKind::CompactionStart {
+                        token_estimate: 1,
+                        compaction_id: Some("c".to_string()),
+                    },
+                ))
+                .is_empty()
+        );
+        assert!(
+            legacy
+                .translate_updates(&envelope(
+                    2,
+                    AgentEventKind::CompactionSummaryChunk {
+                        compaction_id: "c".to_string(),
+                        content: "x".to_string(),
+                    },
+                ))
+                .is_empty()
+        );
+
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let started = capable.translate_updates(&envelope(
+            1,
+            AgentEventKind::CompactionStart {
+                token_estimate: 1,
+                compaction_id: Some("c".to_string()),
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &started[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::InProgress);
+
+        let completed = capable.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionEnd {
+                summary: "final".to_string(),
+                summary_len: 5,
+                compaction_id: Some("c".to_string()),
+                context_tokens: None,
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &completed[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::Completed);
+        assert!(!matches!(update.summary, MaybeUndefined::Value(_)));
+    }
+
+    #[test]
+    fn failed_and_cancelled_compactions_carry_only_valid_fields() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+
+        let failed = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::CompactionFailed {
+                compaction_id: "c".to_string(),
+                reason: "boom".to_string(),
+                cancelled: false,
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &failed[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::Failed);
+        assert!(matches!(&update.error, MaybeUndefined::Value(v) if v == "boom"));
+
+        let cancelled = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionFailed {
+                compaction_id: "c".to_string(),
+                reason: "stop".to_string(),
+                cancelled: true,
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &cancelled[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::Cancelled);
+        assert!(!matches!(update.error, MaybeUndefined::Value(_)));
+    }
+
+    // ── 5.1 Event round trips (new and legacy) ─────────────────────────────
+
+    #[test]
+    fn compaction_events_round_trip_new_and_legacy_records() {
+        let new_end = serde_json::json!({
+            "type": "compaction_end",
+            "data": {
+                "summary": "s",
+                "summary_len": 1,
+                "compaction_id": "c-1",
+                "context_tokens": 123
+            }
+        });
+        let parsed: AgentEventKind = serde_json::from_value(new_end).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::CompactionEnd {
+                context_tokens: Some(123),
+                ..
+            }
+        ));
+
+        // Legacy record: no ID or token count.
+        let legacy_end = serde_json::json!({
+            "type": "compaction_end",
+            "data": {"summary": "s", "summary_len": 1}
+        });
+        let parsed: AgentEventKind = serde_json::from_value(legacy_end).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::CompactionEnd {
+                compaction_id: None,
+                context_tokens: None,
+                ..
+            }
+        ));
+
+        let legacy_start = serde_json::json!({
+            "type": "compaction_start",
+            "data": {"token_estimate": 10}
+        });
+        let parsed: AgentEventKind = serde_json::from_value(legacy_start).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::CompactionStart {
+                compaction_id: None,
+                ..
+            }
+        ));
+    }
+
+    // ── 6.1/6.2 Materialized replay ────────────────────────────────────────
+
+    fn replay_updates(
+        events: Vec<AgentEvent>,
+        capabilities: AcpSessionUpdateCapabilities,
+    ) -> Vec<SessionUpdate> {
+        replay_agent_events_materialized("s-1", events, &HashMap::new(), &capabilities)
+            .into_iter()
+            .map(|notification| notification.update)
+            .collect()
+    }
+
+    #[test]
+    fn replay_materializes_only_current_state_with_stable_ids() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::SessionModeChanged {
+                    mode: AgentMode::Build,
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::SessionConfigChanged {
+                    mode: AgentMode::Plan,
+                    reasoning_effort: Some("high".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::SessionMetadataUpdated {
+                    title: Some(Some("First".to_string())),
+                    updated_at: None,
+                },
+            ),
+            agent_event(
+                4,
+                AgentEventKind::SessionMetadataUpdated {
+                    title: None,
+                    updated_at: Some("2026-05-05T00:00:00Z".to_string()),
+                },
+            ),
+            agent_event(
+                5,
+                AgentEventKind::ProviderChanged {
+                    provider: "local".to_string(),
+                    model: "m".to_string(),
+                    config_id: 1,
+                    context_limit: Some(100),
+                    provider_node_id: None,
+                },
+            ),
+            agent_event(
+                6,
+                AgentEventKind::LlmRequestEnd {
+                    usage: None,
+                    tool_calls: 0,
+                    finish_reason: None,
+                    cost_usd: None,
+                    cumulative_cost_usd: Some(3.0),
+                    context_tokens: 50,
+                    metrics: Default::default(),
+                },
+            ),
+            agent_event(
+                7,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "tc".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "pending")]),
+                },
+            ),
+            agent_event(
+                8,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 1,
+                    compaction_id: Some("c-1".to_string()),
+                },
+            ),
+            agent_event(
+                9,
+                AgentEventKind::CompactionSummaryChunk {
+                    compaction_id: "c-1".to_string(),
+                    content: "chunk".to_string(),
+                },
+            ),
+            agent_event(
+                10,
+                AgentEventKind::CompactionEnd {
+                    summary: "final summary".to_string(),
+                    summary_len: 13,
+                    compaction_id: Some("c-1".to_string()),
+                    context_tokens: Some(5),
+                },
+            ),
+            agent_event(
+                11,
+                AgentEventKind::HookNotice {
+                    event_name: "hook".to_string(),
+                    message: "noisy".to_string(),
+                    is_error: false,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events.clone(), plan_ops());
+
+        let mode_updates: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::CurrentModeUpdate(_)))
+            .collect();
+        assert_eq!(mode_updates.len(), 1, "one materialized mode update");
+        let SessionUpdate::CurrentModeUpdate(update) = mode_updates[0] else {
+            unreachable!()
+        };
+        assert_eq!(update.current_mode_id.0.as_ref(), "plan");
+
+        let config_count = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::ConfigOptionUpdate(_)))
+            .count();
+        assert_eq!(config_count, 1);
+
+        let info: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::SessionInfoUpdate(_)))
+            .collect();
+        assert_eq!(info.len(), 1);
+        let SessionUpdate::SessionInfoUpdate(update) = info[0] else {
+            unreachable!()
+        };
+        assert!(matches!(&update.title, MaybeUndefined::Value(v) if v == "First"));
+        assert!(
+            matches!(&update.updated_at, MaybeUndefined::Value(v) if v == "2026-05-05T00:00:00Z")
+        );
+
+        let usage: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
+            .collect();
+        assert_eq!(usage.len(), 1, "only the latest valid usage snapshot");
+        let SessionUpdate::UsageUpdate(usage) = usage[0] else {
+            unreachable!()
+        };
+        assert_eq!(usage.used, 5);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 3.0);
+
+        let plans: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::PlanUpdate(_)))
+            .collect();
+        assert_eq!(plans.len(), 1);
+        let SessionUpdate::PlanUpdate(plan) = plans[0] else {
+            unreachable!()
+        };
+        let PlanUpdateContent::Items(items) = &plan.plan else {
+            unreachable!()
+        };
+        assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
+
+        let compactions: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::CompactionUpdate(_)))
+            .collect();
+        assert_eq!(compactions.len(), 1, "one terminal compaction update");
+        let SessionUpdate::CompactionUpdate(compaction) = compactions[0] else {
+            unreachable!()
+        };
+        assert_eq!(compaction.compaction_id.0.as_ref(), "c-1");
+        assert_eq!(compaction.status, CompactionStatus::Completed);
+        assert!(matches!(
+            &compaction.summary,
+            MaybeUndefined::Value(blocks) if !blocks.is_empty()
+        ));
+
+        // No live-only variants in replay.
+        assert!(updates.iter().all(|u| !matches!(
+            u,
+            SessionUpdate::Notice(_) | SessionUpdate::CompactionSummaryChunk(_)
+        )));
+    }
+
+    #[test]
+    fn replay_excludes_unsupported_preview_variants() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::SessionConfigChanged {
+                    mode: AgentMode::Build,
+                    reasoning_effort: None,
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "tc".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "pending")]),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::CompactionEnd {
+                    summary: "s".to_string(),
+                    summary_len: 1,
+                    compaction_id: Some("c-1".to_string()),
+                    context_tokens: None,
+                },
+            ),
+            agent_event(
+                4,
+                AgentEventKind::HookNotice {
+                    event_name: "h".to_string(),
+                    message: "m".to_string(),
+                    is_error: false,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events, AcpSessionUpdateCapabilities::default());
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::ConfigOptionUpdate(_)))
+        );
+        assert!(updates.iter().any(|u| matches!(u, SessionUpdate::Plan(_))));
+        assert!(updates.iter().all(|u| !matches!(
+            u,
+            SessionUpdate::PlanUpdate(_)
+                | SessionUpdate::PlanRemoved(_)
+                | SessionUpdate::CompactionUpdate(_)
+                | SessionUpdate::CompactionSummaryChunk(_)
+                | SessionUpdate::Notice(_)
+        )));
+    }
+
+    #[test]
+    fn replay_pairs_legacy_compaction_terminal_with_stable_id() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 10,
+                    compaction_id: None,
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::CompactionEnd {
+                    summary: "legacy".to_string(),
+                    summary_len: 6,
+                    compaction_id: None,
+                    context_tokens: None,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events, plan_ops());
+        let SessionUpdate::CompactionUpdate(compaction) = &updates[0] else {
+            panic!("expected compaction update");
+        };
+        assert!(
+            compaction
+                .compaction_id
+                .0
+                .starts_with("querymt-compaction-legacy-")
+        );
+        assert_eq!(compaction.status, CompactionStatus::Completed);
+    }
+
+    #[test]
+    fn replay_drops_obsolete_in_progress_compaction() {
+        let events = vec![agent_event(
+            1,
+            AgentEventKind::CompactionStart {
+                token_estimate: 1,
+                compaction_id: Some("in-flight".to_string()),
+            },
+        )];
+        let updates = replay_updates(events, plan_ops());
+        assert!(
+            updates
+                .iter()
+                .all(|u| !matches!(u, SessionUpdate::CompactionUpdate(_)))
+        );
     }
 }
