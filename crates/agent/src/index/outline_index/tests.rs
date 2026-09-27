@@ -1075,6 +1075,62 @@ fn extension_mapping_includes_lua() {
 }
 
 #[test]
+fn extension_mapping_includes_new_languages() {
+    assert_eq!(
+        super::common::get_language_for_extension("svelte"),
+        Some("svelte")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("sh"),
+        Some("bash")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("bash"),
+        Some("bash")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("php"),
+        Some("php")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("kt"),
+        Some("kotlin")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("kts"),
+        Some("kotlin")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("swift"),
+        Some("swift")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("json"),
+        Some("json")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("yaml"),
+        Some("yaml")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("yml"),
+        Some("yaml")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("toml"),
+        Some("toml")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("md"),
+        Some("markdown")
+    );
+    assert_eq!(
+        super::common::get_language_for_extension("markdown"),
+        Some("markdown")
+    );
+}
+
+#[test]
 fn lua_basic_outline() {
     let source = r#"
 local json = require("json")
@@ -1353,4 +1409,128 @@ mod tests {
         labels.iter().any(|l| l.contains("my_test")),
         "should find my_test in test section, got: {labels:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Projection routing: sections / markup
+// ---------------------------------------------------------------------------
+
+#[test]
+fn existing_languages_have_no_sections_or_markup() {
+    // The `markup` and `sections` outline sections must only be produced for
+    // the new file types.
+    let cases: [(&str, &str); 10] = [
+        (
+            "rust",
+            "use std::io;\npub struct Config { pub name: String }\npub fn run() {}\n",
+        ),
+        (
+            "python",
+            "import os\nclass Config:\n    def validate(self):\n        pass\n",
+        ),
+        (
+            "typescript",
+            "import axios from 'axios';\ninterface Config { name: string }\nexport function run(): void {}\n",
+        ),
+        ("javascript", "const x = require('x');\nfunction run() {}\n"),
+        ("go", "package main\n\nfunc Run() error { return nil }\n"),
+        (
+            "java",
+            "package a.b;\npublic class Config { public void run() {} }\n",
+        ),
+        ("c", "#include <stdio.h>\nvoid run(void) {}\n"),
+        ("cpp", "class Box { public: void grow() {} };\n"),
+        ("csharp", "using System;\nclass Config { }\n"),
+        (
+            "ruby",
+            "require 'json'\nclass Config\n  def run\n  end\nend\n",
+        ),
+    ];
+    for (language, source) in cases {
+        let sections = index_source(source, language, &default_opts()).unwrap();
+        assert!(
+            find_section(&sections, "sections").is_none(),
+            "{language} unexpectedly produced a `sections` outline section"
+        );
+        assert!(
+            find_section(&sections, "markup").is_none(),
+            "{language} unexpectedly produced a `markup` outline section"
+        );
+    }
+}
+
+#[test]
+fn markdown_headings_route_to_sections() {
+    let source = "# Title\n\nIntro.\n\n## Section One\n\nBody.\n";
+    let sections = index_source(source, "markdown", &default_opts()).unwrap();
+
+    let sections_section = find_section(&sections, "sections").expect("sections present");
+    assert!(
+        sections_section
+            .entries
+            .iter()
+            .any(|e| e.label == "# Title")
+    );
+    let title = sections_section
+        .entries
+        .iter()
+        .find(|e| e.label == "# Title")
+        .unwrap();
+    assert!(title.children.iter().any(|c| c.label == "## Section One"));
+    assert!(find_section(&sections, "markup").is_none());
+}
+
+#[test]
+fn toml_tables_route_to_sections_and_keys_to_constants() {
+    let source = "name = \"demo\"\n\n[server]\nhost = \"localhost\"\nport = 8080\n";
+    let sections = index_source(source, "toml", &default_opts()).unwrap();
+
+    let sections_section = find_section(&sections, "sections").expect("sections present");
+    assert!(
+        sections_section
+            .entries
+            .iter()
+            .any(|e| e.label == "[server]")
+    );
+    let constants = find_section(&sections, "constants").unwrap();
+    assert!(
+        constants
+            .entries
+            .iter()
+            .any(|e| e.label == "name = \"demo\"")
+    );
+}
+
+#[test]
+fn svelte_template_routes_to_markup_and_script_to_standard_sections() {
+    let source = "<script>\n  import Widget from './Widget.svelte';\n  let count = 0;\n  function increment(): void {\n    count += 1;\n  }\n</script>\n\n<Widget prop={count} />\n\n{#if count > 0}\n  <p>positive</p>\n{/if}\n\n{#snippet row(item)}\n  <li>{item}</li>\n{/snippet}\n";
+    let sections = index_source(source, "svelte", &default_opts()).unwrap();
+
+    let imports = find_section(&sections, "imports").unwrap();
+    assert!(!imports.entries.is_empty());
+    let functions = find_section(&sections, "functions").unwrap();
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.starts_with("function increment"))
+    );
+    assert!(
+        functions
+            .entries
+            .iter()
+            .any(|e| e.label.contains("snippet row"))
+    );
+    let constants = find_section(&sections, "constants").unwrap();
+    assert!(constants.entries.iter().any(|e| e.label.contains("count")));
+
+    let markup = find_section(&sections, "markup").expect("markup present");
+    assert!(
+        markup
+            .entries
+            .iter()
+            .any(|e| e.label.starts_with("<Widget"))
+    );
+    assert!(markup.entries.iter().any(|e| e.label.starts_with("{#if")));
+    assert!(find_section(&sections, "sections").is_none());
 }

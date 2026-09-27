@@ -136,6 +136,18 @@ tree-sitter-ruby = "0.23"
 tree-sitter-elixir = "0.3"
 tree-sitter-nix = "0.3"
 tree-sitter-lua = "0.5"
+tree-sitter-svelte-ng = "1.0"
+tree-sitter-bash = "0.25"
+tree-sitter-php = "0.24"
+# crates.io tree-sitter-kotlin 0.3.x pins tree-sitter 0.20, whose C runtime
+# (linked globally via build-script flags) breaks the tree-sitter 0.26 runtime
+# already in the graph. Master binds via tree-sitter-language only.
+tree-sitter-kotlin = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "1852ea17b7f60fb3f9d84e0b1555d56b46b39fb1" }
+tree-sitter-swift = "0.7"
+tree-sitter-json = "0.24"
+tree-sitter-yaml = "0.7"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-md = "0.5"
 
 # Rust AST parsing for rich structural fingerprinting during function indexing
 syn = { version = "2", features = ["full", "visit"] }

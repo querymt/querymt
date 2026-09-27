@@ -37,7 +37,7 @@ impl ToolTrait for IndexTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, Ruby, Elixir, Nix, and Lua."
+                description: "Produce a compact structural skeleton of a source file with exact line ranges per item. Use this before read_tool to understand file structure and target reads to relevant sections. Returns imports, types, classes, traits, impls, functions, tests, sections, markup, etc. with [start-end] line ranges. Supports Rust, Python, TypeScript, JavaScript, Go, Java, C, C++, C#, Ruby, Elixir, Nix, Lua, Svelte, Bash, PHP, Kotlin, Swift, JSON, YAML, TOML, and Markdown."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
@@ -140,7 +140,7 @@ impl ToolTrait for IndexTool {
 
         let sections = index_file(&target, &options).map_err(|e| match e {
             OutlineError::UnsupportedLanguage(ext) => ToolError::InvalidRequest(format!(
-                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs, nix, lua",
+                "Unsupported file extension '.{}'. Supported: rs, py, ts, tsx, js, jsx, go, java, c, h, cpp, hpp, cc, cs, rb, ex, exs, nix, lua, svelte, sh, bash, php, kt, kts, swift, json, yaml, yml, toml, md, markdown",
                 ext
             )),
             OutlineError::FileTooLarge { size, limit } => ToolError::InvalidRequest(format!(
@@ -284,6 +284,11 @@ def main():
         assert!(err.contains("Unsupported"));
         assert!(err.contains("ex"));
         assert!(err.contains("lua"));
+        for extension in [
+            "svelte", "sh", "php", "kt", "swift", "json", "yaml", "toml", "md",
+        ] {
+            assert!(err.contains(extension), "error missing {extension}");
+        }
     }
 
     #[tokio::test]
@@ -317,11 +322,53 @@ end
         assert!(text.contains("function M.run"));
     }
 
+    #[tokio::test]
+    async fn test_index_svelte_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let svelte_source = "<script lang=\"ts\">\n  import Widget from './Widget.svelte';\n  let count = 0;\n  function increment(): void {\n    count += 1;\n  }\n</script>\n\n<Widget prop={count} />\n\n{#if count > 0}\n  <p>positive</p>\n{/if}\n";
+
+        let file_path = temp_dir.path().join("Counter.svelte");
+        fs::write(&file_path, svelte_source).unwrap();
+
+        let tool = IndexTool::new();
+        let args = json!({ "path": file_path.to_str().unwrap() });
+        let result = tool.call(args, &context).await.unwrap();
+        let text = first_text(&result);
+
+        assert!(text.contains("language: svelte"));
+        assert!(text.contains("imports:"));
+        assert!(text.contains("Widget"));
+        assert!(text.contains("functions:"));
+        assert!(text.contains("increment"));
+        assert!(text.contains("constants:"));
+        assert!(text.contains("count"));
+        assert!(text.contains("markup:"));
+        assert!(text.contains("<Widget prop"));
+        assert!(text.contains("{#if count > 0}"));
+    }
+
     #[test]
     fn test_index_description_mentions_lua() {
         let tool = IndexTool::new();
         let definition = tool.definition();
         assert!(definition.function.description.contains("Lua"));
+    }
+
+    #[test]
+    fn test_index_description_mentions_new_languages() {
+        let tool = IndexTool::new();
+        let definition = tool.definition();
+        for language in [
+            "Svelte", "Bash", "PHP", "Kotlin", "Swift", "JSON", "YAML", "TOML", "Markdown",
+        ] {
+            assert!(
+                definition.function.description.contains(language),
+                "description missing {language}"
+            );
+        }
     }
 
     #[tokio::test]
