@@ -178,6 +178,20 @@ pub struct RpcResponse {
 pub struct RpcDispatchOutput {
     pub notifications: Vec<serde_json::Value>,
     pub response: Option<RpcResponse>,
+    /// When true the transport must send `notifications` before `response`.
+    ///
+    /// Only `session/load` sets this: its notifications carry the replayed
+    /// history, and the client needs that content before its load promise
+    /// resolves so replay is never misapplied as live traffic.
+    pub notify_before_response: bool,
+}
+
+impl RpcDispatchOutput {
+    /// Whether the transport should send the response ahead of the queued
+    /// notifications.
+    pub(crate) fn response_precedes_notifications(&self) -> bool {
+        !self.notify_before_response
+    }
 }
 
 /// Dispatch one JSON-RPC method call and forward all resulting wire messages.
@@ -244,8 +258,19 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     )
     .await;
 
-    // Reply first so the client can bind the session before catalog updates arrive.
-    if let Some(response) = output.response {
+    let response_precedes_notifications = output.response_precedes_notifications();
+    let RpcDispatchOutput {
+        notifications,
+        mut response,
+        ..
+    } = output;
+
+    // A `session/load` returns historical `session/update` notifications that
+    // the client must apply before (or together with) the response, so the
+    // replay has to be delivered first. Other methods keep the original
+    // respond-then-notify ordering so the client can bind the session before
+    // catalog updates arrive.
+    if response_precedes_notifications && let Some(response) = response.take() {
         match serde_json::to_string(&response) {
             Ok(json) => {
                 if tx.send(json).await.is_err() {
@@ -256,7 +281,7 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
         }
     }
 
-    for notification in output.notifications {
+    for notification in notifications {
         let json = match serde_json::to_string(&notification) {
             Ok(json) => json,
             Err(err) => {
@@ -266,6 +291,15 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
         };
         if tx.send(json).await.is_err() {
             return;
+        }
+    }
+
+    if let Some(response) = response {
+        match serde_json::to_string(&response) {
+            Ok(json) => {
+                let _ = tx.send(json).await;
+            }
+            Err(err) => log::warn!("Failed to serialize JSON-RPC response: {}", err),
         }
     }
 }
@@ -280,6 +314,25 @@ pub struct RpcDispatchContext {
     /// negotiated client capabilities are parsed into it so Preview session
     /// updates stay scoped to this connection.
     pub translator: Option<Arc<std::sync::Mutex<AcpLiveEventTranslator>>>,
+    /// The connection's session-load preferences. On successful initialization
+    /// the negotiated client capabilities are parsed into it so the
+    /// snapshot-vs-replay choice stays scoped to this connection.
+    pub session_load: Option<Arc<std::sync::Mutex<AcpSessionLoadPreferences>>>,
+}
+
+impl RpcDispatchContext {
+    /// Reads whether this connection asked to hydrate history from the load
+    /// snapshot instead of historical `session/update` replay.
+    ///
+    /// Absent state (for example in unit-test contexts) means standard ACP
+    /// replay, because a client that never advertised the capability must not
+    /// silently lose its history.
+    pub(crate) fn prefers_snapshot_history(&self) -> bool {
+        self.session_load
+            .as_ref()
+            .and_then(|preferences| preferences.lock().ok().map(|guard| guard.snapshot_history))
+            .unwrap_or(false)
+    }
 }
 
 async fn attach_rpc_session<S: SendAgent>(
@@ -991,6 +1044,65 @@ struct MaterializedReplayState {
 
 /// Deterministic plan identity for QueryMT's todo list within a session.
 pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
+
+/// QueryMT extension namespace inside ACP's `_meta` escape hatch.
+pub const QUERYMT_META_NAMESPACE: &str = "querymt";
+
+/// `_meta.querymt.sessionLoadSnapshot` key. A client that advertises a
+/// supported version promises it can hydrate session history directly from the
+/// `querymt/sessionLoadSnapshot.v1` load-response metadata, so the agent can
+/// skip emitting historical `session/update` notifications for that load.
+pub const QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY: &str = "sessionLoadSnapshot";
+
+/// Highest `sessionLoadSnapshot` revision understood by the desktop client and
+/// the agent's QueryMT load-response metadata. Keep both sides in lockstep.
+pub const QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH: u64 = 1;
+
+/// Connection-scoped session-load transport preferences.
+///
+/// Parsed once from the client's advertised capabilities after a successful ACP
+/// initialization. The snapshot is immutable for the rest of the connection so
+/// one client's preference never affects another connection. Standard ACP
+/// clients that do not advertise the QueryMT capability keep receiving the full
+/// historical replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcpSessionLoadPreferences {
+    /// Client advertised a supported `sessionLoadSnapshot` epoch in `_meta`,
+    /// meaning it can hydrate history from the load-response snapshot and does
+    /// not need historical `session/update` replay.
+    pub snapshot_history: bool,
+}
+
+impl AcpSessionLoadPreferences {
+    /// Derives the snapshot from negotiated client capabilities.
+    ///
+    /// Only the exact supported epoch opts into snapshot history. An omitted,
+    /// malformed, or unknown (including newer) epoch is treated as unsupported,
+    /// because a future revision may change the snapshot payload shape. Clients
+    /// that omit the capability are never assumed to understand the snapshot,
+    /// which keeps older clients on replay.
+    pub fn from_client_capabilities(capabilities: &ClientCapabilities) -> Self {
+        let advertised = capabilities
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(QUERYMT_META_NAMESPACE))
+            .and_then(|querymt| querymt.get(QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY))
+            .and_then(|value| {
+                value
+                    .get("epoch")
+                    .or_else(|| value.get("version"))
+                    .and_then(serde_json::Value::as_u64)
+            });
+        Self {
+            snapshot_history: advertised == Some(QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH),
+        }
+    }
+
+    /// Whether historical `session/update` notifications should be replayed.
+    pub fn replays_history(&self) -> bool {
+        !self.snapshot_history
+    }
+}
 
 /// Connection-scoped snapshot of ACP v1 Preview session-update capabilities.
 ///
@@ -1763,6 +1875,10 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let capabilities = AcpSessionUpdateCapabilities::from_client_capabilities(
                                 &params.client_capabilities,
                             );
+                            let session_load =
+                                AcpSessionLoadPreferences::from_client_capabilities(
+                                    &params.client_capabilities,
+                                );
                             let response = agent.initialize(params).await;
                             if response.is_ok() {
                                 // Parse Preview capabilities once per connection
@@ -1771,6 +1887,11 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     && let Ok(mut translator) = translator.lock()
                                 {
                                     translator.set_capabilities(capabilities);
+                                }
+                                if let Some(preferences) = context.session_load.as_ref()
+                                    && let Ok(mut preferences) = preferences.lock()
+                                {
+                                    *preferences = session_load;
                                 }
                                 if let Some(registry) = context.elicitation_recovery.as_ref() {
                                     registry
@@ -1922,7 +2043,17 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         }
                                         return Err(error);
                                     }
-                                    if let Some(local_agent) = local_agent {
+                                    if local_agent.is_some() && context.prefers_snapshot_history() {
+                                        // The client hydrates conversation
+                                        // history from the load-response
+                                        // snapshot, so the expensive event and
+                                        // message reads that only feed replay
+                                        // are skipped entirely.
+                                        tracing::debug!(
+                                            session.id = %session_id,
+                                            "skipping ACP history replay for snapshot-capable client"
+                                        );
+                                    } else if let Some(local_agent) = local_agent {
                                         let capabilities = context
                                             .translator
                                             .as_ref()
@@ -2370,6 +2501,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     RpcDispatchOutput {
         notifications,
         response,
+        // Only `session/load` replays history through the notification queue;
+        // every other method keeps the respond-first ordering.
+        notify_before_response: rpc_method == AGENT_METHOD_NAMES.session_load,
     }
 }
 
@@ -3889,6 +4023,7 @@ mod tests {
             session_bridge: None,
             elicitation_recovery: None,
             translator: None,
+            session_load: None,
         };
 
         for session_id in ["s-load-new", "s-load-existing"] {
@@ -3958,6 +4093,7 @@ mod tests {
             session_bridge: None,
             elicitation_recovery: None,
             translator: None,
+            session_load: None,
         };
 
         for (method, params) in [
@@ -4049,6 +4185,7 @@ mod tests {
                 ),
                 elicitation_recovery: None,
                 translator: None,
+                session_load: None,
             },
         )
         .await;
@@ -4107,6 +4244,7 @@ mod tests {
                 ),
                 elicitation_recovery: None,
                 translator: None,
+                session_load: None,
             },
         )
         .await;
@@ -4239,6 +4377,7 @@ mod tests {
                 session_bridge: None,
                 elicitation_recovery: None,
                 translator: None,
+                session_load: None,
             },
         )
         .await;
@@ -4307,6 +4446,7 @@ mod tests {
                 session_bridge: None,
                 elicitation_recovery: None,
                 translator: None,
+                session_load: None,
             },
         )
         .await
@@ -4316,6 +4456,21 @@ mod tests {
         agent: &crate::agent::LocalAgentHandle,
         session_id: &str,
         capabilities: AcpSessionUpdateCapabilities,
+    ) -> RpcDispatchOutput {
+        dispatch_session_load_with_preferences(
+            agent,
+            session_id,
+            capabilities,
+            AcpSessionLoadPreferences::default(),
+        )
+        .await
+    }
+
+    async fn dispatch_session_load_with_preferences(
+        agent: &crate::agent::LocalAgentHandle,
+        session_id: &str,
+        capabilities: AcpSessionUpdateCapabilities,
+        preferences: AcpSessionLoadPreferences,
     ) -> RpcDispatchOutput {
         let translator = Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new()));
         translator.lock().unwrap().set_capabilities(capabilities);
@@ -4343,6 +4498,7 @@ mod tests {
                 session_bridge: None,
                 elicitation_recovery: None,
                 translator: Some(translator),
+                session_load: Some(Arc::new(std::sync::Mutex::new(preferences))),
             },
         )
         .await
@@ -4556,6 +4712,87 @@ mod tests {
                 .expect("notification json");
         assert_docs_catalog(&notification, &session_id);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_message_replays_load_history_before_response() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        journal
+            .append_durable(&NewDurableEvent {
+                session_id: session_id.clone(),
+                origin: EventOrigin::Local,
+                source_node: None,
+                source_node_id: None,
+                source_seq: None,
+                kind: AgentEventKind::ToolCallStart {
+                    tool_call_id: "replay-order-1".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: serde_json::json!({
+                        "todos": [{
+                            "content": "verify wire ordering",
+                            "status": "in_progress",
+                            "priority": "high"
+                        }]
+                    })
+                    .to_string(),
+                },
+            })
+            .await
+            .expect("persist replay event");
+
+        let session_owners = SessionOwnerMap::default();
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(64);
+
+        dispatch_rpc_message_with_context(
+            RpcDispatchState {
+                agent: fixture.handle.clone(),
+                session_owners,
+                pending_permissions,
+                pending_elicitations,
+                conn_id: "conn-order".to_string(),
+                tx,
+            },
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_load.to_string(),
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": "/tmp",
+                    "mcpServers": [],
+                }),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext::default(),
+        )
+        .await;
+
+        // The replayed `session/update` notifications must reach the wire
+        // before the load response so the client applies history first.
+        let mut saw_replay_update = false;
+        loop {
+            let wire = rx.recv().await.expect("wire message");
+            let value: serde_json::Value = serde_json::from_str(&wire).expect("json message");
+            if value.get("method").is_some() {
+                assert_eq!(value["method"], "session/update");
+                saw_replay_update = true;
+            } else {
+                assert_eq!(value["id"], 1);
+                assert!(value.get("error").is_none(), "load failed: {value}");
+                break;
+            }
+        }
+        assert!(
+            saw_replay_update,
+            "load must replay at least one session/update before responding"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "load response must be the final wire message"
+        );
     }
 
     #[tokio::test]
@@ -5417,6 +5654,148 @@ mod tests {
             assert_eq!(
                 attrs["rpc.method"].as_str(),
                 AGENT_METHOD_NAMES.session_prompt
+            );
+        }
+    }
+
+    mod session_load_snapshot_capability {
+        use super::*;
+        use crate::acp::protocol::ClientCapabilities;
+
+        fn capabilities_with_epoch(epoch: Option<serde_json::Value>) -> ClientCapabilities {
+            let mut capabilities = ClientCapabilities::default();
+            let mut querymt = serde_json::Map::new();
+            if let Some(epoch) = epoch {
+                let mut entry = serde_json::Map::new();
+                entry.insert("epoch".to_string(), epoch);
+                querymt.insert(
+                    QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY.to_string(),
+                    serde_json::Value::Object(entry),
+                );
+            }
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::Value::Object(querymt),
+            );
+            capabilities.meta = Some(meta);
+            capabilities
+        }
+
+        #[test]
+        fn omitted_capability_defaults_to_replay() {
+            let preferences =
+                AcpSessionLoadPreferences::from_client_capabilities(&ClientCapabilities::default());
+            assert!(!preferences.snapshot_history);
+            assert!(preferences.replays_history());
+        }
+
+        #[test]
+        fn supported_epoch_opts_into_snapshot_history() {
+            let capabilities = capabilities_with_epoch(Some(serde_json::json!(
+                QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH
+            )));
+            let preferences = AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+            assert!(preferences.snapshot_history);
+            assert!(!preferences.replays_history());
+        }
+
+        #[test]
+        fn unknown_or_malformed_epochs_fall_back_to_replay() {
+            for epoch in [
+                serde_json::json!(QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH + 1),
+                serde_json::json!(0),
+                serde_json::json!("1"),
+                serde_json::json!(null),
+            ] {
+                let capabilities = capabilities_with_epoch(Some(epoch.clone()));
+                let preferences =
+                    AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+                assert!(
+                    !preferences.snapshot_history,
+                    "epoch {epoch} must not opt into snapshot history"
+                );
+            }
+
+            // Capability namespace present but entry missing.
+            let capabilities = capabilities_with_epoch(None);
+            let preferences = AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+            assert!(!preferences.snapshot_history);
+        }
+
+        #[test]
+        fn legacy_version_key_is_accepted() {
+            let mut capabilities = ClientCapabilities::default();
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::json!({
+                    QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY: { "version": QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH }
+                }),
+            );
+            capabilities.meta = Some(meta);
+            let preferences = AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+            assert!(preferences.snapshot_history);
+        }
+
+        #[tokio::test]
+        async fn snapshot_capable_load_skips_history_replay_and_returns_snapshot() {
+            let fixture = crate::test_utils::TestAgent::new().await;
+            let session_id = fixture.create_session().await;
+            let journal = fixture.storage.event_journal();
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind: AgentEventKind::ToolCallStart {
+                        tool_call_id: "todo-1".to_string(),
+                        tool_name: "todowrite".to_string(),
+                        arguments: serde_json::json!({
+                            "todos": [{
+                                "content": "ship replay",
+                                "status": "in_progress",
+                                "priority": "high"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                })
+                .await
+                .expect("persist replay event");
+
+            let snapshot_capable = dispatch_session_load_with_preferences(
+                fixture.handle.as_ref(),
+                &session_id,
+                AcpSessionUpdateCapabilities::default(),
+                AcpSessionLoadPreferences {
+                    snapshot_history: true,
+                },
+            )
+            .await;
+
+            let response = snapshot_capable.response.expect("load response");
+            assert!(response.error.is_none());
+            // No historical notifications: the client hydrates from the snapshot.
+            assert!(
+                snapshot_capable.notifications.is_empty(),
+                "snapshot-capable load must not emit historical replay"
+            );
+            // Replay is still ordered before the response for clients that need it.
+            assert!(snapshot_capable.notify_before_response);
+
+            let replaying = dispatch_session_load_with_preferences(
+                fixture.handle.as_ref(),
+                &session_id,
+                AcpSessionUpdateCapabilities::default(),
+                AcpSessionLoadPreferences::default(),
+            )
+            .await;
+            assert!(
+                !replaying.notifications.is_empty(),
+                "standard clients must still receive historical replay"
             );
         }
     }

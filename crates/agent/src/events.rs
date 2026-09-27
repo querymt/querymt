@@ -469,6 +469,7 @@ pub enum AgentEventKind {
         compaction_id: Option<String>,
         /// Authoritative post-compaction context-token count, once recalculated.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
         context_tokens: Option<u64>,
     },
     /// One user-displayable summary fragment appended to an in-progress compaction.

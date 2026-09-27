@@ -146,14 +146,21 @@ async fn prepare_session_load(
     agent: &Arc<crate::agent::LocalAgentHandle>,
     req: LoadSessionRequest,
     capabilities: &crate::acp::shared::AcpSessionUpdateCapabilities,
+    preferences: &crate::acp::shared::AcpSessionLoadPreferences,
 ) -> Result<AcpSessionLoadOutcome, acp::Error> {
     let session_id = req.session_id.to_string();
     let response = agent
         .load_session(req)
         .instrument(info_span!("agent.session_load", session.id = %session_id))
         .await?;
-    let (notifications, event_count) =
-        replay_loaded_session(agent.as_ref(), &session_id, capabilities).await?;
+    // Snapshot-capable clients hydrate history from the load-response snapshot.
+    // Skipping replay here also avoids the redundant event-stream and message
+    // reads that only exist to produce historical notifications.
+    let (notifications, event_count) = if preferences.replays_history() {
+        replay_loaded_session(agent.as_ref(), &session_id, capabilities).await?
+    } else {
+        (Vec::new(), 0)
+    };
     tracing::Span::current().record("session.load.event_count", event_count as i64);
     tracing::Span::current().record(
         "session.load.replay_notification_count",
@@ -176,6 +183,7 @@ pub async fn load_session_with_replay(
         agent,
         req,
         &crate::acp::shared::AcpSessionUpdateCapabilities::default(),
+        &crate::acp::shared::AcpSessionLoadPreferences::default(),
     )
     .instrument(span)
     .await
@@ -199,6 +207,7 @@ async fn load_session_and_enqueue_replay(
     bridge_sender: &ClientBridgeSender,
     req: LoadSessionRequest,
     translator: &std::sync::Arc<std::sync::Mutex<crate::acp::shared::AcpLiveEventTranslator>>,
+    session_load: &std::sync::Arc<std::sync::Mutex<crate::acp::shared::AcpSessionLoadPreferences>>,
 ) -> Result<LoadSessionResponse, acp::Error> {
     let span = session_load_span(&req);
     async {
@@ -208,7 +217,12 @@ async fn load_session_and_enqueue_replay(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             translator.capabilities()
         };
-        let outcome = prepare_session_load(agent, req, &capabilities).await?;
+        let preferences = {
+            *session_load
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        let outcome = prepare_session_load(agent, req, &capabilities, &preferences).await?;
         let enqueue_span = info_span!(
             "acp.replay.enqueue",
             event_count = outcome.event_count,
@@ -674,6 +688,12 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
     let mut forwarder_handles = Vec::new();
     let forwarded_elicitations = Arc::new(Mutex::new(HashSet::new()));
     let translator = Arc::new(Mutex::new(AcpLiveEventTranslator::new()));
+    // One session-load preference per connection: parsed from the client's
+    // advertised capabilities at initialize and consulted by session/load.
+    let session_load = Arc::new(Mutex::new(
+        crate::acp::shared::AcpSessionLoadPreferences::default(),
+    ));
+    let session_load_forwarders = session_load.clone();
     for (idx, event_fanout) in event_sources.into_iter().enumerate() {
         let handle = spawn_event_bridge_forwarder(
             event_fanout,
@@ -700,9 +720,14 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
             {
                 let agent = agent.clone();
                 let translator = translator.clone();
+                let session_load = session_load.clone();
                 async move |req: InitializeRequest, responder, _cx| {
                     let capabilities =
                         crate::acp::shared::AcpSessionUpdateCapabilities::from_client_capabilities(
+                            &req.client_capabilities,
+                        );
+                    let preferences =
+                        crate::acp::shared::AcpSessionLoadPreferences::from_client_capabilities(
                             &req.client_capabilities,
                         );
                     let result = agent.initialize(req).await;
@@ -710,6 +735,11 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
                         && let Ok(mut translator) = translator.lock()
                     {
                         translator.set_capabilities(capabilities);
+                    }
+                    if result.is_ok()
+                        && let Ok(mut current) = session_load.lock()
+                    {
+                        *current = preferences;
                     }
                     responder.respond_with_result(result)
                 }
@@ -767,11 +797,18 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
             {
                 let agent = agent.clone();
                 let bridge_sender = bridge_sender.clone();
+                let translator = translator.clone();
+                let session_load = session_load_forwarders.clone();
                 async move |req: LoadSessionRequest, responder, _cx| {
                     let session_id = req.session_id.to_string();
-                    let result =
-                        load_session_and_enqueue_replay(&agent, &bridge_sender, req, &translator)
-                            .await;
+                    let result = load_session_and_enqueue_replay(
+                        &agent,
+                        &bridge_sender,
+                        req,
+                        &translator,
+                        &session_load,
+                    )
+                    .await;
                     let ok = result.is_ok();
                     let send_result = responder.respond_with_result(result);
                     if ok {

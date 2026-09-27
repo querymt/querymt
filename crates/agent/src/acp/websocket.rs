@@ -727,6 +727,9 @@ async fn handle_websocket_connection(
     // negotiated Preview capabilities into it at initialize, and the event
     // forwarders project through it for the lifetime of the connection.
     let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
+    let session_load = Arc::new(StdMutex::new(
+        crate::acp::shared::AcpSessionLoadPreferences::default(),
+    ));
     spawn_event_forwarders(state.clone(), connection_state.clone(), translator.clone());
 
     let bridge_task = tokio::spawn(run_websocket_bridge(
@@ -751,6 +754,7 @@ async fn handle_websocket_connection(
     let connection_receive = connection_state.clone();
     let bridge_receive = session_bridge;
     let translator_receive = translator.clone();
+    let session_load_receive = session_load.clone();
     let mut receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
             match result {
@@ -771,6 +775,7 @@ async fn handle_websocket_connection(
                         let connection_dispatch = connection_receive.clone();
                         let bridge_dispatch = bridge_receive.clone();
                         let translator_dispatch = translator_receive.clone();
+                        let session_load_dispatch = session_load_receive.clone();
                         tokio::spawn(async move {
                             dispatch_rpc_message_with_context(
                                 RpcDispatchState {
@@ -791,6 +796,7 @@ async fn handle_websocket_connection(
                                         state_dispatch.elicitation_recovery.clone(),
                                     ),
                                     translator: Some(translator_dispatch.clone()),
+                                    session_load: Some(session_load_dispatch.clone()),
                                 },
                             )
                             .await;
