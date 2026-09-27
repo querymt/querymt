@@ -435,12 +435,16 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
     agent: Arc<crate::agent::LocalAgentHandle>,
     recovery: crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
     claim: crate::elicitation::ClaimedElicitationDelivery,
-    connection_id: String,
-    tx: mpsc::Sender<String>,
-    pending_requests: PendingWsRequestMap,
-    request_counter: Arc<AtomicU64>,
-    connection_cancel: CancellationToken,
+    connection: ConnectionEventState,
 ) -> Result<(), Error> {
+    let ConnectionEventState {
+        conn_id: connection_id,
+        tx,
+        pending_requests,
+        request_counter,
+        connection_cancel,
+        ..
+    } = connection;
     let request = match create_elicitation_request(
         claim.elicitation_id.clone(),
         claim.session_id.clone(),
@@ -711,17 +715,15 @@ async fn handle_websocket_connection(
         .await
         .insert(conn_id.clone(), session_bridge.clone());
 
-    spawn_event_forwarders(
-        state.clone(),
-        ConnectionEventState {
-            conn_id: conn_id.clone(),
-            tx: tx.clone(),
-            pending_requests: pending_requests.clone(),
-            forwarded_elicitations,
-            request_counter: request_counter.clone(),
-            connection_cancel: connection_cancel.clone(),
-        },
-    );
+    let connection_state = ConnectionEventState {
+        conn_id: conn_id.clone(),
+        tx: tx.clone(),
+        pending_requests: pending_requests.clone(),
+        forwarded_elicitations,
+        request_counter: request_counter.clone(),
+        connection_cancel: connection_cancel.clone(),
+    };
+    spawn_event_forwarders(state.clone(), connection_state.clone());
 
     let bridge_task = tokio::spawn(run_websocket_bridge(
         bridge_rx,
@@ -742,10 +744,7 @@ async fn handle_websocket_connection(
 
     let conn_id_receive = conn_id.clone();
     let state_receive = state.clone();
-    let tx_receive = tx.clone();
-    let pending_receive = pending_requests.clone();
-    let request_counter_receive = request_counter.clone();
-    let connection_cancel_receive = connection_cancel.clone();
+    let connection_receive = connection_state.clone();
     let bridge_receive = session_bridge;
     let mut receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
@@ -764,10 +763,7 @@ async fn handle_websocket_connection(
                             .flatten();
                         let state_dispatch = state_receive.clone();
                         let conn_id_dispatch = conn_id_receive.clone();
-                        let tx_dispatch = tx_receive.clone();
-                        let pending_dispatch = pending_receive.clone();
-                        let counter_dispatch = request_counter_receive.clone();
-                        let cancel_dispatch = connection_cancel_receive.clone();
+                        let connection_dispatch = connection_receive.clone();
                         let bridge_dispatch = bridge_receive.clone();
                         tokio::spawn(async move {
                             dispatch_rpc_message_with_context(
@@ -779,7 +775,7 @@ async fn handle_websocket_connection(
                                         .pending_elicitations
                                         .clone(),
                                     conn_id: conn_id_dispatch.clone(),
-                                    tx: tx_dispatch.clone(),
+                                    tx: connection_dispatch.tx.clone(),
                                 },
                                 request,
                                 RpcDispatchContext {
@@ -810,11 +806,7 @@ async fn handle_websocket_connection(
                                         state_dispatch.agent.clone(),
                                         state_dispatch.elicitation_recovery.clone(),
                                         claim,
-                                        conn_id_dispatch.clone(),
-                                        tx_dispatch.clone(),
-                                        pending_dispatch.clone(),
-                                        counter_dispatch.clone(),
-                                        cancel_dispatch.clone(),
+                                        connection_dispatch.clone(),
                                     )
                                     .await
                                     {
@@ -827,7 +819,13 @@ async fn handle_websocket_connection(
                         });
                     }
                     Ok(InboundWsMessage::Response { id, result, error }) => {
-                        route_websocket_response(&pending_receive, id, result, error).await;
+                        route_websocket_response(
+                            &connection_receive.pending_requests,
+                            id,
+                            result,
+                            error,
+                        )
+                        .await;
                     }
                     Err(err) => {
                         log::error!("Failed to parse WebSocket JSON-RPC message: {}", err);
@@ -1059,16 +1057,12 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
     let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
     for event_source in &state.event_sources {
         let mut events = event_source.subscribe();
-        let tx_events = connection.tx.clone();
-        let conn_id_events = connection.conn_id.clone();
         let state_events = state.clone();
-        let pending_events = connection.pending_requests.clone();
-        let forwarded_events = connection.forwarded_elicitations.clone();
-        let request_counter = connection.request_counter.clone();
-        let connection_cancel = connection.connection_cancel.clone();
+        let connection_events = connection.clone();
         let translator = translator.clone();
 
         tokio::spawn(async move {
+            let connection_cancel = connection_events.connection_cancel.clone();
             loop {
                 let event = tokio::select! {
                     _ = connection_cancel.cancelled() => break,
@@ -1088,7 +1082,13 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                         .retire_session_if_idle(event.session_id(), state_events.agent.as_ref())
                         .await;
                 }
-                if !is_event_owned(&state_events.session_owners, &conn_id_events, &event).await {
+                if !is_event_owned(
+                    &state_events.session_owners,
+                    &connection_events.conn_id,
+                    &event,
+                )
+                .await
+                {
                     continue;
                 }
 
@@ -1099,13 +1099,22 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                 } = event.kind()
                 {
                     let key = (session_id.clone(), elicitation_id.clone());
-                    if !forwarded_events.lock().await.insert(key) {
+                    if !connection_events
+                        .forwarded_elicitations
+                        .lock()
+                        .await
+                        .insert(key)
+                    {
                         continue;
                     }
 
                     if let Some(resume_authority) = state_events
                         .elicitation_recovery
-                        .issue_for_session(&conn_id_events, session_id, state_events.agent.as_ref())
+                        .issue_for_session(
+                            &connection_events.conn_id,
+                            session_id,
+                            state_events.agent.as_ref(),
+                        )
                         .await
                     {
                         let notification = crate::control::elicitation_recovery::ElicitationRecoveryAuthorityNotification {
@@ -1114,7 +1123,7 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                             resume_authority,
                         };
                         if send_websocket_notification(
-                            &tx_events,
+                            &connection_events.tx,
                             crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION,
                             &notification,
                         )
@@ -1128,7 +1137,7 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                     let Some(claim) = state_events
                         .elicitation_recovery
                         .claim_live_delivery(
-                            &conn_id_events,
+                            &connection_events.conn_id,
                             session_id,
                             elicitation_id,
                             state_events.agent.as_ref(),
@@ -1141,11 +1150,7 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                         state_events.agent.clone(),
                         state_events.elicitation_recovery.clone(),
                         claim,
-                        conn_id_events.clone(),
-                        tx_events.clone(),
-                        pending_events.clone(),
-                        request_counter.clone(),
-                        connection_cancel.clone(),
+                        connection_events.clone(),
                     )
                     .await
                     {
@@ -1166,7 +1171,7 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                     .translate_notification(&event);
                 if let Some(notification) = notification {
                     let json = serde_json::to_string(&notification).unwrap_or_default();
-                    if tx_events.send(json).await.is_err() {
+                    if connection_events.tx.send(json).await.is_err() {
                         break;
                     }
                 }

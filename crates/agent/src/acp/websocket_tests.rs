@@ -784,6 +784,22 @@ async fn websocket_elicitation_has_no_wall_clock_timeout() {
     bridge_task.abort();
 }
 
+fn connection_state_for_test(
+    conn_id: &str,
+    tx: mpsc::Sender<String>,
+    pending_requests: PendingWsRequestMap,
+    request_counter: Arc<AtomicU64>,
+) -> ConnectionEventState {
+    ConnectionEventState {
+        conn_id: conn_id.to_string(),
+        tx,
+        pending_requests,
+        forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+        request_counter,
+        connection_cancel: CancellationToken::new(),
+    }
+}
+
 #[tokio::test]
 async fn invalid_outgoing_schema_is_nonfatal_and_keeps_waiter_pending() {
     let fixture = crate::test_utils::TestAgent::new().await;
@@ -819,15 +835,17 @@ async fn invalid_outgoing_schema_is_nonfatal_and_keeps_waiter_pending() {
     .unwrap();
     let (wire_tx, mut wire_rx) = mpsc::channel::<String>(1);
 
+    // Keep the original sender alive so an empty channel reports Empty, not Disconnected.
     deliver_claimed_websocket_elicitation(
         fixture.handle.clone(),
         recovery,
         claim,
-        "conn".to_string(),
-        wire_tx.clone(),
-        Arc::new(Mutex::new(HashMap::new())),
-        Arc::new(AtomicU64::new(1)),
-        CancellationToken::new(),
+        connection_state_for_test(
+            "conn",
+            wire_tx.clone(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU64::new(1)),
+        ),
     )
     .await
     .expect("local schema rejection is not a transport failure");
@@ -877,11 +895,12 @@ async fn closed_delivery_channel_is_a_transport_failure() {
             fixture.handle.clone(),
             crate::control::elicitation_recovery::ElicitationRecoveryRegistry::default(),
             claim,
-            "conn".to_string(),
-            wire_tx,
-            Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(AtomicU64::new(1)),
-            CancellationToken::new(),
+            connection_state_for_test(
+                "conn",
+                wire_tx,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::new(AtomicU64::new(1)),
+            ),
         )
         .await
         .is_err()
@@ -939,11 +958,7 @@ async fn client_error_and_malformed_response_keep_waiter_pending() {
             fixture.handle.clone(),
             recovery.clone(),
             claim,
-            "conn".to_string(),
-            wire_tx.clone(),
-            pending.clone(),
-            counter.clone(),
-            CancellationToken::new(),
+            connection_state_for_test("conn", wire_tx.clone(), pending.clone(), counter.clone()),
         )
         .await
         .unwrap();
@@ -1041,11 +1056,7 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
         fixture.handle.clone(),
         recovery.clone(),
         old_claim,
-        "old".to_string(),
-        old_tx,
-        old_pending.clone(),
-        counter.clone(),
-        CancellationToken::new(),
+        connection_state_for_test("old", old_tx, old_pending.clone(), counter.clone()),
     )
     .await
     .unwrap();
@@ -1053,11 +1064,7 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
         fixture.handle.clone(),
         recovery.clone(),
         new_claim.clone(),
-        "new".to_string(),
-        new_tx.clone(),
-        new_pending.clone(),
-        counter.clone(),
-        CancellationToken::new(),
+        connection_state_for_test("new", new_tx.clone(), new_pending.clone(), counter.clone()),
     )
     .await
     .unwrap();
@@ -1132,11 +1139,7 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
         fixture.handle.clone(),
         recovery,
         retry_claim,
-        "new".to_string(),
-        new_tx,
-        new_pending.clone(),
-        counter,
-        CancellationToken::new(),
+        connection_state_for_test("new", new_tx, new_pending.clone(), counter),
     )
     .await
     .unwrap();

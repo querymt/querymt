@@ -83,26 +83,41 @@ impl ElicitationRecoveryRegistry {
         session_id: &str,
         agent: &crate::agent::LocalAgentHandle,
     ) -> Option<String> {
+        let existing_verifier = {
+            let state = self.inner.lock().await;
+            let connection = state.connections.get(connection_id)?;
+            if !connection.secure_transport || !connection.supports_form_elicitation {
+                return None;
+            }
+            state
+                .sessions
+                .get(session_id)
+                .map(|authority| authority.verifier)
+        };
+
+        let still_scoped = if let Some(verifier) = existing_verifier {
+            let verifier_hex = hex::encode(verifier);
+            crate::elicitation::pending_sessions_for_authority(agent, &verifier_hex)
+                .await
+                .iter()
+                .any(|pending_session_id| pending_session_id == session_id)
+        } else {
+            false
+        };
+
         let mut state = self.inner.lock().await;
         let connection = state.connections.get(connection_id)?;
         if !connection.secure_transport || !connection.supports_form_elicitation {
             return None;
         }
-
-        if let Some(verifier) = state
-            .sessions
-            .get(session_id)
-            .map(|authority| authority.verifier)
+        if !still_scoped
+            && let Some(verifier) = existing_verifier
+            && state
+                .sessions
+                .get(session_id)
+                .is_some_and(|authority| constant_time_eq(&authority.verifier, &verifier))
         {
-            let verifier_hex = hex::encode(verifier);
-            let still_scoped =
-                crate::elicitation::pending_sessions_for_authority(agent, &verifier_hex)
-                    .await
-                    .iter()
-                    .any(|pending_session_id| pending_session_id == session_id);
-            if !still_scoped {
-                state.sessions.remove(session_id);
-            }
+            state.sessions.remove(session_id);
         }
 
         let (verifier, secret) = match state.sessions.get(session_id) {
@@ -271,8 +286,26 @@ impl ElicitationRecoveryRegistry {
         session_id: &str,
         agent: &crate::agent::LocalAgentHandle,
     ) {
+        let verifier = {
+            let state = self.inner.lock().await;
+            state
+                .sessions
+                .get(session_id)
+                .map(|authority| authority.verifier)
+        };
+        let Some(verifier) = verifier else {
+            return;
+        };
+        if crate::elicitation::has_pending_elicitation_for_agent_session(agent, session_id).await {
+            return;
+        }
+
         let mut state = self.inner.lock().await;
-        if !crate::elicitation::has_pending_elicitation_for_agent_session(agent, session_id).await {
+        if state
+            .sessions
+            .get(session_id)
+            .is_some_and(|authority| constant_time_eq(&authority.verifier, &verifier))
+        {
             state.sessions.remove(session_id);
         }
     }
@@ -714,6 +747,88 @@ mod tests {
             error.code,
             agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)
         );
+    }
+
+    #[tokio::test]
+    async fn idle_scan_does_not_remove_replaced_authority() {
+        let (registry, fixture, _old_secret) =
+            authorized_fixture("session-a", "elicitation-a").await;
+        let pending_map = fixture.handle.pending_elicitations();
+        let mut pending = pending_map.lock().await;
+        pending.clear();
+
+        let state = registry.inner.lock().await;
+        let task_registry = registry.clone();
+        let agent = fixture.handle.clone();
+        let retire = tokio::spawn(async move {
+            task_registry
+                .retire_session_if_idle("session-a", agent.as_ref())
+                .await;
+        });
+        tokio::task::yield_now().await;
+        drop(state);
+
+        let replacement_verifier = authority_verifier("replacement-secret");
+        let mut state =
+            tokio::time::timeout(std::time::Duration::from_secs(1), registry.inner.lock())
+                .await
+                .expect("idle scan must release the registry lock");
+        state.sessions.insert(
+            "session-a".to_string(),
+            SessionAuthority {
+                verifier: replacement_verifier,
+                authorized_connections: HashSet::from(["original".to_string()]),
+            },
+        );
+        drop(state);
+        drop(pending);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), retire)
+            .await
+            .expect("idle scan should finish")
+            .expect("idle scan task should join");
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .await
+                .sessions
+                .get("session-a")
+                .map(|authority| authority.verifier),
+            Some(replacement_verifier)
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_issue_revalidates_connection_after_pending_scan() {
+        let (registry, fixture, _secret) = authorized_fixture("session-a", "elicitation-a").await;
+        let pending_map = fixture.handle.pending_elicitations();
+        let pending = pending_map.lock().await;
+
+        let state = registry.inner.lock().await;
+        let task_registry = registry.clone();
+        let agent = fixture.handle.clone();
+        let issue = tokio::spawn(async move {
+            task_registry
+                .issue_for_session("original", "session-a", agent.as_ref())
+                .await
+        });
+        tokio::task::yield_now().await;
+        drop(state);
+
+        let mut state =
+            tokio::time::timeout(std::time::Duration::from_secs(1), registry.inner.lock())
+                .await
+                .expect("pending scan must release the registry lock");
+        state.connections.remove("original");
+        drop(state);
+        drop(pending);
+
+        let issued = tokio::time::timeout(std::time::Duration::from_secs(1), issue)
+            .await
+            .expect("authority issue should finish")
+            .expect("authority issue task should join");
+        assert!(issued.is_none());
     }
 
     #[tokio::test]
