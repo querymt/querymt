@@ -49,8 +49,22 @@ impl ElicitationRecoveryRegistry {
         );
     }
 
-    pub async fn remove_connection(&self, connection_id: &str) {
-        self.inner.lock().await.connections.remove(connection_id);
+    pub async fn remove_connection(
+        &self,
+        connection_id: &str,
+        agent: &crate::agent::LocalAgentHandle,
+    ) {
+        let session_ids = {
+            let mut state = self.inner.lock().await;
+            state.connections.remove(connection_id);
+            for authority in state.sessions.values_mut() {
+                authority.authorized_connections.remove(connection_id);
+            }
+            state.sessions.keys().cloned().collect::<Vec<_>>()
+        };
+        for session_id in session_ids {
+            self.retire_session_if_idle(&session_id, agent).await;
+        }
     }
 
     pub async fn record_client_capabilities(
@@ -73,6 +87,22 @@ impl ElicitationRecoveryRegistry {
         let connection = state.connections.get(connection_id)?;
         if !connection.secure_transport || !connection.supports_form_elicitation {
             return None;
+        }
+
+        if let Some(verifier) = state
+            .sessions
+            .get(session_id)
+            .map(|authority| authority.verifier)
+        {
+            let verifier_hex = hex::encode(verifier);
+            let still_scoped =
+                crate::elicitation::pending_sessions_for_authority(agent, &verifier_hex)
+                    .await
+                    .iter()
+                    .any(|pending_session_id| pending_session_id == session_id);
+            if !still_scoped {
+                state.sessions.remove(session_id);
+            }
         }
 
         let (verifier, secret) = match state.sessions.get(session_id) {
@@ -234,6 +264,17 @@ impl ElicitationRecoveryRegistry {
             session_id: request.session_id.clone(),
             elicitation_ids,
         })
+    }
+
+    pub(crate) async fn retire_session_if_idle(
+        &self,
+        session_id: &str,
+        agent: &crate::agent::LocalAgentHandle,
+    ) {
+        let mut state = self.inner.lock().await;
+        if !crate::elicitation::has_pending_elicitation_for_agent_session(agent, session_id).await {
+            state.sessions.remove(session_id);
+        }
     }
 
     async fn verify_connection(&self, connection_id: &str, version: u32) -> Result<(), Error> {
@@ -591,6 +632,84 @@ mod tests {
             )
             .await
             .expect_err("finished authority must expire");
+        assert_eq!(
+            error.code,
+            agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_removes_live_authorization_but_preserves_recovery() {
+        let (registry, fixture, secret) = authorized_fixture("session-a", "elicitation-a").await;
+        registry
+            .remove_connection("original", fixture.handle.as_ref())
+            .await;
+
+        assert!(
+            registry
+                .claim_live_delivery(
+                    "original",
+                    "session-a",
+                    "elicitation-a",
+                    fixture.handle.as_ref(),
+                )
+                .await
+                .is_none()
+        );
+        registry
+            .register_connection("replacement".to_string(), true)
+            .await;
+        registry
+            .record_client_capabilities("replacement", true)
+            .await;
+        let pending = registry
+            .list_pending_sessions(
+                "replacement",
+                &ListPendingElicitationSessionsRequest {
+                    version: ELICITATION_RECOVERY_VERSION,
+                    resume_authority: secret,
+                },
+                fixture.handle.as_ref(),
+            )
+            .await
+            .expect("the retained capability recovers the pending question");
+        assert_eq!(pending.session_ids, vec!["session-a"]);
+    }
+
+    #[tokio::test]
+    async fn final_question_retires_authority_before_a_later_question() {
+        let (registry, fixture, old_secret) =
+            authorized_fixture("session-a", "elicitation-a").await;
+        fixture.handle.pending_elicitations().lock().await.clear();
+        registry
+            .retire_session_if_idle("session-a", fixture.handle.as_ref())
+            .await;
+
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        crate::elicitation::insert_pending_elicitation(
+            &fixture.handle.pending_elicitations(),
+            "elicitation-b".to_string(),
+            "session-a".to_string(),
+            sender,
+        )
+        .await;
+        let new_secret = registry
+            .issue_for_session("original", "session-a", fixture.handle.as_ref())
+            .await
+            .expect("a later question receives fresh authority");
+        assert_ne!(new_secret, old_secret);
+
+        let error = registry
+            .list_pending_sessions(
+                "original",
+                &ListPendingElicitationSessionsRequest {
+                    version: ELICITATION_RECOVERY_VERSION,
+                    resume_authority: old_secret,
+                },
+                fixture.handle.as_ref(),
+            )
+            .await
+            .expect_err("retired authority cannot recover a later question");
         assert_eq!(
             error.code,
             agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)

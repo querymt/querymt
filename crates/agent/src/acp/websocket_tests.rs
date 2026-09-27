@@ -195,6 +195,67 @@ async fn websocket_event_forwarder_issues_authority_only_on_capable_loopback_con
 }
 
 #[tokio::test]
+async fn unauthorized_subscriber_receives_no_elicitation_content() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let session_id = "protected-session";
+    let elicitation_id = "protected-elicitation";
+    state.session_owners.lock().await.insert(
+        session_id.to_string(),
+        HashSet::from(["original".to_string(), "observer".to_string()]),
+    );
+    for connection_id in ["original", "observer"] {
+        state
+            .elicitation_recovery
+            .register_connection(connection_id.to_string(), true)
+            .await;
+        state
+            .elicitation_recovery
+            .record_client_capabilities(connection_id, true)
+            .await;
+    }
+    let (waiter_tx, _waiter_rx) = oneshot::channel();
+    insert_pending_elicitation(
+        &fixture.handle.pending_elicitations(),
+        elicitation_id.to_string(),
+        session_id.to_string(),
+        waiter_tx,
+    )
+    .await;
+    state
+        .elicitation_recovery
+        .issue_for_session("original", session_id, fixture.handle.as_ref())
+        .await
+        .expect("original connection receives recovery authority");
+
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
+    let cancel = CancellationToken::new();
+    spawn_event_forwarders(
+        state,
+        ConnectionEventState {
+            conn_id: "observer".to_string(),
+            tx: wire_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+        },
+    );
+    fixture
+        .config
+        .event_sink
+        .fanout()
+        .publish(elicitation_event(session_id, elicitation_id));
+
+    assert!(
+        timeout(Duration::from_millis(100), wire_rx.recv())
+            .await
+            .is_err()
+    );
+    cancel.cancel();
+}
+
+#[tokio::test]
 async fn websocket_event_forwarder_sends_native_elicitation_and_resolves_response() {
     let fixture = crate::test_utils::TestAgent::new().await;
     let state = WsServerState::new(fixture.handle.clone());
@@ -724,8 +785,211 @@ async fn websocket_elicitation_has_no_wall_clock_timeout() {
 }
 
 #[tokio::test]
+async fn invalid_outgoing_schema_is_nonfatal_and_keeps_waiter_pending() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let recovery = crate::control::elicitation_recovery::ElicitationRecoveryRegistry::default();
+    let (waiter_tx, mut waiter_rx) = oneshot::channel();
+    register_pending_elicitation(
+        &fixture.handle.pending_elicitations(),
+        "invalid-schema".to_string(),
+        PendingElicitationRegistration {
+            session_id: "session".to_string(),
+            form: PendingElicitationForm {
+                message: "Choose".to_string(),
+                requested_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"choice": {"type": "object"}}
+                }),
+                source: "builtin:question".to_string(),
+            },
+            owner_authority: None,
+            run_id: Some("run".to_string()),
+            tool_call_id: Some("tool".to_string()),
+        },
+        waiter_tx,
+    )
+    .await;
+    let claim = crate::elicitation::claim_live_elicitation_delivery(
+        fixture.handle.as_ref(),
+        "session",
+        "invalid-schema",
+        "conn",
+    )
+    .await
+    .unwrap();
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(1);
+
+    deliver_claimed_websocket_elicitation(
+        fixture.handle.clone(),
+        recovery,
+        claim,
+        "conn".to_string(),
+        wire_tx.clone(),
+        Arc::new(Mutex::new(HashMap::new())),
+        Arc::new(AtomicU64::new(1)),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("local schema rejection is not a transport failure");
+
+    assert!(matches!(
+        wire_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(
+        fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("invalid-schema")
+    );
+    assert!(matches!(
+        waiter_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn closed_delivery_channel_is_a_transport_failure() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let (waiter_tx, mut waiter_rx) = oneshot::channel();
+    insert_pending_elicitation(
+        &fixture.handle.pending_elicitations(),
+        "transport-failure".to_string(),
+        "session".to_string(),
+        waiter_tx,
+    )
+    .await;
+    let claim = crate::elicitation::claim_live_elicitation_delivery(
+        fixture.handle.as_ref(),
+        "session",
+        "transport-failure",
+        "conn",
+    )
+    .await
+    .unwrap();
+    let (wire_tx, wire_rx) = mpsc::channel::<String>(1);
+    drop(wire_rx);
+
+    assert!(
+        deliver_claimed_websocket_elicitation(
+            fixture.handle.clone(),
+            crate::control::elicitation_recovery::ElicitationRecoveryRegistry::default(),
+            claim,
+            "conn".to_string(),
+            wire_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(AtomicU64::new(1)),
+            CancellationToken::new(),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("transport-failure")
+    );
+    assert!(matches!(
+        waiter_rx.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn client_error_and_malformed_response_keep_waiter_pending() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let recovery = crate::control::elicitation_recovery::ElicitationRecoveryRegistry::default();
+    let (waiter_tx, mut waiter_rx) = oneshot::channel();
+    register_pending_elicitation(
+        &fixture.handle.pending_elicitations(),
+        "retryable-question".to_string(),
+        PendingElicitationRegistration {
+            session_id: "session".to_string(),
+            form: PendingElicitationForm {
+                message: "Choose".to_string(),
+                requested_schema: serde_json::json!({"type": "object", "properties": {}}),
+                source: "builtin:question".to_string(),
+            },
+            owner_authority: None,
+            run_id: Some("run".to_string()),
+            tool_call_id: Some("tool".to_string()),
+        },
+        waiter_tx,
+    )
+    .await;
+    let pending: PendingWsRequestMap = Arc::new(Mutex::new(HashMap::new()));
+    let counter = Arc::new(AtomicU64::new(1));
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
+
+    for response_error in [true, false] {
+        let claim = crate::elicitation::claim_live_elicitation_delivery(
+            fixture.handle.as_ref(),
+            "session",
+            "retryable-question",
+            "conn",
+        )
+        .await
+        .unwrap();
+        deliver_claimed_websocket_elicitation(
+            fixture.handle.clone(),
+            recovery.clone(),
+            claim,
+            "conn".to_string(),
+            wire_tx.clone(),
+            pending.clone(),
+            counter.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let request: serde_json::Value =
+            serde_json::from_str(&wire_rx.recv().await.unwrap()).unwrap();
+        if response_error {
+            assert!(
+                route_websocket_response(
+                    &pending,
+                    request["id"].clone(),
+                    None,
+                    Some(serde_json::json!({"code": -32000, "message": "client failed"})),
+                )
+                .await
+            );
+        } else {
+            assert!(
+                route_websocket_response(
+                    &pending,
+                    request["id"].clone(),
+                    Some(serde_json::json!({"action": "unsupported"})),
+                    None,
+                )
+                .await
+            );
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            fixture
+                .handle
+                .pending_elicitations()
+                .lock()
+                .await
+                .contains_key("retryable-question")
+        );
+        assert!(matches!(
+            waiter_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_replies() {
     let fixture = crate::test_utils::TestAgent::new().await;
+    let recovery = crate::control::elicitation_recovery::ElicitationRecoveryRegistry::default();
     let (waiter_tx, waiter_rx) = oneshot::channel();
     register_pending_elicitation(
         &fixture.handle.pending_elicitations(),
@@ -775,6 +1039,7 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
     let (new_tx, mut new_rx) = mpsc::channel::<String>(8);
     deliver_claimed_websocket_elicitation(
         fixture.handle.clone(),
+        recovery.clone(),
         old_claim,
         "old".to_string(),
         old_tx,
@@ -786,6 +1051,7 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
     .unwrap();
     deliver_claimed_websocket_elicitation(
         fixture.handle.clone(),
+        recovery.clone(),
         new_claim.clone(),
         "new".to_string(),
         new_tx.clone(),
@@ -864,6 +1130,7 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
     .unwrap();
     deliver_claimed_websocket_elicitation(
         fixture.handle.clone(),
+        recovery,
         retry_claim,
         "new".to_string(),
         new_tx,

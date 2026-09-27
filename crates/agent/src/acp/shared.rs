@@ -1534,6 +1534,14 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         .await?
                                         {
                                             crate::elicitation::ElicitationResolution::Resolved => {
+                                                if let (Some(registry), Some(session_id)) = (
+                                                    context.elicitation_recovery.as_ref(),
+                                                    params.session_id.as_deref(),
+                                                ) {
+                                                    registry
+                                                        .retire_session_if_idle(session_id, query_agent)
+                                                        .await;
+                                                }
                                                 Ok(serde_json::Value::Null)
                                             }
                                             crate::elicitation::ElicitationResolution::StaleDelivery => {

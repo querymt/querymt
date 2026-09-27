@@ -416,6 +416,23 @@ pub async fn pending_sessions_for_authority(
     session_ids
 }
 
+pub async fn has_pending_elicitation_for_agent_session(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+) -> bool {
+    for map in all_pending_maps(agent).await {
+        if map
+            .lock()
+            .await
+            .values()
+            .any(|entry| entry.session_id == session_id)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub async fn claim_pending_elicitation_deliveries(
     agent: &crate::agent::LocalAgentHandle,
     session_id: &str,

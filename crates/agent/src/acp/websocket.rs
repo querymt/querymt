@@ -433,6 +433,7 @@ async fn send_websocket_ext_notification(
 
 pub(crate) async fn deliver_claimed_websocket_elicitation(
     agent: Arc<crate::agent::LocalAgentHandle>,
+    recovery: crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
     claim: crate::elicitation::ClaimedElicitationDelivery,
     connection_id: String,
     tx: mpsc::Sender<String>,
@@ -440,13 +441,24 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
     request_counter: Arc<AtomicU64>,
     connection_cancel: CancellationToken,
 ) -> Result<(), Error> {
-    let request = create_elicitation_request(
+    let request = match create_elicitation_request(
         claim.elicitation_id.clone(),
         claim.session_id.clone(),
         claim.form.message.clone(),
         claim.form.requested_schema.clone(),
         claim.form.source.clone(),
-    )?;
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            log::warn!(
+                "Cannot construct WebSocket elicitation request: session_id={} elicitation_id={} error={}",
+                claim.session_id,
+                claim.elicitation_id,
+                error
+            );
+            return Ok(());
+        }
+    };
     let pending = send_websocket_request(
         &tx,
         &pending_requests,
@@ -490,6 +502,9 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
         .await
         {
             Ok(crate::elicitation::ElicitationResolution::Resolved) => {
+                recovery
+                    .retire_session_if_idle(&claim.session_id, agent.as_ref())
+                    .await;
                 let _ = send_websocket_notification(
                     &tx,
                     crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
@@ -793,6 +808,7 @@ async fn handle_websocket_connection(
                                 {
                                     if let Err(error) = deliver_claimed_websocket_elicitation(
                                         state_dispatch.agent.clone(),
+                                        state_dispatch.elicitation_recovery.clone(),
                                         claim,
                                         conn_id_dispatch.clone(),
                                         tx_dispatch.clone(),
@@ -843,7 +859,10 @@ async fn handle_websocket_connection(
     bridge_task.abort();
 
     cancel_pending_websocket_requests(&pending_requests).await;
-    state.elicitation_recovery.remove_connection(&conn_id).await;
+    state
+        .elicitation_recovery
+        .remove_connection(&conn_id, state.agent.as_ref())
+        .await;
     reconcile_websocket_disconnect(&state, &conn_id).await;
     log::info!("WebSocket connection closed: {}", conn_id);
 }
@@ -1058,6 +1077,17 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                         Err(_) => break,
                     },
                 };
+                if matches!(
+                    event.kind(),
+                    crate::events::AgentEventKind::RunCompleted { .. }
+                        | crate::events::AgentEventKind::ToolCallEnd { .. }
+                        | crate::events::AgentEventKind::Cancelled
+                ) {
+                    state_events
+                        .elicitation_recovery
+                        .retire_session_if_idle(event.session_id(), state_events.agent.as_ref())
+                        .await;
+                }
                 if !is_event_owned(&state_events.session_owners, &conn_id_events, &event).await {
                     continue;
                 }
@@ -1109,6 +1139,7 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                     };
                     if let Err(error) = deliver_claimed_websocket_elicitation(
                         state_events.agent.clone(),
+                        state_events.elicitation_recovery.clone(),
                         claim,
                         conn_id_events.clone(),
                         tx_events.clone(),
