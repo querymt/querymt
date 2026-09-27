@@ -1088,12 +1088,9 @@ fun helper(name: String): String {
                     && child.kind == SymbolKind::Method)
         );
 
-        assert_eq!(
-            index
-                .find_by_name("Singleton", Some(SymbolKind::Class))
-                .len(),
-            1
-        );
+        let singleton = index.find_by_name("Singleton", Some(SymbolKind::Class));
+        assert_eq!(singleton.len(), 1);
+        assert_eq!(singleton[0].signature, "object Singleton {");
 
         let interface = index.find_by_name("Repository", Some(SymbolKind::Interface));
         assert_eq!(interface.len(), 1);

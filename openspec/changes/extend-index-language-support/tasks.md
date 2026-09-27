@@ -2,7 +2,7 @@
 
 ## 1. Plumbing: dependencies and extension map
 
-- [x] 1.1 Add the 9 grammar crates to `crates/agent/Cargo.toml` under the tree-sitter block (`tree-sitter-svelte-ng`, `tree-sitter-bash`, `tree-sitter-php`, `tree-sitter-kotlin`, `tree-sitter-swift`, `tree-sitter-json`, `tree-sitter-yaml`, `tree-sitter-toml`, `tree-sitter-markdown`) and run `cargo check -p querymt-agent` to verify resolution and C compilation succeed
+- [x] 1.1 Add the 9 grammar crates to `crates/agent/Cargo.toml` under the tree-sitter block (`tree-sitter-svelte-ng`, `tree-sitter-bash`, `tree-sitter-php`, `tree-sitter-kotlin`, `tree-sitter-swift`, `tree-sitter-json`, `tree-sitter-yaml`, `tree-sitter-toml-ng`, `tree-sitter-md`) and run `cargo check -p querymt-agent` to verify resolution and C compilation succeed
 - [x] 1.2 Extend `get_language_for_extension` in `crates/agent/src/index/outline_index/common.rs` with the new extensions (`svelte`, `sh`/`bash`, `php`, `kt`/`kts`, `swift`, `json`, `yaml`/`yml`, `toml`, `md`/`markdown`) and extend the mapping test in `outline_index/tests.rs`; verify with `cargo test -p querymt-agent outline_index`
 
 ## 2. Code-language extractors (bash, php, kotlin, swift)

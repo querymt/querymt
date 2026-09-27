@@ -127,14 +127,7 @@ fn object_symbol(node: &Node, source: &str) -> SymbolEntry {
         }
     }
 
-    container_symbol_with_children(
-        node,
-        source,
-        SymbolKind::Class,
-        name,
-        format!("object {signature}"),
-        children,
-    )
+    container_symbol_with_children(node, source, SymbolKind::Class, name, signature, children)
 }
 
 fn collect_class_member(
