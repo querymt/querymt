@@ -205,6 +205,26 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(())
     }
 
+    async fn set_session_name(&self, session_id: &str, name: Option<String>) -> SessionResult<String> {
+        let session_id = session_id.to_string();
+        let updated_at = format_rfc3339(&OffsetDateTime::now_utc());
+        let updated_at_for_write = updated_at.clone();
+
+        self.run_blocking(move |conn| {
+            let affected = conn.execute(
+                "UPDATE sessions SET name = ?, updated_at = ? WHERE public_id = ?",
+                params![name, updated_at_for_write, session_id],
+            )?;
+            if affected == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
+        })
+        .await?;
+
+        Ok(updated_at)
+    }
+
     async fn set_current_intent_snapshot(
         &self,
         session_id: &str,

@@ -2,7 +2,7 @@
 
 ## 1. Protocol Surface and Projection Foundation
 
-- [ ] 1.1 Confirm the locked `agent-client-protocol` v1 types, feature flags, and exact capability paths for usage, plan operations, notices, and compaction; update `crates/agent/Cargo.toml` only as needed and verify `cargo check -p querymt-agent` succeeds.
+- [x] 1.1 Confirm the locked `agent-client-protocol` v1 types, feature flags, and exact capability paths for usage, plan operations, notices, and compaction; update `crates/agent/Cargo.toml` only as needed and verify `cargo check -p querymt-agent` succeeds.
 - [ ] 1.2 Add a connection-scoped session-update capability snapshot parsed during successful ACP initialization, treating omitted and null Preview capabilities as unsupported; verify unit tests cover every capability combination and isolation between two connections.
 - [ ] 1.3 Refactor the shared live translator to return ordered zero-to-many notifications and update both stdio and WebSocket delivery loops; verify existing translation tests pass and new transport tests prove multiple updates retain order.
 - [ ] 1.4 Add JSON serialization tests for every targeted ACP v1 discriminator and required field shape, verifying the tests assert `current_mode_update`, `config_option_update`, `session_info_update`, `usage_update`, `plan_update`, `plan_removed`, `notice`, `compaction_update`, and `compaction_summary_chunk` wire output.

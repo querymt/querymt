@@ -723,7 +723,11 @@ async fn handle_websocket_connection(
         request_counter: request_counter.clone(),
         connection_cancel: connection_cancel.clone(),
     };
-    spawn_event_forwarders(state.clone(), connection_state.clone());
+    // One projection context per connection: the RPC dispatcher parses the
+    // negotiated Preview capabilities into it at initialize, and the event
+    // forwarders project through it for the lifetime of the connection.
+    let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
+    spawn_event_forwarders(state.clone(), connection_state.clone(), translator.clone());
 
     let bridge_task = tokio::spawn(run_websocket_bridge(
         bridge_rx,
@@ -746,6 +750,7 @@ async fn handle_websocket_connection(
     let state_receive = state.clone();
     let connection_receive = connection_state.clone();
     let bridge_receive = session_bridge;
+    let translator_receive = translator.clone();
     let mut receive_task = tokio::spawn(async move {
         while let Some(result) = FuturesStreamExt::next(&mut ws_receiver).await {
             match result {
@@ -765,6 +770,7 @@ async fn handle_websocket_connection(
                         let conn_id_dispatch = conn_id_receive.clone();
                         let connection_dispatch = connection_receive.clone();
                         let bridge_dispatch = bridge_receive.clone();
+                        let translator_dispatch = translator_receive.clone();
                         tokio::spawn(async move {
                             dispatch_rpc_message_with_context(
                                 RpcDispatchState {
@@ -784,6 +790,7 @@ async fn handle_websocket_connection(
                                     elicitation_recovery: Some(
                                         state_dispatch.elicitation_recovery.clone(),
                                     ),
+                                    translator: Some(translator_dispatch.clone()),
                                 },
                             )
                             .await;
@@ -1052,9 +1059,12 @@ fn spawn_global_notification_forwarders(state: WsServerState, connection: Connec
     }
 }
 
-pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: ConnectionEventState) {
+pub(crate) fn spawn_event_forwarders(
+    state: WsServerState,
+    connection: ConnectionEventState,
+    translator: Arc<StdMutex<AcpLiveEventTranslator>>,
+) {
     spawn_global_notification_forwarders(state.clone(), connection.clone());
-    let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
     for event_source in &state.event_sources {
         let mut events = event_source.subscribe();
         let state_events = state.clone();
@@ -1165,11 +1175,11 @@ pub(crate) fn spawn_event_forwarders(state: WsServerState, connection: Connectio
                     continue;
                 }
 
-                let notification = translator
+                let notifications = translator
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .translate_notification(&event);
-                if let Some(notification) = notification {
+                    .translate_notifications(&event);
+                for notification in notifications {
                     let json = serde_json::to_string(&notification).unwrap_or_default();
                     if connection_events.tx.send(json).await.is_err() {
                         break;

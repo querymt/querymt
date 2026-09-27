@@ -2,6 +2,30 @@ use super::utils::format_prefixed_error_chain;
 use super::*;
 
 impl LocalAgentHandle {
+    /// Persists a session title and emits `session_info_update` metadata only
+    /// after persistence succeeds. `None` explicitly clears the title. Returns
+    /// the persisted RFC 3339 last-activity timestamp.
+    pub async fn set_session_title(
+        &self,
+        session_id: &str,
+        title: Option<String>,
+    ) -> Result<String, Error> {
+        let updated_at = self
+            .provider
+            .history_store()
+            .set_session_name(session_id, title.clone())
+            .await
+            .map_err(Error::from)?;
+        self.emit_event(
+            session_id,
+            crate::events::AgentEventKind::SessionMetadataUpdated {
+                title: Some(title),
+                updated_at: Some(updated_at.clone()),
+            },
+        );
+        Ok(updated_at)
+    }
+
     pub(super) async fn handle_set_session_model(
         &self,
         req: SetSessionModelRequest,

@@ -6,11 +6,14 @@
 
 use crate::acp::protocol::AGENT_METHOD_NAMES;
 use crate::acp::protocol::{
-    Content, ContentBlock, ContentChunk, CreateElicitationRequest, CreateElicitationResponse,
-    ElicitationAction as AcpElicitationAction, ElicitationFormMode, ElicitationSchema,
-    ElicitationSessionScope, Error, MessageId, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    RequestPermissionOutcome, SessionId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ClientCapabilities, CompactionId, CompactionStatus, CompactionSummaryChunk, CompactionUpdate,
+    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, CreateElicitationRequest,
+    CreateElicitationResponse, CurrentModeUpdate, ElicitationAction as AcpElicitationAction,
+    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Error, MaybeUndefined, MessageId,
+    Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId,
+    PlanRemoved, PlanUpdate, PlanUpdateContent, RequestPermissionOutcome, SessionId,
+    SessionInfoUpdate, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
@@ -273,6 +276,10 @@ pub struct RpcDispatchContext {
     pub session_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
     pub elicitation_recovery:
         Option<crate::control::elicitation_recovery::ElicitationRecoveryRegistry>,
+    /// The connection's live translator. On successful initialization the
+    /// negotiated client capabilities are parsed into it so Preview session
+    /// updates stay scoped to this connection.
+    pub translator: Option<Arc<std::sync::Mutex<AcpLiveEventTranslator>>>,
 }
 
 async fn attach_rpc_session<S: SendAgent>(
@@ -688,50 +695,368 @@ pub fn replay_agent_events_with_user_prompts<I>(
 where
     I: IntoIterator<Item = AgentEvent>,
 {
-    events
-        .into_iter()
-        .flat_map(|event| {
-            let structured_updates = match &event.kind {
-                AgentEventKind::PromptReceived {
-                    message_id: Some(message_id),
-                    ..
-                } => user_prompts.get(message_id).map(|blocks| {
-                    blocks
-                        .iter()
-                        .cloned()
-                        .map(|block| {
-                            SessionUpdate::UserMessageChunk(user_prompt_chunk(
-                                message_id, None, block,
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                }),
-                _ => None,
-            };
-            let updates = structured_updates.unwrap_or_else(|| {
-                let envelope = EventEnvelope::from(event);
-                translate_replay_event_to_updates(&envelope)
-            });
-            updates.into_iter().map(|update| {
-                crate::acp::protocol::SessionNotification::new(
-                    crate::acp::protocol::SessionId::from(session_id.to_string()),
-                    update,
-                )
-            })
-        })
-        .collect()
+    replay_agent_events_materialized(
+        session_id,
+        events,
+        user_prompts,
+        &AcpSessionUpdateCapabilities::default(),
+    )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcpTranslateMode {
-    Live,
-    Replay,
+/// Projects replayed session history with materialized state.
+///
+/// Durable session-update state (configuration, metadata, usage, the current
+/// todo plan, and terminal compactions) is folded before notifications are
+/// created, so replay emits only current state with stable identities. Notices,
+/// historical compaction summary chunks, and obsolete in-progress compaction
+/// states are never replayed; Preview variants are gated by the connection's
+/// capability snapshot.
+pub fn replay_agent_events_materialized<I>(
+    session_id: &str,
+    events: I,
+    user_prompts: &HashMap<String, Vec<ContentBlock>>,
+    capabilities: &AcpSessionUpdateCapabilities,
+) -> Vec<crate::acp::protocol::SessionNotification>
+where
+    I: IntoIterator<Item = AgentEvent>,
+{
+    let events: Vec<AgentEvent> = events.into_iter().collect();
+    let materialized = materialize_replay_state(&events, capabilities);
+    let mut notifications = Vec::new();
+    let session = crate::acp::protocol::SessionId::from(session_id.to_string());
+    let mut push = |update: SessionUpdate, notifications: &mut Vec<_>| {
+        notifications.push(crate::acp::protocol::SessionNotification::new(
+            session.clone(),
+            update,
+        ));
+    };
+
+    // 1. Latest current mode and configuration snapshot.
+    if let Some(mode) = materialized.mode {
+        push(
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(SessionModeId::from(
+                mode.as_str().to_string(),
+            ))),
+            &mut notifications,
+        );
+        let effort = materialized
+            .reasoning_effort
+            .as_deref()
+            .and_then(parse_reasoning_effort);
+        push(
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(session_config_options(
+                mode, effort,
+            ))),
+            &mut notifications,
+        );
+    }
+
+    // 2. Folded session metadata patch state.
+    if materialized.metadata_touched {
+        let mut update = SessionInfoUpdate::new();
+        if let Some(title) = materialized.metadata_title {
+            update.title = match title {
+                Some(title) => MaybeUndefined::Value(title),
+                None => MaybeUndefined::Null,
+            };
+        }
+        if let Some(updated_at) = materialized.metadata_updated_at {
+            update.updated_at = MaybeUndefined::Value(updated_at);
+        }
+        push(
+            SessionUpdate::SessionInfoUpdate(update),
+            &mut notifications,
+        );
+    }
+
+    // 3. Latest valid usage snapshot.
+    if let Some(used) = materialized.usage_used
+        && let Some(update) = materialized.usage.usage_update(used)
+    {
+        push(SessionUpdate::UsageUpdate(update), &mut notifications);
+    }
+
+    // 4. Current todo plan (retained only when non-empty).
+    if let Some(entries) = materialized.todo_entries
+        && !entries.is_empty()
+    {
+        if capabilities.plan_operations {
+            push(
+                SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
+                    PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
+                    entries,
+                ))),
+                &mut notifications,
+            );
+        } else {
+            push(SessionUpdate::Plan(Plan::new(entries)), &mut notifications);
+        }
+    }
+
+    // 5. Terminal compactions with their original identities and final
+    // summaries; chunks and in-progress states are omitted.
+    if capabilities.compaction {
+        for terminal in &materialized.compactions {
+            let mut update = CompactionUpdate::new(
+                CompactionId::from(terminal.id.clone()),
+                terminal.status.clone(),
+            );
+            if let Some(summary) = &terminal.summary {
+                update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
+                    summary.clone(),
+                ))]));
+            }
+            if let Some(error) = &terminal.error {
+                update = update.error(error.clone());
+            }
+            push(
+                SessionUpdate::CompactionUpdate(update),
+                &mut notifications,
+            );
+        }
+    }
+
+    // 6. Historical conversation/tool content in order.
+    for event in events {
+        let structured_updates = match &event.kind {
+            AgentEventKind::PromptReceived {
+                message_id: Some(message_id),
+                ..
+            } => user_prompts.get(message_id).map(|blocks| {
+                blocks
+                    .iter()
+                    .cloned()
+                    .map(|block| {
+                        SessionUpdate::UserMessageChunk(user_prompt_chunk(
+                            message_id, None, block,
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            _ => None,
+        };
+        let updates = structured_updates.unwrap_or_else(|| {
+            let envelope = EventEnvelope::from(event);
+            translate_replay_event_to_updates(&envelope)
+        });
+        for update in updates {
+            push(update, &mut notifications);
+        }
+    }
+
+    notifications
+}
+
+/// Final folded state of one compaction entity.
+struct ReplayCompactionTerminal {
+    id: String,
+    status: CompactionStatus,
+    summary: Option<String>,
+    error: Option<String>,
+}
+
+/// Folds durable events into the current session-update state for replay.
+fn materialize_replay_state(
+    events: &[AgentEvent],
+    capabilities: &AcpSessionUpdateCapabilities,
+) -> MaterializedReplayState {
+    let _ = capabilities;
+    let mut state = MaterializedReplayState::default();
+    // Most recent legacy (ID-less) compaction start, for pairing terminals.
+    let mut open_legacy_start: Option<String> = None;
+    let mut legacy_counter: usize = 0;
+
+    for event in events {
+        let envelope = EventEnvelope::from(event.clone());
+        match event.kind.clone() {
+            AgentEventKind::SessionModeChanged { mode } => {
+                state.mode = Some(mode);
+            }
+            AgentEventKind::SessionConfigChanged {
+                mode,
+                reasoning_effort,
+            } => {
+                state.mode = Some(mode);
+                state.reasoning_effort = reasoning_effort;
+            }
+            AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
+                state.metadata_touched = true;
+                if title.is_some() {
+                    state.metadata_title = title;
+                }
+                if updated_at.is_some() {
+                    state.metadata_updated_at = updated_at;
+                }
+            }
+            AgentEventKind::ProviderChanged { context_limit, .. } => {
+                state.usage.context_limit = context_limit;
+            }
+            AgentEventKind::LlmRequestEnd {
+                context_tokens,
+                cumulative_cost_usd,
+                ..
+            } => {
+                if let Some(cost) = cumulative_cost_usd {
+                    state.usage.cumulative_cost_usd = Some(cost);
+                }
+                if state.usage.context_limit.is_some() {
+                    state.usage_used = Some(context_tokens);
+                } else {
+                    state.usage_used = None;
+                }
+            }
+            AgentEventKind::CompactionStart { compaction_id, .. } => {
+                match compaction_id {
+                    Some(id) => open_legacy_start = None,
+                    None => {
+                        legacy_counter += 1;
+                        open_legacy_start = Some(format!(
+                            "querymt-compaction-legacy-{}",
+                            envelope.seq().max(legacy_counter as i64)
+                        ));
+                    }
+                }
+            }
+            AgentEventKind::CompactionEnd {
+                compaction_id,
+                summary,
+                context_tokens,
+                ..
+            } => {
+                let id = match compaction_id {
+                    Some(id) => id,
+                    None => open_legacy_start.take().unwrap_or_else(|| {
+                        legacy_counter += 1;
+                        format!(
+                            "querymt-compaction-legacy-{}",
+                            envelope.seq().max(legacy_counter as i64)
+                        )
+                    }),
+                };
+                state.compactions.retain(|c: &ReplayCompactionTerminal| c.id != id);
+                state.compactions.push(ReplayCompactionTerminal {
+                    id: id.clone(),
+                    status: CompactionStatus::Completed,
+                    summary: (!summary.trim().is_empty()).then_some(summary),
+                    error: None,
+                });
+                if let Some(tokens) = context_tokens {
+                    state.usage_used = Some(tokens);
+                }
+                open_legacy_start = None;
+            }
+            AgentEventKind::CompactionFailed {
+                compaction_id,
+                reason,
+                cancelled,
+            } => {
+                state.compactions.retain(|c| c.id != compaction_id);
+                state.compactions.push(ReplayCompactionTerminal {
+                    id: compaction_id.clone(),
+                    status: if cancelled {
+                        CompactionStatus::Cancelled
+                    } else {
+                        CompactionStatus::Failed
+                    },
+                    summary: None,
+                    error: (!cancelled).then_some(reason),
+                });
+                open_legacy_start = None;
+            }
+            AgentEventKind::CompactionSummaryChunk { .. } | AgentEventKind::HookNotice { .. } => {
+                // Live-only content: notices are never replayed and summary
+                // chunks would duplicate the materialized terminal summary.
+            }
+            AgentEventKind::ToolCallStart {
+                ref tool_name,
+                ref arguments,
+                ..
+            } if is_todo_write_tool(tool_name) => {
+                if let Some(entries) = todo_entries_from_arguments(arguments) {
+                    state.todo_entries = Some(entries);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    state
+}
+
+/// Materialized current state folded from durable session events.
+#[derive(Default)]
+struct MaterializedReplayState {
+    mode: Option<crate::agent::core::AgentMode>,
+    reasoning_effort: Option<String>,
+    metadata_touched: bool,
+    metadata_title: Option<Option<String>>,
+    metadata_updated_at: Option<String>,
+    usage: SessionUsageProjection,
+    usage_used: Option<u64>,
+    todo_entries: Option<Vec<PlanEntry>>,
+    compactions: Vec<ReplayCompactionTerminal>,
+}
+
+/// Deterministic plan identity for QueryMT's todo list within a session.
+pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
+
+/// Connection-scoped snapshot of ACP v1 Preview session-update capabilities.
+///
+/// Parsed once from the client's advertised capabilities after a successful
+/// ACP initialization. Omitted and `null` Preview capability fields map to
+/// `false`, and the snapshot is immutable for the rest of the connection so
+/// one client's Preview support never affects another connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcpSessionUpdateCapabilities {
+    /// Client advertised `plan_update` / `plan_removed` support.
+    pub plan_operations: bool,
+    /// Client advertised advisory `notice` support.
+    pub notices: bool,
+    /// Client advertised ID-addressed compaction updates.
+    pub compaction: bool,
+}
+
+impl AcpSessionUpdateCapabilities {
+    /// Derives the snapshot from negotiated client capabilities.
+    pub fn from_client_capabilities(capabilities: &ClientCapabilities) -> Self {
+        let session = capabilities.session.as_ref();
+        Self {
+            plan_operations: capabilities.plan.is_some(),
+            notices: session.is_some_and(|session| session.notices.is_some()),
+            compaction: session.is_some_and(|session| session.compaction.is_some()),
+        }
+    }
+}
+
+/// Per-session usage projection state for the live context meter.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SessionUsageProjection {
+    context_limit: Option<u64>,
+    cumulative_cost_usd: Option<f64>,
+}
+
+impl SessionUsageProjection {
+    /// Builds a `usage_update` for the given current context occupancy, or
+    /// `None` when the effective context limit is unknown or meaningless.
+    fn usage_update(&self, used: u64) -> Option<UsageUpdate> {
+        let size = self.context_limit.filter(|size| *size > 0)?;
+        let mut update = UsageUpdate::new(used, size);
+        if let Some(amount) = self.cumulative_cost_usd {
+            update = update.cost(crate::acp::protocol::Cost::new(amount, "USD"));
+        }
+        Some(update)
+    }
 }
 
 pub struct AcpLiveEventTranslator {
     streamed_assistant_messages: HashSet<(String, String)>,
     structured_user_messages: HashSet<(String, String)>,
     delegation_updates: crate::control::delegation_notifications::DelegationUpdateProjector,
+    capabilities: AcpSessionUpdateCapabilities,
+    usage: HashMap<String, SessionUsageProjection>,
+    /// Sessions whose deterministic todo plan is currently announced to a
+    /// plan-operations client, so an empty snapshot removes it exactly once.
+    announced_todo_plans: HashSet<String>,
 }
 
 impl Default for AcpLiveEventTranslator {
@@ -748,7 +1073,31 @@ impl AcpLiveEventTranslator {
             delegation_updates:
                 crate::control::delegation_notifications::DelegationUpdateProjector::for_live_stream(
                 ),
+            capabilities: AcpSessionUpdateCapabilities::default(),
+            usage: HashMap::new(),
+            announced_todo_plans: HashSet::new(),
         }
+    }
+
+    /// Applies the connection's negotiated Preview capability snapshot.
+    /// Called once after successful ACP initialization.
+    pub fn set_capabilities(&mut self, capabilities: AcpSessionUpdateCapabilities) {
+        self.capabilities = capabilities;
+    }
+
+    /// Currently applied Preview capability snapshot.
+    pub fn capabilities(&self) -> AcpSessionUpdateCapabilities {
+        self.capabilities
+    }
+
+    /// Drops all per-session projection state for a closed session.
+    pub fn forget_session(&mut self, session_id: &str) {
+        self.usage.remove(session_id);
+        self.announced_todo_plans.remove(session_id);
+        self.streamed_assistant_messages
+            .retain(|(session, _)| session != session_id);
+        self.structured_user_messages
+            .retain(|(session, _)| session != session_id);
     }
 
     pub fn translate_delegation_update(
@@ -758,18 +1107,20 @@ impl AcpLiveEventTranslator {
         self.delegation_updates.project_envelope(event)
     }
 
-    pub fn translate_notification(&mut self, event: &EventEnvelope) -> Option<serde_json::Value> {
+    /// Translates one internal event into zero or more ordered JSON-RPC
+    /// notifications for the owning connection.
+    pub fn translate_notifications(&mut self, event: &EventEnvelope) -> Vec<serde_json::Value> {
         if let AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
-            return Some(delegate_models_changed_notification(
+            return vec![delegate_models_changed_notification(
                 event.session_id(),
                 *revision,
-            ));
+            )];
         }
         if let Some(update) = self.translate_delegation_update(event) {
-            return Some(delegation_update_notification(update));
+            return vec![delegation_update_notification(update)];
         }
         if let Some(notification) = input_state_notification(event) {
-            return Some(notification);
+            return vec![notification];
         }
 
         // Handle ElicitationRequested specially - it's a custom notification, not a session/update
@@ -781,7 +1132,7 @@ impl AcpLiveEventTranslator {
             source,
         } = event.kind()
         {
-            return Some(serde_json::json!({
+            return vec![serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "elicitation/requested",
                 "params": {
@@ -791,23 +1142,27 @@ impl AcpLiveEventTranslator {
                     "requestedSchema": requested_schema,
                     "source": source,
                 }
-            }));
+            })];
         }
 
         let session_id = event.session_id().to_owned();
-        let update = self.translate_update(event)?;
-
-        Some(serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": update
-            }
-        }))
+        self.translate_updates(event)
+            .into_iter()
+            .map(|update| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": update
+                    }
+                })
+            })
+            .collect()
     }
 
-    pub fn translate_update(&mut self, event: &EventEnvelope) -> Option<SessionUpdate> {
+    /// Translates one internal event into zero or more ordered session updates.
+    pub fn translate_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
         match event.kind() {
             AgentEventKind::UserPromptBlock {
                 message_id,
@@ -816,11 +1171,11 @@ impl AcpLiveEventTranslator {
             } => {
                 self.structured_user_messages
                     .insert((event.session_id().to_owned(), message_id.clone()));
-                Some(SessionUpdate::UserMessageChunk(user_prompt_chunk(
+                vec![SessionUpdate::UserMessageChunk(user_prompt_chunk(
                     message_id,
                     client_prompt_id.as_deref(),
                     block.clone(),
-                )))
+                ))]
             }
             AgentEventKind::PromptReceived {
                 message_id: Some(message_id),
@@ -828,9 +1183,9 @@ impl AcpLiveEventTranslator {
             } => {
                 let key = (event.session_id().to_owned(), message_id.clone());
                 if self.structured_user_messages.remove(&key) {
-                    None
+                    Vec::new()
                 } else {
-                    translate_event_to_update_for_mode(event, AcpTranslateMode::Live)
+                    self.translate_live_event(event)
                 }
             }
             AgentEventKind::AssistantContentDelta {
@@ -838,14 +1193,14 @@ impl AcpLiveEventTranslator {
                 message_id,
             } => {
                 if content.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 self.streamed_assistant_messages
                     .insert((event.session_id().to_owned(), message_id.clone()));
-                Some(SessionUpdate::AgentMessageChunk(
+                vec![SessionUpdate::AgentMessageChunk(
                     ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                         .message_id(MessageId::from(message_id.clone())),
-                ))
+                )]
             }
             AgentEventKind::AssistantMessageStored {
                 content,
@@ -853,20 +1208,204 @@ impl AcpLiveEventTranslator {
                 ..
             } => {
                 if content.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 let key = (event.session_id().to_owned(), message_id.clone());
                 if self.streamed_assistant_messages.remove(&key) {
-                    None
+                    Vec::new()
                 } else {
-                    Some(SessionUpdate::AgentMessageChunk(
+                    vec![SessionUpdate::AgentMessageChunk(
                         ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                             .message_id(MessageId::from(message_id.clone())),
-                    ))
+                    )]
                 }
             }
-            _ => translate_event_to_update_for_mode(event, AcpTranslateMode::Live),
+            _ => self.translate_live_event(event),
         }
+    }
+
+    /// Live-only projection for stateful session updates plus fallthrough to
+    /// the shared stateless translation.
+    fn translate_live_event(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
+        let session_id = event.session_id().to_owned();
+        match event.kind() {
+            AgentEventKind::SessionModeChanged { mode } => {
+                vec![SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                    SessionModeId::from(mode.as_str().to_string()),
+                ))]
+            }
+            AgentEventKind::SessionConfigChanged {
+                mode,
+                reasoning_effort,
+            } => {
+                let effort = reasoning_effort.as_deref().and_then(parse_reasoning_effort);
+                vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                    session_config_options(*mode, effort),
+                ))]
+            }
+            AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
+                let mut update = SessionInfoUpdate::new();
+                if let Some(title) = title {
+                    update.title = match title {
+                        Some(title) => MaybeUndefined::Value(title.clone()),
+                        None => MaybeUndefined::Null,
+                    };
+                }
+                if let Some(updated_at) = updated_at {
+                    update.updated_at = MaybeUndefined::Value(updated_at.clone());
+                }
+                vec![SessionUpdate::SessionInfoUpdate(update)]
+            }
+            AgentEventKind::ProviderChanged { context_limit, .. } => {
+                self.usage
+                    .entry(session_id)
+                    .or_default()
+                    .context_limit = *context_limit;
+                Vec::new()
+            }
+            AgentEventKind::LlmRequestEnd {
+                context_tokens,
+                cumulative_cost_usd,
+                ..
+            } => {
+                let usage = self.usage.entry(session_id).or_default();
+                if let Some(cost) = cumulative_cost_usd {
+                    usage.cumulative_cost_usd = Some(*cost);
+                }
+                usage
+                    .usage_update(*context_tokens)
+                    .map(|update| vec![SessionUpdate::UsageUpdate(update)])
+                    .unwrap_or_default()
+            }
+            AgentEventKind::HookNotice {
+                event_name,
+                message,
+                is_error,
+            } => {
+                if !self.capabilities.notices {
+                    return Vec::new();
+                }
+                let severity = if *is_error {
+                    NoticeSeverity::Error
+                } else {
+                    NoticeSeverity::Info
+                };
+                let title = if event_name.is_empty() {
+                    "Hook notice"
+                } else {
+                    event_name.as_str()
+                };
+                vec![SessionUpdate::Notice(
+                    Notice::new(severity, title).description(message.clone()),
+                )]
+            }
+            AgentEventKind::ToolCallStart {
+                tool_name,
+                arguments,
+                ..
+            } if is_todo_write_tool(tool_name) => {
+                self.translate_todo_updates(&session_id, arguments)
+            }
+            AgentEventKind::CompactionStart { compaction_id, .. } => {
+                if !self.capabilities.compaction {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+                    compaction_identity(compaction_id.as_deref(), event),
+                    CompactionStatus::InProgress,
+                ))]
+            }
+            AgentEventKind::CompactionSummaryChunk {
+                compaction_id,
+                content,
+            } => {
+                if !self.capabilities.compaction || content.is_empty() {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::CompactionSummaryChunk(
+                    CompactionSummaryChunk::new(
+                        CompactionId::from(compaction_id.clone()),
+                        ContentBlock::Text(TextContent::new(content.clone())),
+                    ),
+                )]
+            }
+            AgentEventKind::CompactionEnd {
+                compaction_id,
+                context_tokens,
+                ..
+            } => {
+                let mut updates = Vec::new();
+                if self.capabilities.compaction {
+                    updates.push(SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+                        compaction_identity(compaction_id.as_deref(), event),
+                        CompactionStatus::Completed,
+                    )));
+                }
+                // Post-compaction usage snapshots are stable, ungated updates.
+                if let Some(tokens) = context_tokens
+                    && let Some(update) = self
+                        .usage
+                        .get(&session_id)
+                        .and_then(|usage| usage.usage_update(*tokens))
+                {
+                    updates.push(SessionUpdate::UsageUpdate(update));
+                }
+                updates
+            }
+            AgentEventKind::CompactionFailed {
+                compaction_id,
+                reason,
+                cancelled,
+            } => {
+                if !self.capabilities.compaction {
+                    return Vec::new();
+                }
+                let mut update = CompactionUpdate::new(
+                    CompactionId::from(compaction_id.clone()),
+                    if *cancelled {
+                        CompactionStatus::Cancelled
+                    } else {
+                        CompactionStatus::Failed
+                    },
+                );
+                if !*cancelled {
+                    update = update.error(reason.clone());
+                }
+                vec![SessionUpdate::CompactionUpdate(update)]
+            }
+            _ => translate_replayable_updates(event),
+        }
+    }
+
+    /// Projects a todowrite snapshot to plan updates. Plan-operations clients
+    /// receive item-based `plan_update` replacements with one deterministic
+    /// per-session plan ID and a single `plan_removed` for dismissal; legacy
+    /// clients retain the full-replacement `plan` update (an empty snapshot
+    /// stays an empty replacement because legacy v1 has no removal variant).
+    fn translate_todo_updates(&mut self, session_id: &str, arguments: &str) -> Vec<SessionUpdate> {
+        // Malformed snapshots emit nothing; an empty entry list is a valid,
+        // explicitly-dismissed snapshot.
+        let Some(entries) = todo_entries_from_arguments(arguments) else {
+            return Vec::new();
+        };
+        if self.capabilities.plan_operations {
+            if entries.is_empty() {
+                if self.announced_todo_plans.remove(session_id) {
+                    return vec![SessionUpdate::PlanRemoved(PlanRemoved::new(
+                        PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
+                    ))];
+                }
+                return Vec::new();
+            }
+            self.announced_todo_plans.insert(session_id.to_owned());
+            return vec![SessionUpdate::PlanUpdate(PlanUpdate::new(
+                PlanUpdateContent::items(
+                    PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
+                    entries,
+                ),
+            ))];
+        }
+        vec![SessionUpdate::Plan(Plan::new(entries))]
     }
 }
 
@@ -909,11 +1448,11 @@ pub fn translate_replay_event_to_notification(event: &EventEnvelope) -> Option<s
     }))
 }
 
-/// Translate an agent event to a replay SessionUpdate.
+/// Translate an agent event to a single replay SessionUpdate.
 ///
 /// Returns `None` if the event should not be sent to the client.
 pub fn translate_replay_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate> {
-    translate_event_to_update_for_mode(event, AcpTranslateMode::Replay)
+    translate_replayable_updates(event).into_iter().next()
 }
 
 pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
@@ -926,77 +1465,54 @@ pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUp
     {
         return stored_summary_updates(content, message_id.as_deref(), reasoning_parts);
     }
-    translate_replay_event_to_update(event)
-        .into_iter()
-        .collect()
+    translate_replayable_updates(event)
 }
 
-fn translate_event_to_update_for_mode(
-    event: &EventEnvelope,
-    mode: AcpTranslateMode,
-) -> Option<SessionUpdate> {
+/// Stateless, replay-safe projection shared by replay translation and the live
+/// fallthrough for conversation/tool events.
+///
+/// Streaming text deltas and per-block user prompts stay live-only (replay
+/// reconstructs them from persisted messages), and stateful session updates
+/// (mode/config, metadata, usage, notices, capability-gated plans, and
+/// compaction) are projected by their owners instead.
+fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
     match event.kind() {
         AgentEventKind::PromptReceived {
             content,
             message_id,
-        } => Some(SessionUpdate::UserMessageChunk(
+        } => vec![SessionUpdate::UserMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                 .message_id(message_id.clone().map(MessageId::from)),
-        )),
-        AgentEventKind::UserPromptBlock {
-            message_id,
-            client_prompt_id,
-            block,
-        } => {
-            if mode == AcpTranslateMode::Replay {
-                None
-            } else {
-                Some(SessionUpdate::UserMessageChunk(user_prompt_chunk(
-                    message_id,
-                    client_prompt_id.as_deref(),
-                    block.clone(),
-                )))
-            }
-        }
+        )],
+        AgentEventKind::UserPromptBlock { .. } => Vec::new(),
         AgentEventKind::AssistantMessageStored {
             content,
             message_id,
             ..
         } => {
-            if mode == AcpTranslateMode::Live || content.is_empty() {
-                return None;
+            if content.is_empty() {
+                return Vec::new();
             }
-            Some(SessionUpdate::AgentMessageChunk(
+            vec![SessionUpdate::AgentMessageChunk(
                 ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                     .message_id(message_id.clone().map(MessageId::from)),
-            ))
+            )]
         }
-        // Streaming text deltas: forward to ACP clients so they also benefit from streaming.
-        AgentEventKind::AssistantContentDelta {
-            content,
-            message_id,
-        } => {
-            if mode == AcpTranslateMode::Replay || content.is_empty() {
-                return None;
-            }
-            Some(SessionUpdate::AgentMessageChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                    .message_id(MessageId::from(message_id.clone())),
-            ))
-        }
+        // Streaming text deltas are live-only; replay uses persisted messages.
+        AgentEventKind::AssistantContentDelta { .. } => Vec::new(),
         AgentEventKind::AssistantThinkingDelta {
             content,
             message_id,
             part_id,
         } => {
             if content.is_empty() {
-                return None;
+                return Vec::new();
             }
-            Some(SessionUpdate::AgentThoughtChunk(thought_chunk(
+            vec![SessionUpdate::AgentThoughtChunk(thought_chunk(
                 content,
                 message_id,
                 part_id.as_deref(),
-            )))
+            ))]
         }
         AgentEventKind::ToolCallStart {
             tool_call_id,
@@ -1004,11 +1520,15 @@ fn translate_event_to_update_for_mode(
             arguments,
         } => {
             if is_todo_write_tool(tool_name) {
-                return todo_plan_from_arguments(arguments).map(SessionUpdate::Plan);
+                // Ungated contexts receive the legacy full-replacement plan;
+                // plan-operations connections intercept todowrite earlier.
+                return todo_entries_from_arguments(arguments)
+                    .map(|entries| vec![SessionUpdate::Plan(Plan::new(entries))])
+                    .unwrap_or_default();
             }
 
             let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-            Some(SessionUpdate::ToolCall(
+            vec![SessionUpdate::ToolCall(
                 ToolCall::new(
                     ToolCallId::from(tool_call_id.clone()),
                     format!("Run {}", tool_name),
@@ -1016,7 +1536,7 @@ fn translate_event_to_update_for_mode(
                 .kind(tool_kind_for_tool(tool_name))
                 .status(ToolCallStatus::InProgress)
                 .raw_input(args),
-            ))
+            )]
         }
         AgentEventKind::ToolCallEnd {
             tool_call_id,
@@ -1025,7 +1545,7 @@ fn translate_event_to_update_for_mode(
             is_error,
         } => {
             if is_todo_write_tool(tool_name) {
-                return None;
+                return Vec::new();
             }
 
             let status = if *is_error {
@@ -1034,7 +1554,7 @@ fn translate_event_to_update_for_mode(
                 ToolCallStatus::Completed
             };
             let raw_output = serde_json::from_str(result).ok();
-            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 ToolCallId::from(tool_call_id.clone()),
                 ToolCallUpdateFields::new()
                     .kind(tool_kind_for_tool(tool_name))
@@ -1044,9 +1564,9 @@ fn translate_event_to_update_for_mode(
                         ContentBlock::Text(TextContent::new(result.clone())),
                     ))])
                     .raw_output(raw_output),
-            )))
+            ))]
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -1054,7 +1574,7 @@ fn is_todo_write_tool(tool_name: &str) -> bool {
     matches!(tool_name, "todowrite" | "mcp_todowrite")
 }
 
-fn todo_plan_from_arguments(arguments: &str) -> Option<Plan> {
+fn todo_entries_from_arguments(arguments: &str) -> Option<Vec<PlanEntry>> {
     let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let todos = parsed.get("todos")?.as_array()?;
     let mut entries = Vec::with_capacity(todos.len());
@@ -1078,7 +1598,25 @@ fn todo_plan_from_arguments(arguments: &str) -> Option<Plan> {
         entries.push(PlanEntry::new(content, priority, status));
     }
 
-    Some(Plan::new(entries))
+    Some(entries)
+}
+
+/// Resolves the protocol compaction identity for a compaction event. Live
+/// events always carry an explicit ID; legacy persisted records derive a
+/// deterministic identity from their stream position.
+fn compaction_identity(explicit: Option<&str>, event: &EventEnvelope) -> CompactionId {
+    match explicit {
+        Some(id) if !id.is_empty() => CompactionId::from(id.to_string()),
+        _ => CompactionId::from(format!("querymt-compaction-legacy-{}", event.seq())),
+    }
+}
+
+/// Parses a reasoning-effort wire string (`"auto"` maps to no override).
+fn parse_reasoning_effort(value: &str) -> Option<querymt::chat::ReasoningEffort> {
+    if value == "auto" {
+        return None;
+    }
+    serde_json::from_value(serde_json::json!(value)).ok()
 }
 
 fn todo_priority_to_plan_priority(priority: &str) -> Option<PlanEntryPriority> {
@@ -1168,8 +1706,7 @@ pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventFanout>> 
 }
 
 /// Re-export from session_registry — the single source of truth for config option shape.
-/// Used by tests in this module and by the config_option_update notification handler.
-#[cfg(test)]
+/// Used by the config_option_update projection and by tests in this module.
 use crate::agent::session_registry::config_options as session_config_options;
 
 /// Handle an RPC request and return a response.
@@ -1221,16 +1758,26 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 .elicitation
                                 .as_ref()
                                 .is_some_and(|elicitation| elicitation.form.is_some());
+                            let capabilities = AcpSessionUpdateCapabilities::from_client_capabilities(
+                                &params.client_capabilities,
+                            );
                             let response = agent.initialize(params).await;
-                            if response.is_ok()
-                                && let Some(registry) = context.elicitation_recovery.as_ref()
-                            {
-                                registry
-                                    .record_client_capabilities(
-                                        conn_id,
-                                        supports_form_elicitation,
-                                    )
-                                    .await;
+                            if response.is_ok() {
+                                // Parse Preview capabilities once per connection
+                                // so gating stays isolated to this client.
+                                if let Some(translator) = context.translator.as_ref()
+                                    && let Ok(mut translator) = translator.lock()
+                                {
+                                    translator.set_capabilities(capabilities);
+                                }
+                                if let Some(registry) = context.elicitation_recovery.as_ref() {
+                                    registry
+                                        .record_client_capabilities(
+                                            conn_id,
+                                            supports_form_elicitation,
+                                        )
+                                        .await;
+                                }
                             }
                             response.map(|r| serde_json::to_value(r).unwrap())
                         }
@@ -3289,6 +3836,7 @@ mod tests {
             })),
             session_bridge: None,
             elicitation_recovery: None,
+            translator: None,
         };
 
         for session_id in ["s-load-new", "s-load-existing"] {
@@ -3357,6 +3905,7 @@ mod tests {
             })),
             session_bridge: None,
             elicitation_recovery: None,
+            translator: None,
         };
 
         for (method, params) in [
@@ -3447,6 +3996,7 @@ mod tests {
                     ),
                 ),
                 elicitation_recovery: None,
+                translator: None,
             },
         )
         .await;
@@ -3504,6 +4054,7 @@ mod tests {
                     ),
                 ),
                 elicitation_recovery: None,
+                translator: None,
             },
         )
         .await;
@@ -3635,6 +4186,7 @@ mod tests {
                 session_hooks: None,
                 session_bridge: None,
                 elicitation_recovery: None,
+                translator: None,
             },
         )
         .await;
@@ -3702,6 +4254,7 @@ mod tests {
                 session_hooks: None,
                 session_bridge: None,
                 elicitation_recovery: None,
+                translator: None,
             },
         )
         .await

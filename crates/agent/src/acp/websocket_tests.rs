@@ -1407,6 +1407,7 @@ async fn authorized_recovery_rpc_discovers_and_attaches_pending_session() {
         session_hooks: None,
         session_bridge: Some(bridge),
         elicitation_recovery: Some(state.elicitation_recovery.clone()),
+        translator: None,
     };
 
     for (id, method, params) in [
@@ -1588,6 +1589,7 @@ async fn disconnected_websocket_cannot_be_reattached_by_in_flight_dispatch() {
             session_hooks: None,
             session_bridge: Some(bridge),
             elicitation_recovery: None,
+            translator: None,
         },
     ));
     tokio::task::yield_now().await;

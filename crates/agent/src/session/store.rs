@@ -291,6 +291,16 @@ pub trait SessionStore: Send + Sync {
     /// Retrieves session metadata by its unique ID.
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;
 
+    /// Persist a session title and return the stored RFC 3339 last-activity
+    /// timestamp. `None` explicitly clears the title. Default stores reject
+    /// the operation; callers emit metadata updates only after it succeeds.
+    async fn set_session_name(&self, session_id: &str, name: Option<String>) -> SessionResult<String> {
+        let _ = (session_id, name);
+        Err(crate::session::error::SessionError::InvalidOperation(
+            "set_session_name is not supported by this store".to_string(),
+        ))
+    }
+
     /// None means this storage backend does not support durable assignments.
     /// Supporting backends return an empty snapshot for an existing, unconfigured session.
     async fn get_delegate_assignments(

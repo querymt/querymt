@@ -562,6 +562,34 @@ impl Message<PromptFinished> for SessionActor {
                 outcome: outcome.to_string(),
             },
         );
+
+        // The turn persisted messages, so the session's last-activity time
+        // changed. Read the persisted row so the patch matches later
+        // session-list output exactly, and emit only after that read succeeds.
+        if let Ok(Some(session)) = self
+            .config
+            .provider
+            .history_store()
+            .get_session(&self.session_id)
+            .await
+        {
+            let updated_at = session
+                .updated_at
+                .and_then(|updated_at| {
+                    updated_at
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                })
+                .unwrap_or_default();
+            self.config.emit_event(
+                &self.session_id,
+                AgentEventKind::SessionMetadataUpdated {
+                    title: None,
+                    updated_at: Some(updated_at),
+                },
+            );
+        }
+
         self.active_run = None;
         self.prompt_running = false;
         self.turn_state.token = CancellationToken::new();
@@ -767,7 +795,11 @@ impl SessionActor {
 
         self.apply_control_state(current.clone());
 
-        if previous.active_mode != current.active_mode {
+        let mode_changed = previous.active_mode != current.active_mode;
+        let model_changed = previous.effective_model != current.effective_model;
+        let effort_changed = previous.reasoning_effort != current.reasoning_effort;
+
+        if mode_changed {
             self.config.emit_event(
                 &self.session_id,
                 AgentEventKind::SessionModeChanged {
@@ -775,7 +807,7 @@ impl SessionActor {
                 },
             );
         }
-        if previous.effective_model != current.effective_model {
+        if model_changed {
             let binding = &current.effective_model;
             let context_limit =
                 crate::model_info::get_model_info(&binding.provider, &binding.model)
@@ -788,6 +820,19 @@ impl SessionActor {
                     config_id: binding.llm_config_id,
                     context_limit,
                     provider_node_id: binding.provider_node_id.clone(),
+                },
+            );
+        }
+        // One authoritative post-commit configuration snapshot whenever any
+        // effective value changed; no-op transitions emit nothing. Mode changes
+        // additionally emit SessionModeChanged above so projections can order
+        // `current_mode_update` before the full config replacement.
+        if mode_changed || model_changed || effort_changed {
+            self.config.emit_event(
+                &self.session_id,
+                AgentEventKind::SessionConfigChanged {
+                    mode: current.active_mode,
+                    reasoning_effort: current.reasoning_effort.map(|effort| effort.to_string()),
                 },
             );
         }

@@ -455,10 +455,34 @@ pub enum AgentEventKind {
     },
     CompactionStart {
         token_estimate: u32,
+        /// Opaque lifecycle identity for this compaction, unique per session.
+        /// Legacy persisted records omit it; consumers derive a deterministic
+        /// identity from the record itself in that case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
     },
     CompactionEnd {
         summary: String,
         summary_len: u32,
+        /// Opaque lifecycle identity matching the originating compaction start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
+        /// Authoritative post-compaction context-token count, once recalculated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_tokens: Option<u64>,
+    },
+    /// One user-displayable summary fragment appended to an in-progress compaction.
+    CompactionSummaryChunk {
+        compaction_id: String,
+        content: String,
+    },
+    /// Terminal unsuccessful outcome for a previously started compaction.
+    CompactionFailed {
+        compaction_id: String,
+        reason: String,
+        /// `true` when the compaction was cancelled rather than failed.
+        #[serde(default)]
+        cancelled: bool,
     },
     MiddlewareInjected {
         message: String,
@@ -614,6 +638,29 @@ pub enum AgentEventKind {
     SessionModeChanged {
         #[typeshare(serialized_as = "string")]
         mode: crate::agent::core::AgentMode,
+    },
+    /// Emitted after a session-control transition commits successfully, carrying
+    /// the authoritative post-commit configuration snapshot values. Consumers
+    /// derive the complete configuration-option set from these values.
+    SessionConfigChanged {
+        #[typeshare(serialized_as = "string")]
+        mode: crate::agent::core::AgentMode,
+        /// Current reasoning effort as its wire string; `None` means auto.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+    },
+    /// Emitted after mutable session metadata (title / last-activity) persists
+    /// successfully. Fields follow patch semantics: an absent field is
+    /// unchanged, a present title is the new value, and `None` inside
+    /// `Some` is an explicit clear.
+    SessionMetadataUpdated {
+        #[typeshare(serialized_as = "Option<string>")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<Option<String>>,
+        /// RFC 3339 last-activity timestamp as persisted.
+        #[typeshare(serialized_as = "Option<string>")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
     },
     /// LLM request was rate limited, execution is paused and waiting.
     /// Retained as a stable wire event for rate-limit-specific UI behavior.
