@@ -217,6 +217,7 @@ pub struct FunctionCall {
 }
 
 /// Represents the usage of tokens in a tool call, supporting multiple JSON formats.
+#[cfg_attr(feature = "type-generation", typeshare::typeshare)]
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq, Default)]
 pub struct Usage {
     /// Number of input tokens.

@@ -246,6 +246,7 @@ pub struct ParametersSchema {
 }
 
 /// Represents a function definition for a tool
+#[cfg_attr(feature = "type-generation", typeshare::typeshare)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FunctionTool {
     /// The name of the function
@@ -253,6 +254,7 @@ pub struct FunctionTool {
     /// Description of what the function does
     pub description: String,
     /// The parameters schema for the function
+    #[cfg_attr(feature = "type-generation", typeshare(serialized_as = "any"))]
     pub parameters: Value,
     /// Whether the provider should enforce strict schema adherence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +310,7 @@ pub struct StructuredOutputFormat {
 }
 
 /// Represents a tool that can be used in chat
+#[cfg_attr(feature = "type-generation", typeshare::typeshare)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Tool {
     /// The type of tool (e.g. "function")

@@ -705,16 +705,17 @@ impl SessionMaterializer {
         }
 
         // Emit SessionConfigured
-        let mcp_configs: Vec<crate::config::McpServerConfig> = prepared
+        let mcp_servers = prepared
             .mcp_servers
             .iter()
             .map(crate::config::McpServerConfig::from_acp)
+            .map(crate::events::McpServerInfo::from)
             .collect();
         self.config.emit_event(
             &prepared.session_id,
             crate::events::AgentEventKind::SessionConfigured {
                 cwd: prepared.cwd.clone(),
-                mcp_servers: mcp_configs,
+                mcp_servers,
                 limits: self.config.get_session_limits(),
             },
         );

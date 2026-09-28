@@ -10,9 +10,12 @@ if ! command -v typeshare &> /dev/null; then
 fi
 
 TS_OUT="$REPO_ROOT/target/generated/types.ts"
+mkdir -p "$(dirname "$TS_OUT")"
 
 echo "Generating TypeScript types..."
-typeshare "$REPO_ROOT/crates/agent" \
+typeshare \
+  "$REPO_ROOT/crates/agent" \
+  "$REPO_ROOT/crates/querymt" \
   --lang=typescript \
   --output-file="$TS_OUT"
 

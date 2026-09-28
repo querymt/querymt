@@ -11469,6 +11469,7 @@ dependencies = [
  "tokio",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
+ "typeshare",
  "url",
  "uuid 1.26.1",
  "which 8.0.6",

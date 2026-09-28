@@ -52,7 +52,6 @@ pub mod slash_commands;
 pub mod snapshot;
 pub mod tasks;
 pub mod tools;
-pub mod ts_mirrors;
 pub mod verification;
 pub mod workspace_query;
 

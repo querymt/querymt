@@ -38,6 +38,7 @@ tracing = "0.1"
 http-serde-ext = "1.0"
 regex = "1"
 heck = "0.5"
+typeshare = "1.0"
 dirs = "7"
 hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"] }
 toml = "1"

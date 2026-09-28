@@ -2,7 +2,7 @@ use crate::acp::protocol::{ContentBlock, StopReason};
 use querymt::Usage;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 use typeshare::typeshare;
 
 use crate::config::McpServerConfig;
@@ -94,6 +94,57 @@ pub struct SessionLimits {
     pub max_turns: Option<u32>,
     /// Maximum cost in USD
     pub max_cost_usd: Option<f64>,
+}
+
+/// MCP configuration as emitted in the session event stream.
+///
+/// This flat DTO preserves the serialized `McpServerConfig` shape while avoiding
+/// Typeshare's lack of support for internally tagged enums.
+#[typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpServerInfo {
+    pub transport: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+}
+
+impl From<McpServerConfig> for McpServerInfo {
+    fn from(config: McpServerConfig) -> Self {
+        match config {
+            McpServerConfig::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => Self {
+                transport: "stdio".into(),
+                name,
+                command: Some(command),
+                args: Some(args),
+                env: Some(env),
+                url: None,
+                headers: None,
+            },
+            McpServerConfig::Http { name, url, headers } => Self {
+                transport: "http".into(),
+                name,
+                command: None,
+                args: None,
+                env: None,
+                url: Some(url),
+                headers: Some(headers),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -352,7 +403,7 @@ pub enum AgentEventKind {
         message_count: u32,
     },
     LlmRequestEnd {
-        #[typeshare(serialized_as = "Option<UsageInfo>")]
+        #[typeshare(serialized_as = "Option<Usage>")]
         usage: Option<Usage>,
         tool_calls: u32,
         #[typeshare(serialized_as = "Option<string>")]
@@ -536,14 +587,13 @@ pub enum AgentEventKind {
     SessionConfigured {
         #[typeshare(serialized_as = "Option<string>")]
         cwd: Option<PathBuf>,
-        #[typeshare(serialized_as = "Vec<McpServerInfo>")]
-        mcp_servers: Vec<McpServerConfig>,
+        mcp_servers: Vec<McpServerInfo>,
         /// Session limits configuration (if any)
         limits: Option<SessionLimits>,
     },
     /// Emitted at session start and whenever available tools change
     ToolsAvailable {
-        #[typeshare(serialized_as = "Vec<ToolInfo>")]
+        #[typeshare(serialized_as = "Vec<Tool>")]
         tools: Vec<querymt::chat::Tool>,
         #[typeshare(serialized_as = "string")]
         tools_hash: RapidHash,
@@ -882,6 +932,41 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_stdio_info_preserves_config_wire_shape() {
+        let config = McpServerConfig::Stdio {
+            name: "filesystem".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "server-filesystem".into()],
+            env: HashMap::from([("TOKEN".into(), "secret".into())]),
+        };
+        let expected = serde_json::to_value(&config).unwrap();
+        let info = McpServerInfo::from(config);
+
+        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
+            info
+        );
+    }
+
+    #[test]
+    fn mcp_http_info_preserves_config_wire_shape() {
+        let config = McpServerConfig::Http {
+            name: "remote".into(),
+            url: "https://example.test/mcp".into(),
+            headers: HashMap::from([("Authorization".into(), "Bearer secret".into())]),
+        };
+        let expected = serde_json::to_value(&config).unwrap();
+        let info = McpServerInfo::from(config);
+
+        assert_eq!(serde_json::to_value(&info).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_value::<McpServerInfo>(expected).unwrap(),
+            info
+        );
+    }
 
     // ── StopType -> StopReason conversion ──────────────────────────────────
 
