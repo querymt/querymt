@@ -1467,6 +1467,67 @@
   
 </li>
         
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#acp-session-updates" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        ACP Session Updates
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="ACP Session Updates">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#stable-updates" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Stable updates
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#preview-capability-gated-updates" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Preview (capability-gated) updates
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#fallbacks" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Fallbacks
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#replay-semantics" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Replay semantics
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
           <li class="md-nav__item">
   <a href="#via-configuration" class="md-nav__link">
     <span class="md-ellipsis">
@@ -2318,13 +2379,123 @@
 <a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="w">    </span><span class="n">mode</span><span class="p">:</span><span class="w"> </span><span class="nc">AgentMode</span><span class="p">::</span><span class="n">Plan</span><span class="p">,</span>
 <a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="p">})</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="via-configuration">Via Configuration</h3>
-<p>Set default mode in configuration:</p>
+<h2 id="acp-session-updates">ACP Session Updates</h2>
+<p>QueryMT publishes the session state it already tracks so ACP clients stay
+synchronized. Stable updates are emitted to every ACP v1 client; Preview
+updates are emitted only when the client advertises the matching capability
+during <code>initialize</code>.</p>
+<h3 id="stable-updates">Stable updates</h3>
+<table>
+<thead>
+<tr>
+<th>Update</th>
+<th>Emitted when</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>current_mode_update</code></td>
+<td>The active session mode changes</td>
+</tr>
+<tr>
+<td><code>config_option_update</code></td>
+<td>Mode, model, profile, or reasoning effort changes; always carries the complete option set</td>
+</tr>
+<tr>
+<td><code>session_info_update</code></td>
+<td>A session title or last-activity timestamp is persisted</td>
+</tr>
+<tr>
+<td><code>usage_update</code></td>
+<td>Provider request usage or a post-compaction context size becomes available</td>
+</tr>
+<tr>
+<td><code>plan</code></td>
+<td>Legacy plan replacement for clients without plan operations</td>
+</tr>
+</tbody>
+</table>
+<p>A mode change produces <code>current_mode_update</code> first, followed by
+<code>config_option_update</code>. <code>usage_update</code> reports <code>used</code> as the tokens currently
+occupying model context (cached tokens included) and <code>size</code> as the active
+model's effective context limit; the update is omitted when the limit is
+unknown, and cumulative USD cost is included only when available.</p>
+<h3 id="preview-capability-gated-updates">Preview (capability-gated) updates</h3>
+<table>
+<thead>
+<tr>
+<th>Update</th>
+<th>Client capability</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>plan_update</code> / <code>plan_removed</code></td>
+<td><code>plan</code> (top level)</td>
+<td>Item-based plan with the stable ID <code>querymt-todos</code></td>
+</tr>
+<tr>
+<td><code>notice</code></td>
+<td><code>session.notices</code></td>
+<td>Advisory hook notices only; never conversation history</td>
+</tr>
+<tr>
+<td><code>compaction_update</code> / <code>compaction_summary_chunk</code></td>
+<td><code>session.compaction</code></td>
+<td>ID-addressed compaction lifecycle</td>
+</tr>
+</tbody>
+</table>
+<p>Omitted and <code>null</code> capability fields mean unsupported. Capabilities are parsed
+per connection, so one client's Preview support never affects another client.</p>
+<p>A fully capable client advertises all three during <code>initialize</code>:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
 <span class="normal"><a href="#__codelineno-7-2">2</a></span>
-<span class="normal"><a href="#__codelineno-7-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"plan"</span><span class="w">  </span><span class="c1"># "build", "plan", or "review"</span>
+<span class="normal"><a href="#__codelineno-7-3">3</a></span>
+<span class="normal"><a href="#__codelineno-7-4">4</a></span>
+<span class="normal"><a href="#__codelineno-7-5">5</a></span>
+<span class="normal"><a href="#__codelineno-7-6">6</a></span>
+<span class="normal"><a href="#__codelineno-7-7">7</a></span>
+<span class="normal"><a href="#__codelineno-7-8">8</a></span>
+<span class="normal"><a href="#__codelineno-7-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="p">{</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="w">  </span><span class="nt">"clientCapabilities"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="w">    </span><span class="nt">"plan"</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="w">    </span><span class="nt">"session"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="w">      </span><span class="nt">"notices"</span><span class="p">:</span><span class="w"> </span><span class="p">{},</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="w">      </span><span class="nt">"compaction"</span><span class="p">:</span><span class="w"> </span><span class="p">{}</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p>Leaving any of these fields out (or setting them to <code>null</code>) treats that Preview
+surface as unsupported for that connection.</p>
+<h3 id="fallbacks">Fallbacks</h3>
+<p>Clients without plan operations receive the legacy full-replacement <code>plan</code>
+update (an empty snapshot stays an empty replacement because v1 has no removal
+primitive). Clients without compaction support receive neither
+<code>compaction_update</code> nor <code>compaction_summary_chunk</code>. Notices fall back to the
+event source's existing user-visible behavior.</p>
+<h3 id="replay-semantics">Replay semantics</h3>
+<p>When session history is replayed (for example on <code>session/load</code>), QueryMT
+materializes current state instead of replaying every historical event:</p>
+<ul>
+<li>One current mode/config snapshot, one folded metadata patch, and the latest
+  valid <code>usage_update</code>.</li>
+<li>The current todo plan using its stable ID.</li>
+<li>Terminal compactions with their original IDs and final summaries.</li>
+<li>Notices, historical compaction summary chunks, and obsolete in-progress
+  compaction states are never replayed.</li>
+</ul>
+<p>Replay applies the connection's capabilities after materialization, so
+unsupported Preview variants are never sent.</p>
+<h3 id="via-configuration">Via Configuration</h3>
+<p>Set default mode in configuration:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
+<span class="normal"><a href="#__codelineno-8-2">2</a></span>
+<span class="normal"><a href="#__codelineno-8-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"plan"</span><span class="w">  </span><span class="c1"># "build", "plan", or "review"</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="mode-transition-flow">Mode Transition Flow</h2>
 <pre class="mermaid"><code>flowchart LR
@@ -2497,26 +2668,6 @@
 <h2 id="configuration">Configuration</h2>
 <h3 id="custom-mode-reminders">Custom Mode Reminders</h3>
 <p>Customize the system reminders for Plan and Review modes:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
-<span class="normal"><a href="#__codelineno-8-2">2</a></span>
-<span class="normal"><a href="#__codelineno-8-3">3</a></span>
-<span class="normal"><a href="#__codelineno-8-4">4</a></span>
-<span class="normal"><a href="#__codelineno-8-5">5</a></span>
-<span class="normal"><a href="#__codelineno-8-6">6</a></span>
-<span class="normal"><a href="#__codelineno-8-7">7</a></span>
-<span class="normal"><a href="#__codelineno-8-8">8</a></span>
-<span class="normal"><a href="#__codelineno-8-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="s2">Custom plan mode reminder here.</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
-<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
-<a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="s2">Custom review mode reminder here.</span>
-<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="mode-specific-tools">Mode-Specific Tools</h3>
-<p>Configure different tools per mode:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
 <span class="normal"><a href="#__codelineno-9-2">2</a></span>
 <span class="normal"><a href="#__codelineno-9-3">3</a></span>
@@ -2524,14 +2675,34 @@
 <span class="normal"><a href="#__codelineno-9-5">5</a></span>
 <span class="normal"><a href="#__codelineno-9-6">6</a></span>
 <span class="normal"><a href="#__codelineno-9-7">7</a></span>
-<span class="normal"><a href="#__codelineno-9-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="c1"># Build mode tools (default)</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
-<a id="__codelineno-9-3" name="__codelineno-9-3"></a>
-<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="c1"># Plan mode tools (automatically filtered)</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="c1"># Only read-only tools are available</span>
-<a id="__codelineno-9-6" name="__codelineno-9-6"></a>
-<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="c1"># Review mode tools (automatically filtered)</span>
-<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="c1"># Only read-only tools are available</span>
+<span class="normal"><a href="#__codelineno-9-8">8</a></span>
+<span class="normal"><a href="#__codelineno-9-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="n">reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="s2">Custom plan mode reminder here.</span>
+<a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
+<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="n">review_reminder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"""&lt;system-reminder&gt;</span>
+<a id="__codelineno-9-8" name="__codelineno-9-8"></a><span class="s2">Custom review mode reminder here.</span>
+<a id="__codelineno-9-9" name="__codelineno-9-9"></a><span class="s2">&lt;/system-reminder&gt;"""</span>
+</code></pre></div></td></tr></table></div>
+<h3 id="mode-specific-tools">Mode-Specific Tools</h3>
+<p>Configure different tools per mode:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
+<span class="normal"><a href="#__codelineno-10-2">2</a></span>
+<span class="normal"><a href="#__codelineno-10-3">3</a></span>
+<span class="normal"><a href="#__codelineno-10-4">4</a></span>
+<span class="normal"><a href="#__codelineno-10-5">5</a></span>
+<span class="normal"><a href="#__codelineno-10-6">6</a></span>
+<span class="normal"><a href="#__codelineno-10-7">7</a></span>
+<span class="normal"><a href="#__codelineno-10-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Build mode tools (default)</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="n">tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">]</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3"></a>
+<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="c1"># Plan mode tools (automatically filtered)</span>
+<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="c1"># Only read-only tools are available</span>
+<a id="__codelineno-10-6" name="__codelineno-10-6"></a>
+<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="c1"># Review mode tools (automatically filtered)</span>
+<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="c1"># Only read-only tools are available</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="best-practices">Best Practices</h2>
 <h3 id="when-to-use-each-mode">When to Use Each Mode</h3>
