@@ -9,7 +9,7 @@ if ! command -v typeshare &> /dev/null; then
     exit 1
 fi
 
-TS_OUT="$REPO_ROOT/crates/agent/ui/src/generated/types.ts"
+TS_OUT="$REPO_ROOT/target/generated/types.ts"
 
 echo "Generating TypeScript types..."
 typeshare "$REPO_ROOT/crates/agent" \

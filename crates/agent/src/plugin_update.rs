@@ -5,6 +5,7 @@
 
 use querymt::plugin::host::{OciProgressCallback, PluginRegistry};
 use serde::{Deserialize, Serialize};
+use typeshare::typeshare;
 
 /// A factory that creates a per-plugin [`OciProgressCallback`].
 ///
@@ -15,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub type ProgressCallbackFactory = dyn Fn(&str, &str) -> OciProgressCallback + Send + Sync;
 
 /// Result of updating a single OCI plugin.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginUpdateResult {
     pub plugin_name: String,

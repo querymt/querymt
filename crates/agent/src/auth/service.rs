@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use typeshare::typeshare;
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -86,6 +87,7 @@ impl OAuthService {
 }
 
 /// OAuth authentication status for a provider.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OAuthStatus {
@@ -95,6 +97,7 @@ pub enum OAuthStatus {
 }
 
 /// Auth status entry for a single provider.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthProviderStatus {
     pub provider: String,
@@ -109,6 +112,7 @@ pub struct AuthProviderStatus {
 }
 
 /// Result of `start_flow`.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StartFlowResult {
     pub flow_id: String,
@@ -118,6 +122,7 @@ pub struct StartFlowResult {
 }
 
 /// Result of `complete_flow`.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteFlowResult {
     pub provider: String,
@@ -126,6 +131,7 @@ pub struct CompleteFlowResult {
 }
 
 /// Result of `logout`.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogoutResult {
     pub provider: String,
@@ -138,6 +144,7 @@ pub struct LogoutResult {
 ///
 /// Same wire shape as [`LogoutResult`] / [`CompleteFlowResult`] so ACP clients and
 /// the dashboard can treat auth mutations uniformly.
+#[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthMutationResult {
     pub provider: String,

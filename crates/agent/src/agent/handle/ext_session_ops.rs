@@ -1,5 +1,6 @@
 use super::utils::{ext_json_response, format_prefixed_error_chain};
 use super::*;
+use typeshare::typeshare;
 
 #[derive(Debug, serde::Deserialize)]
 struct UndoSessionRequest {
@@ -28,11 +29,14 @@ struct DiscardQueuedInputRequest {
     input_id: String,
 }
 
+/// A single entry of a session's undo stack.
+#[typeshare]
 #[derive(Debug, serde::Serialize)]
 struct UndoStackFrameResponse {
     message_id: String,
 }
 
+#[typeshare]
 #[derive(Debug, serde::Serialize)]
 struct UndoSessionResponse {
     success: bool,
@@ -42,6 +46,7 @@ struct UndoSessionResponse {
     undo_stack: Vec<UndoStackFrameResponse>,
 }
 
+#[typeshare]
 #[derive(Debug, serde::Serialize)]
 struct RedoSessionResponse {
     success: bool,
@@ -49,6 +54,7 @@ struct RedoSessionResponse {
     undo_stack: Vec<UndoStackFrameResponse>,
 }
 
+#[typeshare]
 #[derive(Debug, serde::Serialize)]
 struct UndoStackResponse {
     undo_stack: Vec<UndoStackFrameResponse>,
