@@ -1,0 +1,76 @@
+# Tasks
+
+## 1. Configuration, identities, and safe discovery
+
+- [ ] 1.1 Add disabled-by-default repository knowledge settings to standalone/quorum configuration and public builders, with host source/output limits, optional explicit root, and independently disabled orientation/index-context delivery controls; verify configuration round trips and that existing configurations cause no repository reads, file creation, or prompt changes.
+- [ ] 1.2 Implement `.agents/knowledge.toml` v1 parsing and normalized relative include/exclude rules; verify absent/unsupported manifests, exclude precedence, duplicate selections, selected hidden documentation, optional orientation entrypoints, and invalid/unselected entrypoint diagnostics with fixture tests.
+- [ ] 1.3 Implement root resolution from the effective session checkout or explicit non-Git root, with checkout-local cache identity; verify repository-root versus `crates/agent` equivalence, nested repositories, non-Git errors, and linked-worktree isolation.
+- [ ] 1.4 Implement confined, ignore-aware source discovery with file/count/byte budgets; verify traversal, external symlink, non-regular file, ignored-secret, and oversized-source rejection plus stable incomplete-coverage diagnostics.
+- [ ] 1.5 Document manifest/settings/root semantics and the distinction from dotagents protocol enablement in the agent docs; validate documented example manifests against the parser and configuration tests.
+
+## 2. Document projection and rebuildable local index
+
+- [ ] 2.1 Add repository document/chunk/provenance types and Markdown parsing using existing frontmatter facilities; verify explicit IDs, path-derived IDs, enabled memories, duplicate-ID isolation, duplicate headings, original line ranges, meaningful section bodies, and declarative `knowledge_paths` associations distinct from evidence dependencies.
+- [ ] 2.2 Add parsing of directory File/Purpose tables as citable navigation rows without changing existing documents or instruction handling; verify managed and ordinary Pi-style tables, empty purpose cells, relative row paths, and authored-text preservation.
+- [ ] 2.3 Implement the separate repository store and SQLite/FTS schema under the knowledge module, with versioned rebuildable cache metadata and transactional generations; verify create/reopen, rebuild after incompatible format/corruption, stable record keys, and no session DB migration.
+- [ ] 2.4 Implement hash-based reconciliation of selected documents and manifest changes, deactivating removed/disabled/invalid documents and reusing unchanged parsing; verify external edits without watcher events, deletion, rename, malformed updates, and branch-switch fixtures.
+- [ ] 2.5 Implement serialized refresh, process-safe transaction/busy handling, selected-source revalidation, and bounded retry/unavailable behavior; verify concurrent refresh/read and injected failure tests never expose partial generations or silently return known obsolete bodies.
+- [ ] 2.6 Add coexistence and privacy tests with legacy protocol imports, private entries, and consolidations; verify one repository hit per source, no global/private result leakage, and no changes to legacy retention, reconciliation, or stored rows.
+- [ ] 2.7 Document cache location, rebuild/recovery, coverage diagnostics, and source-of-truth boundaries; verify a fixture clone rebuilds equivalent logical records without any copied cache or session database.
+
+## 3. Deterministic source records and maps
+
+- [ ] 3.1 Adapt existing symbol/outline extraction to repository navigation records, including paths, qualified names, signatures, parents, ranges, digests, and syntactic imports; verify Rust and representative existing-language fixtures without changing established index-tool snapshots.
+- [ ] 3.2 Extract Rust module/item documentation comments verbatim with original coordinates and source-documentation provenance; verify line/block comments and that no semantic descriptions or inferred edges are generated.
+- [ ] 3.3 Cache structural extraction by source/config/extractor fingerprint and retain unsupported/unparseable path records with diagnostics; verify only changed files are reparsed, extractor upgrades invalidate old records, and deleted symbols disappear.
+- [ ] 3.4 Implement bounded directory/file map rendering and explicit generated-artifact/block export with preimage checks; verify byte-identical exports across different checkout paths, truncation guidance, stale-preimage refusal, and preservation of authored text.
+- [ ] 3.5 Document source-derived versus authored knowledge, extraction coverage, and map export safety; verify all generation tests pass without network access or provider credentials and existing symbol/edit tests retain their contracts.
+
+## 4. Evidence freshness and deterministic maintenance
+
+- [ ] 4.1 Define and parse portable `.agents/knowledge-evidence.json` records plus `knowledge_sources` selectors; verify deterministic serialization, relative-only references, format validation, whole-file hashes, unambiguous symbol hashes, and rejection of unsafe dependencies.
+- [ ] 4.2 Implement evidence state evaluation for unchanged, changed, missing, and unverified records; verify note edits, dependency edits/removals, ambiguous selectors, fresh clones, and that index refresh never acknowledges evidence.
+- [ ] 4.3 Implement read-only reference/coverage checking for relative Markdown links, file-table orphans, duplicate/invalid documents, configured budgets, and opt-in exhaustive missing-row checks; verify stable JSON diagnostics, curated-mode acceptance, no remote requests, and zero repository writes.
+- [ ] 4.4 Implement deterministic scaffold preview/apply plans restricted to new non-root directory documents or managed inventory blocks; verify sorted empty-purpose rows, idempotence, existing-purpose preservation, refusal of unmarked existing documents, orphan preservation, and stale-plan rejection.
+- [ ] 4.5 Implement selected-record evidence acknowledgement preview/apply with versioned preimage-bound plans and atomic confined writes; verify changed dependencies or note bytes invalidate apply and no bulk automatic acknowledgement occurs.
+- [ ] 4.6 Add typed maintenance operations and `examples/repository_knowledge.rs` exposing refresh, map, check, scaffold, and acknowledge with JSON output and explicit write options; verify offline invocation, nonzero failing-check exit status, path policy, and no model startup or Git commits.
+- [ ] 4.7 Document maintenance commands, managed-block markers, plan/apply flow, evidence states, and handling moves without deleting authored knowledge; execute the documented workflows against temporary fixture repositories.
+
+## 5. Repository retrieval and tool compatibility
+
+- [ ] 5.1 Implement deterministic navigation/documentation/all retrieval with exact identifier/path priority, safe text-query handling, filters, and deduplication; verify identifier and conceptual ranking fixtures, punctuation, empty input, and stable ties.
+- [ ] 5.2 Add explicit repository collection branches to knowledge_query/list/stats while preserving legacy defaults and required `question`; verify scope conflicts, rejection of explicit legacy-only repository parameters, old scope policy behavior, and unchanged legacy tool tests.
+- [ ] 5.3 Add repository knowledge_get and register it through built-in tool exports; verify section body retrieval, path-only section catalogs/preambles, duplicate/stale selectors, pagination, source edits between query/get, and original line citations.
+- [ ] 5.4 Enforce checkout authorization on every repository operation and reject unsafe relative filters/fetches; verify cross-checkout IDs, traversal/symlink fetches, absent workspaces, denied roots, and unmounted remote filesystem contexts cannot disclose contents.
+- [ ] 5.5 Add bounded result formatting, provenance/evidence labels, catalog pagination, and coverage stats; verify default/max counts, 16 KiB default and host-capped 64 KiB maximum response budgets, UTF-8-safe truncation, continuation, and generation-change diagnostics.
+- [ ] 5.6 Document repository tool examples and private-session compatibility; validate example payloads against tool schemas and verify query/list/stats/get tests need no external service.
+
+## 6. Workspace lifecycle and two-stage context delivery
+
+- [ ] 6.1 Carry an optional repository service through agent configuration, materialization, execution context, and tool context, keyed to effective session checkout; verify two sessions sharing a checkout reuse the service while different checkouts and resumed sessions use their own roots.
+- [ ] 6.2 Connect available workspace file-change events as coalesced refresh hints without making them the sole freshness mechanism; verify missed events, newly added files, changes through shell/external editors, and branch changes still reconcile on retrieval.
+- [ ] 6.3 Implement a bounded prompt-orientation selector using the existing repository retrieval service, explicit lexical relevance gating, and optional first-task/post-compaction entrypoint fallback; verify path-free feature prompts yield useful cited pointers, unrelated/generic prompts can yield nothing, invalid entrypoints are diagnosed, and no model call is needed.
+- [ ] 6.4 Implement knowledge-for-path selection using canonical effective index root/path arguments, file-purpose rows, evidence dependencies, and explicit path associations; verify exact-file/directory applicability, distinct provenance, changed/missing evidence labels, no fuzzy-basename matches, and no duplicated outline signatures.
+- [ ] 6.5 Integrate native repository-provider adapters at accepted user-prompt and successful built-in post-index contribution stages, reusing typed hook context rather than adding a new generic handler language; verify tool-call IDs/path attribution, unchanged raw outlines/error flags, allowed result-policy ordering, and no recursive model-visible tool calls.
+- [ ] 6.6 Add bounded-time, non-blocking delivery fallback for missing/unready knowledge and selector failures; verify failed/denied/foreign-tool/outside-corpus index calls attach nothing and timeouts or errors preserve successful index output without restoring suppressed/redacted content.
+- [ ] 6.7 Implement one shared per-turn delivery budget (default two cards, 600 estimated tokens, 4 KiB ceiling) and stable parallel-result allocation; verify orientation plus multiple index calls remain within the aggregate limits, contribution placement preserves provider protocol, and omitted cards are not marked delivered.
+- [ ] 6.8 Add delivery identity/version/epoch provenance and duplicate suppression across channels, retries, and session resume; verify actual inclusion rather than selection advances delivery state and loss of disposable diagnostics state does not cause repeated injection.
+- [ ] 6.9 Integrate post-compaction re-evaluation of recently relevant task/path cards with current-source validation and bounded redelivery; verify dropped cards can return, retained typed contributions are not duplicated, and removed or changed documents cannot be restored from stale payloads.
+- [ ] 6.10 Add local matched/delivered/suppressed/fetched diagnostics with reasons, token cost, and latency; verify no raw prompt/session data is written to shared documents and delivered/fetched counters are not labeled as followed advice.
+- [ ] 6.11 Add one stable capability-gated retrieval policy and session-local root/readiness information; verify independent delivery controls, excluded query/get tools, usable citation-only cards, unchanged system-policy prefixes, and no duplicate per-turn policy injection.
+- [ ] 6.12 Add prompt/trust regression fixtures showing indexed AGENTS content is attributed evidence rather than instruction authority; verify host permission policy, existing protocol prompt ordering, direct-source validation, and context assembled with other configured hooks remain intact.
+- [ ] 6.13 Document opt-in standalone/quorum settings, lexical gate, entrypoint/path metadata, native hook-stage integration, shared budgets, and failure behavior; validate example settings and run prompt-to-index delivery fixtures for both runtime types before enabling an example profile.
+
+## 7. Controlled crates/agent pilot
+
+- [ ] 7.1 Define selected runtime/session/tool pilot subtrees and prepare reviewed corpus A (subsystem notes plus deterministic maps) and corpus B (same inputs plus exhaustive purpose rows), with separate opt-in manifests; verify the repository root instructions stay lean and scaffolding never generates semantic descriptions.
+- [ ] 7.2 Create sanitized navigation/conceptual query fixtures and held-out task expectations for a pinned source revision, freezing corpus authoring before evaluation; verify fixtures contain no session transcript, secret, absolute developer path, or dependency on a personal sessions.db.
+- [ ] 7.3 Add a deterministic retrieval and delivery-replay harness reporting corpus/revision/index version, recall, MRR, wrong-file rates, response bytes, cold/warm indexing time, cue false positives/misses, duplicates, added tokens, and latency; verify repeatability across fresh caches and offline positive/negative prompt/tool fixtures, including tasks with no known filenames.
+- [ ] 7.4 Provide an opt-in model-backed comparison runner or executable recipe for baseline/A/B with fixed tool budgets and repeated trials, plus same-corpus pull-only/index-enriched/index-plus-orientation comparisons; verify report schema includes model/configuration, delivery mode, tokens/tool calls, time to first relevant file selection, correctness, and authoring/maintenance effort without requiring model access for default tests.
+- [ ] 7.5 Freeze relevance-gate tuning before held-out replay, run deterministic comparisons and maintenance exercises, and record coverage/delivery recommendations and limitations; verify results separate corpus effects from delivery effects, distinguish measured outcomes from unrun model trials or unverified external claims, and do not enable exhaustive coverage repository-wide.
+
+## 8. Cross-cutting acceptance and opt-in rollout
+
+- [ ] 8.1 Run the integration matrix spanning fresh clone/cache loss, note and source edits, removals, branch switches, linked worktrees, multi-process refresh, malformed sources, path-free orientation, prompt/index duplicate delivery, parallel calls, compaction/resume, output-policy preservation, and independently disabled delivery behavior; verify all portability, freshness, privacy, and fallback requirements across the four delta specs.
+- [ ] 8.2 Run relevant knowledge, dotagents, index/symbol, tool, hook/context-assembly, configuration, and session/compaction regression suites plus formatting/lint checks using the repository's supported build environment; record commands/results and verify no qndx dependency or legacy session/protocol behavior change.
+- [ ] 8.3 After correctness gates pass, publish an explicitly opt-in coder example using repository tools and the pilot manifest, and verify its documented path-free prompt/orientation/index-enrichment/query/get/maintenance workflow; document rollback by disabling the feature and discarding only its derived cache.
