@@ -65,11 +65,11 @@ fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<
                 if !is_event_owned(&session_owners, &conn_id_events, &event).await {
                     continue;
                 }
-                let notification = translator
+                let notifications = translator
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .translate_notification(&event);
-                if let Some(notification) = notification {
+                    .translate_notifications(&event);
+                for notification in notifications {
                     let json = serde_json::to_string(&notification).unwrap_or_default();
                     if tx_events.send(json).await.is_err() {
                         break;

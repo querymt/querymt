@@ -14,6 +14,25 @@ use crate::session::compaction::SessionCompaction;
 use log::{debug, info};
 use std::sync::Arc;
 
+/// Emits the terminal event for a started compaction before propagating an
+/// error, so every reported compaction start is matched by exactly one
+/// terminal outcome.
+fn emit_compaction_failure(
+    config: &AgentConfig,
+    session_id: &str,
+    compaction_id: &str,
+    error: &anyhow::Error,
+) {
+    config.emit_event(
+        session_id,
+        AgentEventKind::CompactionFailed {
+            compaction_id: compaction_id.to_string(),
+            reason: format!("{error:#}"),
+            cancelled: false,
+        },
+    );
+}
+
 /// Run pruning on tool results to reduce context size.
 ///
 /// This marks low-value tool results as compacted based on the pruning configuration.
@@ -170,10 +189,15 @@ pub(super) async fn run_ai_compaction(
         });
     }
 
+    // The compaction identity is fixed before the start event so every
+    // related update shares one session-unique ID.
+    let compaction_id = uuid::Uuid::now_v7().to_string();
+
     config.emit_event(
         session_id,
         AgentEventKind::CompactionStart {
             token_estimate: token_estimate_u32,
+            compaction_id: Some(compaction_id.clone()),
         },
     );
 
@@ -195,17 +219,24 @@ pub(super) async fn run_ai_compaction(
             original_token_count: token_estimate,
         }
     } else {
-        let llm_provider = exec_ctx
+        let llm_provider = match exec_ctx
             .session_handle
             .provider()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get LLM provider: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to get LLM provider: {}", e))
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                emit_compaction_failure(config, session_id, &compaction_id, &error);
+                return Err(error);
+            }
+        };
         let retry_config = crate::session::compaction::RetryConfig {
             max_retries: config.execution_policy.compaction.retry.max_retries,
             initial_backoff_ms: config.execution_policy.compaction.retry.initial_backoff_ms,
             backoff_multiplier: config.execution_policy.compaction.retry.backoff_multiplier,
         };
-        config
+        match config
             .compaction
             .process(
                 &messages,
@@ -217,10 +248,17 @@ pub(super) async fn run_ai_compaction(
                     .and_then(|cfg| cfg.max_prompt_bytes),
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Compaction failed: {}", e))?
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let error = anyhow::anyhow!("Compaction failed: {}", error);
+                emit_compaction_failure(config, session_id, &compaction_id, &error);
+                return Err(error);
+            }
+        }
     };
 
-    let post_hook = config
+    let post_hook = match config
         .hooks
         .run_post_compaction(PostCompactionRequest {
             session_id: session_id.clone(),
@@ -242,7 +280,14 @@ pub(super) async fn run_ai_compaction(
             ),
             message_count,
         })
-        .await?;
+        .await
+    {
+        Ok(post_hook) => post_hook,
+        Err(error) => {
+            emit_compaction_failure(config, session_id, &compaction_id, &error);
+            return Err(error);
+        }
+    };
     for notice in post_hook.notices {
         config.emit_event(
             session_id,
@@ -272,14 +317,42 @@ pub(super) async fn run_ai_compaction(
         result.original_token_count,
     );
 
-    exec_ctx
-        .add_message(request_msg)
+    exec_ctx.add_message(request_msg).await.map_err(|e| {
+        let error = anyhow::anyhow!("Failed to store compaction request: {}", e);
+        emit_compaction_failure(config, session_id, &compaction_id, &error);
+        error
+    })?;
+    exec_ctx.add_message(summary_msg).await.map_err(|e| {
+        let error = anyhow::anyhow!("Failed to store compaction summary: {}", e);
+        emit_compaction_failure(config, session_id, &compaction_id, &error);
+        error
+    })?;
+
+    let filtered_messages = exec_ctx
+        .session_handle
+        .get_effective_agent_history()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to store compaction request: {}", e))?;
-    exec_ctx
-        .add_message(summary_msg)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to store compaction summary: {}", e))?;
+        .map_err(|e| {
+            let error = anyhow::anyhow!("Failed to get new history: {}", e);
+            emit_compaction_failure(config, session_id, &compaction_id, &error);
+            error
+        })?;
+
+    let new_context_tokens = config
+        .compaction
+        .estimate_messages_tokens(&filtered_messages, prompt_limit);
+
+    // One text summary chunk after the start and before the terminal update.
+    // Hidden (empty) summaries skip the chunk; the lifecycle is still reported.
+    if !result.summary.trim().is_empty() {
+        config.emit_event(
+            session_id,
+            AgentEventKind::CompactionSummaryChunk {
+                compaction_id: compaction_id.clone(),
+                content: result.summary.clone(),
+            },
+        );
+    }
 
     config.emit_event(
         session_id,
@@ -290,14 +363,12 @@ pub(super) async fn run_ai_compaction(
                 "result.summary.len",
                 Some(session_id),
             ),
+            compaction_id: Some(compaction_id.clone()),
+            // The authoritative post-compaction token count rides with the
+            // terminal event so clients can project the reduced usage.
+            context_tokens: Some(u64::try_from(new_context_tokens).unwrap_or(u64::MAX)),
         },
     );
-
-    let filtered_messages = exec_ctx
-        .session_handle
-        .get_effective_agent_history()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to get new history: {}", e))?;
 
     // Convert AgentMessages to ChatMessages for the ConversationContext
     let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
@@ -305,10 +376,6 @@ pub(super) async fn run_ai_compaction(
         .map(|message| message.to_chat_message_with_max_prompt_bytes(prompt_limit))
         .collect::<Result<_, _>>()
         .map_err(|error| anyhow::anyhow!("Invalid prompt content after compaction: {error}"))?;
-
-    let new_context_tokens = config
-        .compaction
-        .estimate_messages_tokens(&filtered_messages, prompt_limit);
 
     debug!(
         "Post-compaction context tokens updated: {} -> {} (filtered {} messages)",

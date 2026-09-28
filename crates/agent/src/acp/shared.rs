@@ -6,11 +6,14 @@
 
 use crate::acp::protocol::AGENT_METHOD_NAMES;
 use crate::acp::protocol::{
-    Content, ContentBlock, ContentChunk, CreateElicitationRequest, CreateElicitationResponse,
-    ElicitationAction as AcpElicitationAction, ElicitationFormMode, ElicitationSchema,
-    ElicitationSessionScope, Error, MessageId, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    RequestPermissionOutcome, SessionId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ClientCapabilities, CompactionId, CompactionStatus, CompactionSummaryChunk, CompactionUpdate,
+    ConfigOptionUpdate, Content, ContentBlock, ContentChunk, CreateElicitationRequest,
+    CreateElicitationResponse, CurrentModeUpdate, ElicitationAction as AcpElicitationAction,
+    ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, Error, MaybeUndefined,
+    MessageId, Notice, NoticeSeverity, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, PlanId,
+    PlanRemoved, PlanUpdate, PlanUpdateContent, RequestPermissionOutcome, SessionId,
+    SessionInfoUpdate, SessionModeId, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, UsageUpdate,
 };
 use crate::agent::LocalAgentHandle as AgentHandle;
 use crate::control::remote::{AttachRemoteSessionRequest, RemoteSessionAttachInfo};
@@ -175,6 +178,20 @@ pub struct RpcResponse {
 pub struct RpcDispatchOutput {
     pub notifications: Vec<serde_json::Value>,
     pub response: Option<RpcResponse>,
+    /// When true the transport must send `notifications` before `response`.
+    ///
+    /// Only `session/load` sets this: its notifications carry the replayed
+    /// history, and the client needs that content before its load promise
+    /// resolves so replay is never misapplied as live traffic.
+    pub notify_before_response: bool,
+}
+
+impl RpcDispatchOutput {
+    /// Whether the transport should send the response ahead of the queued
+    /// notifications.
+    pub(crate) fn response_precedes_notifications(&self) -> bool {
+        !self.notify_before_response
+    }
 }
 
 /// Dispatch one JSON-RPC method call and forward all resulting wire messages.
@@ -241,8 +258,19 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     )
     .await;
 
-    // Reply first so the client can bind the session before catalog updates arrive.
-    if let Some(response) = output.response {
+    let response_precedes_notifications = output.response_precedes_notifications();
+    let RpcDispatchOutput {
+        notifications,
+        mut response,
+        ..
+    } = output;
+
+    // A `session/load` returns historical `session/update` notifications that
+    // the client must apply before (or together with) the response, so the
+    // replay has to be delivered first. Other methods keep the original
+    // respond-then-notify ordering so the client can bind the session before
+    // catalog updates arrive.
+    if response_precedes_notifications && let Some(response) = response.take() {
         match serde_json::to_string(&response) {
             Ok(json) => {
                 if tx.send(json).await.is_err() {
@@ -253,7 +281,7 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
         }
     }
 
-    for notification in output.notifications {
+    for notification in notifications {
         let json = match serde_json::to_string(&notification) {
             Ok(json) => json,
             Err(err) => {
@@ -265,6 +293,15 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
             return;
         }
     }
+
+    if let Some(response) = response {
+        match serde_json::to_string(&response) {
+            Ok(json) => {
+                let _ = tx.send(json).await;
+            }
+            Err(err) => log::warn!("Failed to serialize JSON-RPC response: {}", err),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -273,6 +310,29 @@ pub struct RpcDispatchContext {
     pub session_bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
     pub elicitation_recovery:
         Option<crate::control::elicitation_recovery::ElicitationRecoveryRegistry>,
+    /// The connection's live translator. On successful initialization the
+    /// negotiated client capabilities are parsed into it so Preview session
+    /// updates stay scoped to this connection.
+    pub translator: Option<Arc<std::sync::Mutex<AcpLiveEventTranslator>>>,
+    /// The connection's session-load preferences. On successful initialization
+    /// the negotiated client capabilities are parsed into it so the
+    /// snapshot-vs-replay choice stays scoped to this connection.
+    pub session_load: Option<Arc<std::sync::Mutex<AcpSessionLoadPreferences>>>,
+}
+
+impl RpcDispatchContext {
+    /// Reads whether this connection asked to hydrate history from the load
+    /// snapshot instead of historical `session/update` replay.
+    ///
+    /// Absent state (for example in unit-test contexts) means standard ACP
+    /// replay, because a client that never advertised the capability must not
+    /// silently lose its history.
+    pub(crate) fn prefers_snapshot_history(&self) -> bool {
+        self.session_load
+            .as_ref()
+            .and_then(|preferences| preferences.lock().ok().map(|guard| guard.snapshot_history))
+            .unwrap_or(false)
+    }
 }
 
 async fn attach_rpc_session<S: SendAgent>(
@@ -688,50 +748,419 @@ pub fn replay_agent_events_with_user_prompts<I>(
 where
     I: IntoIterator<Item = AgentEvent>,
 {
-    events
-        .into_iter()
-        .flat_map(|event| {
-            let structured_updates = match &event.kind {
-                AgentEventKind::PromptReceived {
-                    message_id: Some(message_id),
-                    ..
-                } => user_prompts.get(message_id).map(|blocks| {
-                    blocks
-                        .iter()
-                        .cloned()
-                        .map(|block| {
-                            SessionUpdate::UserMessageChunk(user_prompt_chunk(
-                                message_id, None, block,
-                            ))
-                        })
-                        .collect::<Vec<_>>()
-                }),
-                _ => None,
-            };
-            let updates = structured_updates.unwrap_or_else(|| {
-                let envelope = EventEnvelope::from(event);
-                translate_replay_event_to_updates(&envelope)
-            });
-            updates.into_iter().map(|update| {
-                crate::acp::protocol::SessionNotification::new(
-                    crate::acp::protocol::SessionId::from(session_id.to_string()),
-                    update,
-                )
-            })
-        })
-        .collect()
+    replay_agent_events_materialized(
+        session_id,
+        events,
+        user_prompts,
+        &AcpSessionUpdateCapabilities::default(),
+    )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AcpTranslateMode {
-    Live,
-    Replay,
+/// Projects replayed session history with materialized state.
+///
+/// Durable session-update state (configuration, metadata, usage, the current
+/// todo plan, and terminal compactions) is folded before notifications are
+/// created, so replay emits only current state with stable identities. Notices,
+/// historical compaction summary chunks, and obsolete in-progress compaction
+/// states are never replayed; Preview variants are gated by the connection's
+/// capability snapshot.
+pub fn replay_agent_events_materialized<I>(
+    session_id: &str,
+    events: I,
+    user_prompts: &HashMap<String, Vec<ContentBlock>>,
+    capabilities: &AcpSessionUpdateCapabilities,
+) -> Vec<crate::acp::protocol::SessionNotification>
+where
+    I: IntoIterator<Item = AgentEvent>,
+{
+    let events: Vec<AgentEvent> = events.into_iter().collect();
+    let materialized = materialize_replay_state(&events, capabilities);
+    let mut notifications = Vec::new();
+    let session = crate::acp::protocol::SessionId::from(session_id.to_string());
+    let push = |update: SessionUpdate, notifications: &mut Vec<_>| {
+        notifications.push(crate::acp::protocol::SessionNotification::new(
+            session.clone(),
+            update,
+        ));
+    };
+
+    // 1. Latest current mode and configuration snapshot.
+    if let Some(mode) = materialized.mode {
+        push(
+            SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(SessionModeId::from(
+                mode.as_str().to_string(),
+            ))),
+            &mut notifications,
+        );
+        let effort = materialized
+            .reasoning_effort
+            .as_deref()
+            .and_then(parse_reasoning_effort);
+        push(
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(session_config_options(
+                mode, effort,
+            ))),
+            &mut notifications,
+        );
+    }
+
+    // 2. Folded session metadata patch state.
+    if materialized.metadata_touched {
+        let mut update = SessionInfoUpdate::new();
+        if let Some(title) = materialized.metadata_title {
+            update.title = match title {
+                Some(title) => MaybeUndefined::Value(title),
+                None => MaybeUndefined::Null,
+            };
+        }
+        if let Some(updated_at) = materialized.metadata_updated_at {
+            update.updated_at = MaybeUndefined::Value(updated_at);
+        }
+        push(SessionUpdate::SessionInfoUpdate(update), &mut notifications);
+    }
+
+    // 3. Latest valid usage snapshot.
+    if let Some(used) = materialized.usage_used
+        && let Some(update) = materialized.usage.usage_update(used)
+    {
+        push(SessionUpdate::UsageUpdate(update), &mut notifications);
+    }
+
+    // 4. Current todo plan (retained only when non-empty).
+    if let Some(entries) = materialized.todo_entries
+        && !entries.is_empty()
+    {
+        if capabilities.plan_operations {
+            push(
+                SessionUpdate::PlanUpdate(PlanUpdate::new(PlanUpdateContent::items(
+                    PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()),
+                    entries,
+                ))),
+                &mut notifications,
+            );
+        } else {
+            push(SessionUpdate::Plan(Plan::new(entries)), &mut notifications);
+        }
+    }
+
+    // 5. Terminal compactions with their original identities and final
+    // summaries; chunks and in-progress states are omitted.
+    if capabilities.compaction {
+        for terminal in &materialized.compactions {
+            let mut update = CompactionUpdate::new(
+                CompactionId::from(terminal.id.clone()),
+                terminal.status.clone(),
+            );
+            if let Some(summary) = &terminal.summary {
+                update = update.summary(Some(vec![ContentBlock::Text(TextContent::new(
+                    summary.clone(),
+                ))]));
+            }
+            if let Some(error) = &terminal.error {
+                update = update.error(error.clone());
+            }
+            push(SessionUpdate::CompactionUpdate(update), &mut notifications);
+        }
+    }
+
+    // 6. Historical conversation/tool content in order.
+    for event in events {
+        let structured_updates = match &event.kind {
+            AgentEventKind::PromptReceived {
+                message_id: Some(message_id),
+                ..
+            } => user_prompts.get(message_id).map(|blocks| {
+                blocks
+                    .iter()
+                    .cloned()
+                    .map(|block| {
+                        SessionUpdate::UserMessageChunk(user_prompt_chunk(message_id, None, block))
+                    })
+                    .collect::<Vec<_>>()
+            }),
+            _ => None,
+        };
+        let updates = structured_updates.unwrap_or_else(|| {
+            let envelope = EventEnvelope::from(event);
+            translate_replay_event_to_updates(&envelope)
+        });
+        for update in updates {
+            push(update, &mut notifications);
+        }
+    }
+
+    notifications
+}
+
+/// Final folded state of one compaction entity.
+struct ReplayCompactionTerminal {
+    id: String,
+    status: CompactionStatus,
+    summary: Option<String>,
+    error: Option<String>,
+}
+
+/// Folds durable events into the current session-update state for replay.
+fn materialize_replay_state(
+    events: &[AgentEvent],
+    capabilities: &AcpSessionUpdateCapabilities,
+) -> MaterializedReplayState {
+    let _ = capabilities;
+    let mut state = MaterializedReplayState::default();
+    // Most recent legacy (ID-less) compaction start, for pairing terminals.
+    let mut open_legacy_start: Option<String> = None;
+    let mut legacy_counter: usize = 0;
+
+    for event in events {
+        let envelope = EventEnvelope::from(event.clone());
+        match event.kind.clone() {
+            AgentEventKind::SessionModeChanged { mode } => {
+                state.mode = Some(mode);
+            }
+            AgentEventKind::SessionConfigChanged {
+                mode,
+                reasoning_effort,
+            } => {
+                state.mode = Some(mode);
+                state.reasoning_effort = reasoning_effort;
+            }
+            AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
+                state.metadata_touched = true;
+                if title.is_some() {
+                    state.metadata_title = title;
+                }
+                if updated_at.is_some() {
+                    state.metadata_updated_at = updated_at;
+                }
+            }
+            AgentEventKind::ProviderChanged { context_limit, .. } => {
+                state.usage.context_limit = context_limit;
+            }
+            AgentEventKind::LlmRequestEnd {
+                context_tokens,
+                cumulative_cost_usd,
+                ..
+            } => {
+                if let Some(cost) = cumulative_cost_usd {
+                    state.usage.cumulative_cost_usd = Some(cost);
+                }
+                if state.usage.context_limit.is_some() {
+                    state.usage_used = Some(context_tokens);
+                } else {
+                    state.usage_used = None;
+                }
+            }
+            AgentEventKind::CompactionStart { compaction_id, .. } => match compaction_id {
+                Some(_) => open_legacy_start = None,
+                None => {
+                    legacy_counter += 1;
+                    open_legacy_start = Some(format!(
+                        "querymt-compaction-legacy-{}",
+                        envelope.seq().max(legacy_counter as i64)
+                    ));
+                }
+            },
+            AgentEventKind::CompactionEnd {
+                compaction_id,
+                summary,
+                context_tokens,
+                ..
+            } => {
+                let id = match compaction_id {
+                    Some(id) => id,
+                    None => open_legacy_start.take().unwrap_or_else(|| {
+                        legacy_counter += 1;
+                        format!(
+                            "querymt-compaction-legacy-{}",
+                            envelope.seq().max(legacy_counter as i64)
+                        )
+                    }),
+                };
+                state
+                    .compactions
+                    .retain(|c: &ReplayCompactionTerminal| c.id != id);
+                state.compactions.push(ReplayCompactionTerminal {
+                    id: id.clone(),
+                    status: CompactionStatus::Completed,
+                    summary: (!summary.trim().is_empty()).then_some(summary),
+                    error: None,
+                });
+                if let Some(tokens) = context_tokens {
+                    state.usage_used = Some(tokens);
+                }
+                open_legacy_start = None;
+            }
+            AgentEventKind::CompactionFailed {
+                compaction_id,
+                reason,
+                cancelled,
+            } => {
+                state.compactions.retain(|c| c.id != compaction_id);
+                state.compactions.push(ReplayCompactionTerminal {
+                    id: compaction_id.clone(),
+                    status: if cancelled {
+                        CompactionStatus::Cancelled
+                    } else {
+                        CompactionStatus::Failed
+                    },
+                    summary: None,
+                    error: (!cancelled).then_some(reason),
+                });
+                open_legacy_start = None;
+            }
+            AgentEventKind::CompactionSummaryChunk { .. } | AgentEventKind::HookNotice { .. } => {
+                // Live-only content: notices are never replayed and summary
+                // chunks would duplicate the materialized terminal summary.
+            }
+            AgentEventKind::ToolCallStart {
+                ref tool_name,
+                ref arguments,
+                ..
+            } if is_todo_write_tool(tool_name) => {
+                if let Some(entries) = todo_entries_from_arguments(arguments) {
+                    state.todo_entries = Some(entries);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    state
+}
+
+/// Materialized current state folded from durable session events.
+#[derive(Default)]
+struct MaterializedReplayState {
+    mode: Option<crate::agent::core::AgentMode>,
+    reasoning_effort: Option<String>,
+    metadata_touched: bool,
+    metadata_title: Option<Option<String>>,
+    metadata_updated_at: Option<String>,
+    usage: SessionUsageProjection,
+    usage_used: Option<u64>,
+    todo_entries: Option<Vec<PlanEntry>>,
+    compactions: Vec<ReplayCompactionTerminal>,
+}
+
+/// Deterministic plan identity for QueryMT's todo list within a session.
+pub const QUERYMT_TODO_PLAN_ID: &str = "querymt-todos";
+
+/// QueryMT extension namespace inside ACP's `_meta` escape hatch.
+pub const QUERYMT_META_NAMESPACE: &str = "querymt";
+
+/// `_meta.querymt.sessionLoadSnapshot` key. A client that advertises a
+/// supported version promises it can hydrate session history directly from the
+/// `querymt/sessionLoadSnapshot.v1` load-response metadata, so the agent can
+/// skip emitting historical `session/update` notifications for that load.
+pub const QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY: &str = "sessionLoadSnapshot";
+
+/// Highest `sessionLoadSnapshot` revision understood by the desktop client and
+/// the agent's QueryMT load-response metadata. Keep both sides in lockstep.
+pub const QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH: u64 = 1;
+
+/// Connection-scoped session-load transport preferences.
+///
+/// Parsed once from the client's advertised capabilities after a successful ACP
+/// initialization. The snapshot is immutable for the rest of the connection so
+/// one client's preference never affects another connection. Standard ACP
+/// clients that do not advertise the QueryMT capability keep receiving the full
+/// historical replay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcpSessionLoadPreferences {
+    /// Client advertised a supported `sessionLoadSnapshot` epoch in `_meta`,
+    /// meaning it can hydrate history from the load-response snapshot and does
+    /// not need historical `session/update` replay.
+    pub snapshot_history: bool,
+}
+
+impl AcpSessionLoadPreferences {
+    /// Derives the snapshot from negotiated client capabilities.
+    ///
+    /// Only the exact supported epoch opts into snapshot history. An omitted,
+    /// malformed, or unknown (including newer) epoch is treated as unsupported,
+    /// because a future revision may change the snapshot payload shape. Clients
+    /// that omit the capability are never assumed to understand the snapshot,
+    /// which keeps older clients on replay.
+    pub fn from_client_capabilities(capabilities: &ClientCapabilities) -> Self {
+        let advertised = capabilities
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(QUERYMT_META_NAMESPACE))
+            .and_then(|querymt| querymt.get(QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY))
+            .and_then(|value| {
+                value
+                    .get("epoch")
+                    .or_else(|| value.get("version"))
+                    .and_then(serde_json::Value::as_u64)
+            });
+        Self {
+            snapshot_history: advertised == Some(QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH),
+        }
+    }
+
+    /// Whether historical `session/update` notifications should be replayed.
+    pub fn replays_history(&self) -> bool {
+        !self.snapshot_history
+    }
+}
+
+/// Connection-scoped snapshot of ACP v1 Preview session-update capabilities.
+///
+/// Parsed once from the client's advertised capabilities after a successful
+/// ACP initialization. Omitted and `null` Preview capability fields map to
+/// `false`, and the snapshot is immutable for the rest of the connection so
+/// one client's Preview support never affects another connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcpSessionUpdateCapabilities {
+    /// Client advertised `plan_update` / `plan_removed` support.
+    pub plan_operations: bool,
+    /// Client advertised advisory `notice` support.
+    pub notices: bool,
+    /// Client advertised ID-addressed compaction updates.
+    pub compaction: bool,
+}
+
+impl AcpSessionUpdateCapabilities {
+    /// Derives the snapshot from negotiated client capabilities.
+    pub fn from_client_capabilities(capabilities: &ClientCapabilities) -> Self {
+        let session = capabilities.session.as_ref();
+        Self {
+            plan_operations: capabilities.plan.is_some(),
+            notices: session.is_some_and(|session| session.notices.is_some()),
+            compaction: session.is_some_and(|session| session.compaction.is_some()),
+        }
+    }
+}
+
+/// Per-session usage projection state for the live context meter.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct SessionUsageProjection {
+    context_limit: Option<u64>,
+    cumulative_cost_usd: Option<f64>,
+}
+
+impl SessionUsageProjection {
+    /// Builds a `usage_update` for the given current context occupancy, or
+    /// `None` when the effective context limit is unknown or meaningless.
+    fn usage_update(&self, used: u64) -> Option<UsageUpdate> {
+        let size = self.context_limit.filter(|size| *size > 0)?;
+        let mut update = UsageUpdate::new(used, size);
+        if let Some(amount) = self.cumulative_cost_usd {
+            update = update.cost(crate::acp::protocol::Cost::new(amount, "USD"));
+        }
+        Some(update)
+    }
 }
 
 pub struct AcpLiveEventTranslator {
     streamed_assistant_messages: HashSet<(String, String)>,
     structured_user_messages: HashSet<(String, String)>,
     delegation_updates: crate::control::delegation_notifications::DelegationUpdateProjector,
+    capabilities: AcpSessionUpdateCapabilities,
+    usage: HashMap<String, SessionUsageProjection>,
+    /// Sessions whose deterministic todo plan is currently announced to a
+    /// plan-operations client, so an empty snapshot removes it exactly once.
+    announced_todo_plans: HashSet<String>,
 }
 
 impl Default for AcpLiveEventTranslator {
@@ -748,7 +1177,31 @@ impl AcpLiveEventTranslator {
             delegation_updates:
                 crate::control::delegation_notifications::DelegationUpdateProjector::for_live_stream(
                 ),
+            capabilities: AcpSessionUpdateCapabilities::default(),
+            usage: HashMap::new(),
+            announced_todo_plans: HashSet::new(),
         }
+    }
+
+    /// Applies the connection's negotiated Preview capability snapshot.
+    /// Called once after successful ACP initialization.
+    pub fn set_capabilities(&mut self, capabilities: AcpSessionUpdateCapabilities) {
+        self.capabilities = capabilities;
+    }
+
+    /// Currently applied Preview capability snapshot.
+    pub fn capabilities(&self) -> AcpSessionUpdateCapabilities {
+        self.capabilities
+    }
+
+    /// Drops all per-session projection state for a closed session.
+    pub fn forget_session(&mut self, session_id: &str) {
+        self.usage.remove(session_id);
+        self.announced_todo_plans.remove(session_id);
+        self.streamed_assistant_messages
+            .retain(|(session, _)| session != session_id);
+        self.structured_user_messages
+            .retain(|(session, _)| session != session_id);
     }
 
     pub fn translate_delegation_update(
@@ -758,18 +1211,20 @@ impl AcpLiveEventTranslator {
         self.delegation_updates.project_envelope(event)
     }
 
-    pub fn translate_notification(&mut self, event: &EventEnvelope) -> Option<serde_json::Value> {
+    /// Translates one internal event into zero or more ordered JSON-RPC
+    /// notifications for the owning connection.
+    pub fn translate_notifications(&mut self, event: &EventEnvelope) -> Vec<serde_json::Value> {
         if let AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
-            return Some(delegate_models_changed_notification(
+            return vec![delegate_models_changed_notification(
                 event.session_id(),
                 *revision,
-            ));
+            )];
         }
         if let Some(update) = self.translate_delegation_update(event) {
-            return Some(delegation_update_notification(update));
+            return vec![delegation_update_notification(update)];
         }
         if let Some(notification) = input_state_notification(event) {
-            return Some(notification);
+            return vec![notification];
         }
 
         // Handle ElicitationRequested specially - it's a custom notification, not a session/update
@@ -781,7 +1236,7 @@ impl AcpLiveEventTranslator {
             source,
         } = event.kind()
         {
-            return Some(serde_json::json!({
+            return vec![serde_json::json!({
                 "jsonrpc": "2.0",
                 "method": "elicitation/requested",
                 "params": {
@@ -791,23 +1246,35 @@ impl AcpLiveEventTranslator {
                     "requestedSchema": requested_schema,
                     "source": source,
                 }
-            }));
+            })];
         }
 
         let session_id = event.session_id().to_owned();
-        let update = self.translate_update(event)?;
-
-        Some(serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": session_id,
-                "update": update
-            }
-        }))
+        self.translate_updates(event)
+            .into_iter()
+            .map(|update| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": update
+                    }
+                })
+            })
+            .collect()
     }
 
-    pub fn translate_update(&mut self, event: &EventEnvelope) -> Option<SessionUpdate> {
+    /// Single-notification adapter over [`Self::translate_notifications`].
+    ///
+    /// Prefer the plural form in delivery loops so no projected update is
+    /// dropped when one event produces several ordered notifications.
+    pub fn translate_notification(&mut self, event: &EventEnvelope) -> Option<serde_json::Value> {
+        self.translate_notifications(event).into_iter().next()
+    }
+
+    /// Translates one internal event into zero or more ordered session updates.
+    pub fn translate_updates(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
         match event.kind() {
             AgentEventKind::UserPromptBlock {
                 message_id,
@@ -816,11 +1283,11 @@ impl AcpLiveEventTranslator {
             } => {
                 self.structured_user_messages
                     .insert((event.session_id().to_owned(), message_id.clone()));
-                Some(SessionUpdate::UserMessageChunk(user_prompt_chunk(
+                vec![SessionUpdate::UserMessageChunk(user_prompt_chunk(
                     message_id,
                     client_prompt_id.as_deref(),
                     block.clone(),
-                )))
+                ))]
             }
             AgentEventKind::PromptReceived {
                 message_id: Some(message_id),
@@ -828,9 +1295,9 @@ impl AcpLiveEventTranslator {
             } => {
                 let key = (event.session_id().to_owned(), message_id.clone());
                 if self.structured_user_messages.remove(&key) {
-                    None
+                    Vec::new()
                 } else {
-                    translate_event_to_update_for_mode(event, AcpTranslateMode::Live)
+                    self.translate_live_event(event)
                 }
             }
             AgentEventKind::AssistantContentDelta {
@@ -838,14 +1305,14 @@ impl AcpLiveEventTranslator {
                 message_id,
             } => {
                 if content.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 self.streamed_assistant_messages
                     .insert((event.session_id().to_owned(), message_id.clone()));
-                Some(SessionUpdate::AgentMessageChunk(
+                vec![SessionUpdate::AgentMessageChunk(
                     ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                         .message_id(MessageId::from(message_id.clone())),
-                ))
+                )]
             }
             AgentEventKind::AssistantMessageStored {
                 content,
@@ -853,20 +1320,206 @@ impl AcpLiveEventTranslator {
                 ..
             } => {
                 if content.is_empty() {
-                    return None;
+                    return Vec::new();
                 }
                 let key = (event.session_id().to_owned(), message_id.clone());
                 if self.streamed_assistant_messages.remove(&key) {
-                    None
+                    Vec::new()
                 } else {
-                    Some(SessionUpdate::AgentMessageChunk(
+                    vec![SessionUpdate::AgentMessageChunk(
                         ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                             .message_id(MessageId::from(message_id.clone())),
-                    ))
+                    )]
                 }
             }
-            _ => translate_event_to_update_for_mode(event, AcpTranslateMode::Live),
+            _ => self.translate_live_event(event),
         }
+    }
+
+    /// Single-update adapter over [`Self::translate_updates`].
+    ///
+    /// Prefer the plural form; one event may produce several ordered updates
+    /// (for example a terminal compaction followed by a usage snapshot).
+    pub fn translate_update(&mut self, event: &EventEnvelope) -> Option<SessionUpdate> {
+        self.translate_updates(event).into_iter().next()
+    }
+
+    /// Live-only projection for stateful session updates plus fallthrough to
+    /// the shared stateless translation.
+    fn translate_live_event(&mut self, event: &EventEnvelope) -> Vec<SessionUpdate> {
+        let session_id = event.session_id().to_owned();
+        match event.kind() {
+            AgentEventKind::SessionModeChanged { mode } => {
+                vec![SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
+                    SessionModeId::from(mode.as_str().to_string()),
+                ))]
+            }
+            AgentEventKind::SessionConfigChanged {
+                mode,
+                reasoning_effort,
+            } => {
+                let effort = reasoning_effort.as_deref().and_then(parse_reasoning_effort);
+                vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                    session_config_options(*mode, effort),
+                ))]
+            }
+            AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
+                let mut update = SessionInfoUpdate::new();
+                if let Some(title) = title {
+                    update.title = match title {
+                        Some(title) => MaybeUndefined::Value(title.clone()),
+                        None => MaybeUndefined::Null,
+                    };
+                }
+                if let Some(updated_at) = updated_at {
+                    update.updated_at = MaybeUndefined::Value(updated_at.clone());
+                }
+                vec![SessionUpdate::SessionInfoUpdate(update)]
+            }
+            AgentEventKind::ProviderChanged { context_limit, .. } => {
+                self.usage.entry(session_id).or_default().context_limit = *context_limit;
+                Vec::new()
+            }
+            AgentEventKind::LlmRequestEnd {
+                context_tokens,
+                cumulative_cost_usd,
+                ..
+            } => {
+                let usage = self.usage.entry(session_id).or_default();
+                if let Some(cost) = cumulative_cost_usd {
+                    usage.cumulative_cost_usd = Some(*cost);
+                }
+                usage
+                    .usage_update(*context_tokens)
+                    .map(|update| vec![SessionUpdate::UsageUpdate(update)])
+                    .unwrap_or_default()
+            }
+            AgentEventKind::HookNotice {
+                event_name,
+                message,
+                is_error,
+            } => {
+                if !self.capabilities.notices {
+                    return Vec::new();
+                }
+                let severity = if *is_error {
+                    NoticeSeverity::Error
+                } else {
+                    NoticeSeverity::Info
+                };
+                let title = if event_name.is_empty() {
+                    "Hook notice"
+                } else {
+                    event_name.as_str()
+                };
+                vec![SessionUpdate::Notice(
+                    Notice::new(severity, title).description(message.clone()),
+                )]
+            }
+            AgentEventKind::ToolCallStart {
+                tool_name,
+                arguments,
+                ..
+            } if is_todo_write_tool(tool_name) => {
+                self.translate_todo_updates(&session_id, arguments)
+            }
+            AgentEventKind::CompactionStart { compaction_id, .. } => {
+                if !self.capabilities.compaction {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+                    compaction_identity(compaction_id.as_deref(), event),
+                    CompactionStatus::InProgress,
+                ))]
+            }
+            AgentEventKind::CompactionSummaryChunk {
+                compaction_id,
+                content,
+            } => {
+                if !self.capabilities.compaction || content.is_empty() {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::CompactionSummaryChunk(
+                    CompactionSummaryChunk::new(
+                        CompactionId::from(compaction_id.clone()),
+                        ContentBlock::Text(TextContent::new(content.clone())),
+                    ),
+                )]
+            }
+            AgentEventKind::CompactionEnd {
+                compaction_id,
+                context_tokens,
+                ..
+            } => {
+                let mut updates = Vec::new();
+                if self.capabilities.compaction {
+                    updates.push(SessionUpdate::CompactionUpdate(CompactionUpdate::new(
+                        compaction_identity(compaction_id.as_deref(), event),
+                        CompactionStatus::Completed,
+                    )));
+                }
+                // Post-compaction usage snapshots are stable, ungated updates.
+                if let Some(tokens) = context_tokens
+                    && let Some(update) = self
+                        .usage
+                        .get(&session_id)
+                        .and_then(|usage| usage.usage_update(*tokens))
+                {
+                    updates.push(SessionUpdate::UsageUpdate(update));
+                }
+                updates
+            }
+            AgentEventKind::CompactionFailed {
+                compaction_id,
+                reason,
+                cancelled,
+            } => {
+                if !self.capabilities.compaction {
+                    return Vec::new();
+                }
+                let mut update = CompactionUpdate::new(
+                    CompactionId::from(compaction_id.clone()),
+                    if *cancelled {
+                        CompactionStatus::Cancelled
+                    } else {
+                        CompactionStatus::Failed
+                    },
+                );
+                if !*cancelled {
+                    update = update.error(reason.clone());
+                }
+                vec![SessionUpdate::CompactionUpdate(update)]
+            }
+            _ => translate_replayable_updates(event),
+        }
+    }
+
+    /// Projects a todowrite snapshot to plan updates. Plan-operations clients
+    /// receive item-based `plan_update` replacements with one deterministic
+    /// per-session plan ID and a single `plan_removed` for dismissal; legacy
+    /// clients retain the full-replacement `plan` update (an empty snapshot
+    /// stays an empty replacement because legacy v1 has no removal variant).
+    fn translate_todo_updates(&mut self, session_id: &str, arguments: &str) -> Vec<SessionUpdate> {
+        // Malformed snapshots emit nothing; an empty entry list is a valid,
+        // explicitly-dismissed snapshot.
+        let Some(entries) = todo_entries_from_arguments(arguments) else {
+            return Vec::new();
+        };
+        if self.capabilities.plan_operations {
+            if entries.is_empty() {
+                if self.announced_todo_plans.remove(session_id) {
+                    return vec![SessionUpdate::PlanRemoved(PlanRemoved::new(PlanId::from(
+                        QUERYMT_TODO_PLAN_ID.to_string(),
+                    )))];
+                }
+                return Vec::new();
+            }
+            self.announced_todo_plans.insert(session_id.to_owned());
+            return vec![SessionUpdate::PlanUpdate(PlanUpdate::new(
+                PlanUpdateContent::items(PlanId::from(QUERYMT_TODO_PLAN_ID.to_string()), entries),
+            ))];
+        }
+        vec![SessionUpdate::Plan(Plan::new(entries))]
     }
 }
 
@@ -909,11 +1562,11 @@ pub fn translate_replay_event_to_notification(event: &EventEnvelope) -> Option<s
     }))
 }
 
-/// Translate an agent event to a replay SessionUpdate.
+/// Translate an agent event to a single replay SessionUpdate.
 ///
 /// Returns `None` if the event should not be sent to the client.
 pub fn translate_replay_event_to_update(event: &EventEnvelope) -> Option<SessionUpdate> {
-    translate_event_to_update_for_mode(event, AcpTranslateMode::Replay)
+    translate_replayable_updates(event).into_iter().next()
 }
 
 pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
@@ -926,77 +1579,54 @@ pub fn translate_replay_event_to_updates(event: &EventEnvelope) -> Vec<SessionUp
     {
         return stored_summary_updates(content, message_id.as_deref(), reasoning_parts);
     }
-    translate_replay_event_to_update(event)
-        .into_iter()
-        .collect()
+    translate_replayable_updates(event)
 }
 
-fn translate_event_to_update_for_mode(
-    event: &EventEnvelope,
-    mode: AcpTranslateMode,
-) -> Option<SessionUpdate> {
+/// Stateless, replay-safe projection shared by replay translation and the live
+/// fallthrough for conversation/tool events.
+///
+/// Streaming text deltas and per-block user prompts stay live-only (replay
+/// reconstructs them from persisted messages), and stateful session updates
+/// (mode/config, metadata, usage, notices, capability-gated plans, and
+/// compaction) are projected by their owners instead.
+fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
     match event.kind() {
         AgentEventKind::PromptReceived {
             content,
             message_id,
-        } => Some(SessionUpdate::UserMessageChunk(
+        } => vec![SessionUpdate::UserMessageChunk(
             ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                 .message_id(message_id.clone().map(MessageId::from)),
-        )),
-        AgentEventKind::UserPromptBlock {
-            message_id,
-            client_prompt_id,
-            block,
-        } => {
-            if mode == AcpTranslateMode::Replay {
-                None
-            } else {
-                Some(SessionUpdate::UserMessageChunk(user_prompt_chunk(
-                    message_id,
-                    client_prompt_id.as_deref(),
-                    block.clone(),
-                )))
-            }
-        }
+        )],
+        AgentEventKind::UserPromptBlock { .. } => Vec::new(),
         AgentEventKind::AssistantMessageStored {
             content,
             message_id,
             ..
         } => {
-            if mode == AcpTranslateMode::Live || content.is_empty() {
-                return None;
+            if content.is_empty() {
+                return Vec::new();
             }
-            Some(SessionUpdate::AgentMessageChunk(
+            vec![SessionUpdate::AgentMessageChunk(
                 ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
                     .message_id(message_id.clone().map(MessageId::from)),
-            ))
+            )]
         }
-        // Streaming text deltas: forward to ACP clients so they also benefit from streaming.
-        AgentEventKind::AssistantContentDelta {
-            content,
-            message_id,
-        } => {
-            if mode == AcpTranslateMode::Replay || content.is_empty() {
-                return None;
-            }
-            Some(SessionUpdate::AgentMessageChunk(
-                ContentChunk::new(ContentBlock::Text(TextContent::new(content.clone())))
-                    .message_id(MessageId::from(message_id.clone())),
-            ))
-        }
+        // Streaming text deltas are live-only; replay uses persisted messages.
+        AgentEventKind::AssistantContentDelta { .. } => Vec::new(),
         AgentEventKind::AssistantThinkingDelta {
             content,
             message_id,
             part_id,
         } => {
             if content.is_empty() {
-                return None;
+                return Vec::new();
             }
-            Some(SessionUpdate::AgentThoughtChunk(thought_chunk(
+            vec![SessionUpdate::AgentThoughtChunk(thought_chunk(
                 content,
                 message_id,
                 part_id.as_deref(),
-            )))
+            ))]
         }
         AgentEventKind::ToolCallStart {
             tool_call_id,
@@ -1004,11 +1634,15 @@ fn translate_event_to_update_for_mode(
             arguments,
         } => {
             if is_todo_write_tool(tool_name) {
-                return todo_plan_from_arguments(arguments).map(SessionUpdate::Plan);
+                // Ungated contexts receive the legacy full-replacement plan;
+                // plan-operations connections intercept todowrite earlier.
+                return todo_entries_from_arguments(arguments)
+                    .map(|entries| vec![SessionUpdate::Plan(Plan::new(entries))])
+                    .unwrap_or_default();
             }
 
             let args: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
-            Some(SessionUpdate::ToolCall(
+            vec![SessionUpdate::ToolCall(
                 ToolCall::new(
                     ToolCallId::from(tool_call_id.clone()),
                     format!("Run {}", tool_name),
@@ -1016,7 +1650,7 @@ fn translate_event_to_update_for_mode(
                 .kind(tool_kind_for_tool(tool_name))
                 .status(ToolCallStatus::InProgress)
                 .raw_input(args),
-            ))
+            )]
         }
         AgentEventKind::ToolCallEnd {
             tool_call_id,
@@ -1025,7 +1659,7 @@ fn translate_event_to_update_for_mode(
             is_error,
         } => {
             if is_todo_write_tool(tool_name) {
-                return None;
+                return Vec::new();
             }
 
             let status = if *is_error {
@@ -1034,7 +1668,7 @@ fn translate_event_to_update_for_mode(
                 ToolCallStatus::Completed
             };
             let raw_output = serde_json::from_str(result).ok();
-            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            vec![SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
                 ToolCallId::from(tool_call_id.clone()),
                 ToolCallUpdateFields::new()
                     .kind(tool_kind_for_tool(tool_name))
@@ -1044,9 +1678,9 @@ fn translate_event_to_update_for_mode(
                         ContentBlock::Text(TextContent::new(result.clone())),
                     ))])
                     .raw_output(raw_output),
-            )))
+            ))]
         }
-        _ => None,
+        _ => Vec::new(),
     }
 }
 
@@ -1054,7 +1688,7 @@ fn is_todo_write_tool(tool_name: &str) -> bool {
     matches!(tool_name, "todowrite" | "mcp_todowrite")
 }
 
-fn todo_plan_from_arguments(arguments: &str) -> Option<Plan> {
+fn todo_entries_from_arguments(arguments: &str) -> Option<Vec<PlanEntry>> {
     let parsed: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let todos = parsed.get("todos")?.as_array()?;
     let mut entries = Vec::with_capacity(todos.len());
@@ -1078,7 +1712,25 @@ fn todo_plan_from_arguments(arguments: &str) -> Option<Plan> {
         entries.push(PlanEntry::new(content, priority, status));
     }
 
-    Some(Plan::new(entries))
+    Some(entries)
+}
+
+/// Resolves the protocol compaction identity for a compaction event. Live
+/// events always carry an explicit ID; legacy persisted records derive a
+/// deterministic identity from their stream position.
+fn compaction_identity(explicit: Option<&str>, event: &EventEnvelope) -> CompactionId {
+    match explicit {
+        Some(id) if !id.is_empty() => CompactionId::from(id.to_string()),
+        _ => CompactionId::from(format!("querymt-compaction-legacy-{}", event.seq())),
+    }
+}
+
+/// Parses a reasoning-effort wire string (`"auto"` maps to no override).
+fn parse_reasoning_effort(value: &str) -> Option<querymt::chat::ReasoningEffort> {
+    if value == "auto" {
+        return None;
+    }
+    serde_json::from_value(serde_json::json!(value)).ok()
 }
 
 fn todo_priority_to_plan_priority(priority: &str) -> Option<PlanEntryPriority> {
@@ -1168,8 +1820,7 @@ pub fn collect_event_sources(agent: &Arc<AgentHandle>) -> Vec<Arc<EventFanout>> 
 }
 
 /// Re-export from session_registry — the single source of truth for config option shape.
-/// Used by tests in this module and by the config_option_update notification handler.
-#[cfg(test)]
+/// Used by the config_option_update projection and by tests in this module.
 use crate::agent::session_registry::config_options as session_config_options;
 
 /// Handle an RPC request and return a response.
@@ -1221,16 +1872,35 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 .elicitation
                                 .as_ref()
                                 .is_some_and(|elicitation| elicitation.form.is_some());
+                            let capabilities = AcpSessionUpdateCapabilities::from_client_capabilities(
+                                &params.client_capabilities,
+                            );
+                            let session_load =
+                                AcpSessionLoadPreferences::from_client_capabilities(
+                                    &params.client_capabilities,
+                                );
                             let response = agent.initialize(params).await;
-                            if response.is_ok()
-                                && let Some(registry) = context.elicitation_recovery.as_ref()
-                            {
-                                registry
-                                    .record_client_capabilities(
-                                        conn_id,
-                                        supports_form_elicitation,
-                                    )
-                                    .await;
+                            if response.is_ok() {
+                                // Parse Preview capabilities once per connection
+                                // so gating stays isolated to this client.
+                                if let Some(translator) = context.translator.as_ref()
+                                    && let Ok(mut translator) = translator.lock()
+                                {
+                                    translator.set_capabilities(capabilities);
+                                }
+                                if let Some(preferences) = context.session_load.as_ref()
+                                    && let Ok(mut preferences) = preferences.lock()
+                                {
+                                    *preferences = session_load;
+                                }
+                                if let Some(registry) = context.elicitation_recovery.as_ref() {
+                                    registry
+                                        .record_client_capabilities(
+                                            conn_id,
+                                            supports_form_elicitation,
+                                        )
+                                        .await;
+                                }
                             }
                             response.map(|r| serde_json::to_value(r).unwrap())
                         }
@@ -1356,12 +2026,12 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                     )
                                     .await?;
                                     let mut value = serde_json::to_value(r).unwrap();
-                                    if let (Some(hooks), Some(local_agent)) = (
-                                        context.session_hooks.as_ref(),
-                                        agent.as_any().downcast_ref::<AgentHandle>(),
-                                    ) && let Err(error) = hooks
-                                        .on_session_loaded(local_agent, &session_id, &mut value)
-                                        .await
+                                    let local_agent = agent.as_any().downcast_ref::<AgentHandle>();
+                                    if let (Some(hooks), Some(local_agent)) =
+                                        (context.session_hooks.as_ref(), local_agent)
+                                        && let Err(error) = hooks
+                                            .on_session_loaded(local_agent, &session_id, &mut value)
+                                            .await
                                     {
                                         if ownership_inserted {
                                             unsubscribe_connection(
@@ -1372,6 +2042,56 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                             .await;
                                         }
                                         return Err(error);
+                                    }
+                                    if local_agent.is_some() && context.prefers_snapshot_history() {
+                                        // The client hydrates conversation
+                                        // history from the load-response
+                                        // snapshot, so the expensive event and
+                                        // message reads that only feed replay
+                                        // are skipped entirely.
+                                        tracing::debug!(
+                                            session.id = %session_id,
+                                            "skipping ACP history replay for snapshot-capable client"
+                                        );
+                                    } else if let Some(local_agent) = local_agent {
+                                        let capabilities = context
+                                            .translator
+                                            .as_ref()
+                                            .map(|translator| {
+                                                translator
+                                                    .lock()
+                                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                                    .capabilities()
+                                            })
+                                            .unwrap_or_default();
+                                        let replay =
+                                            crate::acp::stdio::replay_loaded_session(
+                                                local_agent,
+                                                &session_id,
+                                                &capabilities,
+                                            )
+                                            .await;
+                                        let (replay, _) = match replay {
+                                            Ok(replay) => replay,
+                                            Err(error) => {
+                                                if ownership_inserted {
+                                                    unsubscribe_connection(
+                                                        session_owners,
+                                                        &session_id,
+                                                        conn_id,
+                                                    )
+                                                    .await;
+                                                }
+                                                return Err(error);
+                                            }
+                                        };
+                                        notifications.extend(replay.into_iter().map(|params| {
+                                            serde_json::json!({
+                                                "jsonrpc": "2.0",
+                                                "method": "session/update",
+                                                "params": params,
+                                            })
+                                        }));
                                     }
                                     if let Some(notification) =
                                         available_commands_session_update(agent, &session_id).await
@@ -1421,11 +2141,19 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                     }
                 }
                 m if m == AGENT_METHOD_NAMES.session_close => {
-                    match serde_json::from_value(req.params) {
-                        Ok(params) => agent
-                            .close_session(params)
-                            .await
-                            .map(|r| serde_json::to_value(r).unwrap()),
+                    match serde_json::from_value::<crate::acp::protocol::CloseSessionRequest>(req.params)
+                    {
+                        Ok(params) => {
+                            let session_id = params.session_id.to_string();
+                            let result = agent.close_session(params).await;
+                            if result.is_ok()
+                                && let Some(translator) = context.translator.as_ref()
+                                && let Ok(mut translator) = translator.lock()
+                            {
+                                translator.forget_session(&session_id);
+                            }
+                            result.map(|r| serde_json::to_value(r).unwrap())
+                        }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -1773,6 +2501,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
     RpcDispatchOutput {
         notifications,
         response,
+        // Only `session/load` replays history through the notification queue;
+        // every other method keeps the respond-first ordering.
+        notify_before_response: rpc_method == AGENT_METHOD_NAMES.session_load,
     }
 }
 
@@ -1886,6 +2617,8 @@ mod tests {
     use crate::agent::core::AgentMode;
     use crate::elicitation::ElicitationAction;
     use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
+    use crate::session::backend::StorageBackend;
+    use crate::session::projection::NewDurableEvent;
     use crate::test_utils::DelegateTestFixture;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -3289,6 +4022,8 @@ mod tests {
             })),
             session_bridge: None,
             elicitation_recovery: None,
+            translator: None,
+            session_load: None,
         };
 
         for session_id in ["s-load-new", "s-load-existing"] {
@@ -3357,6 +4092,8 @@ mod tests {
             })),
             session_bridge: None,
             elicitation_recovery: None,
+            translator: None,
+            session_load: None,
         };
 
         for (method, params) in [
@@ -3447,6 +4184,8 @@ mod tests {
                     ),
                 ),
                 elicitation_recovery: None,
+                translator: None,
+                session_load: None,
             },
         )
         .await;
@@ -3504,6 +4243,8 @@ mod tests {
                     ),
                 ),
                 elicitation_recovery: None,
+                translator: None,
+                session_load: None,
             },
         )
         .await;
@@ -3635,6 +4376,8 @@ mod tests {
                 session_hooks: None,
                 session_bridge: None,
                 elicitation_recovery: None,
+                translator: None,
+                session_load: None,
             },
         )
         .await;
@@ -3702,9 +4445,177 @@ mod tests {
                 session_hooks: None,
                 session_bridge: None,
                 elicitation_recovery: None,
+                translator: None,
+                session_load: None,
             },
         )
         .await
+    }
+
+    async fn dispatch_session_load_with_capabilities(
+        agent: &crate::agent::LocalAgentHandle,
+        session_id: &str,
+        capabilities: AcpSessionUpdateCapabilities,
+    ) -> RpcDispatchOutput {
+        dispatch_session_load_with_preferences(
+            agent,
+            session_id,
+            capabilities,
+            AcpSessionLoadPreferences::default(),
+        )
+        .await
+    }
+
+    async fn dispatch_session_load_with_preferences(
+        agent: &crate::agent::LocalAgentHandle,
+        session_id: &str,
+        capabilities: AcpSessionUpdateCapabilities,
+        preferences: AcpSessionLoadPreferences,
+    ) -> RpcDispatchOutput {
+        let translator = Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new()));
+        translator.lock().unwrap().set_capabilities(capabilities);
+        let session_owners = SessionOwnerMap::default();
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        handle_rpc_message_with_context(
+            agent,
+            &session_owners,
+            &pending_permissions,
+            &pending_elicitations,
+            "conn-1",
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_load.to_string(),
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": "/tmp",
+                    "mcpServers": [],
+                }),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext {
+                session_hooks: None,
+                session_bridge: None,
+                elicitation_recovery: None,
+                translator: Some(translator),
+                session_load: Some(Arc::new(std::sync::Mutex::new(preferences))),
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_materialized_updates_for_connection_capabilities() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        for kind in [
+            AgentEventKind::ToolCallStart {
+                tool_call_id: "todo-1".to_string(),
+                tool_name: "todowrite".to_string(),
+                arguments: serde_json::json!({
+                    "todos": [{
+                        "content": "ship replay",
+                        "status": "in_progress",
+                        "priority": "high"
+                    }]
+                })
+                .to_string(),
+            },
+            AgentEventKind::CompactionStart {
+                token_estimate: 10,
+                compaction_id: Some("compaction-1".to_string()),
+            },
+            AgentEventKind::CompactionSummaryChunk {
+                compaction_id: "compaction-1".to_string(),
+                content: "streamed summary".to_string(),
+            },
+            AgentEventKind::CompactionEnd {
+                summary: "final summary".to_string(),
+                summary_len: 13,
+                compaction_id: Some("compaction-1".to_string()),
+                context_tokens: Some(5),
+            },
+            AgentEventKind::HookNotice {
+                event_name: "post_tool".to_string(),
+                message: "live only".to_string(),
+                is_error: false,
+            },
+        ] {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .expect("persist replay event");
+        }
+
+        let capable = dispatch_session_load_with_capabilities(
+            fixture.handle.as_ref(),
+            &session_id,
+            AcpSessionUpdateCapabilities {
+                plan_operations: true,
+                notices: true,
+                compaction: true,
+            },
+        )
+        .await;
+        assert!(capable.response.unwrap().error.is_none());
+        let capable_updates: Vec<&serde_json::Value> = capable
+            .notifications
+            .iter()
+            .filter_map(|notification| notification["params"].get("update"))
+            .collect();
+        assert!(capable_updates.iter().any(|update| {
+            update["sessionUpdate"] == "plan_update"
+                && update["plan"]["planId"] == QUERYMT_TODO_PLAN_ID
+        }));
+        assert!(capable_updates.iter().any(|update| {
+            update["sessionUpdate"] == "compaction_update"
+                && update["compactionId"] == "compaction-1"
+                && update["status"] == "completed"
+        }));
+        assert!(capable_updates.iter().all(|update| {
+            !matches!(
+                update["sessionUpdate"].as_str(),
+                Some("notice" | "compaction_summary_chunk")
+            )
+        }));
+
+        let legacy = dispatch_session_load_with_capabilities(
+            fixture.handle.as_ref(),
+            &session_id,
+            AcpSessionUpdateCapabilities::default(),
+        )
+        .await;
+        assert!(legacy.response.unwrap().error.is_none());
+        let legacy_updates: Vec<&serde_json::Value> = legacy
+            .notifications
+            .iter()
+            .filter_map(|notification| notification["params"].get("update"))
+            .collect();
+        assert!(
+            legacy_updates
+                .iter()
+                .any(|update| update["sessionUpdate"] == "plan")
+        );
+        assert!(legacy_updates.iter().all(|update| {
+            !matches!(
+                update["sessionUpdate"].as_str(),
+                Some(
+                    "plan_update"
+                        | "plan_removed"
+                        | "notice"
+                        | "compaction_update"
+                        | "compaction_summary_chunk"
+                )
+            )
+        }));
     }
 
     #[tokio::test]
@@ -3801,6 +4712,87 @@ mod tests {
                 .expect("notification json");
         assert_docs_catalog(&notification, &session_id);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn dispatch_rpc_message_replays_load_history_before_response() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        journal
+            .append_durable(&NewDurableEvent {
+                session_id: session_id.clone(),
+                origin: EventOrigin::Local,
+                source_node: None,
+                source_node_id: None,
+                source_seq: None,
+                kind: AgentEventKind::ToolCallStart {
+                    tool_call_id: "replay-order-1".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: serde_json::json!({
+                        "todos": [{
+                            "content": "verify wire ordering",
+                            "status": "in_progress",
+                            "priority": "high"
+                        }]
+                    })
+                    .to_string(),
+                },
+            })
+            .await
+            .expect("persist replay event");
+
+        let session_owners = SessionOwnerMap::default();
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(64);
+
+        dispatch_rpc_message_with_context(
+            RpcDispatchState {
+                agent: fixture.handle.clone(),
+                session_owners,
+                pending_permissions,
+                pending_elicitations,
+                conn_id: "conn-order".to_string(),
+                tx,
+            },
+            RpcMessage {
+                jsonrpc: "2.0".to_string(),
+                method: AGENT_METHOD_NAMES.session_load.to_string(),
+                params: serde_json::json!({
+                    "sessionId": session_id,
+                    "cwd": "/tmp",
+                    "mcpServers": [],
+                }),
+                id: Some(serde_json::json!(1)),
+            },
+            RpcDispatchContext::default(),
+        )
+        .await;
+
+        // The replayed `session/update` notifications must reach the wire
+        // before the load response so the client applies history first.
+        let mut saw_replay_update = false;
+        loop {
+            let wire = rx.recv().await.expect("wire message");
+            let value: serde_json::Value = serde_json::from_str(&wire).expect("json message");
+            if value.get("method").is_some() {
+                assert_eq!(value["method"], "session/update");
+                saw_replay_update = true;
+            } else {
+                assert_eq!(value["id"], 1);
+                assert!(value.get("error").is_none(), "load failed: {value}");
+                break;
+            }
+        }
+        assert!(
+            saw_replay_update,
+            "load must replay at least one session/update before responding"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "load response must be the final wire message"
+        );
     }
 
     #[tokio::test]
@@ -4666,6 +5658,148 @@ mod tests {
         }
     }
 
+    mod session_load_snapshot_capability {
+        use super::*;
+        use crate::acp::protocol::ClientCapabilities;
+
+        fn capabilities_with_epoch(epoch: Option<serde_json::Value>) -> ClientCapabilities {
+            let mut capabilities = ClientCapabilities::default();
+            let mut querymt = serde_json::Map::new();
+            if let Some(epoch) = epoch {
+                let mut entry = serde_json::Map::new();
+                entry.insert("epoch".to_string(), epoch);
+                querymt.insert(
+                    QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY.to_string(),
+                    serde_json::Value::Object(entry),
+                );
+            }
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::Value::Object(querymt),
+            );
+            capabilities.meta = Some(meta);
+            capabilities
+        }
+
+        #[test]
+        fn omitted_capability_defaults_to_replay() {
+            let preferences =
+                AcpSessionLoadPreferences::from_client_capabilities(&ClientCapabilities::default());
+            assert!(!preferences.snapshot_history);
+            assert!(preferences.replays_history());
+        }
+
+        #[test]
+        fn supported_epoch_opts_into_snapshot_history() {
+            let capabilities = capabilities_with_epoch(Some(serde_json::json!(
+                QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH
+            )));
+            let preferences = AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+            assert!(preferences.snapshot_history);
+            assert!(!preferences.replays_history());
+        }
+
+        #[test]
+        fn unknown_or_malformed_epochs_fall_back_to_replay() {
+            for epoch in [
+                serde_json::json!(QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH + 1),
+                serde_json::json!(0),
+                serde_json::json!("1"),
+                serde_json::json!(null),
+            ] {
+                let capabilities = capabilities_with_epoch(Some(epoch.clone()));
+                let preferences =
+                    AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+                assert!(
+                    !preferences.snapshot_history,
+                    "epoch {epoch} must not opt into snapshot history"
+                );
+            }
+
+            // Capability namespace present but entry missing.
+            let capabilities = capabilities_with_epoch(None);
+            let preferences = AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+            assert!(!preferences.snapshot_history);
+        }
+
+        #[test]
+        fn legacy_version_key_is_accepted() {
+            let mut capabilities = ClientCapabilities::default();
+            let mut meta = serde_json::Map::new();
+            meta.insert(
+                QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::json!({
+                    QUERYMT_SESSION_LOAD_SNAPSHOT_META_KEY: { "version": QUERYMT_SESSION_LOAD_SNAPSHOT_EPOCH }
+                }),
+            );
+            capabilities.meta = Some(meta);
+            let preferences = AcpSessionLoadPreferences::from_client_capabilities(&capabilities);
+            assert!(preferences.snapshot_history);
+        }
+
+        #[tokio::test]
+        async fn snapshot_capable_load_skips_history_replay_and_returns_snapshot() {
+            let fixture = crate::test_utils::TestAgent::new().await;
+            let session_id = fixture.create_session().await;
+            let journal = fixture.storage.event_journal();
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind: AgentEventKind::ToolCallStart {
+                        tool_call_id: "todo-1".to_string(),
+                        tool_name: "todowrite".to_string(),
+                        arguments: serde_json::json!({
+                            "todos": [{
+                                "content": "ship replay",
+                                "status": "in_progress",
+                                "priority": "high"
+                            }]
+                        })
+                        .to_string(),
+                    },
+                })
+                .await
+                .expect("persist replay event");
+
+            let snapshot_capable = dispatch_session_load_with_preferences(
+                fixture.handle.as_ref(),
+                &session_id,
+                AcpSessionUpdateCapabilities::default(),
+                AcpSessionLoadPreferences {
+                    snapshot_history: true,
+                },
+            )
+            .await;
+
+            let response = snapshot_capable.response.expect("load response");
+            assert!(response.error.is_none());
+            // No historical notifications: the client hydrates from the snapshot.
+            assert!(
+                snapshot_capable.notifications.is_empty(),
+                "snapshot-capable load must not emit historical replay"
+            );
+            // Replay is still ordered before the response for clients that need it.
+            assert!(snapshot_capable.notify_before_response);
+
+            let replaying = dispatch_session_load_with_preferences(
+                fixture.handle.as_ref(),
+                &session_id,
+                AcpSessionUpdateCapabilities::default(),
+                AcpSessionLoadPreferences::default(),
+            )
+            .await;
+            assert!(
+                !replaying.notifications.is_empty(),
+                "standard clients must still receive historical replay"
+            );
+        }
+    }
+
     mod prompt_response_json {
         use crate::acp::protocol::{PromptResponse, StopReason};
 
@@ -4720,5 +5854,1140 @@ mod tests {
                 Some("refusal")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod session_update_tests {
+    use super::*;
+    use crate::agent::core::AgentMode;
+    use crate::events::{AgentEventKind, DurableEvent, EventEnvelope, EventOrigin};
+    use std::collections::HashMap;
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+
+    fn envelope(seq: i64, kind: AgentEventKind) -> EventEnvelope {
+        EventEnvelope::Durable(DurableEvent {
+            event_id: format!("evt-{seq}"),
+            stream_seq: seq,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        })
+    }
+
+    fn agent_event(seq: i64, kind: AgentEventKind) -> AgentEvent {
+        AgentEvent {
+            seq,
+            timestamp: 0,
+            session_id: "s-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        }
+    }
+
+    fn plan_ops() -> AcpSessionUpdateCapabilities {
+        AcpSessionUpdateCapabilities {
+            plan_operations: true,
+            notices: true,
+            compaction: true,
+        }
+    }
+
+    fn todo_args(entries: &[(&str, &str)]) -> String {
+        let todos: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(content, status)| {
+                serde_json::json!({"content": content, "status": status, "priority": "medium"})
+            })
+            .collect();
+        serde_json::json!({"todos": todos}).to_string()
+    }
+
+    fn todo_start(args: &str) -> EventEnvelope {
+        envelope(
+            1,
+            AgentEventKind::ToolCallStart {
+                tool_call_id: "tc-1".to_string(),
+                tool_name: "todowrite".to_string(),
+                arguments: args.to_string(),
+            },
+        )
+    }
+
+    fn usage_end(seq: i64, context_tokens: u64, cumulative_cost: Option<f64>) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::LlmRequestEnd {
+                usage: None,
+                tool_calls: 0,
+                finish_reason: None,
+                cost_usd: None,
+                cumulative_cost_usd: cumulative_cost,
+                context_tokens,
+                metrics: Default::default(),
+            },
+        )
+    }
+
+    fn provider_changed(seq: i64, limit: Option<u64>) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::ProviderChanged {
+                provider: "local".to_string(),
+                model: "m".to_string(),
+                config_id: 1,
+                context_limit: limit,
+                provider_node_id: None,
+            },
+        )
+    }
+
+    // ── 1.2 Capability snapshot ────────────────────────────────────────────
+
+    #[test]
+    fn capability_snapshot_covers_every_combination() {
+        let none = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new(),
+        );
+        assert_eq!(none, AcpSessionUpdateCapabilities::default());
+
+        // Top-level plan capability.
+        let plan_only = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new()
+                .plan(crate::acp::protocol::PlanCapabilities::default()),
+        );
+        assert!(plan_only.plan_operations && !plan_only.notices && !plan_only.compaction);
+
+        // Session-scoped notices and compaction.
+        let session_scoped = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new().session(
+                crate::acp::protocol::ClientSessionCapabilities::new()
+                    .notices(crate::acp::protocol::NoticeCapabilities::new())
+                    .compaction(crate::acp::protocol::CompactionCapabilities::new()),
+            ),
+        );
+        assert!(!session_scoped.plan_operations);
+        assert!(session_scoped.notices && session_scoped.compaction);
+    }
+
+    #[test]
+    fn capability_snapshot_treats_omitted_and_null_as_unsupported() {
+        let omitted = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new(),
+        );
+        assert_eq!(omitted, AcpSessionUpdateCapabilities::default());
+
+        let null_session = AcpSessionUpdateCapabilities::from_client_capabilities(
+            &crate::acp::protocol::ClientCapabilities::new().session(None),
+        );
+        assert!(!null_session.notices && !null_session.compaction);
+    }
+
+    #[test]
+    fn capability_snapshot_matches_documented_client_capabilities_json() {
+        // Mirrors the JSON advertised in the ACP documentation.
+        let capabilities: crate::acp::protocol::ClientCapabilities =
+            serde_json::from_value(serde_json::json!({
+                "plan": {},
+                "session": {"notices": {}, "compaction": {}}
+            }))
+            .expect("documented capabilities deserialize");
+
+        let snapshot = AcpSessionUpdateCapabilities::from_client_capabilities(&capabilities);
+        assert_eq!(snapshot, plan_ops());
+    }
+
+    #[test]
+    fn capability_snapshot_is_isolated_between_connections() {
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let mut legacy = AcpLiveEventTranslator::new();
+        legacy.set_capabilities(AcpSessionUpdateCapabilities::default());
+
+        let args = todo_args(&[("a", "pending")]);
+        assert!(matches!(
+            capable.translate_updates(&todo_start(&args)).as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+        assert!(matches!(
+            legacy.translate_updates(&todo_start(&args)).as_slice(),
+            [SessionUpdate::Plan(_)]
+        ));
+    }
+
+    #[test]
+    fn mixed_capability_clients_receive_only_supported_preview_variants() {
+        let mut full = AcpLiveEventTranslator::new();
+        full.set_capabilities(plan_ops());
+        let mut compaction_only = AcpLiveEventTranslator::new();
+        compaction_only.set_capabilities(AcpSessionUpdateCapabilities {
+            plan_operations: false,
+            notices: false,
+            compaction: true,
+        });
+        let mut legacy = AcpLiveEventTranslator::new();
+
+        let notice = envelope(
+            1,
+            AgentEventKind::HookNotice {
+                event_name: "hook".to_string(),
+                message: "m".to_string(),
+                is_error: false,
+            },
+        );
+        assert!(matches!(
+            full.translate_updates(&notice).as_slice(),
+            [SessionUpdate::Notice(_)]
+        ));
+        assert!(compaction_only.translate_updates(&notice).is_empty());
+        assert!(legacy.translate_updates(&notice).is_empty());
+
+        let plan = todo_start(&todo_args(&[("a", "pending")]));
+        assert!(matches!(
+            full.translate_updates(&plan).as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+        // Compaction-only clients fall back to the legacy plan replacement.
+        assert!(matches!(
+            compaction_only.translate_updates(&plan).as_slice(),
+            [SessionUpdate::Plan(_)]
+        ));
+
+        let compaction = envelope(
+            3,
+            AgentEventKind::CompactionStart {
+                token_estimate: 1,
+                compaction_id: Some("c".to_string()),
+            },
+        );
+        assert!(matches!(
+            full.translate_updates(&compaction).as_slice(),
+            [SessionUpdate::CompactionUpdate(_)]
+        ));
+        assert!(matches!(
+            compaction_only.translate_updates(&compaction).as_slice(),
+            [SessionUpdate::CompactionUpdate(_)]
+        ));
+        assert!(legacy.translate_updates(&compaction).is_empty());
+
+        // Stable configuration updates reach every client regardless of
+        // Preview support.
+        let config = envelope(
+            4,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Build,
+                reasoning_effort: None,
+            },
+        );
+        for translator in [&mut full, &mut compaction_only, &mut legacy] {
+            assert!(matches!(
+                translator.translate_updates(&config).as_slice(),
+                [SessionUpdate::ConfigOptionUpdate(_)]
+            ));
+        }
+    }
+
+    // ── 1.3 Zero-to-many ordering ──────────────────────────────────────────
+
+    #[test]
+    fn multiple_updates_retain_order() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&provider_changed(1, Some(200_000)));
+
+        // Terminal compaction plus a reduced usage snapshot in one event.
+        let updates = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionEnd {
+                summary: "short".to_string(),
+                summary_len: 5,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: Some(1_000),
+            },
+        ));
+        assert!(matches!(updates[0], SessionUpdate::CompactionUpdate(_)));
+        assert!(matches!(updates[1], SessionUpdate::UsageUpdate(_)));
+    }
+
+    #[test]
+    fn mode_change_orders_current_mode_before_config_replacements() {
+        let mut translator = AcpLiveEventTranslator::new();
+        let updates = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::SessionModeChanged {
+                mode: AgentMode::Plan,
+            },
+        ));
+        assert!(matches!(
+            updates.as_slice(),
+            [SessionUpdate::CurrentModeUpdate(_)]
+        ));
+
+        let updates = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Plan,
+                reasoning_effort: Some("high".to_string()),
+            },
+        ));
+        let [SessionUpdate::ConfigOptionUpdate(config)] = updates.as_slice() else {
+            panic!("expected config option update");
+        };
+        let mode = config
+            .config_options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "mode")
+            .expect("mode option");
+        assert_eq!(
+            serde_json::to_value(mode).unwrap()["currentValue"],
+            serde_json::json!("plan")
+        );
+    }
+
+    // ── 1.4 Serialization discriminators ───────────────────────────────────
+
+    #[test]
+    fn session_update_discriminators_match_acp_v1_wire_shape() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+
+        let mode_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    1,
+                    AgentEventKind::SessionModeChanged {
+                        mode: AgentMode::Build,
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(mode_json["sessionUpdate"], "current_mode_update");
+        assert_eq!(mode_json["currentModeId"], "build");
+
+        let config_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    2,
+                    AgentEventKind::SessionConfigChanged {
+                        mode: AgentMode::Build,
+                        reasoning_effort: None,
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(config_json["sessionUpdate"], "config_option_update");
+        assert!(config_json["configOptions"].is_array());
+
+        let info_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    3,
+                    AgentEventKind::SessionMetadataUpdated {
+                        title: Some(Some("Renamed".to_string())),
+                        updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(info_json["sessionUpdate"], "session_info_update");
+        assert_eq!(info_json["title"], "Renamed");
+        assert_eq!(info_json["updatedAt"], "2026-01-01T00:00:00Z");
+
+        translator.translate_updates(&provider_changed(4, Some(100)));
+        let usage_json = serde_json::to_value(
+            translator
+                .translate_updates(&usage_end(5, 42, Some(0.5)))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(usage_json["sessionUpdate"], "usage_update");
+        assert_eq!(usage_json["used"], 42);
+        assert_eq!(usage_json["size"], 100);
+        assert_eq!(usage_json["cost"]["amount"], 0.5);
+        assert_eq!(usage_json["cost"]["currency"], "USD");
+
+        let plan_json = serde_json::to_value(
+            translator
+                .translate_updates(&todo_start(&todo_args(&[("a", "pending")])))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(plan_json["sessionUpdate"], "plan_update");
+        assert_eq!(plan_json["plan"]["type"], "items");
+        assert_eq!(plan_json["plan"]["planId"], QUERYMT_TODO_PLAN_ID);
+
+        // Remove the announced plan so a removal variant is produced.
+        let removed_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    7,
+                    AgentEventKind::ToolCallStart {
+                        tool_call_id: "tc-2".to_string(),
+                        tool_name: "todowrite".to_string(),
+                        arguments: todo_args(&[]).to_string(),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(removed_json["sessionUpdate"], "plan_removed");
+        assert_eq!(removed_json["planId"], QUERYMT_TODO_PLAN_ID);
+
+        let notice_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    8,
+                    AgentEventKind::HookNotice {
+                        event_name: "pre_compaction".to_string(),
+                        message: "careful".to_string(),
+                        is_error: false,
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(notice_json["sessionUpdate"], "notice");
+        assert_eq!(notice_json["severity"], "info");
+        assert_eq!(notice_json["title"], "pre_compaction");
+        assert_eq!(notice_json["description"], "careful");
+
+        let compaction_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    9,
+                    AgentEventKind::CompactionStart {
+                        token_estimate: 10,
+                        compaction_id: Some("c-1".to_string()),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(compaction_json["sessionUpdate"], "compaction_update");
+        assert_eq!(compaction_json["compactionId"], "c-1");
+        assert_eq!(compaction_json["status"], "in_progress");
+
+        let chunk_json = serde_json::to_value(
+            translator
+                .translate_updates(&envelope(
+                    10,
+                    AgentEventKind::CompactionSummaryChunk {
+                        compaction_id: "c-1".to_string(),
+                        content: "summary text".to_string(),
+                    },
+                ))
+                .remove(0),
+        )
+        .unwrap();
+        assert_eq!(chunk_json["sessionUpdate"], "compaction_summary_chunk");
+        assert_eq!(chunk_json["compactionId"], "c-1");
+        assert_eq!(chunk_json["content"]["type"], "text");
+    }
+
+    // ── 2.4 Metadata patch semantics ───────────────────────────────────────
+
+    #[test]
+    fn metadata_patches_cover_title_timestamp_omission_and_clear() {
+        let mut translator = AcpLiveEventTranslator::new();
+
+        let title_only = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::SessionMetadataUpdated {
+                title: Some(Some("T".to_string())),
+                updated_at: None,
+            },
+        ));
+        let json = serde_json::to_value(&title_only[0]).unwrap();
+        assert_eq!(json["title"], "T");
+        assert!(json.get("updatedAt").is_none());
+
+        let timestamp_only = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::SessionMetadataUpdated {
+                title: None,
+                updated_at: Some("2026-02-03T04:05:06Z".to_string()),
+            },
+        ));
+        let json = serde_json::to_value(&timestamp_only[0]).unwrap();
+        assert!(json.get("title").is_none());
+        assert_eq!(json["updatedAt"], "2026-02-03T04:05:06Z");
+
+        let cleared = translator.translate_updates(&envelope(
+            3,
+            AgentEventKind::SessionMetadataUpdated {
+                title: Some(None),
+                updated_at: None,
+            },
+        ));
+        let json = serde_json::to_value(&cleared[0]).unwrap();
+        assert!(json["title"].is_null());
+    }
+
+    // ── 3.1/3.2 Usage meter ────────────────────────────────────────────────
+
+    #[test]
+    fn usage_uses_latest_limit_and_includes_cost_and_cached_tokens() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        // Cached tokens are already included in context_tokens.
+        let updates = translator.translate_updates(&usage_end(2, 12_345, Some(1.25)));
+        let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
+            panic!("expected usage update");
+        };
+        assert_eq!(usage.used, 12_345);
+        assert_eq!(usage.size, 100_000);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+
+        // A different known limit applies to the next snapshot. A request
+        // without a fresh cost value keeps the last cumulative session cost.
+        translator.translate_updates(&provider_changed(3, Some(50_000)));
+        let updates = translator.translate_updates(&usage_end(4, 100, None));
+        let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
+            panic!("expected usage update");
+        };
+        assert_eq!(usage.size, 50_000);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+
+        // With no cost observed anywhere, the cost field stays omitted.
+        let mut fresh = AcpLiveEventTranslator::new();
+        fresh.translate_updates(&provider_changed(1, Some(50_000)));
+        let updates = fresh.translate_updates(&usage_end(2, 100, None));
+        let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
+            panic!("expected usage update");
+        };
+        assert!(usage.cost.is_none());
+    }
+
+    #[test]
+    fn usage_is_suppressed_when_limit_is_unknown() {
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(
+            translator
+                .translate_updates(&usage_end(1, 10, None))
+                .is_empty()
+        );
+
+        translator.translate_updates(&provider_changed(2, None));
+        assert!(
+            translator
+                .translate_updates(&usage_end(3, 10, None))
+                .is_empty()
+        );
+
+        // Zero is not a meaningful effective limit.
+        translator.translate_updates(&provider_changed(4, Some(0)));
+        assert!(
+            translator
+                .translate_updates(&usage_end(5, 10, None))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn usage_state_is_cleared_on_session_close() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(1_000)));
+        assert!(
+            !translator
+                .translate_updates(&usage_end(2, 10, None))
+                .is_empty()
+        );
+
+        translator.forget_session("s-1");
+        assert!(
+            translator
+                .translate_updates(&usage_end(3, 10, None))
+                .is_empty()
+        );
+    }
+
+    // ── 3.3 Compaction reduces context ─────────────────────────────────────
+
+    #[test]
+    fn compaction_completion_projects_reduced_usage() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        translator.translate_updates(&usage_end(2, 90_000, Some(2.0)));
+
+        let updates = translator.translate_updates(&envelope(
+            3,
+            AgentEventKind::CompactionEnd {
+                summary: "s".to_string(),
+                summary_len: 1,
+                compaction_id: Some("c-1".to_string()),
+                context_tokens: Some(1_000),
+            },
+        ));
+        let SessionUpdate::UsageUpdate(usage) = &updates[1] else {
+            panic!("expected usage update after compaction");
+        };
+        assert_eq!(usage.used, 1_000);
+        assert_eq!(usage.size, 100_000);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 2.0);
+    }
+
+    // ── 4.1/4.2 Plan lifecycle ─────────────────────────────────────────────
+
+    #[test]
+    fn capable_client_plan_lifecycle_create_update_remove_recreate() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+
+        let created = translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+        let [SessionUpdate::PlanUpdate(update)] = created.as_slice() else {
+            panic!("expected plan update");
+        };
+        let PlanUpdateContent::Items(items) = &update.plan else {
+            panic!("expected item-based plan");
+        };
+        assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
+        assert_eq!(items.entries.len(), 1);
+
+        let updated = translator.translate_updates(&todo_start(&todo_args(&[
+            ("a", "completed"),
+            ("b", "in_progress"),
+        ])));
+        let [SessionUpdate::PlanUpdate(update)] = updated.as_slice() else {
+            panic!("expected plan update");
+        };
+        let PlanUpdateContent::Items(items) = &update.plan else {
+            panic!("expected item-based plan");
+        };
+        assert_eq!(items.entries.len(), 2);
+
+        let removed = translator.translate_updates(&todo_start(&todo_args(&[])));
+        assert!(matches!(
+            removed.as_slice(),
+            [SessionUpdate::PlanRemoved(_)]
+        ));
+
+        // Repeated empty snapshots do not emit duplicate removals.
+        assert!(
+            translator
+                .translate_updates(&todo_start(&todo_args(&[])))
+                .is_empty()
+        );
+
+        // Recreating the plan works after removal.
+        let recreated = translator.translate_updates(&todo_start(&todo_args(&[("c", "pending")])));
+        assert!(matches!(
+            recreated.as_slice(),
+            [SessionUpdate::PlanUpdate(_)]
+        ));
+    }
+
+    #[test]
+    fn legacy_client_keeps_full_replacement_plan_and_empty_plan() {
+        let mut translator = AcpLiveEventTranslator::new();
+
+        let created = translator.translate_updates(&todo_start(&todo_args(&[("a", "pending")])));
+        let [SessionUpdate::Plan(plan)] = created.as_slice() else {
+            panic!("expected legacy plan");
+        };
+        assert_eq!(plan.entries.len(), 1);
+
+        let emptied = translator.translate_updates(&todo_start(&todo_args(&[])));
+        let [SessionUpdate::Plan(plan)] = emptied.as_slice() else {
+            panic!("expected legacy empty replacement");
+        };
+        assert!(plan.entries.is_empty());
+    }
+
+    #[test]
+    fn malformed_todowrite_emits_nothing() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+        assert!(
+            translator
+                .translate_updates(&todo_start("not json"))
+                .is_empty()
+        );
+    }
+
+    // ── 4.3 Notices ────────────────────────────────────────────────────────
+
+    #[test]
+    fn notices_are_gated_and_map_severity() {
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(
+            legacy
+                .translate_updates(&envelope(
+                    1,
+                    AgentEventKind::HookNotice {
+                        event_name: "hook".to_string(),
+                        message: "m".to_string(),
+                        is_error: true,
+                    },
+                ))
+                .is_empty()
+        );
+
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let error = capable.translate_updates(&envelope(
+            1,
+            AgentEventKind::HookNotice {
+                event_name: "hook".to_string(),
+                message: "m".to_string(),
+                is_error: true,
+            },
+        ));
+        let SessionUpdate::Notice(notice) = &error[0] else {
+            panic!("expected notice");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Error);
+        assert_eq!(notice.description.as_deref(), Some("m"));
+
+        let info = capable.translate_updates(&envelope(
+            2,
+            AgentEventKind::HookNotice {
+                event_name: String::new(),
+                message: "m".to_string(),
+                is_error: false,
+            },
+        ));
+        let SessionUpdate::Notice(notice) = &info[0] else {
+            panic!("expected notice");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert!(!notice.title.is_empty());
+    }
+
+    // ── 5.3 Compaction lifecycle projection ────────────────────────────────
+
+    #[test]
+    fn compaction_updates_require_capability_and_valid_ordering() {
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(
+            legacy
+                .translate_updates(&envelope(
+                    1,
+                    AgentEventKind::CompactionStart {
+                        token_estimate: 1,
+                        compaction_id: Some("c".to_string()),
+                    },
+                ))
+                .is_empty()
+        );
+        assert!(
+            legacy
+                .translate_updates(&envelope(
+                    2,
+                    AgentEventKind::CompactionSummaryChunk {
+                        compaction_id: "c".to_string(),
+                        content: "x".to_string(),
+                    },
+                ))
+                .is_empty()
+        );
+
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let started = capable.translate_updates(&envelope(
+            1,
+            AgentEventKind::CompactionStart {
+                token_estimate: 1,
+                compaction_id: Some("c".to_string()),
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &started[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::InProgress);
+
+        let completed = capable.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionEnd {
+                summary: "final".to_string(),
+                summary_len: 5,
+                compaction_id: Some("c".to_string()),
+                context_tokens: None,
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &completed[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::Completed);
+        assert!(!matches!(update.summary, MaybeUndefined::Value(_)));
+    }
+
+    #[test]
+    fn failed_and_cancelled_compactions_carry_only_valid_fields() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.set_capabilities(plan_ops());
+
+        let failed = translator.translate_updates(&envelope(
+            1,
+            AgentEventKind::CompactionFailed {
+                compaction_id: "c".to_string(),
+                reason: "boom".to_string(),
+                cancelled: false,
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &failed[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::Failed);
+        assert!(matches!(&update.error, MaybeUndefined::Value(v) if v == "boom"));
+
+        let cancelled = translator.translate_updates(&envelope(
+            2,
+            AgentEventKind::CompactionFailed {
+                compaction_id: "c".to_string(),
+                reason: "stop".to_string(),
+                cancelled: true,
+            },
+        ));
+        let SessionUpdate::CompactionUpdate(update) = &cancelled[0] else {
+            panic!("expected compaction update");
+        };
+        assert_eq!(update.status, CompactionStatus::Cancelled);
+        assert!(!matches!(update.error, MaybeUndefined::Value(_)));
+    }
+
+    // ── 5.1 Event round trips (new and legacy) ─────────────────────────────
+
+    #[test]
+    fn compaction_events_round_trip_new_and_legacy_records() {
+        let new_end = serde_json::json!({
+            "type": "compaction_end",
+            "data": {
+                "summary": "s",
+                "summary_len": 1,
+                "compaction_id": "c-1",
+                "context_tokens": 123
+            }
+        });
+        let parsed: AgentEventKind = serde_json::from_value(new_end).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::CompactionEnd {
+                context_tokens: Some(123),
+                ..
+            }
+        ));
+
+        // Legacy record: no ID or token count.
+        let legacy_end = serde_json::json!({
+            "type": "compaction_end",
+            "data": {"summary": "s", "summary_len": 1}
+        });
+        let parsed: AgentEventKind = serde_json::from_value(legacy_end).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::CompactionEnd {
+                compaction_id: None,
+                context_tokens: None,
+                ..
+            }
+        ));
+
+        let legacy_start = serde_json::json!({
+            "type": "compaction_start",
+            "data": {"token_estimate": 10}
+        });
+        let parsed: AgentEventKind = serde_json::from_value(legacy_start).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::CompactionStart {
+                compaction_id: None,
+                ..
+            }
+        ));
+    }
+
+    // ── 6.1/6.2 Materialized replay ────────────────────────────────────────
+
+    fn replay_updates(
+        events: Vec<AgentEvent>,
+        capabilities: AcpSessionUpdateCapabilities,
+    ) -> Vec<SessionUpdate> {
+        replay_agent_events_materialized("s-1", events, &HashMap::new(), &capabilities)
+            .into_iter()
+            .map(|notification| notification.update)
+            .collect()
+    }
+
+    #[test]
+    fn replay_materializes_only_current_state_with_stable_ids() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::SessionModeChanged {
+                    mode: AgentMode::Build,
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::SessionConfigChanged {
+                    mode: AgentMode::Plan,
+                    reasoning_effort: Some("high".to_string()),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::SessionMetadataUpdated {
+                    title: Some(Some("First".to_string())),
+                    updated_at: None,
+                },
+            ),
+            agent_event(
+                4,
+                AgentEventKind::SessionMetadataUpdated {
+                    title: None,
+                    updated_at: Some("2026-05-05T00:00:00Z".to_string()),
+                },
+            ),
+            agent_event(
+                5,
+                AgentEventKind::ProviderChanged {
+                    provider: "local".to_string(),
+                    model: "m".to_string(),
+                    config_id: 1,
+                    context_limit: Some(100),
+                    provider_node_id: None,
+                },
+            ),
+            agent_event(
+                6,
+                AgentEventKind::LlmRequestEnd {
+                    usage: None,
+                    tool_calls: 0,
+                    finish_reason: None,
+                    cost_usd: None,
+                    cumulative_cost_usd: Some(3.0),
+                    context_tokens: 50,
+                    metrics: Default::default(),
+                },
+            ),
+            agent_event(
+                7,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "tc".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "pending")]),
+                },
+            ),
+            agent_event(
+                8,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 1,
+                    compaction_id: Some("c-1".to_string()),
+                },
+            ),
+            agent_event(
+                9,
+                AgentEventKind::CompactionSummaryChunk {
+                    compaction_id: "c-1".to_string(),
+                    content: "chunk".to_string(),
+                },
+            ),
+            agent_event(
+                10,
+                AgentEventKind::CompactionEnd {
+                    summary: "final summary".to_string(),
+                    summary_len: 13,
+                    compaction_id: Some("c-1".to_string()),
+                    context_tokens: Some(5),
+                },
+            ),
+            agent_event(
+                11,
+                AgentEventKind::HookNotice {
+                    event_name: "hook".to_string(),
+                    message: "noisy".to_string(),
+                    is_error: false,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events.clone(), plan_ops());
+
+        let mode_updates: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::CurrentModeUpdate(_)))
+            .collect();
+        assert_eq!(mode_updates.len(), 1, "one materialized mode update");
+        let SessionUpdate::CurrentModeUpdate(update) = mode_updates[0] else {
+            unreachable!()
+        };
+        assert_eq!(update.current_mode_id.0.as_ref(), "plan");
+
+        let config_count = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::ConfigOptionUpdate(_)))
+            .count();
+        assert_eq!(config_count, 1);
+
+        let info: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::SessionInfoUpdate(_)))
+            .collect();
+        assert_eq!(info.len(), 1);
+        let SessionUpdate::SessionInfoUpdate(update) = info[0] else {
+            unreachable!()
+        };
+        assert!(matches!(&update.title, MaybeUndefined::Value(v) if v == "First"));
+        assert!(
+            matches!(&update.updated_at, MaybeUndefined::Value(v) if v == "2026-05-05T00:00:00Z")
+        );
+
+        let usage: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
+            .collect();
+        assert_eq!(usage.len(), 1, "only the latest valid usage snapshot");
+        let SessionUpdate::UsageUpdate(usage) = usage[0] else {
+            unreachable!()
+        };
+        assert_eq!(usage.used, 5);
+        assert_eq!(usage.cost.as_ref().unwrap().amount, 3.0);
+
+        let plans: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::PlanUpdate(_)))
+            .collect();
+        assert_eq!(plans.len(), 1);
+        let SessionUpdate::PlanUpdate(plan) = plans[0] else {
+            unreachable!()
+        };
+        let PlanUpdateContent::Items(items) = &plan.plan else {
+            unreachable!()
+        };
+        assert_eq!(items.plan_id.0.as_ref(), QUERYMT_TODO_PLAN_ID);
+
+        let compactions: Vec<&SessionUpdate> = updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::CompactionUpdate(_)))
+            .collect();
+        assert_eq!(compactions.len(), 1, "one terminal compaction update");
+        let SessionUpdate::CompactionUpdate(compaction) = compactions[0] else {
+            unreachable!()
+        };
+        assert_eq!(compaction.compaction_id.0.as_ref(), "c-1");
+        assert_eq!(compaction.status, CompactionStatus::Completed);
+        assert!(matches!(
+            &compaction.summary,
+            MaybeUndefined::Value(blocks) if !blocks.is_empty()
+        ));
+
+        // No live-only variants in replay.
+        assert!(updates.iter().all(|u| !matches!(
+            u,
+            SessionUpdate::Notice(_) | SessionUpdate::CompactionSummaryChunk(_)
+        )));
+    }
+
+    #[test]
+    fn replay_excludes_unsupported_preview_variants() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::SessionConfigChanged {
+                    mode: AgentMode::Build,
+                    reasoning_effort: None,
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: "tc".to_string(),
+                    tool_name: "todowrite".to_string(),
+                    arguments: todo_args(&[("a", "pending")]),
+                },
+            ),
+            agent_event(
+                3,
+                AgentEventKind::CompactionEnd {
+                    summary: "s".to_string(),
+                    summary_len: 1,
+                    compaction_id: Some("c-1".to_string()),
+                    context_tokens: None,
+                },
+            ),
+            agent_event(
+                4,
+                AgentEventKind::HookNotice {
+                    event_name: "h".to_string(),
+                    message: "m".to_string(),
+                    is_error: false,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events, AcpSessionUpdateCapabilities::default());
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::ConfigOptionUpdate(_)))
+        );
+        assert!(updates.iter().any(|u| matches!(u, SessionUpdate::Plan(_))));
+        assert!(updates.iter().all(|u| !matches!(
+            u,
+            SessionUpdate::PlanUpdate(_)
+                | SessionUpdate::PlanRemoved(_)
+                | SessionUpdate::CompactionUpdate(_)
+                | SessionUpdate::CompactionSummaryChunk(_)
+                | SessionUpdate::Notice(_)
+        )));
+    }
+
+    #[test]
+    fn replay_pairs_legacy_compaction_terminal_with_stable_id() {
+        let events = vec![
+            agent_event(
+                1,
+                AgentEventKind::CompactionStart {
+                    token_estimate: 10,
+                    compaction_id: None,
+                },
+            ),
+            agent_event(
+                2,
+                AgentEventKind::CompactionEnd {
+                    summary: "legacy".to_string(),
+                    summary_len: 6,
+                    compaction_id: None,
+                    context_tokens: None,
+                },
+            ),
+        ];
+
+        let updates = replay_updates(events, plan_ops());
+        let SessionUpdate::CompactionUpdate(compaction) = &updates[0] else {
+            panic!("expected compaction update");
+        };
+        assert!(
+            compaction
+                .compaction_id
+                .0
+                .starts_with("querymt-compaction-legacy-")
+        );
+        assert_eq!(compaction.status, CompactionStatus::Completed);
+    }
+
+    #[test]
+    fn replay_drops_obsolete_in_progress_compaction() {
+        let events = vec![agent_event(
+            1,
+            AgentEventKind::CompactionStart {
+                token_estimate: 1,
+                compaction_id: Some("in-flight".to_string()),
+            },
+        )];
+        let updates = replay_updates(events, plan_ops());
+        assert!(
+            updates
+                .iter()
+                .all(|u| !matches!(u, SessionUpdate::CompactionUpdate(_)))
+        );
     }
 }

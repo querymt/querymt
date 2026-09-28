@@ -83,6 +83,19 @@ pub fn reasoning_content_part_id(item_id: &str, part_index: usize) -> String {
     format!("{item_id}:content:{part_index}")
 }
 
+/// Deserialize a nested `Option<Option<T>>` so that an absent field, an explicit
+/// `null`, and a concrete value stay distinct. The `#[serde(default)]` on the
+/// field supplies `None` for an absent key; this function only handles the
+/// present cases, mapping JSON `null` to `Some(None)` (an explicit clear) and a
+/// concrete value to `Some(Some(value))` (a new value).
+fn deserialize_double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
 /// Session limits configuration (exposed to UI)
 /// Typeshare-annotated: generated for TypeScript and Swift.
 #[typeshare]
@@ -455,10 +468,35 @@ pub enum AgentEventKind {
     },
     CompactionStart {
         token_estimate: u32,
+        /// Opaque lifecycle identity for this compaction, unique per session.
+        /// Legacy persisted records omit it; consumers derive a deterministic
+        /// identity from the record itself in that case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
     },
     CompactionEnd {
         summary: String,
         summary_len: u32,
+        /// Opaque lifecycle identity matching the originating compaction start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction_id: Option<String>,
+        /// Authoritative post-compaction context-token count, once recalculated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        context_tokens: Option<u64>,
+    },
+    /// One user-displayable summary fragment appended to an in-progress compaction.
+    CompactionSummaryChunk {
+        compaction_id: String,
+        content: String,
+    },
+    /// Terminal unsuccessful outcome for a previously started compaction.
+    CompactionFailed {
+        compaction_id: String,
+        reason: String,
+        /// `true` when the compaction was cancelled rather than failed.
+        #[serde(default)]
+        cancelled: bool,
     },
     MiddlewareInjected {
         message: String,
@@ -614,6 +652,33 @@ pub enum AgentEventKind {
     SessionModeChanged {
         #[typeshare(serialized_as = "string")]
         mode: crate::agent::core::AgentMode,
+    },
+    /// Emitted after a session-control transition commits successfully, carrying
+    /// the authoritative post-commit configuration snapshot values. Consumers
+    /// derive the complete configuration-option set from these values.
+    SessionConfigChanged {
+        #[typeshare(serialized_as = "string")]
+        mode: crate::agent::core::AgentMode,
+        /// Current reasoning effort as its wire string; `None` means auto.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+    },
+    /// Emitted after mutable session metadata (title / last-activity) persists
+    /// successfully. Fields follow patch semantics: an absent field is
+    /// unchanged, a present title is the new value, and `None` inside
+    /// `Some` is an explicit clear.
+    SessionMetadataUpdated {
+        #[typeshare(serialized_as = "Option<string>")]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_double_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        title: Option<Option<String>>,
+        /// RFC 3339 last-activity timestamp as persisted.
+        #[typeshare(serialized_as = "Option<string>")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<String>,
     },
     /// LLM request was rate limited, execution is paused and waiting.
     /// Retained as a stable wire event for rate-limit-specific UI behavior.
@@ -1529,5 +1594,68 @@ mod tests {
         assert_eq!(env.session_id(), "s2");
         assert!(!env.is_durable());
         assert!(env.is_ephemeral());
+    }
+
+    // ── SessionMetadataUpdated title patch semantics ───────────────────────
+
+    #[test]
+    fn session_metadata_updated_title_preserves_absent_null_and_value() {
+        let kind = |json: &str| -> AgentEventKind { serde_json::from_str(json).unwrap() };
+
+        // Absent field: leave the title unchanged.
+        let absent = kind(r#"{"type":"session_metadata_updated","data":{"updated_at":"t"}}"#);
+        match absent {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => assert_eq!(title, None),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        // Explicit null: clear the title.
+        let null =
+            kind(r#"{"type":"session_metadata_updated","data":{"title":null,"updated_at":"t"}}"#);
+        match null {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => assert_eq!(title, Some(None)),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        // Concrete string: set the title.
+        let value =
+            kind(r#"{"type":"session_metadata_updated","data":{"title":"hi","updated_at":"t"}}"#);
+        match value {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => {
+                assert_eq!(title, Some(Some("hi".into())))
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_metadata_updated_title_clear_survives_persisted_round_trip() {
+        let event = DurableEvent {
+            event_id: "evt-title".into(),
+            stream_seq: 7,
+            session_id: "sess-title".into(),
+            timestamp: 1700000000,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionMetadataUpdated {
+                title: Some(None),
+                updated_at: Some("2024-01-01T00:00:00Z".into()),
+            },
+        };
+
+        let json = serde_json::to_string(&event).unwrap();
+        // The explicit clear must be persisted as an emitted `null`, not dropped.
+        assert!(
+            json.contains(r#""title":null"#),
+            "expected explicit null in {json}"
+        );
+
+        let restored: DurableEvent = serde_json::from_str(&json).unwrap();
+        match restored.kind {
+            AgentEventKind::SessionMetadataUpdated { title, .. } => {
+                assert_eq!(title, Some(None), "title clear must survive round trip");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
     }
 }
