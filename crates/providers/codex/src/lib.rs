@@ -274,6 +274,7 @@ fn codex_models() -> Vec<String> {
         "gpt-6-luna".to_string(),
         "gpt-6-sol".to_string(),
         "gpt-6-astra".to_string(),
+        "gpt-6.1-sol".to_string(),
     ]
 }
 
