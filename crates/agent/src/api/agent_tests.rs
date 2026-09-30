@@ -999,7 +999,7 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
         )
         .await?;
     assert_eq!(first.sessions.len(), 10);
-    assert_eq!(first.next_cursor.as_deref(), Some("remote:0:10"));
+    assert_eq!(first.next_cursor.as_deref(), Some("remote:0:10:bookmarks"));
     for session in &first.sessions {
         let fields = session.meta.as_ref().expect("remote metadata");
         assert_eq!(fields.get("location"), Some(&serde_json::json!("remote")));

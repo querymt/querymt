@@ -302,7 +302,7 @@ async fn test_acp_remote_listing_preserves_raw_offsets_across_filtered_pages() {
         if ids.len() < 25 {
             assert_eq!(
                 cursor.as_deref(),
-                Some(format!("remote:0:{}", ids.len()).as_str())
+                Some(format!("remote:0:{}:live", ids.len()).as_str())
             );
         }
     }
@@ -327,7 +327,108 @@ async fn test_acp_remote_listing_preserves_raw_offsets_across_filtered_pages() {
     .await
     .expect("filtered remote page");
     assert!(page.sessions.is_empty());
-    assert_eq!(page.next_cursor.as_deref(), Some("remote:0:10"));
+    assert_eq!(page.next_cursor.as_deref(), Some("remote:0:10:live"));
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_acp_remote_cursor_restarts_when_peer_switches_between_bookmarks_and_live() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = RealStorageHandleFixture::new().await;
+    let remote = RealStorageHandleFixture::new().await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "transition-owner", false).await;
+    let store = remote.handle.config.provider.history_store();
+    for _ in 0..25 {
+        store
+            .create_session(
+                None,
+                Some(std::path::PathBuf::from("/remote/work")),
+                None,
+                None,
+            )
+            .await
+            .expect("remote session");
+    }
+    let owner_page = manager
+        .ask(crate::agent::remote::ListRemoteSessions {
+            offset: Some(0),
+            limit: Some(100),
+        })
+        .await
+        .expect("owner list");
+    for entry in owner_page.sessions.iter().skip(13) {
+        f.handle
+            .config
+            .provider
+            .history_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: entry.session_id.clone(),
+                node_id: node_id.clone(),
+                peer_label: "owner".into(),
+                cwd: entry.cwd.clone(),
+                created_at: entry.created_at,
+                title: None,
+            })
+            .await
+            .expect("bookmark subset");
+    }
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert("remoteNodeIds".into(), serde_json::json!([node_id]));
+    let request = |cursor: Option<String>| {
+        crate::acp::protocol::ListSessionsRequest::new()
+            .cwd("/remote/work")
+            .meta(meta.clone())
+            .cursor(cursor)
+    };
+    let offline = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(None),
+    )
+    .await
+    .expect("offline first page");
+    assert_eq!(offline.sessions.len(), 10);
+    assert_eq!(
+        offline.next_cursor.as_deref(),
+        Some("remote:0:10:bookmarks")
+    );
+
+    f.handle.set_mesh(mesh.clone());
+    let online = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(offline.next_cursor),
+    )
+    .await
+    .expect("online restart");
+    assert_eq!(
+        online
+            .sessions
+            .iter()
+            .map(|entry| entry.session_id.to_string())
+            .collect::<Vec<_>>(),
+        owner_page
+            .sessions
+            .iter()
+            .take(10)
+            .map(|entry| entry.session_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(online.next_cursor.as_deref(), Some("remote:0:10:live"));
+
+    f.handle.clear_mesh();
+    let offline_again = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(online.next_cursor),
+    )
+    .await
+    .expect("offline restart");
+    assert_eq!(offline_again.sessions, offline.sessions);
+    assert_eq!(
+        offline_again.next_cursor.as_deref(),
+        Some("remote:0:10:bookmarks")
+    );
 }
 
 #[cfg(feature = "remote")]

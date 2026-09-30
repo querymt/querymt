@@ -127,6 +127,34 @@ pub(crate) enum AcpSessionListError {
     Backend(#[from] anyhow::Error),
 }
 
+/// A raw offset is valid only for the live or bookmark list that produced it.
+#[cfg(feature = "remote")]
+#[derive(Debug, Clone, Copy, Default)]
+struct AcpRemoteCursor {
+    node: usize,
+    offset: u32,
+    source: Option<AcpRemoteSource>,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpRemoteSource {
+    Live,
+    Bookmarks,
+}
+
+#[cfg(feature = "remote")]
+impl AcpRemoteCursor {
+    /// Restart after a source switch or an untagged legacy continuation.
+    fn offset_for(self, source: AcpRemoteSource) -> u32 {
+        if self.source == Some(source) {
+            self.offset
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AcpSessionCursor(i64);
 
@@ -337,7 +365,7 @@ impl AgentSessions {
                 &remote_nodes,
                 remote_cwd.as_deref(),
                 remote_scope,
-                (0, 0),
+                AcpRemoteCursor::default(),
             )
             .await?;
             page.sessions.extend(remote_page.sessions);
@@ -355,12 +383,12 @@ impl AgentSessions {
         nodes: &[String],
         cwd: Option<&str>,
         scope: SessionScope,
-        cursor: (usize, usize),
+        cursor: AcpRemoteCursor,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let node_id = nodes
-            .get(cursor.0)
+            .get(cursor.node)
             .ok_or(AcpSessionListError::InvalidCursor)?;
-        let offset = u32::try_from(cursor.1).map_err(|_| AcpSessionListError::InvalidCursor)?;
+        let offset = cursor.offset_for(AcpRemoteSource::Live);
         let limit = if cwd.is_some() { 10 } else { 100 };
         let store = agent.config.provider.history_store();
         let bookmarks = store
@@ -399,9 +427,10 @@ impl AgentSessions {
                     .iter()
                     .filter(|bookmark| bookmark.node_id == *node_id)
                     .collect();
+                let start = cursor.offset_for(AcpRemoteSource::Bookmarks) as usize;
                 let entries: Vec<_> = peer_bookmarks
                     .iter()
-                    .skip(cursor.1)
+                    .skip(start)
                     .take(limit as usize)
                     .map(|bookmark| crate::agent::remote::RemoteSessionSnapshot {
                         session_id: bookmark.session_id.clone(),
@@ -418,7 +447,7 @@ impl AgentSessions {
                         fork_origin: None,
                     })
                     .collect();
-                let end = cursor.1.saturating_add(entries.len());
+                let end = start.saturating_add(entries.len());
                 let next = if end < peer_bookmarks.len() {
                     Some(u32::try_from(end).map_err(|_| AcpSessionListError::InvalidCursor)?)
                 } else {
@@ -427,9 +456,12 @@ impl AgentSessions {
                 (entries, next, false)
             }
         };
+        let source = if live { "live" } else { "bookmarks" };
         let next_cursor = next_offset
-            .map(|offset| format!("remote:{}:{offset}", cursor.0))
-            .or_else(|| (cursor.0 + 1 < nodes.len()).then(|| format!("remote:{}:0", cursor.0 + 1)));
+            .map(|offset| format!("remote:{}:{offset}:{source}", cursor.node))
+            .or_else(|| {
+                (cursor.node + 1 < nodes.len()).then(|| format!("remote:{}:0", cursor.node + 1))
+            });
         let mut sessions = Vec::new();
         for entry in entries {
             let same_cwd = cwd.is_none_or(|requested| {
@@ -980,17 +1012,31 @@ fn validate_acp_remote_page(
 #[cfg(feature = "remote")]
 fn parse_acp_remote_cursor(
     cursor: &str,
-) -> std::result::Result<(usize, usize), AcpSessionListError> {
+) -> std::result::Result<AcpRemoteCursor, AcpSessionListError> {
     let mut parts = cursor.split(':');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some("remote"), Some(node), Some(offset), None) => {
-            let node = node
-                .parse()
-                .map_err(|_| AcpSessionListError::InvalidCursor)?;
-            let offset = offset
-                .parse()
-                .map_err(|_| AcpSessionListError::InvalidCursor)?;
-            Ok((node, offset))
+    match (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        (Some("remote"), Some(node), Some(offset), source, None) => {
+            let source = match source {
+                None => None,
+                Some("live") => Some(AcpRemoteSource::Live),
+                Some("bookmarks") => Some(AcpRemoteSource::Bookmarks),
+                _ => return Err(AcpSessionListError::InvalidCursor),
+            };
+            Ok(AcpRemoteCursor {
+                node: node
+                    .parse()
+                    .map_err(|_| AcpSessionListError::InvalidCursor)?,
+                offset: offset
+                    .parse()
+                    .map_err(|_| AcpSessionListError::InvalidCursor)?,
+                source,
+            })
         }
         _ => Err(AcpSessionListError::InvalidCursor),
     }
@@ -1133,6 +1179,27 @@ mod remote_page_tests {
                 .collect(),
             next_offset,
             total_count: 100,
+        }
+    }
+
+    #[test]
+    fn remote_cursor_offsets_are_scoped_to_their_list_source() {
+        let live = parse_acp_remote_cursor("remote:2:30:live").expect("live cursor");
+        assert_eq!(live.node, 2);
+        assert_eq!(live.offset_for(AcpRemoteSource::Live), 30);
+        assert_eq!(live.offset_for(AcpRemoteSource::Bookmarks), 0);
+        let bookmarks = parse_acp_remote_cursor("remote:2:10:bookmarks").expect("bookmark cursor");
+        assert_eq!(bookmarks.offset_for(AcpRemoteSource::Live), 0);
+        assert_eq!(bookmarks.offset_for(AcpRemoteSource::Bookmarks), 10);
+        let legacy = parse_acp_remote_cursor("remote:2:10").expect("legacy cursor");
+        assert_eq!(legacy.offset_for(AcpRemoteSource::Live), 0);
+        assert_eq!(legacy.offset_for(AcpRemoteSource::Bookmarks), 0);
+        for invalid in [
+            "remote:2:10:unknown",
+            "remote:2:10:live:extra",
+            "remote:2:4294967296:live",
+        ] {
+            assert!(parse_acp_remote_cursor(invalid).is_err());
         }
     }
 
