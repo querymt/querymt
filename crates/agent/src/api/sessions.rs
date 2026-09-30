@@ -294,9 +294,228 @@ impl AgentSessions {
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
+        #[cfg(feature = "remote")]
+        let remote_nodes = acp_remote_node_ids(request.meta.as_ref());
+        #[cfg(feature = "remote")]
+        let remote_cursor = request
+            .cursor
+            .as_deref()
+            .filter(|cursor| cursor.starts_with("remote:"))
+            .map(parse_acp_remote_cursor)
+            .transpose()?;
+        #[cfg(feature = "remote")]
+        if remote_cursor.is_some() && remote_nodes.is_empty() {
+            return Err(AcpSessionListError::InvalidCursor);
+        }
+        #[cfg(feature = "remote")]
+        let remote_cwd = request
+            .cwd
+            .as_ref()
+            .map(|cwd| normalize_group_cwd(cwd.display().to_string()));
+        #[cfg(feature = "remote")]
+        let remote_scope = acp_session_scope_from_meta(request.meta.as_ref());
+        #[cfg(feature = "remote")]
+        if let Some(cursor) = remote_cursor {
+            return Self::list_acp_remote_page(
+                agent,
+                &remote_nodes,
+                remote_cwd.as_deref(),
+                remote_scope,
+                cursor,
+            )
+            .await;
+        }
+
         let mut page = Self::list_for_acp_from_view_store(view_store.clone(), request).await?;
         Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
+        #[cfg(feature = "remote")]
+        if !remote_nodes.is_empty() && page.next_cursor.is_none() {
+            let remote_page = Self::list_acp_remote_page(
+                agent,
+                &remote_nodes,
+                remote_cwd.as_deref(),
+                remote_scope,
+                (0, 0),
+            )
+            .await?;
+            page.sessions.extend(remote_page.sessions);
+            page.next_cursor = remote_page.next_cursor;
+            page.total_count += remote_page.total_count;
+        }
         Ok(page)
+    }
+
+    #[cfg(feature = "remote")]
+    async fn list_acp_remote_page(
+        agent: &LocalAgentHandle,
+        nodes: &[String],
+        cwd: Option<&str>,
+        scope: SessionScope,
+        cursor: (usize, usize),
+    ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
+        if cursor.0 >= nodes.len() {
+            return Err(AcpSessionListError::InvalidCursor);
+        }
+        let limit = if cwd.is_some() { 10 } else { 100 };
+        let store = agent.config.provider.history_store();
+        let bookmarks = store
+            .list_remote_session_bookmarks()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mut sessions = Vec::new();
+        let mut next_cursor = None;
+        let mut total_count = 0;
+        let available_nodes: std::collections::HashSet<String> = agent
+            .list_remote_nodes()
+            .await
+            .into_iter()
+            .map(|node| node.node_id.to_string())
+            .collect();
+
+        for (node_index, node_id) in nodes.iter().enumerate().skip(cursor.0) {
+            let mut entries = Vec::new();
+            let mut live = false;
+            if let Some(manager) = if available_nodes.contains(node_id) {
+                agent.find_node_manager(node_id).await.ok()
+            } else {
+                None
+            } {
+                let mut offset = None;
+                loop {
+                    match agent
+                        .list_remote_sessions(&manager, offset, Some(100))
+                        .await
+                    {
+                        Ok(response) => {
+                            entries.extend(response.sessions);
+                            live = true;
+                            if let Some(next) = response.next_offset {
+                                if Some(next) == offset {
+                                    break;
+                                }
+                                offset = Some(next);
+                            } else {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("Unable to list sessions from peer {}: {}", node_id, error);
+                            entries.clear();
+                            live = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !live {
+                entries = bookmarks
+                    .iter()
+                    .filter(|b| b.node_id == *node_id)
+                    .map(|b| crate::agent::remote::RemoteSessionSnapshot {
+                        session_id: b.session_id.clone(),
+                        actor_id: 0,
+                        cwd: b.cwd.clone(),
+                        created_at: b.created_at,
+                        updated_at: None,
+                        title: b.title.clone(),
+                        profile_id: None,
+                        profile_label: None,
+                        peer_label: b.peer_label.clone(),
+                        runtime_state: None,
+                        parent_session_id: None,
+                        fork_origin: None,
+                    })
+                    .collect();
+            }
+            entries.retain(|entry| {
+                let same_cwd = cwd.is_none_or(|requested| {
+                    entry
+                        .cwd
+                        .as_deref()
+                        .map(|cwd| normalize_group_cwd(cwd.to_string()))
+                        .as_deref()
+                        == Some(requested)
+                });
+                let same_scope = match scope {
+                    SessionScope::All => true,
+                    SessionScope::Root => entry.parent_session_id.is_none(),
+                    SessionScope::Forks => entry.fork_origin.as_deref() == Some("user"),
+                    SessionScope::Delegates => entry.fork_origin.as_deref() == Some("delegation"),
+                    SessionScope::Children => entry.parent_session_id.is_some(),
+                };
+                same_cwd && same_scope
+            });
+            // A bookmark is authoritative for its original owner; do not advertise
+            // a session from a different peer (or one that is stored locally).
+            let mut checked = Vec::new();
+            for entry in entries {
+                if bookmarks
+                    .iter()
+                    .any(|b| b.session_id == entry.session_id && b.node_id != *node_id)
+                {
+                    continue;
+                }
+                if store
+                    .get_session(&entry.session_id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                    .is_some()
+                {
+                    continue;
+                }
+                checked.push(entry);
+            }
+            total_count += checked.len() as u64;
+            let start = if node_index == cursor.0 { cursor.1 } else { 0 };
+            if start > checked.len() {
+                return Err(AcpSessionListError::InvalidCursor);
+            }
+            for (offset, entry) in checked.into_iter().enumerate().skip(start) {
+                if sessions.len() == limit {
+                    next_cursor = Some(format!("remote:{node_index}:{offset}"));
+                    break;
+                }
+                let mut info = SessionInfo::new(
+                    SessionId::from(entry.session_id),
+                    entry.cwd.map(PathBuf::from).unwrap_or_default(),
+                );
+                info.title = entry.title;
+                info.updated_at = time::OffsetDateTime::from_unix_timestamp(
+                    entry.updated_at.unwrap_or(entry.created_at),
+                )
+                .ok()
+                .and_then(|ts| ts.format(&Rfc3339).ok());
+                let mut meta = Meta::new();
+                meta.insert("location".into(), serde_json::json!("remote"));
+                meta.insert("nodeId".into(), serde_json::json!(node_id));
+                meta.insert("nodeLabel".into(), serde_json::json!(entry.peer_label));
+                meta.insert("profileId".into(), serde_json::json!(entry.profile_id));
+                meta.insert(
+                    "profileLabel".into(),
+                    serde_json::json!(entry.profile_label),
+                );
+                meta.insert(
+                    "connectionState".into(),
+                    serde_json::json!(if live { "available" } else { "disconnected" }),
+                );
+                if let Some(parent) = entry.parent_session_id {
+                    meta.insert("parentSessionId".into(), serde_json::json!(parent));
+                }
+                if let Some(origin) = entry.fork_origin {
+                    meta.insert("forkOrigin".into(), serde_json::json!(origin));
+                }
+                info.meta = Some(meta);
+                sessions.push(info);
+            }
+            if next_cursor.is_some() {
+                break;
+            }
+        }
+        Ok(AcpSessionListPage {
+            sessions,
+            next_cursor,
+            total_count,
+        })
     }
 
     pub(crate) async fn list_for_acp_from_view_store(
@@ -738,6 +957,42 @@ impl From<crate::session::projection::SessionGroup> for SessionGroup {
             total_count: group.total_count.map(|v| v as u64),
             next_cursor: group.next_cursor,
         }
+    }
+}
+
+// QueryMT-only ACP opt-in. Without selected peer IDs, session/list remains local-only.
+#[cfg(feature = "remote")]
+fn acp_remote_node_ids(meta: Option<&Meta>) -> Vec<String> {
+    let mut ids: Vec<String> = meta
+        .and_then(|meta| meta.get("remoteNodeIds"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[cfg(feature = "remote")]
+fn parse_acp_remote_cursor(
+    cursor: &str,
+) -> std::result::Result<(usize, usize), AcpSessionListError> {
+    let mut parts = cursor.split(':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("remote"), Some(node), Some(offset), None) => {
+            let node = node
+                .parse()
+                .map_err(|_| AcpSessionListError::InvalidCursor)?;
+            let offset = offset
+                .parse()
+                .map_err(|_| AcpSessionListError::InvalidCursor)?;
+            Ok((node, offset))
+        }
+        _ => Err(AcpSessionListError::InvalidCursor),
     }
 }
 

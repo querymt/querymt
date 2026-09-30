@@ -97,7 +97,8 @@ pub async fn spawn_and_register_local_mesh_actors_with_name(
         handle.registry.clone(),
         Some(mesh.clone()),
         handle.scheduler_handle.clone(),
-    );
+    )
+    .with_profiles_slot(handle.profiles.clone());
     let node_manager = match node_name.clone() {
         Some(name) => node_manager.with_node_name(name),
         None => node_manager,

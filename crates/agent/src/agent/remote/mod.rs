@@ -119,9 +119,10 @@ pub use node_id::NodeId;
 pub use node_manager::{
     CreateRemoteSchedule, CreateRemoteScheduleResponse, CreateRemoteSession,
     CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, ListRemoteSchedules, ListRemoteSchedulesResponse,
-    ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager, ResumeRemoteSchedule,
-    ResumeRemoteSession, StopRemoteSessionRuntime, TriggerRemoteSchedule,
+    ForkRemoteSessionResponse, GetNodeInfo, GetRemoteSessionProfile, ListRemoteSchedules,
+    ListRemoteSchedulesResponse, ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager,
+    RemoteSessionProfile, ResumeRemoteSchedule, ResumeRemoteSession, StopRemoteSessionRuntime,
+    TriggerRemoteSchedule,
 };
 pub use node_manager::{ListRemoteSessionsResponse, NodeInfo, RemoteSessionSnapshot};
 #[cfg(feature = "remote")]

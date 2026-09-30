@@ -81,7 +81,7 @@ impl LocalAgentHandle {
             remote_connect_gates: Default::default(),
             model_inventory,
             oauth_service,
-            profiles: ArcSwap::from_pointee(None),
+            profiles: Arc::new(ArcSwap::from_pointee(None)),
             scheduler_handle: Arc::new(parking_lot::Mutex::new(None)),
             shutdown_done: AtomicBool::new(false),
         }
@@ -173,6 +173,31 @@ impl LocalAgentHandle {
                 &profile_list,
             ),
         )
+    }
+
+    /// Mode is read from the attached owner, never inferred from this node's profile.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn remote_session_mode_config_options(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionConfigOption>, Error> {
+        let session_ref = self
+            .registry
+            .lock()
+            .await
+            .remote_attachment(session_id)
+            .map(|attachment| attachment.session_ref)
+            .ok_or_else(|| {
+                Error::invalid_params().data(serde_json::json!({
+                    "message": "remote session is not attached",
+                    "sessionId": session_id,
+                }))
+            })?;
+        let mode = session_ref.get_mode().await.map_err(Error::from)?;
+        Ok(crate::agent::session_registry::config_options(mode, None)
+            .into_iter()
+            .filter(|option| option.id.0.as_ref() == "mode")
+            .collect())
     }
 
     /// Acquire the registry lock with tracing for wait and hold durations.
@@ -621,6 +646,74 @@ impl LocalAgentHandle {
         req: crate::acp::protocol::LoadSessionRequest,
     ) -> std::result::Result<crate::acp::protocol::LoadSessionResponse, Error> {
         let session_id = req.session_id.to_string();
+
+        // Resolve durable remote ownership before profile routing or local
+        // materialization. A bookmark lookup is local I/O; mesh recovery is
+        // only attempted when this ID is actually remote.
+        #[cfg(feature = "remote")]
+        if let Some(bookmark) = self
+            .config
+            .provider
+            .history_store()
+            .get_remote_session_bookmark(&session_id)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?
+        {
+            use crate::agent::handle::remote_connect::RemoteConnectReason;
+            let store = self.config.provider.history_store();
+            if store
+                .get_session(&session_id)
+                .await
+                .map_err(|error| Error::internal_error().data(error.to_string()))?
+                .is_some()
+            {
+                return Err(Error::invalid_params().data(serde_json::json!({
+                    "message": "Session ID exists both locally and remotely",
+                    "sessionId": session_id,
+                })));
+            }
+            self.ensure_remote_session_connected(
+                &session_id,
+                Some(&bookmark.node_id),
+                RemoteConnectReason::OperationRecovery,
+            )
+            .await
+            .map_err(|error| error.to_acp_error())?;
+            let snapshot = self
+                .build_remote_attach_snapshot(&session_id)
+                .await
+                .map_err(|error| Error::internal_error().data(error.to_string()))?;
+            let mut meta = serde_json::Map::new();
+            meta.insert("querymt/sessionLoadSnapshot.v1".into(), snapshot);
+            meta.insert("location".into(), serde_json::json!("remote"));
+            meta.insert("nodeId".into(), serde_json::json!(bookmark.node_id));
+            meta.insert("nodeLabel".into(), serde_json::json!(bookmark.peer_label));
+            meta.insert("cwd".into(), serde_json::json!(bookmark.cwd));
+            meta.insert("title".into(), serde_json::json!(bookmark.title));
+            if let Some(profile) = self
+                .remote_session_profile(&bookmark.node_id, &session_id)
+                .await
+            {
+                meta.insert(
+                    "profileId".into(),
+                    serde_json::json!(profile.as_ref().map(|value| &value.profile_id)),
+                );
+                meta.insert(
+                    "profileLabel".into(),
+                    serde_json::json!(profile.as_ref().map(|value| &value.profile_label)),
+                );
+            }
+            let config_options = self
+                .remote_session_mode_config_options(&session_id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(session_id, error = %error, "remote mode unavailable during session load");
+                    Vec::new()
+                });
+            return Ok(LoadSessionResponse::new()
+                .config_options(config_options)
+                .meta(meta));
+        }
 
         if let Some(profiles) = self.profiles() {
             let binding = profiles.session_binding(&session_id).await.ok_or_else(|| {

@@ -24,6 +24,7 @@ pub struct RemoteSessionInfo {
     pub cwd: Option<String>,
     pub updated_at: Option<String>,
     pub profile_id: Option<String>,
+    pub profile_label: Option<String>,
     pub model_id: Option<String>,
 }
 
@@ -78,6 +79,10 @@ pub struct RemoteSessionAttachInfo {
     #[typeshare(serialized_as = "Array<any>")]
     pub config_options: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_label: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[typeshare(serialized_as = "any")]
     pub snapshot: Option<serde_json::Value>,
 }
@@ -94,16 +99,35 @@ fn default_attach() -> bool {
 }
 
 #[cfg(feature = "remote")]
+async fn attached_remote_mode_options(
+    agent: &LocalAgentHandle,
+    session_id: &str,
+) -> Vec<serde_json::Value> {
+    match agent.remote_session_mode_config_options(session_id).await {
+        Ok(options) => options.into_iter().filter_map(|option| {
+            serde_json::to_value(option).map_err(|error| {
+                tracing::warn!(session_id, error = %error, "could not serialize remote mode option");
+            }).ok()
+        }).collect(),
+        Err(error) => {
+            tracing::warn!(session_id, error = %error, "remote mode unavailable during attach");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(feature = "remote")]
 fn remote_snapshot_to_info(
     node_id: &str,
     session: crate::agent::remote::RemoteSessionSnapshot,
 ) -> RemoteSessionInfo {
-    let updated_at = time::OffsetDateTime::from_unix_timestamp(session.created_at)
-        .ok()
-        .and_then(|ts| {
-            ts.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        });
+    let updated_at =
+        time::OffsetDateTime::from_unix_timestamp(session.updated_at.unwrap_or(session.created_at))
+            .ok()
+            .and_then(|ts| {
+                ts.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            });
     RemoteSessionInfo {
         id: session.session_id,
         node_id: node_id.to_string(),
@@ -111,7 +135,8 @@ fn remote_snapshot_to_info(
         title: session.title,
         cwd: session.cwd,
         updated_at,
-        profile_id: None,
+        profile_id: session.profile_id,
+        profile_label: session.profile_label,
         model_id: None,
     }
 }
@@ -192,6 +217,8 @@ pub async fn create_remote_session(
                 node_id: request.node_id,
                 attached: false,
                 config_options: Vec::new(),
+                profile_id: None,
+                profile_label: None,
                 snapshot: None,
             });
         }
@@ -204,11 +231,19 @@ pub async fn create_remote_session(
             )
             .await?;
 
+        let profile = agent
+            .remote_session_profile(&request.node_id, &response.session_id)
+            .await;
+        let config_options = attached_remote_mode_options(agent, &response.session_id).await;
         Ok(RemoteSessionAttachInfo {
             session_id: response.session_id,
             node_id: request.node_id,
             attached: true,
-            config_options: Vec::new(),
+            config_options,
+            profile_id: profile
+                .as_ref()
+                .map(|value| value.as_ref().map(|value| value.profile_id.clone())),
+            profile_label: profile.map(|value| value.map(|value| value.profile_label)),
             snapshot: Some(snapshot),
         })
     }
@@ -230,11 +265,19 @@ pub async fn attach_remote_session(
         let snapshot = agent
             .attach_remote_session_for_ext(&request.node_id, &request.session_id, None)
             .await?;
+        let profile = agent
+            .remote_session_profile(&request.node_id, &request.session_id)
+            .await;
+        let config_options = attached_remote_mode_options(agent, &request.session_id).await;
         Ok(RemoteSessionAttachInfo {
             session_id: request.session_id,
             node_id: request.node_id,
             attached: true,
-            config_options: Vec::new(),
+            config_options,
+            profile_id: profile
+                .as_ref()
+                .map(|value| value.as_ref().map(|value| value.profile_id.clone())),
+            profile_label: profile.map(|value| value.map(|value| value.profile_label)),
             snapshot: Some(snapshot),
         })
     }

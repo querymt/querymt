@@ -956,6 +956,75 @@ async fn acp_session_list_marks_scheduled_recurring_session() -> Result<()> {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Result<()> {
+    let agent = test_agent().await?;
+    let store = agent.storage_backend().session_store();
+    for index in 0..12 {
+        store
+            .save_remote_session_bookmark(&RemoteSessionBookmark {
+                session_id: format!("remote-{index:02}"),
+                node_id: "peer-a".into(),
+                peer_label: "Remote A".into(),
+                cwd: Some("/remote/work".into()),
+                created_at: index,
+                title: Some(format!("Remote {index}")),
+            })
+            .await?;
+    }
+    store
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: "other-peer".into(),
+            node_id: "peer-b".into(),
+            peer_label: "Remote B".into(),
+            cwd: Some("/remote/work".into()),
+            created_at: 0,
+            title: None,
+        })
+        .await?;
+
+    let local_only = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await?;
+    assert!(local_only.sessions.is_empty());
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert("remoteNodeIds".into(), serde_json::json!(["peer-a"]));
+    meta.insert("session_scope".into(), serde_json::json!("root"));
+    let first = agent
+        .sessions()
+        .list_for_acp(
+            AcpListSessionsRequest::new()
+                .cwd("/remote/work")
+                .meta(meta.clone()),
+        )
+        .await?;
+    assert_eq!(first.sessions.len(), 10);
+    assert_eq!(first.next_cursor.as_deref(), Some("remote:0:10"));
+    for session in &first.sessions {
+        let fields = session.meta.as_ref().expect("remote metadata");
+        assert_eq!(fields.get("location"), Some(&serde_json::json!("remote")));
+        assert_eq!(fields.get("nodeId"), Some(&serde_json::json!("peer-a")));
+        assert_eq!(
+            fields.get("connectionState"),
+            Some(&serde_json::json!("disconnected"))
+        );
+    }
+    let second = agent
+        .sessions()
+        .list_for_acp(
+            AcpListSessionsRequest::new()
+                .cwd("/remote/work")
+                .meta(meta)
+                .cursor(first.next_cursor),
+        )
+        .await?;
+    assert_eq!(second.sessions.len(), 2);
+    assert_eq!(second.next_cursor, None);
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn list_sessions_remote_bookmarks_mode_includes_detached_bookmarks() -> Result<()> {
     let agent = test_agent().await?;
     let storage = agent.storage_backend();

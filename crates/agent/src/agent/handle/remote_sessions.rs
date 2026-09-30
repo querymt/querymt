@@ -236,6 +236,32 @@ impl LocalAgentHandle {
         .map_err(Self::map_remote_node_manager_error)
     }
 
+    /// Read display-only profile identity from the session's owning node.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn remote_session_profile(
+        &self,
+        node_id: &str,
+        session_id: &str,
+    ) -> Option<Option<crate::agent::remote::RemoteSessionProfile>> {
+        use crate::agent::remote::GetRemoteSessionProfile;
+        // Missing metadata must not block loading a healthy remote session.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let manager = self.find_node_manager(node_id).await.ok()?;
+            querymt_remote::ask_remote_with_timeout(
+                &manager,
+                &GetRemoteSessionProfile {
+                    session_id: session_id.to_string(),
+                },
+                Self::remote_request_timeout(),
+            )
+            .await
+            .ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// Create a session on a remote node and return the owning node's live session ref.
     ///
     /// Callers can immediately finalize local attachment from the returned capability

@@ -816,6 +816,79 @@ async fn test_profile_handle_rejects_unbound_session_load() {
     assert!(err.to_string().contains("profile binding"));
 }
 
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_load_session_resolves_remote_bookmark_before_local_or_profile_load() {
+    use crate::session::store::RemoteSessionBookmark;
+
+    let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
+    f.handle
+        .config
+        .provider
+        .history_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: "remote-reload".into(),
+            node_id: "peer-offline".into(),
+            peer_label: "Laptop".into(),
+            cwd: Some("/remote/work".into()),
+            title: Some("Remote task".into()),
+            created_at: 1,
+        })
+        .await
+        .expect("bookmark remote session");
+
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from("remote-reload"),
+        std::path::PathBuf::new(),
+    );
+    let error = f
+        .handle
+        .load_session(request)
+        .await
+        .expect_err("offline peer");
+    assert!(
+        error
+            .to_string()
+            .contains("remote mesh is not bootstrapped")
+    );
+    assert!(!error.to_string().contains("profile binding"));
+    assert!(!error.to_string().contains("session not found"));
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_load_session_rejects_conflicting_remote_and_local_identity() {
+    use crate::session::store::RemoteSessionBookmark;
+
+    let f = HandleFixture::new().await;
+    let store = f.handle.config.provider.history_store();
+    let local = store
+        .create_session(None, None, None, None)
+        .await
+        .expect("local session");
+    store
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: local.public_id.clone(),
+            node_id: "peer-1".into(),
+            peer_label: "Laptop".into(),
+            cwd: None,
+            title: None,
+            created_at: 1,
+        })
+        .await
+        .expect("conflicting bookmark");
+    let request = crate::acp::protocol::LoadSessionRequest::new(
+        SessionId::from(local.public_id),
+        std::path::PathBuf::new(),
+    );
+    let error = f
+        .handle
+        .load_session(request)
+        .await
+        .expect_err("location conflict");
+    assert!(error.to_string().contains("both locally and remotely"));
+}
+
 #[tokio::test]
 async fn test_load_session_reports_persisted_reasoning_effort() {
     let f = RealStorageHandleFixture::new().await;

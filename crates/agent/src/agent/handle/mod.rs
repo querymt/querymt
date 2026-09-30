@@ -244,7 +244,7 @@ pub struct LocalAgentHandle {
 
 type SharedProfileCatalog = Arc<dyn ProfileCatalog>;
 type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
-type ProfileRuntimeSlot = ArcSwap<Option<ProfileRuntime>>;
+pub(crate) type ProfileRuntimeSlot = Arc<ArcSwap<Option<ProfileRuntime>>>;
 pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::SchedulerHandle>>>;
 
 // ── Remote node lookup type aliases ─────────────────────────────────────────
