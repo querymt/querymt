@@ -97,6 +97,7 @@ impl LocalAgentHandle {
         Ok(crate::acp::protocol::SetSessionModeResponse::new())
     }
 
+    /// Apply the selected option and return the authoritative configuration of its owner.
     pub(super) async fn handle_set_session_config_option(
         &self,
         req: crate::acp::protocol::SetSessionConfigOptionRequest,

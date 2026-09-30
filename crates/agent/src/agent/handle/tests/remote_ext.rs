@@ -159,6 +159,14 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     assert_eq!(attached["config_options"].as_array().map(Vec::len), Some(1));
     assert_eq!(attached["config_options"][0]["id"], "mode");
     assert_eq!(attached["config_options"][0]["currentValue"], "plan");
+    let attachment_id = f
+        .handle
+        .registry
+        .lock()
+        .await
+        .remote_attachment(&created.session_id)
+        .expect("remote attachment")
+        .attachment_id;
 
     let response = f
         .handle
@@ -174,6 +182,16 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     assert_eq!(json["configOptions"].as_array().map(Vec::len), Some(1));
     assert_eq!(json["configOptions"][0]["id"], "mode");
     assert_eq!(json["configOptions"][0]["currentValue"], "plan");
+    assert_eq!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .remote_attachment(&created.session_id)
+            .expect("attachment after load")
+            .attachment_id,
+        attachment_id
+    );
 
     let changed = f
         .handle
@@ -213,6 +231,16 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         .as_deref(),
         Some("review")
     );
+    assert_eq!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .remote_attachment(&created.session_id)
+            .expect("attachment after reload")
+            .attachment_id,
+        attachment_id
+    );
     let reattached = ext_method_json(
         &f.handle,
         "querymt/remote/attachSession",
@@ -220,6 +248,86 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     )
     .await;
     assert_eq!(reattached["config_options"][0]["currentValue"], "review");
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_acp_remote_listing_preserves_raw_offsets_across_filtered_pages() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = RealStorageHandleFixture::new().await;
+    f.handle.set_mesh(mesh.clone());
+    let remote = RealStorageHandleFixture::new().await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "listing-owner", false).await;
+    let store = remote.handle.config.provider.history_store();
+    for index in 0..25 {
+        store
+            .create_session(
+                Some(format!("Session {index}")),
+                Some(std::path::PathBuf::from("/remote/work")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist remote session");
+    }
+    let expected = manager
+        .ask(crate::agent::remote::ListRemoteSessions {
+            offset: Some(0),
+            limit: Some(100),
+        })
+        .await
+        .expect("owner list");
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert("remoteNodeIds".into(), serde_json::json!([node_id]));
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    for expected_size in [10, 10, 5] {
+        let page = crate::api::AgentSessions::list_for_acp_with_runtime(
+            &f.handle,
+            f.storage.view_store().expect("view store"),
+            crate::acp::protocol::ListSessionsRequest::new()
+                .cwd("/remote/work")
+                .meta(meta.clone())
+                .cursor(cursor),
+        )
+        .await
+        .expect("ACP remote page");
+        assert_eq!(page.sessions.len(), expected_size);
+        ids.extend(
+            page.sessions
+                .into_iter()
+                .map(|session| session.session_id.to_string()),
+        );
+        cursor = page.next_cursor;
+        if ids.len() < 25 {
+            assert_eq!(
+                cursor.as_deref(),
+                Some(format!("remote:0:{}", ids.len()).as_str())
+            );
+        }
+    }
+    assert_eq!(cursor, None);
+    assert_eq!(
+        ids,
+        expected
+            .sessions
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // No matches must still advance a bounded raw page, not scan all history.
+    let page = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        crate::acp::protocol::ListSessionsRequest::new()
+            .cwd("/missing")
+            .meta(meta),
+    )
+    .await
+    .expect("filtered remote page");
+    assert!(page.sessions.is_empty());
+    assert_eq!(page.next_cursor.as_deref(), Some("remote:0:10"));
 }
 
 #[cfg(feature = "remote")]

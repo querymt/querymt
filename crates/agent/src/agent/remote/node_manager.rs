@@ -420,6 +420,7 @@ mod remote_impl {
     }
 
     impl RemoteNodeManagerState {
+        /// Resolve display metadata only when the owner's live catalog contains the binding.
         async fn session_profile(&self, session_id: &str) -> Option<RemoteSessionProfile> {
             let loaded = self.profiles.load_full();
             let profiles = loaded.as_ref().as_ref()?;

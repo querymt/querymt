@@ -98,6 +98,7 @@ fn default_attach() -> bool {
     true
 }
 
+/// Return owner-confirmed mode options, leaving unavailable metadata empty.
 #[cfg(feature = "remote")]
 async fn attached_remote_mode_options(
     agent: &LocalAgentHandle,
@@ -116,6 +117,7 @@ async fn attached_remote_mode_options(
     }
 }
 
+/// Map an owner snapshot to the control DTO without substituting local profile data.
 #[cfg(feature = "remote")]
 fn remote_snapshot_to_info(
     node_id: &str,

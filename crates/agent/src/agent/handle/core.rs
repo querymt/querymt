@@ -675,7 +675,7 @@ impl LocalAgentHandle {
             self.ensure_remote_session_connected(
                 &session_id,
                 Some(&bookmark.node_id),
-                RemoteConnectReason::OperationRecovery,
+                RemoteConnectReason::Open,
             )
             .await
             .map_err(|error| error.to_acp_error())?;
