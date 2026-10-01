@@ -27,7 +27,7 @@ tokio = { version = "1.0", features = ["macros", "rt", "sync", "time"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 tracing = { version = "0.1", features = ["attributes", "release_max_level_debug"] }
-libp2p = { version = "0.56", optional = true, default-features = false }
+libp2p = { version = "0.57", optional = true, default-features = false }
 libp2p-iroh = { git = "https://github.com/querymt/libp2p-iroh.git", branch = "iroh_v1", optional = true }
 moka = { version = "0.12", features = ["sync"], optional = true }
 qrcode = { version = "0.14", optional = true }
