@@ -97,6 +97,7 @@ impl LocalAgentHandle {
         Ok(crate::acp::protocol::SetSessionModeResponse::new())
     }
 
+    /// Apply the selected option and return the authoritative configuration of its owner.
     pub(super) async fn handle_set_session_config_option(
         &self,
         req: crate::acp::protocol::SetSessionConfigOptionRequest,
@@ -238,14 +239,38 @@ impl LocalAgentHandle {
                     .parse::<AgentMode>()
                     .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e })))?;
 
-                let session_ref = self.session_ref_for_agent_session(&session_id).await?;
-                session_ref.set_mode(mode).await.map_err(Error::from)?;
+                #[cfg(feature = "remote")]
+                {
+                    self.execute_session_operation(
+                        &session_id,
+                        session_operation::SessionOperation::SetMode,
+                        |session_ref| Box::pin(session_ref.set_mode(mode)),
+                    )
+                    .await
+                    .map_err(session_operation::SessionOperationError::into_acp_error)?;
+                    let resolved = self
+                        .session_ref_for_operation(
+                            &session_id,
+                            session_operation::SessionOperation::SetMode,
+                        )
+                        .await
+                        .map_err(session_operation::SessionOperationError::into_acp_error)?;
+                    if resolved.session_ref.is_remote() {
+                        return Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
+                            self.remote_session_mode_config_options(&session_id).await?,
+                        ));
+                    }
+                }
 
+                let session_ref = self.session_ref_for_agent_session(&session_id).await?;
+                #[cfg(not(feature = "remote"))]
+                session_ref.set_mode(mode).await.map_err(Error::from)?;
+                let confirmed_mode = session_ref.get_mode().await.map_err(Error::from)?;
                 let effort = self
                     .session_reasoning_effort(&session_ref, &session_id)
                     .await;
                 let config_options = self
-                    .session_config_options(Some(&session_id), mode, effort)
+                    .session_config_options(Some(&session_id), confirmed_mode, effort)
                     .await?;
                 Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
                     config_options,

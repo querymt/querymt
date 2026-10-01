@@ -22,12 +22,22 @@ pub struct RemoteSessionSnapshot {
     pub cwd: Option<String>,
     /// Unix timestamp when the session was created
     pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: Option<i64>,
     /// Session title/name, if set
     pub title: Option<String>,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub profile_label: Option<String>,
     /// Human-readable label of the peer that owns this session
     pub peer_label: String,
     /// High-level runtime lifecycle state for UI summaries.
     pub runtime_state: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub fork_origin: Option<String>,
 }
 
 /// Paginated response for listing sessions on a remote node.
@@ -61,10 +71,10 @@ pub struct NodeInfo {
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteScheduleResponse,
     CreateRemoteSession, CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, ListRemoteSchedules, ListRemoteSchedulesResponse,
-    ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager, RemoteNodeManagerState,
-    ResumeRemoteSchedule, ResumeRemoteSession, SessionHandoff, StopRemoteSessionRuntime,
-    TriggerRemoteSchedule,
+    ForkRemoteSessionResponse, GetNodeInfo, GetRemoteSessionProfile, ListRemoteSchedules,
+    ListRemoteSchedulesResponse, ListRemoteSessions, PauseRemoteSchedule, RemoteNodeManager,
+    RemoteNodeManagerState, RemoteSessionProfile, ResumeRemoteSchedule, ResumeRemoteSession,
+    SessionHandoff, StopRemoteSessionRuntime, TriggerRemoteSchedule,
 };
 
 #[cfg(feature = "remote")]
@@ -154,6 +164,18 @@ mod remote_impl {
         pub cwd: Option<String>,
         pub title: Option<String>,
         pub created_at: i64,
+    }
+
+    /// Display identity from the owning node's profile catalog.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RemoteSessionProfile {
+        pub profile_id: String,
+        pub profile_label: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct GetRemoteSessionProfile {
+        pub session_id: String,
     }
 
     /// List sessions active on this node, with pagination.
@@ -303,6 +325,7 @@ mod remote_impl {
     pub struct RemoteNodeManagerState {
         /// Configuration and provider access.
         pub config: Arc<AgentConfig>,
+        pub(crate) profiles: crate::agent::handle::ProfileRuntimeSlot,
         /// Local session registry — we manage sessions via this.
         pub registry: Arc<Mutex<SessionRegistry>>,
         /// Session materializer for heavy async work (DB, MCP, actor spawn).
@@ -364,6 +387,7 @@ mod remote_impl {
 
             let shared_state = RemoteNodeManagerState {
                 config,
+                profiles: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
                 registry,
                 session_materializer,
                 session_meta: Arc::new(Mutex::new(HashMap::new())),
@@ -379,13 +403,16 @@ mod remote_impl {
             }
         }
 
-        /// Override the name returned by `GetNodeInfo` instead of reading the
-        /// OS hostname.  Returns `self` for easy chaining:
-        ///
-        /// ```rust,ignore
-        /// let nm = RemoteNodeManager::new(config, registry, mesh, scheduler_handle)
-        ///     .with_node_name("bob".to_string());
-        /// ```
+        /// Share the live profile slot so profiles installed after mesh startup are visible.
+        pub(crate) fn with_profiles_slot(
+            mut self,
+            profiles: crate::agent::handle::ProfileRuntimeSlot,
+        ) -> Self {
+            self.shared_state.profiles = profiles;
+            self
+        }
+
+        /// Override the name returned by `GetNodeInfo` instead of reading the OS hostname.
         pub fn with_node_name(mut self, name: String) -> Self {
             self.node_name = Some(name);
             self
@@ -393,6 +420,24 @@ mod remote_impl {
     }
 
     impl RemoteNodeManagerState {
+        /// Resolve display metadata only when the owner's live catalog contains the binding.
+        async fn session_profile(&self, session_id: &str) -> Option<RemoteSessionProfile> {
+            let loaded = self.profiles.load_full();
+            let profiles = loaded.as_ref().as_ref()?;
+            let binding = profiles.session_binding(session_id).await?;
+            let profile_label = profiles
+                .list_profiles()
+                .await
+                .ok()?
+                .into_iter()
+                .find(|profile| profile.id == binding.profile_id)?
+                .name;
+            Some(RemoteSessionProfile {
+                profile_id: binding.profile_id,
+                profile_label,
+            })
+        }
+
         fn scheduler_unavailable_error() -> AgentError {
             AgentError::Internal("scheduler unavailable".to_string())
         }
@@ -971,6 +1016,33 @@ mod remote_impl {
         }
     }
 
+    impl Message<GetRemoteSessionProfile> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Option<RemoteSessionProfile>>;
+
+        async fn handle(
+            &mut self,
+            msg: GetRemoteSessionProfile,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let shared_state = self.shared_state.clone();
+            ctx.spawn(async move {
+                let exists = shared_state
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session(&msg.session_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some();
+                if !exists {
+                    return None;
+                }
+                shared_state.session_profile(&msg.session_id).await
+            })
+        }
+    }
+
     impl Message<ListRemoteSessions> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<ListRemoteSessionsResponse, AgentError>>;
 
@@ -996,6 +1068,10 @@ mod remote_impl {
                     AgentError::Internal(format!("Failed to list persisted sessions: {}", e))
                 })?;
 
+                let ids_by_row: std::collections::HashMap<i64, String> = all_sessions
+                    .iter()
+                    .map(|session| (session.id, session.public_id.clone()))
+                    .collect();
                 let mut sorted = all_sessions;
                 sorted.sort_by(|a, b| {
                     b.updated_at
@@ -1022,7 +1098,20 @@ mod remote_impl {
                 };
 
                 let mut infos = Vec::with_capacity(page_len);
+                let loaded_profiles = shared_state.profiles.load_full();
+                let profiles = loaded_profiles.as_ref().as_ref();
+                let profile_names: std::collections::HashMap<_, _> = if let Some(profiles) = profiles {
+                    profiles.list_profiles().await.unwrap_or_default().into_iter()
+                        .map(|profile| (profile.id, profile.name)).collect()
+                } else {
+                    std::collections::HashMap::new()
+                };
                 for session in &page {
+                    let profile = if let Some(profiles) = profiles {
+                        profiles.session_binding(&session.public_id).await.and_then(|binding| {
+                            profile_names.get(&binding.profile_id).map(|label| (binding.profile_id, label.clone()))
+                        })
+                    } else { None };
                     let title = store
                         .get_initial_intent_snapshot(&session.public_id)
                         .await
@@ -1075,9 +1164,14 @@ mod remote_impl {
                         actor_id,
                         cwd: session.cwd.as_ref().map(|p| p.display().to_string()),
                         created_at,
+                        updated_at: session.updated_at.map(|t| t.unix_timestamp()),
                         title,
+                        profile_id: profile.as_ref().map(|(id, _)| id.clone()),
+                        profile_label: profile.map(|(_, label)| label),
                         peer_label: hostname.clone(),
                         runtime_state,
+                        parent_session_id: session.parent_session_id.and_then(|id| ids_by_row.get(&id).cloned()),
+                        fork_origin: session.fork_origin.as_ref().map(|origin| origin.to_string()),
                     });
                 }
 
@@ -1680,6 +1774,11 @@ mod remote_impl {
         ListRemoteSessions,
         "querymt::ListRemoteSessions",
         REG_LIST_REMOTE_SESSIONS
+    );
+    remote_node_msg_impl!(
+        GetRemoteSessionProfile,
+        "querymt::GetRemoteSessionProfile",
+        REG_GET_REMOTE_SESSION_PROFILE
     );
     remote_node_msg_impl!(
         StopRemoteSessionRuntime,

@@ -12,10 +12,15 @@ async fn register_remote_node(
     mesh: &crate::agent::remote::mesh::MeshHandle,
     remote: &RealStorageHandleFixture,
     node_name: &str,
+    use_mesh_peer: bool,
 ) -> (String, kameo::actor::ActorRef<RemoteNodeManager>) {
-    let peer_id = libp2p::identity::Keypair::generate_ed25519()
-        .public()
-        .to_peer_id();
+    let peer_id = if use_mesh_peer {
+        *mesh.peer_id()
+    } else {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    };
     let node_id = peer_id.to_string();
     let node_manager = RemoteNodeManager::new(
         remote.handle.config.clone(),
@@ -23,6 +28,7 @@ async fn register_remote_node(
         Some(mesh.clone()),
         remote.handle.scheduler_handle.clone(),
     )
+    .with_profiles_slot(remote.handle.profiles.clone())
     .with_node_name(node_name.to_string());
     let node_manager_ref = RemoteNodeManager::spawn(node_manager);
 
@@ -43,7 +49,8 @@ async fn test_querymt_remote_sessions_returns_shared_shape() {
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let (node_id, node_manager_ref) = register_remote_node(mesh, &remote, "peer-remote").await;
+    let (node_id, node_manager_ref) =
+        register_remote_node(mesh, &remote, "peer-remote", false).await;
 
     node_manager_ref
         .ask(crate::agent::remote::CreateRemoteSession {
@@ -69,13 +76,371 @@ async fn test_querymt_remote_sessions_returns_shared_shape() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load() {
+    use crate::profiles::{
+        LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager, SessionProfileBinding,
+    };
+
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = RealStorageHandleFixture::new().await;
+    f.handle.set_mesh(mesh.clone());
+    let remote = RealStorageHandleFixture::new().await;
+    let (node_id, node_manager) = register_remote_node(mesh, &remote, "owner", true).await;
+    let created = node_manager
+        .ask(crate::agent::remote::CreateRemoteSession { cwd: None })
+        .await
+        .expect("create owner session");
+    let owner_ref = remote
+        .handle
+        .registry
+        .lock()
+        .await
+        .get(&created.session_id)
+        .cloned()
+        .expect("owner session actor");
+    owner_ref
+        .set_mode(AgentMode::Plan)
+        .await
+        .expect("set owner mode");
+
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(LocalProfileCatalog::builder().build());
+    let profile = catalog
+        .list_profiles()
+        .await
+        .expect("owner profiles")
+        .remove(0);
+    let (plugin_registry, _plugins_dir) = empty_plugin_registry().expect("plugins");
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        profile.id.clone(),
+        AgentInfra {
+            plugin_registry: Arc::new(plugin_registry),
+            storage: Some(remote.storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    // The node manager was spawned before the owner installed its profile runtime.
+    remote.handle.set_profiles(profiles.clone());
+    profiles
+        .set_session_binding(
+            &created.session_id,
+            SessionProfileBinding {
+                profile_id: profile.id.clone(),
+                agent_id: None,
+                profile_fingerprint: None,
+                profile_source: None,
+                profile_config_kind: None,
+                provider_lock_digest: None,
+                provider_locks_json: None,
+            },
+        )
+        .await;
+
+    let listed = ext_method_json(
+        &f.handle,
+        "querymt/remote/sessions",
+        serde_json::json!({ "node_id": node_id }),
+    )
+    .await;
+    assert_eq!(listed["sessions"][0]["profile_id"], profile.id);
+    assert_eq!(listed["sessions"][0]["profile_label"], profile.name);
+
+    let attached = ext_method_json(
+        &f.handle,
+        "querymt/remote/attachSession",
+        serde_json::json!({
+            "node_id": node_id, "session_id": created.session_id,
+        }),
+    )
+    .await;
+    assert_eq!(attached["profile_id"], profile.id);
+    assert_eq!(attached["profile_label"], profile.name);
+    assert_eq!(attached["config_options"].as_array().map(Vec::len), Some(1));
+    assert_eq!(attached["config_options"][0]["id"], "mode");
+    assert_eq!(attached["config_options"][0]["currentValue"], "plan");
+    let attachment_id = f
+        .handle
+        .registry
+        .lock()
+        .await
+        .remote_attachment(&created.session_id)
+        .expect("remote attachment")
+        .attachment_id;
+
+    let response = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(created.session_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("bookmarked remote load");
+    let json = serde_json::to_value(response).expect("serialize load response");
+    assert_eq!(json["_meta"]["profileId"], profile.id);
+    assert_eq!(json["_meta"]["profileLabel"], profile.name);
+    assert_eq!(json["configOptions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["configOptions"][0]["id"], "mode");
+    assert_eq!(json["configOptions"][0]["currentValue"], "plan");
+    assert_eq!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .remote_attachment(&created.session_id)
+            .expect("attachment after load")
+            .attachment_id,
+        attachment_id
+    );
+
+    let changed = f
+        .handle
+        .set_session_config_option(crate::acp::protocol::SetSessionConfigOptionRequest::new(
+            created.session_id.clone(),
+            "mode",
+            "review",
+        ))
+        .await
+        .expect("change remote mode through ACP config option");
+    assert_eq!(
+        config_option_value(&changed.config_options, "mode").as_deref(),
+        Some("review")
+    );
+    assert_eq!(changed.config_options.len(), 1);
+    assert_eq!(
+        owner_ref.get_mode().await.expect("owner mode"),
+        AgentMode::Review
+    );
+
+    let reloaded = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(created.session_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("reload remote session");
+    assert_eq!(
+        config_option_value(
+            reloaded
+                .config_options
+                .as_deref()
+                .expect("remote config options"),
+            "mode"
+        )
+        .as_deref(),
+        Some("review")
+    );
+    assert_eq!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .remote_attachment(&created.session_id)
+            .expect("attachment after reload")
+            .attachment_id,
+        attachment_id
+    );
+    let reattached = ext_method_json(
+        &f.handle,
+        "querymt/remote/attachSession",
+        serde_json::json!({ "node_id": node_id, "session_id": created.session_id }),
+    )
+    .await;
+    assert_eq!(reattached["config_options"][0]["currentValue"], "review");
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_acp_remote_listing_preserves_raw_offsets_across_filtered_pages() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = RealStorageHandleFixture::new().await;
+    f.handle.set_mesh(mesh.clone());
+    let remote = RealStorageHandleFixture::new().await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "listing-owner", false).await;
+    let store = remote.handle.config.provider.history_store();
+    for index in 0..25 {
+        store
+            .create_session(
+                Some(format!("Session {index}")),
+                Some(std::path::PathBuf::from("/remote/work")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist remote session");
+    }
+    let expected = manager
+        .ask(crate::agent::remote::ListRemoteSessions {
+            offset: Some(0),
+            limit: Some(100),
+        })
+        .await
+        .expect("owner list");
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert("remoteNodeIds".into(), serde_json::json!([node_id]));
+    let mut cursor = None;
+    let mut ids = Vec::new();
+    for expected_size in [10, 10, 5] {
+        let page = crate::api::AgentSessions::list_for_acp_with_runtime(
+            &f.handle,
+            f.storage.view_store().expect("view store"),
+            crate::acp::protocol::ListSessionsRequest::new()
+                .cwd("/remote/work")
+                .meta(meta.clone())
+                .cursor(cursor),
+        )
+        .await
+        .expect("ACP remote page");
+        assert_eq!(page.sessions.len(), expected_size);
+        ids.extend(
+            page.sessions
+                .into_iter()
+                .map(|session| session.session_id.to_string()),
+        );
+        cursor = page.next_cursor;
+        if ids.len() < 25 {
+            assert_eq!(
+                cursor.as_deref(),
+                Some(format!("remote:0:{}:live", ids.len()).as_str())
+            );
+        }
+    }
+    assert_eq!(cursor, None);
+    assert_eq!(
+        ids,
+        expected
+            .sessions
+            .iter()
+            .map(|entry| entry.session_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // No matches must still advance a bounded raw page, not scan all history.
+    let page = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        crate::acp::protocol::ListSessionsRequest::new()
+            .cwd("/missing")
+            .meta(meta),
+    )
+    .await
+    .expect("filtered remote page");
+    assert!(page.sessions.is_empty());
+    assert_eq!(page.next_cursor.as_deref(), Some("remote:0:10:live"));
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn test_acp_remote_cursor_restarts_when_peer_switches_between_bookmarks_and_live() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = RealStorageHandleFixture::new().await;
+    let remote = RealStorageHandleFixture::new().await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "transition-owner", false).await;
+    let store = remote.handle.config.provider.history_store();
+    for _ in 0..25 {
+        store
+            .create_session(
+                None,
+                Some(std::path::PathBuf::from("/remote/work")),
+                None,
+                None,
+            )
+            .await
+            .expect("remote session");
+    }
+    let owner_page = manager
+        .ask(crate::agent::remote::ListRemoteSessions {
+            offset: Some(0),
+            limit: Some(100),
+        })
+        .await
+        .expect("owner list");
+    for entry in owner_page.sessions.iter().skip(13) {
+        f.handle
+            .config
+            .provider
+            .history_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: entry.session_id.clone(),
+                node_id: node_id.clone(),
+                peer_label: "owner".into(),
+                cwd: entry.cwd.clone(),
+                created_at: entry.created_at,
+                title: None,
+            })
+            .await
+            .expect("bookmark subset");
+    }
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert("remoteNodeIds".into(), serde_json::json!([node_id]));
+    let request = |cursor: Option<String>| {
+        crate::acp::protocol::ListSessionsRequest::new()
+            .cwd("/remote/work")
+            .meta(meta.clone())
+            .cursor(cursor)
+    };
+    let offline = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(None),
+    )
+    .await
+    .expect("offline first page");
+    assert_eq!(offline.sessions.len(), 10);
+    assert_eq!(
+        offline.next_cursor.as_deref(),
+        Some("remote:0:10:bookmarks")
+    );
+
+    f.handle.set_mesh(mesh.clone());
+    let online = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(offline.next_cursor),
+    )
+    .await
+    .expect("online restart");
+    assert_eq!(
+        online
+            .sessions
+            .iter()
+            .map(|entry| entry.session_id.to_string())
+            .collect::<Vec<_>>(),
+        owner_page
+            .sessions
+            .iter()
+            .take(10)
+            .map(|entry| entry.session_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(online.next_cursor.as_deref(), Some("remote:0:10:live"));
+
+    f.handle.clear_mesh();
+    let offline_again = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(online.next_cursor),
+    )
+    .await
+    .expect("offline restart");
+    assert_eq!(offline_again.sessions, offline.sessions);
+    assert_eq!(
+        offline_again.next_cursor.as_deref(),
+        Some("remote:0:10:bookmarks")
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn test_querymt_remote_create_session_without_attach_returns_structured_result() {
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let f = RealStorageHandleFixture::new().await;
     f.handle.set_mesh(mesh.clone());
 
     let remote = RealStorageHandleFixture::new().await;
-    let (node_id, _node_manager_ref) = register_remote_node(mesh, &remote, "peer-create").await;
+    let (node_id, _node_manager_ref) =
+        register_remote_node(mesh, &remote, "peer-create", false).await;
 
     let created = ext_method_json(
         &f.handle,
