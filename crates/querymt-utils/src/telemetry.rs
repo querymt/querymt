@@ -1,12 +1,16 @@
 use std::fmt;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use opentelemetry::InstrumentationScope;
+use opentelemetry::logs::{LogRecord, Severity};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     Resource,
-    logs::SdkLoggerProvider,
+    error::OTelSdkResult,
+    logs::{LogExporter, LogProcessor, SdkLogRecord, SdkLoggerProvider},
     trace::{RandomIdGenerator, SdkTracerProvider},
 };
 use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
@@ -143,10 +147,52 @@ pub fn init_logger_provider(
         .build()
         .map_err(|e| TelemetryInitError::LoggerProvider(e.to_string()))?;
 
-    Ok(SdkLoggerProvider::builder()
+    Ok(build_logger_provider(
+        service_name,
+        service_version,
+        exporter,
+    ))
+}
+
+#[derive(Debug)]
+struct EventTimestampProcessor;
+
+impl LogProcessor for EventTimestampProcessor {
+    fn emit(&self, record: &mut SdkLogRecord, _scope: &InstrumentationScope) {
+        // The SDK sets observed time before processors run. Use it only when
+        // the source did not supply an event timestamp.
+        if record.timestamp().is_none()
+            && let Some(observed) = record.observed_timestamp()
+        {
+            record.set_timestamp(observed);
+        }
+    }
+
+    fn force_flush(&self) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn shutdown_with_timeout(&self, _timeout: Duration) -> OTelSdkResult {
+        Ok(())
+    }
+
+    fn event_enabled(&self, _level: Severity, _target: &str, _name: Option<&str>) -> bool {
+        // A transform alone must not enable logging without an exporting processor.
+        false
+    }
+}
+
+fn build_logger_provider(
+    service_name: &str,
+    service_version: &str,
+    exporter: impl LogExporter + 'static,
+) -> SdkLoggerProvider {
+    SdkLoggerProvider::builder()
         .with_resource(resource(service_name, service_version))
+        // Normalize before the batch processor clones the record into its queue.
+        .with_log_processor(EventTimestampProcessor)
         .with_batch_exporter(exporter)
-        .build())
+        .build()
 }
 
 // ─── Boxed layer alias ─────────────────────────────────────────────────────────
@@ -327,4 +373,173 @@ pub fn setup_telemetry(service_name: &str, service_version: &str, use_stderr: bo
     };
 
     try_setup_telemetry(config).expect("Failed to set up telemetry");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use opentelemetry::Context;
+    use opentelemetry::logs::{AnyValue, Logger, LoggerProvider};
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
+    use opentelemetry_sdk::logs::InMemoryLogExporter;
+
+    fn log_record() -> SdkLogRecord {
+        SdkLoggerProvider::builder()
+            .build()
+            .logger("timestamp-test")
+            .create_log_record()
+    }
+
+    #[test]
+    fn fills_missing_event_timestamp_without_changing_other_fields() {
+        let observed = UNIX_EPOCH + Duration::from_secs(123);
+        let mut record = log_record();
+        record.set_observed_timestamp(observed);
+        record.set_body("timestamp check".into());
+        record.set_event_name("timestamp-test");
+        record.set_target("querymt.timestamp_test");
+        record.set_severity_number(Severity::Info);
+        record.set_severity_text("INFO");
+        record.add_attribute("user_id", 42_i64);
+        record.set_trace_context(TraceId::from(1), SpanId::from(2), Some(TraceFlags::SAMPLED));
+        let mut expected = record.clone();
+        expected.set_timestamp(observed);
+
+        EventTimestampProcessor.emit(
+            &mut record,
+            &InstrumentationScope::builder("timestamp-test").build(),
+        );
+
+        assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn preserves_explicit_event_timestamp() {
+        let mut record = log_record();
+        record.set_timestamp(UNIX_EPOCH + Duration::from_secs(123));
+        record.set_observed_timestamp(UNIX_EPOCH + Duration::from_secs(456));
+        let expected = record.clone();
+
+        EventTimestampProcessor.emit(
+            &mut record,
+            &InstrumentationScope::builder("timestamp-test").build(),
+        );
+
+        assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn does_not_invent_timestamp_when_observed_time_is_missing() {
+        let mut record = log_record();
+        let expected = record.clone();
+
+        EventTimestampProcessor.emit(
+            &mut record,
+            &InstrumentationScope::builder("timestamp-test").build(),
+        );
+
+        assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn timestamp_processor_alone_does_not_enable_events() {
+        let provider = SdkLoggerProvider::builder()
+            .with_log_processor(EventTimestampProcessor)
+            .build();
+
+        assert!(!provider.logger("timestamp-test").event_enabled(
+            Severity::Info,
+            "querymt.timestamp_test",
+            Some("timestamp-test"),
+        ));
+        provider.force_flush().unwrap();
+        provider.shutdown().unwrap();
+    }
+
+    #[test]
+    fn normalizes_upstream_bridge_logs_with_simple_exporter() {
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_resource(resource("timestamp-test", "1"))
+            .with_log_processor(EventTimestampProcessor)
+            .with_simple_exporter(exporter.clone())
+            .build();
+
+        assert_bridge_pipeline(provider, exporter);
+    }
+
+    #[test]
+    fn normalizes_upstream_bridge_logs_before_batch_export() {
+        let exporter = InMemoryLogExporter::default();
+        let provider = build_logger_provider("timestamp-test", "1", exporter.clone());
+
+        assert_bridge_pipeline(provider, exporter);
+    }
+
+    fn assert_bridge_pipeline(provider: SdkLoggerProvider, exporter: InMemoryLogExporter) {
+        let trace_id = TraceId::from(1);
+        let span_id = SpanId::from(2);
+        let span_context = SpanContext::new(
+            trace_id,
+            span_id,
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
+        let context = Context::new().with_remote_span_context(span_context);
+        let layer = OpenTelemetryTracingBridge::new(&provider)
+            .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+        let subscriber = Registry::default().with(layer);
+        let before = SystemTime::now();
+        tracing::subscriber::with_default(subscriber, || {
+            let _guard = context.attach();
+            tracing::info!(target: "querymt.timestamp_test", user_id = 42_i64, active = true, "timestamp pipeline");
+        });
+        let after = SystemTime::now();
+
+        provider.force_flush().unwrap();
+        let logs = exporter.get_emitted_logs().unwrap();
+        assert_eq!(logs.len(), 1);
+        let log = &logs[0];
+        let timestamp = log.record.timestamp().expect("event timestamp must be set");
+        assert!((before..=after).contains(&timestamp));
+        assert_eq!(log.record.observed_timestamp(), Some(timestamp));
+        assert_eq!(log.record.severity_number(), Some(Severity::Info));
+        assert_eq!(log.record.severity_text(), Some("INFO"));
+        assert_eq!(
+            log.record.target().map(|target| target.as_ref()),
+            Some("querymt.timestamp_test"),
+        );
+        assert!(log.record.event_name().is_some());
+        assert_eq!(
+            log.record.body(),
+            Some(&AnyValue::String("timestamp pipeline".into())),
+        );
+        let attributes: Vec<_> = log.record.attributes_iter().cloned().collect();
+        assert_eq!(
+            attributes,
+            vec![
+                ("user_id".into(), AnyValue::Int(42)),
+                ("active".into(), AnyValue::Boolean(true)),
+            ],
+        );
+        let trace_context = log.record.trace_context().expect("trace context preserved");
+        assert_eq!(trace_context.trace_id, trace_id);
+        assert_eq!(trace_context.span_id, span_id);
+        assert_eq!(trace_context.trace_flags, Some(TraceFlags::SAMPLED));
+        assert_eq!(log.instrumentation.name(), "");
+        assert_eq!(
+            log.resource.get(&opentelemetry::Key::new("service.name")),
+            Some("timestamp-test".into()),
+        );
+        assert_eq!(
+            log.resource.get(&opentelemetry::Key::new(SERVICE_VERSION)),
+            Some("1".into()),
+        );
+        provider.shutdown().unwrap();
+    }
 }
