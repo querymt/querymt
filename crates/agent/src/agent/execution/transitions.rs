@@ -165,11 +165,18 @@ pub(super) async fn transition_before_llm_call(
         );
     }
     messages = hook_result.messages.unwrap_or_default();
-    if hook_result.estimated_tokens > context_window as usize {
+    // Tool definitions are model input; reuse the serialization already used for their hash.
+    let tool_tokens = if tools.is_empty() {
+        0
+    } else {
+        tools_json.len().div_ceil(4)
+    };
+    let estimated_tokens = hook_result.estimated_tokens.saturating_add(tool_tokens);
+    if estimated_tokens > context_window as usize {
         return Ok(ExecutionState::Stopped {
             message: format!(
                 "Prepared request is approximately {} tokens, exceeding the {} token context window",
-                hook_result.estimated_tokens, context_window
+                estimated_tokens, context_window
             )
             .into(),
             stop_type: StopType::ContextThreshold,
@@ -182,7 +189,7 @@ pub(super) async fn transition_before_llm_call(
         request: Arc::new(PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
             tools: Arc::from(tools.into_boxed_slice()),
-            estimated_tokens: hook_result.estimated_tokens,
+            estimated_tokens,
         }),
     })
 }

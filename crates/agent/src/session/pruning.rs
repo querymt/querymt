@@ -5,8 +5,16 @@
 
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::store::LLMConfig;
-use querymt::chat::{ChatRole, MediaKind, MediaPart, MediaSource, ToolResultPart};
+use base64::Engine as _;
+use querymt::chat::{
+    ChatInputPart, ChatMessage, ChatMessagePart, ChatOutputItem, ChatRole, MediaKind, MediaPart,
+    MediaSource, ToolResultPart,
+};
 use tracing::instrument;
+
+// Payload-independent reserves, not exact model-specific vision token counts.
+const IMAGE_TOKENS_ESTIMATE: usize = 2_048;
+const ORIGINAL_IMAGE_TOKENS_ESTIMATE: usize = 10_000;
 
 // TODO: Move image metadata extraction into a shared utility if more subsystems need it.
 fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
@@ -269,7 +277,9 @@ pub trait ContentCostEstimator: Send + Sync {
     }
 
     fn estimate_content(&self, content: &[ToolResultPart]) -> usize {
-        content.iter().map(|part| self.estimate_part(part)).sum()
+        content.iter().fold(0usize, |total, part| {
+            total.saturating_add(self.estimate_part(part))
+        })
     }
 
     fn estimate_part(&self, part: &ToolResultPart) -> usize {
@@ -280,19 +290,35 @@ pub trait ContentCostEstimator: Send + Sync {
     }
 
     fn estimate_media(&self, media: &MediaPart) -> usize {
-        let mut total = 0;
-        if let Some(filename) = &media.filename {
-            total += self.estimate_text(filename);
+        let filename_tokens = media
+            .filename
+            .as_deref()
+            .map_or(0, |filename| self.estimate_text(filename));
+        if media.kind == MediaKind::Image && media.detail.as_deref() == Some("original") {
+            return filename_tokens.saturating_add(ORIGINAL_IMAGE_TOKENS_ESTIMATE);
         }
-        if let Some(detail) = &media.detail {
-            total += self.estimate_text(detail);
-        }
-        match media.source() {
-            MediaSource::Inline { data } => total + self.estimate_media_bytes(media, data),
-            MediaSource::DataUrl { url } => total + self.estimate_text(url),
-            MediaSource::Url { url } => total + self.estimate_text(url),
-            MediaSource::ProviderFile { file_id, .. } => total + self.estimate_text(file_id),
-        }
+        let tokens = match media.source() {
+            MediaSource::Inline { data } => self.estimate_media_bytes(media, data),
+            MediaSource::DataUrl { url } if media.kind == MediaKind::Image => {
+                let data = url
+                    .split_once(',')
+                    .filter(|(header, _)| header.ends_with(";base64"))
+                    .and_then(|(_, payload)| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(payload)
+                            .ok()
+                    });
+                self.estimate_media_bytes(media, data.as_deref().unwrap_or_default())
+            }
+            MediaSource::Url { .. } | MediaSource::ProviderFile { .. }
+                if media.kind == MediaKind::Image =>
+            {
+                IMAGE_TOKENS_ESTIMATE
+            }
+            MediaSource::DataUrl { url } | MediaSource::Url { url } => self.estimate_text(url),
+            MediaSource::ProviderFile { file_id, .. } => self.estimate_text(file_id),
+        };
+        filename_tokens.saturating_add(tokens)
     }
 
     fn estimate_media_bytes(&self, media: &MediaPart, data: &[u8]) -> usize {
@@ -322,7 +348,7 @@ pub struct GenericContentCostEstimator;
 
 impl TokenEstimator for GenericContentCostEstimator {
     fn estimate(&self, text: &str) -> usize {
-        text.len().saturating_div(4)
+        text.len().div_ceil(4)
     }
 }
 
@@ -331,9 +357,69 @@ impl ContentCostEstimator for GenericContentCostEstimator {
         self.estimate(text)
     }
 
-    fn estimate_image(&self, _mime_type: &str, data: &[u8]) -> usize {
-        data.len().saturating_div(4)
+    fn estimate_image(&self, _mime_type: &str, _data: &[u8]) -> usize {
+        IMAGE_TOKENS_ESTIMATE
     }
+}
+
+/// Approximate prepared-message cost without counting binary transport or output metadata.
+// TODO: Prefer provider/model-specific estimation, including token-counting APIs when supported.
+// This local heuristic (especially image reserves) is neither an exact count nor an upper bound;
+// retain it as a fallback for providers without a counting API.
+pub(crate) fn estimate_chat_tokens(messages: &[ChatMessage]) -> usize {
+    let estimator = GenericContentCostEstimator;
+    messages.iter().fold(0usize, |total, message| {
+        let content_tokens = match message.output() {
+            Some(output) => output.items.iter().fold(0usize, |total, item| {
+                let tokens = match item {
+                    ChatOutputItem::Message(message) => {
+                        message.parts.iter().fold(0usize, |total, part| {
+                            let tokens = match part {
+                                ChatMessagePart::Text { text, .. } => estimator.estimate_text(text),
+                                ChatMessagePart::Refusal { refusal, .. } => {
+                                    estimator.estimate_text(refusal)
+                                }
+                                ChatMessagePart::Media(media) => estimator.estimate_media(media),
+                                ChatMessagePart::Opaque(_) => 0,
+                            };
+                            total.saturating_add(tokens)
+                        })
+                    }
+                    ChatOutputItem::Reasoning(reasoning) => reasoning
+                        .summary
+                        .iter()
+                        .chain(&reasoning.content)
+                        .fold(0usize, |total, part| {
+                            total.saturating_add(estimator.estimate_text(&part.text))
+                        }),
+                    ChatOutputItem::FunctionCall(call) => estimator
+                        .estimate_text(&call.name)
+                        .saturating_add(estimator.estimate_text(&call.arguments)),
+                    ChatOutputItem::Opaque(_) => 0,
+                };
+                total.saturating_add(tokens)
+            }),
+            None => message.input().map_or(0, |parts| {
+                parts.iter().fold(0usize, |total, part| {
+                    let tokens = match part {
+                        ChatInputPart::Text { text } => estimator.estimate_text(text),
+                        ChatInputPart::Attachment(media) => estimator.estimate_media(media),
+                        ChatInputPart::ToolResult(result) => {
+                            estimator.estimate_content(&result.parts).saturating_add(
+                                result
+                                    .name
+                                    .as_deref()
+                                    .map_or(0, |name| estimator.estimate_text(name)),
+                            )
+                        }
+                    };
+                    total.saturating_add(tokens)
+                })
+            }),
+        };
+        // Small allowance for roles, boundaries and tool-result framing.
+        total.saturating_add(content_tokens).saturating_add(4)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -343,7 +429,7 @@ pub struct OpenAIContentCostEstimator {
 
 impl TokenEstimator for OpenAIContentCostEstimator {
     fn estimate(&self, text: &str) -> usize {
-        text.len().saturating_div(4)
+        GenericContentCostEstimator.estimate(text)
     }
 }
 
@@ -365,16 +451,12 @@ impl ContentCostEstimator for OpenAIContentCostEstimator {
         )
     )]
     fn estimate_image(&self, _mime_type: &str, data: &[u8]) -> usize {
-        let estimated_tokens = if let Some((width, height)) = image_dimensions(data) {
-            tracing::Span::current().record("dimensions_found", true);
-            tracing::Span::current().record("used_fallback", false);
-            estimate_openai_image_tokens(&self.model, width, height)
-                .unwrap_or_else(|| data.len().saturating_div(8).max(256))
-        } else {
-            tracing::Span::current().record("dimensions_found", false);
-            tracing::Span::current().record("used_fallback", true);
-            data.len().saturating_div(8).max(256)
-        };
+        let dimensions = image_dimensions(data);
+        let model_estimate = dimensions
+            .and_then(|(width, height)| estimate_openai_image_tokens(&self.model, width, height));
+        tracing::Span::current().record("dimensions_found", dimensions.is_some());
+        tracing::Span::current().record("used_fallback", model_estimate.is_none());
+        let estimated_tokens = model_estimate.unwrap_or(IMAGE_TOKENS_ESTIMATE);
 
         tracing::Span::current().record("estimated_tokens", estimated_tokens);
         estimated_tokens
@@ -685,6 +767,8 @@ mod tests {
         let estimator = GenericContentCostEstimator;
         assert_eq!(estimator.estimate(""), 0);
         assert_eq!(estimator.estimate("test"), 1);
+        assert_eq!(estimator.estimate("x"), 1);
+        assert_eq!(estimator.estimate("12345"), 2);
         assert_eq!(estimator.estimate("12345678"), 2);
         assert_eq!(estimator.estimate(&"a".repeat(100)), 25);
     }
@@ -701,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_content_tokens_counts_binary_payloads() {
+    fn test_estimate_content_tokens_reserves_image_cost() {
         let estimator = GenericContentCostEstimator;
         let content = vec![
             inline_image_part("image/png", vec![0u8; 400]),
@@ -711,7 +795,7 @@ mod tests {
 
         let tokens = estimate_content_tokens(&content, &estimator);
 
-        assert_eq!(tokens, 100 + 200 + 1);
+        assert_eq!(tokens, IMAGE_TOKENS_ESTIMATE + 200 + 1);
     }
 
     /// Build a validated inline image result part for tests.
@@ -745,6 +829,72 @@ mod tests {
         png.extend_from_slice(&height.to_be_bytes());
         png.extend_from_slice(&[0x08, 0x02, 0x00, 0x00, 0x00]);
         png
+    }
+
+    #[test]
+    fn test_generic_image_cost_is_independent_of_payload_size() {
+        let estimator = GenericContentCostEstimator;
+        for bytes in [vec![0; 400], vec![255; 1_581_941]] {
+            assert_eq!(
+                estimator.estimate_image("image/png", &bytes),
+                IMAGE_TOKENS_ESTIMATE
+            );
+        }
+    }
+
+    #[test]
+    fn test_image_data_urls_match_inline_pruning_estimates() {
+        use base64::Engine as _;
+
+        for model in ["gpt-4.1", "gpt-6.1-sol"] {
+            let estimator = OpenAIContentCostEstimator {
+                model: model.into(),
+            };
+            let mut png = png_header(1024, 1024);
+            let expected = estimator.estimate_image("image/png", &png);
+            png.extend_from_slice(&vec![255; 100_000]);
+            let inline = MediaPart::new(
+                MediaKind::Image,
+                Some("image/png".parse().unwrap()),
+                MediaSource::Inline { data: png.clone() },
+            )
+            .unwrap();
+            let data_url = MediaPart::new(
+                MediaKind::Image,
+                None,
+                MediaSource::DataUrl {
+                    url: format!(
+                        "data:image/png;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(&png)
+                    ),
+                },
+            )
+            .unwrap();
+            assert_eq!(estimator.estimate_media(&inline), expected);
+            assert_eq!(estimator.estimate_media(&data_url), expected);
+            for media in [inline, data_url] {
+                assert_eq!(
+                    estimator.estimate_media(&media.with_detail("original")),
+                    ORIGINAL_IMAGE_TOKENS_ESTIMATE
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_malformed_image_payload_uses_a_reserve_not_its_encoded_length() {
+        let media = MediaPart::new(
+            MediaKind::Image,
+            None,
+            MediaSource::DataUrl {
+                url: format!("data:image/png;base64,{}", "!".repeat(100_000)),
+            },
+        )
+        .unwrap();
+        let estimator = OpenAIContentCostEstimator {
+            model: "gpt-4.1".into(),
+        };
+        assert_eq!(estimator.estimate_media(&media), IMAGE_TOKENS_ESTIMATE);
     }
 
     #[test]
@@ -854,7 +1004,7 @@ mod tests {
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
-        assert_eq!(tokens, 256);
+        assert_eq!(tokens, IMAGE_TOKENS_ESTIMATE);
     }
 
     #[test]
@@ -876,7 +1026,7 @@ mod tests {
 
         let tokens = estimate_content_tokens(&content, estimator.as_ref());
 
-        assert_eq!(tokens, 100);
+        assert_eq!(tokens, IMAGE_TOKENS_ESTIMATE);
     }
 
     #[test]

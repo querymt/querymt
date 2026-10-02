@@ -16,6 +16,7 @@ use crate::hooks::schema::{
     SessionEndCommandOutputWire, SessionStartCommandInput, StopCommandInput,
     StructuredToolResultWire, UserPromptSubmitCommandInput,
 };
+use crate::session::pruning::estimate_chat_tokens;
 use log::warn;
 use serde::Serialize;
 use serde_json::Value;
@@ -1900,21 +1901,6 @@ fn preserves_tool_identities(
     identities(candidate).is_subset(&identities(current))
 }
 
-fn estimate_chat_tokens(messages: &[querymt::chat::ChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(|message| match message.output() {
-            Some(output) => serde_json::to_vec(output).map_or(0, |bytes| bytes.len() / 4),
-            None => message.input().map_or(0, |parts| {
-                parts
-                    .iter()
-                    .map(|part| serde_json::to_vec(part).map_or(0, |bytes| bytes.len() / 4))
-                    .sum()
-            }),
-        })
-        .sum()
-}
-
 fn flatten_content(content: &[querymt::chat::ToolResultPart]) -> String {
     content
         .iter()
@@ -1941,8 +1927,11 @@ fn record_hook_output(span: &tracing::Span, output: &CommandOutput, duration: Du
 
 #[cfg(test)]
 mod token_estimate_tests {
-    use super::estimate_chat_tokens;
-    use querymt::chat::{ChatMessage, ChatOutput, FinishReason};
+    use super::{ContextHookRequest, Hooks, HooksConfig, estimate_chat_tokens};
+    use querymt::chat::{
+        ChatInputPart, ChatMessage, ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem,
+        FinishReason, MediaKind, MediaPart, MediaSource, ToolResult,
+    };
 
     #[test]
     fn structured_output_is_estimated_once() {
@@ -1953,8 +1942,8 @@ mod token_estimate_tests {
             None,
             Some(FinishReason::Stop),
         );
-        let message = ChatMessage::from_assistant_output(output.clone());
-        let expected = serde_json::to_vec(&output).unwrap().len() / 4;
+        let message = ChatMessage::from_assistant_output(output);
+        let expected = "a sufficiently long assistant response".len().div_ceil(4) + 4;
 
         assert_eq!(estimate_chat_tokens(&[message]), expected);
     }
@@ -1964,13 +1953,160 @@ mod token_estimate_tests {
         let message = ChatMessage::user()
             .text("a sufficiently long user prompt")
             .build();
-        let expected: usize = message
-            .input()
-            .unwrap()
-            .iter()
-            .map(|part| serde_json::to_vec(part).unwrap().len() / 4)
-            .sum();
+        let expected = "a sufficiently long user prompt".len().div_ceil(4) + 4;
 
         assert_eq!(estimate_chat_tokens(&[message]), expected);
+    }
+
+    fn image(source: MediaSource) -> MediaPart {
+        MediaPart::new(MediaKind::Image, Some("image/png".parse().unwrap()), source).unwrap()
+    }
+
+    #[test]
+    fn image_estimates_do_not_depend_on_payload_size_or_representation() {
+        let sources = [
+            MediaSource::Inline { data: vec![0; 400] },
+            MediaSource::Inline {
+                data: vec![255; 1_581_941],
+            },
+            MediaSource::DataUrl {
+                url: format!("data:image/png;base64,{}", "AAAA".repeat(100_000)),
+            },
+            MediaSource::Url {
+                url: "https://example.com/preview.png".into(),
+            },
+            MediaSource::ProviderFile {
+                file_id: "file-image".into(),
+                origin: querymt::chat::ChatOutputProvenance {
+                    provider: "openai".into(),
+                    model: "vision".into(),
+                    protocol: "responses".into(),
+                    endpoint: "https://api.openai.com/v1".into(),
+                },
+            },
+        ];
+        for source in sources {
+            let media = image(source);
+            for (media, expected) in [
+                (media.clone(), 2_048),
+                (media.with_detail("original"), 10_000),
+            ] {
+                let message = ChatMessage::from_user_parts(vec![ChatInputPart::attachment(media)]);
+                assert_eq!(estimate_chat_tokens(&[message]), expected + 4);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_result_and_generated_images_are_counted_once() {
+        let media = image(MediaSource::Inline {
+            data: vec![255; 1_581_941],
+        });
+        let tool_result = ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(
+            ToolResult::new("call-read")
+                .with_text("preview")
+                .with_attachment(media.clone()),
+        )]);
+        assert_eq!(estimate_chat_tokens(&[tool_result]), 2_048 + 2 + 4);
+
+        let output = ChatOutput {
+            items: vec![ChatOutputItem::Message(ChatMessageItem {
+                id: None,
+                role: querymt::chat::ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![
+                    ChatMessagePart::Media(Box::new(media.clone())),
+                    ChatMessagePart::Media(Box::new(media)),
+                ],
+                extensions: Default::default(),
+            })],
+            ..ChatOutput::default()
+        };
+        assert_eq!(
+            estimate_chat_tokens(&[ChatMessage::from_assistant_output(output)]),
+            2 * 2_048 + 4
+        );
+    }
+
+    #[test]
+    fn output_estimate_counts_visible_content_not_transport_metadata() {
+        let mut output = ChatOutput::from_projections(
+            Some("thinking".into()),
+            Some("text".into()),
+            Some(vec![querymt::ToolCall {
+                id: "call".into(),
+                call_type: "function".into(),
+                function: querymt::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            None,
+            Some(FinishReason::Stop),
+        );
+        let expected = 2 + 1 + 1 + 1 + 4;
+        assert_eq!(
+            estimate_chat_tokens(&[ChatMessage::from_assistant_output(output.clone())]),
+            expected
+        );
+        output.extensions.insert(
+            "raw_response".into(),
+            serde_json::json!("x".repeat(100_000)),
+        );
+        output.response_id = Some("x".repeat(100_000));
+        for item in &mut output.items {
+            if let ChatOutputItem::Reasoning(reasoning) = item {
+                reasoning.encrypted_content = Some("x".repeat(100_000));
+            }
+        }
+        assert_eq!(
+            estimate_chat_tokens(&[ChatMessage::from_assistant_output(output)]),
+            expected
+        );
+    }
+
+    #[test]
+    fn large_text_still_exceeds_a_context_window() {
+        assert!(
+            estimate_chat_tokens(&[ChatMessage::user().text("x".repeat(400_004)).build()])
+                > 100_000
+        );
+        assert_eq!(estimate_chat_tokens(&[]), 0);
+        assert_eq!(
+            estimate_chat_tokens(&[ChatMessage::user().text("x").build()]),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_and_disabled_context_hooks_use_semantic_estimates() {
+        for enabled in [false, true] {
+            let hooks = Hooks::new(HooksConfig {
+                enabled,
+                ..HooksConfig::default()
+            })
+            .unwrap();
+            let result = hooks
+                .run_context(ContextHookRequest {
+                    session_id: "image-budget".into(),
+                    mcp_tool_state: None,
+                    turn_id: String::new(),
+                    cwd: None,
+                    model: "gpt-6.1-sol".into(),
+                    permission_mode: "default".into(),
+                    trigger: "after_tool_batch".into(),
+                    context_window: 1_050_000,
+                    messages: vec![ChatMessage::from_user_parts(vec![
+                        ChatInputPart::attachment(image(MediaSource::Inline {
+                            data: vec![255; 1_581_941],
+                        })),
+                    ])],
+                })
+                .await
+                .unwrap();
+            assert_eq!(result.estimated_tokens, 2_048 + 4);
+            assert_eq!(result.messages.unwrap().len(), 1);
+        }
     }
 }
