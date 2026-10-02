@@ -258,6 +258,13 @@ pub(super) async fn run_ai_compaction(
         }
     };
 
+    // A hook-provided summary must be usable on its own, not rescued by post-hook notes.
+    SessionCompaction::validate_summary(&result.summary).map_err(|error| {
+        let error = anyhow::Error::from(error);
+        emit_compaction_failure(config, session_id, &compaction_id, &error);
+        error
+    })?;
+
     let post_hook = match config
         .hooks
         .run_post_compaction(PostCompactionRequest {
@@ -306,6 +313,13 @@ pub(super) async fn run_ai_compaction(
         );
     }
 
+    // Final validation must precede both writes: a blank boundary would hide the original history.
+    SessionCompaction::validate_summary(&result.summary).map_err(|error| {
+        let error = anyhow::Error::from(error);
+        emit_compaction_failure(config, session_id, &compaction_id, &error);
+        error
+    })?;
+
     info!(
         "Compaction generated summary: {} tokens -> {} tokens",
         result.original_token_count, result.summary_token_count
@@ -342,17 +356,14 @@ pub(super) async fn run_ai_compaction(
         .compaction
         .estimate_messages_tokens(&filtered_messages, prompt_limit);
 
-    // One text summary chunk after the start and before the terminal update.
-    // Hidden (empty) summaries skip the chunk; the lifecycle is still reported.
-    if !result.summary.trim().is_empty() {
-        config.emit_event(
-            session_id,
-            AgentEventKind::CompactionSummaryChunk {
-                compaction_id: compaction_id.clone(),
-                content: result.summary.clone(),
-            },
-        );
-    }
+    // One validated text summary chunk after the start and before the terminal update.
+    config.emit_event(
+        session_id,
+        AgentEventKind::CompactionSummaryChunk {
+            compaction_id: compaction_id.clone(),
+            content: result.summary.clone(),
+        },
+    );
 
     config.emit_event(
         session_id,
@@ -408,4 +419,339 @@ pub(super) async fn run_ai_compaction(
     Ok(ExecutionState::BeforeLlmCall {
         context: new_context,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::agent::core::{McpToolState, SessionRuntime, ToolConfig};
+    use crate::hooks::{
+        HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig,
+    };
+    use crate::middleware::{AgentStats, ConversationContext};
+    use crate::model::AgentMessage;
+    use crate::session::RuntimeContext;
+    use crate::session::sqlite_storage::SqliteStorage;
+    use crate::session::store::SessionExecutionConfig;
+    use crate::test_utils::helpers::mock_plugin_registry;
+    use crate::test_utils::mocks::{MockLlmProvider, SharedLlmProvider, TestProviderFactory};
+    use querymt::LLMParams;
+    use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason};
+
+    fn hook_group(output: serde_json::Value) -> Vec<MatcherGroupConfig> {
+        vec![MatcherGroupConfig {
+            matcher: None,
+            hooks: vec![HookHandlerConfig::Command(HookCommandConfig {
+                command: format!("printf '%s' '{}'", output),
+                timeout_sec: Some(5),
+                ..HookCommandConfig::default()
+            })],
+        }]
+    }
+
+    fn custom_summary_hooks(summary: &str, post_context: Option<&str>) -> Hooks {
+        Hooks::new(HooksConfig {
+            enabled: true,
+            pre_compaction: hook_group(serde_json::json!({"hook_specific_output": {
+                "hook_event_name": "pre_compaction", "compaction": {"summary": summary}
+            }})),
+            post_compaction: post_context.map_or_else(Vec::new, |context| hook_group(serde_json::json!({
+                "hook_specific_output": {"hook_event_name": "post_compaction", "additional_context": context}
+            }))),
+            ..HooksConfig::default()
+        }).unwrap()
+    }
+
+    async fn fixture(
+        hooks: Hooks,
+        output: Option<ChatOutput>,
+    ) -> (
+        AgentConfig,
+        ExecutionContext,
+        ExecutionState,
+        tempfile::TempDir,
+    ) {
+        let mut mock = MockLlmProvider::new();
+        if let Some(output) = output {
+            // The configured single retry may call the provider at most twice.
+            mock.expect_chat()
+                .times(1..=2)
+                .returning(move |_| Ok(output.clone()));
+        } else {
+            mock.expect_chat().times(0);
+        }
+        let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
+            mock,
+            vec![],
+        )));
+        let (registry, tempdir) = mock_plugin_registry(factory).unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let mut config = AgentConfigBuilder::new(
+            Arc::new(registry),
+            storage,
+            LLMParams::new().provider("mock").model("mock"),
+        )
+        .with_hooks(hooks)
+        .build();
+        config.execution_policy.compaction.retry.max_retries = 1;
+        config.execution_policy.compaction.retry.initial_backoff_ms = 0;
+        let session_handle = config
+            .provider
+            .create_session(None, None, &SessionExecutionConfig::default())
+            .await
+            .unwrap();
+        let session_id = session_handle.session().public_id.clone();
+        let mut original = AgentMessage::new(session_id.clone(), ChatRole::User);
+        original.parts.push(MessagePart::Text {
+            content: "Keep the implemented shader and verified test results.".into(),
+        });
+        session_handle.add_message(original).await.unwrap();
+        let runtime_context =
+            RuntimeContext::new(config.provider.history_store(), session_id.clone())
+                .await
+                .unwrap();
+        let runtime = SessionRuntime::new(None, Default::default(), McpToolState::empty());
+        let exec_ctx = ExecutionContext::new(
+            session_id.clone(),
+            runtime,
+            runtime_context,
+            session_handle,
+            ToolConfig::default(),
+        )
+        .with_turn_id("run-compaction");
+        let state = ExecutionState::Stopped {
+            message: "context threshold".into(),
+            stop_type: StopType::ContextThreshold,
+            context: Some(Arc::new(ConversationContext::new(
+                session_id.into(),
+                Arc::from([ChatMessage::user().text("Continue the task").build()]),
+                Arc::new(AgentStats {
+                    context_tokens: 100_000,
+                    ..AgentStats::default()
+                }),
+                "mock".into(),
+                "mock".into(),
+            ))),
+        };
+        (config, exec_ctx, state, tempdir)
+    }
+
+    async fn assert_failed_compaction_preserves_history(
+        hooks: Hooks,
+        output: Option<ChatOutput>,
+        expected_error: &str,
+    ) {
+        let (config, exec_ctx, state, _tempdir) = fixture(hooks, output).await;
+        let before = config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        let mut events = config.subscribe_events();
+        let error = run_ai_compaction(&config, &exec_ctx, &state)
+            .await
+            .expect_err("compaction must fail");
+        assert!(error.to_string().contains(expected_error), "{error:#}");
+        let after = config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&before).unwrap(),
+            serde_json::to_value(&after).unwrap()
+        );
+        let effective = exec_ctx
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&effective).unwrap(),
+            serde_json::to_value(&before).unwrap()
+        );
+        assert_eq!(state.context().unwrap().stats.context_tokens, 100_000);
+
+        let mut start_id = None;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.kind() {
+                AgentEventKind::CompactionStart { compaction_id, .. } => {
+                    start_id = compaction_id.clone()
+                }
+                AgentEventKind::CompactionFailed {
+                    compaction_id,
+                    reason,
+                    cancelled,
+                } => {
+                    assert_eq!(Some(compaction_id), start_id.as_ref());
+                    assert!(reason.contains(expected_error));
+                    assert!(!cancelled);
+                    break;
+                }
+                AgentEventKind::CompactionEnd { .. }
+                | AgentEventKind::CompactionSummaryChunk { .. } => {
+                    panic!("failed compaction emitted success")
+                }
+                _ => {}
+            }
+        }
+        assert!(!crate::session::compaction::has_compaction(&after));
+    }
+
+    #[tokio::test]
+    async fn blank_provider_summary_emits_failure_without_writing_a_boundary() {
+        for summary in ["", " \n\t "] {
+            let output = ChatOutput::from_projections(
+                None,
+                Some(summary.into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            assert_failed_compaction_preserves_history(
+                Hooks::disabled(),
+                Some(output),
+                "empty summary",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_custom_summary_fails_without_provider_fallback_or_post_hook_rescue() {
+        for summary in ["", " \n\t "] {
+            assert_failed_compaction_preserves_history(
+                custom_summary_hooks(
+                    summary,
+                    Some("Do not use these notes as a replacement summary"),
+                ),
+                None,
+                "empty summary",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_provider_summary_emits_failure_and_preserves_history() {
+        let output = ChatOutput::from_projections(
+            None,
+            Some("partial summary".into()),
+            None,
+            None,
+            Some(FinishReason::Length),
+        );
+        assert_failed_compaction_preserves_history(
+            Hooks::disabled(),
+            Some(output),
+            "did not complete successfully",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_failure_stops_the_run_without_reentering_inference() {
+        let output = ChatOutput::from_projections(
+            None,
+            Some(" \n ".into()),
+            None,
+            None,
+            Some(FinishReason::Stop),
+        );
+        let (mut config, mut exec_ctx, _state, _tempdir) =
+            fixture(Hooks::disabled(), Some(output)).await;
+        config.execution_policy.compaction.auto = true;
+        config.middleware_drivers = vec![Arc::new(crate::middleware::ContextMiddleware::new(
+            // Force compaction before the first model request, even at initial zero usage.
+            crate::middleware::ContextConfig {
+                compact_at_percent: 0,
+                ..crate::middleware::ContextConfig::with_manual_limit(100)
+            },
+        ))];
+        let before = config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            super::super::execute_cycle_state_machine(
+                &config,
+                &mut exec_ctx,
+                None,
+                crate::agent::core::AgentMode::Build,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(outcome, super::super::CycleOutcome::Stopped(_)));
+        let after = config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_custom_summary_is_stored_and_emitted_as_success() {
+        let (config, exec_ctx, state, _tempdir) = fixture(
+            custom_summary_hooks("Valid continuation summary", Some("Keep the tests passing")),
+            None,
+        )
+        .await;
+        let mut events = config.subscribe_events();
+        let result = run_ai_compaction(&config, &exec_ctx, &state).await.unwrap();
+        let expected = "Valid continuation summary\n\nKeep the tests passing";
+        let effective = exec_ctx
+            .session_handle
+            .get_effective_agent_history()
+            .await
+            .unwrap();
+        assert_eq!(effective.len(), 2);
+        assert!(
+            matches!(&effective[1].parts[0], MessagePart::Compaction { summary, .. } if summary == expected)
+        );
+        assert!(result.context().unwrap().stats.context_tokens > 0);
+        let mut saw_summary = false;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.kind() {
+                AgentEventKind::CompactionSummaryChunk { content, .. } => {
+                    assert_eq!(content, expected);
+                    saw_summary = true;
+                }
+                AgentEventKind::CompactionEnd {
+                    summary,
+                    context_tokens,
+                    ..
+                } => {
+                    assert_eq!(summary, expected);
+                    assert!(context_tokens.unwrap() > 0);
+                    assert!(saw_summary);
+                    break;
+                }
+                AgentEventKind::CompactionFailed { reason, .. } => {
+                    panic!("valid summary failed: {reason}")
+                }
+                _ => {}
+            }
+        }
+    }
 }

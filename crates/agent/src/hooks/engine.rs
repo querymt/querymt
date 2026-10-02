@@ -1151,14 +1151,9 @@ impl Hooks {
                         result.additional_contexts.push(context);
                     }
                     if let Some(summary) = parsed.summary {
-                        if summary.trim().is_empty() {
-                            result.notices.push(control_notice(
-                                HookEventConfig::PreCompaction,
-                                "Ignoring blank hook-provided compaction summary".to_string(),
-                            ));
-                        } else {
-                            result.custom_summary = Some(summary);
-                        }
+                        // Preserve explicit blank overrides so compaction fails validation instead
+                        // of silently falling back to a provider or retaining an earlier summary.
+                        result.custom_summary = Some(summary);
                     }
                     if matches!(parsed.decision, Some(ParsedDecision::Block)) {
                         result.should_block = true;
