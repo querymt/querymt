@@ -8,7 +8,8 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
 use futures_util::StreamExt;
-use querymt::chat::{ChatRole, StreamChunk};
+use querymt::chat::{ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator, FinishReason};
+use querymt::error::LLMError;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -179,11 +180,9 @@ impl SessionCompaction {
             let result = if provider.supports_streaming() {
                 Self::call_streaming(messages, &provider).await
             } else {
-                provider
-                    .chat(messages)
-                    .await
-                    .map(|r| r.text().unwrap_or_default())
-            };
+                provider.chat(messages).await
+            }
+            .and_then(Self::summary_from_output);
 
             match result {
                 Ok(text) => return Ok(text),
@@ -218,22 +217,68 @@ impl SessionCompaction {
         ))
     }
 
-    /// Streaming compaction call — collects text chunks into a single string.
+    /// Collect legacy or structured output, requiring a successful stream completion.
     async fn call_streaming(
         messages: &[querymt::chat::ChatMessage],
         provider: &Arc<dyn querymt::chat::ChatProvider>,
-    ) -> std::result::Result<String, querymt::error::LLMError> {
+    ) -> std::result::Result<ChatOutput, LLMError> {
         let mut stream = provider.chat_stream(messages).await?;
-        let mut text = String::new();
+        let mut accumulator = ChatStreamAccumulator::new();
+        let mut terminal_seen = false;
         while let Some(chunk) = stream.next().await {
-            match chunk? {
-                StreamChunk::Text(delta) => text.push_str(&delta),
-                // Canonical structured terminals also end the stream.
-                chunk if querymt::chat::chunk_is_terminal(&chunk) => break,
-                _ => {} // ignore Thinking, ToolUseStart, etc. for compaction
+            let chunk = chunk?;
+            accumulator.push(&chunk).map_err(|error| {
+                LLMError::GenericError(format!("Invalid compaction stream: {error}"))
+            })?;
+            if querymt::chat::chunk_is_terminal(&chunk) {
+                terminal_seen = true;
+                break;
             }
         }
-        Ok(text)
+        if !terminal_seen {
+            return Err(LLMError::GenericError(
+                "Compaction stream ended without a terminal event".into(),
+            ));
+        }
+        accumulator
+            .finish_success()
+            .map_err(|error| LLMError::GenericError(format!("Invalid compaction stream: {error}")))
+    }
+
+    /// Partial output and tool calls cannot replace a conversation with a usable summary.
+    fn summary_from_output(output: ChatOutput) -> std::result::Result<String, LLMError> {
+        if output
+            .status
+            .is_some_and(|status| status != ChatOutputStatus::Completed)
+            || matches!(
+                output.finish_reason,
+                Some(
+                    FinishReason::Length
+                        | FinishReason::ContentFilter
+                        | FinishReason::Error
+                        | FinishReason::ToolCalls
+                )
+            )
+            || output.tool_calls().is_some_and(|calls| !calls.is_empty())
+        {
+            return Err(LLMError::GenericError(format!(
+                "Compaction response did not complete successfully (status={:?}, finish_reason={:?})",
+                output.status, output.finish_reason
+            )));
+        }
+        let summary = output.text().unwrap_or_default();
+        Self::validate_summary(&summary)?;
+        Ok(summary)
+    }
+
+    /// Validate provider and hook summaries before they can create a history boundary.
+    pub(crate) fn validate_summary(summary: &str) -> std::result::Result<(), LLMError> {
+        if summary.trim().is_empty() {
+            return Err(LLMError::GenericError(
+                "Compaction produced an empty summary".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Estimate token count for a list of messages
@@ -455,7 +500,443 @@ pub fn get_last_compaction(messages: &[AgentMessage]) -> Option<&MessagePart> {
 mod tests {
     use super::*;
     use crate::test_utils::mocks::MockCompactionProvider;
+    use querymt::chat::{
+        ChatMessage, ChatMessageItem, ChatMessagePart, ChatMessagePartDelta, ChatOutputItem,
+        StreamChunk, StructuredStreamEvent, Tool,
+    };
     use querymt::error::LLMError;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    enum Attempt {
+        Output(Box<ChatOutput>),
+        Stream(Vec<std::result::Result<StreamChunk, LLMError>>),
+    }
+
+    impl Attempt {
+        fn output(output: ChatOutput) -> Self {
+            Self::Output(Box::new(output))
+        }
+    }
+
+    struct ScriptedProvider {
+        streaming: bool,
+        attempts: tokio::sync::Mutex<VecDeque<Attempt>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedProvider {
+        fn new(streaming: bool, attempts: Vec<Attempt>) -> Arc<Self> {
+            Arc::new(Self {
+                streaming,
+                attempts: tokio::sync::Mutex::new(attempts.into()),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        async fn next(&self) -> Attempt {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.attempts
+                .lock()
+                .await
+                .pop_front()
+                .expect("unexpected provider retry")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl querymt::chat::ChatProvider for ScriptedProvider {
+        fn supports_streaming(&self) -> bool {
+            self.streaming
+        }
+
+        async fn chat_with_tools(
+            &self,
+            _: &[ChatMessage],
+            _: Option<&[Tool]>,
+        ) -> std::result::Result<ChatOutput, LLMError> {
+            let Attempt::Output(output) = self.next().await else {
+                panic!("expected non-streaming call")
+            };
+            Ok(*output)
+        }
+
+        async fn chat_stream_with_tools(
+            &self,
+            _: &[ChatMessage],
+            _: Option<&[Tool]>,
+        ) -> std::result::Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures_util::Stream<Item = std::result::Result<StreamChunk, LLMError>>
+                        + Send,
+                >,
+            >,
+            LLMError,
+        > {
+            let Attempt::Stream(chunks) = self.next().await else {
+                panic!("expected streaming call")
+            };
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+
+    fn retry_config(max_retries: usize) -> RetryConfig {
+        RetryConfig {
+            max_retries,
+            initial_backoff_ms: 0,
+            backoff_multiplier: 1.0,
+        }
+    }
+
+    fn message_item(text: &str) -> ChatOutputItem {
+        ChatOutputItem::Message(ChatMessageItem {
+            id: Some("msg-summary".into()),
+            role: ChatRole::Assistant,
+            phase: None,
+            status: Some(ChatOutputStatus::Completed),
+            parts: vec![ChatMessagePart::Text {
+                text: text.into(),
+                annotations: vec![],
+                extensions: Default::default(),
+            }],
+            extensions: Default::default(),
+        })
+    }
+
+    fn structured_summary(text: &str, with_deltas: bool) -> Vec<StreamChunk> {
+        let mut chunks = vec![StreamChunk::Structured(
+            StructuredStreamEvent::ResponseMetadata {
+                response_id: Some("response-summary".into()),
+                status: Some(ChatOutputStatus::InProgress),
+                usage: None,
+                finish_reason: None,
+                provenance: None,
+            },
+        )];
+        if with_deltas {
+            let mut item = message_item("");
+            if let ChatOutputItem::Message(message) = &mut item {
+                message.status = Some(ChatOutputStatus::InProgress);
+            }
+            chunks.push(StreamChunk::Structured(
+                StructuredStreamEvent::ItemStarted {
+                    output_index: 0,
+                    item,
+                },
+            ));
+            chunks.push(StreamChunk::Structured(
+                StructuredStreamEvent::MessagePartDelta {
+                    output_index: 0,
+                    content_index: 0,
+                    delta: ChatMessagePartDelta::Text { delta: text.into() },
+                },
+            ));
+            // Compatibility projections must not duplicate the canonical summary.
+            chunks.push(StreamChunk::Text(text.into()));
+        }
+        chunks.push(StreamChunk::Structured(
+            StructuredStreamEvent::ItemCompleted {
+                output_index: 0,
+                item: message_item(text),
+            },
+        ));
+        chunks.push(StreamChunk::Structured(
+            StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                usage: None,
+                finish_reason: Some(FinishReason::Stop),
+                detail: None,
+            },
+        ));
+        chunks
+    }
+
+    async fn process_script(
+        provider: Arc<ScriptedProvider>,
+        max_retries: usize,
+    ) -> Result<CompactionResult> {
+        SessionCompaction::new()
+            .process(&[], provider, "model", &retry_config(max_retries), None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn structured_compaction_collects_deltas_and_final_snapshots_once() {
+        for with_deltas in [false, true] {
+            let chunks =
+                structured_summary("Keep the implementation and continue testing.", with_deltas);
+            let provider = ScriptedProvider::new(
+                true,
+                vec![Attempt::Stream(chunks.into_iter().map(Ok).collect())],
+            );
+            let result = process_script(provider.clone(), 0).await.unwrap();
+            assert_eq!(
+                result.summary,
+                "Keep the implementation and continue testing."
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_collects_text_without_thinking() {
+        let provider = ScriptedProvider::new(
+            true,
+            vec![Attempt::Stream(vec![
+                Ok(StreamChunk::Thinking("not a summary".into())),
+                Ok(StreamChunk::Text("Keep the implementation".into())),
+                Ok(StreamChunk::Text(" and continue testing.".into())),
+                Ok(StreamChunk::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
+            ])],
+        );
+        assert_eq!(
+            process_script(provider, 0).await.unwrap().summary,
+            "Keep the implementation and continue testing."
+        );
+    }
+
+    #[tokio::test]
+    async fn blank_compaction_retries_are_bounded_for_both_formats() {
+        for streaming in [false, true] {
+            for text in ["", " \n\t "] {
+                let attempts = (0..3)
+                    .map(|_| {
+                        if streaming {
+                            Attempt::Stream(
+                                structured_summary(text, true).into_iter().map(Ok).collect(),
+                            )
+                        } else {
+                            Attempt::output(ChatOutput::from_projections(
+                                None,
+                                Some(text.into()),
+                                None,
+                                None,
+                                Some(FinishReason::Stop),
+                            ))
+                        }
+                    })
+                    .collect();
+                let provider = ScriptedProvider::new(streaming, attempts);
+                let error = process_script(provider.clone(), 2).await.unwrap_err();
+                assert!(error.to_string().contains("empty summary"));
+                assert_eq!(provider.calls.load(Ordering::Relaxed), 3);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_compaction_can_retry_to_a_valid_summary() {
+        let provider = Arc::new(MockCompactionProvider::new(vec![
+            Ok(" \n ".into()),
+            Ok("Valid continuation summary".into()),
+        ]));
+        let result = SessionCompaction::new()
+            .process(&[], provider.clone(), "model", &retry_config(1), None)
+            .await
+            .unwrap();
+        assert_eq!(result.summary, "Valid continuation summary");
+        assert_eq!(provider.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn incomplete_failed_and_unterminated_streams_cannot_replace_history() {
+        for status in [ChatOutputStatus::Incomplete, ChatOutputStatus::Failed] {
+            let mut chunks = structured_summary("partial summary", false);
+            *chunks.last_mut().unwrap() =
+                StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                    status,
+                    usage: None,
+                    finish_reason: None,
+                    detail: Some("not complete".into()),
+                });
+            let provider = ScriptedProvider::new(
+                true,
+                vec![Attempt::Stream(chunks.into_iter().map(Ok).collect())],
+            );
+            assert!(process_script(provider, 0).await.is_err());
+        }
+        let mut chunks = structured_summary("partial summary", true);
+        chunks.pop();
+        let metadata = chunks.first_mut().unwrap();
+        if let StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata { status, .. }) =
+            metadata
+        {
+            *status = Some(ChatOutputStatus::Completed);
+        }
+        for chunks in [
+            chunks,
+            vec![StreamChunk::Text("partial legacy summary".into())],
+        ] {
+            let provider = ScriptedProvider::new(
+                true,
+                vec![Attempt::Stream(chunks.into_iter().map(Ok).collect())],
+            );
+            let error = process_script(provider, 0).await.unwrap_err();
+            assert!(error.to_string().contains("without a terminal event"));
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_stream_retry_discards_previous_partial_text() {
+        let provider = ScriptedProvider::new(
+            true,
+            vec![
+                Attempt::Stream(vec![
+                    Ok(StreamChunk::Text("discard me".into())),
+                    Err(LLMError::GenericError("transport failed".into())),
+                ]),
+                Attempt::Stream(
+                    structured_summary("Valid continuation summary", true)
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                ),
+            ],
+        );
+        assert_eq!(
+            process_script(provider.clone(), 1).await.unwrap().summary,
+            "Valid continuation summary"
+        );
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn unfinished_structured_items_are_rejected_even_with_a_success_terminal() {
+        let chunks = structured_summary("unfinished summary", true)
+            .into_iter()
+            .filter(|chunk| {
+                !matches!(
+                    chunk,
+                    StreamChunk::Structured(StructuredStreamEvent::ItemCompleted { .. })
+                )
+            })
+            .map(Ok)
+            .collect();
+        let provider = ScriptedProvider::new(true, vec![Attempt::Stream(chunks)]);
+        assert!(process_script(provider, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn compaction_rejects_tool_calls_even_when_text_and_status_look_successful() {
+        let output = ChatOutput::from_projections(
+            None,
+            Some("not a usable continuation".into()),
+            Some(vec![querymt::ToolCall {
+                id: "call".into(),
+                call_type: "function".into(),
+                function: querymt::FunctionCall {
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            None,
+            Some(FinishReason::Stop),
+        );
+        let provider = ScriptedProvider::new(false, vec![Attempt::output(output)]);
+        assert!(
+            process_script(provider, 0)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("did not complete successfully")
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_and_refusal_are_not_compaction_summaries() {
+        let outputs = [
+            ChatOutput::from_projections(
+                Some("reasoning only".into()),
+                None,
+                None,
+                None,
+                Some(FinishReason::Stop),
+            ),
+            ChatOutput {
+                items: vec![ChatOutputItem::Message(ChatMessageItem {
+                    parts: vec![ChatMessagePart::Refusal {
+                        refusal: "I cannot summarize".into(),
+                        extensions: Default::default(),
+                    }],
+                    ..match message_item("") {
+                        ChatOutputItem::Message(message) => message,
+                        _ => unreachable!(),
+                    }
+                })],
+                status: Some(ChatOutputStatus::Completed),
+                ..ChatOutput::default()
+            },
+        ];
+        for output in outputs {
+            let provider = ScriptedProvider::new(false, vec![Attempt::output(output)]);
+            assert!(
+                process_script(provider, 0)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("empty summary")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsuccessful_non_streaming_and_legacy_finishes_are_rejected() {
+        for finish_reason in [
+            FinishReason::Length,
+            FinishReason::ContentFilter,
+            FinishReason::Error,
+            FinishReason::ToolCalls,
+        ] {
+            let output = ChatOutput::from_projections(
+                None,
+                Some("not a complete summary".into()),
+                None,
+                None,
+                Some(finish_reason),
+            );
+            let provider = ScriptedProvider::new(false, vec![Attempt::output(output)]);
+            assert!(
+                process_script(provider, 0)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("did not complete successfully")
+            );
+            let provider = ScriptedProvider::new(
+                true,
+                vec![Attempt::Stream(vec![
+                    Ok(StreamChunk::Text("not a complete summary".into())),
+                    Ok(StreamChunk::Done { finish_reason }),
+                ])],
+            );
+            assert!(process_script(provider, 0).await.is_err());
+        }
+        for status in [
+            ChatOutputStatus::Incomplete,
+            ChatOutputStatus::Failed,
+            ChatOutputStatus::InProgress,
+        ] {
+            let mut output = ChatOutput::from_projections(
+                None,
+                Some("partial summary".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            output.status = Some(status);
+            assert!(
+                process_script(
+                    ScriptedProvider::new(false, vec![Attempt::output(output)]),
+                    0
+                )
+                .await
+                .is_err()
+            );
+        }
+    }
 
     // ========================================================================
     // Test Fixtures
