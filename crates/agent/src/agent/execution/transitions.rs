@@ -165,11 +165,19 @@ pub(super) async fn transition_before_llm_call(
         );
     }
     messages = hook_result.messages.unwrap_or_default();
-    if hook_result.estimated_tokens > context_window as usize {
+    // Tool definitions are model input; reuse the serialization already used for their hash.
+    let tool_tokens = if tools.is_empty() {
+        0
+    } else {
+        tools_json.len().div_ceil(4)
+    };
+    validate_tool_context_budget(tool_tokens, context_window)?;
+    let estimated_tokens = hook_result.estimated_tokens.saturating_add(tool_tokens);
+    if estimated_tokens > context_window as usize {
         return Ok(ExecutionState::Stopped {
             message: format!(
                 "Prepared request is approximately {} tokens, exceeding the {} token context window",
-                hook_result.estimated_tokens, context_window
+                estimated_tokens, context_window
             )
             .into(),
             stop_type: StopType::ContextThreshold,
@@ -182,9 +190,19 @@ pub(super) async fn transition_before_llm_call(
         request: Arc::new(PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
             tools: Arc::from(tools.into_boxed_slice()),
-            estimated_tokens: hook_result.estimated_tokens,
+            estimated_tokens,
         }),
     })
+}
+
+/// Reject fixed tool overhead that history compaction cannot reduce.
+fn validate_tool_context_budget(tool_tokens: usize, context_window: u32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        tool_tokens < context_window as usize,
+        "Tool definitions require approximately {tool_tokens} tokens, leaving no room in the \
+         {context_window} token context window. Reduce the available tools or use a larger-context model."
+    );
+    Ok(())
 }
 
 /// Apply cache breakpoints to the last 2 messages in the conversation.
@@ -1945,6 +1963,22 @@ mod tests {
             ChatRole::User => ChatMessage::user().text(content).build(),
             ChatRole::Assistant => ChatMessage::assistant().text(content).build(),
         }
+    }
+
+    /// Fixed tool overhead must fail instead of requesting repeated history compaction.
+    #[test]
+    fn oversized_tool_definitions_fail_without_compaction() {
+        for tokens in [10_000, 10_001, usize::MAX] {
+            let error = validate_tool_context_budget(tokens, 10_000).unwrap_err();
+            assert!(error.to_string().contains("Reduce the available tools"));
+        }
+    }
+
+    /// Tool overhead below the window still permits history-reducible admission checks.
+    #[test]
+    fn fitting_tool_definitions_pass_the_fixed_overhead_guard() {
+        assert!(validate_tool_context_budget(0, 10_000).is_ok());
+        assert!(validate_tool_context_budget(9_999, 10_000).is_ok());
     }
 
     // ── Item-aware accumulation (task 4.1) ───────────────────────────────────

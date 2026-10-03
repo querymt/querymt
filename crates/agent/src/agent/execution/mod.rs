@@ -68,6 +68,20 @@ pub enum CycleOutcome {
     Stopped(StopReason),
 }
 
+/// Allow one automatic compaction between main model requests, preventing non-progress loops.
+fn mark_automatic_compaction(
+    last_compaction_request_count: &mut Option<u32>,
+    llm_request_count: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        *last_compaction_request_count != Some(llm_request_count),
+        "The request still exceeds its context budget after automatic compaction. \
+         Reduce tools or injected context, or use a larger-context model."
+    );
+    *last_compaction_request_count = Some(llm_request_count);
+    Ok(())
+}
+
 fn render_run_objective(exec_ctx: &ExecutionContext) -> String {
     exec_ctx
         .run_objective
@@ -337,6 +351,7 @@ pub(crate) async fn execute_cycle_state_machine(
     let mut task_completion_guard_continuations = 0u8;
     let mut task_completion_tool_available = false;
     let mut llm_request_count = 0u32;
+    let mut last_compaction_request_count = None;
     let mut last_objective_checkpoint_step = 0usize;
 
     state = driver
@@ -762,6 +777,10 @@ pub(crate) async fn execute_cycle_state_machine(
                 if stop_type == StopType::ContextThreshold
                     && config.execution_policy.compaction.auto
                 {
+                    mark_automatic_compaction(
+                        &mut last_compaction_request_count,
+                        llm_request_count,
+                    )?;
                     info!("Context threshold reached, triggering AI compaction");
 
                     match maintenance::run_ai_compaction(config, exec_ctx, &state).await {
@@ -815,12 +834,32 @@ pub(crate) async fn execute_cycle_state_machine(
 mod tests {
     use super::{
         apply_pending_steering, format_stop_hook_continuation_message,
-        has_effective_task_completion_tool,
+        has_effective_task_completion_tool, mark_automatic_compaction,
     };
     use crate::session::backend::StorageBackend;
     use querymt::chat::{FunctionTool, Tool};
     use serde_json::json;
     use std::sync::Arc;
+
+    /// Failed admission after compaction must not issue another summarization request.
+    #[test]
+    fn automatic_compaction_requires_model_request_progress() {
+        let mut last_compaction = None;
+        mark_automatic_compaction(&mut last_compaction, 0).unwrap();
+        let error = mark_automatic_compaction(&mut last_compaction, 0).unwrap_err();
+        assert!(error.to_string().contains("after automatic compaction"));
+        assert_eq!(last_compaction, Some(0));
+    }
+
+    /// A later model/tool exchange can legitimately require another compaction in the same turn.
+    #[test]
+    fn automatic_compaction_is_allowed_after_a_new_model_request() {
+        let mut last_compaction = None;
+        mark_automatic_compaction(&mut last_compaction, 0).unwrap();
+        mark_automatic_compaction(&mut last_compaction, 1).unwrap();
+        assert_eq!(last_compaction, Some(1));
+        assert!(mark_automatic_compaction(&mut last_compaction, 1).is_err());
+    }
 
     fn tool(name: &str) -> Tool {
         Tool {
