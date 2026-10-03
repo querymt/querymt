@@ -88,7 +88,7 @@ dependencies = [
  "serde_json",
  "shell-words",
  "tracing",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "windows-sys 0.61.2",
 ]
 
@@ -1594,7 +1594,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3"
 dependencies = [
  "fnv",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "web-time",
 ]
 
@@ -2855,7 +2855,7 @@ version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef552e6f588e446098f6ba40d89ac146c8c7b64aade83c051ee00bb5d2bc18d"
 dependencies = [
- "uuid 1.26.1",
+ "uuid 1.27.0",
 ]
 
 [[package]]
@@ -3589,7 +3589,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq 3.4.2",
  "url",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "wasi-common",
  "wasmtime",
  "wiggle",
@@ -5664,7 +5664,7 @@ dependencies = [
  "tokio-util",
  "tokio_with_wasm",
  "tracing",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "xet-client",
  "xet-core-structures",
  "xet-data",
@@ -6879,7 +6879,7 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tracing",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "zip 7.2.0",
 ]
 
@@ -7174,7 +7174,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "url",
- "uuid 1.26.1",
+ "uuid 1.27.0",
 ]
 
 [[package]]
@@ -8325,7 +8325,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "uuid 1.26.1",
+ "uuid 1.27.0",
 ]
 
 [[package]]
@@ -8428,7 +8428,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "variantly",
  "vob",
 ]
@@ -8473,7 +8473,7 @@ dependencies = [
  "tokio-tungstenite 0.28.0",
  "tracing",
  "utoipa",
- "uuid 1.26.1",
+ "uuid 1.27.0",
 ]
 
 [[package]]
@@ -8611,7 +8611,7 @@ dependencies = [
  "portable-atomic",
  "smallvec 1.15.1",
  "tagptr",
- "uuid 1.26.1",
+ "uuid 1.27.0",
 ]
 
 [[package]]
@@ -9557,7 +9557,7 @@ dependencies = [
  "toml 0.8.23",
  "ureq 2.12.1",
  "url",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "walkdir",
 ]
 
@@ -11472,7 +11472,7 @@ dependencies = [
  "tracing",
  "typeshare",
  "url",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "which 8.0.6",
 ]
 
@@ -11584,7 +11584,7 @@ dependencies = [
  "tree-sitter-yaml",
  "typeshare",
  "ureq 3.4.2",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "whatlang",
 ]
 
@@ -11724,7 +11724,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
- "uuid 1.26.1",
+ "uuid 1.27.0",
 ]
 
 [[package]]
@@ -12635,7 +12635,7 @@ dependencies = [
  "smallvec 1.15.1",
  "sqlite-wasm-rs",
  "time",
- "uuid 1.26.1",
+ "uuid 1.27.0",
 ]
 
 [[package]]
@@ -14700,7 +14700,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
@@ -16220,9 +16220,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.26.1"
+version = "1.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
+checksum = "97277d36b9c3ace13e58fa6e753f8b0bbbf302a18dd193240d70f9e29681059a"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -17879,7 +17879,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "web-time",
  "xet-runtime",
 ]
@@ -17909,7 +17909,7 @@ dependencies = [
  "tokio_with_wasm",
  "tracing",
  "url",
- "uuid 1.26.1",
+ "uuid 1.27.0",
  "web-time",
  "xet-client",
  "xet-core-structures",
