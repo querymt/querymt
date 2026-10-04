@@ -10,7 +10,7 @@ use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
-use crate::agent::utils::u32_from_usize;
+use crate::agent::utils::{genai, u32_from_usize};
 use crate::events::{
     AgentEventKind, ExecutionMetrics, ReasoningPartStored, StopType, reasoning_content_part_id,
     reasoning_summary_part_id,
@@ -228,6 +228,7 @@ fn contextualize_llm_error(
     operation: &'static str,
     context: &crate::middleware::ConversationContext,
 ) -> anyhow::Error {
+    genai::llm_error(&error);
     let source_message = error.to_string();
     anyhow::Error::new(error).context(format!(
         "LLM {operation} error (provider={}, model={}): {source_message}",
@@ -562,6 +563,14 @@ fn gate_function_calls_for_execution(
     name = "agent.transition.call_llm",
     skip(config, context, request, exec_ctx),
     fields(
+        otel.name = %format!("chat {}", context.model),
+        otel.kind = "client",
+        gen_ai.operation.name = "chat",
+        gen_ai.provider.name = %genai::provider_name(&context.provider),
+        gen_ai.request.model = %context.model,
+        gen_ai.conversation.id = %exec_ctx.session_id,
+        session.id = %exec_ctx.session_id,
+        gen_ai.request.stream = tracing::field::Empty,
         session_id = %exec_ctx.session_id,
         provider = %context.provider,
         model = %context.model,
@@ -575,6 +584,11 @@ pub(super) async fn transition_call_llm(
     request: &Arc<PreparedModelRequest>,
     exec_ctx: &ExecutionContext,
 ) -> Result<ExecutionState, anyhow::Error> {
+    // A single expected generation; early cancellation/drop retains an abnormal finish
+    // without marking the span as an error. Successful canonical output replaces it.
+    genai::finish_reason("error");
+    let chat_span = tracing::Span::current();
+    genai::agent_id(&chat_span, config.provider.agent_id.as_deref());
     let session_id = &exec_ctx.session_id;
     let request_messages = request.messages.as_ref();
     let tools = &request.tools;
@@ -633,8 +647,14 @@ pub(super) async fn transition_call_llm(
         )
         .await
         {
-            Ok(resp) => resp,
-            Err(e) => return map_failed_llm_call(e, false, context),
+            Ok(resp) => {
+                session_handle.record_generation_settings(&chat_span);
+                resp
+            }
+            Err(e) => {
+                session_handle.record_generation_settings(&chat_span);
+                return map_failed_llm_call(e, false, context);
+            }
         }
     } else {
         let provider = match super::llm_retry::call_with_retry(
@@ -642,7 +662,6 @@ pub(super) async fn transition_call_llm(
             session_id,
             &exec_ctx.cancellation_token,
             || {
-                let session_handle = session_handle.clone();
                 let cancel = exec_ctx.cancellation_token.clone();
                 async move {
                     tokio::select! {
@@ -665,7 +684,9 @@ pub(super) async fn transition_call_llm(
             }
         };
 
+        session_handle.record_generation_settings(&chat_span);
         if provider.supports_streaming() {
+            tracing::Span::current().record("gen_ai.request.stream", true);
             // === STREAMING PATH (all capable providers) ===
             let message_id = Uuid::new_v4().to_string();
             streaming_message_id = Some(message_id.clone());
@@ -755,6 +776,7 @@ pub(super) async fn transition_call_llm(
                 max_stream_retries,
                 config.execution_policy.rate_limit.max_attempts(),
             );
+            let mut first_chunk = genai::FirstChunk::default();
             let streamed_output: ChatOutput = 'stream: loop {
                 let mut semantic_output_seen = false;
 
@@ -787,6 +809,7 @@ pub(super) async fn transition_call_llm(
                     return Ok(ExecutionState::Cancelled);
                 }
 
+                first_chunk.start();
                 let mut stream = match provider
                     .chat_stream_with_tools(messages_with_cache, Some(tools.as_ref()))
                     .await
@@ -865,6 +888,7 @@ pub(super) async fn transition_call_llm(
                         },
                     };
 
+                    first_chunk.received(&chat_span);
                     semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
                     // Canonical accumulation. Accumulator violations are provider
@@ -1074,10 +1098,10 @@ pub(super) async fn transition_call_llm(
                     ChatStreamFinish::Completed(output) => {
                         break 'stream merge_drained_usage(output, drained_usage.take());
                     }
-                    ChatStreamFinish::Incomplete { output, detail } => {
+                    ChatStreamFinish::Incomplete { output, .. } => {
                         warn!(
-                            "Provider reported incomplete response: session={} message_id={} detail={:?}",
-                            session_id, message_id, detail
+                            "Provider reported incomplete response: session={} message_id={}",
+                            session_id, message_id
                         );
                         // Preserve partial output and the terminal status; the
                         // incomplete cause is handled downstream without retries.
@@ -1085,8 +1109,8 @@ pub(super) async fn transition_call_llm(
                     }
                     ChatStreamFinish::Failed { error, .. } => {
                         debug!(
-                            "Stream failed terminal validation: session={} message_id={} error={}",
-                            session_id, message_id, error
+                            "Stream failed terminal validation: session={} message_id={}",
+                            session_id, message_id
                         );
                         match super::llm_retry::handle_stream_failure(
                             config,
@@ -1174,6 +1198,7 @@ pub(super) async fn transition_call_llm(
 
     // Canonical output is authoritative; the flattened fields below are
     // compatibility projections of it.
+    genai::output(&output);
     let response_content = output.text().unwrap_or_default();
     let response_thinking = output.thinking();
     let response_thinking_signature = output.signature();
@@ -1951,6 +1976,812 @@ pub(super) async fn transition_processing_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod genai_trace_tests {
+        use super::*;
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use opentelemetry::{
+            Array, Value,
+            trace::{SpanKind, Status},
+        };
+        use querymt::chat::ChatOutputProvenance;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn request() -> Arc<PreparedModelRequest> {
+            Arc::new(PreparedModelRequest {
+                messages: vec![ChatMessage::user().text("SECRET_PROMPT").build()].into(),
+                tools: Arc::from([]),
+                estimated_tokens: 1,
+            })
+        }
+
+        type TimedChunks = Result<Vec<(u64, Result<StreamChunk, LLMError>)>, LLMError>;
+
+        #[derive(Clone)]
+        struct TimedProvider {
+            attempts: Arc<std::sync::Mutex<std::collections::VecDeque<TimedChunks>>>,
+            clock: Arc<std::sync::Mutex<(Option<Instant>, Option<f64>)>>,
+            streaming: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl querymt::chat::ChatProvider for TimedProvider {
+            fn supports_streaming(&self) -> bool {
+                self.streaming
+            }
+            async fn chat_with_tools(
+                &self,
+                _: &[ChatMessage],
+                _: Option<&[querymt::chat::Tool]>,
+            ) -> Result<ChatOutput, LLMError> {
+                Ok(ChatOutput::from_projections(
+                    None,
+                    Some("SECRET_RESPONSE".into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                ))
+            }
+            async fn chat_stream_with_tools(
+                &self,
+                _: &[ChatMessage],
+                _: Option<&[querymt::chat::Tool]>,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
+            {
+                self.clock
+                    .lock()
+                    .unwrap()
+                    .0
+                    .get_or_insert_with(Instant::now);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let chunks = self
+                    .attempts
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("physical attempt")?;
+                let pending_tail = !chunks
+                    .iter()
+                    .any(|(_, chunk)| chunk.as_ref().is_ok_and(querymt::chat::chunk_is_terminal));
+                let clock = self.clock.clone();
+                Ok(Box::pin(
+                    futures_util::stream::iter(chunks)
+                        .then(move |(delay, chunk)| {
+                            let clock = clock.clone();
+                            async move {
+                                tokio::time::sleep(Duration::from_millis(delay)).await;
+                                if chunk.is_ok() {
+                                    let mut clock = clock.lock().unwrap();
+                                    if clock.1.is_none() {
+                                        clock.1 = Some(clock.0.unwrap().elapsed().as_secs_f64());
+                                    }
+                                }
+                                chunk
+                            }
+                        })
+                        .chain(futures_util::stream::pending().take(usize::from(pending_tail))),
+                ))
+            }
+        }
+        #[async_trait::async_trait]
+        impl querymt::completion::CompletionProvider for TimedProvider {
+            async fn complete(
+                &self,
+                _: &querymt::completion::CompletionRequest,
+            ) -> Result<querymt::completion::CompletionResponse, LLMError> {
+                Err(LLMError::NotImplemented("test".into()))
+            }
+        }
+        #[async_trait::async_trait]
+        impl querymt::embedding::EmbeddingProvider for TimedProvider {
+            async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+                Err(LLMError::NotImplemented("test".into()))
+            }
+        }
+        impl querymt::LLMProvider for TimedProvider {}
+
+        struct TimedFactory {
+            provider: TimedProvider,
+            binding: std::sync::Mutex<serde_json::Value>,
+            configs: std::sync::Mutex<Vec<serde_json::Value>>,
+            resolutions: AtomicUsize,
+            identity: Option<String>,
+            name: &'static str,
+        }
+        impl querymt::plugin::LLMProviderFactory for TimedFactory {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn config_schema(&self) -> String {
+                // top_p is deliberately unsupported to exercise final schema pruning.
+                serde_json::json!({"type":"object", "properties": {
+                    "model":{"type":"string"}, "temperature":{"type":"number"},
+                    "max_tokens":{"type":"integer"}, "reasoning_effort":{"type":"string"}
+                }, "additionalProperties":false})
+                .to_string()
+            }
+            fn from_config(&self, cfg: &str) -> Result<Box<dyn querymt::LLMProvider>, LLMError> {
+                self.configs
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(cfg).unwrap());
+                Ok(Box::new(self.provider.clone()))
+            }
+            fn list_models<'a>(
+                &'a self,
+                _: &str,
+            ) -> querymt::plugin::Fut<'a, Result<Vec<String>, LLMError>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+        }
+        struct TimedResolver(Arc<TimedFactory>);
+        #[async_trait::async_trait]
+        impl querymt::plugin::host::ProviderResolver for TimedResolver {
+            async fn resolve(
+                &self,
+                logical_name: &str,
+            ) -> Result<querymt::plugin::host::ProviderBinding, LLMError> {
+                let factory = &self.0;
+                factory.resolutions.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Ok(querymt::plugin::host::ProviderBinding {
+                    logical_name: logical_name.into(),
+                    factory: factory.clone(),
+                    static_config: factory.binding.lock().unwrap().clone(),
+                    implementation_id: factory.identity.clone(),
+                })
+            }
+        }
+        async fn timed_fixture(
+            streaming: bool,
+            attempts: Vec<TimedChunks>,
+            name: &'static str,
+            identity: Option<&str>,
+        ) -> (TestAgent, Arc<TimedFactory>) {
+            use crate::session::backend::StorageBackend;
+            let mut fixture = TestAgent::new().await;
+            let factory = Arc::new(TimedFactory {
+                provider: TimedProvider {
+                    streaming,
+                    attempts: Arc::new(std::sync::Mutex::new(attempts.into())),
+                    clock: Default::default(),
+                },
+                binding: std::sync::Mutex::new(
+                    serde_json::json!({"temperature":0.25, "max_tokens":123, "top_p":0.75}),
+                ),
+                configs: Default::default(),
+                resolutions: AtomicUsize::new(0),
+                name,
+                identity: identity.map(str::to_owned),
+            });
+            let provider = crate::session::provider::SessionProvider::new(
+                fixture.config.provider.plugin_registry(),
+                fixture.storage.session_store(),
+                querymt::LLMParams::new()
+                    .provider("alias")
+                    .model("mock-model")
+                    .temperature(1.5),
+            )
+            .with_provider_resolver(Arc::new(TimedResolver(factory.clone())))
+            .with_agent_id(Some("parent".into()));
+            let mut config = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                fixture.storage.clone(),
+                Arc::new(provider),
+                fixture.storage.event_journal(),
+            )
+            .build();
+            config.execution_policy.rate_limit.jitter_ratio = 0.0;
+            config.execution_policy.rate_limit.default_wait_secs = 0;
+            fixture.config = Arc::new(config);
+            fixture.handle = Arc::new(crate::agent::LocalAgentHandle::from_config(
+                fixture.config.clone(),
+            ));
+            (fixture, factory)
+        }
+
+        #[tokio::test]
+        async fn genai_stream_first_chunk_counts_setup_and_retries_but_not_provider_resolution() {
+            for mode in [
+                "metadata",
+                "empty",
+                "usage",
+                "terminal",
+                "setup_retry",
+                "metadata_retry",
+                "controls",
+                "error",
+                "cancel_before",
+                "cancel_after",
+                "drop_before",
+                "drop_after",
+            ] {
+                let retry = || LLMError::RateLimited {
+                    message: "SECRET_ERROR".into(),
+                    retry_after_secs: Some(1),
+                };
+                let mut chunks = vec![(
+                    20,
+                    Ok(match mode {
+                        "empty" => StreamChunk::Text(String::new()),
+                        "usage" => StreamChunk::Usage(Default::default()),
+                        "terminal" => StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        },
+                        _ => metadata_event(),
+                    }),
+                )];
+                let mut attempts = vec![];
+                if mode == "setup_retry" {
+                    attempts.push(Err(retry()));
+                }
+                if mode == "metadata_retry" {
+                    attempts.push(Ok(vec![(20, Ok(metadata_event())), (0, Err(retry()))]));
+                }
+                if mode == "controls" {
+                    chunks.insert(
+                        0,
+                        (
+                            0,
+                            Err(LLMError::RemoteStreamDisconnected {
+                                message: "SECRET_ERROR".into(),
+                            }),
+                        ),
+                    );
+                    chunks.insert(
+                        1,
+                        (
+                            0,
+                            Err(LLMError::RemoteStreamReconnected {
+                                message: "SECRET_ERROR".into(),
+                            }),
+                        ),
+                    );
+                }
+                if mode == "error" {
+                    chunks = vec![(0, Err(LLMError::AuthError("SECRET_ERROR".into())))];
+                }
+                if matches!(mode, "cancel_before" | "drop_before") {
+                    chunks.clear();
+                }
+                if !mode.starts_with("cancel")
+                    && !mode.starts_with("drop")
+                    && !matches!(mode, "error" | "terminal")
+                {
+                    chunks.extend([
+                        (100, Ok(StreamChunk::Text("SECRET_RESPONSE".into()))),
+                        (
+                            0,
+                            Ok(if matches!(mode, "empty" | "usage") {
+                                StreamChunk::Done {
+                                    finish_reason: FinishReason::Stop,
+                                }
+                            } else {
+                                terminal_event(
+                                    ChatOutputStatus::Completed,
+                                    Some(FinishReason::Stop),
+                                )
+                            }),
+                        ),
+                        (
+                            0,
+                            Ok(StreamChunk::Done {
+                                finish_reason: FinishReason::Stop,
+                            }),
+                        ),
+                    ]);
+                }
+                attempts.push(Ok(chunks));
+                let (fixture, factory) = timed_fixture(
+                    true,
+                    attempts,
+                    "openai",
+                    Some("oci://ghcr.io/querymt/openai:latest"),
+                )
+                .await;
+                let exec = fixture.execution_context().await;
+                let context = crate::test_utils::test_context(&exec.session_id, 0);
+                let mut request = (*request()).clone();
+                request.tools = vec![serde_json::from_value(serde_json::json!({"type":"function", "function":{"name":"safe", "description":"", "parameters":{"type":"object"}}})).unwrap()].into();
+                let (_, spans) = capture(async {
+                    let parent = info_span!("timing-parent");
+                    async {
+                        let request = Arc::new(request);
+                        let mut future = Box::pin(transition_call_llm(
+                            &fixture.config,
+                            &context,
+                            &request,
+                            &exec,
+                        ));
+                        if mode.starts_with("cancel") || mode.starts_with("drop") {
+                            assert!(
+                                tokio::time::timeout(Duration::from_millis(180), &mut future)
+                                    .await
+                                    .is_err()
+                            );
+                            if mode.starts_with("cancel") {
+                                exec.cancellation_token.cancel();
+                                assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+                            }
+                        } else {
+                            let result = future.await;
+                            assert_eq!(result.is_err(), mode == "error");
+                        }
+                    }
+                    .instrument(parent)
+                    .await
+                })
+                .await;
+                let chat = spans
+                    .iter()
+                    .find(|span| span.name == "chat mock-model")
+                    .unwrap();
+                assert_eq!(
+                    chat.parent_span_id,
+                    spans
+                        .iter()
+                        .find(|span| span.name == "timing-parent")
+                        .unwrap()
+                        .span_context
+                        .span_id()
+                );
+                let expected = factory.provider.clock.lock().unwrap().1;
+                match (attr(chat, "gen_ai.response.time_to_first_chunk"), expected) {
+                    (Some(Value::F64(actual)), Some(expected)) => {
+                        assert!(
+                            (actual - expected).abs() < 0.03,
+                            "{mode}: actual={actual} expected={expected}"
+                        );
+                        if mode == "setup_retry" {
+                            assert!(*actual >= 1.0);
+                        }
+                    }
+                    (None, None) => {}
+                    other => panic!("{mode}: {other:?}"),
+                }
+                assert_eq!(
+                    chat.attributes
+                        .iter()
+                        .filter(|attr| attr.key.as_str() == "gen_ai.response.time_to_first_chunk")
+                        .count(),
+                    usize::from(expected.is_some())
+                );
+                assert_eq!(attr(chat, "gen_ai.agent.id"), Some(&Value::from("parent")));
+                for diagnostic in spans
+                    .iter()
+                    .filter(|span| span.span_context.span_id() != chat.span_context.span_id())
+                {
+                    assert!(attr(diagnostic, "gen_ai.response.time_to_first_chunk").is_none());
+                    for key in [
+                        "gen_ai.request.max_tokens",
+                        "gen_ai.request.temperature",
+                        "gen_ai.request.top_p",
+                        "gen_ai.request.reasoning.level",
+                    ] {
+                        assert!(attr(diagnostic, key).is_none(), "{mode}: {key}");
+                    }
+                }
+                if mode.starts_with("cancel") || mode.starts_with("drop") {
+                    assert_eq!(chat.status, Status::Unset);
+                }
+                assert_private(&spans);
+            }
+        }
+
+        #[tokio::test]
+        async fn genai_effective_settings_stay_bound_to_the_actual_cached_provider() {
+            for (with_tools, streaming) in [(false, false), (true, false), (true, true)] {
+                for identity in [
+                    Some("oci://ghcr.io/querymt/openai:latest"),
+                    Some("static:openai"),
+                    None,
+                ] {
+                    let item = ChatOutput::from_projections(
+                        None,
+                        Some("SECRET_RESPONSE".into()),
+                        None,
+                        None,
+                        Some(FinishReason::Stop),
+                    )
+                    .items
+                    .remove(0);
+                    let chunks = || {
+                        Ok(vec![
+                            metadata_event(),
+                            StreamChunk::Structured(StructuredStreamEvent::ItemCompleted {
+                                output_index: 0,
+                                item: item.clone(),
+                            }),
+                            terminal_event(ChatOutputStatus::Completed, Some(FinishReason::Stop)),
+                            StreamChunk::Usage(querymt::Usage {
+                                input_tokens: 10,
+                                output_tokens: 5,
+                                ..Default::default()
+                            }),
+                        ]
+                        .into_iter()
+                        .map(|chunk| (0, Ok(chunk)))
+                        .collect())
+                    };
+                    let attempts = if streaming {
+                        vec![chunks(), chunks()]
+                    } else {
+                        vec![]
+                    };
+                    let (fixture, factory) =
+                        timed_fixture(streaming, attempts, "openai", identity).await;
+                    factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
+                    let exec = fixture.execution_context().await;
+                    let context = crate::test_utils::test_context(&exec.session_id, 0);
+                    let mut prepared = request();
+                    if with_tools {
+                        Arc::make_mut(&mut prepared).tools = vec![serde_json::from_value(serde_json::json!({
+                            "type":"function", "function":{"name":"telemetry_tool", "description":"",
+                            "parameters":{"type":"object"}}
+                        })).unwrap()].into();
+                    }
+                    // The actual transition must initialize the turn handle, not a prewarm.
+                    assert_eq!(factory.resolutions.load(Ordering::Relaxed), 0);
+                    assert!(factory.configs.lock().unwrap().is_empty());
+                    let (_, spans) = capture(async {
+                        async {
+                            for call in 0..2 {
+                                let ExecutionState::AfterLlm { response, .. } =
+                                    transition_call_llm(&fixture.config, &context, &prepared, &exec)
+                                        .await
+                                        .unwrap()
+                                else {
+                                    panic!("expected completed generation");
+                                };
+                                let output = response.output.as_ref().unwrap();
+                                assert_eq!(output.text().as_deref(), Some("SECRET_RESPONSE"));
+                                assert_eq!(output.finish_reason, Some(FinishReason::Stop));
+                                if streaming {
+                                    let usage = output.usage.as_ref().unwrap();
+                                    assert_eq!((usage.input_tokens, usage.output_tokens), (10, 5));
+                                }
+                                assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
+                                let configs = factory.configs.lock().unwrap();
+                                assert_eq!(configs.len(), 1);
+                                assert_eq!(configs[0]["temperature"], 1.5); // Session override.
+                                assert_eq!(configs[0]["max_tokens"], 123); // Binding override.
+                                assert_eq!(configs[0]["reasoning_effort"], "high");
+                                assert!(configs[0].get("top_p").is_none()); // Schema-pruned.
+                                if call == 0 {
+                                    *factory.binding.lock().unwrap() = serde_json::json!({
+                                        "temperature":0.5, "max_tokens":999, "reasoning_effort":"low"
+                                    });
+                                }
+                            }
+                        }
+                        .instrument(info_span!("settings-parent"))
+                        .await
+                    })
+                    .await;
+                    let chats: Vec<_> = spans
+                        .iter()
+                        .filter(|span| {
+                            attr(span, "gen_ai.operation.name") == Some(&Value::from("chat"))
+                        })
+                        .collect();
+                    assert_eq!(chats.len(), 2);
+                    for chat in chats {
+                        let verified = identity == Some("oci://ghcr.io/querymt/openai:latest");
+                        for (key, value) in [
+                            ("gen_ai.request.temperature", Value::F64(1.5)),
+                            ("gen_ai.request.max_tokens", Value::I64(123)),
+                            ("gen_ai.request.reasoning.level", Value::from("high")),
+                        ] {
+                            assert_eq!(attr(chat, key), verified.then_some(&value));
+                        }
+                        assert!(attr(chat, "gen_ai.request.top_p").is_none());
+                        assert_eq!(
+                            attr(chat, "gen_ai.response.time_to_first_chunk").is_some(),
+                            streaming
+                        );
+                        assert_eq!(
+                            attr(chat, "gen_ai.request.stream"),
+                            streaming.then_some(&Value::Bool(true))
+                        );
+                        assert_eq!(
+                            attr(chat, "gen_ai.response.finish_reasons"),
+                            Some(&Value::Array(Array::String(vec!["stop".into()])))
+                        );
+                        if streaming {
+                            assert_eq!(
+                                attr(chat, "gen_ai.usage.input_tokens"),
+                                Some(&Value::I64(10))
+                            );
+                            assert_eq!(
+                                attr(chat, "gen_ai.usage.output_tokens"),
+                                Some(&Value::I64(5))
+                            );
+                        }
+                    }
+                    for diagnostic in spans.iter().filter(|span| span.name != "chat mock-model") {
+                        for key in [
+                            "gen_ai.request.max_tokens",
+                            "gen_ai.request.temperature",
+                            "gen_ai.request.top_p",
+                            "gen_ai.request.reasoning.level",
+                        ] {
+                            assert!(attr(diagnostic, key).is_none());
+                        }
+                    }
+                    assert_private(&spans);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn genai_nonstream_retry_exports_one_logical_chat_and_typed_totals() {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let counter = attempts.clone();
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(move |_| {
+                if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return Err(LLMError::RateLimited {
+                        message: "SECRET_ERROR".into(),
+                        retry_after_secs: Some(0),
+                    });
+                }
+                let mut output = ChatOutput::from_projections(
+                    None,
+                    Some("SECRET_RESPONSE".into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                );
+                output.response_id = Some("response-1".into());
+                output.usage = Some(querymt::Usage {
+                    input_tokens: 100,
+                    output_tokens: 200,
+                    cache_read: 5,
+                    cache_write: 7,
+                    reasoning_tokens: 9,
+                });
+                output.provenance = Some(ChatOutputProvenance {
+                    provider: "codex".into(),
+                    model: "effective-model".into(),
+                    endpoint: "SECRET_ENDPOINT".into(),
+                    protocol: "responses".into(),
+                });
+                Ok(output)
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (result, spans) = capture(async {
+                transition_call_llm(&fixture.config, &context, &request(), &exec)
+                    .instrument(info_span!("test-parent"))
+                    .await
+            })
+            .await;
+            assert!(matches!(result.unwrap(), ExecutionState::AfterLlm { .. }));
+            assert_eq!(attempts.load(Ordering::Relaxed), 2);
+            let chats: Vec<_> = spans
+                .iter()
+                .filter(|s| attr(s, "gen_ai.operation.name") == Some(&Value::from("chat")))
+                .collect();
+            assert_eq!(chats.len(), 1);
+            let chat = chats[0];
+            assert_eq!(chat.name, "chat mock-model");
+            assert_eq!(
+                attr(chat, "gen_ai.request.model"),
+                Some(&Value::from("mock-model"))
+            );
+            assert_eq!(chat.span_kind, SpanKind::Client);
+            assert_eq!(chat.status, Status::Unset);
+            assert_eq!(
+                chat.parent_span_id,
+                spans
+                    .iter()
+                    .find(|s| s.name == "test-parent")
+                    .unwrap()
+                    .span_context
+                    .span_id()
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.provider.name"),
+                Some(&Value::from("openai"))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.conversation.id"),
+                Some(&Value::from(exec.session_id.clone()))
+            );
+            assert_eq!(
+                attr(chat, "session.id"),
+                attr(chat, "gen_ai.conversation.id")
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.input_tokens"),
+                Some(&Value::I64(112))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.output_tokens"),
+                Some(&Value::I64(209))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.response.finish_reasons"),
+                Some(&Value::Array(Array::String(vec!["stop".into()])))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.response.model"),
+                Some(&Value::from("effective-model"))
+            );
+            assert!(attr(chat, "error.type").is_none());
+            assert!(attr(chat, "gen_ai.agent.id").is_none());
+            assert!(attr(chat, "gen_ai.response.time_to_first_chunk").is_none());
+            assert_private(&spans);
+        }
+
+        #[tokio::test]
+        async fn genai_error_and_early_cancel_close_without_error_messages() {
+            for cancelled in [false, true] {
+                let mut mock = MockLlmProvider::new();
+                mock.expect_chat()
+                    .returning(|_| Err(LLMError::AuthError("SECRET_ERROR".into())));
+                let fixture =
+                    TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+                let exec = fixture.execution_context().await;
+                if cancelled {
+                    exec.cancellation_token.cancel();
+                }
+                let context = crate::test_utils::test_context(&exec.session_id, 0);
+                let (result, spans) = capture(transition_call_llm(
+                    &fixture.config,
+                    &context,
+                    &request(),
+                    &exec,
+                ))
+                .await;
+                let chat = spans.iter().find(|s| s.name == "chat mock-model").unwrap();
+                assert_eq!(
+                    attr(chat, "session.id"),
+                    Some(&Value::from(exec.session_id.clone()))
+                );
+                assert_eq!(
+                    attr(chat, "session.id"),
+                    attr(chat, "gen_ai.conversation.id")
+                );
+                if cancelled {
+                    assert!(matches!(result.unwrap(), ExecutionState::Cancelled));
+                    assert_eq!(chat.status, Status::Unset);
+                    assert!(attr(chat, "error.type").is_none());
+                } else {
+                    assert!(result.is_err());
+                    assert_eq!(chat.status, Status::error(""));
+                    assert_eq!(
+                        attr(chat, "error.type"),
+                        Some(&Value::from("authentication"))
+                    );
+                }
+                assert_private(&spans);
+            }
+        }
+
+        #[tokio::test]
+        async fn genai_stream_terminal_and_late_usage_export_one_typed_canonical_result() {
+            for structured in [false, true] {
+                let (_, spans) = capture(async {
+                    async {
+                        let mut accumulator = ChatStreamAccumulator::new();
+                        if structured {
+                            accumulator.push(&metadata_event()).unwrap();
+                            accumulator
+                                .push(&terminal_event(
+                                    ChatOutputStatus::Completed,
+                                    Some(FinishReason::Stop),
+                                ))
+                                .unwrap();
+                        } else {
+                            accumulator
+                                .push(&StreamChunk::Text("SECRET_RESPONSE".into()))
+                                .unwrap();
+                            accumulator
+                                .push(&StreamChunk::Usage(querymt::Usage {
+                                    input_tokens: 10,
+                                    output_tokens: 5,
+                                    ..Default::default()
+                                }))
+                                .unwrap();
+                            accumulator
+                                .push(&StreamChunk::Done {
+                                    finish_reason: FinishReason::Stop,
+                                })
+                                .unwrap();
+                        }
+                        let mut trailing: Pin<
+                            Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>,
+                        > = Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk::Usage(
+                            querymt::Usage {
+                                input_tokens: u32::MAX,
+                                output_tokens: u32::MAX,
+                                cache_read: 20,
+                                cache_write: 30,
+                                reasoning_tokens: 5,
+                            },
+                        ))]));
+                        let usage =
+                            drain_trailing_usage(&mut trailing, &CancellationToken::new()).await;
+                        let ChatStreamFinish::Completed(output) = accumulator.finish() else {
+                            panic!("expected completion")
+                        };
+                        let output = merge_drained_usage(output, usage);
+                        genai::output(&output);
+                    }
+                    .instrument(info_span!(
+                        "test-chat",
+                        otel.name = "chat stream-model",
+                        otel.kind = "client"
+                    ))
+                    .await
+                })
+                .await;
+                assert_eq!(spans.len(), 1);
+                let chat = &spans[0];
+                assert_eq!(chat.span_kind, SpanKind::Client);
+                assert_eq!(chat.status, Status::Unset);
+                assert_eq!(
+                    attr(chat, "gen_ai.usage.input_tokens"),
+                    Some(&Value::I64(i64::from(u32::MAX) + 50))
+                );
+                assert_eq!(
+                    attr(chat, "gen_ai.usage.output_tokens"),
+                    Some(&Value::I64(i64::from(u32::MAX) + 5))
+                );
+                assert_eq!(
+                    attr(chat, "gen_ai.response.finish_reasons"),
+                    Some(&Value::Array(Array::String(vec!["stop".into()])))
+                );
+                assert_private(&spans);
+            }
+        }
+
+        #[tokio::test]
+        async fn genai_polled_then_dropped_request_closes_unset() {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat()
+                .returning(|_| panic!("provider must not be reached while its lock is held"));
+            let shared = SharedLlmProvider::new(mock, vec![]);
+            let lock = shared.inner.clone();
+            let fixture = TestAgent::with_mock_provider(shared).await;
+            let exec = fixture.execution_context().await;
+            // Initialize the provider before blocking the mock's call.
+            exec.session_handle.provider().await.unwrap();
+            let _locked = lock.lock().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (_, spans) = capture(async {
+                let request = request();
+                let mut future = Box::pin(transition_call_llm(
+                    &fixture.config,
+                    &context,
+                    &request,
+                    &exec,
+                ));
+                assert!(futures_util::poll!(&mut future).is_pending());
+                drop(future);
+            })
+            .await;
+            let chat = spans.iter().find(|s| s.name == "chat mock-model").unwrap();
+            assert_eq!(
+                attr(chat, "session.id"),
+                Some(&Value::from(exec.session_id.clone()))
+            );
+            assert_eq!(
+                attr(chat, "session.id"),
+                attr(chat, "gen_ai.conversation.id")
+            );
+            assert_eq!(chat.status, Status::Unset);
+            assert!(attr(chat, "error.type").is_none());
+            assert_eq!(
+                attr(chat, "gen_ai.response.finish_reasons"),
+                Some(&Value::Array(Array::String(vec!["error".into()])))
+            );
+            assert_private(&spans);
+        }
+    }
+
     use crate::middleware::ConversationContext;
     use querymt::chat::{
         ChatFunctionCallItem, ChatMessageItem, ChatMessagePart, ChatOpaqueItem, ChatOutputItem,

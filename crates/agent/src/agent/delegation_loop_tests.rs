@@ -33,6 +33,534 @@ use tokio::sync::Mutex;
 
 // Mock implementations moved to crate::test_utils::mocks
 
+#[tokio::test(flavor = "current_thread")]
+async fn genai_delegation_concurrent_parent_prompts_reach_child_agents_without_persisting_context()
+{
+    use crate::acp::protocol::{ContentBlock, LoadSessionRequest, PromptRequest, TextContent};
+    use crate::agent::handle::AgentHandle as _;
+    use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture_local_tasks};
+    use opentelemetry::Value;
+
+    let ((parents, children), spans) = capture_local_tasks(async {
+        async fn run(trace: &str, unsuccessful_summary: bool) -> (String, String) {
+            let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+            harness.expect_single_delegation().await;
+            harness.stop_harness_orchestrator();
+            tokio::task::yield_now().await;
+            let mut summary_mock = MockLlmProvider::new();
+            summary_mock.expect_chat().times(1).returning(move |_| {
+                let mut output: querymt::chat::ChatOutput =
+                    MockChatResponse::text_only("SECRET_RESPONSE").into();
+                output.finish_reason = Some(FinishReason::Stop);
+                if unsuccessful_summary {
+                    output.status = Some(querymt::chat::ChatOutputStatus::Incomplete);
+                }
+                Ok(output)
+            });
+            let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider {
+                inner: Arc::new(Mutex::new(summary_mock)),
+                tools: Vec::new().into_boxed_slice(),
+            }));
+            let (registry, _summary_dir) =
+                crate::test_utils::helpers::mock_plugin_registry(factory).unwrap();
+            let provider = crate::session::provider::SessionProvider::new(
+                Arc::new(registry),
+                harness.config.provider.history_store(),
+                LLMParams::new().provider("mock").model("summary-model"),
+            );
+            let summarizer = crate::delegation::DelegationSummarizer::from_config(
+                &crate::config::DelegationSummaryConfig {
+                    provider: "mock".into(),
+                    model: "summary-model".into(),
+                    min_history_tokens: 0,
+                    ..Default::default()
+                },
+                &provider,
+            )
+            .await
+            .unwrap();
+            let config = harness.config.clone();
+            let orchestrator = Arc::new(
+                DelegationOrchestrator::new(
+                    Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+                    config.event_sink.clone(),
+                    config.provider.history_store(),
+                    config.agent_registry.clone(),
+                    config.tool_registry_arc(),
+                    config.hooks.clone(),
+                    None,
+                )
+                .with_result_injection(false)
+                .with_summarizer(Some(Arc::new(summarizer))),
+            );
+            harness.orchestrator_handle =
+                Some(orchestrator.start_listening(config.event_sink.fanout()));
+            let handle = crate::agent::LocalAgentHandle::from_config(harness.config.clone());
+            let parent_id = harness.exec_ctx.session_id.clone();
+            handle
+                .load_session(LoadSessionRequest::new(
+                    parent_id.clone(),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .unwrap();
+            let mut request = PromptRequest::new(
+                parent_id.clone(),
+                vec![ContentBlock::Text(TextContent::new("SECRET_PROMPT"))],
+            );
+            request.meta = Some(
+                serde_json::json!({
+                    "traceparent": format!("00-{trace}-1234567890abcdef-01"),
+                    "tracestate": "vendor=value"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle.prompt(request))
+                .await
+                .unwrap()
+                .unwrap();
+            let children = harness.child_sessions().await;
+            assert_eq!(children.len(), 1);
+            harness
+                .provider_mut()
+                .await
+                .expect_chat()
+                .times(1)
+                .returning(|_| Ok(MockChatResponse::text_only("SECRET_RESPONSE").into()));
+            let followup_trace = if unsuccessful_summary {
+                "44444444444444444444444444444444"
+            } else {
+                "33333333333333333333333333333333"
+            };
+            let mut followup = PromptRequest::new(
+                parent_id.clone(),
+                vec![ContentBlock::Text(TextContent::new("SECRET_PROMPT"))],
+            );
+            followup.meta = Some(serde_json::Map::from_iter([(
+                "traceparent".into(),
+                serde_json::Value::from(format!("00-{followup_trace}-fedcba0987654321-01")),
+            )]));
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle.prompt(followup))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(harness.child_sessions().await, children);
+            let events = harness
+                .config
+                .event_sink
+                .journal()
+                .load_session_stream(&parent_id, None, None)
+                .await
+                .unwrap();
+            let target = harness.config.agent_registry.get_handle("agent").unwrap();
+            let child_events = target
+                .as_any()
+                .downcast_ref::<crate::agent::LocalAgentHandle>()
+                .unwrap()
+                .config
+                .event_sink
+                .journal()
+                .load_session_stream(&children[0], None, None)
+                .await
+                .unwrap();
+            let delegations = harness
+                .config
+                .provider
+                .history_store()
+                .list_delegations(&parent_id)
+                .await
+                .unwrap();
+            assert_eq!(delegations.len(), 1);
+            assert_eq!(delegations[0].status, DelegationStatus::Complete);
+            assert_eq!(
+                delegations[0].planning_summary.as_deref(),
+                if unsuccessful_summary {
+                    None
+                } else {
+                    Some("SECRET_RESPONSE")
+                }
+            );
+            for json in [
+                serde_json::to_string(&events).unwrap(),
+                serde_json::to_string(&child_events).unwrap(),
+                serde_json::to_string(&delegations).unwrap(),
+            ] {
+                assert!(!json.contains("traceparent"));
+                assert!(!json.contains("tracestate"));
+                assert!(!json.contains(trace));
+                assert!(!json.contains("vendor=value"));
+            }
+            harness.stop_harness_orchestrator();
+            handle.config.shutdown().await;
+            tokio::task::yield_now().await;
+            (parent_id, children[0].clone())
+        }
+        let (first, second) = tokio::join!(
+            run("11111111111111111111111111111111", false),
+            run("22222222222222222222222222222222", true)
+        );
+        ([first.0, second.0], [first.1, second.1])
+    })
+    .await;
+    for (index, trace) in [
+        "11111111111111111111111111111111",
+        "22222222222222222222222222222222",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let parent = spans
+            .iter()
+            .find(|span| {
+                span.name == "invoke_agent"
+                    && attr(span, "gen_ai.conversation.id")
+                        == Some(&Value::from(parents[index].clone()))
+            })
+            .unwrap();
+        let child = spans
+            .iter()
+            .find(|span| {
+                span.name == "invoke_agent"
+                    && attr(span, "gen_ai.conversation.id")
+                        == Some(&Value::from(children[index].clone()))
+            })
+            .unwrap();
+        assert_eq!(parent.span_context.trace_id().to_string(), *trace);
+        assert_eq!(
+            child.span_context.trace_id(),
+            parent.span_context.trace_id()
+        );
+        assert_eq!(parent.parent_span_id.to_string(), "1234567890abcdef");
+        assert_eq!(
+            attr(parent, "gen_ai.agent.id"),
+            Some(&Value::from("parent"))
+        );
+        assert_eq!(attr(child, "gen_ai.agent.id"), Some(&Value::from("reader")));
+        assert_ne!(parents[index], children[index]);
+        for (span, owner) in [(parent, &parents[index]), (child, &children[index])] {
+            assert_eq!(attr(span, "session.id"), Some(&Value::from(owner.clone())));
+            assert_eq!(
+                attr(span, "session.id"),
+                attr(span, "gen_ai.conversation.id")
+            );
+        }
+        for span in spans.iter().filter(|span| {
+            span.span_context.trace_id() == parent.span_context.trace_id()
+                && attr(span, "gen_ai.operation.name").is_some()
+        }) {
+            let owner = attr(span, "gen_ai.conversation.id").unwrap();
+            assert!(
+                owner == &Value::from(parents[index].clone())
+                    || owner == &Value::from(children[index].clone())
+            );
+            assert_eq!(attr(span, "session.id"), Some(owner));
+            if span.name != "chat summary-model" {
+                assert_eq!(
+                    attr(span, "gen_ai.agent.id"),
+                    Some(&Value::from(
+                        if owner == &Value::from(parents[index].clone()) {
+                            "parent"
+                        } else {
+                            "reader"
+                        }
+                    ))
+                );
+            }
+        }
+        let followup_trace = [
+            "33333333333333333333333333333333",
+            "44444444444444444444444444444444",
+        ][index];
+        let followup_spans: Vec<_> = spans
+            .iter()
+            .filter(|span| {
+                span.span_context.trace_id().to_string() == followup_trace
+                    && attr(span, "gen_ai.operation.name").is_some()
+            })
+            .collect();
+        assert_eq!(followup_spans.len(), 2);
+        assert_eq!(
+            followup_spans
+                .iter()
+                .filter(|span| span.name == "invoke_agent")
+                .count(),
+            1
+        );
+        assert_eq!(
+            followup_spans
+                .iter()
+                .filter(|span| attr(span, "gen_ai.operation.name") == Some(&Value::from("chat")))
+                .count(),
+            1
+        );
+        for span in followup_spans {
+            assert_eq!(attr(span, "gen_ai.agent.id"), Some(&Value::from("parent")));
+            assert_eq!(
+                attr(span, "session.id"),
+                Some(&Value::from(parents[index].clone()))
+            );
+            assert_eq!(
+                attr(span, "session.id"),
+                attr(span, "gen_ai.conversation.id")
+            );
+        }
+        assert_eq!(child.span_context.trace_state().header(), "vendor=value");
+        let execute = spans
+            .iter()
+            .find(|span| {
+                span.name == "delegation.execute"
+                    && attr(span, "child_session_id") == Some(&Value::from(children[index].clone()))
+            })
+            .unwrap();
+        assert_eq!(child.parent_span_id, execute.span_context.span_id());
+        let handlers: Vec<_> = spans
+            .iter()
+            .filter(|span| {
+                span.name == "delegation.orchestrator.handle_event"
+                    && span.span_context.trace_id() == parent.span_context.trace_id()
+            })
+            .collect();
+        assert_eq!(handlers.len(), 1);
+        let handler = handlers[0];
+        assert_eq!(execute.parent_span_id, handler.span_context.span_id());
+        assert_eq!(
+            attr(handler, "event_kind"),
+            Some(&Value::from("DelegationRequested"))
+        );
+        let summary = spans
+            .iter()
+            .find(|span| {
+                span.name == "chat summary-model"
+                    && span.span_context.trace_id() == parent.span_context.trace_id()
+            })
+            .unwrap();
+        assert!(attr(summary, "gen_ai.agent.id").is_none());
+        assert_eq!(
+            attr(summary, "gen_ai.conversation.id"),
+            Some(&Value::from(parents[index].clone()))
+        );
+        assert_eq!(
+            attr(summary, "session.id"),
+            attr(summary, "gen_ai.conversation.id")
+        );
+        assert_eq!(
+            summary.status,
+            if index == 1 {
+                opentelemetry::trace::Status::error("")
+            } else {
+                opentelemetry::trace::Status::Unset
+            }
+        );
+        let mut ancestor = summary;
+        while ancestor.span_context.span_id() != execute.span_context.span_id() {
+            ancestor = spans
+                .iter()
+                .find(|span| span.span_context.span_id() == ancestor.parent_span_id)
+                .expect("summary must descend from its delegation worker");
+        }
+        // The emitter is the original side-effect span, not the consuming listener.
+        let emitter = spans
+            .iter()
+            .find(|span| span.span_context.span_id() == handler.parent_span_id)
+            .unwrap();
+        assert_eq!(emitter.name, "agent.tool.side_effects");
+        assert_eq!(
+            emitter.span_context.trace_id(),
+            parent.span_context.trace_id()
+        );
+    }
+    assert!(
+        spans
+            .iter()
+            .all(|span| span.name != "invoke_workflow" && span.name != "delegation.dispatch")
+    );
+    assert_private(&spans);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consumer_context() {
+    use crate::events::{DurableEvent, EventEnvelope, EventOrigin};
+    use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture_local_tasks};
+    use opentelemetry::{Value, trace::SpanId};
+    use tracing::{Instrument, Span};
+
+    for route in ["absent", "invalid", "remote", "replay"] {
+        let (_, spans) = capture_local_tasks(async {
+            let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+            harness.stop_harness_orchestrator();
+            tokio::task::yield_now().await;
+            let config = harness.config.clone();
+            let store = config.provider.history_store();
+            let orchestrator = Arc::new(
+                DelegationOrchestrator::new(
+                    Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+                    config.event_sink.clone(),
+                    store.clone(),
+                    config.agent_registry.clone(),
+                    config.tool_registry_arc(),
+                    config.hooks.clone(),
+                    None,
+                )
+                .with_result_injection(false),
+            );
+            let consumer = tracing::info_span!(parent: None, "unrelated-consumer");
+            let listener =
+                consumer.in_scope(|| orchestrator.start_listening(config.event_sink.fanout()));
+            let session = store
+                .get_session(&harness.exec_ctx.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let delegation = store
+                .create_delegation(Delegation {
+                    id: 0,
+                    public_id: String::new(),
+                    session_id: session.id,
+                    task_id: None,
+                    target_agent_id: "agent".into(),
+                    objective: "SECRET_ARGUMENT".into(),
+                    objective_hash: crate::hash::RapidHash::new(b"SECRET_ARGUMENT"),
+                    context: Some("SECRET_PROMPT".into()),
+                    constraints: None,
+                    expected_output: None,
+                    verification_spec: None,
+                    planning_summary: None,
+                    status: DelegationStatus::Requested,
+                    retry_count: 0,
+                    created_at: OffsetDateTime::now_utc(),
+                    completed_at: None,
+                })
+                .await
+                .unwrap();
+            let kind = AgentEventKind::DelegationRequested {
+                delegation: delegation.clone(),
+                tool_call_id: None,
+            };
+            let unrelated = tracing::info_span!(parent: None, "unrelated-relay");
+            async {
+                match route {
+                    "remote" => {
+                        config
+                            .event_sink
+                            .emit_durable_with_origin(
+                                &harness.exec_ctx.session_id,
+                                kind,
+                                EventOrigin::Remote,
+                                Some("peer".into()),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    "replay" => {
+                        config
+                            .event_sink
+                            .fanout()
+                            .publish(EventEnvelope::Durable(DurableEvent {
+                                event_id: "replayed".into(),
+                                stream_seq: 1,
+                                session_id: harness.exec_ctx.session_id.clone(),
+                                timestamp: 0,
+                                origin: EventOrigin::Local,
+                                source_node: None,
+                                kind,
+                            }));
+                    }
+                    "invalid" => {
+                        let invalid = serde_json::json!({"traceparent":"invalid"});
+                        assert!(
+                            crate::acp::trace_context::extract_acp_trace_context(&invalid)
+                                .is_none()
+                        );
+                        let root = tracing::info_span!(parent: None, "invalid-request-emitter");
+                        // No valid request context is installed, matching invoke_agent's fallback.
+                        config
+                            .event_sink
+                            .emit_durable(&harness.exec_ctx.session_id, kind)
+                            .instrument(root)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        config
+                            .event_sink
+                            .emit_durable(&harness.exec_ctx.session_id, kind)
+                            .instrument(Span::none())
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            .instrument(if route == "absent" {
+                Span::none()
+            } else {
+                unrelated
+            })
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if store
+                        .get_delegation(&delegation.public_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .status
+                        == DelegationStatus::Complete
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            orchestrator.cancel_active_delegations().await;
+            listener.abort();
+            let _ = listener.await;
+        })
+        .await;
+        let handlers: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "delegation.orchestrator.handle_event")
+            .collect();
+        assert_eq!(handlers.len(), 1);
+        let handler = handlers[0];
+        assert!(spans.iter().all(|span| span.name != "delegation.dispatch"));
+        if route != "invalid" {
+            assert_eq!(handler.parent_span_id, SpanId::INVALID);
+        }
+        let child = spans
+            .iter()
+            .find(|span| span.name == "invoke_agent")
+            .unwrap();
+        assert_eq!(
+            child.span_context.trace_id(),
+            handler.span_context.trace_id()
+        );
+        let execute = spans
+            .iter()
+            .find(|span| span.name == "delegation.execute")
+            .unwrap();
+        assert_eq!(child.parent_span_id, execute.span_context.span_id());
+        assert_eq!(execute.parent_span_id, handler.span_context.span_id());
+        for unrelated in spans
+            .iter()
+            .filter(|span| span.name == "unrelated-consumer" || span.name == "unrelated-relay")
+        {
+            assert_ne!(
+                child.span_context.trace_id(),
+                unrelated.span_context.trace_id()
+            );
+        }
+        assert_eq!(
+            attr(child, "gen_ai.operation.name"),
+            Some(&Value::from("invoke_agent"))
+        );
+        assert_private(&spans);
+    }
+}
+
 /// A middleware that immediately stops execution with `StepLimit`,
 /// simulating what happens when a delegate is stopped by middleware before
 /// completing its work. Uses `StepLimit` (maps to `StopReason::MaxTurnRequests`)
@@ -180,7 +708,8 @@ impl TestHarness {
             registry,
             store.clone(),
             LLMParams::new().provider("mock").model("mock-model"),
-        );
+        )
+        .with_agent_id(Some("parent".into()));
         let provider_context = Arc::new(provider_context);
 
         // Create the parent session via SessionProvider so LLM config is set up.
@@ -317,7 +846,7 @@ impl TestHarness {
             .expect("set parent config");
     }
 
-    async fn run_single_delegation(&mut self) -> CycleOutcome {
+    async fn expect_single_delegation(&mut self) {
         let delegate_call = mock_querymt_tool_call(
             "call-1",
             "delegate",
@@ -355,7 +884,10 @@ impl TestHarness {
             .expect_tools()
             .return_const(None)
             .times(0..);
+    }
 
+    async fn run_single_delegation(&mut self) -> CycleOutcome {
+        self.expect_single_delegation().await;
         self.run().await
     }
 
@@ -535,11 +1067,14 @@ async fn build_delegate_handle(
 
     let mut delegate_params = LLMParams::new().provider("mock").model("mock-model");
     delegate_params.reasoning_effort = reasoning_effort;
-    let delegate_session_provider = Arc::new(crate::session::provider::SessionProvider::new(
-        delegate_plugin_registry,
-        shared_store,
-        delegate_params,
-    ));
+    let delegate_session_provider = Arc::new(
+        crate::session::provider::SessionProvider::new(
+            delegate_plugin_registry,
+            shared_store,
+            delegate_params,
+        )
+        .with_agent_id(Some("reader".into())),
+    );
     let delegate_event_storage = Arc::new(
         SqliteStorage::connect(":memory:".into())
             .await

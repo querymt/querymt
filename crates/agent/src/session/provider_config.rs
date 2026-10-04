@@ -23,6 +23,7 @@ pub(crate) struct ResolvedProviderConfig {
     #[cfg(feature = "oauth")]
     pub builder_config: Value,
     pub pruned_config_str: String,
+    pub generation_settings: crate::agent::utils::genai::GenerationSettings,
     pub pruned_keys: Vec<String>,
     pub use_oauth_resolver: bool,
 }
@@ -195,15 +196,36 @@ pub(crate) async fn resolve_provider_config(
     let SharedResolvedProviderConfig {
         #[cfg(feature = "oauth")]
         full_config,
+        pruned_config,
         pruned_config_str,
         pruned_keys,
         ..
     } = builder.prune_for_factory(factory.as_ref())?;
 
+    // Trust implementation identity, not a logical alias or a custom factory's name.
+    // Derive only scalar metadata while the final pruned Value is already available.
+    let generation_settings = binding
+        .implementation_id
+        .as_deref()
+        .and_then(|id| id.strip_prefix("oci://ghcr.io/querymt/"))
+        .filter(|id| {
+            id.strip_prefix(factory.name()).is_some_and(|suffix| {
+                suffix.starts_with(':') || suffix.starts_with('@') || suffix.is_empty()
+            })
+        })
+        .map(|_| {
+            crate::agent::utils::genai::GenerationSettings::from_config(
+                factory.name(),
+                &pruned_config,
+            )
+        })
+        .unwrap_or_default();
+
     Ok(ResolvedProviderConfig {
         #[cfg(feature = "oauth")]
         builder_config: full_config,
         pruned_config_str,
+        generation_settings,
         pruned_keys,
         use_oauth_resolver,
     })
@@ -397,6 +419,68 @@ mod tests {
             let _ = resolve_provider_config(&binding, &initial, ProviderConfigMode::CatalogListing)
                 .await
                 .expect("resolved config");
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_settings_follow_binding_session_defaults_and_schema_pruning() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::Value;
+        let registry = registry_with_provider("providers = []");
+        let factory = adapted_factory(
+            Some("UNUSED_TEST_KEY"),
+            r#"{"type":"object","properties":{"model":{"type":"string"},"api_key":{"type":"string"},"max_tokens":{"type":"integer"},"temperature":{"type":"number"},"reasoning_effort":{"type":"string"}},"additionalProperties":false}"#,
+        );
+        for binding_max in [None, Some(1234)] {
+            let mut binding = binding(&registry, factory.clone());
+            binding.logical_name = "anthropic".into();
+            binding.static_config =
+                serde_json::json!({"api_key":"SECRET_ARGUMENT", "temperature":0.25});
+            if let Some(max) = binding_max {
+                binding.static_config["max_tokens"] = max.into();
+            }
+            let params =
+                serde_json::json!({"temperature":0.5, "top_p":0.75, "reasoning_effort":"high"});
+            let config = resolve_provider_config(
+                &binding,
+                &LLMParams::new(),
+                ProviderConfigMode::Runtime {
+                    model: "claude-test",
+                    params: Some(&params),
+                    api_key_override: None,
+                    session_id: "test",
+                },
+            )
+            .await
+            .unwrap();
+            let config: serde_json::Value =
+                serde_json::from_str(&config.pruned_config_str).unwrap();
+            assert_eq!(config["temperature"], 0.5);
+            assert!(config.get("top_p").is_none());
+            let max = binding_max.unwrap_or(32_000);
+            assert_eq!(config["max_tokens"], max);
+            let (_, spans) = capture(async {
+                let span = tracing::info_span!("resolved-settings");
+                span.in_scope(|| {
+                    crate::agent::utils::genai::GenerationSettings::from_config(
+                        "anthropic",
+                        &config,
+                    )
+                    .record(&span)
+                });
+            })
+            .await;
+            assert_eq!(
+                attr(&spans[0], "gen_ai.request.max_tokens"),
+                Some(&Value::I64(max))
+            );
+            assert_eq!(
+                attr(&spans[0], "gen_ai.request.temperature"),
+                Some(&Value::F64(1.0))
+            );
+            assert!(attr(&spans[0], "gen_ai.request.top_p").is_none());
+            assert!(attr(&spans[0], "gen_ai.request.reasoning.level").is_none());
+            assert_private(&spans);
         }
     }
 

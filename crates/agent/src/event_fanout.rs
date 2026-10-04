@@ -3,7 +3,7 @@
 //! `EventFanout` delivers events to live subscribers. It does NOT write to
 //! storage. This is the "transport boundary" from the refactor plan.
 
-use crate::events::EventEnvelope;
+use crate::events::{AgentEventKind, EventEnvelope};
 use tokio::sync::broadcast;
 
 const FANOUT_BUFFER: usize = 1024;
@@ -14,13 +14,18 @@ const FANOUT_BUFFER: usize = 1024;
 /// No persistence behavior.
 pub struct EventFanout {
     sender: broadcast::Sender<EventEnvelope>,
+    delegation_sender: broadcast::Sender<(EventEnvelope, Option<tracing::Span>)>,
 }
 
 impl EventFanout {
     /// Create a new fanout with a bounded broadcast channel.
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(FANOUT_BUFFER);
-        Self { sender }
+        let (delegation_sender, _) = broadcast::channel(FANOUT_BUFFER);
+        Self {
+            sender,
+            delegation_sender,
+        }
     }
 
     /// Subscribe to the live event stream.
@@ -30,12 +35,39 @@ impl EventFanout {
 
     /// Publish an event envelope to all live subscribers.
     pub fn publish(&self, envelope: EventEnvelope) {
+        self.publish_with_context(envelope, None);
+    }
+
+    pub(crate) fn is_delegation_event(kind: &AgentEventKind) -> bool {
+        matches!(
+            kind,
+            AgentEventKind::DelegationRequested { .. }
+                | AgentEventKind::DelegationCancelRequested { .. }
+                | AgentEventKind::Cancelled
+        )
+    }
+
+    pub(crate) fn subscribe_delegation(
+        &self,
+    ) -> broadcast::Receiver<(EventEnvelope, Option<tracing::Span>)> {
+        self.delegation_sender.subscribe()
+    }
+
+    // Context belongs only to this bounded live channel, never the journal or public wire.
+    pub(crate) fn publish_with_context(
+        &self,
+        envelope: EventEnvelope,
+        parent: Option<tracing::Span>,
+    ) {
+        if Self::is_delegation_event(envelope.kind()) {
+            let _ = self.delegation_sender.send((envelope.clone(), parent));
+        }
         let _ = self.sender.send(envelope);
     }
 
     /// Number of active subscribers.
     pub fn subscriber_count(&self) -> usize {
-        self.sender.receiver_count()
+        self.sender.receiver_count() + self.delegation_sender.receiver_count()
     }
 }
 

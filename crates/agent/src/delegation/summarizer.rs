@@ -5,18 +5,21 @@
 //! provides the coder with context about decisions made, files to modify, patterns
 //! to follow, and implementation steps.
 
-use crate::agent::utils::{render_prompt_for_display, render_prompt_for_llm};
+use crate::agent::utils::{genai, render_prompt_for_display, render_prompt_for_llm};
 use crate::config::DelegationSummaryConfig;
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider::{ProviderRequest, SessionProvider};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatRole, StreamChunk};
+use querymt::chat::{
+    ChatMessage, ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator, FinishReason,
+    StreamChunk,
+};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::instrument;
+use tracing::{Instrument, instrument};
 
 /// System prompt for the summarizer LLM
 const SUMMARIZER_SYSTEM_PROMPT: &str = r#"You are a technical brief writer for a software development team. Your job is to 
@@ -35,6 +38,8 @@ Rules:
 /// Summarizes a parent planning session for delegation handoff
 pub struct DelegationSummarizer {
     provider: Arc<dyn LLMProvider>,
+    provider_name: String,
+    model: String,
     timeout: Duration,
     min_history_tokens: usize,
     estimator: Arc<dyn TokenEstimator>,
@@ -65,6 +70,8 @@ impl DelegationSummarizer {
 
         Ok(Self {
             provider,
+            provider_name: config.provider.clone(),
+            model: config.model.clone(),
             timeout: Duration::from_secs(config.timeout_secs),
             min_history_tokens: config.min_history_tokens,
             estimator: Arc::new(SimpleTokenEstimator),
@@ -74,9 +81,8 @@ impl DelegationSummarizer {
     /// Generate a structured Implementation Brief from parent session history
     #[instrument(
         name = "delegation.summarizer.summarize",
-        skip(self, parent_history),
+        skip(self, parent_history, delegation_objective),
         fields(
-            objective = %delegation_objective,
             history_messages = parent_history.len(),
             estimated_tokens = tracing::field::Empty,
             strategy = tracing::field::Empty,
@@ -137,23 +143,54 @@ impl DelegationSummarizer {
         );
 
         let llm_start = std::time::Instant::now();
-        let summary = tokio::time::timeout(
-            timeout,
-            Self::call_provider(&self.provider, &messages, use_streaming),
-        )
-        .await
-        .map_err(|_| {
-            SessionError::InvalidOperation(format!(
-                "Delegation summary generation timed out after {} seconds",
-                timeout.as_secs()
-            ))
-        })?
-        .map_err(|e| {
-            SessionError::InvalidOperation(format!("Delegation summary LLM call failed: {}", e))
-        })?;
+        let session_id = parent_history
+            .first()
+            .map(|message| message.session_id.as_str())
+            .filter(|id| !id.is_empty());
+        let inference = tracing::info_span!(
+            "delegation.summarizer.chat",
+            otel.name = %format!("chat {}", self.model),
+            otel.kind = "client",
+            gen_ai.operation.name = "chat",
+            gen_ai.provider.name = %genai::provider_name(&self.provider_name),
+            gen_ai.request.model = %self.model,
+            gen_ai.request.stream = use_streaming,
+            gen_ai.conversation.id = session_id,
+            session.id = session_id,
+        );
+        let output = async {
+            // Default finish survives cancellation/drop without declaring an operation error.
+            genai::finish_reason("error");
+            match tokio::time::timeout(
+                timeout,
+                Self::call_provider(&self.provider, &messages, use_streaming),
+            )
+            .await
+            {
+                Ok(Ok(output)) => Ok(output),
+                Ok(Err(error)) => {
+                    genai::llm_error(&error);
+                    Err(SessionError::InvalidOperation(format!(
+                        "Delegation summary LLM call failed: {error}"
+                    )))
+                }
+                Err(_) => {
+                    genai::error("timeout");
+                    Err(SessionError::InvalidOperation(format!(
+                        "Delegation summary generation timed out after {} seconds",
+                        timeout.as_secs()
+                    )))
+                }
+            }
+        }
+        .instrument(inference)
+        .await?;
         span.record("llm_duration_ms", llm_start.elapsed().as_millis() as u64);
 
-        let summary = summary.unwrap_or_else(|| "No summary generated".to_string());
+        let summary = output
+            .text()
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "No summary generated".to_string());
         span.record("output_bytes", summary.len() as u64);
         Ok(summary)
     }
@@ -162,27 +199,71 @@ impl DelegationSummarizer {
         provider: &Arc<dyn LLMProvider>,
         messages: &[ChatMessage],
         use_streaming: bool,
-    ) -> Result<Option<String>, querymt::error::LLMError> {
-        if !use_streaming {
-            return provider
-                .chat(messages)
-                .await
-                .map(|response| response.text());
-        }
-
-        let mut stream = provider.chat_stream(messages).await?;
-        let mut text = String::new();
-        while let Some(chunk) = stream.next().await {
-            match chunk? {
-                StreamChunk::Text(delta) => text.push_str(&delta),
-                // The canonical structured terminal is terminal for consumers
-                // that only need display text, just like a legacy `Done`.
-                chunk if querymt::chat::chunk_is_terminal(&chunk) => break,
-                _ => {}
+    ) -> Result<ChatOutput, querymt::error::LLMError> {
+        let (output, stream_completed) = if use_streaming {
+            let chat_span = tracing::Span::current();
+            let mut first_chunk = genai::FirstChunk::default();
+            first_chunk.start();
+            let mut stream = provider.chat_stream(messages).await?;
+            let mut accumulator = ChatStreamAccumulator::new();
+            let mut terminal_seen = false;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.inspect_err(|_| genai::output(&accumulator.output()))?;
+                first_chunk.received(&chat_span);
+                accumulator.push(&chunk).map_err(|_| {
+                    genai::output(&accumulator.output());
+                    querymt::error::LLMError::GenericError("Invalid summary stream".into())
+                })?;
+                if querymt::chat::chunk_is_terminal(&chunk) {
+                    terminal_seen = true;
+                    break;
+                }
             }
-        }
+            if !terminal_seen {
+                genai::output(&accumulator.output());
+                return Err(querymt::error::LLMError::GenericError(
+                    "Invalid summary stream: missing terminal event".into(),
+                ));
+            }
+            // Keep failed/incomplete terminal metadata, but retain canonical item validation.
+            let finish = accumulator.finish();
+            let completed = finish.is_completed();
+            let mut output = finish.into_output();
+            // Merge only ready usage; never wait for a trailing chunk, even on rejection.
+            while let Some(Some(Ok(StreamChunk::Usage(extra)))) = stream.next().now_or_never() {
+                output.usage = Some(match output.usage.take() {
+                    Some(previous) => previous.merge_max(extra),
+                    None => extra,
+                });
+            }
+            (output, completed)
+        } else {
+            (provider.chat(messages).await?, true)
+        };
 
-        Ok((!text.is_empty()).then_some(text))
+        // Record billed usage and actual finish before applying the summary-only success policy.
+        genai::output(&output);
+        if !stream_completed
+            || output
+                .status
+                .is_some_and(|status| status != ChatOutputStatus::Completed)
+            || matches!(
+                output.finish_reason,
+                Some(
+                    FinishReason::Length
+                        | FinishReason::ContentFilter
+                        | FinishReason::Error
+                        | FinishReason::ToolCalls
+                )
+            )
+            || output.tool_calls().is_some_and(|calls| !calls.is_empty())
+        {
+            return Err(querymt::error::LLMError::GenericError(format!(
+                "Delegation summary response did not complete successfully (status={:?}, finish_reason={:?})",
+                output.status, output.finish_reason
+            )));
+        }
+        Ok(output)
     }
 
     /// Estimate token count for a list of messages using the configured estimator
@@ -419,9 +500,12 @@ mod tests {
 
     struct SummaryTestProvider {
         supports_streaming: bool,
-        chat_result: Mutex<Option<Result<String, LLMError>>>,
+        chat_result: Mutex<Option<Result<ChatOutput, LLMError>>>,
         stream_result: Mutex<Option<SummaryChunks>>,
         stall_stream: bool,
+        pending_tail: bool,
+        setup_delay: Duration,
+        first_delay: Duration,
         chat_calls: AtomicUsize,
         stream_calls: AtomicUsize,
     }
@@ -436,11 +520,22 @@ mod tests {
         }
 
         fn non_streaming(result: Result<String, LLMError>) -> Self {
+            Self::output(
+                result.map(|text| {
+                    crate::test_utils::mocks::MockChatResponse::text_only(&text).into()
+                }),
+            )
+        }
+
+        fn output(result: Result<ChatOutput, LLMError>) -> Self {
             Self {
                 supports_streaming: false,
                 chat_result: Mutex::new(Some(result)),
                 stream_result: Mutex::new(None),
                 stall_stream: false,
+                pending_tail: false,
+                setup_delay: Duration::ZERO,
+                first_delay: Duration::ZERO,
                 chat_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
             }
@@ -452,6 +547,9 @@ mod tests {
                 chat_result: Mutex::new(None),
                 stream_result: Mutex::new(Some(Ok(chunks))),
                 stall_stream: false,
+                pending_tail: false,
+                setup_delay: Duration::ZERO,
+                first_delay: Duration::ZERO,
                 chat_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
             }
@@ -463,6 +561,9 @@ mod tests {
                 chat_result: Mutex::new(None),
                 stream_result: Mutex::new(None),
                 stall_stream: true,
+                pending_tail: false,
+                setup_delay: Duration::ZERO,
+                first_delay: Duration::ZERO,
                 chat_calls: AtomicUsize::new(0),
                 stream_calls: AtomicUsize::new(0),
             }
@@ -481,8 +582,7 @@ mod tests {
             _tools: Option<&[Tool]>,
         ) -> Result<ChatOutput, LLMError> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
-            let result = self
-                .chat_result
+            self.chat_result
                 .lock()
                 .expect("chat result lock")
                 .take()
@@ -490,8 +590,7 @@ mod tests {
                     Err(LLMError::NotImplemented(
                         "non-streaming chat was not configured".to_string(),
                     ))
-                });
-            result.map(|text| crate::test_utils::mocks::MockChatResponse::text_only(&text).into())
+                })
         }
 
         async fn chat_stream_with_tools(
@@ -500,6 +599,9 @@ mod tests {
             _tools: Option<&[Tool]>,
         ) -> Result<SummaryStream, LLMError> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.setup_delay.is_zero() {
+                tokio::time::sleep(self.setup_delay).await;
+            }
             if self.stall_stream {
                 return Ok(Box::pin(futures_util::stream::pending()));
             }
@@ -514,7 +616,21 @@ mod tests {
                         "streaming chat was not configured".to_string(),
                     ))
                 })?;
-            Ok(Box::pin(futures_util::stream::iter(chunks)))
+            let mut first_delay = self.first_delay;
+            let stream = futures_util::stream::iter(chunks).then(move |chunk| {
+                let delay = std::mem::take(&mut first_delay);
+                async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    chunk
+                }
+            });
+            if self.pending_tail {
+                Ok(Box::pin(stream.chain(futures_util::stream::pending())))
+            } else {
+                Ok(Box::pin(stream))
+            }
         }
     }
 
@@ -533,6 +649,615 @@ mod tests {
     }
 
     impl LLMProvider for SummaryTestProvider {}
+
+    #[tokio::test]
+    async fn genai_summary_non_streaming_records_typed_metadata_without_content() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::{
+            Array, Value,
+            trace::{SpanKind, Status},
+        };
+        let mut output: ChatOutput =
+            crate::test_utils::mocks::MockChatResponse::text_only("SECRET_RESPONSE").into();
+        output.finish_reason = Some(FinishReason::Stop);
+        output.response_id = Some("summary-response-id".into());
+        output.provenance = Some(querymt::chat::ChatOutputProvenance {
+            provider: "codex".into(),
+            model: "reported-summary-model".into(),
+            protocol: "SECRET_ARGUMENT".into(),
+            endpoint: "SECRET_ENDPOINT".into(),
+        });
+        output.usage = Some(querymt::Usage {
+            input_tokens: u32::MAX,
+            output_tokens: 20,
+            cache_read: 7,
+            cache_write: 3,
+            reasoning_tokens: 5,
+        });
+        let summarizer = summarizer_with_provider(
+            Arc::new(SummaryTestProvider::output(Ok(output))),
+            Duration::from_secs(1),
+        );
+        let (result, spans) =
+            capture(summarizer.summarize(&[make_user_msg("SECRET_PROMPT")], "SECRET_ARGUMENT"))
+                .await;
+        assert_eq!(result.unwrap(), "SECRET_RESPONSE");
+        let chat = spans
+            .iter()
+            .find(|span| span.name == "chat requested-summary-model")
+            .unwrap();
+        assert_eq!(chat.span_kind, SpanKind::Client);
+        assert_eq!(chat.status, Status::Unset);
+        assert_eq!(
+            attr(chat, "gen_ai.provider.name"),
+            Some(&Value::from("openai"))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.request.model"),
+            Some(&Value::from("requested-summary-model"))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.response.model"),
+            Some(&Value::from("reported-summary-model"))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.response.id"),
+            Some(&Value::from("summary-response-id"))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.conversation.id"),
+            Some(&Value::from("s1"))
+        );
+        assert_eq!(
+            attr(chat, "session.id"),
+            attr(chat, "gen_ai.conversation.id")
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.request.stream"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.input_tokens"),
+            Some(&Value::I64(i64::from(u32::MAX) + 10))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.output_tokens"),
+            Some(&Value::I64(25))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.cache_read.input_tokens"),
+            Some(&Value::I64(7))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.cache_write.input_tokens"),
+            Some(&Value::I64(3))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+            Some(&Value::I64(5))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.response.finish_reasons"),
+            Some(&Value::Array(Array::String(vec!["stop".into()])))
+        );
+        assert!(attr(chat, "gen_ai.response.time_to_first_chunk").is_none());
+        assert_private(&spans);
+
+        for session_id in [None, Some("")] {
+            let summarizer = summarizer_with_provider(
+                Arc::new(SummaryTestProvider::non_streaming_text("SECRET_RESPONSE")),
+                Duration::from_secs(1),
+            );
+            let history: Vec<_> = session_id
+                .into_iter()
+                .map(|id| {
+                    let mut message = make_user_msg("SECRET_PROMPT");
+                    message.session_id = id.into();
+                    message
+                })
+                .collect();
+            let (result, spans) = capture(async {
+                summarizer
+                    .summarize(&history, "SECRET_ARGUMENT")
+                    .instrument(tracing::info_span!(
+                        "unrelated-parent",
+                        session.id = "unrelated-session"
+                    ))
+                    .await
+            })
+            .await;
+            assert_eq!(result.unwrap(), "SECRET_RESPONSE");
+            let chat = spans
+                .iter()
+                .find(|span| span.name == "chat requested-summary-model")
+                .unwrap();
+            assert!(attr(chat, "gen_ai.conversation.id").is_none());
+            assert!(attr(chat, "session.id").is_none());
+            assert_private(&spans);
+        }
+    }
+
+    fn partial_summary_output(
+        status: Option<ChatOutputStatus>,
+        finish: FinishReason,
+    ) -> ChatOutput {
+        let mut output: ChatOutput =
+            crate::test_utils::mocks::MockChatResponse::text_only("SECRET_RESPONSE").into();
+        output.status = status;
+        output.finish_reason = Some(finish);
+        output.response_id = Some("partial-summary-id".into());
+        output.provenance = Some(querymt::chat::ChatOutputProvenance {
+            provider: "codex".into(),
+            model: "reported-summary-model".into(),
+            protocol: "SECRET_ARGUMENT".into(),
+            endpoint: "SECRET_ENDPOINT".into(),
+        });
+        output
+    }
+
+    async fn assert_summary_rejected(
+        provider: SummaryTestProvider,
+        expected: &ChatOutput,
+        finish: &str,
+    ) {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::{Array, Value, trace::Status};
+        let streaming = provider.supports_streaming;
+        let summarizer = summarizer_with_provider(Arc::new(provider), Duration::from_secs(1));
+        let (result, spans) =
+            capture(summarizer.summarize(&[make_user_msg("SECRET_PROMPT")], "SECRET_ARGUMENT"))
+                .await;
+        let error = result
+            .expect_err("partial brief must not be returned")
+            .to_string();
+        assert!(error.contains("did not complete successfully"));
+        assert!(!error.contains("SECRET_"));
+        let chats: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "chat requested-summary-model")
+            .collect();
+        assert_eq!(chats.len(), 1);
+        let chat = chats[0];
+        assert_eq!(chat.status, Status::error(""));
+        assert_eq!(
+            attr(chat, "error.type"),
+            Some(&Value::from("provider_error"))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.request.stream"),
+            Some(&Value::Bool(streaming))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.response.id"),
+            expected.response_id.clone().map(Value::from).as_ref()
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.response.model"),
+            expected
+                .provenance
+                .as_ref()
+                .map(|origin| Value::from(origin.model.clone()))
+                .as_ref()
+        );
+        let usage = expected.usage.as_ref().unwrap();
+        assert_eq!(
+            attr(chat, "gen_ai.usage.input_tokens"),
+            Some(&Value::I64(i64::from(usage.input_tokens)))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.output_tokens"),
+            Some(&Value::I64(i64::from(usage.output_tokens)))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.response.finish_reasons"),
+            Some(&Value::Array(Array::String(vec![finish.to_owned().into()])))
+        );
+        assert_private(&spans);
+    }
+
+    #[tokio::test]
+    async fn genai_summary_rejects_unsuccessful_non_streaming_outputs_without_losing_metadata() {
+        for (status, finish, reason, tool_call) in [
+            (
+                Some(ChatOutputStatus::Incomplete),
+                FinishReason::Stop,
+                "stop",
+                false,
+            ),
+            (
+                Some(ChatOutputStatus::Failed),
+                FinishReason::Stop,
+                "stop",
+                false,
+            ),
+            (
+                Some(ChatOutputStatus::InProgress),
+                FinishReason::Stop,
+                "stop",
+                false,
+            ),
+            (
+                Some(ChatOutputStatus::Completed),
+                FinishReason::Length,
+                "length",
+                false,
+            ),
+            (
+                Some(ChatOutputStatus::Completed),
+                FinishReason::ContentFilter,
+                "content_filter",
+                false,
+            ),
+            (
+                Some(ChatOutputStatus::Completed),
+                FinishReason::ToolCalls,
+                "tool_calls",
+                false,
+            ),
+            (
+                Some(ChatOutputStatus::Completed),
+                FinishReason::Error,
+                "error",
+                false,
+            ),
+            (
+                Some(ChatOutputStatus::Completed),
+                FinishReason::Stop,
+                "stop",
+                true,
+            ),
+        ] {
+            let mut output = partial_summary_output(status, finish);
+            if tool_call {
+                output
+                    .items
+                    .push(querymt::chat::ChatOutputItem::FunctionCall(
+                        querymt::chat::ChatFunctionCallItem {
+                            item_id: None,
+                            call_id: "summary-call".into(),
+                            name: "SECRET_ARGUMENT".into(),
+                            arguments: r#"{"value":"SECRET_ARGUMENT"}"#.into(),
+                            status: Some(ChatOutputStatus::Completed),
+                            extensions: Default::default(),
+                        },
+                    ));
+            }
+            assert_summary_rejected(
+                SummaryTestProvider::output(Ok(output.clone())),
+                &output,
+                reason,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_summary_accepts_legacy_status_none_with_stop() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, capture};
+        use opentelemetry::trace::Status;
+        let output = partial_summary_output(None, FinishReason::Stop);
+        let summarizer = summarizer_with_provider(
+            Arc::new(SummaryTestProvider::output(Ok(output))),
+            Duration::from_secs(1),
+        );
+        let (result, spans) =
+            capture(summarizer.summarize(&[make_user_msg("SECRET_PROMPT")], "SECRET_ARGUMENT"))
+                .await;
+        assert_eq!(result.unwrap(), "SECRET_RESPONSE");
+        assert_eq!(
+            spans
+                .iter()
+                .find(|span| span.name == "chat requested-summary-model")
+                .unwrap()
+                .status,
+            Status::Unset
+        );
+        assert_private(&spans);
+    }
+
+    #[tokio::test]
+    async fn genai_summary_rejects_unsuccessful_streams_and_keeps_ready_billed_usage() {
+        use querymt::chat::StructuredStreamEvent;
+        for structured in [false, true] {
+            for (status, finish, reason, unfinished_item) in [
+                (
+                    ChatOutputStatus::Completed,
+                    FinishReason::Length,
+                    "length",
+                    false,
+                ),
+                (
+                    ChatOutputStatus::Completed,
+                    FinishReason::ContentFilter,
+                    "content_filter",
+                    false,
+                ),
+                (
+                    ChatOutputStatus::Completed,
+                    FinishReason::ToolCalls,
+                    "tool_calls",
+                    false,
+                ),
+                (
+                    ChatOutputStatus::Completed,
+                    FinishReason::Error,
+                    "error",
+                    false,
+                ),
+                (
+                    ChatOutputStatus::Incomplete,
+                    FinishReason::Stop,
+                    "stop",
+                    false,
+                ),
+                (ChatOutputStatus::Failed, FinishReason::Stop, "stop", false),
+                (
+                    ChatOutputStatus::InProgress,
+                    FinishReason::Stop,
+                    "stop",
+                    false,
+                ),
+                (
+                    ChatOutputStatus::Completed,
+                    FinishReason::Stop,
+                    "stop",
+                    true,
+                ),
+            ] {
+                if !structured && (status != ChatOutputStatus::Completed || unfinished_item) {
+                    continue;
+                }
+                let mut output = partial_summary_output(Some(status), finish);
+                let mut chunks = if structured {
+                    vec![
+                        StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                            response_id: output.response_id.clone(),
+                            status: Some(ChatOutputStatus::InProgress),
+                            usage: None,
+                            finish_reason: None,
+                            provenance: output.provenance.clone(),
+                        }),
+                        StreamChunk::Structured(if unfinished_item {
+                            StructuredStreamEvent::ItemStarted {
+                                output_index: 0,
+                                item: output.items[0].clone(),
+                            }
+                        } else {
+                            StructuredStreamEvent::ItemCompleted {
+                                output_index: 0,
+                                item: output.items[0].clone(),
+                            }
+                        }),
+                        StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                            status,
+                            usage: output.usage.clone(),
+                            finish_reason: Some(finish),
+                            detail: Some("SECRET_ERROR".into()),
+                        }),
+                    ]
+                } else {
+                    output.response_id = None;
+                    output.provenance = None;
+                    vec![
+                        StreamChunk::Text("SECRET_RESPONSE".into()),
+                        StreamChunk::Usage(output.usage.clone().unwrap()),
+                        StreamChunk::Done {
+                            finish_reason: finish,
+                        },
+                    ]
+                };
+                output.usage = Some(querymt::Usage {
+                    input_tokens: 200,
+                    output_tokens: 70,
+                    ..Default::default()
+                });
+                chunks.push(StreamChunk::Usage(output.usage.clone().unwrap()));
+                let mut provider =
+                    SummaryTestProvider::streaming(chunks.into_iter().map(Ok).collect());
+                provider.pending_tail = true;
+                assert_summary_rejected(provider, &output, reason).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_summary_streams_merge_ready_usage_and_ignore_projections_without_waiting() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::{Value, trace::Status};
+        use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
+        for structured in [false, true] {
+            let initial = querymt::Usage {
+                input_tokens: 12,
+                output_tokens: 20,
+                ..Default::default()
+            };
+            let mut chunks = if structured {
+                let output: ChatOutput =
+                    crate::test_utils::mocks::MockChatResponse::text_only("SECRET_RESPONSE").into();
+                vec![
+                    StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                        response_id: Some("stream-summary-id".into()),
+                        status: Some(ChatOutputStatus::InProgress),
+                        usage: None,
+                        finish_reason: None,
+                        provenance: Some(querymt::chat::ChatOutputProvenance {
+                            provider: "codex".into(),
+                            model: "reported-stream-model".into(),
+                            protocol: "SECRET_ARGUMENT".into(),
+                            endpoint: "SECRET_ENDPOINT".into(),
+                        }),
+                    }),
+                    StreamChunk::Text("SECRET_ARGUMENT".into()),
+                    StreamChunk::Structured(StructuredStreamEvent::ItemCompleted {
+                        output_index: 0,
+                        item: output.items[0].clone(),
+                    }),
+                    StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                        status: ChatOutputStatus::Completed,
+                        usage: Some(initial),
+                        finish_reason: Some(FinishReason::Stop),
+                        detail: None,
+                    }),
+                ]
+            } else {
+                vec![
+                    StreamChunk::Thinking("SECRET_ARGUMENT".into()),
+                    StreamChunk::Text("SECRET_RESPONSE".into()),
+                    StreamChunk::Usage(initial),
+                    StreamChunk::Done {
+                        finish_reason: FinishReason::Stop,
+                    },
+                ]
+            };
+            chunks.extend([
+                StreamChunk::Usage(querymt::Usage {
+                    input_tokens: 30,
+                    output_tokens: 5,
+                    cache_read: 7,
+                    ..Default::default()
+                }),
+                StreamChunk::Usage(querymt::Usage {
+                    input_tokens: 10,
+                    output_tokens: 40,
+                    reasoning_tokens: 2,
+                    ..Default::default()
+                }),
+            ]);
+            let mut provider = SummaryTestProvider::streaming(chunks.into_iter().map(Ok).collect());
+            provider.setup_delay = Duration::from_millis(20);
+            provider.first_delay = Duration::from_millis(20);
+            provider.pending_tail = true;
+            let summarizer = summarizer_with_provider(Arc::new(provider), Duration::from_secs(1));
+            let (result, spans) =
+                capture(summarizer.summarize(&[make_user_msg("SECRET_PROMPT")], "SECRET_ARGUMENT"))
+                    .await;
+            assert_eq!(result.unwrap(), "SECRET_RESPONSE");
+            let chat = spans
+                .iter()
+                .find(|span| span.name == "chat requested-summary-model")
+                .unwrap();
+            assert_eq!(chat.status, Status::Unset);
+            assert!(
+                matches!(attr(chat, "gen_ai.response.time_to_first_chunk"), Some(Value::F64(seconds)) if *seconds >= 0.04)
+            );
+            assert_eq!(
+                chat.attributes
+                    .iter()
+                    .filter(|attr| attr.key.as_str() == "gen_ai.response.time_to_first_chunk")
+                    .count(),
+                1
+            );
+            assert!(attr(chat, "gen_ai.agent.id").is_none());
+            assert_eq!(
+                attr(chat, "gen_ai.request.stream"),
+                Some(&Value::Bool(true))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.input_tokens"),
+                Some(&Value::I64(37))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.output_tokens"),
+                Some(&Value::I64(42))
+            );
+            if structured {
+                assert_eq!(
+                    attr(chat, "gen_ai.response.model"),
+                    Some(&Value::from("reported-stream-model"))
+                );
+            }
+            assert_private(&spans);
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_summary_failure_timeout_cancel_and_drop_have_bounded_status() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::{Array, Value, trace::Status};
+        for (provider, expected_error, dropped) in [
+            (
+                SummaryTestProvider::non_streaming_error(LLMError::ProviderError(
+                    "SECRET_ERROR".into(),
+                )),
+                Some("provider_error"),
+                false,
+            ),
+            (
+                SummaryTestProvider::streaming(vec![Err(LLMError::Cancelled)]),
+                None,
+                false,
+            ),
+            (
+                SummaryTestProvider::stalled_stream(),
+                Some("timeout"),
+                false,
+            ),
+            (SummaryTestProvider::stalled_stream(), None, true),
+        ] {
+            let summarizer =
+                summarizer_with_provider(Arc::new(provider), Duration::from_millis(20));
+            let (_, spans) = capture(async {
+                let history = [make_user_msg("SECRET_PROMPT")];
+                let mut future = Box::pin(summarizer.summarize(&history, "SECRET_ARGUMENT"));
+                if dropped {
+                    tokio::select! {
+                        _ = &mut future => panic!("must still be pending"),
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                    }
+                } else {
+                    assert!(future.await.is_err());
+                }
+            })
+            .await;
+            let chat = spans
+                .iter()
+                .find(|span| span.name == "chat requested-summary-model")
+                .unwrap();
+            assert_eq!(
+                attr(chat, "gen_ai.response.finish_reasons"),
+                Some(&Value::Array(Array::String(vec!["error".into()])))
+            );
+            assert_eq!(
+                attr(chat, "error.type"),
+                expected_error.map(Value::from).as_ref()
+            );
+            assert!(attr(chat, "gen_ai.response.time_to_first_chunk").is_none());
+            assert_eq!(
+                chat.status,
+                if expected_error.is_some() {
+                    Status::error("")
+                } else {
+                    Status::Unset
+                }
+            );
+            assert_private(&spans);
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_summary_shortcuts_do_not_create_inference_spans() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, capture};
+        let provider = Arc::new(SummaryTestProvider::non_streaming_text("not called"));
+        let mut summarizer = summarizer_with_provider(provider.clone(), Duration::from_secs(1));
+        summarizer.min_history_tokens = usize::MAX;
+        let history = [make_user_msg("SECRET_PROMPT")];
+        let (_, raw_spans) = capture(summarizer.summarize(&history, "SECRET_ARGUMENT")).await;
+        summarizer.min_history_tokens = 0;
+        let (request, summary) =
+            crate::session::compaction::SessionCompaction::create_compaction_messages(
+                "s1",
+                "SECRET_RESPONSE",
+                100,
+            );
+        let (_, compact_spans) =
+            capture(summarizer.summarize(&[request, summary], "SECRET_ARGUMENT")).await;
+        for spans in [raw_spans, compact_spans] {
+            assert!(spans.iter().all(|span| !span.name.starts_with("chat ")));
+            assert_private(&spans);
+        }
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 0);
+    }
 
     // ── summarize_tool_args ────────────────────────────────────────────────
 
@@ -672,6 +1397,8 @@ mod tests {
     ) -> DelegationSummarizer {
         DelegationSummarizer {
             provider,
+            provider_name: "codex".into(),
+            model: "requested-summary-model".into(),
             timeout,
             min_history_tokens: 0,
             estimator: Arc::new(SimpleTokenEstimator),
@@ -711,18 +1438,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_provider_accepts_clean_end_without_done_chunk() {
+    async fn streaming_provider_rejects_end_without_terminal_chunk() {
         let provider = Arc::new(SummaryTestProvider::streaming(vec![Ok(StreamChunk::Text(
             "complete at eof".to_string(),
         ))]));
         let summarizer = summarizer_with_provider(provider, Duration::from_secs(1));
 
-        let summary = summarizer
+        let error = summarizer
             .summarize(&[make_user_msg("plan")], "implement")
             .await
-            .expect("streaming summary");
+            .expect_err("unterminated stream");
 
-        assert_eq!(summary, "complete at eof");
+        assert!(error.to_string().contains("Invalid summary stream"));
     }
 
     #[tokio::test]
@@ -745,7 +1472,11 @@ mod tests {
     #[tokio::test]
     async fn empty_response_uses_existing_fallback_for_both_transports() {
         let streaming = summarizer_with_provider(
-            Arc::new(SummaryTestProvider::streaming(Vec::new())),
+            Arc::new(SummaryTestProvider::streaming(vec![Ok(
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Stop,
+                },
+            )])),
             Duration::from_secs(1),
         );
         let non_streaming = summarizer_with_provider(

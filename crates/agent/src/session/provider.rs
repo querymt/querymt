@@ -414,6 +414,15 @@ impl SessionProvider {
         &self,
         req: ProviderRequest<'_>,
     ) -> SessionResult<Arc<dyn LLMProvider>> {
+        self.build_provider_snapshot(req)
+            .await
+            .map(|built| built.provider)
+    }
+
+    async fn build_provider_snapshot(
+        &self,
+        req: ProviderRequest<'_>,
+    ) -> SessionResult<ProviderSnapshot> {
         let provider_name = req.provider_name;
         let model = req.model;
         let params = req.params;
@@ -457,7 +466,7 @@ impl SessionProvider {
                     p
                 })
                 .or_else(|| Some(serde_json::json!({"_remote_session_id": session_id})));
-            return Ok(Arc::new(
+            return Ok(ProviderSnapshot::unverified(Arc::new(
                 querymt_remote::MeshChatProvider::from_node_id(
                     mesh,
                     &node_id,
@@ -465,7 +474,7 @@ impl SessionProvider {
                     model,
                 )
                 .with_params(remote_params),
-            ));
+            )));
         }
 
         // ── Case 2: Try local provider ─────────────────────────────────────────
@@ -515,7 +524,7 @@ impl SessionProvider {
                             .or_else(|| {
                                 Some(serde_json::json!({"_remote_session_id": session_id}))
                             });
-                        return Ok(Arc::new(
+                        return Ok(ProviderSnapshot::unverified(Arc::new(
                             querymt_remote::MeshChatProvider::from_node_id(
                                 mesh,
                                 &node_id,
@@ -523,7 +532,7 @@ impl SessionProvider {
                                 model,
                             )
                             .with_params(remote_params),
-                        ));
+                        )));
                     }
                 }
                 return Err(SessionError::ProviderError(local_error));
@@ -542,6 +551,8 @@ impl SessionProvider {
             },
         )
         .await?;
+
+        let settings = resolved_cfg.generation_settings;
 
         #[cfg(feature = "oauth")]
         let builder_config = resolved_cfg.builder_config;
@@ -598,7 +609,10 @@ impl SessionProvider {
                     provider_name,
                     model
                 );
-                return Ok(Arc::from(provider));
+                return Ok(ProviderSnapshot {
+                    provider: Arc::from(provider),
+                    settings,
+                });
             }
 
             // Fallback for native HTTP providers: set the resolver on the inner
@@ -614,7 +628,10 @@ impl SessionProvider {
                 );
 
                 let adapter = querymt::adapters::LLMProviderFromHTTP::new(http_provider);
-                return Ok(Arc::from(Box::new(adapter) as Box<dyn LLMProvider>));
+                return Ok(ProviderSnapshot {
+                    provider: Arc::from(Box::new(adapter) as Box<dyn LLMProvider>),
+                    settings,
+                });
             }
 
             // Neither path attached a resolver — return the provider as-is.
@@ -623,11 +640,17 @@ impl SessionProvider {
                 provider_name,
                 model
             );
-            return Ok(Arc::from(provider));
+            return Ok(ProviderSnapshot {
+                provider: Arc::from(provider),
+                settings,
+            });
         }
 
         let provider = factory.from_config(&pruned_config_str)?;
-        Ok(Arc::from(provider))
+        Ok(ProviderSnapshot {
+            provider: Arc::from(provider),
+            settings,
+        })
     }
 }
 
@@ -645,6 +668,21 @@ impl Clone for SessionProvider {
             mesh: Arc::clone(&self.mesh),
             #[cfg(feature = "remote")]
             allow_mesh_fallback: Arc::clone(&self.allow_mesh_fallback),
+        }
+    }
+}
+
+struct ProviderSnapshot {
+    provider: Arc<dyn LLMProvider>,
+    settings: crate::agent::utils::genai::GenerationSettings,
+}
+
+impl ProviderSnapshot {
+    #[cfg(feature = "remote")]
+    fn unverified(provider: Arc<dyn LLMProvider>) -> Self {
+        Self {
+            provider,
+            settings: Default::default(),
         }
     }
 }
@@ -672,7 +710,7 @@ pub struct SessionHandle {
     /// Session execution config resolved once at construction time (turn-pinned).
     execution_config: Option<SessionExecutionConfig>,
     /// Lazily cached LLM provider for this turn.
-    cached_llm_provider: tokio::sync::OnceCell<Arc<dyn LLMProvider>>,
+    cached_llm_provider: tokio::sync::OnceCell<ProviderSnapshot>,
 }
 
 impl Clone for SessionHandle {
@@ -757,10 +795,16 @@ impl SessionHandle {
                     .with_session_id(&self.session.public_id);
                 #[cfg(feature = "remote")]
                 let request = request.with_provider_node_id(self.provider_node_id.as_deref());
-                self.provider.build_provider(request).await
+                self.provider.build_provider_snapshot(request).await
             })
             .await
-            .map(Arc::clone)
+            .map(|built| Arc::clone(&built.provider))
+    }
+
+    pub(crate) fn record_generation_settings(&self, span: &tracing::Span) {
+        if let Some(built) = self.cached_llm_provider.get() {
+            built.settings.record(span);
+        }
     }
 
     /// Get the session history as rich AgentMessages
@@ -880,7 +924,7 @@ impl SessionHandle {
         }
 
         if let Some(provider) = self.cached_llm_provider.get()
-            && provider.key_resolver().is_some()
+            && provider.provider.key_resolver().is_some()
         {
             return None;
         }
