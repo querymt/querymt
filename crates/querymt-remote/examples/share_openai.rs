@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
             directory: querymt_remote::mesh_runtime_config::DirectoryMode::Cached,
         }),
         iroh_enabled: false,
+        iroh_gso: true,
         iroh_scopes: Vec::new(),
         identity_file: None,
         request_timeout: std::time::Duration::from_secs(300),

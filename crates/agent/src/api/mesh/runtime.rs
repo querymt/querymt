@@ -64,6 +64,7 @@ fn runtime_configs_compatible(existing: &MeshRuntimeConfig, requested: &MeshRunt
                 .as_ref()
                 .map(|lan| (&lan.listen, lan.discovery, lan.directory))
         && existing.iroh_enabled == requested.iroh_enabled
+        && existing.iroh_gso == requested.iroh_gso
         && existing.identity_file == requested.identity_file
         && existing.request_timeout == requested.request_timeout
         && existing.stream_reconnect_grace == requested.stream_reconnect_grace
@@ -88,11 +89,12 @@ fn runtime_config_label(config: &MeshRuntimeConfig) -> String {
         (false, false) => "disabled",
     };
     format!(
-        "{transports} mesh (identity={:?}, node_name={:?}, peers={}, iroh_scopes={})",
+        "{transports} mesh (identity={:?}, node_name={:?}, peers={}, iroh_scopes={}, iroh_gso={})",
         config.identity_file,
         config.node_name,
         config.peers.len(),
-        config.iroh_scopes.len()
+        config.iroh_scopes.len(),
+        config.iroh_gso
     )
 }
 
@@ -112,5 +114,47 @@ fn runtime_config_from_spec(spec: MeshSpec) -> Result<MeshRuntimeConfig> {
         cfg.auto_fallback,
         cfg.lan,
         cfg.iroh,
+        cfg.iroh_gso,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iroh_gso_defaults_on_for_api_modes() {
+        for spec in [MeshSpec::Lan, MeshSpec::Iroh, MeshSpec::Hybrid] {
+            assert!(runtime_config_from_spec(spec).unwrap().iroh_gso);
+        }
+    }
+
+    #[test]
+    fn iroh_gso_is_preserved_for_legacy_and_multi_transport_toml() {
+        for transport in [
+            "transport = 'iroh'",
+            "[[iroh]]\nenabled = true\nname = 'test'",
+            "[lan]\nenabled = true\n[[iroh]]\nenabled = true\nname = 'test'",
+        ] {
+            for enabled in [false, true] {
+                let cfg: MeshTomlConfig = toml::from_str(&format!(
+                    "enabled = true\niroh_gso = {enabled}\n{transport}"
+                ))
+                .unwrap();
+                let runtime = runtime_config_from_spec(MeshSpec::Toml(cfg)).unwrap();
+                assert!(runtime.iroh_enabled);
+                assert_eq!(runtime.iroh_gso, enabled);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_runtime_rejects_different_iroh_gso_settings() {
+        let existing = runtime_config_from_spec(MeshSpec::Hybrid).unwrap();
+        let mut requested = existing.clone();
+        assert!(runtime_configs_compatible(&existing, &requested));
+        requested.iroh_gso = false;
+        assert!(!runtime_configs_compatible(&existing, &requested));
+        assert!(runtime_config_label(&requested).contains("iroh_gso=false"));
+    }
 }

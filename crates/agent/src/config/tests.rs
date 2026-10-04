@@ -1063,6 +1063,7 @@ discovery = "mdns"
     let config: SingleAgentConfig = toml::from_str(toml).expect("TOML should parse");
     assert!(config.mesh.enabled);
     assert_eq!(config.mesh.transport, MeshTransportConfig::Lan);
+    assert!(config.mesh.iroh_gso);
     assert_eq!(config.mesh.discovery, MeshDiscoveryConfig::Mdns);
     assert!(config.mesh.lan.is_none());
     assert!(config.mesh.iroh.is_empty());
@@ -1148,6 +1149,18 @@ name = "team-b"
 }
 
 #[test]
+fn test_mesh_iroh_gso_parses_on_and_off() {
+    assert!(MeshTomlConfig::default().iroh_gso);
+    for enabled in [false, true] {
+        let config: MeshTomlConfig = toml::from_str(&format!("iroh_gso = {enabled}")).unwrap();
+        assert_eq!(config.iroh_gso, enabled);
+        let round_trip: MeshTomlConfig =
+            toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(round_trip.iroh_gso, enabled);
+    }
+}
+
+#[test]
 fn test_mesh_config_defaults_no_new_fields() {
     let toml = r#"
 [agent]
@@ -1159,6 +1172,7 @@ enabled = false
 "#;
     let config: SingleAgentConfig = toml::from_str(toml).expect("TOML should parse");
     assert!(!config.mesh.enabled);
+    assert!(config.mesh.iroh_gso);
     assert!(config.mesh.lan.is_none());
     assert!(config.mesh.iroh.is_empty());
 }
