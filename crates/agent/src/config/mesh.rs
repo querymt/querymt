@@ -151,6 +151,12 @@ pub struct MeshTomlConfig {
     #[serde(default)]
     pub transport: MeshTransportConfig,
 
+    /// Enable Generic Segmentation Offload (GSO) on the shared iroh actor endpoint.
+    /// Default: true. Set to false as a UDP offload compatibility workaround.
+    /// Applies to all Iroh scopes; does not affect LAN or separate payload endpoints.
+    #[serde(default = "default_true")]
+    pub iroh_gso: bool,
+
     /// Whether `provider_node_id = None` may fall back to mesh provider discovery.
     ///
     /// Default: `false` (local-only unless an explicit `provider_node_id` is set).
@@ -227,6 +233,7 @@ impl Default for MeshTomlConfig {
             listen: default_mesh_listen(),
             discovery: MeshDiscoveryConfig::default(),
             transport: MeshTransportConfig::default(),
+            iroh_gso: true,
             auto_fallback: false,
             peers: Vec::new(),
             request_timeout_secs: default_mesh_request_timeout_secs(),

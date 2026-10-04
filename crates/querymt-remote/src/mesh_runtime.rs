@@ -45,6 +45,14 @@ async fn next_mesh_event<B: NetworkBehaviour>(
     }
 }
 
+fn iroh_transport_config(config: &MeshRuntimeConfig) -> libp2p_iroh::TransportConfig {
+    libp2p_iroh::TransportConfig {
+        timeout: config.request_timeout,
+        enable_gso: config.iroh_gso,
+        ..Default::default()
+    }
+}
+
 pub async fn bootstrap_mesh_runtime(
     config: &MeshRuntimeConfig,
 ) -> Result<MeshRuntimeHandle, MeshError> {
@@ -135,10 +143,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
     }
 
     let mut swarm: libp2p::Swarm<UnifiedMeshBehaviour> = if has_lan && has_iroh {
-        let iroh_config = libp2p_iroh::TransportConfig {
-            timeout: config.request_timeout,
-            ..Default::default()
-        };
+        let iroh_config = iroh_transport_config(config);
         let iroh_transport = libp2p_iroh::Transport::with_config(Some(&keypair), iroh_config)
             .await
             .map_err(|e| MeshError::SwarmError(format!("iroh transport init failed: {e}")))?;
@@ -219,10 +224,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
             })
             .build()
     } else {
-        let iroh_config = libp2p_iroh::TransportConfig {
-            timeout: config.request_timeout,
-            ..Default::default()
-        };
+        let iroh_config = iroh_transport_config(config);
         let iroh_transport = libp2p_iroh::Transport::with_config(Some(&keypair), iroh_config)
             .await
             .map_err(|e| MeshError::SwarmError(format!("iroh transport init failed: {e}")))?;
@@ -530,6 +532,39 @@ mod tests {
     use futures_util::io::Cursor;
     use libp2p::request_response::Codec as _;
     use serde::{Deserialize, Serialize};
+
+    #[test]
+    fn iroh_gso_is_forwarded_for_iroh_only_and_mixed_transports() {
+        for has_lan in [false, true] {
+            for iroh_gso in [false, true] {
+                let config = MeshRuntimeConfig {
+                    enabled: true,
+                    lan: has_lan.then_some(crate::LanMeshConfig {
+                        listen: None,
+                        discovery: LanDiscovery::None,
+                        directory: crate::DirectoryMode::default(),
+                    }),
+                    iroh_enabled: true,
+                    iroh_gso,
+                    iroh_scopes: Vec::new(),
+                    identity_file: None,
+                    request_timeout: std::time::Duration::from_secs(19),
+                    stream_reconnect_grace: std::time::Duration::from_secs(120),
+                    node_name: None,
+                    peers: Vec::new(),
+                    auto_fallback: false,
+                };
+                let transport = iroh_transport_config(&config);
+                assert_eq!(transport.enable_gso, iroh_gso);
+                assert_eq!(transport.timeout, config.request_timeout);
+                assert_eq!(
+                    transport.relay_mode,
+                    libp2p_iroh::TransportConfig::default().relay_mode
+                );
+                assert!(transport.peer_filter.is_none());
+            }
+        }
+    }
 
     #[derive(Debug, Serialize, Deserialize)]
     struct LargeRequest(Vec<u8>);

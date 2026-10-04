@@ -7449,7 +7449,7 @@ dependencies = [
 [[package]]
 name = "libp2p-iroh"
 version = "0.1.3"
-source = "git+https://github.com/querymt/libp2p-iroh.git?branch=iroh_v1#cd6bf864ef141d3dee9ea6f0fad16fed79b279fe"
+source = "git+https://github.com/querymt/libp2p-iroh.git?branch=iroh_v1#60b85fe17b1c0a69a3e2f4d8e39ae11b357184a8"
 dependencies = [
  "futures",
  "futures-timer",

@@ -21,9 +21,11 @@ use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig, MeshRuntimeHandle};
 /// # Arguments
 /// - `invite` - a decoded `SignedInviteGrant` (signature verified offline)
 /// - `identity_file` - optional path to the persistent ed25519 identity file
+/// - `iroh_gso` - whether to enable GSO on the actor endpoint
 pub async fn join_mesh_via_invite(
     invite: &crate::agent::remote::invite::SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
+    iroh_gso: bool,
 ) -> Result<MeshRuntimeHandle, MeshError> {
     use crate::agent::remote::invite::{PeerEntry, mesh_id_for};
     use crate::agent::remote::node_manager::{AdmissionRequest, AdmissionResponse};
@@ -78,6 +80,7 @@ pub async fn join_mesh_via_invite(
         enabled: true,
         lan: None,
         iroh_enabled: true,
+        iroh_gso,
         iroh_scopes: vec![IrohMeshConfig {
             mesh_id: mesh_id.clone(),
             invite: Some(invite.encode()),

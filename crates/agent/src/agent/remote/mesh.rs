@@ -17,5 +17,15 @@ pub async fn join_mesh_via_invite(
     invite: &SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
-    join::join_mesh_via_invite(invite, identity_file).await
+    join_mesh_via_invite_with_gso(invite, identity_file, true).await
+}
+
+/// Join or reconnect via an invite with an explicit iroh actor-endpoint GSO setting.
+/// The default join entry point keeps GSO enabled.
+pub async fn join_mesh_via_invite_with_gso(
+    invite: &SignedInviteGrant,
+    identity_file: Option<std::path::PathBuf>,
+    iroh_gso: bool,
+) -> Result<MeshRuntimeHandle, MeshError> {
+    join::join_mesh_via_invite(invite, identity_file, iroh_gso).await
 }

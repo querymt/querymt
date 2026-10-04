@@ -20,6 +20,7 @@ pub fn from_toml_config(
     auto_fallback: bool,
     lan: Option<crate::config::LanMeshTomlConfig>,
     iroh: Vec<crate::config::IrohMeshTomlConfig>,
+    iroh_gso: bool,
 ) -> Result<MeshRuntimeConfig> {
     let identity_file = identity_file.map(PathBuf::from);
     let request_timeout = Duration::from_secs(request_timeout_secs);
@@ -124,6 +125,7 @@ pub fn from_toml_config(
         enabled,
         lan: lan_config,
         iroh_enabled,
+        iroh_gso,
         iroh_scopes: iroh_configs,
         identity_file,
         request_timeout,

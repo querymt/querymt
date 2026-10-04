@@ -125,6 +125,7 @@ pub(crate) mod fixtures {
                                     querymt_remote::mesh_runtime_config::DirectoryMode::default(),
                             }),
                             iroh_enabled: false,
+                            iroh_gso: true,
                             iroh_scopes: Vec::new(),
                             identity_file: Some(identity_path),
                             request_timeout: std::time::Duration::from_secs(300),

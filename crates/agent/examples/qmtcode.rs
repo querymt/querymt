@@ -21,6 +21,10 @@
 //! cargo run --example qmtcode --features remote -- --mesh=/ip4/0.0.0.0/tcp/0
 //! cargo run --example qmtcode --features remote -- --mesh --mesh-no-lan
 //!
+//! # UDP offload compatibility override (also works with --profile and --mesh-join)
+//! cargo run --example qmtcode --features remote -- --mesh --mesh-iroh-gso=false
+//! QMT_MESH_IROH_GSO=false cargo run --example qmtcode --features remote -- --mesh
+//!
 //! # Dashboard mode with mesh enabled
 //! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 //! cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh --mesh-no-lan
@@ -152,6 +156,14 @@ struct Cli {
     #[arg(long)]
     mesh_no_lan: bool,
 
+    /// Override iroh actor-endpoint GSO (UDP segmentation offload).
+    ///
+    /// Precedence: CLI > QMT_MESH_IROH_GSO > config/profile TOML > true.
+    /// Set false as a UDP offload compatibility workaround; restart to change it.
+    #[cfg(feature = "remote")]
+    #[arg(long, env = "QMT_MESH_IROH_GSO", value_name = "true|false", action = ArgAction::Set)]
+    mesh_iroh_gso: Option<bool>,
+
     /// Create and print a signed mesh invite token, then host that Iroh mesh.
     ///
     /// Requires --mesh. The invite is signed with the node's ed25519 identity
@@ -213,6 +225,46 @@ fn qmtcode_profile_catalog_with_user_dir(
     }
 
     Ok(builder.build())
+}
+
+#[cfg(feature = "remote")]
+fn configure_mesh_iroh_gso(mut config: Config, override_value: Option<bool>) -> (Config, bool) {
+    let mesh = match &mut config {
+        Config::Single(config) => &mut config.mesh,
+        Config::Multi(config) => &mut config.mesh,
+    };
+    mesh.iroh_gso = override_value.unwrap_or(mesh.iroh_gso);
+    let iroh_gso = mesh.iroh_gso;
+    (config, iroh_gso)
+}
+
+// Keep the process-wide endpoint setting consistent across profile switches/reloads.
+#[cfg(feature = "remote")]
+struct MeshGsoProfileCatalog {
+    inner: LocalProfileCatalog,
+    iroh_gso: bool,
+}
+
+#[cfg(feature = "remote")]
+#[async_trait::async_trait]
+impl ProfileCatalog for MeshGsoProfileCatalog {
+    async fn list_profiles(&self) -> anyhow::Result<Vec<ProfileMetadata>> {
+        self.inner.list_profiles().await
+    }
+
+    async fn load_profile(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<querymt_agent::profiles::ProfileDocument> {
+        let mut document = self.inner.load_profile(id).await?;
+        let (config, _) = configure_mesh_iroh_gso(document.config, Some(self.iroh_gso));
+        document.config = config;
+        Ok(document)
+    }
+
+    fn watch_roots(&self) -> Vec<PathBuf> {
+        self.inner.watch_roots()
+    }
 }
 
 fn validate_profile_args(cli: &Cli) -> anyhow::Result<()> {
@@ -447,12 +499,32 @@ async fn run(
 
     let shared_infra = AgentInfra::shared_with_db_path(cli.db.clone()).await?;
 
+    #[cfg(feature = "remote")]
+    let mesh_iroh_gso;
+
     let runner = if let Some(config_path) = &cli.config_file {
         eprintln!("Loading agent from: {}", config_path.display());
-        from_config_with_infra(config_path, shared_infra.clone()).await?
+        let config = querymt_agent::config::load_config(config_path).await?;
+        #[cfg(feature = "remote")]
+        let config = {
+            let (config, gso) = configure_mesh_iroh_gso(config, cli.mesh_iroh_gso);
+            mesh_iroh_gso = gso;
+            config
+        };
+        from_config_value_with_infra(config, shared_infra.clone()).await?
     } else {
         let selected_profile = selected_profile_id(&cli).to_string();
         eprintln!("Loading agent from profile: {selected_profile}");
+        #[cfg(feature = "remote")]
+        let profile_catalog = {
+            let document = profile_catalog.load_profile(&selected_profile).await?;
+            let (_, gso) = configure_mesh_iroh_gso(document.config, cli.mesh_iroh_gso);
+            mesh_iroh_gso = gso;
+            MeshGsoProfileCatalog {
+                inner: profile_catalog,
+                iroh_gso: gso,
+            }
+        };
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
         let profiles = AgentProfiles::new(catalog, selected_profile, shared_infra.clone());
         let runtime = profiles.active_runtime().await?;
@@ -477,7 +549,7 @@ async fn run(
     #[cfg(feature = "remote")]
     if let Some(ref token) = cli.mesh_join {
         use querymt_agent::agent::remote::invite::SignedInviteGrant;
-        use querymt_agent::agent::remote::mesh::join_mesh_via_invite;
+        use querymt_agent::agent::remote::mesh::join_mesh_via_invite_with_gso;
 
         let invite =
             SignedInviteGrant::decode(token).map_err(|e| format!("Invalid invite token: {e}"))?;
@@ -496,7 +568,7 @@ async fn run(
             invite.grant.inviter_peer_id
         );
 
-        match join_mesh_via_invite(&invite, None).await {
+        match join_mesh_via_invite_with_gso(&invite, None, mesh_iroh_gso).await {
             Ok(runtime) => {
                 let mesh = runtime.as_mesh_handle().clone();
                 eprintln!("Joined mesh: peer_id={}", mesh.peer_id());
@@ -565,6 +637,7 @@ async fn run(
                 })
             },
             iroh_enabled: true,
+            iroh_gso: mesh_iroh_gso,
             iroh_scopes,
             identity_file: None,
             request_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
@@ -885,6 +958,149 @@ system = "inline"
         assert!(help.contains("--profile"));
         assert!(help.contains("--list-profiles"));
         assert!(!help.contains("--profiles-url"));
+    }
+
+    #[cfg(feature = "remote")]
+    fn parse_gso_cli(args: &[&str]) -> Result<Cli, clap::Error> {
+        use clap::FromArgMatches;
+        // Ignore the caller's environment without mutating process-global state.
+        let matches = Cli::command()
+            .mut_arg("mesh_iroh_gso", |arg| arg.env(None::<&str>))
+            .try_get_matches_from(args)?;
+        Cli::from_arg_matches(&matches)
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn mesh_iroh_gso_cli_accepts_explicit_values_for_all_mesh_modes() {
+        for mode in ["--mesh", "--mesh-invite=Test", "--mesh-join=TOKEN"] {
+            let cli = parse_gso_cli(&["qmtcode", "--profile=default", mode]).unwrap();
+            assert_eq!(cli.mesh_iroh_gso, None);
+            for value in [false, true] {
+                let arg = format!("--mesh-iroh-gso={value}");
+                let cli = parse_gso_cli(&["qmtcode", "--profile=default", mode, &arg]).unwrap();
+                assert_eq!(cli.mesh_iroh_gso, Some(value));
+            }
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn mesh_iroh_gso_cli_rejects_invalid_or_missing_values() {
+        for arg in [
+            "--mesh-iroh-gso=invalid",
+            "--mesh-iroh-gso=0",
+            "--mesh-iroh-gso",
+        ] {
+            assert!(parse_gso_cli(&["qmtcode", "--mesh", arg]).is_err());
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn mesh_iroh_gso_environment_and_cli_precedence() {
+        const CASE_ENV: &str = "QMT_TEST_MESH_IROH_GSO_CASE";
+        if let Ok(case) = std::env::var(CASE_ENV) {
+            let mut args = vec!["qmtcode", "--profile=default", "--mesh"];
+            if case == "cli-on" {
+                args.push("--mesh-iroh-gso=true");
+            } else if case == "cli-off" {
+                args.push("--mesh-iroh-gso=false");
+            }
+            let parsed = Cli::try_parse_from(args);
+            if case == "invalid" {
+                assert!(parsed.is_err());
+            } else {
+                let expected = match case.as_str() {
+                    "on" | "cli-on" => Some(true),
+                    "off" | "cli-off" => Some(false),
+                    "unset" => None,
+                    _ => panic!("unexpected test case: {case}"),
+                };
+                assert_eq!(parsed.unwrap().mesh_iroh_gso, expected);
+            }
+            return;
+        }
+        // Subprocesses isolate environment tests from the parallel test runner.
+        for (case, value) in [
+            ("unset", None),
+            ("on", Some("true")),
+            ("off", Some("false")),
+            ("invalid", Some("invalid")),
+            ("cli-on", Some("false")),
+            ("cli-off", Some("true")),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "--exact",
+                "tests::mesh_iroh_gso_environment_and_cli_precedence",
+            ]);
+            child.env(CASE_ENV, case).env_remove("QMT_MESH_IROH_GSO");
+            if let Some(value) = value {
+                child.env("QMT_MESH_IROH_GSO", value);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "case {case}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn mesh_iroh_gso_overrides_config_and_profile_before_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = LocalProfileCatalog::builder()
+            .include_default_user_dir(false)
+            .local_dir(dir.path())
+            .embedded_config_toml("single", "Single", None,
+                "[agent]\nprovider = 'test'\nmodel = 'test'\n[mesh]\nenabled = true\ntransport = 'iroh'\niroh_gso = false")
+            .embedded_config_toml("multi", "Multi", None,
+                "[quorum]\n[planner]\nprovider = 'test'\nmodel = 'test'\n[mesh]\nenabled = true\ntransport = 'iroh'\niroh_gso = false")
+            .build();
+        for id in ["single", "multi"] {
+            let document = inner.load_profile(id).await.unwrap();
+            let (config, gso) = configure_mesh_iroh_gso(document.config, None);
+            assert!(!gso);
+            let (config, gso) = configure_mesh_iroh_gso(config, Some(true));
+            assert!(gso);
+            let (_, gso) = configure_mesh_iroh_gso(config, Some(false));
+            assert!(!gso);
+        }
+        for gso in [false, true] {
+            let catalog = MeshGsoProfileCatalog {
+                inner: inner.clone(),
+                iroh_gso: gso,
+            };
+            assert_eq!(catalog.watch_roots(), inner.watch_roots());
+            assert_eq!(
+                catalog.list_profiles().await.unwrap().len(),
+                inner.list_profiles().await.unwrap().len()
+            );
+            for id in ["single", "multi"] {
+                let document = catalog.load_profile(id).await.unwrap();
+                let (_, resolved) = configure_mesh_iroh_gso(document.config, None);
+                assert_eq!(resolved, gso);
+            }
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn mesh_iroh_gso_help_exposes_cli_environment_and_precedence() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--mesh-iroh-gso <true|false>"));
+        assert!(help.contains("QMT_MESH_IROH_GSO"));
+        assert!(help.contains("CLI > QMT_MESH_IROH_GSO > config/profile TOML > true"));
+    }
+
+    #[cfg(not(feature = "remote"))]
+    #[test]
+    fn mesh_iroh_gso_flag_requires_remote_feature() {
+        assert!(Cli::try_parse_from(["qmtcode", "--mesh-iroh-gso=false"]).is_err());
     }
 
     #[test]

@@ -53,6 +53,10 @@ cargo run --example qmtcode --features dashboard -- --dashboard=0.0.0.0:8080
 # Mesh-only mode (runs until Ctrl+C)
 cargo run --example qmtcode --features remote -- --mesh
 
+# Disable iroh UDP segmentation offload for compatibility with problematic systems
+cargo run --example qmtcode --features remote -- --mesh --mesh-iroh-gso=false
+QMT_MESH_IROH_GSO=false cargo run --example qmtcode --features remote -- --mesh
+
 # Dashboard + mesh (cross-machine sessions)
 cargo run --example qmtcode --features "dashboard remote" -- --dashboard --mesh
 

@@ -106,6 +106,7 @@ This is the config equivalent of `Mesh::hybrid()`: LAN stays enabled, and iroh t
 | `enabled` | bool | `false` | Enable mesh networking |
 | `listen` | string | `/ip4/0.0.0.0/tcp/0` | Multiaddr to listen on |
 | `transport` | string | `"lan"` | Transport layer: `"lan"` or `"iroh"` |
+| `iroh_gso` | bool | `true` | Enable UDP Generic Segmentation Offload on the shared iroh actor endpoint |
 | `discovery` | string | `"mdns"` | Peer discovery method |
 | `auto_fallback` | bool | `false` | Allow mesh provider discovery fallback |
 | `node_name` | string | OS hostname | Human-readable node name advertised to peers |
@@ -149,6 +150,39 @@ Internet-capable transport with NAT traversal using the iroh networking library:
 enabled = true
 transport = "iroh"
 ```
+
+GSO batches outgoing UDP packets to reduce CPU overhead and is enabled by
+default. On systems with problematic UDP offload paths, opt out explicitly:
+
+```toml
+[mesh]
+iroh_gso = false
+```
+
+This is a compatibility workaround, not a universal reliability guarantee. The
+setting applies to the shared actor endpoint across all `[[mesh.iroh]]` scopes,
+including mixed LAN+iroh runtimes and invite joins/reconnects. It does not change
+LAN transport, encryption, authentication, or separately created payload endpoints.
+The endpoint reads this setting at startup; restart to change it. `qmtcode` also
+honors it from an explicit TOML config file or the profile selected by `--profile`.
+Override it for this process without editing a profile:
+
+```sh
+qmtcode --profile default --mesh --mesh-iroh-gso=false
+QMT_MESH_IROH_GSO=false qmtcode --profile default --mesh
+qmtcode --mesh-join="$INVITE_TOKEN" --mesh-iroh-gso=false
+```
+
+Precedence: `--mesh-iroh-gso` > `QMT_MESH_IROH_GSO` > config/profile
+`[mesh].iroh_gso` > default `true`. CLI and environment values must be `true` or
+`false`; invalid values are rejected. An explicit `--mesh-iroh-gso=true` overrides
+an environment value of `false`. The resolved value is applied before endpoint
+bind for hosting, joining, and reconnecting, and stays fixed across profile
+switches/reloads until the process restarts. These overrides require a build with
+the `remote` feature; they do not enable mesh networking by themselves.
+
+Rust callers set `MeshRuntimeConfig::iroh_gso`. Existing exhaustive runtime-config
+struct literals must add `iroh_gso: true` to preserve previous behavior.
 
 **Characteristics:**
 - ✅ **Internet-capable**: Works across the internet

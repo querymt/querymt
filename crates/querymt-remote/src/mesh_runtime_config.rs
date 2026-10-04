@@ -8,6 +8,8 @@ pub struct MeshRuntimeConfig {
     pub enabled: bool,
     pub lan: Option<LanMeshConfig>,
     pub iroh_enabled: bool,
+    /// Enable GSO on the shared iroh actor endpoint. Use true to preserve the default.
+    pub iroh_gso: bool,
     pub iroh_scopes: Vec<IrohMeshConfig>,
     pub identity_file: Option<PathBuf>,
     pub request_timeout: Duration,
@@ -115,6 +117,7 @@ mod tests {
             enabled: true,
             lan: None,
             iroh_enabled: false,
+            iroh_gso: true,
             iroh_scopes: Vec::new(),
             identity_file: None,
             request_timeout: Duration::from_secs(300),
