@@ -588,7 +588,7 @@ mod tests {
                     output_tokens: 20,
                     cache_read: 30,
                     cache_write: 40,
-                    ..Default::default()
+                    reasoning_tokens: 5,
                 });
             }
             let provider = ScriptedProvider::new(
@@ -637,6 +637,19 @@ mod tests {
                 attr(chat, "gen_ai.usage.input_tokens"),
                 Some(&Value::I64(82))
             );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.output_tokens"),
+                Some(&Value::I64(25))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+                Some(&Value::I64(5))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning_tokens"),
+                Some(&Value::I64(5))
+            );
+            assert!(attr(chat, "gen_ai.request.reasoning.level").is_none());
             assert_eq!(
                 attr(chat, "gen_ai.request.stream"),
                 Some(&Value::Bool(true))

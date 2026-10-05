@@ -183,13 +183,28 @@ configuration, exporters, or add metrics.
   The allowlist uses the implementation factory's name and an official QueryMT
   OCI identity: OpenAI (Chat Completions and Responses), Codex (no max tokens,
   which its request ignores), and Anthropic (temperature 1.0 with reasoning;
-  thinking mode/budget is not reported as a reasoning level). OpenAI/Codex `max`
-  effort maps to the sent `xhigh`. Extra-body fields other than known storage,
-  prompt-cache-key, and verbosity fields conservatively omit all settings. Absent, malformed, unsupported, or unverified values are not
-  inferred from server defaults. Custom/static/local-path factories, unidentified
-  aliases, mesh providers, Google/XAI mappings, and summary/compaction settings
-  remain deferred; no provider rebuild, extra auth lookup, or config/credential
-  retention is added for telemetry.
+  thinking mode/budget is not reported as a reasoning level). OpenAI/Codex effort
+  `low`/`medium`/`high`/`max` maps to sent `low`/`medium`/`high`/`xhigh`.
+  Official xAI and Google implementations additionally support **effort only**:
+  xAI uses the same mapping for model prefixes `grok-3-mini`,
+  `grok-4.20-multi-agent`, and `grok-4.3` after trimming, lowercasing, and taking
+  the final slash-separated name. This gate applies conservatively to all
+  endpoints: unsupported models (including `grok-4.6`) omit the attribute even
+  when a custom Chat Completions route sends effort. Google sends `low` for `low`
+  and `high` for `medium`/`high`/`max`; models containing the case-sensitive `2.5`
+  or an explicit nonnull `thinking_budget` (including zero) omit the level because
+  the request sends a budget instead. Neither implementation adds the other three
+  generation knobs. Extra-body fields other than known storage, prompt-cache-key,
+  and verbosity fields conservatively omit all settings. Absent, malformed,
+  unsupported, or unverified values are not inferred from server defaults.
+  Custom/static/local-path factories, unidentified aliases, mesh providers,
+  and summary/compaction settings remain deferred; no provider rebuild, extra
+  auth lookup, or config/credential retention is added for telemetry.
+  `gen_ai.request.reasoning.level` is an attribute on the existing logical chat
+  span, not a separate reasoning span, and is never inferred from token counts,
+  thinking content, or budgets. Otelite 0.1.153 does not consume this standard
+  attribute in its aggregate effort panel; it remains available in raw traces
+  and to standards-aware collectors.
 - `session.id` is a collector interoperability alias of `gen_ai.conversation.id`,
   using the same stable session UUID as a string at creation on all five boundaries:
   prompt invocation, normal chat, tool execution, compaction chat, and delegation
@@ -206,7 +221,16 @@ configuration, exporters, or add metrics.
   normalization, Anthropic reports exclusive cache buckets, and current
   Google/Ollama/mrs/llama-cpp adapters leave these extra buckets zero. External
   providers must respect that usage contract; missing modality usage is not
-  inferred.
+  inferred. `gen_ai.usage.reasoning_tokens` is a nonstandard collector compatibility
+  alias (including Otelite 0.1.153) of `gen_ai.usage.reasoning.output_tokens`, with
+  the exact same normalized `i64` bucket, including zero. Missing usage omits both;
+  inclusive output totals are unchanged. This records actual response statistics,
+  not request effort or thinking text, through the shared normal chat, streaming,
+  retry, compaction, and summary response helper. The alias enables Otelite's raw
+  reasoning scan for newly emitted positive reasoning rows only, without backfill,
+  extra spans/events/metrics, or synthetic Claude/Codex signals; it does not enable
+  the Claude effort chart. Google's detailed reasoning usage normalization remains
+  deferred.
 - Errors use an empty OTel status description and bounded `error.type` values:
   `authentication`, `rate_limited`, `invalid_request`, `response_format`,
   `unsupported_operation`, `transport`, `provider_error`, `tool_error`,

@@ -485,6 +485,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn genai_reasoning_effort_is_omitted_after_schema_pruning() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        let registry = registry_with_provider("providers = []");
+        let factory = adapted_factory(None, r#"{"properties":{"model":{},"api_key":{}}}"#);
+        let mut binding = binding(&registry, factory);
+        binding.implementation_id = Some("oci://ghcr.io/querymt/openai:latest".into());
+        binding.static_config =
+            serde_json::json!({"api_key":"SECRET_ARGUMENT", "reasoning_effort":"high"});
+        let resolved = resolve_provider_config(
+            &binding,
+            &LLMParams::new(),
+            ProviderConfigMode::Runtime {
+                model: "test",
+                params: None,
+                api_key_override: None,
+                session_id: "test",
+            },
+        )
+        .await
+        .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&resolved.pruned_config_str).unwrap();
+        assert!(config.get("reasoning_effort").is_none());
+        let (_, spans) = capture(async {
+            let span = tracing::info_span!("resolved-settings");
+            resolved.generation_settings.record(&span);
+        })
+        .await;
+        assert!(attr(&spans[0], "gen_ai.request.reasoning.level").is_none());
+        assert_private(&spans);
+    }
+
+    #[tokio::test]
     async fn runtime_mode_uses_api_key_override_before_static_key() {
         let registry = registry_with_provider(
             "[[providers]]\nname = \"xiaomi\"\npath = \"dummy\"\n\n[providers.config]\napi_key = \"bogus\"\n",

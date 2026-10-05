@@ -2335,7 +2335,11 @@ mod tests {
                 fixture.storage.session_store(),
                 querymt::LLMParams::new()
                     .provider("alias")
-                    .model("mock-model")
+                    .model(if name == "xai" {
+                        "grok-4.3"
+                    } else {
+                        "mock-model"
+                    })
                     .temperature(1.5),
             )
             .with_provider_resolver(Arc::new(TimedResolver(factory.clone())))
@@ -2546,11 +2550,16 @@ mod tests {
         #[tokio::test]
         async fn genai_effective_settings_stay_bound_to_the_actual_cached_provider() {
             for (with_tools, streaming) in [(false, false), (true, false), (true, true)] {
-                for identity in [
-                    Some("oci://ghcr.io/querymt/openai:latest"),
-                    Some("static:openai"),
-                    None,
+                for (provider, identity) in [
+                    ("openai", Some("oci://ghcr.io/querymt/openai:latest")),
+                    ("openai", Some("static:openai")),
+                    ("openai", None),
+                    ("xai", Some("oci://ghcr.io/querymt/xai:latest")),
+                    ("google", Some("oci://ghcr.io/querymt/google:latest")),
+                    ("xai", Some("oci://ghcr.io/querymt/xai-custom:latest")),
+                    ("google", Some("/tmp/google.wasm")),
                 ] {
+                    let official = format!("oci://ghcr.io/querymt/{provider}:latest");
                     let item = ChatOutput::from_projections(
                         None,
                         Some("SECRET_RESPONSE".into()),
@@ -2584,7 +2593,7 @@ mod tests {
                         vec![]
                     };
                     let (fixture, factory) =
-                        timed_fixture(streaming, attempts, "openai", identity).await;
+                        timed_fixture(streaming, attempts, provider, identity).await;
                     factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
                     let exec = fixture.execution_context().await;
                     let context = crate::test_utils::test_context(&exec.session_id, 0);
@@ -2641,14 +2650,20 @@ mod tests {
                         .collect();
                     assert_eq!(chats.len(), 2);
                     for chat in chats {
-                        let verified = identity == Some("oci://ghcr.io/querymt/openai:latest");
+                        let verified = identity == Some(official.as_str());
                         for (key, value) in [
                             ("gen_ai.request.temperature", Value::F64(1.5)),
                             ("gen_ai.request.max_tokens", Value::I64(123)),
-                            ("gen_ai.request.reasoning.level", Value::from("high")),
                         ] {
-                            assert_eq!(attr(chat, key), verified.then_some(&value));
+                            assert_eq!(
+                                attr(chat, key),
+                                (verified && provider == "openai").then_some(&value)
+                            );
                         }
+                        assert_eq!(
+                            attr(chat, "gen_ai.request.reasoning.level"),
+                            verified.then_some(&Value::from("high"))
+                        );
                         assert!(attr(chat, "gen_ai.request.top_p").is_none());
                         assert_eq!(
                             attr(chat, "gen_ai.response.time_to_first_chunk").is_some(),
@@ -2673,8 +2688,12 @@ mod tests {
                             );
                         }
                     }
-                    for diagnostic in spans.iter().filter(|span| span.name != "chat mock-model") {
+                    for diagnostic in spans.iter().filter(|span| {
+                        attr(span, "gen_ai.operation.name") != Some(&Value::from("chat"))
+                    }) {
                         for key in [
+                            "gen_ai.usage.reasoning_tokens",
+                            "gen_ai.usage.reasoning.output_tokens",
                             "gen_ai.request.max_tokens",
                             "gen_ai.request.temperature",
                             "gen_ai.request.top_p",
@@ -2775,6 +2794,14 @@ mod tests {
             assert_eq!(
                 attr(chat, "gen_ai.usage.output_tokens"),
                 Some(&Value::I64(209))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+                Some(&Value::I64(9))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning_tokens"),
+                Some(&Value::I64(9))
             );
             assert_eq!(
                 attr(chat, "gen_ai.response.finish_reasons"),
@@ -2904,6 +2931,14 @@ mod tests {
                 assert_eq!(
                     attr(chat, "gen_ai.usage.output_tokens"),
                     Some(&Value::I64(i64::from(u32::MAX) + 5))
+                );
+                assert_eq!(
+                    attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+                    Some(&Value::I64(5))
+                );
+                assert_eq!(
+                    attr(chat, "gen_ai.usage.reasoning_tokens"),
+                    Some(&Value::I64(5))
                 );
                 assert_eq!(
                     attr(chat, "gen_ai.response.finish_reasons"),

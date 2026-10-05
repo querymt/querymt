@@ -737,6 +737,11 @@ mod tests {
             Some(&Value::I64(5))
         );
         assert_eq!(
+            attr(chat, "gen_ai.usage.reasoning_tokens"),
+            Some(&Value::I64(5))
+        );
+        assert!(attr(chat, "gen_ai.request.reasoning.level").is_none());
+        assert_eq!(
             attr(chat, "gen_ai.response.finish_reasons"),
             Some(&Value::Array(Array::String(vec!["stop".into()])))
         );
@@ -847,6 +852,14 @@ mod tests {
         assert_eq!(
             attr(chat, "gen_ai.usage.output_tokens"),
             Some(&Value::I64(i64::from(usage.output_tokens)))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.reasoning_tokens"),
+            Some(&Value::I64(i64::from(usage.reasoning_tokens)))
+        );
+        assert_eq!(
+            attr(chat, "gen_ai.usage.reasoning_tokens"),
+            attr(chat, "gen_ai.usage.reasoning.output_tokens")
         );
         assert_eq!(
             attr(chat, "gen_ai.response.finish_reasons"),
@@ -1159,6 +1172,14 @@ mod tests {
             assert_eq!(
                 attr(chat, "gen_ai.usage.output_tokens"),
                 Some(&Value::I64(42))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+                Some(&Value::I64(2))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning_tokens"),
+                Some(&Value::I64(2))
             );
             if structured {
                 assert_eq!(

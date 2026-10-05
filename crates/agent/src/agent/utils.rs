@@ -133,21 +133,65 @@ pub(crate) mod genai {
 
     impl GenerationSettings {
         pub(crate) fn from_config(provider: &str, config: &serde_json::Value) -> Self {
-            if !matches!(provider, "openai" | "codex" | "anthropic")
-                || config.get("extra_body").is_some_and(|value| {
-                    // These known storage/cache/display fields cannot override the four knobs.
-                    !value.is_null()
-                        && value.as_object().is_none_or(|map| {
-                            map.keys().any(|key| {
-                                !matches!(
-                                    key.as_str(),
-                                    "store" | "promptCacheKey" | "prompt_cache_key" | "verbosity"
-                                )
-                            })
+            if !matches!(
+                provider,
+                "openai" | "codex" | "anthropic" | "xai" | "google"
+            ) || config.get("extra_body").is_some_and(|value| {
+                // These known storage/cache/display fields cannot override the four knobs.
+                !value.is_null()
+                    && value.as_object().is_none_or(|map| {
+                        map.keys().any(|key| {
+                            !matches!(
+                                key.as_str(),
+                                "store" | "promptCacheKey" | "prompt_cache_key" | "verbosity"
+                            )
                         })
-                })
-            {
+                    })
+            }) {
                 return Self::default();
+            }
+            let effort = config.get("reasoning_effort").and_then(|value| {
+                serde_json::from_value::<querymt::chat::ReasoningEffort>(value.clone()).ok()
+            });
+            let level = effort.map(|effort| match effort {
+                querymt::chat::ReasoningEffort::Low => "low",
+                querymt::chat::ReasoningEffort::Medium => "medium",
+                querymt::chat::ReasoningEffort::High => "high",
+                querymt::chat::ReasoningEffort::Max => "xhigh",
+            });
+            if matches!(provider, "xai" | "google") {
+                let model = config.get("model").and_then(serde_json::Value::as_str);
+                let reasoning = model
+                    .filter(|model| !model.trim().is_empty())
+                    .and_then(|model| {
+                        if provider == "xai" {
+                            // Match xAI's Responses gate even on custom Chat Completions routes.
+                            let name = model.trim().to_ascii_lowercase();
+                            let name = name.rsplit('/').next().unwrap_or(name.as_str());
+                            level.filter(|_| {
+                                ["grok-3-mini", "grok-4.20-multi-agent", "grok-4.3"]
+                                    .iter()
+                                    .any(|prefix| name.starts_with(prefix))
+                            })
+                        } else if model.contains("2.5")
+                            || config
+                                .get("thinking_budget")
+                                .is_some_and(|value| !value.is_null())
+                        {
+                            None // Google sends a budget instead of a level in these cases.
+                        } else {
+                            effort.map(|effort| match effort {
+                                querymt::chat::ReasoningEffort::Low => "low",
+                                querymt::chat::ReasoningEffort::Medium
+                                | querymt::chat::ReasoningEffort::High
+                                | querymt::chat::ReasoningEffort::Max => "high",
+                            })
+                        }
+                    });
+                return Self {
+                    reasoning,
+                    ..Self::default()
+                };
             }
             let number = |key: &str, upper: f64| {
                 let value = config.get(key)?.as_f64()?;
@@ -155,9 +199,6 @@ pub(crate) mod genai {
                 (value.is_finite() && (0.0..=upper).contains(&value))
                     .then_some(f64::from(value as f32))
             };
-            let effort = config.get("reasoning_effort").and_then(|value| {
-                serde_json::from_value::<querymt::chat::ReasoningEffort>(value.clone()).ok()
-            });
             Self {
                 max_tokens: if provider == "codex" {
                     None // The Codex request deliberately ignores this config field.
@@ -177,12 +218,7 @@ pub(crate) mod genai {
                 reasoning: if provider == "anthropic" {
                     None // Anthropic sends a thinking mode/budget, not an effort level.
                 } else {
-                    effort.map(|effort| match effort {
-                        querymt::chat::ReasoningEffort::Low => "low",
-                        querymt::chat::ReasoningEffort::Medium => "medium",
-                        querymt::chat::ReasoningEffort::High => "high",
-                        querymt::chat::ReasoningEffort::Max => "xhigh",
-                    })
+                    level
                 },
             }
         }
@@ -282,10 +318,10 @@ pub(crate) mod genai {
                 "gen_ai.usage.cache_write.input_tokens",
                 i64::from(usage.cache_write),
             );
-            span.set_attribute(
-                "gen_ai.usage.reasoning.output_tokens",
-                i64::from(usage.reasoning_tokens),
-            );
+            let reasoning = i64::from(usage.reasoning_tokens);
+            span.set_attribute("gen_ai.usage.reasoning.output_tokens", reasoning);
+            // Collector compatibility alias; keep the normalized standard bucket unchanged.
+            span.set_attribute("gen_ai.usage.reasoning_tokens", reasoning);
         }
         let reason = match output.finish_reason {
             Some(FinishReason::Stop) => "stop",
@@ -484,7 +520,19 @@ mod tests {
     async fn genai_generation_settings_are_typed_bounded_and_provider_specific() {
         use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
-        for provider in ["openai", "codex", "anthropic", "google", "xai", "unknown"] {
+        for (provider, model, sends_level) in [
+            ("openai", "test", true),
+            ("codex", "test", true),
+            ("anthropic", "test", false),
+            ("xai", "grok-3-mini", true),
+            ("xai", " org/GROK-4.20-MULTI-AGENT-beta ", true),
+            ("xai", "grok-4.3-latest", true),
+            ("xai", "grok-4.6", false),
+            ("xai", "SECRET_ARGUMENT", false),
+            ("google", "gemini-3-pro", true),
+            ("google", "gemini-2.5-pro", false),
+            ("unknown", "test", false),
+        ] {
             for effort in [
                 None,
                 Some("low"),
@@ -493,7 +541,7 @@ mod tests {
                 Some("max"),
                 Some("SECRET_ARGUMENT"),
             ] {
-                let config = serde_json::json!({"max_tokens":u32::MAX, "temperature":0.5, "top_p":0.75, "reasoning_effort":effort,
+                let config = serde_json::json!({"model":model, "thinking_budget":null, "max_tokens":u32::MAX, "temperature":0.5, "top_p":0.75, "reasoning_effort":effort,
                     "extra_body":{"store":false, "promptCacheKey":"SECRET_ARGUMENT", "verbosity":"SECRET_RESPONSE"}});
                 let (_, spans) = capture(async {
                     let span = tracing::info_span!("settings");
@@ -506,6 +554,7 @@ mod tests {
                 let span = &spans[0];
                 let known = matches!(provider, "openai" | "codex" | "anthropic");
                 let reasoning = match effort {
+                    Some("medium" | "high" | "max") if provider == "google" => Some("high"),
                     Some("max") => Some("xhigh"),
                     Some("low" | "medium" | "high") => effort,
                     _ => None,
@@ -530,10 +579,7 @@ mod tests {
                 );
                 assert_eq!(
                     attr(span, "gen_ai.request.reasoning.level"),
-                    reasoning
-                        .filter(|_| known && provider != "anthropic")
-                        .map(Value::from)
-                        .as_ref()
+                    reasoning.filter(|_| sends_level).map(Value::from).as_ref()
                 );
                 assert_private(&spans);
             }
@@ -557,6 +603,84 @@ mod tests {
                     .iter()
                     .all(|attr| !attr.key.as_str().starts_with("gen_ai.request."))
             );
+            assert_private(&spans);
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_effort_omits_unverified_config_and_google_budgets() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use serde_json::json;
+        for (provider, model) in [("xai", "grok-4.3"), ("google", "gemini-3-pro")] {
+            let mut configs = vec![
+                json!({"reasoning_effort":"high"}),
+                json!({"model":42,"reasoning_effort":"high"}),
+                json!({"model":"","reasoning_effort":"high"}),
+                json!({"model":model}),
+                json!({"model":model,"reasoning_effort":42}),
+                json!({"model":model,"reasoning_effort":""}),
+                json!({"model":model,"reasoning_effort":"high","extra_body":{"reasoning":{"effort":"SECRET_ARGUMENT"}}}),
+            ];
+            if provider == "google" {
+                for budget in [json!(0), json!(123), json!("SECRET_ARGUMENT")] {
+                    configs.push(
+                        json!({"model":model,"reasoning_effort":"high","thinking_budget":budget}),
+                    );
+                }
+            }
+            for config in configs {
+                let (_, spans) = capture(async {
+                    let span = tracing::info_span!("settings");
+                    super::genai::GenerationSettings::from_config(provider, &config).record(&span);
+                })
+                .await;
+                assert!(attr(&spans[0], "gen_ai.request.reasoning.level").is_none());
+                assert_private(&spans);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_reasoning_usage_alias_is_typed_equal_and_does_not_infer_effort() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::Value;
+        use querymt::chat::{ChatOutput, FinishReason};
+        for reasoning in [None, Some(0), Some(9), Some(u32::MAX)] {
+            let mut output = ChatOutput::from_projections(
+                Some("SECRET_ARGUMENT".into()),
+                Some("SECRET_RESPONSE".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            output.usage = reasoning.map(|reasoning_tokens| querymt::Usage {
+                input_tokens: u32::MAX,
+                output_tokens: u32::MAX,
+                reasoning_tokens,
+                ..Default::default()
+            });
+            let (_, spans) = capture(async {
+                let chat = tracing::info_span!("chat");
+                chat.in_scope(|| super::genai::output(&output));
+            })
+            .await;
+            let chat = &spans[0];
+            let expected = reasoning.map(|value| Value::I64(i64::from(value)));
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+                expected.as_ref()
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning_tokens"),
+                expected.as_ref()
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.output_tokens"),
+                reasoning
+                    .map(|value| Value::I64(i64::from(u32::MAX) + i64::from(value)))
+                    .as_ref()
+            );
+            assert!(attr(chat, "gen_ai.request.reasoning.level").is_none());
             assert_private(&spans);
         }
     }
@@ -614,6 +738,10 @@ mod tests {
             )
             .is_none()
         );
+        for span in &spans {
+            assert!(attr(span, "gen_ai.usage.reasoning_tokens").is_none());
+            assert!(attr(span, "gen_ai.request.reasoning.level").is_none());
+        }
     }
 
     #[test]
