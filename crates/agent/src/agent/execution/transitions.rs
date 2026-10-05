@@ -591,6 +591,7 @@ pub(super) async fn transition_call_llm(
     genai::agent_id(&chat_span, config.provider.agent_id.as_deref());
     let session_id = &exec_ctx.session_id;
     let request_messages = request.messages.as_ref();
+    genai::conversation_compacted(&chat_span, &exec_ctx.compaction_summaries, request_messages);
     let tools = &request.tools;
     debug!(
         "CallLlm: session={}, messages={}",
@@ -1994,6 +1995,180 @@ mod tests {
                 tools: Arc::from([]),
                 estimated_tokens: 1,
             })
+        }
+
+        #[tokio::test]
+        async fn genai_compacted_requires_retained_typed_effective_summary() {
+            use crate::agent::agent_config_builder::AgentConfigBuilder;
+            use crate::hooks::{Hooks, HooksConfig};
+            use crate::session::backend::StorageBackend;
+            use crate::session::compaction::SessionCompaction;
+            use crate::test_utils::helpers::genai_trace::capture_info;
+
+            for mode in [
+                "retained",
+                "cached",
+                "removed",
+                "modified",
+                "role_changed",
+                "hook_removed",
+                "hook_modified",
+                "request_only",
+                "orphan_request",
+                "blank",
+                "untyped",
+                "superseded",
+                "reload_removed",
+                "empty",
+            ] {
+                let mut mock = MockLlmProvider::new();
+                mock.expect_chat().times(1).returning(|_| {
+                    Ok(ChatOutput::from_projections(
+                        None,
+                        Some("SECRET_RESPONSE".into()),
+                        None,
+                        None,
+                        Some(FinishReason::Stop),
+                    ))
+                });
+                let fixture =
+                    TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+                let mut exec = fixture.execution_context().await;
+                let (boundary, mut summary) = SessionCompaction::create_compaction_messages(
+                    &exec.session_id,
+                    if mode == "blank" {
+                        " \n "
+                    } else {
+                        "SECRET_PROMPT"
+                    },
+                    100,
+                );
+                let boundary_id = boundary.id.clone();
+                if mode == "untyped" {
+                    summary.parts = vec![MessagePart::Text {
+                        content: "SECRET_PROMPT".into(),
+                    }];
+                } else if mode == "superseded" {
+                    summary.parts.push(MessagePart::Output {
+                        output: ChatOutput::from_projections(
+                            None,
+                            Some("SECRET_ARGUMENT".into()),
+                            None,
+                            None,
+                            Some(FinishReason::Stop),
+                        ),
+                    });
+                }
+                if mode != "empty" {
+                    exec.add_message(boundary).await.unwrap();
+                    if mode != "request_only" {
+                        exec.add_message(summary).await.unwrap();
+                    }
+                }
+                if mode == "orphan_request" {
+                    let (orphan, _) = SessionCompaction::create_compaction_messages(
+                        &exec.session_id,
+                        "unused",
+                        100,
+                    );
+                    exec.add_message(orphan).await.unwrap();
+                }
+                let (mut messages, summaries) =
+                    exec.session_handle.history_with_compaction().await.unwrap();
+                exec.compaction_summaries = summaries;
+                if mode == "reload_removed" {
+                    assert_eq!(exec.compaction_summaries.len(), 1);
+                    fixture
+                        .config
+                        .provider
+                        .history_store()
+                        .delete_messages_after(&exec.session_id, &boundary_id)
+                        .await
+                        .unwrap();
+                    let (_, refreshed) =
+                        exec.session_handle.history_with_compaction().await.unwrap();
+                    exec.compaction_summaries = refreshed;
+                }
+                let context = Arc::new(crate::middleware::ConversationContext::new(
+                    exec.session_id.as_str().into(),
+                    Arc::from(messages.clone()),
+                    Arc::new(crate::middleware::AgentStats::default()),
+                    "mock".into(),
+                    "mock-model".into(),
+                ));
+                let mut builder = AgentConfigBuilder::from_provider(
+                    fixture.storage.clone(),
+                    fixture.config.provider.clone(),
+                    fixture.storage.event_journal(),
+                );
+                if mode.starts_with("hook_") {
+                    let replacement = if mode == "hook_removed" {
+                        vec![ChatMessage::user().text("SECRET_ARGUMENT").build()]
+                    } else {
+                        vec![ChatMessage::assistant().text("SECRET_ARGUMENT").build()]
+                    };
+                    let output = serde_json::json!({"hook_specific_output": {
+                        "hook_event_name": "context", "messages": replacement,
+                    }})
+                    .to_string();
+                    builder = builder.with_hooks(Hooks::new(serde_json::from_value::<HooksConfig>(serde_json::json!({
+                        "enabled": true, "context": [{"hooks": [{"type": "command",
+                            "command": format!("printf '%s' '{output}'"), "timeout_sec": 5}]}],
+                    })).unwrap()).unwrap());
+                }
+                let config = builder.build();
+                match mode {
+                    "cached" => messages = apply_cache_breakpoints(&messages),
+                    "removed" => {
+                        messages.pop();
+                    }
+                    "modified" => {
+                        *messages.last_mut().unwrap() =
+                            ChatMessage::assistant().text("SECRET_ARGUMENT").build();
+                    }
+                    "role_changed" => {
+                        messages.last_mut().unwrap().role = ChatRole::User;
+                    }
+                    _ => {}
+                }
+                let (result, spans) = capture_info(async {
+                    let request = if mode.starts_with("hook_") {
+                        let ExecutionState::CallLlm { request, .. } =
+                            transition_before_llm_call(&config, &context, &exec)
+                                .await
+                                .unwrap()
+                        else {
+                            panic!("expected prepared request");
+                        };
+                        request
+                    } else {
+                        Arc::new(PreparedModelRequest {
+                            messages: Arc::from(messages),
+                            tools: Arc::from([]),
+                            estimated_tokens: 1,
+                        })
+                    };
+                    transition_call_llm(&config, &context, &request, &exec).await
+                })
+                .await;
+                assert!(
+                    matches!(result.unwrap(), ExecutionState::AfterLlm { .. }),
+                    "mode={mode}"
+                );
+                let chats: Vec<_> = spans
+                    .iter()
+                    .filter(|span| {
+                        attr(span, "gen_ai.operation.name") == Some(&Value::from("chat"))
+                    })
+                    .collect();
+                assert_eq!(chats.len(), 1, "mode={mode}");
+                assert_eq!(
+                    attr(chats[0], "gen_ai.conversation.compacted"),
+                    matches!(mode, "retained" | "cached").then_some(&Value::Bool(true)),
+                    "mode={mode}"
+                );
+                assert_private(&spans);
+            }
         }
 
         type TimedChunks = Result<Vec<(u64, Result<StreamChunk, LLMError>)>, LLMError>;

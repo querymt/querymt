@@ -59,6 +59,9 @@ pub(crate) struct ExecutionContext {
     /// throughout execution — avoids repeated DB lookups for session/config.
     pub session_handle: SessionHandle,
 
+    /// Ephemeral typed-summary provenance, refreshed whenever effective history is rebuilt.
+    pub compaction_summaries: Vec<querymt::chat::ChatMessage>,
+
     /// Cancellation token for this execution. Cancelled when the session receives
     /// a cancel signal. Propagated into tool contexts so individual tools can
     /// abort long-running work cooperatively.
@@ -110,6 +113,7 @@ impl ExecutionContext {
             runtime,
             state,
             session_handle,
+            compaction_summaries: Vec::new(),
             cancellation_token: CancellationToken::new(),
             tool_config,
             execution_origin: ExecutionOrigin::Interactive,

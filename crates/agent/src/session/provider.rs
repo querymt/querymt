@@ -836,6 +836,19 @@ impl SessionHandle {
     /// Get the session history converted to standard ChatMessages for the LLM.
     pub async fn history(&self) -> SessionResult<Vec<ChatMessage>> {
         let agent_msgs = self.get_effective_agent_history().await?;
+        self.project_history(&agent_msgs)
+    }
+
+    pub(crate) async fn history_with_compaction(
+        &self,
+    ) -> SessionResult<(Vec<ChatMessage>, Vec<ChatMessage>)> {
+        let agent_msgs = self.get_effective_agent_history().await?;
+        let messages = self.project_history(&agent_msgs)?;
+        let summaries = crate::agent::utils::genai::compaction_summaries(&agent_msgs, &messages);
+        Ok((messages, summaries))
+    }
+
+    fn project_history(&self, agent_msgs: &[AgentMessage]) -> SessionResult<Vec<ChatMessage>> {
         // Build the full target identity so native provider state (encrypted
         // reasoning, opaque items) may only replay to the exact same
         // provider/protocol/model/endpoint; any other target gets the portable

@@ -9,10 +9,12 @@ pub(crate) mod genai {
         Array, Value,
         trace::{Status, TraceContextExt},
     };
-    use querymt::chat::{ChatOutput, ChatOutputStatus, FinishReason};
+    use querymt::chat::{ChatMessage, ChatOutput, ChatOutputStatus, ChatRole, FinishReason};
     use querymt::error::LLMError;
     use tracing::Span;
     use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    use crate::model::{AgentMessage, MessagePart};
 
     pub(crate) fn agent_id(span: &Span, id: Option<&str>) {
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
@@ -32,15 +34,66 @@ pub(crate) mod genai {
         TOOL_SPAN.scope(span, future).await
     }
 
+    fn rename_tool(span: &Span, name: String) {
+        span.record("otel.name", &name);
+        // Updating the tracing field alone cannot rename the started OTel span in 0.33.
+        span.context().span().update_name(name);
+    }
+
     pub(crate) fn skill_name(name: &str) {
         let _ = TOOL_SPAN.try_with(|span| {
             span.set_attribute("gen_ai.skill.name", name.to_owned());
-            let span_name = format!("execute_tool skill {name}");
-            span.record("otel.name", &span_name);
-            // The semantic span is already active; updating its tracing field alone
-            // cannot rename the started OTel span in tracing-opentelemetry 0.33.
-            span.context().span().update_name(span_name);
+            rename_tool(span, format!("execute_tool skill {name}"));
         });
+    }
+
+    pub(crate) fn shell_executable(name: &str) {
+        let _ = TOOL_SPAN.try_with(|span| {
+            span.set_attribute("process.executable.name", name.to_owned());
+            rename_tool(span, format!("execute_tool shell {name}"));
+        });
+    }
+
+    pub(crate) fn shell_exit_code(code: Option<i32>) {
+        if let Some(code) = code {
+            let _ = TOOL_SPAN.try_with(|span| {
+                span.set_attribute("process.exit.code", i64::from(code));
+            });
+        }
+    }
+
+    /// Keep only typed successful summaries, projected alongside the effective history.
+    /// Canonical assistant output supersedes legacy parts, including compaction parts.
+    pub(crate) fn compaction_summaries(
+        history: &[AgentMessage],
+        projected: &[ChatMessage],
+    ) -> Vec<ChatMessage> {
+        history
+            .iter()
+            .zip(projected)
+            .filter(|(message, _)| {
+                message.parts.iter().any(|part| {
+                    matches!(part, MessagePart::Compaction { summary, .. } if !summary.trim().is_empty())
+                }) && !(message.role == ChatRole::Assistant
+                    && message.parts.iter().any(|part| matches!(part, MessagePart::Output { .. })))
+            })
+            .map(|(_, projected)| projected.clone())
+            .collect()
+    }
+
+    pub(crate) fn conversation_compacted(
+        span: &Span,
+        summaries: &[ChatMessage],
+        messages: &[ChatMessage],
+    ) {
+        // Hooks/middleware can replace the final request; cache hints are not content.
+        if summaries.iter().any(|summary| {
+            messages.iter().any(|message| {
+                message.role == summary.role && message.payload() == summary.payload()
+            })
+        }) {
+            span.set_attribute("gen_ai.conversation.compacted", true);
+        }
     }
 
     /// First received chunk, not first visible token. State belongs to the logical chat,

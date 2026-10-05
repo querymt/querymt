@@ -148,6 +148,24 @@ configuration, exporters, or add metrics.
   validation, permission checks, and successful loading, not from an arbitrary
   request or another tool named `skill`. Skill content, descriptions, paths, and
   source URIs are not attached.
+- Normal chat adds `gen_ai.conversation.compacted=true` only when the final request
+  retains a nonblank successful summary from typed effective history, matched by
+  role and payload (ignoring cache hints). History reloads and successful compaction
+  rebuilds refresh this private provenance. Requests alone, removed/modified summaries,
+  and unverified summary-like text omit the attribute; `false` is never emitted.
+  Compaction and delegation-summary chat spans do not currently attach this flag.
+- The built-in shell refines the existing INTERNAL tool span to
+  `execute_tool shell {process.executable.name}` when a best-effort Linux
+  `/proc/[pid]/exe` lookup started immediately after spawn yields an executable basename.
+  The lookup does not delay process waiting or cancellation; identity may be omitted
+  if completion or cancellation wins. This identifies the observed executable
+  (possibly a script interpreter or shell), not a parsed command or requested symlink.
+  Lookup failures and other platforms also omit identity. `process.exit.code` records
+  only an actual numeric status, including nonzero exits, without changing tool success
+  semantics. Cancellation/drop retains already-recorded identity but omits exit code
+  without a status. Pre-spawn
+  failures and custom tools named `shell` add no process metadata. No separate process
+  span, executable path, command/argv, stdout, or stderr is attached.
 - Streaming chat records `gen_ai.response.time_to_first_chunk` as a floating-point
   duration in seconds from the first physical generation request to the first
   received successful chunk, including stream creation time. Metadata, empty,

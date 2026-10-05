@@ -1441,6 +1441,174 @@ mod genai_trace_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn genai_shell_refines_only_spawned_builtin_on_existing_span() {
+        use crate::test_utils::helpers::genai_trace::capture_info;
+        use crate::tools::{
+            Tool, ToolContext, ToolError, ToolRegistry, builtins::shell::ShellTool,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        struct CustomShell;
+        #[async_trait::async_trait]
+        impl Tool for CustomShell {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn definition(&self) -> querymt::chat::Tool {
+                ShellTool::new().definition()
+            }
+            async fn call(
+                &self,
+                _: serde_json::Value,
+                _: &dyn ToolContext,
+            ) -> Result<Vec<querymt::chat::ToolResultPart>, ToolError> {
+                Ok(vec![querymt::chat::ToolResultPart::text("SECRET_RESPONSE")])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|path| path.join("sh"))
+            .find(|path| path.is_file())
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let executable = shell.file_name().unwrap().to_str().unwrap();
+        let symlink = dir.path().join("SECRET_ARGUMENT-link");
+        std::os::unix::fs::symlink(&shell, &symlink).unwrap();
+        let script = dir.path().join("SECRET_ARGUMENT-script");
+        std::fs::write(
+            &script,
+            format!(
+                "#!{}\nsleep 0.2\nprintf SECRET_RESPONSE\nprintf SECRET_ERROR >&2\nexit 7\n",
+                shell.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let mut exec = fixture.execution_context().await;
+        for mode in [
+            "direct",
+            "symlink",
+            "script",
+            "wrapper",
+            "signal",
+            "spawn_failure",
+            "blocked",
+            "policy_blocked",
+            "custom",
+        ] {
+            let mut registry = ToolRegistry::new();
+            if mode == "custom" {
+                registry.add(Arc::new(CustomShell));
+            } else {
+                registry.add(Arc::new(ShellTool::new()));
+            }
+            exec.tool_config.denylist.clear();
+            if mode == "policy_blocked" {
+                exec.tool_config.denylist.insert("shell".into());
+            }
+            let mut builder = AgentConfigBuilder::from_provider(
+                fixture.storage.clone(),
+                fixture.config.provider.clone(),
+                fixture.storage.event_journal(),
+            )
+            .with_tool_registry(registry);
+            if mode == "blocked" {
+                builder = builder.with_hooks(Hooks::new(serde_json::from_value::<HooksConfig>(serde_json::json!({
+                    "enabled": true, "pre_tool_use": [{"matcher": "^shell$", "hooks": [{"type": "command",
+                    "command": "printf '%s' '{\"hook_specific_output\":{\"hook_event_name\":\"pre_tool_use\",\"permission_decision\":\"deny\"}}'", "timeout_sec": 5}]}],
+                })).unwrap()).unwrap());
+            }
+            let config = builder.build();
+            let command = match mode {
+                "symlink" => symlink.to_str().unwrap(),
+                "script" => script.to_str().unwrap(),
+                "spawn_failure" => "SECRET_ARGUMENT-missing-executable",
+                _ => shell.to_str().unwrap(),
+            };
+            let mut args = serde_json::json!({"command": command, "args": ["-c", "sleep 0.2; printf SECRET_RESPONSE; printf SECRET_ERROR >&2; exit 0"], "workdir": dir.path()});
+            if mode == "script" {
+                args["args"] = serde_json::json!([]);
+            }
+            if mode == "wrapper" {
+                args = serde_json::json!({"command": "sleep 0.2; printf SECRET_RESPONSE; printf SECRET_ERROR >&2; exit 7", "workdir": dir.path()});
+            }
+            if mode == "signal" {
+                args["args"] = serde_json::json!(["-c", "sleep 0.2; kill -TERM $$"]);
+            }
+            let call = mock_tool_call(mode, "shell", &args.to_string());
+            let (result, spans) =
+                capture_info(execute_tool_call(&config, &call, &exec, None)).await;
+            let result = result.unwrap();
+            let ran = matches!(mode, "direct" | "symlink" | "script" | "wrapper" | "signal");
+            assert_eq!(
+                result.is_error,
+                matches!(mode, "spawn_failure" | "blocked" | "policy_blocked"),
+                "mode={mode}"
+            );
+            let semantic: Vec<_> = spans
+                .iter()
+                .filter(|span| {
+                    attr(span, "gen_ai.operation.name") == Some(&Value::from("execute_tool"))
+                })
+                .collect();
+            assert_eq!(semantic.len(), 1, "mode={mode}");
+            let tool = semantic[0];
+            assert_eq!(tool.span_kind, SpanKind::Internal);
+            assert_eq!(
+                tool.name,
+                if ran {
+                    format!("execute_tool shell {executable}")
+                } else {
+                    "execute_tool shell".into()
+                },
+                "mode={mode}"
+            );
+            assert_eq!(attr(tool, "gen_ai.tool.name"), Some(&Value::from("shell")));
+            assert_eq!(
+                attr(tool, "process.executable.name"),
+                ran.then_some(&Value::from(executable.to_owned())),
+                "mode={mode}"
+            );
+            let exit = match mode {
+                "direct" | "symlink" => Some(0),
+                "script" | "wrapper" => Some(7),
+                _ => None,
+            };
+            assert_eq!(
+                attr(tool, "process.exit.code"),
+                exit.map(Value::I64).as_ref(),
+                "mode={mode}"
+            );
+            if ran {
+                assert_eq!(tool.status, Status::Unset);
+                let text = result.content[0].as_text().unwrap();
+                let output: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(output["exit_code"], exit.unwrap_or(-1));
+            }
+            for diagnostic in spans
+                .iter()
+                .filter(|span| span.span_context.span_id() != tool.span_context.span_id())
+            {
+                assert!(attr(diagnostic, "process.executable.name").is_none());
+                assert!(attr(diagnostic, "process.exit.code").is_none());
+            }
+            assert_private(&spans);
+            let exported = format!("{spans:?}");
+            assert!(
+                !exported.contains(dir.path().to_str().unwrap()),
+                "mode={mode}"
+            );
+            assert!(!exported.contains(shell.to_str().unwrap()), "mode={mode}");
+        }
+    }
+
     #[tokio::test]
     async fn genai_tool_status_uses_execution_truth_not_post_hook_projection() {
         for execution_failed in [false, true] {
