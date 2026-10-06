@@ -71,6 +71,10 @@ impl MeshRuntimeHandle {
         self.inner.request_shutdown();
     }
 
+    pub async fn shutdown(&self) {
+        self.inner.shutdown().await;
+    }
+
     pub async fn register_actor<A>(&self, actor_ref: ActorRef<A>, name: impl Into<String>)
     where
         A: kameo::Actor + kameo::remote::RemoteActor,
@@ -504,7 +508,7 @@ mod tests {
         runtime.request_shutdown();
 
         match swarm_cmd_rx.try_recv().unwrap() {
-            SwarmCommand::Shutdown => {}
+            SwarmCommand::Shutdown { completion: None } => {}
             other => panic!("expected Shutdown command, got {other:?}"),
         }
     }

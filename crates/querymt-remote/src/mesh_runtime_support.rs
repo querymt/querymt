@@ -23,7 +23,9 @@ pub(crate) enum SwarmCommand {
     LeaveIrohScope {
         mesh_id: String,
     },
-    Shutdown,
+    Shutdown {
+        completion: Option<tokio::sync::oneshot::Sender<()>>,
+    },
 }
 
 pub(crate) fn resolve_local_hostname() -> String {
