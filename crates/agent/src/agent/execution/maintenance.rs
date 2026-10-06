@@ -11,26 +11,35 @@ use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
 use crate::middleware::ExecutionState;
 use crate::model::MessagePart;
 use crate::session::compaction::SessionCompaction;
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::sync::Arc;
 
 /// Emits the terminal event for a started compaction before propagating an
 /// error, so every reported compaction start is matched by exactly one
 /// terminal outcome.
-fn emit_compaction_failure(
+async fn emit_compaction_failure(
     config: &AgentConfig,
     session_id: &str,
     compaction_id: &str,
     error: &anyhow::Error,
 ) {
-    config.emit_event(
+    emit_compaction_event(
+        config,
         session_id,
         AgentEventKind::CompactionFailed {
             compaction_id: compaction_id.to_string(),
             reason: format!("{error:#}"),
             cancelled: false,
         },
-    );
+    )
+    .await;
+}
+
+// Await persistence and publication to preserve compaction lifecycle ordering.
+async fn emit_compaction_event(config: &AgentConfig, session_id: &str, kind: AgentEventKind) {
+    if let Err(error) = config.emit_event_persisted(session_id, kind).await {
+        warn!("failed to emit compaction event for session {session_id}: {error}");
+    }
 }
 
 /// Run pruning on tool results to reduce context size.
@@ -193,13 +202,15 @@ pub(super) async fn run_ai_compaction(
     // related update shares one session-unique ID.
     let compaction_id = uuid::Uuid::now_v7().to_string();
 
-    config.emit_event(
+    emit_compaction_event(
+        config,
         session_id,
         AgentEventKind::CompactionStart {
             token_estimate: token_estimate_u32,
             compaction_id: Some(compaction_id.clone()),
         },
-    );
+    )
+    .await;
 
     let llm_config = exec_ctx
         .llm_config()
@@ -227,7 +238,7 @@ pub(super) async fn run_ai_compaction(
         {
             Ok(provider) => provider,
             Err(error) => {
-                emit_compaction_failure(config, session_id, &compaction_id, &error);
+                emit_compaction_failure(config, session_id, &compaction_id, &error).await;
                 return Err(error);
             }
         };
@@ -252,18 +263,18 @@ pub(super) async fn run_ai_compaction(
             Ok(result) => result,
             Err(error) => {
                 let error = anyhow::anyhow!("Compaction failed: {}", error);
-                emit_compaction_failure(config, session_id, &compaction_id, &error);
+                emit_compaction_failure(config, session_id, &compaction_id, &error).await;
                 return Err(error);
             }
         }
     };
 
     // A hook-provided summary must be usable on its own, not rescued by post-hook notes.
-    SessionCompaction::validate_summary(&result.summary).map_err(|error| {
+    if let Err(error) = SessionCompaction::validate_summary(&result.summary) {
         let error = anyhow::Error::from(error);
-        emit_compaction_failure(config, session_id, &compaction_id, &error);
-        error
-    })?;
+        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
 
     let post_hook = match config
         .hooks
@@ -291,7 +302,7 @@ pub(super) async fn run_ai_compaction(
     {
         Ok(post_hook) => post_hook,
         Err(error) => {
-            emit_compaction_failure(config, session_id, &compaction_id, &error);
+            emit_compaction_failure(config, session_id, &compaction_id, &error).await;
             return Err(error);
         }
     };
@@ -314,11 +325,11 @@ pub(super) async fn run_ai_compaction(
     }
 
     // Final validation must precede both writes: a blank boundary would hide the original history.
-    SessionCompaction::validate_summary(&result.summary).map_err(|error| {
+    if let Err(error) = SessionCompaction::validate_summary(&result.summary) {
         let error = anyhow::Error::from(error);
-        emit_compaction_failure(config, session_id, &compaction_id, &error);
-        error
-    })?;
+        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
 
     info!(
         "Compaction generated summary: {} tokens -> {} tokens",
@@ -331,41 +342,43 @@ pub(super) async fn run_ai_compaction(
         result.original_token_count,
     );
 
-    exec_ctx.add_message(request_msg).await.map_err(|e| {
-        let error = anyhow::anyhow!("Failed to store compaction request: {}", e);
-        emit_compaction_failure(config, session_id, &compaction_id, &error);
-        error
-    })?;
-    exec_ctx.add_message(summary_msg).await.map_err(|e| {
-        let error = anyhow::anyhow!("Failed to store compaction summary: {}", e);
-        emit_compaction_failure(config, session_id, &compaction_id, &error);
-        error
-    })?;
+    if let Err(error) = exec_ctx.add_message(request_msg).await {
+        let error = anyhow::anyhow!("Failed to store compaction request: {}", error);
+        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
+    if let Err(error) = exec_ctx.add_message(summary_msg).await {
+        let error = anyhow::anyhow!("Failed to store compaction summary: {}", error);
+        emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+        return Err(error);
+    }
 
-    let filtered_messages = exec_ctx
-        .session_handle
-        .get_effective_agent_history()
-        .await
-        .map_err(|e| {
-            let error = anyhow::anyhow!("Failed to get new history: {}", e);
-            emit_compaction_failure(config, session_id, &compaction_id, &error);
-            error
-        })?;
+    let filtered_messages = match exec_ctx.session_handle.get_effective_agent_history().await {
+        Ok(messages) => messages,
+        Err(error) => {
+            let error = anyhow::anyhow!("Failed to get new history: {}", error);
+            emit_compaction_failure(config, session_id, &compaction_id, &error).await;
+            return Err(error);
+        }
+    };
 
     let new_context_tokens = config
         .compaction
         .estimate_messages_tokens(&filtered_messages, prompt_limit);
 
     // One validated text summary chunk after the start and before the terminal update.
-    config.emit_event(
+    emit_compaction_event(
+        config,
         session_id,
         AgentEventKind::CompactionSummaryChunk {
             compaction_id: compaction_id.clone(),
             content: result.summary.clone(),
         },
-    );
+    )
+    .await;
 
-    config.emit_event(
+    emit_compaction_event(
+        config,
         session_id,
         AgentEventKind::CompactionEnd {
             summary: result.summary.clone(),
@@ -379,7 +392,8 @@ pub(super) async fn run_ai_compaction(
             // terminal event so clients can project the reduced usage.
             context_tokens: Some(u64::try_from(new_context_tokens).unwrap_or(u64::MAX)),
         },
-    );
+    )
+    .await;
 
     // Convert AgentMessages to ChatMessages for the ConversationContext
     let chat_messages: Vec<querymt::chat::ChatMessage> = filtered_messages
@@ -426,6 +440,7 @@ mod tests {
     use super::*;
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::{McpToolState, SessionRuntime, ToolConfig};
+    use crate::events::{DurableEvent, EventEnvelope};
     use crate::hooks::{
         HookCommandConfig, HookHandlerConfig, Hooks, HooksConfig, MatcherGroupConfig,
     };
@@ -537,6 +552,55 @@ mod tests {
         (config, exec_ctx, state, tempdir)
     }
 
+    fn is_compaction_event(kind: &AgentEventKind) -> bool {
+        matches!(
+            kind,
+            AgentEventKind::CompactionStart { .. }
+                | AgentEventKind::CompactionSummaryChunk { .. }
+                | AgentEventKind::CompactionEnd { .. }
+                | AgentEventKind::CompactionFailed { .. }
+        )
+    }
+
+    fn take_compaction_events(
+        receiver: &mut tokio::sync::broadcast::Receiver<EventEnvelope>,
+    ) -> Vec<DurableEvent> {
+        let mut events = Vec::new();
+        loop {
+            match receiver.try_recv() {
+                Ok(EventEnvelope::Durable(event)) if is_compaction_event(&event.kind) => {
+                    events.push(event);
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return events,
+                Err(error) => panic!("failed to receive compaction event: {error}"),
+            }
+        }
+    }
+
+    async fn assert_compaction_journal_matches(
+        config: &AgentConfig,
+        session_id: &str,
+        live_events: &[DurableEvent],
+    ) {
+        let journal_events: Vec<_> = config
+            .event_sink
+            .journal()
+            .load_session_stream(session_id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| is_compaction_event(&event.kind))
+            .collect();
+        assert_eq!(
+            serde_json::to_value(&journal_events).unwrap(),
+            serde_json::to_value(live_events).unwrap()
+        );
+        for pair in live_events.windows(2) {
+            assert!(pair[0].stream_seq < pair[1].stream_seq);
+        }
+    }
+
     async fn assert_failed_compaction_preserves_history(
         hooks: Hooks,
         output: Option<ChatOutput>,
@@ -553,6 +617,8 @@ mod tests {
         let error = run_ai_compaction(&config, &exec_ctx, &state)
             .await
             .expect_err("compaction must fail");
+        // Do not yield: all lifecycle events must be published before compaction returns.
+        let compaction_events = take_compaction_events(&mut events);
         assert!(error.to_string().contains(expected_error), "{error:#}");
         let after = config
             .provider
@@ -575,33 +641,28 @@ mod tests {
         );
         assert_eq!(state.context().unwrap().stats.context_tokens, 100_000);
 
-        let mut start_id = None;
-        loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            match event.kind() {
-                AgentEventKind::CompactionStart { compaction_id, .. } => {
-                    start_id = compaction_id.clone()
-                }
-                AgentEventKind::CompactionFailed {
-                    compaction_id,
-                    reason,
-                    cancelled,
-                } => {
-                    assert_eq!(Some(compaction_id), start_id.as_ref());
-                    assert!(reason.contains(expected_error));
-                    assert!(!cancelled);
-                    break;
-                }
-                AgentEventKind::CompactionEnd { .. }
-                | AgentEventKind::CompactionSummaryChunk { .. } => {
-                    panic!("failed compaction emitted success")
-                }
-                _ => {}
-            }
-        }
+        let [start, failed] = compaction_events.as_slice() else {
+            panic!("expected start and failure before return: {compaction_events:?}");
+        };
+        let AgentEventKind::CompactionStart {
+            compaction_id: Some(start_id),
+            ..
+        } = &start.kind
+        else {
+            panic!("first compaction event must be a start: {start:?}");
+        };
+        let AgentEventKind::CompactionFailed {
+            compaction_id,
+            reason,
+            cancelled,
+        } = &failed.kind
+        else {
+            panic!("failed compaction must emit a failure, not success: {failed:?}");
+        };
+        assert_eq!(compaction_id, start_id);
+        assert!(reason.contains(expected_error));
+        assert!(!cancelled);
+        assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
         assert!(!crate::session::compaction::has_compaction(&after));
     }
 
@@ -715,6 +776,7 @@ mod tests {
         .await;
         let mut events = config.subscribe_events();
         let result = run_ai_compaction(&config, &exec_ctx, &state).await.unwrap();
+        let compaction_events = take_compaction_events(&mut events);
         let expected = "Valid continuation summary\n\nKeep the tests passing";
         let effective = exec_ctx
             .session_handle
@@ -726,32 +788,37 @@ mod tests {
             matches!(&effective[1].parts[0], MessagePart::Compaction { summary, .. } if summary == expected)
         );
         assert!(result.context().unwrap().stats.context_tokens > 0);
-        let mut saw_summary = false;
-        loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            match event.kind() {
-                AgentEventKind::CompactionSummaryChunk { content, .. } => {
-                    assert_eq!(content, expected);
-                    saw_summary = true;
-                }
-                AgentEventKind::CompactionEnd {
-                    summary,
-                    context_tokens,
-                    ..
-                } => {
-                    assert_eq!(summary, expected);
-                    assert!(context_tokens.unwrap() > 0);
-                    assert!(saw_summary);
-                    break;
-                }
-                AgentEventKind::CompactionFailed { reason, .. } => {
-                    panic!("valid summary failed: {reason}")
-                }
-                _ => {}
-            }
-        }
+        let [start, chunk, end] = compaction_events.as_slice() else {
+            panic!("expected start, summary, and end before return: {compaction_events:?}");
+        };
+        let AgentEventKind::CompactionStart {
+            compaction_id: Some(start_id),
+            ..
+        } = &start.kind
+        else {
+            panic!("first compaction event must be a start: {start:?}");
+        };
+        let AgentEventKind::CompactionSummaryChunk {
+            compaction_id,
+            content,
+        } = &chunk.kind
+        else {
+            panic!("second compaction event must be the summary: {chunk:?}");
+        };
+        assert_eq!(compaction_id, start_id);
+        assert_eq!(content, expected);
+        let AgentEventKind::CompactionEnd {
+            compaction_id,
+            summary,
+            context_tokens,
+            ..
+        } = &end.kind
+        else {
+            panic!("successful compaction must end after its summary: {end:?}");
+        };
+        assert_eq!(compaction_id.as_ref(), Some(start_id));
+        assert_eq!(summary, expected);
+        assert!(context_tokens.unwrap() > 0);
+        assert_compaction_journal_matches(&config, &exec_ctx.session_id, &compaction_events).await;
     }
 }
