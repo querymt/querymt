@@ -467,7 +467,9 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                             reconnect_next_due.clear();
                             peer_iroh_scope_loop.clear();
                             finish_swarm_shutdown(
-                                iroh_endpoint.as_ref().map(|endpoint| endpoint.close()),
+                                iroh_endpoint.take().map(|endpoint| async move {
+                                    endpoint.close().await;
+                                }),
                                 swarm,
                                 completion,
                             ).await;
@@ -719,6 +721,37 @@ mod tests {
         assert!(matches!(completion_rx.lock().try_recv(), Ok(())));
         std::net::TcpListener::bind(listener_addr)
             .expect("owned listener was not released before shutdown acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_iroh_socket_before_ack() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let endpoint = local_endpoint().await;
+            let addr = endpoint.bound_sockets()[0];
+            let mut iroh_endpoint = Some(endpoint.clone());
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let (release_driver_tx, release_driver_rx) = oneshot::channel();
+            let driver = tokio::spawn(async move {
+                finish_swarm_shutdown(
+                    iroh_endpoint.take().map(|endpoint| async move {
+                        endpoint.close().await;
+                    }),
+                    endpoint,
+                    Some(completion_tx),
+                )
+                .await;
+                // Keep the driver alive to detect endpoint clones retained past acknowledgement.
+                release_driver_rx.await.unwrap();
+            });
+
+            completion_rx.await.unwrap();
+            std::net::UdpSocket::bind(addr)
+                .expect("Iroh socket was not released before shutdown acknowledgement");
+            release_driver_tx.send(()).unwrap();
+            driver.await.unwrap();
+        })
+        .await
+        .expect("Iroh socket release test timed out");
     }
 
     #[tokio::test]

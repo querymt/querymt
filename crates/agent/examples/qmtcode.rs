@@ -770,11 +770,11 @@ async fn run(
         eprintln!("Received Ctrl+C, shutting down mesh node...");
     }
 
-    // Request shutdown without blocking on background drains; telemetry is finalized last.
+    // Await mesh transport teardown before exiting the runtime; finalize telemetry last.
     runner.shutdown().await;
     #[cfg(feature = "remote")]
     if let Some(runtime) = mesh_runtime.take() {
-        runtime.request_shutdown();
+        runtime.shutdown().await;
     }
     querymt_utils::telemetry::flush_telemetry();
 
