@@ -6,7 +6,7 @@ use kameo::remote;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
 use libp2p::{Multiaddr, PeerId};
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::mesh_bootstrap::{MeshBootstrapContext, finalize_bootstrap, prepare_runtime_bootstrap};
 use crate::mesh_events::{
@@ -50,6 +50,22 @@ fn iroh_transport_config(config: &MeshRuntimeConfig) -> libp2p_iroh::TransportCo
         timeout: config.request_timeout,
         enable_gso: config.iroh_gso,
         ..Default::default()
+    }
+}
+
+async fn finish_swarm_shutdown<F, T>(
+    endpoint_close: Option<F>,
+    teardown: T,
+    completion: Option<oneshot::Sender<()>>,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    if let Some(endpoint_close) = endpoint_close {
+        endpoint_close.await;
+    }
+    drop(teardown);
+    if let Some(completion) = completion {
+        let _ = completion.send(());
     }
 }
 
@@ -142,11 +158,13 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         mdns: Toggle<libp2p::mdns::tokio::Behaviour>,
     }
 
+    let mut iroh_endpoint = None;
     let mut swarm: libp2p::Swarm<UnifiedMeshBehaviour> = if has_lan && has_iroh {
         let iroh_config = iroh_transport_config(config);
         let iroh_transport = libp2p_iroh::Transport::with_config(Some(&keypair), iroh_config)
             .await
             .map_err(|e| MeshError::SwarmError(format!("iroh transport init failed: {e}")))?;
+        iroh_endpoint = Some(iroh_transport.endpoint().clone());
 
         libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
@@ -228,6 +246,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         let iroh_transport = libp2p_iroh::Transport::with_config(Some(&keypair), iroh_config)
             .await
             .map_err(|e| MeshError::SwarmError(format!("iroh transport init failed: {e}")))?;
+        iroh_endpoint = Some(iroh_transport.endpoint().clone());
 
         let local_peer_id = iroh_transport.peer_id;
         let behaviour = UnifiedMeshBehaviour {
@@ -440,13 +459,20 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                                 }
                             }
                         }
-                        SwarmCommand::Shutdown => {
+                        SwarmCommand::Shutdown { completion } => {
                             reconnect_targets.clear();
                             reconnect_targets_by_scope.clear();
                             pending_dials.clear();
                             reconnect_attempts.clear();
                             reconnect_next_due.clear();
                             peer_iroh_scope_loop.clear();
+                            finish_swarm_shutdown(
+                                iroh_endpoint.take().map(|endpoint| async move {
+                                    endpoint.close().await;
+                                }),
+                                swarm,
+                                completion,
+                            ).await;
                             break;
                         }
                     }
@@ -531,7 +557,56 @@ mod tests {
     use super::*;
     use futures_util::io::Cursor;
     use libp2p::request_response::Codec as _;
+    use parking_lot::RwLock;
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    fn test_runtime_handle(
+        mode: MeshTransportMode,
+    ) -> (MeshRuntimeHandle, mpsc::UnboundedReceiver<SwarmCommand>) {
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = keypair.public().to_peer_id();
+        let (peer_events_tx, _peer_events_rx) = tokio::sync::broadcast::channel(8);
+        let routes = Arc::new(crate::mesh_routes::RouteTable::new(
+            std::time::Duration::from_secs(60),
+        ));
+        let re_register_fns = Arc::new(RwLock::new(HashMap::new()));
+        let (swarm_cmd_tx, swarm_cmd_rx) = mpsc::unbounded_channel();
+        let mesh = MeshHandle::new(
+            peer_id,
+            peer_events_tx,
+            routes,
+            "test-host".to_string(),
+            re_register_fns,
+            keypair,
+            None,
+            None,
+            mode,
+            swarm_cmd_tx,
+            std::time::Duration::from_secs(30),
+        );
+        (MeshRuntimeHandle::new(mesh), swarm_cmd_rx)
+    }
+
+    async fn local_endpoint() -> iroh::Endpoint {
+        iroh::Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .secret_key(iroh::SecretKey::generate())
+            .alpns(vec![b"/querymt/shutdown-test/1".to_vec()])
+            .clear_ip_transports()
+            .bind_addr(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .net_report_config(iroh::endpoint::NetReportConfig::minimal())
+            .transport_config(
+                iroh::endpoint::QuicTransportConfig::builder()
+                    .enable_segmentation_offload(false)
+                    .build(),
+            )
+            .bind()
+            .await
+            .unwrap()
+    }
 
     #[test]
     fn iroh_gso_is_forwarded_for_iroh_only_and_mixed_transports() {
@@ -564,6 +639,185 @@ mod tests {
                 assert!(transport.peer_filter.is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_ack_waits_for_endpoint_close() {
+        let (close_started_tx, close_started_rx) = oneshot::channel();
+        let (release_close_tx, release_close_rx) = oneshot::channel();
+        let (completion_tx, mut completion_rx) = oneshot::channel();
+        let shutdown = tokio::spawn(async move {
+            finish_swarm_shutdown(
+                Some(async move {
+                    close_started_tx.send(()).unwrap();
+                    release_close_rx.await.unwrap();
+                }),
+                (),
+                Some(completion_tx),
+            )
+            .await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), close_started_rx)
+            .await
+            .expect("endpoint close future was not polled")
+            .unwrap();
+        assert!(matches!(
+            completion_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        release_close_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), completion_rx)
+            .await
+            .expect("shutdown completion was not sent after endpoint close")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
+            .await
+            .expect("shutdown task did not finish")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_drops_owned_listener_before_ack() {
+        struct TeardownProbe {
+            completion_rx: Arc<parking_lot::Mutex<oneshot::Receiver<()>>>,
+            dropped_before_ack: Arc<parking_lot::Mutex<bool>>,
+            _listener: std::net::TcpListener,
+        }
+
+        impl Drop for TeardownProbe {
+            fn drop(&mut self) {
+                *self.dropped_before_ack.lock() = matches!(
+                    self.completion_rx.lock().try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                );
+            }
+        }
+
+        let listener =
+            std::net::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let completion_rx = Arc::new(parking_lot::Mutex::new(completion_rx));
+        let dropped_before_ack = Arc::new(parking_lot::Mutex::new(false));
+        let teardown = TeardownProbe {
+            completion_rx: completion_rx.clone(),
+            dropped_before_ack: dropped_before_ack.clone(),
+            _listener: listener,
+        };
+
+        finish_swarm_shutdown(
+            None::<std::future::Ready<()>>,
+            teardown,
+            Some(completion_tx),
+        )
+        .await;
+
+        assert!(
+            *dropped_before_ack.lock(),
+            "shutdown acknowledged before owned teardown was dropped"
+        );
+        assert!(matches!(completion_rx.lock().try_recv(), Ok(())));
+        std::net::TcpListener::bind(listener_addr)
+            .expect("owned listener was not released before shutdown acknowledgement");
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_iroh_socket_before_ack() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let endpoint = local_endpoint().await;
+            let addr = endpoint.bound_sockets()[0];
+            let mut iroh_endpoint = Some(endpoint.clone());
+            let (completion_tx, completion_rx) = oneshot::channel();
+            let (release_driver_tx, release_driver_rx) = oneshot::channel();
+            let driver = tokio::spawn(async move {
+                finish_swarm_shutdown(
+                    iroh_endpoint.take().map(|endpoint| async move {
+                        endpoint.close().await;
+                    }),
+                    endpoint,
+                    Some(completion_tx),
+                )
+                .await;
+                // Keep the driver alive to detect endpoint clones retained past acknowledgement.
+                release_driver_rx.await.unwrap();
+            });
+
+            completion_rx.await.unwrap();
+            std::net::UdpSocket::bind(addr)
+                .expect("Iroh socket was not released before shutdown acknowledgement");
+            release_driver_tx.send(()).unwrap();
+            driver.await.unwrap();
+        })
+        .await
+        .expect("Iroh socket release test timed out");
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_iroh_peer_close_and_serializes_repeats() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let (runtime, mut swarm_cmd_rx) = test_runtime_handle(MeshTransportMode::Iroh);
+            let local = local_endpoint().await;
+            let peer = local_endpoint().await;
+            let addr = iroh::EndpointAddr::new(local.id()).with_ip_addr(local.bound_sockets()[0]);
+            let (local_connection, peer_connection) = tokio::join!(
+                async { local.accept().await.unwrap().await.unwrap() },
+                peer.connect(addr, b"/querymt/shutdown-test/1"),
+            );
+            let peer_connection = peer_connection.unwrap();
+
+            let (mut peer_send, _peer_recv) = peer_connection.open_bi().await.unwrap();
+            peer_send.write_all(b"live").await.unwrap();
+            peer_send.finish().unwrap();
+            let (_local_send, mut local_recv) = local_connection.accept_bi().await.unwrap();
+            let mut local_payload = [0; 4];
+            local_recv.read_exact(&mut local_payload).await.unwrap();
+            assert_eq!(&local_payload, b"live");
+
+            let local_for_loop = local.clone();
+            let driver = tokio::spawn(async move {
+                match swarm_cmd_rx.recv().await.unwrap() {
+                    SwarmCommand::Shutdown { completion } => {
+                        finish_swarm_shutdown(Some(local_for_loop.close()), (), completion).await;
+                    }
+                    other => panic!("expected Shutdown command, got {other:?}"),
+                }
+            });
+            tokio::join!(runtime.shutdown(), runtime.shutdown());
+            driver.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), peer_connection.closed())
+                .await
+                .expect("peer connection did not observe endpoint shutdown");
+            assert!(matches!(
+                peer_connection.close_reason(),
+                Some(iroh::endpoint::ConnectionError::ApplicationClosed(close))
+                    if close.error_code == 0_u32.into()
+            ));
+            peer.close().await;
+        })
+        .await
+        .expect("graceful shutdown test timed out");
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_iroh_endpoint_completes() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (runtime, mut swarm_cmd_rx) = test_runtime_handle(MeshTransportMode::Lan);
+            let driver = tokio::spawn(async move {
+                match swarm_cmd_rx.recv().await.unwrap() {
+                    SwarmCommand::Shutdown { completion } => {
+                        finish_swarm_shutdown(None::<std::future::Ready<()>>, (), completion).await;
+                    }
+                    other => panic!("expected Shutdown command, got {other:?}"),
+                }
+            });
+
+            runtime.shutdown().await;
+            driver.await.unwrap();
+        })
+        .await
+        .expect("LAN-only shutdown test timed out");
     }
 
     #[derive(Debug, Serialize, Deserialize)]

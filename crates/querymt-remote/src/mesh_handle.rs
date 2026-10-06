@@ -42,6 +42,7 @@ pub struct MeshHandle {
     mesh_state_store: Option<Arc<RwLock<MeshStateStore>>>,
     transport_mode: MeshTransportMode,
     swarm_cmd_tx: mpsc::UnboundedSender<SwarmCommand>,
+    shutdown_lock: Arc<tokio::sync::Mutex<()>>,
     stream_reconnect_grace: std::time::Duration,
     config_scopes: Arc<RwLock<Vec<MeshScopeId>>>,
     peer_node_resolver: Option<PeerNodeResolver>,
@@ -86,6 +87,7 @@ impl MeshHandle {
             mesh_state_store,
             transport_mode,
             swarm_cmd_tx,
+            shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
             stream_reconnect_grace,
             config_scopes: Arc::new(RwLock::new(Vec::new())),
             peer_node_resolver: None,
@@ -323,7 +325,25 @@ impl MeshHandle {
     pub fn request_shutdown(&self) {
         self.re_register_fns.write().clear();
         self.config_scopes.write().clear();
-        let _ = self.swarm_cmd_tx.send(SwarmCommand::Shutdown);
+        let _ = self
+            .swarm_cmd_tx
+            .send(SwarmCommand::Shutdown { completion: None });
+    }
+
+    pub async fn shutdown(&self) {
+        let _guard = self.shutdown_lock.lock().await;
+        self.re_register_fns.write().clear();
+        self.config_scopes.write().clear();
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        if self
+            .swarm_cmd_tx
+            .send(SwarmCommand::Shutdown {
+                completion: Some(completion),
+            })
+            .is_ok()
+        {
+            let _ = completed.await;
+        }
     }
 
     pub fn leave_iroh_scope(&self, mesh_id: &str) -> Result<bool, InviteError> {
