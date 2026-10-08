@@ -356,7 +356,11 @@ async fn execute_tool_call_inner(
                     }],
                     true,
                     "builtin",
-                    "executed",
+                    if matches!(&e, crate::tools::ToolError::PermissionDenied(_)) {
+                        "permission_denied"
+                    } else {
+                        "executed"
+                    },
                 ),
             }
         } else if let Some(tool) = mcp_tool {
@@ -1396,6 +1400,23 @@ mod genai_trace_tests {
                 .collect();
             assert_eq!(semantic.len(), 1);
             let tool = semantic[0];
+            assert_eq!(
+                attr(tool, "querymt.tool.execution"),
+                Some(&Value::from(match mode {
+                    "blocked" => "permission_denied",
+                    "unknown" => "validation_rejected",
+                    _ => "executed",
+                }))
+            );
+            assert_eq!(
+                attr(tool, "error.type"),
+                match mode {
+                    "blocked" => Some(Value::from("permission_denied")),
+                    "unknown" => Some(Value::from("invalid_tool_arguments")),
+                    _ => None,
+                }
+                .as_ref()
+            );
             assert_eq!(
                 tool.name,
                 if verified {
