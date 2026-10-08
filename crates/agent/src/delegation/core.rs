@@ -25,6 +25,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 // Type alias to simplify complex type signature
 type ActiveDelegations = Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>;
@@ -242,7 +243,7 @@ impl DelegationOrchestrator {
             cancel_token.cancel();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle).await;
             handle.abort();
-            if let Err(err) = self
+            if self
                 .store
                 .transition_delegation_status(
                     &delegation_id,
@@ -250,10 +251,11 @@ impl DelegationOrchestrator {
                     DelegationStatus::Cancelled,
                 )
                 .await
+                .is_err()
             {
                 warn!(
-                    "Failed to persist cancellation for delegation {} during shutdown: {}",
-                    delegation_id, err
+                    "Failed to persist cancellation for delegation {} during shutdown",
+                    delegation_id
                 );
             }
         }
@@ -265,12 +267,23 @@ impl DelegationOrchestrator {
     /// delegation-related events. Returns the `JoinHandle` for the listener task.
     pub fn start_listening(self: &Arc<Self>, fanout: &Arc<EventFanout>) -> JoinHandle<()> {
         let this = Arc::clone(self);
-        let mut rx = fanout.subscribe();
+        let mut rx = fanout.subscribe_delegation();
         tokio::spawn(async move {
             while !this.shutting_down.load(Ordering::Acquire) {
                 match rx.recv().await {
-                    Ok(envelope) => {
-                        this.handle_envelope(&envelope).await;
+                    Ok((envelope, parent)) => {
+                        // Replay/remote events are roots, not children of the listener's context.
+                        let handler = tracing::info_span!(
+                            parent: None,
+                            "delegation.orchestrator.handle_event",
+                            session_id = %envelope.session_id(),
+                            event_kind = tracing::field::Empty,
+                        );
+                        if let Some(parent) = parent {
+                            let context = parent.context();
+                            let _ = handler.set_parent(context);
+                        }
+                        this.handle_envelope(&envelope).instrument(handler).await;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -317,7 +330,7 @@ impl DelegationOrchestrator {
                 }
             }
             Ok(false) => {}
-            Err(err) => warn!("Failed to persist delegation claim failure: {}", err),
+            Err(_) => warn!("Failed to persist delegation claim failure"),
         }
     }
 
@@ -338,14 +351,6 @@ impl DelegationOrchestrator {
     }
 
     /// Process a single event envelope.
-    #[instrument(
-        name = "delegation.orchestrator.handle_event",
-        skip(self, envelope),
-        fields(
-            session_id = %envelope.session_id(),
-            event_kind = tracing::field::Empty,
-        )
-    )]
     async fn handle_envelope(&self, envelope: &EventEnvelope) {
         if self.shutting_down.load(Ordering::Acquire) {
             return;
@@ -485,54 +490,57 @@ impl DelegationOrchestrator {
                 let delegation_id = delegation.public_id.clone();
                 let cancel_token_clone = cancel_token.clone();
 
-                let handle = tokio::spawn(async move {
-                    if start_rx.await.is_err() {
-                        return;
-                    }
-                    let _permit = match max_parallel.acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            fail_delegation(
-                                DelegationFailureContext {
-                                    event_sink: &event_sink,
-                                    delegator: &delegator,
-                                    store: &store,
-                                    hooks: Some(&hooks),
-                                    config: &config,
-                                    parent_session_id: &parent_session_id,
-                                    delegation_id: &delegation.public_id,
-                                    target_agent_id: Some(&delegation.target_agent_id),
-                                    objective: Some(&delegation.objective),
-                                },
-                                "Delegation queue closed before execution could start",
-                            )
-                            .await;
+                let handle = tokio::spawn(
+                    async move {
+                        if start_rx.await.is_err() {
                             return;
                         }
-                    };
+                        let _permit = match max_parallel.acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                fail_delegation(
+                                    DelegationFailureContext {
+                                        event_sink: &event_sink,
+                                        delegator: &delegator,
+                                        store: &store,
+                                        hooks: Some(&hooks),
+                                        config: &config,
+                                        parent_session_id: &parent_session_id,
+                                        delegation_id: &delegation.public_id,
+                                        target_agent_id: Some(&delegation.target_agent_id),
+                                        objective: Some(&delegation.objective),
+                                    },
+                                    "Delegation queue closed before execution could start",
+                                )
+                                .await;
+                                return;
+                            }
+                        };
 
-                    let ctx = DelegationContext {
-                        delegator,
-                        event_sink,
-                        store,
-                        tool_registry,
-                        config,
-                        hooks,
-                        active_delegations: active_delegations_for_spawn,
-                        delegation_summarizer,
-                        delegate_model_overrides,
-                        profile_id,
-                        routing_snapshot,
-                    };
-                    execute_delegation(
-                        ctx,
-                        target_handle,
-                        parent_session_id,
-                        delegation,
-                        cancel_token,
-                    )
-                    .await;
-                });
+                        let ctx = DelegationContext {
+                            delegator,
+                            event_sink,
+                            store,
+                            tool_registry,
+                            config,
+                            hooks,
+                            active_delegations: active_delegations_for_spawn,
+                            delegation_summarizer,
+                            delegate_model_overrides,
+                            profile_id,
+                            routing_snapshot,
+                        };
+                        execute_delegation(
+                            ctx,
+                            target_handle,
+                            parent_session_id,
+                            delegation,
+                            cancel_token,
+                        )
+                        .await;
+                    }
+                    .in_current_span(),
+                );
 
                 let mut active = active_delegations.lock().await;
                 if self.shutting_down.load(Ordering::Acquire) {
@@ -710,7 +718,7 @@ fn reasoning_effort_from_llm_config(
 
 #[instrument(
     name = "delegation.execute",
-    skip(ctx, target, cancel_token),
+    skip(ctx, target, delegation, cancel_token),
     fields(
         parent_session_id = %parent_session_id,
         delegation_id = %delegation.public_id,
@@ -758,7 +766,7 @@ async fn execute_delegation(
                 );
             }
         }
-        Err(err) => warn!("Delegation start hook failed: {}", err),
+        Err(_) => warn!("Delegation start hook failed"),
     }
 
     // Snapshot the parent's current per-session setting. UI changes persist this value
@@ -846,8 +854,8 @@ async fn execute_delegation(
             warn!("Parent session not found for cwd lookup, using orchestrator default");
             None
         }
-        Err(e) => {
-            warn!("Failed to lookup parent session cwd: {e}, using orchestrator default");
+        Err(_) => {
+            warn!("Failed to lookup parent session cwd, using orchestrator default");
             None
         }
     };
@@ -920,11 +928,10 @@ async fn execute_delegation(
                     );
                 }
             }
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
                     delegation_id = %delegation.public_id,
                     child_session_id = %child_session_id,
-                    error = %error,
                     "Failed to inherit the parent session client bridge"
                 );
             }
@@ -995,15 +1002,16 @@ async fn execute_delegation(
                     {
                         routed_provider_node_id = Some(node_id.clone());
                     }
-                    if let Err(e) = ctx
+                    if ctx
                         .store
                         .set_session_provider_node_id(&child_session_id, Some(node_id.as_str()))
                         .await
+                        .is_err()
                     {
                         warn!(
                             "execute_delegation: failed to set provider_node_id='{}' \
-                                 on session {} from routing table: {}",
-                            node_id, child_session_id, e
+                                 on session {} from routing table",
+                            node_id, child_session_id
                         );
                     } else {
                         debug!(
@@ -1172,7 +1180,7 @@ async fn execute_delegation(
             Some(control.effective_model.model_id),
             control.effective_model.provider_node_id,
         ),
-        Err(error) => {
+        Err(_) => {
             // Provenance only: the child is already created, routed, and configured.
             // Missing selected_model_id is allowed on SessionForked. If confirmed
             // model identity later becomes a hard execution/audit precondition,
@@ -1181,7 +1189,6 @@ async fn execute_delegation(
                 delegation_id = %delegation.public_id,
                 child_session_id = %child_session_id,
                 target_agent_id = %delegation.target_agent_id,
-                error = %error,
                 "Failed to confirm delegate model"
             );
             (None, None)
@@ -1213,8 +1220,8 @@ async fn execute_delegation(
                     tracing::Span::current().record("message_count", history.len() as u64);
                     Some(history)
                 }
-                Err(e) => {
-                    warn!("Failed to load parent history for summary: {}", e);
+                Err(_) => {
+                    warn!("Failed to load parent history for summary");
                     None
                 }
             }
@@ -1232,8 +1239,8 @@ async fn execute_delegation(
                         tracing::Span::current().record("summary_bytes", summary.len() as u64);
                         Some(summary)
                     }
-                    Err(e) => {
-                        warn!("Delegation summary generation failed: {}", e);
+                    Err(_) => {
+                        warn!("Delegation summary generation failed");
                         // Proceed without summary — graceful degradation
                         None
                     }
@@ -1249,12 +1256,13 @@ async fn execute_delegation(
 
             if let Some(summary) = summary {
                 // Persist only the summary; the event copy still has the pre-claim status.
-                if let Err(e) = ctx
+                if ctx
                     .store
                     .set_delegation_planning_summary(&delegation.public_id, &summary)
                     .await
+                    .is_err()
                 {
-                    warn!("Failed to persist delegation summary: {}", e);
+                    warn!("Failed to persist delegation summary");
                 }
 
                 // Inject via SetPlanningContext kameo message
@@ -1264,11 +1272,12 @@ async fn execute_delegation(
                 );
                 let summary_bytes = formatted_summary.len();
                 async {
-                    if let Err(e) = session_ref.set_planning_context(formatted_summary).await {
-                        warn!(
-                            "Failed to inject planning summary via SetPlanningContext: {}",
-                            e
-                        );
+                    if session_ref
+                        .set_planning_context(formatted_summary)
+                        .await
+                        .is_err()
+                    {
+                        warn!("Failed to inject planning summary via SetPlanningContext");
                     } else {
                         log::info!(
                             "Injected planning summary into delegate session {} via kameo",
@@ -1287,10 +1296,11 @@ async fn execute_delegation(
 
     // 3. Send prompt directly via kameo
     let prompt_text = build_delegation_prompt(&delegation);
-    let prompt_req = PromptRequest::new(
+    let mut prompt_req = PromptRequest::new(
         child_session_id.clone(),
         vec![ContentBlock::Text(TextContent::new(prompt_text))],
     );
+    prompt_req.meta = crate::acp::trace_context::inject_current_acp_trace_context();
 
     let prompt_result = tokio::select! {
         result = session_ref.prompt(prompt_req) => Some(result),
@@ -1313,8 +1323,8 @@ async fn execute_delegation(
                     active.remove(&delegation_id);
                     return;
                 }
-                Err(e) => {
-                    warn!("Failed to update delegation status to Cancelled: {}", e);
+                Err(_) => {
+                    warn!("Failed to update delegation status to Cancelled");
                     let mut active = ctx.active_delegations.lock().await;
                     active.remove(&delegation_id);
                     return;
@@ -1387,8 +1397,8 @@ async fn execute_delegation(
                                 .await
                             {
                                 Ok(()) => true,
-                                Err(err) => {
-                                    warn!("Verification failed: {}", err);
+                                Err(_) => {
+                                    warn!("Verification failed");
                                     false
                                 }
                             };
@@ -1440,8 +1450,8 @@ async fn execute_delegation(
             let mut summary = async {
                 let s = match session_ref.get_history().await {
                     Ok(history) => extract_session_summary_from_history(&history),
-                    Err(err) => {
-                        warn!("Error extracting summary via GetHistory: {}", err);
+                    Err(_) => {
+                        warn!("Error extracting summary via GetHistory");
                         "Error extracting summary.".to_string()
                     }
                 };
@@ -1479,7 +1489,7 @@ async fn execute_delegation(
                             format!("{}\n\n{}", summary, result.additional_contexts.join("\n\n"));
                     }
                 }
-                Err(err) => warn!("Post-delegation hook failed: {}", err),
+                Err(_) => warn!("Post-delegation hook failed"),
             }
 
             match ctx
@@ -1497,8 +1507,8 @@ async fn execute_delegation(
                     active.remove(&delegation_id);
                     return;
                 }
-                Err(e) => {
-                    warn!("Failed to persist delegation completion: {}", e);
+                Err(_) => {
+                    warn!("Failed to persist delegation completion");
                     let mut active = ctx.active_delegations.lock().await;
                     active.remove(&delegation_id);
                     return;
@@ -1580,14 +1590,14 @@ async fn persist_delegate_runtime_binding(
 
 #[instrument(
     name = "delegation.fail",
-    skip(ctx),
+    skip(ctx, error_message),
     fields(
         delegation_id = %ctx.delegation_id,
         parent_session_id = %ctx.parent_session_id,
     )
 )]
 async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str) {
-    error!("{}", error_message);
+    error!("Delegation failed");
     let transitioned = match ctx
         .store
         .transition_delegation_status(
@@ -1608,13 +1618,13 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
             .await
         {
             Ok(transitioned) => transitioned,
-            Err(e) => {
-                warn!("Failed to persist delegation failure: {}", e);
+            Err(_) => {
+                warn!("Failed to persist delegation failure");
                 false
             }
         },
-        Err(e) => {
-            warn!("Failed to persist delegation failure: {}", e);
+        Err(_) => {
+            warn!("Failed to persist delegation failure");
             false
         }
     };
@@ -1650,7 +1660,7 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
                     );
                 }
             }
-            Err(err) => warn!("Delegation failure hook failed: {}", err),
+            Err(_) => warn!("Delegation failure hook failed"),
         }
     }
 
@@ -1749,14 +1759,15 @@ async fn inject_results(
 ) {
     let message = format_delegation_completion_message(delegation_id, summary);
 
-    if let Err(e) = delegator
+    if delegator
         .prompt(PromptRequest::new(
             session_id.to_string(),
             vec![ContentBlock::Text(TextContent::new(message))],
         ))
         .await
+        .is_err()
     {
-        warn!("Failed to inject delegation results: {}", e);
+        warn!("Failed to inject delegation results");
     }
 }
 
@@ -1768,14 +1779,15 @@ async fn inject_failure(
 ) {
     let message = format_delegation_failure_message(delegation_id, error);
 
-    if let Err(e) = delegator
+    if delegator
         .prompt(PromptRequest::new(
             session_id.to_string(),
             vec![ContentBlock::Text(TextContent::new(message))],
         ))
         .await
+        .is_err()
     {
-        warn!("Failed to inject delegation failure: {}", e);
+        warn!("Failed to inject delegation failure");
     }
 }
 

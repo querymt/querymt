@@ -48,7 +48,7 @@ produces a tree of child spans describing every step that was executed.
 
 | Span name | Description |
 |---|---|
-| `agent.tool.execute` | Executing a tool call batch |
+| `agent.tool.execute` | Executing a single tool call (exported as `execute_tool {tool}`) |
 | `agent.tool.invoke` | Invoking a single tool (includes `source`: `builtin`, `mcp`, or `provider`) |
 | `agent.tool.permission` | Evaluating tool permissions |
 | `agent.tool.permission_wait` | Waiting for user permission |
@@ -101,6 +101,176 @@ produces a tree of child spans describing every step that was executed.
 | `middleware.dedup_check.update_index` | Updating the dedup index |
 | `middleware.dedup_check.turn_end` | Dedup end-of-turn bookkeeping |
 
+#### GenAI trace conventions
+
+Agent inference, tool execution, and prompt invocation reuse the execution spans
+listed here rather than adding a second semantic span. Their exported OTel names
+are `chat {model}` (CLIENT), `execute_tool {tool}` (INTERNAL), and `invoke_agent`
+(INTERNAL). Compaction has one CLIENT `chat {model}` span around its retry loop.
+Delegation summarization has one CLIENT `chat {model}` span only when it calls a
+provider; raw-history and existing-compaction shortcuts do not create inference
+spans. Its timeout is recorded inside the inference span. Unsuccessful summary
+outputs (non-completed status, truncation, filtering, errors, or tool calls) are
+rejected without persisting or injecting partial text; available response metadata,
+actual finish reason, and billed usage remain recorded before the bounded error.
+Each chat span covers all retries and the terminal stream. Normal inference drains
+trailing usage; compaction collects already-buffered trailing usage without waiting. Structured output and its legacy projections do not
+produce separate semantic spans.
+
+The mapping is pinned to the development conventions at
+[`e07f4ebacb08f56db8c4c882d117720333fbca04`](https://github.com/open-telemetry/semantic-conventions-genai/tree/e07f4ebacb08f56db8c4c882d117720333fbca04):
+[client spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/e07f4ebacb08f56db8c4c882d117720333fbca04/docs/gen-ai/gen-ai-spans.md)
+and [agent spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/e07f4ebacb08f56db8c4c882d117720333fbca04/docs/gen-ai/gen-ai-agent-spans.md).
+Attribute strings are local; this does not change dependencies, telemetry
+configuration, exporters, or add metrics.
+
+- Operation, known provider/request model, tool identity, and session conversation
+  ID are attached at creation. Configured provider aliases are the initial best
+  knowledge; canonical provenance can refine the provider afterwards, but never
+  changes the requested model or the span name. `codex` maps to `openai`, `google`
+  to `gcp.gemini`, `mistral` to `mistral_ai`, `xai` to `x_ai`, and `moonshotai`
+  to `moonshot_ai`. Compaction's generic
+  `ChatProvider` does not expose a provider name, so it is only recorded when
+  canonical provenance supplies it. Unavailable agent names, fixed agent models,
+  and response models are not invented. Available provenance models are recorded
+  as `gen_ai.response.model`: built-in adapters can supply the server-reported
+  response model (including resolved request aliases), while external providers
+  may omit provenance.
+- `gen_ai.agent.id` uses the actual nonblank configured agent ID on prompt invocation,
+  normal chat, and tool execution. It is stable across prompts and sessions within
+  that agent configuration, not globally unique: the ordinary API defaults to
+  `agent`, and independent servers can use the same ID. It is not an agent name or
+  a session UUID. Summary and compaction do not inherit an unknown agent identity.
+- A successful built-in skill load adds the resolved catalog `gen_ai.skill.name`
+  and refines the existing tool span to `execute_tool skill {skill.name}`. The
+  operation remains `execute_tool`; no separate skill span is created. The name
+  comes from canonical registered metadata after effective pre-hook arguments,
+  validation, permission checks, and successful loading, not from an arbitrary
+  request or another tool named `skill`. Skill content, descriptions, paths, and
+  source URIs are not attached.
+- Normal chat adds `gen_ai.conversation.compacted=true` only when the final request
+  retains a nonblank successful summary from typed effective history, matched by
+  role and payload (ignoring cache hints). History reloads and successful compaction
+  rebuilds refresh this private provenance. Requests alone, removed/modified summaries,
+  and unverified summary-like text omit the attribute; `false` is never emitted.
+  Compaction and delegation-summary chat spans do not currently attach this flag.
+- The built-in shell refines the existing INTERNAL tool span to
+  `execute_tool shell {process.executable.name}` when a best-effort Linux
+  `/proc/[pid]/exe` lookup started immediately after spawn yields an executable basename.
+  The lookup does not delay process waiting or cancellation; identity may be omitted
+  if completion or cancellation wins. This identifies the observed executable
+  (possibly a script interpreter or shell), not a parsed command or requested symlink.
+  Lookup failures and other platforms also omit identity. `process.exit.code` records
+  only an actual numeric status, including nonzero exits, without changing tool success
+  semantics. Cancellation/drop retains already-recorded identity but omits exit code
+  without a status. Pre-spawn
+  failures and custom tools named `shell` add no process metadata. No separate process
+  span, executable path, command/argv, stdout, or stderr is attached.
+- Streaming chat records `gen_ai.response.time_to_first_chunk` as a floating-point
+  duration in seconds from the first physical generation request to the first
+  received successful chunk, including stream creation time. Metadata, empty,
+  usage, and terminal chunks qualify; this is not time to the first visible token.
+  Provider construction and waits before the first request are excluded. Retries
+  keep the original start and first measurement, even if that first chunk belongs
+  to a later-failed attempt. Errors and reconnect controls do not qualify. No
+  measurement is recorded for nonstreaming calls or cancellation/drop/error before
+  a successful chunk; a measurement already recorded is retained.
+- Normal chat can attach typed effective `gen_ai.request.max_tokens`,
+  `gen_ai.request.temperature`, `gen_ai.request.top_p`, and
+  `gen_ai.request.reasoning.level`. A private scalar snapshot is bound to the
+  constructed provider using the final merged, model-defaulted, schema-pruned
+  configuration, not the initial agent parameters or a later binding lookup.
+  The allowlist uses the implementation factory's name and an official QueryMT
+  OCI identity: OpenAI (Chat Completions and Responses), Codex (no max tokens,
+  which its request ignores), and Anthropic (temperature 1.0 with reasoning;
+  thinking mode/budget is not reported as a reasoning level). OpenAI/Codex effort
+  `low`/`medium`/`high`/`max` maps to sent `low`/`medium`/`high`/`xhigh`.
+  Official xAI and Google implementations additionally support **effort only**:
+  xAI uses the same mapping for model prefixes `grok-3-mini`,
+  `grok-4.20-multi-agent`, and `grok-4.3` after trimming, lowercasing, and taking
+  the final slash-separated name. This gate applies conservatively to all
+  endpoints: unsupported models (including `grok-4.6`) omit the attribute even
+  when a custom Chat Completions route sends effort. Google sends `low` for `low`
+  and `high` for `medium`/`high`/`max`; models containing the case-sensitive `2.5`
+  or an explicit nonnull `thinking_budget` (including zero) omit the level because
+  the request sends a budget instead. Neither implementation adds the other three
+  generation knobs. Extra-body fields other than known storage, prompt-cache-key,
+  and verbosity fields conservatively omit all settings. Absent, malformed,
+  unsupported, or unverified values are not inferred from server defaults.
+  Custom/static/local-path factories, unidentified aliases, mesh providers,
+  and summary/compaction settings remain deferred; no provider rebuild, extra
+  auth lookup, or config/credential retention is added for telemetry.
+  `gen_ai.request.reasoning.level` is an attribute on the existing logical chat
+  span, not a separate reasoning span, and is never inferred from token counts,
+  thinking content, or budgets. Otelite 0.1.153 does not consume this standard
+  attribute in its aggregate effort panel; it remains available in raw traces
+  and to standards-aware collectors.
+- `session.id` is a collector interoperability alias of `gen_ai.conversation.id`,
+  using the same stable session UUID as a string at creation on all five boundaries:
+  prompt invocation, normal chat, tool execution, compaction chat, and delegation
+  summary chat. Repeated prompts retain that UUID. Parent work, compaction, and
+  summaries use the parent ID; a delegate uses its own ID, even in the same trace.
+  Unavailable or blank history IDs omit both attributes. OTel does not automatically
+  copy parent attributes, so these are explicit span fields, not a global resource
+  attribute on a concurrent server. This applies only to newly emitted spans;
+  historical data is not backfilled. Broader diagnostic span/log enrichment is deferred.
+- Canonical response IDs, when present, and typed string-array finish reasons are
+  recorded without content. Inclusive input usage sums the normalized exclusive
+  input/cache-read/cache-write buckets; inclusive output sums output/reasoning.
+  Arithmetic widens to `i64` first. OpenAI/Codex subtract cache/reasoning during
+  normalization, Anthropic reports exclusive cache buckets, and current
+  Google/Ollama/mrs/llama-cpp adapters leave these extra buckets zero. External
+  providers must respect that usage contract; missing modality usage is not
+  inferred. `gen_ai.usage.reasoning_tokens` is a nonstandard collector compatibility
+  alias (including Otelite 0.1.153) of `gen_ai.usage.reasoning.output_tokens`, with
+  the exact same normalized `i64` bucket, including zero. Missing usage omits both;
+  inclusive output totals are unchanged. This records actual response statistics,
+  not request effort or thinking text, through the shared normal chat, streaming,
+  retry, compaction, and summary response helper. The alias enables Otelite's raw
+  reasoning scan for newly emitted positive reasoning rows only, without backfill,
+  extra spans/events/metrics, or synthetic Claude/Codex signals; it does not enable
+  the Claude effort chart. Google's detailed reasoning usage normalization remains
+  deferred.
+- Errors use an empty OTel status description and bounded `error.type` values:
+  `authentication`, `rate_limited`, `invalid_request`, `response_format`,
+  `unsupported_operation`, `transport`, `provider_error`, `tool_error`,
+  `tool_pipeline_error`, `hook_blocked`, `invalid_tool_arguments`, `policy_blocked`,
+  `permission_denied`, `timeout`, `invalid_prompt`, `client_disconnected`, and
+  `agent_error`. Transport channel teardown is an error, not an automatic
+  successful cancellation; explicit permission cancellation leaves status unset.
+  `querymt.tool.execution` values are `not_started`, `hook_failed`, `hook_blocked`,
+  `validation_rejected`, `policy_blocked`, `permission_denied`, and `executed`.
+  Actual tool failure is recorded before post-hooks can change the model-facing
+  result.
+  Agent status follows the invocation result, not an arbitrary child failure.
+- Span lifetime closes early returns, `?` exits, cancellation, and polled futures
+  that are dropped. Cancellation/drop do not set error status. An unfinished
+  expected generation retains a typed `["error"]` finish reason; canonical
+  output replaces it; completed output without a finish reason records `unknown`.
+  SDK 0.32 retains attribute updates in order, with the final
+  value representing the attribute map value.
+- Detached and queued prompts use only their own valid ACP `_meta.traceparent`
+  parent, installed before span entry (required by tracing-opentelemetry 0.33).
+  Without one they start a root span, not a child of the actor's long-lived span.
+  Chat/tool spans inherit the active execution parent normally. Malformed metadata
+  is extracted against an empty context, so it cannot inherit the consumer's span.
+- Local live delegation events carry the original emitter span through a bounded,
+  private fanout channel. The existing `delegation.orchestrator.handle_event` boundary
+  installs that parent before entry (or explicitly starts a root); there is no extra
+  dispatch span. The diagnostic `delegation.execute` worker inherits the handler and
+  injects W3C `traceparent`/`tracestate` into the child prompt's transient ACP metadata
+  before invocation. Context is never added to event JSON, journal records, or
+  delegation/session configuration. Public fanout publication, remote event relay,
+  and replay carry no context and start independent delegation roots. Cancellation
+  does not replace an already-running worker's parent. Internal tool-driven
+  delegation is not classified as `invoke_workflow`.
+
+This is **traces only**. Standalone core `LLMBuilder` calls, cross-node mesh
+propagation, GenAI metrics, content capture, and exporter/configuration redesign
+are deferred. Verification uses capture-based regression tests and a bounded
+live qmtcode run against a local collector with an isolated fixture directory and
+temporary session database; production databases are not part of these checks.
+
 #### What metadata is attached to spans
 
 Spans may carry lightweight metadata such as:
@@ -112,8 +282,10 @@ Spans may carry lightweight metadata such as:
 - **Boolean flags** — e.g. `is_error`, `granted`, `cache_hit`.
 
 !!! important
-    Spans do **not** contain user prompts, LLM responses, API keys, file
-    contents, or any other sensitive data.
+    The GenAI semantic attributes do not capture prompts, responses, tool
+    arguments/results, file contents, or API keys. This is not a blanket privacy
+    guarantee for preexisting diagnostic logs or span events: verbose logging
+    can include payload previews, so use it only with appropriate data controls.
 
 ### Logs
 

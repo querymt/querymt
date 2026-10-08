@@ -8,6 +8,7 @@ use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SnapshotPolicy;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::snapshots::{SnapshotState, snapshot_metadata};
+use crate::agent::utils::genai;
 use crate::events::AgentEventKind;
 use crate::hooks::{
     PermissionRequestDecision, PostToolUseRequest, PreDelegationRequest, PreToolUseRequest,
@@ -21,6 +22,7 @@ use log::debug;
 use querymt::chat::ChatRole;
 use std::sync::Arc;
 use tracing::{Instrument, Span, info_span, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 /// Execute a single tool call.
@@ -36,8 +38,15 @@ use uuid::Uuid;
 /// 8. Returns the tool result
 #[instrument(
     name = "agent.tool.execute",
-    skip(config, exec_ctx, bridge),
+    skip(config, call, exec_ctx, bridge),
     fields(
+        otel.name = %format!("execute_tool {}", call.function.name),
+        otel.kind = "internal",
+        gen_ai.operation.name = "execute_tool",
+        gen_ai.tool.name = %call.function.name,
+        gen_ai.tool.call.id = %call.id,
+        gen_ai.conversation.id = %exec_ctx.session_id,
+        session.id = %exec_ctx.session_id,
         session_id = %exec_ctx.session_id,
         tool_name = %call.function.name,
         tool_call_id = %call.id,
@@ -47,6 +56,23 @@ use uuid::Uuid;
     )
 )]
 pub(super) async fn execute_tool_call(
+    config: &AgentConfig,
+    call: &MiddlewareToolCall,
+    exec_ctx: &ExecutionContext,
+    bridge: Option<&ClientBridgeSender>,
+) -> Result<ToolResult, anyhow::Error> {
+    genai::agent_id(&Span::current(), config.provider.agent_id.as_deref());
+    Span::current().set_attribute("querymt.tool.execution", "not_started");
+    execute_tool_call_inner(config, call, exec_ctx, bridge)
+        .await
+        .inspect_err(|_| {
+            if !exec_ctx.cancellation_token.is_cancelled() {
+                genai::error("tool_pipeline_error");
+            }
+        })
+}
+
+async fn execute_tool_call_inner(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
     exec_ctx: &ExecutionContext,
@@ -75,7 +101,10 @@ pub(super) async fn execute_tool_call(
             tool_input: args.clone(),
             tool_use_id: call.id.clone(),
         })
-        .await?;
+        .await
+        .inspect_err(|_| {
+            Span::current().set_attribute("querymt.tool.execution", "hook_failed");
+        })?;
     for notice in hook_result.notices {
         config.emit_event(
             &exec_ctx.session_id,
@@ -94,6 +123,8 @@ pub(super) async fn execute_tool_call(
         Some(crate::hooks::engine::PreToolPermissionDecision::Allow)
     );
     if hook_result.should_block {
+        Span::current().set_attribute("querymt.tool.execution", "hook_blocked");
+        genai::error("hook_blocked");
         let reason = hook_result
             .block_reason
             .unwrap_or_else(|| "tool blocked by hook".to_string());
@@ -112,6 +143,8 @@ pub(super) async fn execute_tool_call(
 
     if let Err(error) = validate_tool_arguments(config, exec_ctx, &call.function.name, &args).await
     {
+        Span::current().set_attribute("querymt.tool.execution", "validation_rejected");
+        genai::error("invalid_tool_arguments");
         return Ok(ToolResult::new(
             call.id.clone(),
             vec![querymt::chat::ToolResultPart::Text {
@@ -289,7 +322,7 @@ pub(super) async fn execute_tool_call(
         (server_name, tool)
     };
 
-    let (raw_result_blocks, is_error, tool_source) =
+    let (raw_result_blocks, is_error, tool_source, execution) =
         if !crate::agent::tools::is_mcp_tool_allowed_with(
             &exec_ctx.tool_config,
             &call.function.name,
@@ -301,25 +334,33 @@ pub(super) async fn execute_tool_call(
                 }],
                 true,
                 "blocked",
+                "policy_blocked",
             )
         } else if let Some(tool) = config.tool_registry.find(&call.function.name) {
-            match tool
-                .call(args.clone(), &tool_context)
-                .instrument(info_span!(
-                    "agent.tool.invoke",
-                    source = "builtin",
-                    tool_name = %call.function.name,
-                    tool_call_id = %call.id,
-                ))
-                .await
+            match genai::tool_scope(
+                Span::current(),
+                tool.call(args.clone(), &tool_context)
+                    .instrument(info_span!(
+                        "agent.tool.invoke",
+                        source = "builtin",
+                        tool_name = %call.function.name,
+                        tool_call_id = %call.id,
+                    )),
+            )
+            .await
             {
-                Ok(res) => (res, false, "builtin"),
+                Ok(res) => (res, false, "builtin", "executed"),
                 Err(e) => (
                     vec![querymt::chat::ToolResultPart::Text {
                         text: format!("Error: {}", e),
                     }],
                     true,
                     "builtin",
+                    if matches!(&e, crate::tools::ToolError::PermissionDenied(_)) {
+                        "permission_denied"
+                    } else {
+                        "executed"
+                    },
                 ),
             }
         } else if let Some(tool) = mcp_tool {
@@ -334,13 +375,14 @@ pub(super) async fn execute_tool_call(
                 ))
                 .await
             {
-                Ok(res) => (res, false, "mcp"),
+                Ok(res) => (res, false, "mcp", "executed"),
                 Err(e) => (
                     vec![querymt::chat::ToolResultPart::Text {
                         text: format!("Error: {}", e),
                     }],
                     true,
                     "mcp",
+                    "executed",
                 ),
             }
         } else if !ensure_tool_permission(
@@ -370,6 +412,7 @@ pub(super) async fn execute_tool_call(
                 }],
                 true,
                 "provider",
+                "permission_denied",
             )
         } else {
             match exec_ctx
@@ -383,13 +426,14 @@ pub(super) async fn execute_tool_call(
                 ))
                 .await
             {
-                Ok(res) => (res, false, "provider"),
+                Ok(res) => (res, false, "provider", "executed"),
                 Err(e) => (
                     vec![querymt::chat::ToolResultPart::Text {
                         text: format!("Error: {}", e),
                     }],
                     true,
                     "provider",
+                    "executed",
                 ),
             }
         };
@@ -397,6 +441,14 @@ pub(super) async fn execute_tool_call(
     let span = Span::current();
     span.record("tool_source", tool_source);
     span.record("is_error", is_error);
+    span.set_attribute("querymt.tool.execution", execution);
+    if is_error && !exec_ctx.cancellation_token.is_cancelled() {
+        genai::error(match execution {
+            "policy_blocked" => "policy_blocked",
+            "permission_denied" => "permission_denied",
+            _ => "tool_error",
+        });
+    }
 
     // Post hooks inspect the complete canonical output; truncation is applied once
     // after the transformation pipeline.
@@ -1209,4 +1261,558 @@ pub(super) async fn store_all_tool_results(
     Ok(ExecutionState::BeforeLlmCall {
         context: new_context,
     })
+}
+
+#[cfg(test)]
+mod genai_trace_tests {
+    use super::*;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::hooks::{Hooks, HooksConfig};
+    use crate::session::backend::StorageBackend;
+    use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+    use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent, mock_tool_call};
+    use opentelemetry::{
+        Value,
+        trace::{SpanKind, Status},
+    };
+
+    fn hooks(event: &str, output: serde_json::Value) -> Hooks {
+        let output = serde_json::to_string(&output).unwrap();
+        Hooks::new(serde_json::from_value::<HooksConfig>(serde_json::json!({
+            "enabled": true,
+            event: [{"matcher": "^telemetry_tool$", "hooks": [{
+                "type": "command", "command": format!("printf '%s' '{output}'"), "timeout_sec": 5
+            }]}]
+        })).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn genai_skill_identity_is_verified_after_hooks_on_the_existing_tool_span() {
+        use crate::skills::{
+            permissions::{PermissionLevel, SkillPermissions},
+            registry::SkillRegistry,
+            tool::SkillTool,
+            types::SkillSource,
+        };
+        use crate::test_utils::helpers::genai_trace::capture_info;
+        use crate::tools::{Tool, ToolContext, ToolError, ToolRegistry};
+
+        struct UnrelatedSkill;
+        #[async_trait::async_trait]
+        impl Tool for UnrelatedSkill {
+            fn name(&self) -> &str {
+                "skill"
+            }
+            fn definition(&self) -> querymt::chat::Tool {
+                querymt::chat::Tool {
+                    tool_type: "function".into(),
+                    function: querymt::chat::FunctionTool {
+                        name: "skill".into(),
+                        description: "".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                        strict: None,
+                    },
+                }
+            }
+            async fn call(
+                &self,
+                _: serde_json::Value,
+                _: &dyn ToolContext,
+            ) -> Result<Vec<querymt::chat::ToolResultPart>, ToolError> {
+                Ok(vec![querymt::chat::ToolResultPart::text("SECRET_RESPONSE")])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("catalog");
+        std::fs::create_dir(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(&path, "---\nid: catalog.review\nname: Code Review\ndescription: SECRET_ARGUMENT\n---\nSECRET_RESPONSE\n").unwrap();
+        let mut readonly = std::fs::metadata(&path).unwrap().permissions();
+        readonly.set_readonly(true);
+        std::fs::set_permissions(&path, readonly).unwrap();
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let exec = fixture.execution_context().await;
+        for mode in ["success", "rewrite", "unknown", "blocked", "custom"] {
+            let mut permissions = SkillPermissions::default();
+            if mode == "blocked" {
+                permissions
+                    .patterns
+                    .insert("catalog.review".into(), PermissionLevel::Deny);
+            }
+            let mut registry = ToolRegistry::new();
+            if mode == "custom" {
+                registry.add(Arc::new(UnrelatedSkill));
+            } else {
+                registry.add(Arc::new(SkillTool::new_with_fallback(
+                    Arc::new(std::sync::Mutex::new(SkillRegistry::new())),
+                    Arc::new(permissions),
+                    vec![SkillSource::Configured(dir.path().to_owned())],
+                    false,
+                    dir.path().to_owned(),
+                )));
+            }
+            let mut builder = AgentConfigBuilder::from_provider(
+                fixture.storage.clone(),
+                Arc::new(
+                    (*fixture.config.provider)
+                        .clone()
+                        .with_agent_id(Some("reader".into())),
+                ),
+                fixture.storage.event_journal(),
+            )
+            .with_tool_registry(registry);
+            if mode == "rewrite" {
+                builder = builder.with_hooks(Hooks::new(serde_json::from_value::<HooksConfig>(serde_json::json!({
+                    "enabled": true, "pre_tool_use": [{"matcher":"^skill$", "hooks":[{
+                        "type":"command", "command":"printf '%s' '{\"hook_specific_output\":{\"hook_event_name\":\"pre_tool_use\",\"permission_decision\":\"allow\",\"updated_input\":{\"name\":\"catalog.review\"}}}'", "timeout_sec":5
+                    }]}]
+                })).unwrap()).unwrap());
+            }
+            let config = builder.build();
+            let requested = if matches!(mode, "unknown" | "rewrite") {
+                "SECRET_PROMPT"
+            } else {
+                "catalog.review"
+            };
+            let call = mock_tool_call(
+                mode,
+                "skill",
+                &serde_json::json!({"name":requested}).to_string(),
+            );
+            let (result, spans) =
+                capture_info(execute_tool_call(&config, &call, &exec, None)).await;
+            let verified = matches!(mode, "success" | "rewrite");
+            let result = result.unwrap();
+            assert_eq!(
+                result.is_error,
+                matches!(mode, "unknown" | "blocked"),
+                "mode={mode} source={}",
+                result.tool_source
+            );
+            let semantic: Vec<_> = spans
+                .iter()
+                .filter(|span| {
+                    attr(span, "gen_ai.operation.name") == Some(&Value::from("execute_tool"))
+                })
+                .collect();
+            assert_eq!(semantic.len(), 1);
+            let tool = semantic[0];
+            assert_eq!(
+                attr(tool, "querymt.tool.execution"),
+                Some(&Value::from(match mode {
+                    "blocked" => "permission_denied",
+                    "unknown" => "validation_rejected",
+                    _ => "executed",
+                }))
+            );
+            assert_eq!(
+                attr(tool, "error.type"),
+                match mode {
+                    "blocked" => Some(Value::from("permission_denied")),
+                    "unknown" => Some(Value::from("invalid_tool_arguments")),
+                    _ => None,
+                }
+                .as_ref()
+            );
+            assert_eq!(
+                tool.name,
+                if verified {
+                    "execute_tool skill Code Review"
+                } else {
+                    "execute_tool skill"
+                }
+            );
+            assert_eq!(
+                attr(tool, "gen_ai.skill.name"),
+                verified.then_some(&Value::from("Code Review"))
+            );
+            assert_eq!(attr(tool, "gen_ai.agent.id"), Some(&Value::from("reader")));
+            assert!(attr(tool, "gen_ai.agent.name").is_none());
+            for diagnostic in spans
+                .iter()
+                .filter(|span| span.span_context.span_id() != tool.span_context.span_id())
+            {
+                assert!(attr(diagnostic, "gen_ai.skill.name").is_none());
+            }
+            assert_private(&spans);
+            for span in &spans {
+                let path = dir.path().display().to_string();
+                let keys: Vec<_> = span
+                    .attributes
+                    .iter()
+                    .filter(|attr| attr.value.to_string().contains(&path))
+                    .map(|attr| attr.key.as_str())
+                    .collect();
+                let event_keys: Vec<_> = span
+                    .events
+                    .iter()
+                    .flat_map(|event| event.attributes.iter())
+                    .filter(|attr| attr.value.to_string().contains(&path))
+                    .map(|attr| attr.key.as_str())
+                    .collect();
+                assert!(
+                    keys.is_empty() && event_keys.is_empty(),
+                    "mode={mode} span={} path attribute keys={keys:?} event keys={event_keys:?}",
+                    span.name
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn genai_shell_refines_only_spawned_builtin_on_existing_span() {
+        use crate::test_utils::helpers::genai_trace::capture_info;
+        use crate::tools::{
+            Tool, ToolContext, ToolError, ToolRegistry, builtins::shell::ShellTool,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        struct CustomShell;
+        #[async_trait::async_trait]
+        impl Tool for CustomShell {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn definition(&self) -> querymt::chat::Tool {
+                ShellTool::new().definition()
+            }
+            async fn call(
+                &self,
+                _: serde_json::Value,
+                _: &dyn ToolContext,
+            ) -> Result<Vec<querymt::chat::ToolResultPart>, ToolError> {
+                Ok(vec![querymt::chat::ToolResultPart::text("SECRET_RESPONSE")])
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|path| path.join("sh"))
+            .find(|path| path.is_file())
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let executable = shell.file_name().unwrap().to_str().unwrap();
+        let symlink = dir.path().join("SECRET_ARGUMENT-link");
+        std::os::unix::fs::symlink(&shell, &symlink).unwrap();
+        let script = dir.path().join("SECRET_ARGUMENT-script");
+        std::fs::write(
+            &script,
+            format!(
+                "#!{}\nsleep 0.2\nprintf SECRET_RESPONSE\nprintf SECRET_ERROR >&2\nexit 7\n",
+                shell.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let mut exec = fixture.execution_context().await;
+        for mode in [
+            "direct",
+            "symlink",
+            "script",
+            "wrapper",
+            "signal",
+            "spawn_failure",
+            "blocked",
+            "policy_blocked",
+            "custom",
+        ] {
+            let mut registry = ToolRegistry::new();
+            if mode == "custom" {
+                registry.add(Arc::new(CustomShell));
+            } else {
+                registry.add(Arc::new(ShellTool::new()));
+            }
+            exec.tool_config.denylist.clear();
+            if mode == "policy_blocked" {
+                exec.tool_config.denylist.insert("shell".into());
+            }
+            let mut builder = AgentConfigBuilder::from_provider(
+                fixture.storage.clone(),
+                fixture.config.provider.clone(),
+                fixture.storage.event_journal(),
+            )
+            .with_tool_registry(registry);
+            if mode == "blocked" {
+                builder = builder.with_hooks(Hooks::new(serde_json::from_value::<HooksConfig>(serde_json::json!({
+                    "enabled": true, "pre_tool_use": [{"matcher": "^shell$", "hooks": [{"type": "command",
+                    "command": "printf '%s' '{\"hook_specific_output\":{\"hook_event_name\":\"pre_tool_use\",\"permission_decision\":\"deny\"}}'", "timeout_sec": 5}]}],
+                })).unwrap()).unwrap());
+            }
+            let config = builder.build();
+            let command = match mode {
+                "symlink" => symlink.to_str().unwrap(),
+                "script" => script.to_str().unwrap(),
+                "spawn_failure" => "SECRET_ARGUMENT-missing-executable",
+                _ => shell.to_str().unwrap(),
+            };
+            let mut args = serde_json::json!({"command": command, "args": ["-c", "sleep 0.2; printf SECRET_RESPONSE; printf SECRET_ERROR >&2; exit 0"], "workdir": dir.path()});
+            if mode == "script" {
+                args["args"] = serde_json::json!([]);
+            }
+            if mode == "wrapper" {
+                args = serde_json::json!({"command": "sleep 0.2; printf SECRET_RESPONSE; printf SECRET_ERROR >&2; exit 7", "workdir": dir.path()});
+            }
+            if mode == "signal" {
+                args["args"] = serde_json::json!(["-c", "sleep 0.2; kill -TERM $$"]);
+            }
+            let call = mock_tool_call(mode, "shell", &args.to_string());
+            let (result, spans) =
+                capture_info(execute_tool_call(&config, &call, &exec, None)).await;
+            let result = result.unwrap();
+            let ran = matches!(mode, "direct" | "symlink" | "script" | "wrapper" | "signal");
+            assert_eq!(
+                result.is_error,
+                matches!(mode, "spawn_failure" | "blocked" | "policy_blocked"),
+                "mode={mode}"
+            );
+            let semantic: Vec<_> = spans
+                .iter()
+                .filter(|span| {
+                    attr(span, "gen_ai.operation.name") == Some(&Value::from("execute_tool"))
+                })
+                .collect();
+            assert_eq!(semantic.len(), 1, "mode={mode}");
+            let tool = semantic[0];
+            assert_eq!(tool.span_kind, SpanKind::Internal);
+            assert_eq!(
+                tool.name,
+                if ran {
+                    format!("execute_tool shell {executable}")
+                } else {
+                    "execute_tool shell".into()
+                },
+                "mode={mode}"
+            );
+            assert_eq!(attr(tool, "gen_ai.tool.name"), Some(&Value::from("shell")));
+            assert_eq!(
+                attr(tool, "process.executable.name"),
+                ran.then_some(&Value::from(executable.to_owned())),
+                "mode={mode}"
+            );
+            let exit = match mode {
+                "direct" | "symlink" => Some(0),
+                "script" | "wrapper" => Some(7),
+                _ => None,
+            };
+            assert_eq!(
+                attr(tool, "process.exit.code"),
+                exit.map(Value::I64).as_ref(),
+                "mode={mode}"
+            );
+            if ran {
+                assert_eq!(tool.status, Status::Unset);
+                let text = result.content[0].as_text().unwrap();
+                let output: serde_json::Value = serde_json::from_str(text).unwrap();
+                assert_eq!(output["exit_code"], exit.unwrap_or(-1));
+            }
+            for diagnostic in spans
+                .iter()
+                .filter(|span| span.span_context.span_id() != tool.span_context.span_id())
+            {
+                assert!(attr(diagnostic, "process.executable.name").is_none());
+                assert!(attr(diagnostic, "process.exit.code").is_none());
+            }
+            assert_private(&spans);
+            let exported = format!("{spans:?}");
+            assert!(
+                !exported.contains(dir.path().to_str().unwrap()),
+                "mode={mode}"
+            );
+            assert!(!exported.contains(shell.to_str().unwrap()), "mode={mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_tool_status_uses_execution_truth_not_post_hook_projection() {
+        for execution_failed in [false, true] {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_call_tool().times(1).returning(move |_, _| {
+                if execution_failed {
+                    Err(querymt::error::LLMError::ProviderError(
+                        "SECRET_ERROR".into(),
+                    ))
+                } else {
+                    Ok(vec![querymt::chat::ToolResultPart::text("SECRET_RESPONSE")])
+                }
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let config = AgentConfigBuilder::from_provider(
+                fixture.storage.clone(), fixture.config.provider.clone(), fixture.storage.event_journal(),
+            ).with_hooks(hooks("post_tool_use", serde_json::json!({
+                "hook_specific_output": {"hook_event_name": "post_tool_use", "updated_output": {"is_error": !execution_failed}}
+            }))).build();
+            let call = mock_tool_call(
+                "call-1",
+                "telemetry_tool",
+                r#"{"secret":"SECRET_ARGUMENT"}"#,
+            );
+            let (result, spans) = capture(async {
+                execute_tool_call(&config, &call, &exec, None)
+                    .instrument(info_span!("test-parent"))
+                    .await
+            })
+            .await;
+            let result = result.unwrap();
+            assert_eq!(result.is_error, !execution_failed);
+            assert_eq!(result.execution_is_error, execution_failed);
+            let tool = spans
+                .iter()
+                .find(|s| s.name == "execute_tool telemetry_tool")
+                .unwrap();
+            assert_eq!(tool.span_kind, SpanKind::Internal);
+            assert_eq!(
+                attr(tool, "session.id"),
+                Some(&Value::from(exec.session_id.clone()))
+            );
+            assert_eq!(
+                attr(tool, "session.id"),
+                attr(tool, "gen_ai.conversation.id")
+            );
+            assert_eq!(
+                attr(tool, "gen_ai.tool.call.id"),
+                Some(&Value::from("call-1"))
+            );
+            assert_eq!(
+                attr(tool, "querymt.tool.execution"),
+                Some(&Value::from("executed"))
+            );
+            assert_eq!(
+                tool.parent_span_id,
+                spans
+                    .iter()
+                    .find(|s| s.name == "test-parent")
+                    .unwrap()
+                    .span_context
+                    .span_id()
+            );
+            assert_eq!(
+                tool.status,
+                if execution_failed {
+                    Status::error("")
+                } else {
+                    Status::Unset
+                }
+            );
+            assert_eq!(
+                attr(tool, "error.type"),
+                execution_failed.then_some(&Value::from("tool_error"))
+            );
+            assert!(attr(tool, "call").is_none());
+            assert_private(&spans);
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_pre_tool_hook_spawn_failure_is_not_tool_execution() {
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let mut exec = fixture.execution_context().await;
+        exec.runtime = crate::agent::core::SessionRuntime::new(
+            Some(fixture._tempdir.path().join("nonexistent-hook-cwd")),
+            Default::default(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let config = AgentConfigBuilder::from_provider(
+            fixture.storage.clone(),
+            fixture.config.provider.clone(),
+            fixture.storage.event_journal(),
+        )
+        .with_hooks(hooks("pre_tool_use", serde_json::json!({})))
+        .build();
+        let call = mock_tool_call(
+            "call-1",
+            "telemetry_tool",
+            r#"{"secret":"SECRET_ARGUMENT"}"#,
+        );
+        let (result, spans) = capture(execute_tool_call(&config, &call, &exec, None)).await;
+        assert!(result.is_err());
+        let tool = spans
+            .iter()
+            .find(|s| s.name == "execute_tool telemetry_tool")
+            .unwrap();
+        assert_eq!(
+            attr(tool, "querymt.tool.execution"),
+            Some(&Value::from("hook_failed"))
+        );
+        assert_eq!(
+            attr(tool, "error.type"),
+            Some(&Value::from("tool_pipeline_error"))
+        );
+        assert_eq!(tool.status, Status::error(""));
+        assert_eq!(
+            attr(tool, "session.id"),
+            Some(&Value::from(exec.session_id.clone()))
+        );
+        assert_eq!(
+            attr(tool, "session.id"),
+            attr(tool, "gen_ai.conversation.id")
+        );
+        assert_private(&spans);
+    }
+
+    #[tokio::test]
+    async fn genai_rejected_tools_are_distinguished_from_execution() {
+        for hook_blocked in [false, true] {
+            let mock = MockLlmProvider::new(); // No execution expectation: rejection must not call it.
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            exec.runtime
+                .permission_cache
+                .lock()
+                .insert("telemetry_tool".into(), false);
+            let mut builder = AgentConfigBuilder::from_provider(
+                fixture.storage.clone(),
+                fixture.config.provider.clone(),
+                fixture.storage.event_journal(),
+            )
+            .with_mutating_tools(vec!["telemetry_tool".to_string()]);
+            if hook_blocked {
+                builder = builder.with_hooks(hooks("pre_tool_use", serde_json::json!({
+                    "hook_specific_output": {"hook_event_name": "pre_tool_use", "permission_decision": "deny"}
+                })));
+            }
+            let config = builder.build();
+            let call = mock_tool_call(
+                "call-1",
+                "telemetry_tool",
+                r#"{"secret":"SECRET_ARGUMENT"}"#,
+            );
+            let (result, spans) = capture(execute_tool_call(&config, &call, &exec, None)).await;
+            assert!(result.unwrap().is_error);
+            let tool = spans
+                .iter()
+                .find(|s| s.name == "execute_tool telemetry_tool")
+                .unwrap();
+            let reason = if hook_blocked {
+                "hook_blocked"
+            } else {
+                "permission_denied"
+            };
+            assert_eq!(
+                attr(tool, "querymt.tool.execution"),
+                Some(&Value::from(reason))
+            );
+            assert_eq!(attr(tool, "error.type"), Some(&Value::from(reason)));
+            assert_eq!(tool.status, Status::error(""));
+            assert_eq!(
+                attr(tool, "session.id"),
+                Some(&Value::from(exec.session_id.clone()))
+            );
+            assert_eq!(
+                attr(tool, "session.id"),
+                attr(tool, "gen_ai.conversation.id")
+            );
+            assert_private(&spans);
+        }
+    }
 }

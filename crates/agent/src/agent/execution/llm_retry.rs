@@ -127,8 +127,8 @@ async fn emit_retry_wait(
     let started_at = time::OffsetDateTime::now_utc().unix_timestamp();
 
     info!(
-        "Session {} LLM retry wait, attempt {}/{}, waiting {}s: {}",
-        session_id, attempt, max_attempts, wait_secs, message
+        "Session {} LLM retry wait, attempt {}/{}, waiting {}s",
+        session_id, attempt, max_attempts, wait_secs
     );
     let attempt = u32_from_usize(attempt, "attempt", Some(session_id));
     let max_attempts = u32_from_usize(max_attempts, "max_attempts", Some(session_id));
