@@ -48,7 +48,7 @@ produces a tree of child spans describing every step that was executed.
 
 | Span name | Description |
 |---|---|
-| `agent.tool.execute` | Executing a tool call batch |
+| `agent.tool.execute` | Executing a single tool call (exported as `execute_tool {tool}`) |
 | `agent.tool.invoke` | Invoking a single tool (includes `source`: `builtin`, `mcp`, or `provider`) |
 | `agent.tool.permission` | Evaluating tool permissions |
 | `agent.tool.permission_wait` | Waiting for user permission |
@@ -101,6 +101,36 @@ produces a tree of child spans describing every step that was executed.
 | `middleware.dedup_check.update_index` | Updating the dedup index |
 | `middleware.dedup_check.turn_end` | Dedup end-of-turn bookkeeping |
 
+#### GenAI trace conventions
+
+Agent spans follow the
+[OpenTelemetry GenAI conventions](https://github.com/open-telemetry/semantic-conventions-genai/tree/e07f4ebacb08f56db8c4c882d117720333fbca04).
+
+| Exported span name | Kind | Description |
+|---|---|---|
+| `invoke_agent` | INTERNAL | Prompt execution |
+| `chat {model}` | CLIENT | Inference, including compaction and delegation summarization |
+| `execute_tool {tool}` | INTERNAL | Tool calls |
+
+Metadata includes known providers, models, request settings, response IDs,
+finish reasons, token usage, errors, and tool status. Input totals include cache
+read/write tokens; output totals include reasoning tokens, with breakdowns when available.
+
+When available, `gen_ai.conversation.id` and its `session.id` alias identify the
+current session. Delegates use their own session ID.
+`gen_ai.agent.id` identifies the configured agent, not the session, and is
+not globally unique.
+
+Built-in skill and shell tools may add `gen_ai.skill.name`,
+`process.executable.name`, or `process.exit.code`, and refine the tool span name.
+
+Normal chat adds `gen_ai.conversation.compacted=true` when the request retains
+a verified compaction summary.
+
+Unavailable fields are omitted. For streaming, `gen_ai.response.time_to_first_chunk`
+is measured in seconds from the first generation request to the first received
+chunk, not the first visible token.
+
 #### What metadata is attached to spans
 
 Spans may carry lightweight metadata such as:
@@ -112,8 +142,10 @@ Spans may carry lightweight metadata such as:
 - **Boolean flags** — e.g. `is_error`, `granted`, `cache_hit`.
 
 !!! important
-    Spans do **not** contain user prompts, LLM responses, API keys, file
-    contents, or any other sensitive data.
+    The GenAI semantic attributes do not capture prompts, responses, tool
+    arguments/results, file contents, or API keys. This is not a blanket privacy
+    guarantee for preexisting diagnostic logs or span events: verbose logging
+    can include payload previews, so use it only with appropriate data controls.
 
 ### Logs
 

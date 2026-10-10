@@ -195,16 +195,25 @@ impl AgentConfig {
         // Durable events: persist via EventSink journal in a spawned task.
         let sink = self.event_sink.clone();
         let session_id = session_id.to_string();
+        let parent = if crate::event_fanout::EventFanout::is_delegation_event(&kind) {
+            tracing::Span::current()
+        } else {
+            tracing::Span::none()
+        };
 
-        tokio::spawn(async move {
-            if let Err(err) = sink.emit_durable(&session_id, kind).await {
-                log::warn!(
-                    "failed to emit durable event for session {}: {}",
-                    session_id,
-                    err
-                );
+        use tracing::Instrument;
+        tokio::spawn(
+            async move {
+                if let Err(err) = sink.emit_durable(&session_id, kind).await {
+                    log::warn!(
+                        "failed to emit durable event for session {}: {}",
+                        session_id,
+                        err
+                    );
+                }
             }
-        });
+            .instrument(parent),
+        );
     }
 
     /// Persists and publishes a durable event, returning the `DurableEvent`.

@@ -287,12 +287,13 @@ pub(crate) async fn execute_cycle_state_machine(
 
     let messages: Arc<[querymt::chat::ChatMessage]> = async {
         let started = std::time::Instant::now();
-        let history = exec_ctx
+        let (history, summaries) = exec_ctx
             .session_handle
-            .history()
+            .history_with_compaction()
             .await
-            .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"));
-        let messages: Arc<[querymt::chat::ChatMessage]> = Arc::from(history?.into_boxed_slice());
+            .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
+        exec_ctx.compaction_summaries = summaries;
+        let messages: Arc<[querymt::chat::ChatMessage]> = Arc::from(history.into_boxed_slice());
         let elapsed_ms = started.elapsed().as_millis() as u64;
         let span = tracing::Span::current();
         span.record("history_ms", elapsed_ms);
@@ -613,16 +614,13 @@ pub(crate) async fn execute_cycle_state_machine(
 
             ExecutionState::Complete { context } => {
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Closing);
-                let history = Arc::from(
-                    exec_ctx
-                        .session_handle
-                        .history()
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("Failed to load session history: {error}")
-                        })?
-                        .into_boxed_slice(),
-                );
+                let (history, summaries) = exec_ctx
+                    .session_handle
+                    .history_with_compaction()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("Failed to load session history: {error}"))?;
+                exec_ctx.compaction_summaries = summaries;
+                let history = Arc::from(history.into_boxed_slice());
                 let fallback_context = Arc::new(
                     crate::middleware::ConversationContext::new(
                         context.session_id.clone(),

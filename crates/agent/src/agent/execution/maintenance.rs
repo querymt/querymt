@@ -5,7 +5,7 @@
 
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
-use crate::agent::utils::u32_from_usize;
+use crate::agent::utils::{genai, u32_from_usize};
 use crate::events::{AgentEventKind, StopType};
 use crate::hooks::{PostCompactionRequest, PreCompactionRequest};
 use crate::middleware::ExecutionState;
@@ -107,7 +107,7 @@ pub(super) async fn run_pruning(
 /// operation typically triggered when context thresholds are hit.
 pub(super) async fn run_ai_compaction(
     config: &AgentConfig,
-    exec_ctx: &ExecutionContext,
+    exec_ctx: &mut ExecutionContext,
     current_state: &ExecutionState,
 ) -> Result<ExecutionState, anyhow::Error> {
     let session_id = &exec_ctx.session_id;
@@ -430,6 +430,8 @@ pub(super) async fn run_ai_compaction(
         return Err(anyhow::anyhow!("No context available for compaction"));
     };
 
+    exec_ctx.compaction_summaries =
+        genai::compaction_summaries(&filtered_messages, &new_context.messages);
     Ok(ExecutionState::BeforeLlmCall {
         context: new_context,
     })
@@ -606,7 +608,7 @@ mod tests {
         output: Option<ChatOutput>,
         expected_error: &str,
     ) {
-        let (config, exec_ctx, state, _tempdir) = fixture(hooks, output).await;
+        let (config, mut exec_ctx, state, _tempdir) = fixture(hooks, output).await;
         let before = config
             .provider
             .history_store()
@@ -614,7 +616,7 @@ mod tests {
             .await
             .unwrap();
         let mut events = config.subscribe_events();
-        let error = run_ai_compaction(&config, &exec_ctx, &state)
+        let error = run_ai_compaction(&config, &mut exec_ctx, &state)
             .await
             .expect_err("compaction must fail");
         // Do not yield: all lifecycle events must be published before compaction returns.
@@ -769,13 +771,15 @@ mod tests {
 
     #[tokio::test]
     async fn valid_custom_summary_is_stored_and_emitted_as_success() {
-        let (config, exec_ctx, state, _tempdir) = fixture(
+        let (config, mut exec_ctx, state, _tempdir) = fixture(
             custom_summary_hooks("Valid continuation summary", Some("Keep the tests passing")),
             None,
         )
         .await;
         let mut events = config.subscribe_events();
-        let result = run_ai_compaction(&config, &exec_ctx, &state).await.unwrap();
+        let result = run_ai_compaction(&config, &mut exec_ctx, &state)
+            .await
+            .unwrap();
         let compaction_events = take_compaction_events(&mut events);
         let expected = "Valid continuation summary\n\nKeep the tests passing";
         let effective = exec_ctx
@@ -788,6 +792,11 @@ mod tests {
             matches!(&effective[1].parts[0], MessagePart::Compaction { summary, .. } if summary == expected)
         );
         assert!(result.context().unwrap().stats.context_tokens > 0);
+        assert_eq!(exec_ctx.compaction_summaries.len(), 1);
+        assert_eq!(
+            exec_ctx.compaction_summaries[0].payload(),
+            result.context().unwrap().messages[1].payload()
+        );
         let [start, chunk, end] = compaction_events.as_slice() else {
             panic!("expected start, summary, and end before return: {compaction_events:?}");
         };

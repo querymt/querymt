@@ -3,11 +3,11 @@
 //! This module implements the AI compaction layer of the 3-layer compaction system,
 //! which generates summaries when context threshold is reached.
 
-use crate::agent::utils::render_prompt_for_llm;
+use crate::agent::utils::{genai, render_prompt_for_llm};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use querymt::chat::{ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator, FinishReason};
 use querymt::error::LLMError;
 use std::sync::Arc;
@@ -108,7 +108,16 @@ impl SessionCompaction {
 
         // Call LLM with retry logic
         let summary = self
-            .call_with_retry(&chat_messages, provider, model, retry_config)
+            .call_with_retry(
+                &chat_messages,
+                provider,
+                model,
+                retry_config,
+                messages
+                    .first()
+                    .map(|message| message.session_id.as_str())
+                    .filter(|id| !id.is_empty()),
+            )
             .await?;
 
         let summary_token_count = self.estimator.estimate(&summary);
@@ -152,13 +161,32 @@ impl SessionCompaction {
     /// Mesh timeout errors (remote still processing) are treated as
     /// **non-retriable** to prevent queuing duplicate inference work on the
     /// remote GPU.
+    #[tracing::instrument(
+        name = "agent.compaction.call_llm",
+        skip_all,
+        fields(
+            otel.name = %format!("chat {model}"),
+            otel.kind = "client",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = model,
+            gen_ai.conversation.id = session_id,
+            session.id = session_id,
+            gen_ai.request.stream = provider.supports_streaming(),
+            querymt.compaction = true,
+        )
+    )]
     async fn call_with_retry(
         &self,
         messages: &[querymt::chat::ChatMessage],
         provider: Arc<dyn querymt::chat::ChatProvider>,
-        _model: &str,
+        model: &str,
         retry_config: &RetryConfig,
+        session_id: Option<&str>,
     ) -> Result<String> {
+        // Provider identity is unavailable on ChatProvider; canonical provenance can supply it.
+        genai::finish_reason("error");
+        let chat_span = tracing::Span::current();
+        let mut first_chunk = genai::FirstChunk::default();
         let mut last_error = None;
         let mut backoff_ms = retry_config.initial_backoff_ms;
 
@@ -178,24 +206,26 @@ impl SessionCompaction {
             // a single total-request timeout, keeping the connection alive
             // while the model generates.
             let result = if provider.supports_streaming() {
-                Self::call_streaming(messages, &provider).await
+                Self::call_streaming(messages, &provider, &mut first_chunk, &chat_span).await
             } else {
                 provider.chat(messages).await
             }
-            .and_then(Self::summary_from_output);
+            .and_then(|output| {
+                // Failed attempts must not poison the eventual logical operation status.
+                let summary = Self::summary_from_output(&output)?;
+                genai::output(&output);
+                Ok(summary)
+            });
 
             match result {
                 Ok(text) => return Ok(text),
                 Err(e) => {
-                    log::warn!(
-                        "Compaction LLM call failed (attempt {}): {}",
-                        attempt + 1,
-                        e
-                    );
+                    log::warn!("Compaction LLM call failed (attempt {})", attempt + 1);
                     // Mesh timeouts mean the remote is still processing.
                     // Retrying would just queue more work on an already-busy
                     // remote GPU — abort immediately.
                     if is_mesh_timeout_error(&e) {
+                        genai::llm_error(&e);
                         log::warn!(
                             "Compaction error is a mesh timeout (remote node likely still \
                              processing). Aborting retries to avoid queuing duplicate work."
@@ -210,6 +240,9 @@ impl SessionCompaction {
             }
         }
 
+        if let Some(error) = &last_error {
+            genai::llm_error(error);
+        }
         Err(anyhow::anyhow!(
             "Compaction failed after {} retries: {:?}",
             retry_config.max_retries,
@@ -221,12 +254,16 @@ impl SessionCompaction {
     async fn call_streaming(
         messages: &[querymt::chat::ChatMessage],
         provider: &Arc<dyn querymt::chat::ChatProvider>,
+        first_chunk: &mut genai::FirstChunk,
+        chat_span: &tracing::Span,
     ) -> std::result::Result<ChatOutput, LLMError> {
+        first_chunk.start();
         let mut stream = provider.chat_stream(messages).await?;
         let mut accumulator = ChatStreamAccumulator::new();
         let mut terminal_seen = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
+            first_chunk.received(chat_span);
             accumulator.push(&chunk).map_err(|error| {
                 LLMError::GenericError(format!("Invalid compaction stream: {error}"))
             })?;
@@ -240,13 +277,23 @@ impl SessionCompaction {
                 "Compaction stream ended without a terminal event".into(),
             ));
         }
-        accumulator
-            .finish_success()
-            .map_err(|error| LLMError::GenericError(format!("Invalid compaction stream: {error}")))
+        let mut output = accumulator.finish_success().map_err(|error| {
+            LLMError::GenericError(format!("Invalid compaction stream: {error}"))
+        })?;
+        // Only collect already-buffered usage; post-terminal events must bypass validation.
+        while let Some(Some(Ok(querymt::chat::StreamChunk::Usage(extra)))) =
+            stream.next().now_or_never()
+        {
+            output.usage = Some(match output.usage.take() {
+                Some(previous) => previous.merge_max(extra),
+                None => extra,
+            });
+        }
+        Ok(output)
     }
 
     /// Partial output and tool calls cannot replace a conversation with a usable summary.
-    fn summary_from_output(output: ChatOutput) -> std::result::Result<String, LLMError> {
+    fn summary_from_output(output: &ChatOutput) -> std::result::Result<String, LLMError> {
         if output
             .status
             .is_some_and(|status| status != ChatOutputStatus::Completed)
@@ -508,9 +555,304 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[tokio::test]
+    async fn genai_compaction_stream_retry_records_one_canonical_output_without_content() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::{
+            Array, Value,
+            trace::{SpanKind, Status},
+        };
+        use querymt::chat::ChatOutputProvenance;
+        use tracing::Instrument;
+
+        for session_id in [None, Some("compaction-session"), Some("")] {
+            let mut chunks = structured_summary("SECRET_RESPONSE", true);
+            if let StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                provenance,
+                ..
+            }) = &mut chunks[0]
+            {
+                *provenance = Some(ChatOutputProvenance {
+                    provider: "anthropic".into(),
+                    model: "summary-model".into(),
+                    endpoint: "SECRET_ENDPOINT".into(),
+                    protocol: "messages".into(),
+                });
+            }
+            if let StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                usage, ..
+            }) = chunks.last_mut().unwrap()
+            {
+                *usage = Some(querymt::Usage {
+                    input_tokens: 12,
+                    output_tokens: 20,
+                    cache_read: 30,
+                    cache_write: 40,
+                    reasoning_tokens: 5,
+                });
+            }
+            let provider = ScriptedProvider::new(
+                true,
+                vec![
+                    Attempt::Stream(vec![Err(LLMError::AuthError("SECRET_ERROR".into()))]),
+                    Attempt::Stream(chunks.into_iter().map(Ok).collect()),
+                ],
+            );
+            let history: Vec<_> = session_id
+                .into_iter()
+                .map(|id| MessageFixture::user_message("m1", id, "SECRET_PROMPT"))
+                .collect();
+            let (result, spans) = capture(async {
+                SessionCompaction::new()
+                    .process(&history, provider.clone(), "model", &retry_config(1), None)
+                    .instrument(tracing::info_span!(
+                        "unrelated-parent",
+                        session.id = "unrelated-session"
+                    ))
+                    .await
+            })
+            .await;
+            assert_eq!(result.unwrap().summary, "SECRET_RESPONSE");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(
+                spans
+                    .iter()
+                    .filter(|span| span.name == "chat model")
+                    .count(),
+                1
+            );
+            let chat = spans.iter().find(|span| span.name == "chat model").unwrap();
+            assert_eq!(chat.name, "chat model");
+            assert_eq!(
+                attr(chat, "gen_ai.request.model"),
+                Some(&Value::from("model"))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.response.model"),
+                Some(&Value::from("summary-model"))
+            );
+            assert_eq!(chat.span_kind, SpanKind::Client);
+            assert_eq!(chat.status, Status::Unset);
+            assert_eq!(
+                attr(chat, "gen_ai.usage.input_tokens"),
+                Some(&Value::I64(82))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.output_tokens"),
+                Some(&Value::I64(25))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning.output_tokens"),
+                Some(&Value::I64(5))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.usage.reasoning_tokens"),
+                Some(&Value::I64(5))
+            );
+            assert!(attr(chat, "gen_ai.request.reasoning.level").is_none());
+            assert_eq!(
+                attr(chat, "gen_ai.request.stream"),
+                Some(&Value::Bool(true))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.response.finish_reasons"),
+                Some(&Value::Array(Array::String(vec!["stop".into()])))
+            );
+            assert_eq!(
+                attr(chat, "gen_ai.conversation.id"),
+                session_id
+                    .filter(|id| !id.is_empty())
+                    .map(Value::from)
+                    .as_ref()
+            );
+            assert_eq!(
+                attr(chat, "session.id"),
+                attr(chat, "gen_ai.conversation.id")
+            );
+            assert!(attr(chat, "error.type").is_none());
+            assert_private(&spans);
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_compaction_drains_buffered_usage_without_waiting_or_revalidating() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::Value;
+
+        for structured in [false, true] {
+            for pending_tail in [false, true] {
+                let initial = querymt::Usage {
+                    input_tokens: 12,
+                    output_tokens: 20,
+                    ..Default::default()
+                };
+                let mut chunks = if structured {
+                    let mut chunks = structured_summary("SECRET_RESPONSE", true);
+                    if let StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                        usage,
+                        ..
+                    }) = chunks.last_mut().unwrap()
+                    {
+                        *usage = Some(initial);
+                    }
+                    chunks
+                } else {
+                    vec![
+                        StreamChunk::Text("SECRET_RESPONSE".into()),
+                        StreamChunk::Usage(initial),
+                        StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        },
+                    ]
+                };
+                chunks.extend([
+                    StreamChunk::Usage(querymt::Usage {
+                        input_tokens: 30,
+                        output_tokens: 5,
+                        cache_read: 7,
+                        ..Default::default()
+                    }),
+                    StreamChunk::Usage(querymt::Usage {
+                        input_tokens: 10,
+                        output_tokens: 40,
+                        ..Default::default()
+                    }),
+                ]);
+                if !pending_tail {
+                    // A post-terminal compatibility projection cannot change the canonical output.
+                    chunks.push(StreamChunk::Text("SECRET_ARGUMENT".into()));
+                }
+                let chunks = chunks.into_iter().map(Ok).collect();
+                let attempt = if pending_tail {
+                    Attempt::StreamWithPendingTail(chunks)
+                } else {
+                    Attempt::Stream(chunks)
+                };
+                let provider = ScriptedProvider::new(true, vec![attempt]);
+                let (result, spans) = capture(tokio::time::timeout(
+                    Duration::from_secs(1),
+                    process_script(provider, 0),
+                ))
+                .await;
+                assert_eq!(
+                    result
+                        .expect("must not await the pending tail")
+                        .unwrap()
+                        .summary,
+                    "SECRET_RESPONSE"
+                );
+                assert_eq!(spans.len(), 1);
+                assert_eq!(
+                    attr(&spans[0], "gen_ai.usage.input_tokens"),
+                    Some(&Value::I64(37))
+                );
+                assert_eq!(
+                    attr(&spans[0], "gen_ai.usage.output_tokens"),
+                    Some(&Value::I64(40))
+                );
+                assert_private(&spans);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_compaction_first_chunk_is_logical_across_retry_helper_spans() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::Value;
+        for metadata_first in [false, true] {
+            let error = || LLMError::AuthError("SECRET_ERROR".into());
+            let initial = if metadata_first {
+                Attempt::Stream(vec![
+                    Ok(StreamChunk::Usage(Default::default())),
+                    Err(error()),
+                ])
+            } else {
+                Attempt::SetupError(error())
+            };
+            let mut provider = ScriptedProvider::new(
+                true,
+                vec![
+                    initial,
+                    Attempt::Stream(
+                        structured_summary("SECRET_RESPONSE", true)
+                            .into_iter()
+                            .map(Ok)
+                            .collect(),
+                    ),
+                ],
+            );
+            Arc::get_mut(&mut provider).unwrap().delay = Duration::from_millis(20);
+            let history = [MessageFixture::user_message(
+                "m1",
+                "session",
+                "SECRET_PROMPT",
+            )];
+            let (result, spans) = capture(SessionCompaction::new().process(
+                &history,
+                provider.clone(),
+                "model",
+                &RetryConfig {
+                    max_retries: 1,
+                    initial_backoff_ms: 60,
+                    backoff_multiplier: 1.0,
+                },
+                None,
+            ))
+            .await;
+            assert!(result.is_ok());
+            let chat = spans.iter().find(|span| span.name == "chat model").unwrap();
+            let expected = provider.clock.lock().unwrap().1.unwrap();
+            assert!(
+                matches!(attr(chat, "gen_ai.response.time_to_first_chunk"), Some(Value::F64(actual)) if (actual - expected).abs() < 0.03)
+            );
+            if !metadata_first {
+                assert!(expected >= 0.1);
+            }
+            assert_eq!(
+                chat.attributes
+                    .iter()
+                    .filter(|attr| attr.key.as_str() == "gen_ai.response.time_to_first_chunk")
+                    .count(),
+                1
+            );
+            assert!(attr(chat, "gen_ai.agent.id").is_none());
+            for span in spans
+                .iter()
+                .filter(|span| span.span_context.span_id() != chat.span_context.span_id())
+            {
+                assert!(attr(span, "gen_ai.response.time_to_first_chunk").is_none());
+            }
+            assert_private(&spans);
+        }
+    }
+
+    #[tokio::test]
+    async fn genai_compaction_failed_stream_records_sanitized_terminal_error() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::{Value, trace::Status};
+        let provider = ScriptedProvider::new(
+            true,
+            vec![Attempt::Stream(vec![Err(LLMError::AuthError(
+                "SECRET_ERROR".into(),
+            ))])],
+        );
+        let (result, spans) = capture(process_script(provider, 0)).await;
+        assert!(result.is_err());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].status, Status::error(""));
+        assert!(attr(&spans[0], "gen_ai.response.time_to_first_chunk").is_none());
+        assert_eq!(
+            attr(&spans[0], "error.type"),
+            Some(&Value::from("authentication"))
+        );
+        assert_private(&spans);
+    }
+
     enum Attempt {
         Output(Box<ChatOutput>),
         Stream(Vec<std::result::Result<StreamChunk, LLMError>>),
+        StreamWithPendingTail(Vec<std::result::Result<StreamChunk, LLMError>>),
+        SetupError(LLMError),
     }
 
     impl Attempt {
@@ -523,6 +865,8 @@ mod tests {
         streaming: bool,
         attempts: tokio::sync::Mutex<VecDeque<Attempt>>,
         calls: AtomicUsize,
+        delay: Duration,
+        clock: Arc<std::sync::Mutex<(Option<std::time::Instant>, Option<f64>)>>,
     }
 
     impl ScriptedProvider {
@@ -531,6 +875,8 @@ mod tests {
                 streaming,
                 attempts: tokio::sync::Mutex::new(attempts.into()),
                 calls: AtomicUsize::new(0),
+                delay: Duration::ZERO,
+                clock: Default::default(),
             })
         }
 
@@ -574,10 +920,44 @@ mod tests {
             >,
             LLMError,
         > {
-            let Attempt::Stream(chunks) = self.next().await else {
-                panic!("expected streaming call")
+            self.clock
+                .lock()
+                .unwrap()
+                .0
+                .get_or_insert_with(std::time::Instant::now);
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            let timed = |chunks| {
+                let mut delay = self.delay;
+                let clock = self.clock.clone();
+                futures_util::stream::iter(chunks).then(
+                    move |chunk: std::result::Result<StreamChunk, LLMError>| {
+                        let delay = std::mem::take(&mut delay);
+                        let clock = clock.clone();
+                        async move {
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
+                            if chunk.is_ok() {
+                                let mut clock = clock.lock().unwrap();
+                                if clock.1.is_none() {
+                                    clock.1 = Some(clock.0.unwrap().elapsed().as_secs_f64());
+                                }
+                            }
+                            chunk
+                        }
+                    },
+                )
             };
-            Ok(Box::pin(futures_util::stream::iter(chunks)))
+            match self.next().await {
+                Attempt::Stream(chunks) => Ok(Box::pin(timed(chunks))),
+                Attempt::StreamWithPendingTail(chunks) => Ok(Box::pin(
+                    timed(chunks).chain(futures_util::stream::pending()),
+                )),
+                Attempt::SetupError(error) => Err(error),
+                Attempt::Output(_) => panic!("expected streaming call"),
+            }
         }
     }
 

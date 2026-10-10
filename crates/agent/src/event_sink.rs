@@ -52,6 +52,8 @@ impl EventSink {
         origin: EventOrigin,
         source_node: Option<String>,
     ) -> SessionResult<DurableEvent> {
+        let parent = (origin == EventOrigin::Local && EventFanout::is_delegation_event(&kind))
+            .then(tracing::Span::current);
         let new_event = NewDurableEvent {
             session_id: session_id.to_string(),
             origin: origin.clone(),
@@ -65,7 +67,7 @@ impl EventSink {
 
         // Publish to fanout for live subscribers
         self.fanout
-            .publish(EventEnvelope::Durable(persisted.clone()));
+            .publish_with_context(EventEnvelope::Durable(persisted.clone()), parent);
 
         Ok(persisted)
     }

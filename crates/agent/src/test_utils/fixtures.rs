@@ -55,6 +55,60 @@ pub struct TestAgent {
 }
 
 impl TestAgent {
+    pub(crate) async fn with_mock_provider(provider: crate::test_utils::SharedLlmProvider) -> Self {
+        let (registry, tempdir) = crate::test_utils::mock_plugin_registry(Arc::new(
+            crate::test_utils::TestProviderFactory::new(provider),
+        ))
+        .unwrap();
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let mut config = AgentConfigBuilder::new(
+            Arc::new(registry),
+            storage.clone(),
+            LLMParams::new().provider("mock").model("mock-model"),
+        )
+        .build();
+        config.execution_policy.rate_limit.default_wait_secs = 1;
+        config.execution_policy.rate_limit.jitter_ratio = 0.0;
+        let config = Arc::new(config);
+        let handle = Arc::new(AgentHandle::from_config(config.clone()));
+        Self {
+            storage,
+            config,
+            handle,
+            _tempdir: tempdir,
+        }
+    }
+
+    pub(crate) async fn execution_context(
+        &self,
+    ) -> crate::agent::execution_context::ExecutionContext {
+        let session_handle = self
+            .config
+            .provider
+            .create_session(None, None, &Default::default())
+            .await
+            .unwrap();
+        let session_id = session_handle.session().public_id.clone();
+        let state = crate::session::runtime::RuntimeContext::new(
+            self.storage.session_store(),
+            session_id.clone(),
+        )
+        .await
+        .unwrap();
+        let runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            Default::default(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        crate::agent::execution_context::ExecutionContext::new(
+            session_id,
+            runtime,
+            state,
+            session_handle,
+            Default::default(),
+        )
+    }
+
     /// Minimal agent with in-memory SQLite, no event observer.
     pub async fn new() -> Self {
         let (registry, tempdir) = empty_plugin_registry().expect("empty plugin registry");

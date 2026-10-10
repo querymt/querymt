@@ -413,6 +413,7 @@ impl Tool for SkillTool {
             // TODO: Apply to session's active tool filter (Phase 5)
         }
 
+        crate::agent::utils::genai::skill_name(&skill.metadata.name);
         Ok(vec![ToolResultPart::text(output)])
     }
 }

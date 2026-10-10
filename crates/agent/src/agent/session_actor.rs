@@ -17,7 +17,7 @@ use crate::agent::turn_control::{
     ActiveRun, InputDelivery, RunPhase, SubmitInputResult, TurnControlError, now_ms,
 };
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
-use crate::agent::utils::{format_prompt_user_text_only, render_prompt_for_display};
+use crate::agent::utils::{format_prompt_user_text_only, genai, render_prompt_for_display};
 use crate::error::AgentError;
 use crate::events::{AgentEventKind, SessionLimits};
 use crate::hooks::HookNotice;
@@ -35,6 +35,7 @@ use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 fn client_prompt_id_from_meta(meta: Option<&crate::acp::protocol::Meta>) -> Option<String> {
@@ -2308,10 +2309,19 @@ async fn validate_execution_task(
     Ok(Some(task))
 }
 
-#[instrument(
-    name = "agent.prompt.execute",
-    skip(exec),
-    fields(
+async fn execute_prompt_detached(
+    exec: DetachedPromptExecution,
+) -> Result<PromptResponse, AgentError> {
+    // Construct the existing execution span explicitly: OTel 0.33 starts it on entry,
+    // so the request's remote parent must be installed before instrumenting the future.
+    let span = info_span!(
+        parent: None,
+        "agent.prompt.execute",
+        otel.name = "invoke_agent",
+        otel.kind = "internal",
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.conversation.id = %exec.session_id,
+        session.id = %exec.session_id,
         session_id = %exec.session_id,
         execution_origin = ?exec.execution_origin,
         mode = %exec.mode,
@@ -2325,11 +2335,36 @@ async fn validate_execution_task(
         ),
         admission_ms = tracing::field::Empty,
         intent_projection_ms = tracing::field::Empty,
-    )
-)]
-async fn execute_prompt_detached(
-    exec: DetachedPromptExecution,
-) -> Result<PromptResponse, AgentError> {
+    );
+    crate::agent::utils::genai::agent_id(&span, exec.config.provider.agent_id.as_deref());
+    // Detached/queued work owns its request parent, never the actor's long-lived span.
+    if let Some(parent) = exec
+        .req
+        .meta
+        .as_ref()
+        .and_then(crate::acp::trace_context::extract_acp_trace_context_from_meta)
+    {
+        let _ = span.set_parent(parent);
+    }
+    async move {
+        execute_prompt_inner(exec).await.inspect_err(|error| {
+            let error_type = match error {
+                AgentError::PermissionCancelled => return,
+                AgentError::ClientBridgeClosed
+                | AgentError::PermissionChannelDropped
+                | AgentError::WorkspaceQueryChannelDropped => "client_disconnected",
+                AgentError::SessionTimeout { .. } => "timeout",
+                AgentError::InvalidPromptContent { .. } => "invalid_prompt",
+                _ => "agent_error",
+            };
+            genai::error(error_type);
+        })
+    }
+    .instrument(span)
+    .await
+}
+
+async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptResponse, AgentError> {
     let admission_started = std::time::Instant::now();
     let DetachedPromptExecution {
         req,
@@ -2704,7 +2739,7 @@ async fn execute_prompt_detached(
         result
             .as_ref()
             .map(|o| format!("{:?}", o))
-            .unwrap_or_else(|e| e.to_string())
+            .unwrap_or_else(|_| "error".to_string())
     );
 
     debug!("Session {}: post-turn snapshot start", session_id);
@@ -2885,6 +2920,142 @@ mod tests {
         MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory, mock_llm_config,
         mock_plugin_registry, mock_session,
     };
+
+    #[tokio::test]
+    async fn genai_detached_agent_uses_each_request_parent_and_closes_on_early_exits() {
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use opentelemetry::{
+            Value,
+            trace::{SpanId, SpanKind, Status, TraceId},
+        };
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        for (trace, cancelled, dropped, id) in [
+            (
+                Some("11111111111111111111111111111111"),
+                false,
+                false,
+                Some("parent"),
+            ),
+            (
+                Some("22222222222222222222222222222222"),
+                true,
+                false,
+                Some("parent"),
+            ),
+            (None, false, true, None),
+            (None, false, false, Some(" \t")),
+        ] {
+            let config = AgentConfigBuilder::from_provider(
+                fixture.storage.clone(),
+                Arc::new(
+                    (*fixture.config.provider)
+                        .clone()
+                        .with_agent_id(id.map(str::to_owned)),
+                ),
+                fixture.storage.event_journal(),
+            )
+            .build();
+            let runtime = SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            );
+            let _permit = runtime.execution_permit.acquire().await.unwrap();
+            let actor =
+                SessionActor::new(Arc::new(config), "trace-session".into(), runtime.clone());
+            let prompt = if cancelled || dropped {
+                vec![crate::acp::protocol::ContentBlock::from("SECRET_PROMPT")]
+            } else {
+                vec![]
+            };
+            let mut req = crate::acp::protocol::PromptRequest::new("trace-session", prompt);
+            if let Some(trace) = trace {
+                req.meta = Some(serde_json::Map::from_iter([(
+                    "traceparent".into(),
+                    serde_json::Value::from(format!("00-{trace}-1234567890abcdef-01")),
+                )]));
+            }
+            let exec = actor.prompt_execution(
+                req,
+                None,
+                "trace-run".into(),
+                Arc::new(crate::agent::turn_control::SteeringInbox::new(
+                    "trace-run".into(),
+                )),
+                tokio::sync::mpsc::unbounded_channel().0,
+            );
+            if cancelled {
+                exec.cancel_token.cancel();
+            }
+            let (_, spans) = capture(
+                async {
+                    if dropped {
+                        let mut future = Box::pin(execute_prompt_detached(exec));
+                        assert!(futures_util::poll!(&mut future).is_pending());
+                        drop(future);
+                    } else {
+                        let result = execute_prompt_detached(exec).await;
+                        assert_eq!(result.is_ok(), cancelled);
+                    }
+                }
+                .instrument(info_span!("unrelated-actor")),
+            )
+            .await;
+            let agent = spans.iter().find(|s| s.name == "invoke_agent").unwrap();
+            assert_eq!(agent.span_kind, SpanKind::Internal);
+            assert_eq!(
+                attr(agent, "gen_ai.operation.name"),
+                Some(&Value::from("invoke_agent"))
+            );
+            assert_eq!(
+                attr(agent, "gen_ai.conversation.id"),
+                Some(&Value::from("trace-session"))
+            );
+            assert_eq!(
+                attr(agent, "session.id"),
+                attr(agent, "gen_ai.conversation.id")
+            );
+            assert!(attr(agent, "gen_ai.request.model").is_none());
+            assert!(attr(agent, "gen_ai.agent.name").is_none());
+            assert_eq!(
+                attr(agent, "gen_ai.agent.id"),
+                id.filter(|id| !id.trim().is_empty())
+                    .map(Value::from)
+                    .as_ref()
+            );
+            if let Some(trace) = trace {
+                assert_eq!(
+                    agent.span_context.trace_id(),
+                    TraceId::from_hex(trace).unwrap()
+                );
+                assert_eq!(
+                    agent.parent_span_id,
+                    SpanId::from_hex("1234567890abcdef").unwrap()
+                );
+            } else {
+                assert_eq!(agent.parent_span_id, SpanId::INVALID);
+            }
+            assert_eq!(
+                agent.status,
+                if cancelled || dropped {
+                    Status::Unset
+                } else {
+                    Status::error("")
+                }
+            );
+            let error_type = Value::from("invalid_prompt");
+            assert_eq!(
+                attr(agent, "error.type"),
+                if cancelled || dropped {
+                    None
+                } else {
+                    Some(&error_type)
+                }
+            );
+            assert_private(&spans);
+        }
+    }
 
     // ── Shared fixture ───────────────────────────────────────────────────────
 

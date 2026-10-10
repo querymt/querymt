@@ -153,22 +153,46 @@ impl ToolTrait for ShellTool {
         #[cfg(unix)]
         let mut group_guard = KillProcessGroup(child.id());
 
-        let cancel = context.cancellation_token();
-        let output = tokio::select! {
-            result = child.wait_with_output() => {
-                let output = result
-                    .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?;
-                #[cfg(unix)]
-                {
-                    group_guard.0 = None;
-                }
-                output
+        // Resolve the spawned executable once, without delaying pipe draining or cancellation.
+        #[cfg(target_os = "linux")]
+        let pid = child.id();
+        let executable = async {
+            #[cfg(target_os = "linux")]
+            if let Some(pid) = pid {
+                return tokio::fs::read_link(format!("/proc/{pid}/exe")).await.ok();
             }
-            _ = cancel.cancelled() => {
-                return Err(ToolError::ProviderError("Cancelled by user".to_string()));
+            None::<std::path::PathBuf>
+        };
+        let wait = child.wait_with_output();
+        tokio::pin!(executable, wait);
+        let mut identity_pending = cfg!(target_os = "linux");
+        let cancel = context.cancellation_token();
+        let output = loop {
+            tokio::select! {
+                executable = &mut executable, if identity_pending => {
+                    identity_pending = false;
+                    if let Some(executable) = executable
+                        && let Some(name) = executable.file_name().and_then(|name| name.to_str())
+                    {
+                        crate::agent::utils::genai::shell_executable(name);
+                    }
+                }
+                result = &mut wait => {
+                    let output = result
+                        .map_err(|e| ToolError::ProviderError(format!("command failed: {}", e)))?;
+                    #[cfg(unix)]
+                    {
+                        group_guard.0 = None;
+                    }
+                    break output;
+                }
+                _ = cancel.cancelled() => {
+                    return Err(ToolError::ProviderError("Cancelled by user".to_string()));
+                }
             }
         };
 
+        crate::agent::utils::genai::shell_exit_code(output.status.code());
         let result = json!({
             "exit_code": output.status.code().unwrap_or(-1),
             "stdout": String::from_utf8_lossy(&output.stdout),
@@ -334,6 +358,184 @@ mod tests {
         assert!(result.is_err(), "expected cancellation error");
 
         assert_process_exits(pid).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn shell_with_pending_identity(cancelled: bool) {
+        use crate::agent::utils::genai;
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use std::time::Duration;
+        use tracing::Instrument;
+
+        struct ReleaseWorker(std::sync::mpsc::Sender<()>);
+        impl Drop for ReleaseWorker {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            });
+            // Release even on panic, before the runtime waits for blocking tasks at shutdown.
+            let release = ReleaseWorker(release);
+            ready.await.unwrap();
+
+            let dir = TempDir::new().unwrap();
+            let token = CancellationToken::new();
+            let context = AgentToolContext::basic("test".into(), Some(dir.path().to_owned()))
+                .with_cancellation_token(token.clone());
+            let command = if cancelled {
+                "echo $$ > shell.pid; exec sleep 300"
+            } else {
+                // Gate the otherwise fast exit until the lookup has been polled and is pending.
+                "echo $$ > shell.pid; while [ ! -f finish ]; do sleep 0.01; done; \
+                 printf SECRET_RESPONSE; printf SECRET_ERROR >&2; exit 7"
+            };
+            let tool = ShellTool::new();
+            let (pid, spans) = capture(async {
+                let span = tracing::info_span!(
+                    "tool",
+                    otel.name = "execute_tool shell",
+                    otel.kind = "internal",
+                    gen_ai.operation.name = "execute_tool",
+                    gen_ai.tool.name = "shell"
+                );
+                let mut future = Box::pin(
+                    genai::tool_scope(
+                        span.clone(),
+                        tool.call(json!({"command": "sh", "args": ["-c", command]}), &context),
+                    )
+                    .instrument(span),
+                );
+                assert!(futures_util::poll!(&mut future).is_pending());
+                // Read readiness synchronously: Tokio fs would queue behind the blocked lookup.
+                let pid = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Ok(contents) = std::fs::read_to_string(dir.path().join("shell.pid"))
+                            && let Ok(pid) = contents.trim().parse::<i32>()
+                        {
+                            break pid;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("process did not write its PID in time");
+                if cancelled {
+                    token.cancel();
+                } else {
+                    std::fs::write(dir.path().join("finish"), "").unwrap();
+                }
+                let result = tokio::time::timeout(Duration::from_secs(5), &mut future)
+                    .await
+                    .expect("pending identity must not hold completion or cancellation");
+                if cancelled {
+                    assert!(matches!(result, Err(ToolError::ProviderError(message)) if message == "Cancelled by user"));
+                } else {
+                    let parsed: Value =
+                        serde_json::from_str(&first_text_block(result.unwrap())).unwrap();
+                    assert_eq!(parsed["exit_code"], 7);
+                    assert_eq!(parsed["stdout"], "SECRET_RESPONSE");
+                    assert_eq!(parsed["stderr"], "SECRET_ERROR");
+                }
+                pid
+            })
+            .await;
+            assert_process_exits(pid).await;
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].name, "execute_tool shell");
+            assert!(attr(&spans[0], "process.executable.name").is_none());
+            if cancelled {
+                assert!(attr(&spans[0], "process.exit.code").is_none());
+            } else {
+                assert_eq!(attr(&spans[0], "process.exit.code").unwrap().to_string(), "7");
+            }
+            assert_private(&spans);
+            assert!(!format!("{spans:?}").contains(dir.path().to_str().unwrap()));
+            drop(release);
+            worker.await.unwrap();
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn genai_shell_completion_does_not_wait_for_pending_identity() {
+        shell_with_pending_identity(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn genai_shell_cancellation_does_not_wait_for_pending_identity() {
+        shell_with_pending_identity(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn genai_shell_cancel_and_drop_retain_identity_without_exit_or_scope_leaks() {
+        use crate::agent::utils::genai;
+        use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
+        use std::time::Duration;
+        use tracing::Instrument;
+
+        for dropped in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let token = CancellationToken::new();
+            let context = AgentToolContext::basic("test".into(), Some(dir.path().to_owned()))
+                .with_cancellation_token(token.clone());
+            let pid_file = dir.path().join("shell.pid");
+            let args =
+                json!({"command": format!("echo $$ > {}; sleep 300; wait", pid_file.display())});
+            let tool = ShellTool::new();
+            let (pid, spans) = capture(async {
+                let span = tracing::info_span!(
+                    "tool",
+                    otel.name = "execute_tool shell",
+                    otel.kind = "internal",
+                    gen_ai.operation.name = "execute_tool",
+                    gen_ai.tool.name = "shell"
+                );
+                let mut future = Box::pin(
+                    genai::tool_scope(span.clone(), tool.call(args, &context)).instrument(span),
+                );
+                let pid = tokio::select! {
+                    result = &mut future => panic!("shell finished prematurely: {result:?}"),
+                    pid = wait_for_pid(&pid_file) => pid,
+                };
+                // Continue polling through the async /proc lookup before interrupting.
+                tokio::select! {
+                    result = &mut future => panic!("shell finished prematurely: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                }
+                if dropped {
+                    drop(future);
+                } else {
+                    token.cancel();
+                    assert!(future.await.is_err());
+                }
+                genai::shell_executable("must-not-leak");
+                genai::shell_exit_code(Some(77));
+                pid
+            })
+            .await;
+            assert_process_exits(pid).await;
+            assert_eq!(spans.len(), 1);
+            let span = &spans[0];
+            let name = attr(span, "process.executable.name").expect("running shell identity");
+            assert_eq!(span.name, format!("execute_tool shell {name}"));
+            assert!(attr(span, "process.exit.code").is_none());
+            assert_private(&spans);
+            assert!(!format!("{spans:?}").contains(dir.path().to_str().unwrap()));
+        }
     }
 
     #[cfg(unix)]
