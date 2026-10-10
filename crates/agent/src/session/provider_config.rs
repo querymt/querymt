@@ -434,6 +434,7 @@ mod tests {
         for binding_max in [None, Some(1234)] {
             let mut binding = binding(&registry, factory.clone());
             binding.logical_name = "anthropic".into();
+            binding.implementation_id = Some("oci://ghcr.io/querymt/openai:latest".into());
             binding.static_config =
                 serde_json::json!({"api_key":"SECRET_ARGUMENT", "temperature":0.25});
             if let Some(max) = binding_max {
@@ -441,7 +442,7 @@ mod tests {
             }
             let params =
                 serde_json::json!({"temperature":0.5, "top_p":0.75, "reasoning_effort":"high"});
-            let config = resolve_provider_config(
+            let resolved = resolve_provider_config(
                 &binding,
                 &LLMParams::new(),
                 ProviderConfigMode::Runtime {
@@ -454,20 +455,14 @@ mod tests {
             .await
             .unwrap();
             let config: serde_json::Value =
-                serde_json::from_str(&config.pruned_config_str).unwrap();
+                serde_json::from_str(&resolved.pruned_config_str).unwrap();
             assert_eq!(config["temperature"], 0.5);
             assert!(config.get("top_p").is_none());
             let max = binding_max.unwrap_or(32_000);
             assert_eq!(config["max_tokens"], max);
             let (_, spans) = capture(async {
                 let span = tracing::info_span!("resolved-settings");
-                span.in_scope(|| {
-                    crate::agent::utils::genai::GenerationSettings::from_config(
-                        "anthropic",
-                        &config,
-                    )
-                    .record(&span)
-                });
+                resolved.generation_settings.record(&span);
             })
             .await;
             assert_eq!(
@@ -476,10 +471,13 @@ mod tests {
             );
             assert_eq!(
                 attr(&spans[0], "gen_ai.request.temperature"),
-                Some(&Value::F64(1.0))
+                Some(&Value::F64(0.5))
             );
             assert!(attr(&spans[0], "gen_ai.request.top_p").is_none());
-            assert!(attr(&spans[0], "gen_ai.request.reasoning.level").is_none());
+            assert_eq!(
+                attr(&spans[0], "gen_ai.request.reasoning.level"),
+                Some(&Value::from("high"))
+            );
             assert_private(&spans);
         }
     }

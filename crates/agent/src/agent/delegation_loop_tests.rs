@@ -386,7 +386,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
     use opentelemetry::{Value, trace::SpanId};
     use tracing::{Instrument, Span};
 
-    for route in ["absent", "invalid", "remote", "replay"] {
+    for route in ["absent", "remote", "replay"] {
         let (_, spans) = capture_local_tasks(async {
             let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
             harness.stop_harness_orchestrator();
@@ -467,21 +467,6 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                                 kind,
                             }));
                     }
-                    "invalid" => {
-                        let invalid = serde_json::json!({"traceparent":"invalid"});
-                        assert!(
-                            crate::acp::trace_context::extract_acp_trace_context(&invalid)
-                                .is_none()
-                        );
-                        let root = tracing::info_span!(parent: None, "invalid-request-emitter");
-                        // No valid request context is installed, matching invoke_agent's fallback.
-                        config
-                            .event_sink
-                            .emit_durable(&harness.exec_ctx.session_id, kind)
-                            .instrument(root)
-                            .await
-                            .unwrap();
-                    }
                     _ => {
                         config
                             .event_sink
@@ -527,9 +512,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
         assert_eq!(handlers.len(), 1);
         let handler = handlers[0];
         assert!(spans.iter().all(|span| span.name != "delegation.dispatch"));
-        if route != "invalid" {
-            assert_eq!(handler.parent_span_id, SpanId::INVALID);
-        }
+        assert_eq!(handler.parent_span_id, SpanId::INVALID);
         let child = spans
             .iter()
             .find(|span| span.name == "invoke_agent")

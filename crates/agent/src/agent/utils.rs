@@ -520,69 +520,78 @@ mod tests {
     async fn genai_generation_settings_are_typed_bounded_and_provider_specific() {
         use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
-        for (provider, model, sends_level) in [
-            ("openai", "test", true),
-            ("codex", "test", true),
-            ("anthropic", "test", false),
-            ("xai", "grok-3-mini", true),
-            ("xai", " org/GROK-4.20-MULTI-AGENT-beta ", true),
-            ("xai", "grok-4.3-latest", true),
-            ("xai", "grok-4.6", false),
-            ("xai", "SECRET_ARGUMENT", false),
-            ("google", "gemini-3-pro", true),
-            ("google", "gemini-2.5-pro", false),
-            ("unknown", "test", false),
+        for (provider, effort, expected) in [
+            ("openai", None, None),
+            ("openai", Some("low"), Some("low")),
+            ("openai", Some("medium"), Some("medium")),
+            ("openai", Some("high"), Some("high")),
+            ("openai", Some("max"), Some("xhigh")),
+            ("openai", Some("SECRET_ARGUMENT"), None),
+            ("google", Some("low"), Some("low")),
+            ("google", Some("medium"), Some("high")),
+            ("google", Some("high"), Some("high")),
+            ("google", Some("max"), Some("high")),
         ] {
-            for effort in [
-                None,
-                Some("low"),
-                Some("medium"),
+            let (_, spans) = capture(async {
+                let span = tracing::info_span!("settings");
+                let config = serde_json::json!({"model":"gemini-3-pro", "reasoning_effort":effort});
+                super::genai::GenerationSettings::from_config(provider, &config).record(&span);
+            })
+            .await;
+            assert_eq!(
+                attr(&spans[0], "gen_ai.request.reasoning.level"),
+                expected.map(Value::from).as_ref()
+            );
+            assert_private(&spans);
+        }
+        for (provider, model, effort, expected) in [
+            ("openai", "test", Some("high"), Some("high")),
+            ("codex", "test", Some("high"), Some("high")),
+            ("anthropic", "test", Some("high"), None),
+            ("anthropic", "test", None, None),
+            ("xai", "grok-3-mini", Some("high"), Some("high")),
+            (
+                "xai",
+                " org/GROK-4.20-MULTI-AGENT-beta ",
                 Some("high"),
-                Some("max"),
-                Some("SECRET_ARGUMENT"),
-            ] {
-                let config = serde_json::json!({"model":model, "thinking_budget":null, "max_tokens":u32::MAX, "temperature":0.5, "top_p":0.75, "reasoning_effort":effort,
-                    "extra_body":{"store":false, "promptCacheKey":"SECRET_ARGUMENT", "verbosity":"SECRET_RESPONSE"}});
-                let (_, spans) = capture(async {
-                    let span = tracing::info_span!("settings");
-                    span.in_scope(|| {
-                        super::genai::GenerationSettings::from_config(provider, &config)
-                            .record(&span)
-                    });
-                })
-                .await;
-                let span = &spans[0];
-                let known = matches!(provider, "openai" | "codex" | "anthropic");
-                let reasoning = match effort {
-                    Some("medium" | "high" | "max") if provider == "google" => Some("high"),
-                    Some("max") => Some("xhigh"),
-                    Some("low" | "medium" | "high") => effort,
+                Some("high"),
+            ),
+            ("xai", "grok-4.3-latest", Some("high"), Some("high")),
+            ("xai", "grok-4.6", Some("high"), None),
+            ("xai", "SECRET_ARGUMENT", Some("high"), None),
+            ("google", "gemini-2.5-pro", Some("high"), None),
+            ("unknown", "test", Some("high"), None),
+        ] {
+            let config = serde_json::json!({"model":model, "thinking_budget":null, "max_tokens":u32::MAX, "temperature":0.5, "top_p":0.75, "reasoning_effort":effort,
+                "extra_body":{"store":false, "promptCacheKey":"SECRET_ARGUMENT", "verbosity":"SECRET_RESPONSE"}});
+            let (_, spans) = capture(async {
+                let span = tracing::info_span!("settings");
+                super::genai::GenerationSettings::from_config(provider, &config).record(&span);
+            })
+            .await;
+            let span = &spans[0];
+            assert_eq!(
+                attr(span, "gen_ai.request.max_tokens"),
+                matches!(provider, "openai" | "anthropic")
+                    .then_some(&Value::I64(i64::from(u32::MAX)))
+            );
+            assert_eq!(
+                attr(span, "gen_ai.request.temperature"),
+                match (provider, effort) {
+                    ("anthropic", Some(_)) => Some(&Value::F64(1.0)),
+                    ("anthropic", None) | ("openai" | "codex", _) => Some(&Value::F64(0.5)),
                     _ => None,
-                };
-                assert_eq!(
-                    attr(span, "gen_ai.request.max_tokens"),
-                    (known && provider != "codex").then_some(&Value::I64(i64::from(u32::MAX)))
-                );
-                assert_eq!(
-                    attr(span, "gen_ai.request.temperature"),
-                    known.then_some(&Value::F64(
-                        if provider == "anthropic" && reasoning.is_some() {
-                            1.0
-                        } else {
-                            0.5
-                        }
-                    ))
-                );
-                assert_eq!(
-                    attr(span, "gen_ai.request.top_p"),
-                    known.then_some(&Value::F64(0.75))
-                );
-                assert_eq!(
-                    attr(span, "gen_ai.request.reasoning.level"),
-                    reasoning.filter(|_| sends_level).map(Value::from).as_ref()
-                );
-                assert_private(&spans);
-            }
+                }
+            );
+            assert_eq!(
+                attr(span, "gen_ai.request.top_p"),
+                matches!(provider, "openai" | "codex" | "anthropic").then_some(&Value::F64(0.75))
+            );
+            assert_eq!(
+                attr(span, "gen_ai.request.reasoning.level"),
+                expected.map(Value::from).as_ref()
+            );
+            assert_private(&spans);
         }
         for config in [
             serde_json::json!({}),
@@ -592,9 +601,7 @@ mod tests {
         ] {
             let (_, spans) = capture(async {
                 let span = tracing::info_span!("settings");
-                span.in_scope(|| {
-                    super::genai::GenerationSettings::from_config("openai", &config).record(&span)
-                });
+                super::genai::GenerationSettings::from_config("openai", &config).record(&span);
             })
             .await;
             assert!(
@@ -641,11 +648,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn genai_reasoning_usage_alias_is_typed_equal_and_does_not_infer_effort() {
+    async fn genai_reasoning_usage_alias_and_cache_inclusive_totals_are_typed_and_widened() {
         use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
         use opentelemetry::Value;
         use querymt::chat::{ChatOutput, FinishReason};
-        for reasoning in [None, Some(0), Some(9), Some(u32::MAX)] {
+        for reasoning in [None, Some(0), Some(u32::MAX)] {
             let mut output = ChatOutput::from_projections(
                 Some("SECRET_ARGUMENT".into()),
                 Some("SECRET_RESPONSE".into()),
@@ -657,7 +664,8 @@ mod tests {
                 input_tokens: u32::MAX,
                 output_tokens: u32::MAX,
                 reasoning_tokens,
-                ..Default::default()
+                cache_read: 20,
+                cache_write: 30,
             });
             let (_, spans) = capture(async {
                 let chat = tracing::info_span!("chat");
@@ -680,7 +688,12 @@ mod tests {
                     .map(|value| Value::I64(i64::from(u32::MAX) + i64::from(value)))
                     .as_ref()
             );
-            assert!(attr(chat, "gen_ai.request.reasoning.level").is_none());
+            assert_eq!(
+                attr(chat, "gen_ai.usage.input_tokens"),
+                reasoning
+                    .map(|_| Value::I64(i64::from(u32::MAX) + 50))
+                    .as_ref()
+            );
             assert_private(&spans);
         }
     }

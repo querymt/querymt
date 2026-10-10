@@ -1438,27 +1438,10 @@ mod genai_trace_tests {
                 assert!(attr(diagnostic, "gen_ai.skill.name").is_none());
             }
             assert_private(&spans);
-            for span in &spans {
-                let path = dir.path().display().to_string();
-                let keys: Vec<_> = span
-                    .attributes
-                    .iter()
-                    .filter(|attr| attr.value.to_string().contains(&path))
-                    .map(|attr| attr.key.as_str())
-                    .collect();
-                let event_keys: Vec<_> = span
-                    .events
-                    .iter()
-                    .flat_map(|event| event.attributes.iter())
-                    .filter(|attr| attr.value.to_string().contains(&path))
-                    .map(|attr| attr.key.as_str())
-                    .collect();
-                assert!(
-                    keys.is_empty() && event_keys.is_empty(),
-                    "mode={mode} span={} path attribute keys={keys:?} event keys={event_keys:?}",
-                    span.name
-                );
-            }
+            assert!(
+                !format!("{spans:?}").contains(dir.path().to_str().unwrap()),
+                "mode={mode}"
+            );
         }
     }
 

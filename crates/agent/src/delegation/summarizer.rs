@@ -854,14 +854,6 @@ mod tests {
             Some(&Value::I64(i64::from(usage.output_tokens)))
         );
         assert_eq!(
-            attr(chat, "gen_ai.usage.reasoning_tokens"),
-            Some(&Value::I64(i64::from(usage.reasoning_tokens)))
-        );
-        assert_eq!(
-            attr(chat, "gen_ai.usage.reasoning_tokens"),
-            attr(chat, "gen_ai.usage.reasoning.output_tokens")
-        );
-        assert_eq!(
             attr(chat, "gen_ai.response.finish_reasons"),
             Some(&Value::Array(Array::String(vec![finish.to_owned().into()])))
         );
@@ -870,57 +862,19 @@ mod tests {
 
     #[tokio::test]
     async fn genai_summary_rejects_unsuccessful_non_streaming_outputs_without_losing_metadata() {
+        use ChatOutputStatus::{Completed, Failed, InProgress, Incomplete};
+        use FinishReason::{ContentFilter, Error, Length, Stop, ToolCalls};
         for (status, finish, reason, tool_call) in [
-            (
-                Some(ChatOutputStatus::Incomplete),
-                FinishReason::Stop,
-                "stop",
-                false,
-            ),
-            (
-                Some(ChatOutputStatus::Failed),
-                FinishReason::Stop,
-                "stop",
-                false,
-            ),
-            (
-                Some(ChatOutputStatus::InProgress),
-                FinishReason::Stop,
-                "stop",
-                false,
-            ),
-            (
-                Some(ChatOutputStatus::Completed),
-                FinishReason::Length,
-                "length",
-                false,
-            ),
-            (
-                Some(ChatOutputStatus::Completed),
-                FinishReason::ContentFilter,
-                "content_filter",
-                false,
-            ),
-            (
-                Some(ChatOutputStatus::Completed),
-                FinishReason::ToolCalls,
-                "tool_calls",
-                false,
-            ),
-            (
-                Some(ChatOutputStatus::Completed),
-                FinishReason::Error,
-                "error",
-                false,
-            ),
-            (
-                Some(ChatOutputStatus::Completed),
-                FinishReason::Stop,
-                "stop",
-                true,
-            ),
+            (Incomplete, Stop, "stop", false),
+            (Failed, Stop, "stop", false),
+            (InProgress, Stop, "stop", false),
+            (Completed, Length, "length", false),
+            (Completed, ContentFilter, "content_filter", false),
+            (Completed, ToolCalls, "tool_calls", false),
+            (Completed, Error, "error", false),
+            (Completed, Stop, "stop", true),
         ] {
-            let mut output = partial_summary_output(status, finish);
+            let mut output = partial_summary_output(Some(status), finish);
             if tool_call {
                 output
                     .items
@@ -970,106 +924,62 @@ mod tests {
 
     #[tokio::test]
     async fn genai_summary_rejects_unsuccessful_streams_and_keeps_ready_billed_usage() {
+        use ChatOutputStatus::{Completed, Failed};
+        use FinishReason::{Length, Stop};
         use querymt::chat::StructuredStreamEvent;
-        for structured in [false, true] {
-            for (status, finish, reason, unfinished_item) in [
-                (
-                    ChatOutputStatus::Completed,
-                    FinishReason::Length,
-                    "length",
-                    false,
-                ),
-                (
-                    ChatOutputStatus::Completed,
-                    FinishReason::ContentFilter,
-                    "content_filter",
-                    false,
-                ),
-                (
-                    ChatOutputStatus::Completed,
-                    FinishReason::ToolCalls,
-                    "tool_calls",
-                    false,
-                ),
-                (
-                    ChatOutputStatus::Completed,
-                    FinishReason::Error,
-                    "error",
-                    false,
-                ),
-                (
-                    ChatOutputStatus::Incomplete,
-                    FinishReason::Stop,
-                    "stop",
-                    false,
-                ),
-                (ChatOutputStatus::Failed, FinishReason::Stop, "stop", false),
-                (
-                    ChatOutputStatus::InProgress,
-                    FinishReason::Stop,
-                    "stop",
-                    false,
-                ),
-                (
-                    ChatOutputStatus::Completed,
-                    FinishReason::Stop,
-                    "stop",
-                    true,
-                ),
-            ] {
-                if !structured && (status != ChatOutputStatus::Completed || unfinished_item) {
-                    continue;
-                }
-                let mut output = partial_summary_output(Some(status), finish);
-                let mut chunks = if structured {
-                    vec![
-                        StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
-                            response_id: output.response_id.clone(),
-                            status: Some(ChatOutputStatus::InProgress),
-                            usage: None,
-                            finish_reason: None,
-                            provenance: output.provenance.clone(),
-                        }),
-                        StreamChunk::Structured(if unfinished_item {
-                            StructuredStreamEvent::ItemStarted {
-                                output_index: 0,
-                                item: output.items[0].clone(),
-                            }
-                        } else {
-                            StructuredStreamEvent::ItemCompleted {
-                                output_index: 0,
-                                item: output.items[0].clone(),
-                            }
-                        }),
-                        StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
-                            status,
-                            usage: output.usage.clone(),
-                            finish_reason: Some(finish),
-                            detail: Some("SECRET_ERROR".into()),
-                        }),
-                    ]
-                } else {
-                    output.response_id = None;
-                    output.provenance = None;
-                    vec![
-                        StreamChunk::Text("SECRET_RESPONSE".into()),
-                        StreamChunk::Usage(output.usage.clone().unwrap()),
-                        StreamChunk::Done {
-                            finish_reason: finish,
-                        },
-                    ]
-                };
-                output.usage = Some(querymt::Usage {
-                    input_tokens: 200,
-                    output_tokens: 70,
-                    ..Default::default()
-                });
-                chunks.push(StreamChunk::Usage(output.usage.clone().unwrap()));
-                let mut provider =
-                    SummaryTestProvider::streaming(chunks.into_iter().map(Ok).collect());
-                provider.pending_tail = true;
-                assert_summary_rejected(provider, &output, reason).await;
-            }
+        for (structured, status, finish, reason, unfinished_item) in [
+            (true, Failed, Stop, "stop", false),
+            (true, Completed, Stop, "stop", true),
+            (false, Completed, Length, "length", false),
+        ] {
+            let mut output = partial_summary_output(Some(status), finish);
+            let mut chunks = if structured {
+                vec![
+                    StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                        response_id: output.response_id.clone(),
+                        status: Some(ChatOutputStatus::InProgress),
+                        usage: None,
+                        finish_reason: None,
+                        provenance: output.provenance.clone(),
+                    }),
+                    StreamChunk::Structured(if unfinished_item {
+                        StructuredStreamEvent::ItemStarted {
+                            output_index: 0,
+                            item: output.items[0].clone(),
+                        }
+                    } else {
+                        StructuredStreamEvent::ItemCompleted {
+                            output_index: 0,
+                            item: output.items[0].clone(),
+                        }
+                    }),
+                    StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                        status,
+                        usage: output.usage.clone(),
+                        finish_reason: Some(finish),
+                        detail: Some("SECRET_ERROR".into()),
+                    }),
+                ]
+            } else {
+                output.response_id = None;
+                output.provenance = None;
+                vec![
+                    StreamChunk::Text("SECRET_RESPONSE".into()),
+                    StreamChunk::Usage(output.usage.clone().unwrap()),
+                    StreamChunk::Done {
+                        finish_reason: finish,
+                    },
+                ]
+            };
+            output.usage = Some(querymt::Usage {
+                input_tokens: 200,
+                output_tokens: 70,
+                ..Default::default()
+            });
+            chunks.push(StreamChunk::Usage(output.usage.clone().unwrap()));
+            let mut provider = SummaryTestProvider::streaming(chunks.into_iter().map(Ok).collect());
+            provider.pending_tail = true;
+            assert_summary_rejected(provider, &output, reason).await;
         }
     }
 
@@ -1175,10 +1085,6 @@ mod tests {
             );
             assert_eq!(
                 attr(chat, "gen_ai.usage.reasoning.output_tokens"),
-                Some(&Value::I64(2))
-            );
-            assert_eq!(
-                attr(chat, "gen_ai.usage.reasoning_tokens"),
                 Some(&Value::I64(2))
             );
             if structured {

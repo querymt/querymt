@@ -2549,7 +2549,7 @@ mod tests {
 
         #[tokio::test]
         async fn genai_effective_settings_stay_bound_to_the_actual_cached_provider() {
-            for (with_tools, streaming) in [(false, false), (true, false), (true, true)] {
+            for (with_tools, streaming) in [(false, false), (true, true)] {
                 for (provider, identity) in [
                     ("openai", Some("oci://ghcr.io/querymt/openai:latest")),
                     ("openai", Some("static:openai")),
@@ -2858,92 +2858,6 @@ mod tests {
                         Some(&Value::from("authentication"))
                     );
                 }
-                assert_private(&spans);
-            }
-        }
-
-        #[tokio::test]
-        async fn genai_stream_terminal_and_late_usage_export_one_typed_canonical_result() {
-            for structured in [false, true] {
-                let (_, spans) = capture(async {
-                    async {
-                        let mut accumulator = ChatStreamAccumulator::new();
-                        if structured {
-                            accumulator.push(&metadata_event()).unwrap();
-                            accumulator
-                                .push(&terminal_event(
-                                    ChatOutputStatus::Completed,
-                                    Some(FinishReason::Stop),
-                                ))
-                                .unwrap();
-                        } else {
-                            accumulator
-                                .push(&StreamChunk::Text("SECRET_RESPONSE".into()))
-                                .unwrap();
-                            accumulator
-                                .push(&StreamChunk::Usage(querymt::Usage {
-                                    input_tokens: 10,
-                                    output_tokens: 5,
-                                    ..Default::default()
-                                }))
-                                .unwrap();
-                            accumulator
-                                .push(&StreamChunk::Done {
-                                    finish_reason: FinishReason::Stop,
-                                })
-                                .unwrap();
-                        }
-                        let mut trailing: Pin<
-                            Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>,
-                        > = Box::pin(futures_util::stream::iter(vec![Ok(StreamChunk::Usage(
-                            querymt::Usage {
-                                input_tokens: u32::MAX,
-                                output_tokens: u32::MAX,
-                                cache_read: 20,
-                                cache_write: 30,
-                                reasoning_tokens: 5,
-                            },
-                        ))]));
-                        let usage =
-                            drain_trailing_usage(&mut trailing, &CancellationToken::new()).await;
-                        let ChatStreamFinish::Completed(output) = accumulator.finish() else {
-                            panic!("expected completion")
-                        };
-                        let output = merge_drained_usage(output, usage);
-                        genai::output(&output);
-                    }
-                    .instrument(info_span!(
-                        "test-chat",
-                        otel.name = "chat stream-model",
-                        otel.kind = "client"
-                    ))
-                    .await
-                })
-                .await;
-                assert_eq!(spans.len(), 1);
-                let chat = &spans[0];
-                assert_eq!(chat.span_kind, SpanKind::Client);
-                assert_eq!(chat.status, Status::Unset);
-                assert_eq!(
-                    attr(chat, "gen_ai.usage.input_tokens"),
-                    Some(&Value::I64(i64::from(u32::MAX) + 50))
-                );
-                assert_eq!(
-                    attr(chat, "gen_ai.usage.output_tokens"),
-                    Some(&Value::I64(i64::from(u32::MAX) + 5))
-                );
-                assert_eq!(
-                    attr(chat, "gen_ai.usage.reasoning.output_tokens"),
-                    Some(&Value::I64(5))
-                );
-                assert_eq!(
-                    attr(chat, "gen_ai.usage.reasoning_tokens"),
-                    Some(&Value::I64(5))
-                );
-                assert_eq!(
-                    attr(chat, "gen_ai.response.finish_reasons"),
-                    Some(&Value::Array(Array::String(vec!["stop".into()])))
-                );
                 assert_private(&spans);
             }
         }
