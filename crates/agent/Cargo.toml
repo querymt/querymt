@@ -150,7 +150,7 @@ tree-sitter-toml-ng = "0.7"
 tree-sitter-md = "0.5"
 
 # Rust AST parsing for rich structural fingerprinting during function indexing
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
