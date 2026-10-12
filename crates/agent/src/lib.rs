@@ -55,6 +55,7 @@ pub mod tasks;
 pub mod tools;
 pub mod verification;
 pub mod workspace_query;
+pub mod worktree;
 
 #[cfg(test)]
 pub mod test_utils;

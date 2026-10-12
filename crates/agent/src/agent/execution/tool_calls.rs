@@ -994,6 +994,7 @@ pub(super) async fn record_tool_side_effects(
     config: &AgentConfig,
     result: &mut ToolResult,
     exec_ctx: &ExecutionContext,
+    batch_id: Option<&str>,
 ) -> Result<Option<WaitCondition>, anyhow::Error> {
     if result.execution_is_error {
         return Ok(None);
@@ -1055,6 +1056,13 @@ pub(super) async fn record_tool_side_effects(
             .get("expected_output")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let isolation = args
+            .get("isolation")
+            .and_then(|v| v.as_str())
+            .map(|s| s.parse::<crate::worktree::DelegationIsolation>())
+            .transpose()
+            .unwrap_or_default()
+            .unwrap_or_default();
 
         let pre_hook = config
             .hooks
@@ -1073,6 +1081,7 @@ pub(super) async fn record_tool_side_effects(
                 context: context_val.clone(),
                 constraints: constraints.clone(),
                 expected_output: expected_output.clone(),
+                isolation,
             })
             .await?;
         for notice in pre_hook.notices {
@@ -1092,6 +1101,7 @@ pub(super) async fn record_tool_side_effects(
             context: updated_context,
             constraints: updated_constraints,
             expected_output: updated_expected_output,
+            isolation: updated_isolation,
         } = pre_hook.updated_delegation.unwrap_or_default();
 
         let target_agent_id = updated_target_agent_id.unwrap_or(target_agent_id);
@@ -1099,6 +1109,7 @@ pub(super) async fn record_tool_side_effects(
         let mut context_val = updated_context.or(context_val);
         let constraints = updated_constraints.or(constraints);
         let expected_output = updated_expected_output.or(expected_output);
+        let requested_isolation = updated_isolation.unwrap_or(isolation);
 
         if !pre_hook.additional_contexts.is_empty() {
             let extra_context = pre_hook.additional_contexts.join("\n\n");
@@ -1121,15 +1132,50 @@ pub(super) async fn record_tool_side_effects(
             return Ok(None);
         }
 
+        // Resolve the delegation isolation policy (design decision 2): an
+        // explicit request wins; an inherited request follows the parent's
+        // execution mode. The resolved policy is persisted with the request
+        // and disclosed to the caller.
+        let parent_mode = match config.workspace_service() {
+            Some(service) => match service.session_execution_mode(&exec_ctx.session_id).await {
+                Ok(mode) => mode,
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "cannot resolve delegation workspace policy: {err}"
+                    ));
+                }
+            },
+            None => crate::worktree::ExecutionMode::Local,
+        };
+        let resolved_isolation =
+            crate::worktree::resolve_delegation_isolation(parent_mode, requested_isolation);
+
         if let Ok(serialized_args) = serde_json::to_string(&serde_json::json!({
             "target_agent_id": target_agent_id,
             "objective": objective,
             "context": context_val,
             "constraints": constraints,
             "expected_output": expected_output,
+            "isolation": resolved_isolation_label(resolved_isolation),
         })) {
             result.tool_arguments = Some(serialized_args);
         }
+
+        // Disclose the resolved execution mode: shared execution is never
+        // presented as isolated and explicit overrides are visible.
+        result.content.push(querymt::chat::ToolResultPart::Text {
+            text: format!(
+                "Execution workspace: {}.",
+                match resolved_isolation {
+                    crate::worktree::ResolvedIsolation::Isolated => {
+                        "isolated (private Git worktree checkout seeded from this session's current code state)"
+                    }
+                    crate::worktree::ResolvedIsolation::Shared => {
+                        "shared (this session's checkout; an explicit shared override is disclosed as shared, never isolated)"
+                    }
+                }
+            ),
+        });
 
         if let Ok(delegation) = exec_ctx
             .state
@@ -1139,6 +1185,14 @@ pub(super) async fn record_tool_side_effects(
                 context_val.clone(),
                 constraints,
                 expected_output,
+                match resolved_isolation {
+                    crate::worktree::ResolvedIsolation::Isolated => {
+                        crate::worktree::DelegationIsolation::Isolated
+                    }
+                    crate::worktree::ResolvedIsolation::Shared => {
+                        crate::worktree::DelegationIsolation::Shared
+                    }
+                },
             )
             .await
         {
@@ -1147,6 +1201,7 @@ pub(super) async fn record_tool_side_effects(
                 AgentEventKind::DelegationRequested {
                     delegation: delegation.clone(),
                     tool_call_id: Some(result.call_id.clone()),
+                    batch_id: batch_id.map(str::to_owned),
                 },
             );
             return Ok(Some(WaitCondition::delegation(
@@ -1190,6 +1245,14 @@ fn order_results_by_call_position(
     ordered
 }
 
+/// Serialize the resolved isolation for persisted tool arguments.
+fn resolved_isolation_label(resolved: crate::worktree::ResolvedIsolation) -> &'static str {
+    match resolved {
+        crate::worktree::ResolvedIsolation::Shared => "shared",
+        crate::worktree::ResolvedIsolation::Isolated => "isolated",
+    }
+}
+
 /// Store all completed tool results back into conversation history.
 ///
 /// This function:
@@ -1226,10 +1289,11 @@ pub(super) async fn store_all_tool_results(
     // Record per-result side effects (delegations, artifacts, etc.) before
     // persisting the combined tool_result message so hook-driven rewrites are
     // visible to the model in the stored transcript.
+    let batch_id = Uuid::new_v4().to_string();
     let mut adjusted_results = Vec::with_capacity(ordered_results.len());
     for mut result in ordered_results.iter().cloned() {
         if let Some(wait_condition) =
-            record_tool_side_effects(config, &mut result, exec_ctx).await?
+            record_tool_side_effects(config, &mut result, exec_ctx, Some(&batch_id)).await?
         {
             wait_conditions.push(wait_condition);
         }

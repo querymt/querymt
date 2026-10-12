@@ -88,6 +88,7 @@ nav:
     - Agent Modes: agent/agent_modes.md
     - Middleware: agent/middleware.md
     - Delegation: agent/delegation.md
+    - Git Worktree Workspaces: agent/worktrees.md
     - '`.agents` Protocol': agent/dotagents.md
     - 'Protocol Support Matrix': agent/dotagents_support_matrix.md
     - Mesh Networking: agent/mesh.md

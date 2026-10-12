@@ -33,6 +33,7 @@ pub(crate) async fn build_mcp_state(
     session_id: String,
     client_impl: &Implementation,
     tool_state: Arc<McpToolState>,
+    cwd: Option<&std::path::Path>,
 ) -> Result<HashMap<String, RunningService<RoleClient, crate::elicitation::McpClientHandler>>, Error>
 {
     let mut clients = HashMap::new();
@@ -50,6 +51,7 @@ pub(crate) async fn build_mcp_state(
             session_id.clone(),
             client_impl,
             tool_state.clone(),
+            cwd,
         )
         .await?;
         let peer = running.peer().clone();
@@ -136,6 +138,23 @@ pub(crate) async fn merge_connected_mcp_peers(
 }
 
 /// Starts an MCP server based on its configuration.
+/// Build the stdio child-process command for an MCP server, running inside
+/// the session's effective workspace when one is set so workspace-relative
+/// server entries resolve against the bound checkout rather than the agent
+/// process's working directory.
+fn stdio_command(stdio: &McpServerStdio, cwd: Option<&std::path::Path>) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(&stdio.command);
+    cmd.args(stdio.args.iter())
+        .envs(stdio.env.iter().map(|item| (&item.name, &item.value)))
+        .stderr(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    cmd
+}
+
 async fn start_mcp_server(
     server: &McpServer,
     pending_elicitations: crate::elicitation::PendingElicitationMap,
@@ -143,6 +162,7 @@ async fn start_mcp_server(
     session_id: String,
     client_impl: &Implementation,
     tool_state: Arc<McpToolState>,
+    cwd: Option<&std::path::Path>,
 ) -> Result<
     (
         String,
@@ -152,19 +172,8 @@ async fn start_mcp_server(
 > {
     match server {
         McpServer::Stdio(stdio) => {
-            let McpServerStdio {
-                name,
-                command,
-                args,
-                env,
-                ..
-            } = stdio.clone();
-            let mut cmd = tokio::process::Command::new(command);
-            cmd.args(args)
-                .envs(env.iter().map(|item| (&item.name, &item.value)))
-                .stderr(std::process::Stdio::inherit())
-                .stdout(std::process::Stdio::piped())
-                .stdin(std::process::Stdio::piped());
+            let McpServerStdio { name, .. } = stdio;
+            let cmd = stdio_command(stdio, cwd);
             let transport = TokioChildProcess::new(cmd)
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
             let handler = crate::elicitation::McpClientHandler::new(
@@ -182,7 +191,7 @@ async fn start_mcp_server(
                         reason: e.to_string(),
                     })
                 })?;
-            Ok((name, running))
+            Ok((name.clone(), running))
         }
         McpServer::Http(http) => {
             let McpServerHttp {
@@ -239,4 +248,24 @@ fn headers_to_map(headers: &[crate::acp::protocol::HttpHeader]) -> Result<Header
         map.insert(name, value);
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdio_command_runs_inside_the_session_workspace() {
+        let server = McpServerStdio::new("test", "/bin/true").args(vec!["--x".to_string()]);
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Workspace-bound sessions spawn MCP servers inside the bound
+        // checkout so workspace-relative entries resolve against it.
+        let cmd = stdio_command(&server, Some(dir.path()));
+        assert_eq!(cmd.as_std().get_current_dir(), Some(dir.path()));
+
+        // Local sessions keep the agent process working directory.
+        let cmd = stdio_command(&server, None);
+        assert_eq!(cmd.as_std().get_current_dir(), None);
+    }
 }

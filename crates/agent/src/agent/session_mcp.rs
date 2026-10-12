@@ -79,6 +79,24 @@ pub struct SessionMcpAttachmentContext {
 /// idempotent.
 #[async_trait]
 pub trait SessionMcpAttachmentSource: Send + Sync {
+    /// Attest that workspace-dependent integrations serve this effective cwd.
+    /// Implementations must validate fixed roots, including absolute stdio
+    /// arguments and already-connected peers. Unknown roots fail closed.
+    async fn validate_workspace_roots(
+        &self,
+        context: &SessionMcpAttachmentContext,
+        servers: &[McpServer],
+        peers: &[ConnectedMcpPeer],
+    ) -> Result<(), Error> {
+        if servers.is_empty() && peers.is_empty() {
+            return Ok(());
+        }
+        Err(Error::invalid_request().data(format!(
+            "MCP workspace roots are unverified for {}; configure a workspace-aware attachment source that validates all server and peer roots",
+            context.cwd.as_deref().unwrap_or_else(|| std::path::Path::new(".")).display()
+        )))
+    }
+
     /// Return the MCP attachments for the given session materialization context.
     async fn attachments(
         &self,
@@ -104,24 +122,48 @@ impl SessionMcpAttachmentSource for NoopSessionMcpAttachmentSource {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Split a list of [`SessionMcpAttachment`]s into server configs and
-/// connected peers.
+/// Split a list of attachments into server configs and connected peers.
 pub fn split_attachments(
     attachments: Vec<SessionMcpAttachment>,
 ) -> (Vec<McpServer>, Vec<ConnectedMcpPeer>) {
     let mut servers = Vec::new();
     let mut peers = Vec::new();
-
-    for a in attachments {
-        match a {
+    for attachment in attachments {
+        match attachment {
             SessionMcpAttachment::ServerConfig(config) => servers.push(config),
             SessionMcpAttachment::ConnectedPeer(peer) => peers.push(peer),
         }
     }
-
     (servers, peers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unknown_mcp_roots_fail_closed_before_startup() {
+        let context = SessionMcpAttachmentContext {
+            session_id: "isolated".into(),
+            cwd: Some(PathBuf::from("/workspaces/child")),
+            kind: SessionMaterializationKind::New,
+        };
+        let server = McpServer::Stdio(
+            crate::acp::protocol::McpServerStdio::new("fixed-root", "/bin/false")
+                .args(vec!["/original/project".into()]),
+        );
+        let source = NoopSessionMcpAttachmentSource;
+        assert!(
+            source
+                .validate_workspace_roots(&context, &[server], &[])
+                .await
+                .is_err()
+        );
+        assert!(
+            source
+                .validate_workspace_roots(&context, &[], &[])
+                .await
+                .is_ok()
+        );
+    }
 }

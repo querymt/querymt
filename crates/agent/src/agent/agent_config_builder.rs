@@ -75,7 +75,9 @@ pub struct AgentConfigBuilder {
     schedule_repository: Option<Arc<dyn crate::session::repo_schedule::ScheduleRepository>>,
     knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    slash_commands_config: Option<crate::config::SlashCommandsConfig>,
     hooks: Hooks,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
 }
 
 impl AgentConfigBuilder {
@@ -134,7 +136,9 @@ impl AgentConfigBuilder {
             schedule_repository: storage.schedule_repository(),
             knowledge_store: storage.knowledge_store(),
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            slash_commands_config: None,
             hooks: Hooks::disabled(),
+            workspace_service: None,
         }
     }
 
@@ -187,7 +191,9 @@ impl AgentConfigBuilder {
             schedule_repository: storage.schedule_repository(),
             knowledge_store: storage.knowledge_store(),
             slash_command_registry: crate::slash_commands::SlashCommandRegistry::empty(),
+            slash_commands_config: None,
             hooks: Hooks::disabled(),
+            workspace_service: None,
         }
     }
 
@@ -235,7 +241,9 @@ impl AgentConfigBuilder {
             schedule_repository: self.schedule_repository,
             knowledge_store: self.knowledge_store,
             slash_command_registry: self.slash_command_registry,
+            slash_commands_config: self.slash_commands_config,
             hooks: self.hooks,
+            workspace_service: self.workspace_service,
         }
     }
 
@@ -503,6 +511,30 @@ impl AgentConfigBuilder {
     /// Set the hooks runtime.
     pub fn with_hooks(mut self, hooks: Hooks) -> Self {
         self.hooks = hooks;
+        self
+    }
+
+    /// Retain the slash command discovery configuration alongside the built
+    /// registry so workspace-bound sessions can re-resolve prompt sources
+    /// from their bound checkout.
+    pub fn with_slash_commands_config(
+        mut self,
+        config: Option<crate::config::SlashCommandsConfig>,
+    ) -> Self {
+        self.slash_commands_config = config;
+        self
+    }
+
+    /// Set the managed Git worktree workspace service.
+    ///
+    /// When configured, new sessions may request isolated worktree execution
+    /// and load/resume resolve persisted workspace bindings before startup.
+    /// Omitted (default): every session executes locally.
+    pub fn with_workspace_service(
+        mut self,
+        service: Arc<crate::worktree::WorkspaceService>,
+    ) -> Self {
+        self.workspace_service = Some(service);
         self
     }
 

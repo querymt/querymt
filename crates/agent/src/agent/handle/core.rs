@@ -124,12 +124,60 @@ impl LocalAgentHandle {
         } else {
             self.config.slash_command_registry.clone()
         };
-        if registry.is_empty() {
+        // Prompt sources resolve from the session's bound checkout when it
+        // participates in workspace isolation, so prompts and prompt
+        // includes reflect the workspace's contents instead of the agent
+        // builder's working directory. Local sessions keep the registry
+        // built at agent startup.
+        let registry = self
+            .workspace_catalog_registry(session_id)
+            .await
+            .unwrap_or(registry);
+        let mut update = crate::slash_commands::acp::registry_to_acp_update(&registry);
+        if self.config.workspace_service().is_some() {
+            update
+                .available_commands
+                .retain(|cmd| cmd.name != "/worktree");
+            update.available_commands.push(crate::acp::protocol::AvailableCommand::new(
+                "/worktree", "Create and inspect isolated sessions; conservative removal, no automatic integration",
+            ).input(crate::acp::protocol::AvailableCommandInput::Unstructured(
+                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | remove <id>"),
+            )));
+        }
+        if update.available_commands.is_empty() {
             return None;
         }
-        Some(crate::slash_commands::acp::build_commands_notification(
-            session_id, &registry,
+        Some(crate::acp::protocol::SessionNotification::new(
+            session_id.to_owned(),
+            crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(update),
         ))
+    }
+
+    /// Prompt catalog re-resolved from the session's bound workspace
+    /// checkout, when applicable.
+    ///
+    /// Returns `None` — keeping the agent-level registry — for local
+    /// sessions, absent workspace service, or disabled/absent discovery
+    /// config.
+    async fn workspace_catalog_registry(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::slash_commands::SlashCommandRegistry> {
+        let service = self.config.workspace_service()?;
+        let slash_config = self.config.slash_commands_config.as_ref()?;
+        if !slash_config.enabled {
+            return None;
+        }
+        let binding = service
+            .resolve_existing_session(session_id, None)
+            .await
+            .ok()??;
+        Some(
+            crate::slash_commands::SlashCommandRegistry::registry_for_workspace(
+                slash_config,
+                &binding.effective_cwd,
+            ),
+        )
     }
 
     pub(super) async fn session_config_options(

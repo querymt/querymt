@@ -415,6 +415,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                 .unwrap();
             let delegation = store
                 .create_delegation(Delegation {
+                    isolation: Default::default(),
                     id: 0,
                     public_id: String::new(),
                     session_id: session.id,
@@ -437,6 +438,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
             let kind = AgentEventKind::DelegationRequested {
                 delegation: delegation.clone(),
                 tool_call_id: None,
+                batch_id: None,
             };
             let unrelated = tracing::info_span!(parent: None, "unrelated-relay");
             async {
@@ -1496,6 +1498,7 @@ async fn timeout_cleanup_cancels_requested_delegation_before_it_can_start() {
         .expect("session lookup")
         .expect("parent session");
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 0,
         public_id: String::new(),
         session_id: session.id,
@@ -1550,6 +1553,7 @@ async fn timeout_cleanup_does_not_overwrite_terminal_delegation() {
         .expect("session lookup")
         .expect("parent session");
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 0,
         public_id: String::new(),
         session_id: session.id,
@@ -2021,6 +2025,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
         AgentEventKind::DelegationRequested {
             delegation: completed_delegation,
             tool_call_id: None,
+            batch_id: None,
         },
     );
     let parent = store
@@ -2042,6 +2047,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
             expected_output: None,
             verification_spec: None,
             status: DelegationStatus::Requested,
+            isolation: Default::default(),
             retry_count: 0,
             created_at: OffsetDateTime::now_utc(),
             completed_at: None,
@@ -2054,6 +2060,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
         AgentEventKind::DelegationRequested {
             delegation: retry_delegation.clone(),
             tool_call_id: None,
+            batch_id: None,
         },
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2203,6 +2210,7 @@ async fn wait_timeout_cancellation_resolves_child_and_preserves_reopen() {
         AgentEventKind::DelegationRequested {
             delegation,
             tool_call_id: None,
+            batch_id: None,
         },
     );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2341,6 +2349,7 @@ async fn verification_failure_resolves_terminal_delegate_child() {
                 strategy: Default::default(),
             }),
             status: DelegationStatus::Requested,
+            isolation: Default::default(),
             retry_count: 0,
             created_at: OffsetDateTime::now_utc(),
             completed_at: None,
@@ -2366,6 +2375,7 @@ async fn verification_failure_resolves_terminal_delegate_child() {
         AgentEventKind::DelegationRequested {
             delegation: delegation.clone(),
             tool_call_id: None,
+            batch_id: None,
         },
     );
 
@@ -2484,6 +2494,7 @@ async fn test_delegation_guard_blocks_duplicate() {
     }];
 
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 1,
         public_id: "del-1".to_string(),
         session_id: 1,
@@ -2561,6 +2572,7 @@ async fn test_delegation_guard_blocks_max_retries() {
     }];
 
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 1,
         public_id: "del-1".to_string(),
         session_id: 1,
