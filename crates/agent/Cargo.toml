@@ -168,6 +168,7 @@ tar = { version = "0.4", optional = true, default-features = false }
 ureq = { version = "3", optional = true, default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+qmt-openai = { path = "../providers/openai", default-features = false, features = ["api"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 mockall = "0.15"
 tar = { version = "0.4", default-features = false }

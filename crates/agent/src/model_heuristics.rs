@@ -79,6 +79,14 @@ impl ModelDefaults {
             if !obj.contains_key(key) {
                 let mut v = value.clone();
                 substitute_session_id(&mut v, session_id);
+                // Responses owns storage policy; do not inject its reserved field.
+                if key == "extra_body"
+                    && self.provider == "openai"
+                    && obj.get("api_mode").and_then(Value::as_str) == Some("responses")
+                    && let Some(extra) = v.as_object_mut()
+                {
+                    extra.remove("store");
+                }
                 obj.insert(key.clone(), v);
             }
         }
@@ -245,18 +253,14 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
     let mut opts = HashMap::new();
     let id = model.to_lowercase();
 
-    // OpenAI & Codex:
-    //   - disable request storage by default
-    //   - enable prompt caching via session ID.
-    //   These are not part of the OpenAI SDK schema so they must be sent via extra_body.
+    // A stable session key improves prompt-cache routing for OpenAI and Codex.
+    // Only Chat Completions needs a storage default here; Responses owns it.
     if provider == "openai" || provider == "codex" {
-        opts.insert(
-            "extra_body".into(),
-            json!({
-                "store": false,
-                "promptCacheKey": "__session_id__"
-            }),
-        );
+        let mut extra = json!({"prompt_cache_key": "__session_id__"});
+        if provider == "openai" {
+            extra["store"] = json!(false);
+        }
+        opts.insert("extra_body".into(), extra);
     }
 
     // OpenRouter: request usage stats
@@ -453,7 +457,7 @@ mod tests {
     fn test_openai_extra_body_prompt_cache_key() {
         let d = ModelDefaults::for_model("openai", "gpt-4o");
         let extra = d.provider_options.get("extra_body").unwrap();
-        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
+        assert_eq!(extra["prompt_cache_key"], json!("__session_id__"));
     }
 
     #[test]
@@ -509,7 +513,7 @@ mod tests {
         );
         // OpenAI store/prompt_cache_key should still be present
         assert_eq!(extra["store"], json!(false));
-        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
+        assert_eq!(extra["prompt_cache_key"], json!("__session_id__"));
     }
 
     #[test]
@@ -538,7 +542,7 @@ mod tests {
             Some(&json!("medium"))
         );
         assert_eq!(extra["store"], json!(false));
-        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
+        assert_eq!(extra["prompt_cache_key"], json!("__session_id__"));
     }
 
     #[test]
@@ -626,10 +630,58 @@ mod tests {
         d.apply_to(&mut config, "sess-abc-123");
 
         assert_eq!(
-            config["extra_body"]["promptCacheKey"],
+            config["extra_body"]["prompt_cache_key"],
             json!("sess-abc-123")
         );
         assert_eq!(config["extra_body"]["store"], json!(false));
+    }
+
+    #[test]
+    fn test_openai_responses_heuristics_build_cacheable_request() {
+        let defaults = ModelDefaults::for_model("openai", "gpt-5");
+        let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
+        for session_id in ["session-1", "session-1", "session-2"] {
+            let mut config = json!({
+                "model": "gpt-5", "api_key": "sk-test", "api_mode": "responses"
+            });
+            defaults.apply_to(&mut config, session_id);
+            assert!(config["extra_body"].get("store").is_none());
+            let provider: qmt_openai::OpenAI = serde_json::from_value(config).unwrap();
+            let request = qmt_openai::api::openai_responses_request(&provider, &messages, None)
+                .expect("heuristic defaults must not conflict with Responses policy");
+            let raw = std::str::from_utf8(request.body()).unwrap();
+            let body: Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(body["prompt_cache_key"], session_id);
+            assert!(body.get("promptCacheKey").is_none());
+            assert_eq!(body["store"], false);
+            assert_eq!(raw.matches("\"store\":").count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_codex_apply_to_omits_storage_default() {
+        let defaults = ModelDefaults::for_model("codex", "gpt-5.1-codex");
+        let mut config = json!({"model": "gpt-5.1-codex"});
+        defaults.apply_to(&mut config, "session-1");
+        assert_eq!(config["extra_body"]["prompt_cache_key"], "session-1");
+        assert!(config["extra_body"].get("store").is_none());
+    }
+
+    #[test]
+    fn test_responses_preserves_user_extra_body_conflicts() {
+        let defaults = ModelDefaults::for_model("openai", "gpt-5");
+        let mut config = json!({
+            "model": "gpt-5", "api_key": "sk-test", "api_mode": "responses",
+            "extra_body": {"promptCacheKey": "custom-key", "store": false}
+        });
+        defaults.apply_to(&mut config, "session-1");
+        assert_eq!(config["extra_body"]["promptCacheKey"], "custom-key");
+        assert_eq!(config["extra_body"]["store"], false);
+        let provider: qmt_openai::OpenAI = serde_json::from_value(config).unwrap();
+        let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
+        let err = qmt_openai::api::openai_responses_request(&provider, &messages, None)
+            .expect_err("user-supplied reserved fields must still be rejected");
+        assert!(err.to_string().contains("protocol-owned field 'store'"));
     }
 
     #[test]
@@ -637,12 +689,15 @@ mod tests {
         let d = ModelDefaults::for_model("openai", "gpt-4o");
         let mut config = json!({
             "model": "gpt-4o",
-            "extra_body": { "promptCacheKey": "custom-key", "store": true }
+            "extra_body": { "prompt_cache_key": "custom-key", "store": true }
         });
         d.apply_to(&mut config, "sess-abc-123");
 
         // User's extra_body wins entirely over heuristic extra_body
-        assert_eq!(config["extra_body"]["promptCacheKey"], json!("custom-key"));
+        assert_eq!(
+            config["extra_body"]["prompt_cache_key"],
+            json!("custom-key")
+        );
         assert_eq!(config["extra_body"]["store"], json!(true));
     }
 
@@ -774,8 +829,8 @@ mod tests {
     fn test_codex_provider_prompt_cache_key() {
         let d = ModelDefaults::for_model("codex", "gpt-5.1-codex");
         let extra = d.provider_options.get("extra_body").unwrap();
-        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
-        assert_eq!(extra["store"], json!(false));
+        assert_eq!(extra["prompt_cache_key"], json!("__session_id__"));
+        assert!(extra.get("store").is_none());
     }
 
     #[test]
@@ -786,9 +841,9 @@ mod tests {
             d.provider_options.get("reasoning_effort"),
             Some(&json!("medium"))
         );
-        // Should also have codex defaults
-        assert_eq!(extra["store"], json!(false));
-        assert_eq!(extra["promptCacheKey"], json!("__session_id__"));
+        // Codex owns storage policy instead of injecting a duplicate field.
+        assert!(extra.get("store").is_none());
+        assert_eq!(extra["prompt_cache_key"], json!("__session_id__"));
     }
 
     #[test]

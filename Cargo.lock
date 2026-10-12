@@ -11523,6 +11523,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "parking_lot",
+ "qmt-openai",
  "querymt",
  "querymt-provider-common",
  "querymt-remote",

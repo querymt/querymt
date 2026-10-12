@@ -1706,6 +1706,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_cache_key_serialization_preserves_alias_compatibility() {
+        for extra in [
+            serde_json::json!({"prompt_cache_key": "session-1"}),
+            serde_json::json!({"promptCacheKey": "session-1"}),
+            serde_json::json!({"promptCacheKey": "ignored", "prompt_cache_key": "session-1"}),
+        ] {
+            let token = test_oauth_token("test-account-id");
+            let mut cfg = test_codex(&token);
+            cfg.extra_body = extra.as_object().cloned();
+            let request = codex_chat_request(&cfg, &basic_user_messages(), None).unwrap();
+            let raw = std::str::from_utf8(request.body()).unwrap();
+            let body: Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(body["prompt_cache_key"], "session-1");
+            assert!(body.get("promptCacheKey").is_none());
+            assert_eq!(body["store"], false);
+            assert_eq!(raw.matches("\"store\":").count(), 1);
+        }
+    }
+
+    #[test]
     fn codex_chat_request_omits_max_output_tokens() {
         let mut codex = test_codex("test-token");
         codex.max_tokens = Some(2_000);

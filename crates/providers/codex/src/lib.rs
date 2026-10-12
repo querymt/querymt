@@ -49,8 +49,8 @@ pub struct Codex {
     pub tools: Option<Vec<Tool>>,
     pub tool_choice: Option<ToolChoice>,
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
-    /// Extra body fields to include in the API request (e.g. `store`, `promptCacheKey`).
-    /// These are passed through as-is via `#[serde(flatten)]` in the request body.
+    /// Extra body fields to include in the API request (e.g. `prompt_cache_key`).
+    /// Keys are normalized to snake_case on chatgpt.com; camelCase aliases are supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_body: Option<serde_json::Map<String, Value>>,
 

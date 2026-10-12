@@ -3594,6 +3594,44 @@ mod tests {
     use crate::OpenAI;
 
     #[test]
+    fn responses_cache_key_serialization_preserves_alias_compatibility() {
+        for extra in [
+            serde_json::json!({"prompt_cache_key": "session-1"}),
+            serde_json::json!({"promptCacheKey": "session-1"}),
+            serde_json::json!({"promptCacheKey": "ignored", "prompt_cache_key": "session-1"}),
+        ] {
+            let cfg: OpenAI = serde_json::from_value(serde_json::json!({
+                "model": "gpt-5", "api_key": "sk-test", "api_mode": "responses",
+                "extra_body": extra
+            }))
+            .unwrap();
+            let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
+            let request = super::openai_responses_request(&cfg, &messages, None).unwrap();
+            let raw = std::str::from_utf8(request.body()).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(body["prompt_cache_key"], "session-1");
+            assert!(body.get("promptCacheKey").is_none());
+            assert_eq!(body["store"], false);
+            assert_eq!(raw.matches("\"store\":").count(), 1);
+        }
+    }
+
+    #[test]
+    fn responses_custom_endpoint_preserves_extra_body_spelling() {
+        let cfg: OpenAI = serde_json::from_value(serde_json::json!({
+            "model": "custom", "api_key": "test", "api_mode": "responses",
+            "base_url": "https://example.com/v1/",
+            "extra_body": {"promptCacheKey": "legacy-key", "prompt_cache_key": "canonical-key"}
+        }))
+        .unwrap();
+        let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
+        let request = super::openai_responses_request(&cfg, &messages, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(body["promptCacheKey"], "legacy-key");
+        assert_eq!(body["prompt_cache_key"], "canonical-key");
+    }
+
+    #[test]
     fn responses_replay_reasoning_without_summary_serializes_empty_summary_array() {
         use querymt::chat::{ChatOutputItem, ChatOutputProvenance, ChatReasoningItem, Extensions};
 
