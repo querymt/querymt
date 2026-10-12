@@ -52,6 +52,35 @@ impl AgentHandle for LocalAgentHandle {
         Ok((session_id, session_ref))
     }
 
+    fn supports_local_workspaces(&self) -> bool {
+        true
+    }
+
+    async fn create_isolated_delegation_session(
+        &self,
+        workspace: crate::worktree::WorkspaceBinding,
+        parent_session_id: String,
+    ) -> std::result::Result<(String, SessionActorRef), Error> {
+        let mut meta = serde_json::Map::new();
+        meta.insert("parent_session_id".to_string(), parent_session_id.into());
+        let req = NewSessionRequest::new(workspace.effective_cwd.clone()).meta(meta);
+        let prepared = Box::pin(
+            self.session_materializer
+                .prepare_new_session_with_workspace(req, Some(workspace)),
+        )
+        .await?;
+        let session_ref = self
+            .registry_lock()
+            .await
+            .register_prepared_session(&prepared)
+            .await;
+        let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
+        self.session_materializer
+            .finalize_session(&prepared, bridge)
+            .await?;
+        Ok((prepared.session_id, session_ref))
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
         self.config.event_sink.fanout().subscribe()
     }

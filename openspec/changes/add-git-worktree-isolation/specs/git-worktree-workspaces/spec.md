@@ -87,6 +87,18 @@ Managed workspaces SHALL use durable storage, survive session completion/cancell
 - **WHEN** removal targets an active workspace or one containing uncommitted, untracked, or ignored files
 - **THEN** removal is refused and the blocking state is reported without deleting files
 
+#### Scenario: History-preserving explicit archival
+- **WHEN** a user explicitly archives a workspace after all checkout actors have stopped
+- **THEN** its session history and durable binding remain available for inspection
+- **AND** future load/resume is refused rather than running in another checkout
+- **AND** conservative removal can proceed without deleting the owning conversation
+- **AND** archive and removal are refused while any cooperating actor holds a checkout activity lease, including in another process
+
+#### Scenario: Interrupted removal
+- **WHEN** deletion is interrupted after Removing intent was persisted
+- **THEN** explicit recovery rechecks content/reference safety and idempotently completes removal
+- **AND** no session can attach as an owner during removal
+
 #### Scenario: Clean checkout with unique commits
 - **WHEN** a clean inactive checkout has commits not integrated into the target history
 - **THEN** removal is refused unless those results have an explicitly retained recovery reference

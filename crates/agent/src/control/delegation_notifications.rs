@@ -138,6 +138,7 @@ impl DelegationUpdateProjector {
             AgentEventKind::DelegationRequested {
                 delegation,
                 tool_call_id,
+                ..
             } => {
                 if let Some(snapshot) = self.snapshots.get_mut(&delegation.public_id) {
                     if snapshot.tool_call_id.is_none() {
@@ -397,6 +398,7 @@ mod tests {
 
     fn delegation() -> Delegation {
         Delegation {
+            isolation: Default::default(),
             id: 0,
             public_id: "delegation-1".into(),
             session_id: 0,
@@ -434,6 +436,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
+                batch_id: None,
             },
         );
         let forked = event(
@@ -492,6 +495,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 delegation: delegation(),
                 tool_call_id: None,
+                batch_id: None,
             },
         ));
         let update = projector
@@ -524,6 +528,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
+                batch_id: None,
             },
         ));
         projector.project_event(&event(
@@ -531,6 +536,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 delegation: second,
                 tool_call_id: Some("call-2".into()),
+                batch_id: None,
             },
         ));
 
@@ -548,6 +554,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 delegation: delegation(),
                 tool_call_id: None,
+                batch_id: None,
             },
         ));
         let update = projector
@@ -589,6 +596,7 @@ mod tests {
                 AgentEventKind::DelegationRequested {
                     delegation: delegation(),
                     tool_call_id: Some("call-1".into()),
+                    batch_id: None,
                 },
             ))
             .unwrap();
@@ -629,6 +637,7 @@ mod tests {
                 AgentEventKind::DelegationRequested {
                     delegation: delegation(),
                     tool_call_id: Some("call-1".into()),
+                    batch_id: None,
                 },
             ))
             .unwrap();
@@ -647,6 +656,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
+                batch_id: None,
             },
         ));
         let completed = projector
@@ -699,6 +709,7 @@ mod tests {
                 AgentEventKind::DelegationRequested {
                     delegation: requested,
                     tool_call_id: None,
+                    batch_id: None,
                 },
             ));
         }
@@ -725,6 +736,7 @@ mod tests {
                 AgentEventKind::DelegationRequested {
                     delegation: delegation(),
                     tool_call_id: Some("call-1".into()),
+                    batch_id: None,
                 },
             ),
             event(
@@ -773,6 +785,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
+                batch_id: None,
             },
         ));
         let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
@@ -795,6 +808,7 @@ mod tests {
         let value = serde_json::to_value(AgentEventKind::DelegationRequested {
             delegation: delegation(),
             tool_call_id: None,
+            batch_id: None,
         })
         .unwrap();
         let mut value = value.as_object().unwrap().clone();
@@ -806,6 +820,7 @@ mod tests {
             decoded,
             AgentEventKind::DelegationRequested {
                 tool_call_id: None,
+                batch_id: None,
                 ..
             }
         ));

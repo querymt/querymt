@@ -29,6 +29,14 @@
     "objective": {
       "type": "string"
     },
+    "parent_cwd": {
+      "default": "",
+      "type": "string"
+    },
+    "parent_session_id": {
+      "default": "",
+      "type": "string"
+    },
     "permission_mode": {
       "enum": [
         "default",

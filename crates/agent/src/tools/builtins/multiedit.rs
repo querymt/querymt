@@ -134,40 +134,45 @@ impl Tool for MultiEditTool {
 
         let file_path = context.resolve_path(file_path_str)?;
 
-        // Apply all edits in memory first so the file is only written once.
-        let original_content = tokio::fs::read_to_string(&file_path)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
-        let mut content = original_content.clone();
+        // Mutating phase runs under the checkout mutation gate when the
+        // session has one (see `run_under_mutation_gate`).
+        crate::tools::run_under_mutation_gate(context, async {
+            // Apply all edits in memory first so the file is only written once.
+            let original_content = tokio::fs::read_to_string(&file_path)
+                .await
+                .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
+            let mut content = original_content.clone();
 
-        for (index, edit) in edits.iter().enumerate() {
-            content = EditTool::replace(
-                &content,
-                &edit.old_string,
-                &edit.new_string,
-                edit.replace_all,
-            )
-            .map_err(|e| {
-                ToolError::ProviderError(format!(
-                    "multiedit failed at edit {} of {}: {}; no changes written",
-                    index + 1,
-                    edits.len(),
-                    e
-                ))
-            })?;
-        }
+            for (index, edit) in edits.iter().enumerate() {
+                content = EditTool::replace(
+                    &content,
+                    &edit.old_string,
+                    &edit.new_string,
+                    edit.replace_all,
+                )
+                .map_err(|e| {
+                    ToolError::ProviderError(format!(
+                        "multiedit failed at edit {} of {}: {}; no changes written",
+                        index + 1,
+                        edits.len(),
+                        e
+                    ))
+                })?;
+            }
 
-        // Write final content
-        tokio::fs::write(&file_path, &content)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
+            // Write final content
+            tokio::fs::write(&file_path, &content)
+                .await
+                .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
-        // Build compact line-numbered hunk output from the actual file diff so
-        // sequential edits produce precise hunks instead of whole-file replacements.
-        let file_output =
-            edit_output::build_file_output_from_diff(&file_path, &original_content, &content);
-        let output_text = edit_output::format_compact_receipt(&[file_output]);
-        Ok(vec![ToolResultPart::text(output_text)])
+            // Build compact line-numbered hunk output from the actual file diff so
+            // sequential edits produce precise hunks instead of whole-file replacements.
+            let file_output =
+                edit_output::build_file_output_from_diff(&file_path, &original_content, &content);
+            let output_text = edit_output::format_compact_receipt(&[file_output]);
+            Ok(vec![ToolResultPart::text(output_text)])
+        })
+        .await
     }
 }
 

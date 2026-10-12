@@ -16,6 +16,7 @@ mod ext_profiles;
 mod ext_remote;
 mod ext_schedules;
 mod ext_session_ops;
+mod ext_worktree_ops;
 mod model_registry;
 #[cfg(feature = "remote")]
 pub(crate) mod remote_connect;
@@ -109,6 +110,19 @@ pub trait AgentHandle: Send + Sync {
         cwd: Option<String>,
         parent_session_id: String,
     ) -> std::result::Result<(String, SessionActorRef), Error>;
+
+    /// Whether this handle can execute tools in a node-local managed workspace.
+    fn supports_local_workspaces(&self) -> bool {
+        false
+    }
+
+    async fn create_isolated_delegation_session(
+        &self,
+        _workspace: crate::worktree::WorkspaceBinding,
+        _parent_session_id: String,
+    ) -> std::result::Result<(String, SessionActorRef), Error> {
+        Err(Error::invalid_request().data("isolated delegation requires local workspace execution"))
+    }
 
     // --- Event system ---
 

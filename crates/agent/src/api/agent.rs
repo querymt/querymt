@@ -717,6 +717,9 @@ impl AgentBuilder {
                 log::info!("Discovered slash commands: {}", registry.names().join(", "));
             }
             builder = builder.with_slash_command_registry(registry);
+            // Retain the discovery config so workspace-bound sessions can
+            // re-resolve prompt sources from their bound checkout.
+            builder = builder.with_slash_commands_config(Some(slash_config));
         }
 
         // Build initial config for middleware factories (temporary handle)

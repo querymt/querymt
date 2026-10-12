@@ -239,6 +239,9 @@ impl ExecutionContext {
         )
         .with_cancellation_token(self.cancellation_token.clone());
 
+        if let Some(gate) = self.runtime.mutation_gate.get() {
+            ctx = ctx.with_mutation_gate(gate.clone());
+        }
         if let Some(ref ks) = self.knowledge_store {
             ctx.with_knowledge_store(ks.clone());
         }
@@ -425,6 +428,30 @@ mod tests {
             tool_ctx.knowledge_store().is_some(),
             "knowledge_store should be Some when set on ExecutionContext"
         );
+    }
+
+    #[tokio::test]
+    async fn tool_context_propagates_checkout_mutation_gate() {
+        use crate::tools::context::ToolContext;
+        let (runtime, runtime_ctx, handle) = make_context_parts().await;
+        let storage = tempfile::TempDir::new().unwrap();
+        let checkout = tempfile::TempDir::new().unwrap();
+        let gate = Arc::new(
+            crate::worktree::CheckoutMutationGate::new(storage.path(), checkout.path()).unwrap(),
+        );
+        runtime.mutation_gate.set(gate.clone()).unwrap();
+        let ctx = ExecutionContext::new(
+            handle.session().public_id.clone(),
+            runtime,
+            runtime_ctx,
+            handle,
+            ToolConfig::default(),
+        );
+        let tools = ctx.tool_context(
+            Arc::new(crate::delegation::DefaultAgentRegistry::new()),
+            None,
+        );
+        assert!(Arc::ptr_eq(&gate, &tools.checkout_mutation_gate().unwrap()));
     }
 
     #[tokio::test]

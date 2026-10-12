@@ -744,6 +744,81 @@ mod tests {
         assert_eq!(result.removed_count, 2);
     }
 
+    // ==================== Snapshot GC vs workspace references ====================
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("git must be available");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Undo snapshot garbage collection must never remove the workspace
+    /// baseline/result references the worktree service keeps in the real
+    /// project repository: snapshot history and workspace refs are
+    /// independent lifecycles.
+    #[tokio::test]
+    async fn test_gc_leaves_workspace_baseline_refs_reachable() {
+        // A real project repository.
+        let project = TempDir::new().unwrap();
+        run_git(project.path(), &["init", "-q"]);
+        run_git(project.path(), &["config", "user.email", "qmt@example.com"]);
+        run_git(project.path(), &["config", "user.name", "qmt"]);
+        fs::write(project.path().join("app.txt"), "app").unwrap();
+        run_git(project.path(), &["add", "."]);
+        run_git(project.path(), &["commit", "-q", "-m", "init"]);
+
+        // The baseline ref and a retained result ref the worktree service
+        // would create for a workspace.
+        let workspace_id = crate::worktree::WorkspaceId::generate();
+        let baseline_ref = crate::worktree::baseline_ref_for(&workspace_id);
+        run_git(project.path(), &["update-ref", &baseline_ref, "HEAD"]);
+        let result_ref = format!("refs/qmt/results/{workspace_id}");
+        run_git(project.path(), &["branch", "ws-result", "HEAD"]);
+        run_git(project.path(), &["update-ref", &result_ref, "ws-result"]);
+
+        // A linked worktree of that project with undo snapshot history.
+        let linked = TempDir::new().unwrap();
+        run_git(
+            project.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "qmt/ws-gc-test",
+                linked.path().to_str().unwrap(),
+            ],
+        );
+
+        let snapshot_base = TempDir::new().unwrap();
+        let backend = GitSnapshotBackend::with_snapshot_base(snapshot_base.path().to_path_buf());
+        for i in 0..3 {
+            fs::write(linked.path().join("scratch.txt"), format!("v{i}")).unwrap();
+            backend.track(linked.path()).await.unwrap();
+        }
+
+        // Collect almost all snapshot history.
+        let config = GcConfig {
+            max_snapshots: Some(1),
+            max_age_days: None,
+        };
+        let result = backend.gc(linked.path(), &config).await.unwrap();
+        assert_eq!(result.remaining_count, 1);
+        assert_eq!(result.removed_count, 2);
+
+        // The project's workspace baseline ref and retained result ref are
+        // still reachable.
+        run_git(project.path(), &["rev-parse", "--verify", &baseline_ref]);
+        run_git(project.path(), &["rev-parse", "--verify", &result_ref]);
+
+        // The linked worktree still works: its administrative marker and
+        // the shared repository metadata are intact.
+        assert!(linked.path().join(".git").exists());
+        run_git(linked.path(), &["status", "--porcelain"]);
+    }
+
     // ==================== Test Suite 1.1: Track Idempotency & Determinism ====================
 
     #[tokio::test]

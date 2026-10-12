@@ -97,7 +97,126 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0021_normalize_session_cwd_slashes",
         apply: migration_0021_normalize_session_cwd_slashes,
     },
+    Migration {
+        version: "0022_worktree_workspaces",
+        apply: migration_0022_worktree_workspaces,
+    },
+    Migration {
+        version: "0023_revert_workspace_provenance",
+        apply: migration_0023_revert_workspace_provenance,
+    },
+    Migration {
+        version: "0024_delegation_isolation",
+        apply: migration_0024_delegation_isolation,
+    },
+    Migration {
+        version: "0025_workspace_archival",
+        apply: migration_0025_workspace_archival,
+    },
 ];
+
+fn migration_0025_workspace_archival(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let definition: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE name = 'workspaces'",
+        [],
+        |row| row.get(0),
+    )?;
+    if definition.contains("'archived'") {
+        return Ok(());
+    }
+    // SQLite cannot alter a CHECK constraint. Rebuild atomically with FK
+    // enforcement temporarily disabled, preserving self-links and results.
+    let foreign_keys: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let violations_before: i64 =
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let result = (|| {
+        let tx = conn.transaction()?;
+        let ddl = schema::WORKSPACE_TABLES_DDL
+            .split("-- A managed workspace")
+            .next()
+            .ok_or(rusqlite::Error::InvalidQuery)?
+            .replace(
+                "CREATE TABLE IF NOT EXISTS workspaces",
+                "CREATE TABLE workspaces_new",
+            );
+        tx.execute_batch(&ddl)?;
+        tx.execute_batch("INSERT INTO workspaces_new SELECT * FROM workspaces; DROP TABLE workspaces; ALTER TABLE workspaces_new RENAME TO workspaces;")?;
+        tx.execute_batch(schema::WORKSPACE_TABLES_DDL)?;
+        let violations: i64 =
+            tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        // Existing unrelated legacy FK violations must not block this
+        // additive migration; the rebuild must not introduce any new ones.
+        if violations != violations_before {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        tx.commit()
+    })();
+    conn.pragma_update(None, "foreign_keys", foreign_keys)?;
+    result
+}
+
+/// Managed worktree workspaces and retained result provenance.
+///
+/// Additive migration: creates the `workspaces` and `workspace_results`
+/// tables from the shared workspace DDL. Existing sessions and any other
+/// rows are untouched — local sessions keep their cwd execution and gain no
+/// workspace association (`owner_session_id` stays NULL until isolation is
+/// requested).
+fn migration_0022_worktree_workspaces(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(schema::WORKSPACE_TABLES_DDL)
+}
+
+/// Workspace provenance for undo/redo revert frames.
+///
+/// Records which workspace checkout a revert frame was captured against so
+/// redo validates all entries before restoring (cross-workspace entries are
+/// rejected without any partial restoration). Additive and nullable: frames
+/// recorded before this column keep existing behavior (`workspace_root IS
+/// NULL` is treated as same-workspace). The `ALTER TABLE` is guarded by a
+/// column-existence check so it stays idempotent for fresh installs where
+/// `init_schema` already created the column.
+fn migration_0023_revert_workspace_provenance(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(revert_states)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("workspace_root") {
+        conn.execute(
+            "ALTER TABLE revert_states ADD COLUMN workspace_root TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Requested/resolved execution isolation for delegates.
+///
+/// Records the delegation isolation policy (`inherit` | `shared` |
+/// `isolated`) so the resolved policy survives restarts. Additive and
+/// nullable: delegation rows recorded before this column inherit the
+/// parent's execution mode (`isolation IS NULL` reads as `inherit`), which
+/// preserves legacy shared execution for local parents. The `ALTER TABLE`
+/// is guarded by a column-existence check so it stays idempotent for fresh
+/// installs where `init_schema` already created the column.
+fn migration_0024_delegation_isolation(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(delegations)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("isolation") {
+        conn.execute("ALTER TABLE delegations ADD COLUMN isolation TEXT", [])?;
+    }
+    Ok(())
+}
 
 fn migration_0021_normalize_session_cwd_slashes(
     conn: &mut Connection,

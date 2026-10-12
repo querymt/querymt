@@ -120,6 +120,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             expected_output TEXT,
             verification_spec TEXT,  -- Structured verification specification (JSON)
             planning_summary TEXT,  -- AI-generated summary of parent planning conversation
+            isolation TEXT,  -- Delegation execution isolation: inherit | shared | isolated (NULL = inherit)
             status TEXT NOT NULL,
             retry_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -318,6 +319,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             message_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             backend_id TEXT NOT NULL DEFAULT 'git',
+            workspace_root TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
@@ -587,11 +589,87 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
         -- DELETE trigger for knowledge_consolidations
         CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ad AFTER DELETE ON knowledge_consolidations BEGIN
-            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
-            VALUES ('delete', old.id, old.summary, old.insight);
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, insight)
+            VALUES ('delete', old.id, old.insight);
         END;
+
         "#,
     )?;
 
+    conn.execute_batch(WORKSPACE_TABLES_DDL)?;
+
     Ok(())
 }
+
+/// DDL for managed worktree workspaces and their retained result provenance.
+///
+/// Shared between `init_schema` (fresh installs) and the additive
+/// `0022_worktree_workspaces` migration (existing databases) so the two can
+/// never drift. All statements are `IF NOT EXISTS` and safe to re-run.
+pub const WORKSPACE_TABLES_DDL: &str = r#"
+    -- ========================================================================
+    -- TIER 1: WORKTREE WORKSPACES (with public_id) — isolated Git workspaces
+    -- ========================================================================
+
+    -- One managed workspace per linked-worktree checkout. Repository identity
+    -- is the canonical common directory; checkout identity is the checkout
+    -- path (never reused after removal). `owner_session_id` is the nullable
+    -- session association: a workspace has at most one writable owner.
+    CREATE TABLE IF NOT EXISTS workspaces (
+        id INTEGER PRIMARY KEY,
+        public_id TEXT UNIQUE NOT NULL,
+        common_dir TEXT NOT NULL,
+        origin_path TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        checkout_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        relative_cwd TEXT NOT NULL DEFAULT '',
+        execution TEXT NOT NULL CHECK (execution IN ('local', 'worktree')),
+        baseline_mode TEXT NOT NULL CHECK (baseline_mode IN ('commit', 'current_working_tree')),
+        source_head TEXT,
+        baseline_commit TEXT,
+        lifecycle TEXT NOT NULL CHECK (lifecycle IN ('provisioning', 'ready', 'failed', 'missing', 'archived', 'removing', 'removed')),
+        owner_session_id TEXT,
+        parent_workspace_id TEXT,
+        parent_session_id TEXT,
+        delegation_id TEXT,
+        delegation_batch_id TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(parent_workspace_id) REFERENCES workspaces(public_id) ON DELETE SET NULL,
+        FOREIGN KEY(owner_session_id) REFERENCES sessions(public_id) ON DELETE SET NULL
+    );
+
+    -- A managed workspace has at most one writable session owner.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_owner
+        ON workspaces(owner_session_id) WHERE owner_session_id IS NOT NULL;
+    -- Checkout paths are never reused, including after removal.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_checkout
+        ON workspaces(checkout_path);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_common_dir
+        ON workspaces(common_dir, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_batch
+        ON workspaces(delegation_batch_id) WHERE delegation_batch_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_workspaces_parent
+        ON workspaces(parent_workspace_id) WHERE parent_workspace_id IS NOT NULL;
+
+    -- Retained result provenance for delegates working in a workspace:
+    -- baseline-relative result commits and verification outcome. Absent rows
+    -- never imply integration.
+    CREATE TABLE IF NOT EXISTS workspace_results (
+        id INTEGER PRIMARY KEY,
+        workspace_public_id TEXT NOT NULL,
+        baseline_commit TEXT NOT NULL,
+        result_commit TEXT,
+        result_ref TEXT,
+        verification TEXT CHECK (verification IN ('pending', 'passed', 'failed', 'skipped')),
+        captured_at TEXT NOT NULL,
+        FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_workspace_results_workspace
+        ON workspace_results(workspace_public_id, captured_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_results_result_ref
+        ON workspace_results(result_ref) WHERE result_ref IS NOT NULL;
+"#;

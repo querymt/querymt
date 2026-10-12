@@ -67,6 +67,11 @@ impl LocalAgentHandle {
         delivery: crate::agent::messages::InputDelivery,
     ) -> Result<ExtResponse, Error> {
         let parsed: SubmitInputRequest = parse_session_op_request(req)?;
+        if super::ext_worktree_ops::native_worktree_command(&parsed.prompt)?.is_some() {
+            return Err(Error::invalid_request().data(
+                "native /worktree administration uses session/prompt, not queued or steering input",
+            ));
+        }
         let session_id = parsed.session_id.clone();
         #[cfg(feature = "remote")]
         let operation = session_operation::SessionOperation::SubmitInput {

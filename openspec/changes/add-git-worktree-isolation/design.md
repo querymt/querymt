@@ -41,7 +41,7 @@ Persist:
 - cwd relative to checkout root, lifecycle state, ownership, creation timestamps and last error;
 - session-to-workspace association and result references (baseline, result commit if present, verification status).
 
-Git status is observed, not a persisted lifecycle state: dirty/clean can change outside QueryMT. Use lifecycle states provisioning, ready, failed, missing, removing, removed; retain explicit failure diagnostics. Do not treat a clean worktree as evidence of integration.
+Git status is observed, not a persisted lifecycle state: dirty/clean can change outside QueryMT. Use lifecycle states provisioning, ready, failed, missing, archived, removing, removed; retain explicit failure diagnostics. Do not treat a clean worktree as evidence of integration.
 
 Repository identity groups related sessions; checkout identity keys execution/index/snapshot state. Canonical common-dir identity correctly groups linked worktrees without sharing their file indexes. Managed worktrees live under a configurable durable data directory (default `~/.qmt/worktrees/<repo-id>/<workspace-id>`), never the disposable snapshot cache. Do not reuse removed workspace paths, because current snapshot identity is path-derived.
 
@@ -100,13 +100,15 @@ Provide typed create/list/status/result/remove agent operations, with ACP extens
 - `create [ref] [name]` creates an isolated session and returns its identity/path; it does not move the current actor. An explicit include-local-changes option selects current-working-tree capture.
 - `list` and `status [id]` expose owner, project, path, branch, lifecycle, live Git state, and baseline mode.
 - `result [id]` exposes baseline-relative review/provenance and verification status.
-- `remove <id>` refuses active owners, dirty/untracked/ignored content, and unintegrated result commits without retained recovery references. First version has no force-delete operation. Committed results can be preserved by retaining their branch/ref; report exactly what remains.
+- `archive <id>` retires inactive execution without deleting history or the durable owner binding. It is permanent: load/resume is rejected thereafter. Runtime-held shared checkout activity leases and exclusive archival/removal leases distinguish active execution from durable ownership across processes.
+- `recover <id>` completes interrupted provisioning/removal intent without launching an actor or binding a new owner.
+- `remove <id>` refuses non-archived owners, active activity leases, dirty/untracked/ignored content, and unintegrated result commits without retained recovery references. First version has no force-delete operation. Committed results can be preserved by retaining their branch/ref; report exactly what remains.
 
 Removal of a clean baseline-only inactive checkout is allowed with explicit user intent, retaining any baseline refs still referenced by records. For changed commits require proof they are preserved in a retained result ref or an accepted target history, not merely a clean index. Never delete externally owned worktrees. Session listing uses repository/project identity for associated sessions while preserving legacy grouping for unassociated local sessions.
 
 ### 7. Recovery, concurrency, and snapshot provenance
 
-Worktree creation and SQLite writes cannot form one atomic transaction. Persist provisioning intent with unique operation/workspace IDs, allocate branch/worktree, persist ready binding, then start execution. Compensate only newly allocated, unused resources; after a crash reconcile intent with Git worktree inventory and actual paths. Never delete an unknown existing directory. Serialize repository-admin mutations across processes using a common-dir keyed lock, separate from per-checkout capture gates.
+Worktree creation and SQLite writes cannot form one atomic transaction. Persist provisioning intent with unique operation/workspace IDs, allocate branch/worktree, persist ready binding, then start execution. Compensate only newly allocated, unused resources; after a crash reconcile intent with Git worktree inventory and actual paths. Never delete an unknown existing directory. Serialize repository-admin mutations across processes using a common-dir keyed lock, separate from per-checkout capture gates. Persist Removing intent before deleting any Git resources; ready-only owner attachment and an atomic unowned-or-archived removal transition prevent ownership races. Recovery rechecks safety and completes Removing idempotently.
 
 The current undo implementation scans child-session patches and restores them through the caller's worktree (`crates/agent/src/agent/undo.rs:126`, `crates/agent/src/agent/undo.rs:217`). Retain child aggregation only for children demonstrably sharing the same snapshot workspace/cwd; exclude isolated children from parent undo aggregation. Parent undo must not fail merely because isolated children exist, nor restore their patches into the parent. Validate all selected patches before any restoration, including the fallback snapshot path, rather than warning and continuing after a provenance mismatch.
 

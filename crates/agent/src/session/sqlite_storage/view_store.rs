@@ -43,6 +43,7 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
     let fork_count = row.get::<_, i64>(8)? as usize;
     Ok(SessionListItem {
         session_id: row.get(0)?,
+        workspace: None,
         name: row.get(1)?,
         cwd: row.get(2)?,
         title: row.get::<_, Option<String>>(9)?.map(truncate_title),
@@ -54,6 +55,42 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
         has_children: fork_count > 0,
         fork_count,
     })
+}
+
+fn load_workspace_views(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<HashMap<String, crate::session::projection::SessionWorkspaceView>> {
+    let mut stmt = conn.prepare("SELECT owner_session_id, public_id, common_dir, project_name, checkout_path, branch, baseline_mode, baseline_commit, lifecycle, last_error FROM workspaces WHERE owner_session_id IS NOT NULL")?;
+    let views = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                crate::session::projection::SessionWorkspaceView {
+                    workspace_id: row.get(1)?,
+                    repository_id: row.get(2)?,
+                    project_name: row.get(3)?,
+                    checkout_path: row.get(4)?,
+                    branch: row.get(5)?,
+                    baseline_mode: row.get(6)?,
+                    baseline_commit: row.get(7)?,
+                    lifecycle: row.get(8)?,
+                    last_error: row.get(9)?,
+                },
+            ))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    Ok(views)
+}
+
+fn enrich_workspace_views(
+    conn: &rusqlite::Connection,
+    items: &mut [SessionListItem],
+) -> rusqlite::Result<()> {
+    let views = load_workspace_views(conn)?;
+    for item in items {
+        item.workspace = views.get(&item.session_id).cloned();
+    }
+    Ok(())
 }
 
 fn parse_finish_reason(value: &str) -> Option<FinishReason> {
@@ -499,6 +536,7 @@ impl ViewStore for SqliteStorage {
 
             items.push(SessionListItem {
                 session_id: row.public_id,
+                workspace: None,
                 name: row.name,
                 cwd: row.cwd,
                 title,
@@ -516,6 +554,10 @@ impl ViewStore for SqliteStorage {
                 has_children: row.fork_count > 0,
                 fork_count: row.fork_count,
             });
+        }
+        let workspace_views = self.run_blocking(|conn| load_workspace_views(conn)).await?;
+        for item in &mut items {
+            item.workspace = workspace_views.get(&item.session_id).cloned();
         }
         let title_lookup_ms = title_lookup_started.elapsed().as_millis() as u64;
 
@@ -573,7 +615,7 @@ impl ViewStore for SqliteStorage {
         let group_build_started = Instant::now();
         let mut groups_map: HashMap<Option<String>, Vec<SessionListItem>> = HashMap::new();
         for item in flat_items {
-            groups_map.entry(item.cwd.clone()).or_default().push(item);
+            groups_map.entry(item.group_key()).or_default().push(item);
         }
 
         // Convert to SessionGroup vec and sort
@@ -655,13 +697,13 @@ impl ViewStore for SqliteStorage {
             let mut summary_stmt = conn.prepare(&format!(
                 r#"
                 SELECT
-                    s.cwd,
+                    COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd),
                     COUNT(*) as total_count,
                     MAX(s.updated_at) as latest_activity
                 FROM sessions s
                 WHERE {}
-                GROUP BY s.cwd
-                ORDER BY (s.cwd IS NOT NULL), MAX(s.updated_at) DESC
+                GROUP BY COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd)
+                ORDER BY (COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) IS NOT NULL), MAX(s.updated_at) DESC
                 LIMIT ?1 OFFSET ?2
                 "#,
                 scope_where
@@ -679,7 +721,7 @@ impl ViewStore for SqliteStorage {
 
             let total_groups: usize = conn.query_row(
                 &format!(
-                    "SELECT COUNT(DISTINCT COALESCE(s.cwd, '__none__')) FROM sessions s WHERE {}",
+                    "SELECT COUNT(DISTINCT COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd, '__none__')) FROM sessions s WHERE {}",
                     scope_where
                 ),
                 [],
@@ -708,7 +750,7 @@ impl ViewStore for SqliteStorage {
                         LEFT JOIN sessions p ON p.id = s.parent_session_id
                         LEFT JOIN intent_snapshots i
                             ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                        WHERE s.cwd = ?1 AND {}
+                        WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}
                         ORDER BY s.updated_at DESC
                         LIMIT ?2
                         "#,
@@ -740,7 +782,7 @@ impl ViewStore for SqliteStorage {
                     ))?
                 };
 
-                let sessions = if let Some(ref cwd_value) = cwd {
+                let mut sessions = if let Some(ref cwd_value) = cwd {
                     session_stmt
                         .query_map(params![cwd_value, preview_limit as i64], map_session_list_item_row)?
                         .collect::<Result<Vec<_>, _>>()?
@@ -750,6 +792,7 @@ impl ViewStore for SqliteStorage {
                         .collect::<Result<Vec<_>, _>>()?
                 };
 
+                enrich_workspace_views(conn, &mut sessions)?;
                 let next_cursor = if sessions.len() < total_count {
                     Some(sessions.len().to_string())
                 } else {
@@ -794,7 +837,7 @@ impl ViewStore for SqliteStorage {
             let total_count: usize = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
                     &format!(
-                        "SELECT COUNT(*) FROM sessions s WHERE s.cwd = ?1 AND {}",
+                        "SELECT COUNT(*) FROM sessions s WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}",
                         scope_where
                     ),
                     params![cwd_value],
@@ -814,7 +857,7 @@ impl ViewStore for SqliteStorage {
             let latest_raw: Option<String> = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
                     &format!(
-                        "SELECT MAX(s.updated_at) FROM sessions s WHERE s.cwd = ?1 AND {}",
+                        "SELECT MAX(s.updated_at) FROM sessions s WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}",
                         scope_where
                     ),
                     params![cwd_value],
@@ -851,7 +894,7 @@ impl ViewStore for SqliteStorage {
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                    WHERE s.cwd = ?1 AND {}
+                    WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}
                     ORDER BY s.updated_at DESC
                     LIMIT ?2 OFFSET ?3
                     "#,
@@ -883,7 +926,7 @@ impl ViewStore for SqliteStorage {
                 ))?
             };
 
-            let sessions = if let Some(ref cwd_value) = cwd {
+            let mut sessions = if let Some(ref cwd_value) = cwd {
                 session_stmt
                     .query_map(params![cwd_value, limit as i64, offset as i64], map_session_list_item_row)?
                     .collect::<Result<Vec<_>, _>>()?
@@ -893,6 +936,7 @@ impl ViewStore for SqliteStorage {
                     .collect::<Result<Vec<_>, _>>()?
             };
 
+            enrich_workspace_views(conn, &mut sessions)?;
             let next_cursor = if offset + sessions.len() < total_count {
                 Some((offset + sessions.len()).to_string())
             } else {
@@ -983,10 +1027,11 @@ impl ViewStore for SqliteStorage {
                 "#,
             )?;
 
-            let sessions = stmt
+            let mut sessions = stmt
                 .query_map(params![parent_db_id, limit as i64, offset as i64], map_session_list_item_row)?
                 .collect::<Result<Vec<_>, _>>()?;
 
+            enrich_workspace_views(conn, &mut sessions)?;
             let next_cursor = if offset + sessions.len() < total_count {
                 Some((offset + sessions.len()).to_string())
             } else {
@@ -1025,7 +1070,7 @@ impl ViewStore for SqliteStorage {
         self.run_blocking(move |conn| {
             let total_count: usize = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
-                    &format!("SELECT COUNT(*) FROM sessions s WHERE s.cwd = ?1 AND {}", scope_where),
+                    &format!("SELECT COUNT(*) FROM sessions s WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}", scope_where),
                     params![cwd_value],
                     |row| row.get::<_, i64>(0).map(|v| v as usize),
                 )?
@@ -1058,7 +1103,7 @@ impl ViewStore for SqliteStorage {
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                    WHERE s.cwd = ?1 AND {}
+                    WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}
                     ORDER BY s.updated_at DESC, s.id DESC
                     LIMIT ?2 OFFSET ?3
                     "#,
@@ -1093,7 +1138,7 @@ impl ViewStore for SqliteStorage {
                 ))?
             };
 
-            let sessions = if let Some(ref cwd_value) = cwd {
+            let mut sessions = if let Some(ref cwd_value) = cwd {
                 stmt.query_map(params![cwd_value, limit as i64, offset], map_session_list_item_row)?
                     .collect::<Result<Vec<_>, _>>()?
             } else {
@@ -1101,6 +1146,7 @@ impl ViewStore for SqliteStorage {
                     .collect::<Result<Vec<_>, _>>()?
             };
 
+            enrich_workspace_views(conn, &mut sessions)?;
             let next_cursor = offset.checked_add(sessions.len() as i64).and_then(|next_offset| {
                 (usize::try_from(next_offset).ok()? < total_count).then_some(next_offset.to_string())
             });
@@ -1221,11 +1267,11 @@ impl ViewStore for SqliteStorage {
 
             let mut group_counts_stmt = conn.prepare(&format!(
                 r#"
-                SELECT s.cwd, COUNT(*)
+                SELECT COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd), COUNT(*)
                 FROM sessions_fts f
                 JOIN sessions s ON s.id = f.rowid
                 WHERE sessions_fts MATCH ?1 AND {}
-                GROUP BY s.cwd
+                GROUP BY COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd)
                 "#,
                 scope_where
             ))?;
@@ -1265,14 +1311,15 @@ impl ViewStore for SqliteStorage {
                 scope_where
             ))?;
 
-            let items = stmt
+            let mut items = stmt
                 .query_map(params![fts_query, limit as i64, offset as i64], map_session_list_item_row)?
                 .collect::<Result<Vec<_>, _>>()?;
+            enrich_workspace_views(conn, &mut items)?;
 
             let mut by_cwd: std::collections::HashMap<Option<String>, Vec<SessionListItem>> =
                 std::collections::HashMap::new();
             for item in items {
-                by_cwd.entry(item.cwd.clone()).or_default().push(item);
+                by_cwd.entry(item.group_key()).or_default().push(item);
             }
 
             let mut groups: Vec<SessionGroup> = by_cwd

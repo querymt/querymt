@@ -9,6 +9,9 @@ pub use builtins::{
     KnowledgeQueryTool, KnowledgeStatsTool, ReadTaskTool, ReadTool, SearchTextTool, ShellTool,
     UpdateTaskTool, WebFetchTool, WriteFileTool,
 };
-pub use context::{CapabilityRequirement, Tool, ToolContext, ToolError, ToolExecutionClass};
+pub use context::{
+    CapabilityRequirement, Tool, ToolContext, ToolError, ToolExecutionClass,
+    run_under_mutation_gate,
+};
 pub use context_impl::{AgentToolContext, ElicitationRequest};
 pub use registry::ToolRegistry;
