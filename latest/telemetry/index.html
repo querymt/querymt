@@ -11,6 +11,7 @@
         <link rel="canonical" href="https://docs.query.mt/latest/telemetry/">
       
       
+      
         <link rel="prev" href="../architecture/">
       
       
@@ -21,7 +22,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.68">
+      <meta name="generator" content="zensical-0.0.70">
     
     
       
@@ -32,12 +33,12 @@
       
         
       
-      <link rel="stylesheet" href="../assets/stylesheets/modern/main.595f2bf5.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/modern/main.e442bf79.min.css">
       
         
           
         
-        <link rel="stylesheet" href="../assets/stylesheets/modern/palette.b27955a4.min.css">
+        <link rel="stylesheet" href="../assets/stylesheets/modern/palette.b60ce83d.min.css">
       
       
 
@@ -572,6 +573,17 @@
     <span class="md-ellipsis">
       <span class="md-typeset">
         Agent spans (<code>qmtcode</code>)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#genai-trace-conventions" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        GenAI trace conventions
       </span>
     </span>
   </a>
@@ -1909,7 +1921,7 @@ produces a tree of child spans describing every step that was executed.</p>
 <tbody>
 <tr>
 <td><code>agent.tool.execute</code></td>
-<td>Executing a tool call batch</td>
+<td>Executing a single tool call (exported as <code>execute_tool {tool}</code>)</td>
 </tr>
 <tr>
 <td><code>agent.tool.invoke</code></td>
@@ -2081,6 +2093,49 @@ produces a tree of child spans describing every step that was executed.</p>
 </tr>
 </tbody>
 </table>
+<h4 id="genai-trace-conventions">GenAI trace conventions</h4>
+<p>Agent spans follow the
+<a href="https://github.com/open-telemetry/semantic-conventions-genai/tree/e07f4ebacb08f56db8c4c882d117720333fbca04">OpenTelemetry GenAI conventions</a>.</p>
+<table>
+<thead>
+<tr>
+<th>Exported span name</th>
+<th>Kind</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>invoke_agent</code></td>
+<td>INTERNAL</td>
+<td>Prompt execution</td>
+</tr>
+<tr>
+<td><code>chat {model}</code></td>
+<td>CLIENT</td>
+<td>Inference, including compaction and delegation summarization</td>
+</tr>
+<tr>
+<td><code>execute_tool {tool}</code></td>
+<td>INTERNAL</td>
+<td>Tool calls</td>
+</tr>
+</tbody>
+</table>
+<p>Metadata includes known providers, models, request settings, response IDs,
+finish reasons, token usage, errors, and tool status. Input totals include cache
+read/write tokens; output totals include reasoning tokens, with breakdowns when available.</p>
+<p>When available, <code>gen_ai.conversation.id</code> and its <code>session.id</code> alias identify the
+current session. Delegates use their own session ID.
+<code>gen_ai.agent.id</code> identifies the configured agent, not the session, and is
+not globally unique.</p>
+<p>Built-in skill and shell tools may add <code>gen_ai.skill.name</code>,
+<code>process.executable.name</code>, or <code>process.exit.code</code>, and refine the tool span name.</p>
+<p>Normal chat adds <code>gen_ai.conversation.compacted=true</code> when the request retains
+a verified compaction summary.</p>
+<p>Unavailable fields are omitted. For streaming, <code>gen_ai.response.time_to_first_chunk</code>
+is measured in seconds from the first generation request to the first received
+chunk, not the first visible token.</p>
 <h4 id="what-metadata-is-attached-to-spans">What metadata is attached to spans</h4>
 <p>Spans may carry lightweight metadata such as:</p>
 <ul>
@@ -2092,8 +2147,10 @@ produces a tree of child spans describing every step that was executed.</p>
 </ul>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
-<p>Spans do <strong>not</strong> contain user prompts, LLM responses, API keys, file
-contents, or any other sensitive data.</p>
+<p>The GenAI semantic attributes do not capture prompts, responses, tool
+arguments/results, file contents, or API keys. This is not a blanket privacy
+guarantee for preexisting diagnostic logs or span events: verbose logging
+can include payload previews, so use it only with appropriate data controls.</p>
 </div>
 <h3 id="logs">Logs</h3>
 <p>Application log messages at the configured level and above are exported
@@ -2334,10 +2391,10 @@ quiet while still exporting detailed telemetry, or vice versa:</p>
       
         
         
-      <script id="__config" type="application/json">{"annotate":null,"base":"..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../assets/javascripts/workers/search.7d14d953.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
+      <script id="__config" type="application/json">{"annotate":null,"base":"..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../assets/javascripts/workers/search.c47bb847.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../assets/javascripts/bundle.3c842f4c.min.js"></script>
+      <script src="../assets/javascripts/bundle.a2388154.min.js"></script>
       
     
   </body>
