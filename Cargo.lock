@@ -15166,9 +15166,9 @@ dependencies = [
 
 [[package]]
 name = "toktrie"
-version = "1.7.5"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd0aad1688badacc3a769d7bb38b0f668ef4887bff73aa2d5344d407d8e2f4cb"
+checksum = "1bd80f04d68b86f1a4bf03bd4bed87b31341e74c48035697cded09d797cb1c05"
 dependencies = [
  "anyhow",
  "bytemuck",
