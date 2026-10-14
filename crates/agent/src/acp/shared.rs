@@ -5919,6 +5919,19 @@ mod tests {
             let fixture = crate::test_utils::TestAgent::new().await;
             let session_id = fixture.create_session().await;
             let journal = fixture.storage.event_journal();
+            for _ in 0..10_001 {
+                journal
+                    .append_durable(&NewDurableEvent {
+                        session_id: session_id.clone(),
+                        origin: EventOrigin::Local,
+                        source_node: None,
+                        source_node_id: None,
+                        source_seq: None,
+                        kind: AgentEventKind::SessionCreated,
+                    })
+                    .await
+                    .expect("persist long history");
+            }
             journal
                 .append_durable(&NewDurableEvent {
                     session_id: session_id.clone(),
@@ -5941,6 +5954,22 @@ mod tests {
                 })
                 .await
                 .expect("persist replay event");
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind: AgentEventKind::AssistantMessageStored {
+                        content: "late assistant reply".into(),
+                        thinking: None,
+                        reasoning_parts: Vec::new(),
+                        message_id: Some("late-reply".into()),
+                    },
+                })
+                .await
+                .expect("persist late assistant reply");
 
             let snapshot_capable = dispatch_session_load_with_preferences(
                 fixture.handle.as_ref(),
@@ -5954,6 +5983,21 @@ mod tests {
 
             let response = snapshot_capable.response.expect("load response");
             assert!(response.error.is_none());
+            let result = response.result.as_ref().expect("load result");
+            let events = result["_meta"]["querymt/sessionLoadSnapshot.v1"]["audit"]["events"]
+                .as_array()
+                .expect("snapshot events");
+            assert!(events.len() > 10_001);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"]["type"] == "tool_call_start")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"]["data"]["content"] == "late assistant reply")
+            );
             // No historical notifications: the client hydrates from the snapshot.
             assert!(
                 snapshot_capable.notifications.is_empty(),
@@ -5973,6 +6017,10 @@ mod tests {
                 !replaying.notifications.is_empty(),
                 "standard clients must still receive historical replay"
             );
+            assert!(replaying.notifications.iter().any(|notification| {
+                notification["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && notification["params"]["update"]["content"]["text"] == "late assistant reply"
+            }));
         }
     }
 
@@ -6576,6 +6624,50 @@ mod session_update_tests {
             150
         );
         assert_eq!(value["_meta"]["querymt"]["usage"]["partial"], false);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_includes_requests_beyond_old_journal_cap() {
+        use crate::session::backend::StorageBackend;
+        use crate::session::projection::NewDurableEvent;
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        let mut kinds = vec![AgentEventKind::SessionCreated; 10_001];
+        kinds.push(provider_changed(1, Some(100_000)).kind().clone());
+        kinds.push(request_with_tokens(2).kind().clone());
+        for kind in kinds {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .unwrap();
+        }
+        let snapshot = crate::session::load_session_snapshot(
+            fixture.handle.as_ref(),
+            fixture.storage.view_store().unwrap(),
+            &session_id,
+        )
+        .await
+        .unwrap();
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".into(),
+            serde_json::to_value(snapshot).unwrap(),
+        )]);
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
+        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
+        let usage = &translator.usage[&session_id];
+        assert!(usage.history_loaded);
+        assert!(!usage.partial);
+        assert_eq!(usage.context_limit, Some(100_000));
+        assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
     }
 
     #[test]

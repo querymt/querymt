@@ -135,6 +135,7 @@ pub trait EventJournal: Send + Sync {
     async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent>;
 
     /// Load the durable event stream for a session, optionally starting after a cursor.
+    /// `None` loads all matching events; `Some(limit)` returns at most that many.
     async fn load_session_stream(
         &self,
         session_id: &str,
@@ -143,6 +144,7 @@ pub trait EventJournal: Send + Sync {
     ) -> SessionResult<Vec<DurableEvent>>;
 
     /// Load events across all sessions (global stream), after a given sequence.
+    /// `None` loads all matching events; `Some(limit)` returns at most that many.
     async fn load_global_stream(
         &self,
         after_seq: Option<i64>,

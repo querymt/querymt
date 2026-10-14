@@ -120,12 +120,15 @@ pub(crate) async fn replay_loaded_session(
             }
             Err(err) => {
                 tracing::warn!(session.id = %session_id, error = %err, "failed to load ACP replay events");
-                (Vec::new(), HashMap::new())
+                return Err(err);
             }
         },
         None => {
             tracing::warn!(session.id = %session_id, "loaded session has no runtime ref for ACP replay");
-            (Vec::new(), HashMap::new())
+            return Err(acp::Error::internal_error().data(serde_json::json!({
+                "message": "Loaded session has no runtime ref for ACP replay",
+                "sessionId": session_id,
+            })));
         }
     };
     let event_count = events.len();

@@ -46,7 +46,8 @@ impl EventJournal for SqliteStorage {
         tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
             let conn = conn_arc.lock().unwrap();
             let after = after_seq.unwrap_or(0);
-            let lim = limit.unwrap_or(10_000) as i64;
+            // SQLite's negative LIMIT means unlimited; explicit limits never wrap.
+            let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
 
             let mut stmt = conn.prepare(
                 "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
@@ -77,7 +78,8 @@ impl EventJournal for SqliteStorage {
         tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
             let conn = conn_arc.lock().unwrap();
             let after = after_seq.unwrap_or(0);
-            let lim = limit.unwrap_or(10_000) as i64;
+            // SQLite's negative LIMIT means unlimited; explicit limits never wrap.
+            let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
 
             let mut stmt = conn.prepare(
                 "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
