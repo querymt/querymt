@@ -1227,11 +1227,17 @@ pub fn codex_parse_stream_chunk_with_state(
                     {
                         results.push(StreamChunk::Thinking(text));
                     }
-                    if let Some(usage_value) = response.get("usage")
-                        && let Ok(usage) =
+                    if let Some(usage_value) = response.get("usage") {
+                        // Allowlisted cache diagnostic: raw terminal usage only.
+                        debug!(
+                            target: "qmt_codex",
+                            "cache response terminal=response.completed usage={usage_value}"
+                        );
+                        if let Ok(usage) =
                             serde_json::from_value::<CodexRawUsage>(usage_value.clone())
-                    {
-                        results.push(StreamChunk::Usage(usage.into_usage()));
+                        {
+                            results.push(StreamChunk::Usage(usage.into_usage()));
+                        }
                     }
                 }
                 let finish_reason = if tool_state_buffer

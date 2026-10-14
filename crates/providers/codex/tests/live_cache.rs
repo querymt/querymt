@@ -65,7 +65,7 @@ fn live_codex_cache_usage() {
                     serde_json::Deserializer::from_str(payload).into_iter::<serde_json::Value>();
                 if let Some(Ok(usage)) = parsed.next() {
                     eprintln!("attempt={attempt} model={model} usage={usage}");
-                    usage_seen = usage["usage_state"]["state"] == "object";
+                    usage_seen = usage.is_object();
                 }
             }
         }
@@ -75,7 +75,7 @@ fn live_codex_cache_usage() {
         );
         assert!(
             usage_seen,
-            "No raw terminal usage: check that providers.toml loads the patched Codex plugin"
+            "No usage after success: provider emitted no `cache response terminal=response.completed usage=` diagnostic line"
         );
         // Cache misses are diagnostic outcomes, not test failures.
         std::thread::sleep(std::time::Duration::from_secs(2));
