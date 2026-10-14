@@ -139,13 +139,15 @@ pub enum ChatRole {
 /// Cache hint for providers that support prompt caching.
 /// When set on a message, the provider may use it to mark cache breakpoints,
 /// allowing the conversation prefix up to this point to be cached and reused.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheHint {
     /// Ephemeral cache breakpoint. Providers that support caching (e.g., Anthropic)
     /// will cache the conversation prefix up to and including this message.
-    /// The optional TTL specifies cache lifetime in seconds.
-    /// If None, the provider uses its default TTL.
+    /// The optional TTL requests a supported lifetime in seconds; providers
+    /// validate/translate it, sometimes at request scope. None uses their default.
+    /// This is not a deletion deadline or a guarantee of cache availability.
+    /// Unsupported endpoints may ignore hints without changing message content.
     Ephemeral {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_seconds: Option<u64>,

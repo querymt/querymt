@@ -41,7 +41,12 @@ pub struct LlamaCppConfig {
     /// explicitly configured.
     pub penalty_last_n: Option<i32>,
     /// System prompt to prepend to chat requests.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "querymt::params::deserialize_system_vec",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schemars(schema_with = "querymt::params::schema_for_system_prompts")]
     pub system: Vec<String>,
     /// Override model context length.
     pub n_ctx: Option<u32>,
@@ -239,6 +244,16 @@ pub enum FlashAttentionPolicy {
 #[cfg(test)]
 mod tests {
     use super::{SpeculativeConfig, SpeculativeType};
+
+    #[test]
+    fn portable_instruction_hints_preserve_text_for_local_models() {
+        let config: super::LlamaCppConfig = serde_json::from_value(serde_json::json!({
+            "model": "test.gguf",
+            "system": ["legacy", {"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}}]
+        }))
+        .unwrap();
+        assert_eq!(config.system, ["legacy", "stable"]);
+    }
 
     fn config(n_max: u32, n_min: u32, p_min: f32) -> SpeculativeConfig {
         SpeculativeConfig {

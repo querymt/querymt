@@ -37,9 +37,10 @@ pub struct Codex {
     pub instructions: Option<String>,
     #[serde(
         default,
-        deserialize_with = "querymt::params::deserialize_system_string"
+        deserialize_with = "querymt::params::deserialize_system_prompts"
     )]
-    pub system: Option<String>,
+    #[schemars(schema_with = "querymt::params::schema_for_system_prompts")]
+    pub system: Vec<querymt::params::SystemPrompt>,
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,
     pub top_p: Option<f32>,
@@ -91,8 +92,22 @@ impl api::CodexProviderConfig for Codex {
         self.temperature.as_ref()
     }
 
-    fn system(&self) -> Option<&str> {
-        self.system.as_deref()
+    fn system(&self) -> Option<std::borrow::Cow<'_, str>> {
+        if self.system.is_empty() {
+            None
+        } else {
+            Some(std::borrow::Cow::Owned(
+                self.system
+                    .iter()
+                    .map(|part| part.text())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ))
+        }
+    }
+
+    fn system_parts(&self) -> std::borrow::Cow<'_, [querymt::params::SystemPrompt]> {
+        std::borrow::Cow::Borrowed(&self.system)
     }
 
     fn instructions(&self) -> Option<&str> {

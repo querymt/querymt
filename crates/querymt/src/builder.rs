@@ -71,7 +71,7 @@ pub struct LLMBuilder<State = Unbound> {
     temperature: Option<f32>,
     /// System prompt/context to guide model behavior
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    system: Vec<String>,
+    system: Vec<crate::params::SystemPrompt>,
     /// Request timeout duration in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_seconds: Option<u64>,
@@ -240,7 +240,7 @@ impl<State> LLMBuilder<State> {
     }
 
     /// Appends a system prompt part. Can be called multiple times for multi-part prompts.
-    pub fn system(mut self, system: impl Into<String>) -> Self {
+    pub fn system(mut self, system: impl Into<crate::params::SystemPrompt>) -> Self {
         self.system.push(system.into());
         self
     }

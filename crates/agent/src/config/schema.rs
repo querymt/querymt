@@ -3,36 +3,20 @@
 
 /// Schema for the `system` field: accepts a plain string or an array of
 /// inline strings / `{ file = "..." }` objects.
-pub fn schema_for_system_parts(_gen: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    serde_json::from_value(serde_json::json!({
-        "oneOf": [
-            {
-                "type": "string",
-                "description": "A single inline system prompt string"
-            },
-            {
-                "type": "array",
-                "description": "An array of inline strings and/or file references",
-                "items": {
-                    "oneOf": [
-                        {
-                            "type": "string",
-                            "description": "Inline system prompt text"
-                        },
-                        {
-                            "type": "object",
-                            "description": "A reference to a file whose contents will be used as a system prompt part",
-                            "required": ["file"],
-                            "properties": {
-                                "file": { "type": "string" }
-                            },
-                            "additionalProperties": false
-                        }
-                    ]
-                }
-            }
-        ]
-    }))
+pub fn schema_for_system_parts(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let cache = generator.subschema_for::<querymt::chat::CacheHint>();
+    let part = serde_json::json!({"oneOf": [
+        {"type": "string"},
+        {"type": "object", "required": ["text"], "properties": {
+            "text": {"type": "string"}, "cache": cache
+        }, "additionalProperties": false},
+        {"type": "object", "required": ["file"], "properties": {
+            "file": {"type": "string"}, "cache": cache
+        }, "additionalProperties": false}
+    ]});
+    serde_json::from_value(serde_json::json!({"oneOf": [
+        {"type": "string"}, {"type": "array", "items": part}
+    ]}))
     .expect("system schema is valid JSON Schema")
 }
 

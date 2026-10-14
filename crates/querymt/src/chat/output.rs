@@ -829,11 +829,20 @@ impl fmt::Debug for ChatReasoningItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatReasoningPart {
     pub text: String,
     #[serde(default, flatten)]
     pub extensions: Extensions,
+}
+
+impl fmt::Debug for ChatReasoningPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ChatReasoningPart")
+            .field("text", &self.text)
+            .field("extensions", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ChatReasoningItem {
@@ -1844,6 +1853,8 @@ mod tests {
         const OPAQUE: &str = "sentinel-opaque-payload";
         const REASONING_EXT: &str = "sentinel-reasoning-extension-secret";
         const THOUGHT_SIG: &str = "sentinel-google-thought-signature";
+        const SUMMARY_EXT: &str = "sentinel-summary-extension-secret";
+        const CONTENT_EXT: &str = "sentinel-content-extension-secret";
 
         let fixture = serde_json::json!({
             "status": "completed",
@@ -1851,8 +1862,8 @@ mod tests {
                 {
                     "type": "reasoning",
                     "id": "reasoning_1",
-                    "summary": [{"text": "visible summary"}],
-                    "content": [],
+                    "summary": [{"text": "visible summary", "metadata": {"secret": SUMMARY_EXT}}],
+                    "content": [{"text": "visible content", "metadata": {"secret": CONTENT_EXT}}],
                     "encrypted_content": ENCRYPTED,
                     "signature": SIGNATURE,
                     "google_thought_signature": REASONING_EXT
@@ -1897,6 +1908,18 @@ mod tests {
         );
         // Visible summary text is display content and may still be shown.
         assert!(debug.contains("visible summary"));
+        assert!(debug.contains("visible content"));
+        for secret in [SUMMARY_EXT, CONTENT_EXT] {
+            assert!(
+                !debug.contains(secret),
+                "nested extensions must be redacted"
+            );
+        }
+        let ChatOutputItem::Reasoning(reasoning) = &output.items[0] else {
+            panic!("expected reasoning item");
+        };
+        assert!(!format!("{:?}", reasoning.summary[0]).contains(SUMMARY_EXT));
+        assert!(!format!("{:?}", reasoning.content[0]).contains(CONTENT_EXT));
 
         // Authorized persistence is unaffected: serde keeps the exact bytes.
         let encoded = serde_json::to_string(&output).unwrap();
@@ -1905,5 +1928,9 @@ mod tests {
         assert!(encoded.contains(OPAQUE));
         assert!(encoded.contains(REASONING_EXT));
         assert!(encoded.contains(THOUGHT_SIG));
+        assert!(encoded.contains(SUMMARY_EXT));
+        assert!(encoded.contains(CONTENT_EXT));
+        let restored: ChatOutput = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored, output);
     }
 }

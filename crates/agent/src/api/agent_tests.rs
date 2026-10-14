@@ -1303,7 +1303,7 @@ async fn partial_protocol_overlay_preserves_explicit_settings() -> Result<()> {
     assert_eq!(params.model.as_deref(), Some("gpt-4o-mini"));
     // Explicit prompt plus protocol instructions.
     assert_eq!(
-        params.system.first().map(String::as_str),
+        params.system.first().map(|part| part.text()),
         Some("Explicit system prompt")
     );
     assert!(

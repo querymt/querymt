@@ -367,7 +367,12 @@ fn inline_system_prompt_value(
                             format!("Embedded prompt '{file_ref}' is not valid UTF-8")
                         })?;
 
-                    *part = toml::Value::String(prompt);
+                    if table.contains_key("cache") {
+                        table.remove("file");
+                        table.insert("text".into(), toml::Value::String(prompt));
+                    } else {
+                        *part = toml::Value::String(prompt);
+                    }
                 }
             }
             Ok(())
@@ -1837,6 +1842,25 @@ model = "model.gguf"
         for durable_tool in ["create_task", "read_task", "update_task", "complete_task"] {
             assert!(!tools.contains(&durable_tool));
         }
+    }
+
+    #[test]
+    fn embedded_profile_inlining_preserves_instruction_cache_metadata() {
+        let source = r#"[agent]
+system = [{ file = "../prompts/default_system.txt", cache = { ephemeral = { ttl_seconds = 1800 } } }]
+"#;
+        let inlined = embedded_profile_config("hinted.toml", source).unwrap();
+        let value: toml::Value = toml::from_str(&inlined).unwrap();
+        let part = &value["agent"]["system"][0];
+        assert_eq!(
+            part["text"].as_str(),
+            Some(include_str!("../examples/prompts/default_system.txt"))
+        );
+        assert_eq!(
+            part["cache"]["ephemeral"]["ttl_seconds"].as_integer(),
+            Some(1800)
+        );
+        assert!(part.get("file").is_none());
     }
 
     #[test]

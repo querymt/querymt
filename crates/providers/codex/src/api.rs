@@ -80,7 +80,16 @@ pub trait CodexProviderConfig {
     fn max_tokens(&self) -> Option<&u32>;
     fn temperature(&self) -> Option<&f32>;
     fn instructions(&self) -> Option<&str>;
-    fn system(&self) -> Option<&str>;
+    fn system(&self) -> Option<Cow<'_, str>> {
+        None
+    }
+    fn system_parts(&self) -> Cow<'_, [querymt::params::SystemPrompt]> {
+        Cow::Owned(
+            self.system()
+                .map(|s| vec![s.into_owned().into()])
+                .unwrap_or_default(),
+        )
+    }
     fn timeout_seconds(&self) -> Option<&u64>;
     fn stream(&self) -> Option<&bool>;
     fn top_p(&self) -> Option<&f32>;
@@ -198,6 +207,8 @@ enum CodexToolOutputPart<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<&'a str>,
     },
+    #[serde(untagged)]
+    Cached(qmt_openai::cache::CachedContent<qmt_openai::cache::CacheableContent<'a>>),
 }
 
 #[derive(Serialize, Debug)]
@@ -214,6 +225,8 @@ enum CodexInputContent<'a> {
     // TODO: Support file IDs here so Codex can accept images, PDFs, and other uploaded files.
     #[serde(rename = "input_image")]
     InputImage { image_url: Cow<'a, str> },
+    #[serde(untagged)]
+    Cached(qmt_openai::cache::CachedContent<qmt_openai::cache::CacheableContent<'a>>),
 }
 
 #[derive(Serialize, Debug)]
@@ -305,6 +318,8 @@ struct CodexRawUsage {
 struct CodexInputTokensDetails {
     #[serde(default)]
     cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -315,21 +330,22 @@ struct CodexOutputTokensDetails {
 
 impl CodexRawUsage {
     fn into_usage(self) -> Usage {
-        let cache_read = self
-            .input_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
+        let details = self.input_tokens_details.unwrap_or_default();
+        let cache_read = details.cached_tokens;
+        let cache_write = details.cache_write_tokens;
         let reasoning = self
             .output_tokens_details
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0);
-
         Usage {
-            input_tokens: self.input_tokens.saturating_sub(cache_read),
+            input_tokens: self
+                .input_tokens
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write),
             output_tokens: self.output_tokens.saturating_sub(reasoning),
             reasoning_tokens: reasoning,
             cache_read,
-            cache_write: 0,
+            cache_write,
         }
     }
 }
@@ -534,6 +550,109 @@ impl std::fmt::Display for CodexChatResponse {
     }
 }
 
+fn mark_codex_boundary(items: &mut [CodexInputItem<'_>]) -> bool {
+    use qmt_openai::cache::{CacheableContent as Block, CachedContent};
+    match items.last_mut() {
+        Some(CodexInputItem::Message { content, .. }) => {
+            if !matches!(
+                content.last(),
+                Some(CodexInputContent::InputText { .. } | CodexInputContent::InputImage { .. })
+            ) {
+                return false;
+            }
+            let block = match content.pop().expect("checked ending") {
+                CodexInputContent::InputText { text } => Block::InputText { text },
+                CodexInputContent::InputImage { image_url } => Block::InputImage {
+                    image_url,
+                    detail: None,
+                },
+                _ => unreachable!("checked ending"),
+            };
+            content.push(CodexInputContent::Cached(CachedContent::new(block)));
+            true
+        }
+        Some(CodexInputItem::FunctionCallOutput { output, .. }) => {
+            if let CodexFunctionCallOutput::Text(text) = output {
+                *output = CodexFunctionCallOutput::Parts(vec![CodexToolOutputPart::InputText {
+                    text: std::mem::take(text),
+                }]);
+            }
+            let CodexFunctionCallOutput::Parts(parts) = output else {
+                return false;
+            };
+            let Some(last) = parts.pop() else {
+                return false;
+            };
+            let block = match last {
+                CodexToolOutputPart::InputText { text } => Block::InputText { text },
+                CodexToolOutputPart::InputImage { image_url, detail } => Block::InputImage {
+                    image_url,
+                    detail: detail.map(Cow::Borrowed),
+                },
+                CodexToolOutputPart::Cached(value) => {
+                    parts.push(CodexToolOutputPart::Cached(value));
+                    return true;
+                }
+            };
+            parts.push(CodexToolOutputPart::Cached(CachedContent::new(block)));
+            true
+        }
+        _ => false,
+    }
+}
+
+// Compiled and tested, but deliberately not activated for the ChatGPT backend.
+#[allow(dead_code)]
+fn apply_codex_cache_hints(
+    inputs: &mut [CodexInputItem<'_>],
+    ranges: &[std::ops::Range<usize>],
+    messages: &[ChatMessage],
+    system: &[querymt::params::SystemPrompt],
+    extra: &mut Map<String, Value>,
+) -> Result<(), LLMError> {
+    let mut hints = qmt_openai::cache::CacheHints::default();
+    if system.iter().any(|p| p.cache().is_some())
+        && let Some(CodexInputItem::Message { content, .. }) = inputs.first_mut()
+        && !system.iter().all(|p| p.text().trim().is_empty())
+    {
+        let mut blocks = Vec::new();
+        for (index, part) in system.iter().enumerate() {
+            let prefix = if index == 0 {
+                format!(
+                    "# AGENTS.md instructions for {DEFAULT_INSTRUCTIONS_DIRECTORY}\n\n<INSTRUCTIONS>\n"
+                )
+            } else {
+                "\n\n".into()
+            };
+            let suffix = if index + 1 == system.len() {
+                "\n</INSTRUCTIONS>"
+            } else {
+                ""
+            };
+            let text = Cow::Owned(format!("{prefix}{}{suffix}", part.text()));
+            blocks.push(if let Some(hint) = part.cache() {
+                hints.applied(hint)?;
+                CodexInputContent::Cached(qmt_openai::cache::CachedContent::new(
+                    qmt_openai::cache::CacheableContent::InputText { text },
+                ))
+            } else {
+                CodexInputContent::InputText { text }
+            });
+        }
+        *content = blocks;
+    }
+    for (msg, range) in messages.iter().zip(ranges) {
+        if let Some(hint) = &msg.cache {
+            if mark_codex_boundary(&mut inputs[range.clone()]) {
+                hints.applied(hint)?;
+            } else {
+                log::debug!(target: "qmt_codex", "CacheHint skipped: unsupported message ending");
+            }
+        }
+    }
+    hints.finish(extra)
+}
+
 fn codex_chat_body_json<C: CodexProviderConfig>(
     cfg: &C,
     messages: &[ChatMessage],
@@ -549,7 +668,13 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
     }
     let instructions = resolve_instructions(cfg.model(), cfg.instructions())?;
     let mut inputs = Vec::with_capacity(messages.len() + 1);
-    if let Some(system) = cfg.system().filter(|text| !text.trim().is_empty()) {
+    let system_parts = cfg.system_parts();
+    let system = system_parts
+        .iter()
+        .map(|p| p.text())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !system.trim().is_empty() {
         let text = format!(
             "# AGENTS.md instructions for {directory}\n\n<INSTRUCTIONS>\n{system}\n</INSTRUCTIONS>",
             directory = DEFAULT_INSTRUCTIONS_DIRECTORY
@@ -561,7 +686,9 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
             }],
         });
     }
+    let mut ranges = Vec::with_capacity(messages.len());
     for msg in messages {
+        let start = inputs.len();
         // When a turn retains item-aware fidelity semantics, replay it in order
         // through the shared Responses codec and ignore the portable projection
         // to avoid duplicate items. Codex keeps its own authentication,
@@ -576,6 +703,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                     && origin.endpoint == codex_responses_endpoint()
             });
             convert_structured_output_to_codex(output, &mut inputs, native_replay)?;
+            ranges.push(start..inputs.len());
             continue;
         }
 
@@ -693,6 +821,7 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
                 output,
             });
         }
+        ranges.push(start..inputs.len());
     }
 
     let request_tools = tools
@@ -709,12 +838,41 @@ fn codex_chat_body_json<C: CodexProviderConfig>(
 
         merge_codex_reasoning_request(&mut merged, cfg.reasoning_effort());
         merge_codex_reasoning_include(&mut merged);
-
         if should_snakecase_extra_body(cfg.base_url()) {
-            Some(normalize_extra_body_map(merged))
-        } else {
-            Some(merged)
+            merged = normalize_extra_body_map(merged);
         }
+
+        // FIXME: ChatGPT rejects prompt_cache_options on gpt-5.6-sol and
+        // gpt-6.1-sol, and separately rejects prompt_cache_breakpoint on 6.1.
+        // Keep translation implemented/tested but disabled until an independent
+        // acceptance probe AND changed-suffix live cache test succeed.
+        // https://github.com/openai/codex/issues/35300
+        // https://github.com/openai/codex/issues/51353
+        // apply_codex_cache_hints(&mut inputs, &ranges, messages, &system_parts, &mut merged)?;
+        if messages.iter().any(|m| m.cache.is_some())
+            || system_parts.iter().any(|p| p.cache().is_some())
+        {
+            log::debug!(target: "qmt_codex", "CacheHint translation disabled: ChatGPT backend rejects explicit breakpoints and TTL options; message_hints={} instruction_hints={}",
+                messages.iter().filter(|m| m.cache.is_some()).count(),
+                system_parts.iter().filter(|p| p.cache().is_some()).count());
+            if log::log_enabled!(target: "qmt_codex", log::Level::Trace) {
+                let message_hints = messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, msg)| msg.cache.as_ref().map(|hint| (index, hint)))
+                    .take(32)
+                    .collect::<Vec<_>>();
+                let instruction_hints = system_parts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, part)| part.cache().map(|hint| (index, hint)))
+                    .take(32)
+                    .collect::<Vec<_>>();
+                log::trace!(target: "qmt_codex", "CacheHint requests skipped: messages={message_hints:?} instructions={instruction_hints:?}");
+            }
+        }
+
+        Some(merged)
     };
 
     let body = CodexChatRequest {
@@ -1625,6 +1783,185 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use url::Url;
 
+    #[test]
+    fn chatgpt_backend_does_not_receive_unsupported_cache_defaults() {
+        for model in ["gpt-5.6", "gpt-6-luna", "gpt-6.1-sol", "gpt-5.5"] {
+            let mut cfg = test_codex("test-token");
+            cfg.model = model.into();
+            cfg.instructions = Some("provider instructions".into());
+            cfg.system = vec![querymt::params::SystemPrompt::with_cache(
+                "stable app instructions",
+                querymt::chat::CacheHint::Ephemeral {
+                    ttl_seconds: Some(1800),
+                },
+            )];
+            let body: Value = serde_json::from_slice(
+                &codex_chat_body_json(&cfg, &basic_user_messages(), None).unwrap(),
+            )
+            .unwrap();
+            assert!(body.get("prompt_cache_options").is_none());
+            assert!(
+                body["input"][0]["content"][0]
+                    .get("prompt_cache_breakpoint")
+                    .is_none()
+            );
+            assert_eq!(body["instructions"], "provider instructions");
+            assert_eq!(body["input"][0]["role"], "user");
+            assert!(
+                body["input"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("stable app instructions")
+            );
+        }
+    }
+
+    #[test]
+    fn dormant_translation_covers_instruction_user_and_tool_boundaries() {
+        use super::{CodexFunctionCallOutput, CodexInputContent, CodexInputItem};
+        use querymt::chat::CacheHint;
+        use querymt::params::SystemPrompt;
+        let hint = CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        };
+        let system = vec![
+            SystemPrompt::with_cache("stable", hint.clone()),
+            "dynamic".into(),
+        ];
+        let messages = vec![
+            querymt::chat::ChatMessage::user()
+                .text("reference")
+                .cache(hint.clone())
+                .build(),
+            querymt::chat::ChatMessage::user()
+                .text("tool result")
+                .cache(hint.clone())
+                .build(),
+            querymt::chat::ChatMessage::assistant()
+                .text("answer")
+                .cache(hint)
+                .build(),
+        ];
+        let mut inputs = vec![
+            CodexInputItem::Message {
+                role: "user".into(),
+                content: vec![CodexInputContent::InputText {
+                    text: "placeholder".into(),
+                }],
+            },
+            CodexInputItem::Message {
+                role: "user".into(),
+                content: vec![CodexInputContent::InputText {
+                    text: "reference".into(),
+                }],
+            },
+            CodexInputItem::FunctionCallOutput {
+                call_id: "call_1".into(),
+                output: CodexFunctionCallOutput::Text("result".into()),
+            },
+            CodexInputItem::Message {
+                role: "assistant".into(),
+                content: vec![CodexInputContent::OutputText {
+                    text: "answer".into(),
+                }],
+            },
+        ];
+        let mut extra = serde_json::json!({"prompt_cache_options": {"mode": "explicit"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        super::apply_codex_cache_hints(
+            &mut inputs,
+            &[1..2, 2..3, 3..4],
+            &messages,
+            &system,
+            &mut extra,
+        )
+        .unwrap();
+        let wire = serde_json::to_value(inputs).unwrap();
+        assert_eq!(extra["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(extra["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(
+            wire[0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert!(
+            wire[0]["content"][1]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+        let text = wire[0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["text"].as_str().unwrap())
+            .collect::<String>();
+        assert_eq!(
+            text,
+            format!(
+                "# AGENTS.md instructions for {}\n\n<INSTRUCTIONS>\nstable\n\ndynamic\n</INSTRUCTIONS>",
+                super::DEFAULT_INSTRUCTIONS_DIRECTORY
+            )
+        );
+        assert_eq!(
+            wire[1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(wire[2]["call_id"], "call_1");
+        assert_eq!(wire[2]["output"][0]["text"], "result");
+        assert_eq!(wire[2]["output"][0]["type"], "input_text");
+        assert_eq!(
+            wire[2]["output"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert!(
+            wire[3]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn disabled_translation_preserves_request_bytes_and_ignores_ttl() {
+        let mut cfg = test_codex("test-token");
+        cfg.system = vec!["stable".into(), "dynamic".into()];
+        assert_eq!(
+            super::CodexProviderConfig::system(&cfg).unwrap().as_ref(),
+            "stable\n\ndynamic"
+        );
+        let mut messages = basic_user_messages();
+        let baseline = codex_chat_body_json(&cfg, &messages, None).unwrap();
+        cfg.system[0] = querymt::params::SystemPrompt::with_cache(
+            "stable",
+            querymt::chat::CacheHint::Ephemeral {
+                ttl_seconds: Some(300),
+            },
+        );
+        messages[0].cache = Some(querymt::chat::CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        });
+        assert_eq!(
+            baseline,
+            codex_chat_body_json(&cfg, &messages, None).unwrap()
+        );
+    }
+
+    #[test]
+    fn fallback_usage_accounts_for_reads_and_writes() {
+        let raw: super::CodexRawUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 1000, "output_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300},
+            "output_tokens_details": {"reasoning_tokens": 40}
+        }))
+        .unwrap();
+        let usage = raw.into_usage();
+        assert_eq!(
+            (usage.input_tokens, usage.cache_read, usage.cache_write),
+            (100, 600, 300)
+        );
+        assert_eq!((usage.output_tokens, usage.reasoning_tokens), (60, 40));
+    }
+
     /// Build a minimal config for unit tests.
     fn test_codex(api_key: &str) -> crate::Codex {
         crate::Codex {
@@ -1634,7 +1971,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             instructions: None,
-            system: None,
+            system: Vec::new(),
             timeout_seconds: None,
             stream: None,
             top_p: None,

@@ -626,6 +626,30 @@ mod rmp_wire_tests {
     }
 
     #[test]
+    fn instruction_and_message_hints_survive_remote_wire() {
+        let hint = CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        };
+        let params = querymt::LLMParams::new().system(querymt::params::SystemPrompt::with_cache(
+            "stable",
+            hint.clone(),
+        ));
+        let mut request = chat_request(vec![
+            ChatMessage::user()
+                .text("reference")
+                .cache(hint.clone())
+                .build(),
+        ]);
+        request.params = Some(params.to_json().unwrap());
+        assert_rmp_round_trip_equal(&request);
+        let bytes = rmp_serde::to_vec_named(&request).unwrap();
+        let decoded: ProviderChatRequest = rmp_serde::from_slice(&bytes).unwrap();
+        let params: querymt::LLMParams = serde_json::from_value(decoded.params.unwrap()).unwrap();
+        assert_eq!(params.system[0].cache(), Some(&hint));
+        assert_eq!(decoded.messages[0].cache, Some(hint));
+    }
+
+    #[test]
     fn chat_request_with_mixed_cache_hints_round_trips_over_rmp() {
         let messages = vec![
             ChatMessage::user()

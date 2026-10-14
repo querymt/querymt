@@ -176,7 +176,16 @@ impl SessionTemplateContext {
     /// Non-system fields are copied unchanged.
     pub fn resolve_params(&self, config: &LLMParams) -> Result<LLMParams> {
         let mut resolved = config.clone();
-        let rendered: Result<Vec<String>> = config.system.iter().map(|s| self.render(s)).collect();
+        let rendered: Result<Vec<querymt::params::SystemPrompt>> = config
+            .system
+            .iter()
+            .map(|s| {
+                Ok(querymt::params::SystemPrompt::Hinted {
+                    text: self.render(s.text())?,
+                    cache: s.cache().cloned(),
+                })
+            })
+            .collect();
         resolved.system = rendered?;
         Ok(resolved)
     }
@@ -700,6 +709,28 @@ mod tests {
     }
 
     // -- resolve_params -------------------------------------------------------
+
+    #[test]
+    fn resolve_params_preserves_cache_metadata() {
+        let ctx = make_ctx();
+        let hint = querymt::chat::CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        };
+        let params = LLMParams::default().system(querymt::params::SystemPrompt::with_cache(
+            "Stable {{ model }}",
+            hint.clone(),
+        ));
+        let resolved = ctx.resolve_params(&params).unwrap();
+        assert!(resolved.system[0].text().contains("claude-3-5-sonnet"));
+        assert_eq!(resolved.system[0].cache(), Some(&hint));
+        let persisted = serde_json::to_value(&resolved).unwrap();
+        assert_eq!(
+            serde_json::from_value::<LLMParams>(persisted)
+                .unwrap()
+                .system,
+            resolved.system
+        );
+    }
 
     #[test]
     fn test_resolve_params_replaces_system() {

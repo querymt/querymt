@@ -33,6 +33,38 @@ use heck::ToSnakeCase;
 
 use crate::AuthType;
 
+/// Explicit prefix boundaries are supported starting with GPT-5.6.
+pub fn supports_prompt_cache_breakpoints(model: &str) -> bool {
+    let Some(version) = model.strip_prefix("gpt-") else {
+        return false;
+    };
+    let version = version.split('-').next().unwrap_or_default();
+    let mut components = version.split('.');
+    let Some(major) = components.next().and_then(|v| v.parse::<u32>().ok()) else {
+        return false;
+    };
+    let minor = match components.next() {
+        Some(value) => match value.parse::<u32>() {
+            Ok(value) => value,
+            Err(_) => return false,
+        },
+        None => 0,
+    };
+    components.next().is_none() && (major == 6 || (major == 5 && minor >= 6))
+}
+
+/// The marker covers the complete rendered prefix, including preceding tools.
+#[derive(Serialize, Debug)]
+pub struct PromptCacheBreakpoint {
+    mode: &'static str,
+}
+
+impl PromptCacheBreakpoint {
+    pub fn explicit() -> Self {
+        Self { mode: "explicit" }
+    }
+}
+
 fn should_snakecase_extra_body(base_url: &Url) -> bool {
     // Why: `extra_body` is an untyped string->JSON map that gets flattened into the
     // request body, so serde can't apply `rename_all = "snake_case"` to its keys.
@@ -227,6 +259,8 @@ enum OpenAIResponsesFunctionOutput<'a> {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type")]
 enum OpenAIResponsesToolOutputPart<'a> {
+    #[serde(rename = "input_text")]
+    InputText { text: Cow<'a, str> },
     #[serde(rename = "output_text")]
     OutputText { text: Cow<'a, str> },
     #[serde(rename = "input_image")]
@@ -244,6 +278,8 @@ enum OpenAIResponsesToolOutputPart<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         file_url: Option<Cow<'a, str>>,
     },
+    #[serde(untagged)]
+    Cached(crate::cache::CachedContent<crate::cache::CacheableContent<'a>>),
 }
 
 #[derive(Serialize, Debug)]
@@ -285,6 +321,8 @@ enum OpenAIResponsesInputContent<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         file_url: Option<Cow<'a, str>>,
     },
+    #[serde(untagged)]
+    Cached(crate::cache::CachedContent<crate::cache::CacheableContent<'a>>),
 }
 
 /// Flattened function definition used by the Responses API.
@@ -404,6 +442,8 @@ struct OpenAIRawUsage {
 struct OpenAIPromptTokensDetails {
     #[serde(default)]
     cached_tokens: u32,
+    #[serde(default)]
+    cache_write_tokens: u32,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -427,8 +467,12 @@ impl OpenAIRawUsage {
             .completion_tokens_details
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0);
+        // Prefer DeepSeek's reported uncached count, including zero, over a derived count.
+        let input_tokens = self
+            .prompt_cache_miss_tokens
+            .unwrap_or_else(|| self.prompt_tokens.saturating_sub(cache_read));
         Usage {
-            input_tokens: self.prompt_tokens.saturating_sub(cache_read),
+            input_tokens,
             output_tokens: self.completion_tokens.saturating_sub(reasoning),
             reasoning_tokens: reasoning,
             cache_read,
@@ -463,20 +507,22 @@ struct OpenAIResponsesRawUsage {
 
 impl OpenAIResponsesRawUsage {
     fn into_usage(self) -> Usage {
-        let cache_read = self
-            .input_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
+        let details = self.input_tokens_details.unwrap_or_default();
+        let cache_read = details.cached_tokens;
+        let cache_write = details.cache_write_tokens;
         let reasoning = self
             .output_tokens_details
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0);
         Usage {
-            input_tokens: self.input_tokens.saturating_sub(cache_read),
+            input_tokens: self
+                .input_tokens
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write),
             output_tokens: self.output_tokens.saturating_sub(reasoning),
             reasoning_tokens: reasoning,
             cache_read,
-            cache_write: 0,
+            cache_write,
         }
     }
 }
@@ -497,8 +543,8 @@ struct OpenAIResponsesResponse {
     /// Terminal cause for incomplete responses, e.g. `max_output_tokens`.
     #[serde(default)]
     incomplete_details: Option<Value>,
-    #[serde(default)]
-    error: Option<Value>,
+    #[serde(default, rename = "error")]
+    _error: Option<Value>,
 }
 
 /// Raw Responses output item. Unknown item types are retained as opaque data,
@@ -702,7 +748,16 @@ pub trait OpenAIProviderConfig {
     fn model(&self) -> &str;
     fn max_tokens(&self) -> Option<&u32>;
     fn temperature(&self) -> Option<&f32>;
-    fn system(&self) -> &[String];
+    fn system(&self) -> Cow<'_, [String]> {
+        Cow::Borrowed(&[])
+    }
+    fn system_parts(&self) -> Cow<'_, [querymt::params::SystemPrompt]> {
+        Cow::Owned(self.system().iter().cloned().map(Into::into).collect())
+    }
+    fn supports_cache_breakpoints(&self) -> bool {
+        should_snakecase_extra_body(self.base_url())
+            && supports_prompt_cache_breakpoints(self.model())
+    }
     fn timeout_seconds(&self) -> Option<&u64>;
     fn stream(&self) -> Option<&bool>;
     fn top_p(&self) -> Option<&f32>;
@@ -1194,7 +1249,7 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
         convert_chat_message_to_openai(msg, &mut openai_msgs, include_reasoning);
     }
 
-    let system_parts = cfg.system();
+    let system_parts = cfg.system_parts();
     if !system_parts.is_empty() {
         // Insert system messages in reverse order at position 0
         // so they end up in the correct order.
@@ -1281,6 +1336,92 @@ pub fn openai_chat_request<C: OpenAIProviderConfig>(
 /// have validated Responses representations. An item that is required for
 /// continuation but has no validated input representation (an opaque provider
 /// item) fails explicitly instead of being silently dropped.
+fn mark_responses_boundary(items: &mut [OpenAIResponsesInputItem<'_>]) -> bool {
+    use crate::cache::{CacheableContent as Block, CachedContent};
+    match items.last_mut() {
+        Some(OpenAIResponsesInputItem::Message { content, .. }) => {
+            if !matches!(
+                content.last(),
+                Some(
+                    OpenAIResponsesInputContent::InputText { .. }
+                        | OpenAIResponsesInputContent::InputImage { .. }
+                        | OpenAIResponsesInputContent::InputFile { .. }
+                )
+            ) {
+                return false;
+            }
+            let block = match content.pop().expect("checked ending") {
+                OpenAIResponsesInputContent::InputText { text } => Block::InputText { text },
+                OpenAIResponsesInputContent::InputImage { image_url, detail } => {
+                    Block::InputImage { image_url, detail }
+                }
+                OpenAIResponsesInputContent::InputFile {
+                    filename,
+                    file_data,
+                    file_url,
+                } => Block::InputFile {
+                    filename,
+                    file_data,
+                    file_url,
+                },
+                _ => unreachable!("checked ending"),
+            };
+            content.push(OpenAIResponsesInputContent::Cached(CachedContent::new(
+                block,
+            )));
+            true
+        }
+        Some(OpenAIResponsesInputItem::FunctionCallOutput { output, .. }) => {
+            if let OpenAIResponsesFunctionOutput::Text(text) = output {
+                *output = OpenAIResponsesFunctionOutput::Parts(vec![
+                    OpenAIResponsesToolOutputPart::InputText {
+                        text: std::mem::take(text),
+                    },
+                ]);
+            }
+            let OpenAIResponsesFunctionOutput::Parts(parts) = output else {
+                return false;
+            };
+            // Hinted tool outputs use the Responses input-content representation.
+            for part in parts.iter_mut() {
+                if let OpenAIResponsesToolOutputPart::OutputText { text } = part {
+                    *part = OpenAIResponsesToolOutputPart::InputText {
+                        text: std::mem::take(text),
+                    };
+                }
+            }
+            let Some(last) = parts.pop() else {
+                return false;
+            };
+            let block = match last {
+                OpenAIResponsesToolOutputPart::OutputText { text }
+                | OpenAIResponsesToolOutputPart::InputText { text } => Block::InputText { text },
+                OpenAIResponsesToolOutputPart::InputImage { image_url, detail } => {
+                    Block::InputImage { image_url, detail }
+                }
+                OpenAIResponsesToolOutputPart::InputFile {
+                    filename,
+                    file_data,
+                    file_url,
+                } => Block::InputFile {
+                    filename,
+                    file_data,
+                    file_url,
+                },
+                OpenAIResponsesToolOutputPart::Cached(value) => {
+                    parts.push(OpenAIResponsesToolOutputPart::Cached(value));
+                    return true;
+                }
+            };
+            parts.push(OpenAIResponsesToolOutputPart::Cached(CachedContent::new(
+                block,
+            )));
+            true
+        }
+        _ => false,
+    }
+}
+
 fn convert_chat_messages_to_responses<'a>(
     messages: &'a [ChatMessage],
     out: &mut Vec<OpenAIResponsesInputItem<'a>>,
@@ -1788,8 +1929,9 @@ fn reject_reserved_extra_body_keys(extra_body: &Map<String, Value>) -> Result<()
 /// This is the opt-in Responses path selected via [`crate::ApiMode`]. It never
 /// falls back to Chat Completions, disables remote storage, requests encrypted
 /// reasoning for local replay, and never emits stateful continuation
-/// references. System config maps to `instructions`, `max_tokens` to
-/// `max_output_tokens`, a JSON schema to `text.format`, and reasoning effort to
+/// references. System config maps to `instructions`, or a leading developer
+/// message when explicitly hinted and supported by the endpoint/model. `max_tokens` maps
+/// to `max_output_tokens`, a JSON schema to `text.format`, and reasoning effort to
 /// `reasoning.effort`. Unsupported controls are rejected explicitly rather than
 /// being silently dropped or copied from another backend's contract.
 pub fn openai_responses_request<C: OpenAIProviderConfig>(
@@ -1817,16 +1959,86 @@ pub fn openai_responses_request<C: OpenAIProviderConfig>(
         endpoint: cfg.responses_endpoint(),
     };
     let mut input: Vec<OpenAIResponsesInputItem<'_>> = Vec::new();
-    convert_chat_messages_to_responses(messages, &mut input, &target)?;
-
+    let cache_prefix = cfg.supports_cache_breakpoints();
+    let mut cache_hints = crate::cache::CacheHints::default();
+    for msg in messages {
+        let start = input.len();
+        convert_chat_messages_to_responses(std::slice::from_ref(msg), &mut input, &target)?;
+        if let Some(hint) = &msg.cache {
+            if !cache_prefix {
+                log::debug!(
+                    "Responses CacheHint skipped: unsupported endpoint/model; hint={hint:?}"
+                );
+            } else if mark_responses_boundary(&mut input[start..]) {
+                cache_hints.applied(hint)?;
+                log::debug!(
+                    "Responses CacheHint applied: conversation_item={}",
+                    input.len() - 1
+                );
+            } else {
+                log::debug!(
+                    "Responses CacheHint skipped: unsupported message ending; hint={hint:?}"
+                );
+            }
+        }
+    }
+    let system = cfg.system_parts();
+    let has_instruction_hints = system.iter().any(|part| part.cache().is_some());
+    let cache_instructions = cache_prefix && has_instruction_hints;
     let instructions = {
-        let parts = cfg.system();
-        if parts.is_empty() {
+        if system.is_empty() || cache_instructions {
             None
         } else {
-            Some(parts.join("\n\n"))
+            Some(
+                system
+                    .iter()
+                    .map(|p| p.text())
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            )
         }
     };
+
+    if cache_instructions {
+        let mut content = Vec::new();
+        for (index, part) in system.iter().enumerate() {
+            let text = if index == 0 {
+                part.text().to_owned()
+            } else {
+                format!("\n\n{}", part.text())
+            };
+            content.push(if let Some(hint) = part.cache() {
+                cache_hints.applied(hint)?;
+                log::debug!("Responses CacheHint applied: instruction_block={index}");
+                OpenAIResponsesInputContent::Cached(crate::cache::CachedContent::new(
+                    crate::cache::CacheableContent::InputText {
+                        text: Cow::Owned(text),
+                    },
+                ))
+            } else {
+                OpenAIResponsesInputContent::InputText {
+                    text: Cow::Owned(text),
+                }
+            });
+        }
+        input.insert(
+            0,
+            OpenAIResponsesInputItem::Message {
+                role: Cow::Borrowed("developer"),
+                content,
+            },
+        );
+    } else if has_instruction_hints {
+        log::debug!(
+            "Responses instruction CacheHint skipped: unsupported endpoint/model; hints={:?}",
+            system
+                .iter()
+                .enumerate()
+                .filter_map(|(index, part)| part.cache().map(|hint| (index, hint)))
+                .take(32)
+                .collect::<Vec<_>>()
+        );
+    }
 
     let request_tools = match tools {
         Some(tools) => Some(to_responses_tools(tools)?),
@@ -1857,6 +2069,14 @@ pub fn openai_responses_request<C: OpenAIProviderConfig>(
             reject_reserved_extra_body_keys(&raw)?;
         }
     }
+
+    let extra_body = if cache_prefix {
+        let mut extra = extra_body.unwrap_or_default();
+        cache_hints.finish(&mut extra)?;
+        if extra.is_empty() { None } else { Some(extra) }
+    } else {
+        extra_body
+    };
 
     let body = OpenAIResponsesRequest {
         model: cfg.model(),
@@ -2124,7 +2344,7 @@ fn normalize_responses_response_with(
         _ => None,
     };
 
-    let output = ChatOutput {
+    ChatOutput {
         response_id: parsed.id.clone(),
         items,
         status: output_status,
@@ -2140,9 +2360,7 @@ fn normalize_responses_response_with(
             endpoint: provider.endpoint.to_string(),
         }),
         extensions: Extensions::new(),
-    };
-
-    output
+    }
 }
 
 /// Map an incomplete terminal cause to a QueryMT finish reason.
@@ -2171,9 +2389,13 @@ pub fn normalize_responses_output_item(raw: &Value) -> Option<ChatOutputItem> {
                 .summary
                 .unwrap_or_default()
                 .into_iter()
-                .filter_map(|part| part.text)
-                .filter(|text| !text.is_empty())
-                .map(ChatReasoningPart::text)
+                .filter_map(|part| {
+                    let text = part.text.filter(|text| !text.is_empty())?;
+                    Some(ChatReasoningPart {
+                        text,
+                        extensions: part.extra,
+                    })
+                })
                 .collect();
             let content = normalize_reasoning_content_parts(item.content.unwrap_or_default());
             // Encrypted continuation stays separate from the visible summary.
@@ -2288,9 +2510,15 @@ fn normalize_reasoning_content_parts(
         .filter_map(|part| {
             let text = part.text.filter(|text| !text.is_empty())?;
             match part.content_type.as_str() {
-                "reasoning_text" => Some(ChatReasoningPart::text(text)),
+                "reasoning_text" => Some(ChatReasoningPart {
+                    text,
+                    extensions: part.extra,
+                }),
                 "text" => {
-                    let mut reasoning_part = ChatReasoningPart::text(text);
+                    let mut reasoning_part = ChatReasoningPart {
+                        text,
+                        extensions: part.extra,
+                    };
                     reasoning_part
                         .extensions
                         .insert("type".to_string(), Value::String("text".to_string()));
@@ -2403,7 +2631,7 @@ fn encode_image_data_url(mime_type: &str, data: &[u8]) -> String {
 /// marker is corrupted and the payload is no longer decodable. Parameters are
 /// emitted in their parsed form so their semantics survive.
 fn encode_data_url(media_type: &querymt::chat::MediaType, data: &[u8]) -> String {
-    let mut head = format!("{}", media_type.type_());
+    let mut head = media_type.type_().to_string();
     head.push('/');
     head.push_str(media_type.subtype());
     if let Some(suffix) = media_type.suffix() {
@@ -3231,12 +3459,37 @@ pub struct OpenAIResponsesStreamState {
     model: Option<String>,
     saw_function_call: bool,
     terminal_seen: bool,
+    item_ids: HashMap<usize, String>,
     /// Provider provenance recorded on emitted metadata events. Defaults to
     /// OpenAI; compatible providers (e.g. Codex) supply their own identity.
     provider: ResponsesCodecProvider,
 }
 
 impl OpenAIResponsesStreamState {
+    /// Bind the first observed identity, including when a starting snapshot is absent.
+    fn observe_item_id(
+        &mut self,
+        output_index: usize,
+        item_id: Option<&str>,
+    ) -> Result<(), LLMError> {
+        let Some(item_id) = item_id else {
+            return Ok(());
+        };
+        if let Some(existing) = self.item_ids.get(&output_index) {
+            if existing != item_id {
+                return Err(LLMError::ResponseFormatError {
+                    message: format!(
+                        "Responses item identity changed at output index {output_index}"
+                    ),
+                    raw_response: String::new(),
+                });
+            }
+        } else {
+            self.item_ids.insert(output_index, item_id.to_string());
+        }
+        Ok(())
+    }
+
     /// Create request-local stream state that records the supplied provider
     /// provenance instead of the default OpenAI identity.
     pub fn for_provider(provider: ResponsesCodecProvider) -> Self {
@@ -3334,6 +3587,24 @@ pub fn parse_openai_responses_sse_chunk(
             }
         };
 
+        // Only validate routed events; unknown event kinds remain ignorable.
+        if matches!(
+            event.kind.as_str(),
+            "response.output_item.added"
+                | "response.output_item.done"
+                | "response.content_part.added"
+                | "response.reasoning_summary_part.added"
+                | "response.output_text.delta"
+                | "response.refusal.delta"
+                | "response.reasoning_summary_text.delta"
+                | "response.reasoning_text.delta"
+                | "response.function_call_arguments.delta"
+                | "response.function_call_arguments.done"
+        ) && let Some(output_index) = event.output_index
+        {
+            state.observe_item_id(output_index, event.item_id.as_deref())?;
+        }
+
         match event.kind.as_str() {
             "response.created" | "response.in_progress" => {
                 if !state.response_started {
@@ -3368,6 +3639,7 @@ pub fn parse_openai_responses_sse_chunk(
                 let (Some(item), Some(output_index)) = (&event.item, event.output_index) else {
                     continue;
                 };
+                state.observe_item_id(output_index, item.get("id").and_then(Value::as_str))?;
                 if let Some(normalized) = normalize_responses_output_item(item) {
                     if matches!(normalized, ChatOutputItem::FunctionCall(_)) {
                         state.saw_function_call = true;
@@ -3415,6 +3687,7 @@ pub fn parse_openai_responses_sse_chunk(
                 let (Some(item), Some(output_index)) = (&event.item, event.output_index) else {
                     continue;
                 };
+                state.observe_item_id(output_index, item.get("id").and_then(Value::as_str))?;
                 if let Some(normalized) = normalize_responses_output_item(item) {
                     if matches!(normalized, ChatOutputItem::FunctionCall(_)) {
                         state.saw_function_call = true;
@@ -3511,6 +3784,8 @@ pub fn parse_openai_responses_sse_chunk(
                 // and conflicting snapshots with its idempotency/conflict checks.
                 if let Some(items) = response.get("output").and_then(Value::as_array) {
                     for (output_index, raw) in items.iter().enumerate() {
+                        state
+                            .observe_item_id(output_index, raw.get("id").and_then(Value::as_str))?;
                         if let Some(normalized) = normalize_responses_output_item(raw) {
                             if matches!(normalized, ChatOutputItem::FunctionCall(_)) {
                                 state.saw_function_call = true;
@@ -3594,6 +3869,286 @@ mod tests {
     use crate::OpenAI;
 
     #[test]
+    fn cache_capabilities_parse_versions_and_preserve_overrides() {
+        for model in [
+            "gpt-5.6",
+            "gpt-5.10",
+            "gpt-5.6-2026-10-01",
+            "gpt-6",
+            "gpt-6.1-sol",
+        ] {
+            assert!(super::supports_prompt_cache_breakpoints(model), "{model}");
+        }
+        for model in [
+            "gpt-5.5",
+            "gpt-5",
+            "gpt-4.1",
+            "gpt-6garbage",
+            "gpt-6.1.2",
+            "custom",
+        ] {
+            assert!(!super::supports_prompt_cache_breakpoints(model), "{model}");
+        }
+        let mut extra = serde_json::json!({"prompt_cache_options": {"mode": "explicit", "ttl": "30m", "comparison_response_id": "resp_test"}}).as_object().unwrap().clone();
+        let original = extra.clone();
+        crate::cache::CacheHints::default()
+            .finish(&mut extra)
+            .unwrap();
+        assert_eq!(extra, original);
+        extra["prompt_cache_options"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
+        crate::cache::CacheHints::default()
+            .finish(&mut extra)
+            .unwrap();
+        assert!(extra["prompt_cache_options"].get("mode").is_none());
+        assert_eq!(extra["prompt_cache_options"]["ttl"], "30m");
+    }
+
+    #[test]
+    fn responses_instruction_prefix_is_marked_without_duplication() {
+        for (model, endpoint, supported) in [
+            ("gpt-6.1-sol", "https://api.openai.com/v1/", true),
+            ("gpt-5.6", "https://api.openai.com/v1/", true),
+            ("gpt-5.5", "https://api.openai.com/v1/", false),
+            ("gpt-6.1-sol", "https://example.com/v1/", false),
+        ] {
+            let cfg: OpenAI = serde_json::from_value(serde_json::json!({
+                "model": model, "api_key": "test", "api_mode": "responses", "base_url": endpoint,
+                "system": [{"text": "stable instructions", "cache": {"ephemeral": {"ttl_seconds": 1800}}}], "extra_body": {"prompt_cache_options": {"mode": "explicit"}}
+            })).unwrap();
+            let messages = vec![
+                querymt::chat::ChatMessage::user()
+                    .text("dynamic input")
+                    .build(),
+            ];
+            let request = super::openai_responses_request(&cfg, &messages, None).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+            if supported {
+                assert!(body.get("instructions").is_none());
+                assert_eq!(body["input"][0]["role"], "developer");
+                assert_eq!(
+                    body["input"][0]["content"][0]["text"],
+                    "stable instructions"
+                );
+                assert_eq!(
+                    body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+                    "explicit"
+                );
+                assert_eq!(body["input"].as_array().unwrap().len(), 2);
+            } else {
+                assert_eq!(body["instructions"], "stable instructions");
+                assert_eq!(body["input"].as_array().unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn response_hints_mark_exact_boundaries_and_aggregate_ttl() {
+        use querymt::chat::{CacheHint, ChatMessage};
+        let hint = CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        };
+        let cfg: OpenAI = serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6", "api_key": "sk-test", "api_mode": "responses",
+            "system": [
+                {"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}},
+                "dynamic instructions"
+            ],
+            "extra_body": {"prompt_cache_options": {"mode": "implicit"}}
+        }))
+        .unwrap();
+        let messages = vec![
+            ChatMessage::user()
+                .text("reference")
+                .cache(hint.clone())
+                .build(),
+            ChatMessage::assistant()
+                .text("answer")
+                .cache(hint.clone())
+                .build(),
+            ChatMessage::user()
+                .tool_result(
+                    "call_1".into(),
+                    None,
+                    false,
+                    vec![querymt::chat::ToolResultPart::Text {
+                        text: "result".into(),
+                    }],
+                )
+                .cache(hint)
+                .build(),
+        ];
+        let request = super::openai_responses_request(&cfg, &messages, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(body["prompt_cache_options"]["mode"], "implicit");
+        assert_eq!(
+            body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(
+            body["input"][0]["content"][1]["text"],
+            "\n\ndynamic instructions"
+        );
+        assert!(
+            body["input"][0]["content"][1]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+        assert_eq!(
+            body["input"][1]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert!(
+            body["input"][2]["content"][0]
+                .get("prompt_cache_breakpoint")
+                .is_none()
+        );
+        assert_eq!(body["input"][3]["call_id"], "call_1");
+        assert_eq!(body["input"][3]["output"][0]["text"], "result");
+        assert_eq!(body["input"][3]["output"][0]["type"], "input_text");
+        assert_eq!(
+            body["input"][3]["output"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+    }
+
+    #[test]
+    fn media_boundaries_preserve_fields_and_do_not_move_unsupported_endings() {
+        use super::{OpenAIResponsesInputContent as Content, OpenAIResponsesInputItem as Item};
+        for block in [
+            Content::InputImage {
+                image_url: "https://example.com/image.png".into(),
+                detail: Some("high".into()),
+            },
+            Content::InputFile {
+                filename: Some("reference.pdf".into()),
+                file_data: Some("data:application/pdf;base64,AAA=".into()),
+                file_url: None,
+            },
+        ] {
+            let mut items = vec![Item::Message {
+                role: "user".into(),
+                content: vec![
+                    Content::InputText {
+                        text: "prefix".into(),
+                    },
+                    block,
+                ],
+            }];
+            let before = serde_json::to_value(&items).unwrap();
+            assert!(super::mark_responses_boundary(&mut items));
+            let mut after = serde_json::to_value(&items).unwrap();
+            assert_eq!(
+                after[0]["content"][1]["prompt_cache_breakpoint"]["mode"],
+                "explicit"
+            );
+            after[0]["content"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("prompt_cache_breakpoint");
+            assert_eq!(after, before);
+        }
+        let mut items = vec![Item::Message {
+            role: "assistant".into(),
+            content: vec![
+                Content::InputText {
+                    text: "earlier supported content".into(),
+                },
+                Content::OutputText {
+                    text: "actual ending".into(),
+                },
+            ],
+        }];
+        let before = serde_json::to_value(&items).unwrap();
+        assert!(!super::mark_responses_boundary(&mut items));
+        assert_eq!(serde_json::to_value(&items).unwrap(), before);
+    }
+
+    #[test]
+    fn cache_ttl_validation_is_scoped_to_applied_boundaries() {
+        use querymt::chat::{CacheHint, ChatMessage};
+        for (endpoint, capability, succeeds) in [
+            ("https://api.openai.com/v1/", None, false),
+            ("https://example.com/v1/", None, true),
+            ("https://example.com/v1/", Some(true), false),
+            ("https://api.openai.com/v1/", Some(false), true),
+        ] {
+            let cfg: OpenAI = serde_json::from_value(serde_json::json!({
+                "model": "gpt-5.6", "api_key": "sk-test", "api_mode": "responses",
+                "base_url": endpoint, "supports_prompt_cache_breakpoints": capability
+            }))
+            .unwrap();
+            let messages = vec![
+                ChatMessage::user()
+                    .text("reference")
+                    .cache(CacheHint::Ephemeral {
+                        ttl_seconds: Some(300),
+                    })
+                    .build(),
+            ];
+            let result = super::openai_responses_request(&cfg, &messages, None);
+            assert_eq!(result.is_ok(), succeeds, "{endpoint} {capability:?}");
+            // Unsupported output_text endings must neither move the boundary nor resolve its TTL.
+            let messages = vec![
+                ChatMessage::assistant()
+                    .text("answer")
+                    .cache(CacheHint::Ephemeral {
+                        ttl_seconds: Some(300),
+                    })
+                    .build(),
+            ];
+            assert!(super::openai_responses_request(&cfg, &messages, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn unhinted_instructions_retain_legacy_wire_shape() {
+        let cfg: OpenAI = serde_json::from_value(serde_json::json!({"model": "gpt-5.6", "api_key": "sk-test", "system": ["first", "second"]})).unwrap();
+        assert_eq!(
+            super::OpenAIProviderConfig::system(&cfg).into_owned(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
+        let request = super::openai_responses_request(&cfg, &messages, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        assert_eq!(body["instructions"], "first\n\nsecond");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert!(body.get("prompt_cache_options").is_none());
+    }
+
+    #[test]
+    fn responses_usage_accounts_for_cache_writes_and_missing_details() {
+        for (details, expected) in [
+            (
+                serde_json::json!({"cached_tokens": 600, "cache_write_tokens": 300}),
+                (100, 600, 300),
+            ),
+            (serde_json::json!({"cached_tokens": 600}), (400, 600, 0)),
+            (serde_json::Value::Null, (1000, 0, 0)),
+            (
+                serde_json::json!({"cached_tokens": 900, "cache_write_tokens": 300}),
+                (0, 900, 300),
+            ),
+        ] {
+            let raw: super::OpenAIResponsesRawUsage = serde_json::from_value(serde_json::json!({
+                "input_tokens": 1000, "output_tokens": 100, "input_tokens_details": details,
+                "output_tokens_details": {"reasoning_tokens": 40}
+            }))
+            .unwrap();
+            let usage = raw.into_usage();
+            assert_eq!(
+                (usage.input_tokens, usage.cache_read, usage.cache_write),
+                expected
+            );
+            assert_eq!((usage.output_tokens, usage.reasoning_tokens), (60, 40));
+        }
+    }
+
+    #[test]
     fn responses_cache_key_serialization_preserves_alias_compatibility() {
         for extra in [
             serde_json::json!({"prompt_cache_key": "session-1"}),
@@ -3669,6 +4224,272 @@ mod tests {
         assert!(
             value.get("content").is_none(),
             "empty reasoning content must be omitted from replay"
+        );
+    }
+
+    fn parse_responses_test_event(
+        state: &mut super::OpenAIResponsesStreamState,
+        event: serde_json::Value,
+    ) -> Result<Vec<StreamChunk>, LLMError> {
+        super::parse_openai_responses_sse_chunk(format!("data: {event}\n\n").as_bytes(), state)
+    }
+
+    #[test]
+    fn responses_routed_events_validate_item_identity() {
+        for kind in [
+            "response.content_part.added",
+            "response.reasoning_summary_part.added",
+            "response.output_text.delta",
+            "response.refusal.delta",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_text.delta",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+        ] {
+            let mut state = super::OpenAIResponsesStreamState::default();
+            parse_responses_test_event(
+                &mut state,
+                serde_json::json!({
+                    "type": "response.output_item.added", "output_index": 0,
+                    "item": {"type": "message", "id": "msg_1", "content": []}
+                }),
+            )
+            .unwrap();
+            let mut event = serde_json::json!({
+                "type": kind, "output_index": 0, "item_id": "msg_1",
+                "delta": "delta", "content_index": 0, "summary_index": 0,
+                "part": {"type": "output_text", "text": ""}
+            });
+            assert!(
+                parse_responses_test_event(&mut state, event.clone()).is_ok(),
+                "{kind}"
+            );
+            event.as_object_mut().unwrap().remove("item_id");
+            assert!(
+                parse_responses_test_event(&mut state, event.clone()).is_ok(),
+                "{kind}"
+            );
+            event["item_id"] = serde_json::json!("wrong_item");
+            assert!(
+                matches!(
+                    parse_responses_test_event(&mut state, event),
+                    Err(LLMError::ResponseFormatError { .. })
+                ),
+                "{kind} must reject contradictory identity"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_snapshots_validate_item_identity() {
+        for kind in [
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.completed",
+        ] {
+            let mut state = super::OpenAIResponsesStreamState::default();
+            // An observed delta can establish identity when the starting snapshot is missing.
+            parse_responses_test_event(
+                &mut state,
+                serde_json::json!({
+                    "type": "response.output_text.delta", "output_index": 0,
+                    "item_id": "msg_1", "delta": "hello"
+                }),
+            )
+            .unwrap();
+            let item = serde_json::json!({"type": "message", "id": "msg_2", "content": []});
+            let event = if kind == "response.completed" {
+                serde_json::json!({"type": kind, "response": {"output": [item]}})
+            } else {
+                serde_json::json!({"type": kind, "output_index": 0, "item": item})
+            };
+            assert!(
+                matches!(
+                    parse_responses_test_event(&mut state, event),
+                    Err(LLMError::ResponseFormatError { .. })
+                ),
+                "{kind} must reject contradictory identity"
+            );
+        }
+        let mut state = super::OpenAIResponsesStreamState::default();
+        assert!(matches!(
+            parse_responses_test_event(
+                &mut state,
+                serde_json::json!({
+                    "type": "response.output_item.done", "output_index": 0, "item_id": "msg_1",
+                    "item": {"type": "message", "id": "msg_2", "content": []}
+                })
+            ),
+            Err(LLMError::ResponseFormatError { .. })
+        ));
+    }
+
+    #[test]
+    fn responses_identity_tracking_is_indexed_and_request_local() {
+        let mut state = super::OpenAIResponsesStreamState::default();
+        for (index, id) in [(0, "msg_1"), (1, "msg_2")] {
+            parse_responses_test_event(
+                &mut state,
+                serde_json::json!({
+                    "type": "response.output_item.added", "output_index": index,
+                    "item": {"type": "message", "id": id, "content": []}
+                }),
+            )
+            .unwrap();
+        }
+        for (index, id) in [(1, "msg_2"), (0, "msg_1"), (1, "msg_2")] {
+            let events = parse_responses_test_event(
+                &mut state,
+                serde_json::json!({
+                    "type": "response.output_text.delta", "output_index": index,
+                    "item_id": id, "delta": "hello"
+                }),
+            )
+            .unwrap();
+            assert!(matches!(events.as_slice(), [StreamChunk::Structured(
+                querymt::chat::StructuredStreamEvent::MessagePartDelta { output_index, .. }
+            )] if *output_index == index));
+        }
+        let mut other = super::OpenAIResponsesStreamState::default();
+        parse_responses_test_event(
+            &mut other,
+            serde_json::json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"type": "message", "id": "other_request", "content": []}
+            }),
+        )
+        .unwrap();
+        parse_responses_test_event(
+            &mut state,
+            serde_json::json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"type": "message", "id": "msg_1", "content": []}
+            }),
+        )
+        .unwrap();
+        parse_responses_test_event(
+            &mut state,
+            serde_json::json!({
+                "type": "response.completed", "response": {"output": [
+                    {"type": "message", "id": "msg_1", "content": []},
+                    {"type": "message", "id": "msg_2", "content": []}
+                ]}
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn responses_identity_tracking_preserves_compatible_event_shapes() {
+        let mut state = super::OpenAIResponsesStreamState::default();
+        parse_responses_test_event(
+            &mut state,
+            serde_json::json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": {"type": "message", "content": []}
+            }),
+        )
+        .unwrap();
+        for event in [
+            serde_json::json!({"type": "response.vendor_event", "output_index": 0, "item_id": "ignored"}),
+            serde_json::json!({"type": "response.output_text.delta", "item_id": "no_index", "delta": "ignored"}),
+        ] {
+            assert!(
+                parse_responses_test_event(&mut state, event)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        parse_responses_test_event(&mut state, serde_json::json!({
+            "type": "response.output_text.delta", "output_index": 0, "item_id": "msg_1", "delta": "hello"
+        })).unwrap();
+        parse_responses_test_event(
+            &mut state,
+            serde_json::json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": {"type": "message", "content": []}
+            }),
+        )
+        .unwrap();
+        let mut snapshot_only = super::OpenAIResponsesStreamState::default();
+        parse_responses_test_event(
+            &mut snapshot_only,
+            serde_json::json!({
+                "type": "response.completed", "response": {"output": [
+                    {"type": "message", "id": "msg_final", "content": []}
+                ]}
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reasoning_metadata_survives_normalization_roundtrip_and_portable_conversion() {
+        use querymt::chat::{ChatOutput, ChatOutputItem};
+
+        let raw = serde_json::json!({
+            "type": "reasoning",
+            "summary": [
+                {"type": "summary_text", "text": "first", "metadata": {"nested": [1, 2]}},
+                {"text": ""},
+                {"metadata": {"ignored": true}},
+                {"type": "summary_text", "text": "second", "provider_field": "summary"}
+            ],
+            "content": [
+                {"type": "reasoning_text", "text": "native", "metadata": {"signature": "secret"}},
+                {"type": "text", "text": "legacy", "provider_field": "content"},
+                {"type": "reasoning_text", "text": ""},
+                {"type": "ignored", "text": "unsupported"}
+            ]
+        });
+        let item = super::normalize_responses_output_item(&raw).unwrap();
+        assert!(item.is_native(), "part metadata requires native fidelity");
+        let ChatOutputItem::Reasoning(reasoning) = &item else {
+            panic!("expected reasoning");
+        };
+        assert_eq!(reasoning.summary.len(), 2);
+        assert_eq!(reasoning.summary[0].text, "first");
+        assert_eq!(reasoning.summary[1].text, "second");
+        assert_eq!(
+            reasoning.summary[0].extensions["metadata"],
+            raw["summary"][0]["metadata"]
+        );
+        assert_eq!(reasoning.summary[0].extensions["type"], "summary_text");
+        assert_eq!(reasoning.summary[1].extensions["provider_field"], "summary");
+        assert_eq!(reasoning.content.len(), 2);
+        assert_eq!(
+            reasoning.content[0].extensions["metadata"],
+            raw["content"][0]["metadata"]
+        );
+        assert_eq!(reasoning.content[1].extensions["provider_field"], "content");
+        assert_eq!(
+            reasoning.content[0].reasoning_text_for_replay(),
+            Some("native")
+        );
+        assert_eq!(reasoning.content[1].reasoning_text_for_replay(), None);
+
+        let output = ChatOutput {
+            items: vec![item],
+            ..ChatOutput::default()
+        };
+        let encoded = serde_json::to_value(&output).unwrap();
+        let restored: ChatOutput = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, output);
+        let portable = restored.into_portable();
+        assert!(!portable.requires_item_aware_fidelity());
+        let ChatOutputItem::Reasoning(reasoning) = &portable.items[0] else {
+            panic!("expected portable reasoning");
+        };
+        assert_eq!(
+            reasoning.visible_text(),
+            "first\n\nsecond\n\nnative\n\nlegacy"
+        );
+        assert!(
+            reasoning
+                .summary
+                .iter()
+                .chain(&reasoning.content)
+                .all(|part| part.extensions.is_empty())
         );
     }
 
@@ -4131,8 +4952,8 @@ mod tests {
             fn temperature(&self) -> Option<&f32> {
                 None
             }
-            fn system(&self) -> &[String] {
-                &[]
+            fn system(&self) -> std::borrow::Cow<'_, [String]> {
+                std::borrow::Cow::Borrowed(&[])
             }
             fn timeout_seconds(&self) -> Option<&u64> {
                 None
@@ -4234,8 +5055,8 @@ mod tests {
             fn temperature(&self) -> Option<&f32> {
                 None
             }
-            fn system(&self) -> &[String] {
-                &[]
+            fn system(&self) -> std::borrow::Cow<'_, [String]> {
+                std::borrow::Cow::Borrowed(&[])
             }
             fn timeout_seconds(&self) -> Option<&u64> {
                 None
@@ -4710,6 +5531,67 @@ data: {"choices":[{"index":0,"delta":{"reasoning_content":"continued"}}]}
         assert_eq!(usage.input_tokens, 1000); // 10000 - 9000
         assert_eq!(usage.output_tokens, 1000); // 5000 - 4000 (reasoning)
         assert_eq!(usage.reasoning_tokens, 4000);
+    }
+
+    #[test]
+    fn parse_deepseek_usage_prefers_explicit_cache_misses() {
+        use super::OpenAIRawUsage;
+
+        // Include inconsistent totals to verify explicit provider counts take precedence.
+        for (hits, misses) in [(9000, 1000), (10000, 0), (0, 10000), (9000, 123), (9000, 0)] {
+            let raw: OpenAIRawUsage = serde_json::from_value(serde_json::json!({
+                "prompt_tokens": 10000,
+                "completion_tokens": 100,
+                "prompt_cache_hit_tokens": hits,
+                "prompt_cache_miss_tokens": misses
+            }))
+            .unwrap();
+            let usage = raw.into_usage();
+            assert_eq!(usage.input_tokens, misses);
+            assert_eq!(usage.cache_read, hits);
+            assert_eq!(usage.cache_write, 0);
+        }
+    }
+
+    #[test]
+    fn parse_deepseek_usage_falls_back_when_cache_misses_are_unavailable() {
+        use super::OpenAIRawUsage;
+
+        for hits in [9000, 11000] {
+            for null_misses in [false, true] {
+                let mut value = serde_json::json!({
+                    "prompt_tokens": 10000,
+                    "completion_tokens": 100,
+                    "prompt_cache_hit_tokens": hits
+                });
+                if null_misses {
+                    value["prompt_cache_miss_tokens"] = serde_json::Value::Null;
+                }
+                let raw: OpenAIRawUsage = serde_json::from_value(value).unwrap();
+                let usage = raw.into_usage();
+                assert_eq!(usage.input_tokens, 10000_u32.saturating_sub(hits));
+                assert_eq!(usage.cache_read, hits);
+                assert_eq!(usage.cache_write, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_deepseek_final_stream_chunk_uses_explicit_cache_misses() {
+        let mut tool_states = HashMap::new();
+        let chunk = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10000,"completion_tokens":100,"prompt_cache_hit_tokens":9000,"prompt_cache_miss_tokens":123}}
+
+data: [DONE]
+"#;
+        let events = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap();
+        let Some(StreamChunk::Usage(usage)) = events.first() else {
+            panic!("expected usage before stream completion, got {events:?}");
+        };
+        assert_eq!(usage.input_tokens, 123);
+        assert_eq!(usage.cache_read, 9000);
+        assert_eq!(usage.output_tokens, 100);
+        assert_eq!(usage.cache_write, 0);
+        assert!(matches!(events.get(1), Some(StreamChunk::Done { .. })));
     }
 
     #[test]

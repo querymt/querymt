@@ -440,7 +440,7 @@ impl SessionActor {
     }
 
     /// Helper method to extract system prompt from current session config.
-    async fn get_session_system_prompt(&self) -> Vec<String> {
+    async fn get_session_system_prompt(&self) -> Vec<querymt::params::SystemPrompt> {
         if let Ok(Some(current_config)) = self
             .config
             .provider
@@ -452,8 +452,10 @@ impl SessionActor {
         {
             let mut system_parts = Vec::new();
             for item in system_array {
-                if let Some(s) = item.as_str() {
-                    system_parts.push(s.to_string());
+                if let Ok(part) =
+                    serde_json::from_value::<querymt::params::SystemPrompt>(item.clone())
+                {
+                    system_parts.push(part);
                 }
             }
             if !system_parts.is_empty() {
@@ -1631,7 +1633,7 @@ impl Message<crate::agent::messages::SetPlanningContext> for SessionActor {
 
         // Get current system prompt and append the planning summary
         let mut system_prompt = self.get_session_system_prompt().await;
-        system_prompt.push(msg.summary);
+        system_prompt.push(msg.summary.into());
 
         // Rebuild the LLM config with the updated system prompt
         let current_config = self

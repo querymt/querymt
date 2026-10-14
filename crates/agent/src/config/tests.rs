@@ -2,6 +2,85 @@ use super::*;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[tokio::test]
+async fn system_cache_hints_survive_file_resolution_and_inline_config() {
+    use querymt::chat::CacheHint;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("base.md"),
+        "Stable {{ model }} instructions",
+    )
+    .unwrap();
+    let agent = parse_agent(
+        r#"system = [
+        { file = "base.md", cache = { ephemeral = { ttl_seconds = 1800 } } },
+        { text = "changing {{ provider }}", cache = { ephemeral = {} } },
+        "legacy"
+    ]"#,
+    );
+    let resolved = resolve_system_parts(&agent.system, dir.path(), "test")
+        .await
+        .unwrap();
+    assert_eq!(resolved[0].text(), "Stable {{ model }} instructions");
+    assert_eq!(
+        resolved[0].cache(),
+        Some(&CacheHint::Ephemeral {
+            ttl_seconds: Some(1800)
+        })
+    );
+    assert_eq!(
+        resolved[1].cache(),
+        Some(&CacheHint::Ephemeral { ttl_seconds: None })
+    );
+    assert!(resolved[2].cache().is_none());
+    let source = r#"[agent]
+provider = "openai"
+model = "gpt-5.6"
+system = [{ text = "stable", cache = { ephemeral = { ttl_seconds = 1800 } } }]
+"#;
+    let config = load_config(ConfigSource::Toml(source.into()))
+        .await
+        .unwrap();
+    let Config::Single(config) = config else {
+        panic!("single config");
+    };
+    assert_eq!(
+        config.agent.system[0].resolved().unwrap().cache(),
+        resolved[0].cache()
+    );
+    // Invalid metadata must not fall through the untagged enum to an unhinted file.
+    assert!(
+        serde_json::from_value::<SystemPart>(
+            serde_json::json!({"file": "base.md", "cache": {"unknown": {}}})
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn plain_file_and_inline_sections_receive_runtime_cache_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("base.md"), "stable instructions").unwrap();
+    let agent = parse_agent(
+        r#"system = [{ file = "base.md" }, "Dynamic instructions after the stable prefix."]"#,
+    );
+    let resolved = resolve_system_parts(&agent.system, dir.path(), "test")
+        .await
+        .unwrap();
+    let mut config = serde_json::json!({"system": resolved, "api_mode": "responses"});
+    crate::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6")
+        .apply_to(&mut config, "session");
+    assert_eq!(config["system"][0]["text"], "stable instructions");
+    assert_eq!(
+        config["system"][0]["cache"],
+        serde_json::json!({"ephemeral": {}})
+    );
+    assert_eq!(
+        config["system"][1]["cache"],
+        serde_json::json!({"ephemeral": {}})
+    );
+}
+
 #[test]
 fn test_parse_tool_spec() {
     assert_eq!(parse_tool_spec("edit"), ToolSpec::Builtin("edit".into()));

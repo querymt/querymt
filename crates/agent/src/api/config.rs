@@ -76,7 +76,7 @@ impl PlannerConfigBuilder {
         self.with_llm(|c| c.api_key(key))
     }
 
-    pub fn system(self, value: impl Into<String>) -> Self {
+    pub fn system(self, value: impl Into<querymt::params::SystemPrompt>) -> Self {
         self.with_llm(|c| c.system(value))
     }
 
@@ -161,7 +161,7 @@ impl DelegateConfigBuilder {
         self.with_llm(|c| c.api_key(key))
     }
 
-    pub fn system(self, value: impl Into<String>) -> Self {
+    pub fn system(self, value: impl Into<querymt::params::SystemPrompt>) -> Self {
         self.with_llm(|c| c.system(value))
     }
 

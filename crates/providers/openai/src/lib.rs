@@ -92,8 +92,14 @@ pub struct OpenAI {
     pub model: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
-    #[serde(default, deserialize_with = "querymt::params::deserialize_system_vec")]
-    pub system: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "querymt::params::deserialize_system_prompts"
+    )]
+    #[schemars(schema_with = "querymt::params::schema_for_system_prompts")]
+    pub system: Vec<querymt::params::SystemPrompt>,
+    /// Override breakpoint capability for a verified Responses endpoint/model.
+    pub supports_prompt_cache_breakpoints: Option<bool>,
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,
     pub top_p: Option<f32>,
@@ -123,6 +129,7 @@ impl OpenAI {
 }
 
 pub mod api;
+pub mod cache;
 
 impl api::OpenAIProviderConfig for OpenAI {
     fn api_key(&self) -> &str {
@@ -149,8 +156,23 @@ impl api::OpenAIProviderConfig for OpenAI {
         self.temperature.as_ref()
     }
 
-    fn system(&self) -> &[String] {
-        &self.system
+    fn system(&self) -> std::borrow::Cow<'_, [String]> {
+        std::borrow::Cow::Owned(
+            self.system
+                .iter()
+                .map(|part| part.text().to_owned())
+                .collect(),
+        )
+    }
+
+    fn system_parts(&self) -> std::borrow::Cow<'_, [querymt::params::SystemPrompt]> {
+        std::borrow::Cow::Borrowed(&self.system)
+    }
+    fn supports_cache_breakpoints(&self) -> bool {
+        self.supports_prompt_cache_breakpoints.unwrap_or_else(|| {
+            self.base_url.host_str() == Some("api.openai.com")
+                && api::supports_prompt_cache_breakpoints(&self.model)
+        })
     }
 
     fn timeout_seconds(&self) -> Option<&u64> {
@@ -290,11 +312,11 @@ impl HTTPEmbeddingProvider for OpenAI {
 
 impl HTTPCompletionProvider for OpenAI {
     fn complete_request(&self, _req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
-        !unimplemented!("feature is missing!")
+        unimplemented!("feature is missing!")
     }
 
     fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
-        !unimplemented!("feature is missing!")
+        unimplemented!("feature is missing!")
     }
 }
 
@@ -1085,7 +1107,7 @@ mod tests {
             "usage": {
                 "input_tokens": 100,
                 "output_tokens": 50,
-                "input_tokens_details": {"cached_tokens": 30},
+                "input_tokens_details": {"cached_tokens": 30, "cache_write_tokens": 20},
                 "output_tokens_details": {"reasoning_tokens": 20}
             }
         });
@@ -1113,8 +1135,9 @@ mod tests {
         // Cached and reasoning tokens are counted once, not double-counted.
         let usage = response.usage.as_ref().unwrap();
         assert_eq!(usage.cache_read, 30);
+        assert_eq!(usage.cache_write, 20);
         assert_eq!(usage.reasoning_tokens, 20);
-        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.input_tokens, 50);
         assert_eq!(usage.output_tokens, 30);
 
         // Annotations survive normalization.
@@ -1571,7 +1594,7 @@ mod tests {
             r#"{"type":"response.reasoning_summary_part.added","output_index":0,"summary_index":0,"part":{"type":"summary_text","text":""}}"#,
             r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"short"}"#,
             r#"{"type":"response.reasoning_text.delta","output_index":0,"content_index":0,"delta":"raw thought"}"#,
-            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"short"}],"content":[{"type":"reasoning_text","text":"raw thought"}]}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"short","metadata":{"signature":"summary-secret"}}],"content":[{"type":"reasoning_text","text":"raw thought","metadata":{"signature":"content-secret"}}]}}"#,
             r#"{"type":"response.completed","response":{"id":"resp_r","status":"completed"}}"#,
         ] {
             for chunk in parser.parse_chunk(&sse(payload)).unwrap() {
@@ -1588,6 +1611,20 @@ mod tests {
         };
         assert_eq!(reasoning.summary[0].text, "short");
         assert_eq!(reasoning.content[0].text, "raw thought");
+        assert_eq!(
+            reasoning.summary[0].extensions["metadata"]["signature"],
+            "summary-secret"
+        );
+        assert_eq!(
+            reasoning.content[0].extensions["metadata"]["signature"],
+            "content-secret"
+        );
+        let encoded = serde_json::to_string(&output).unwrap();
+        let restored: querymt::chat::ChatOutput = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored, output);
+        let debug = format!("{output:?}");
+        assert!(!debug.contains("summary-secret"));
+        assert!(!debug.contains("content-secret"));
     }
 
     #[test]
@@ -2197,6 +2234,16 @@ mod tests {
         use querymt::chat::{ChatOutputItem, ChatReasoningItem, ChatReasoningPart, Extensions};
 
         let provider = responses_provider();
+        let mut summary = ChatReasoningPart::text("why");
+        summary.extensions.insert(
+            "provider_secret".into(),
+            Value::String("summary-secret".into()),
+        );
+        let mut native = ChatReasoningPart::text("because");
+        native.extensions.insert(
+            "provider_secret".into(),
+            Value::String("content-secret".into()),
+        );
         let mut legacy = ChatReasoningPart::text("legacy");
         legacy
             .extensions
@@ -2210,8 +2257,8 @@ mod tests {
             }),
             items: vec![ChatOutputItem::Reasoning(ChatReasoningItem {
                 id: Some("rs_1".to_string()),
-                summary: vec![ChatReasoningPart::text("why")],
-                content: vec![ChatReasoningPart::text("because"), legacy],
+                summary: vec![summary],
+                content: vec![native, legacy],
                 encrypted_content: Some("enc_payload".to_string()),
                 signature: None,
                 status: None,
@@ -2233,6 +2280,9 @@ mod tests {
             "Responses input forbids a non-empty reasoning content array"
         );
         assert_eq!(reasoning["encrypted_content"], "enc_payload");
+        let encoded = serde_json::to_string(&body).unwrap();
+        assert!(!encoded.contains("summary-secret"));
+        assert!(!encoded.contains("content-secret"));
     }
 
     #[test]

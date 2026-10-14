@@ -215,7 +215,7 @@ pub(super) fn apply_cache_breakpoints(messages: &[ChatMessage]) -> Vec<ChatMessa
         .enumerate()
         .map(|(i, msg)| {
             let mut m = msg.clone();
-            if len >= 2 && i >= len - 2 {
+            if len >= 2 && i >= len - 2 && m.cache.is_none() {
                 m.cache = Some(CacheHint::Ephemeral { ttl_seconds: None });
             }
             m
@@ -3416,6 +3416,30 @@ mod tests {
     }
 
     // ── apply_cache_breakpoints ───────────────────────────────────────────────
+
+    #[test]
+    fn cache_defaults_preserve_explicit_hints_and_ttls() {
+        let hint = CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        };
+        let messages = vec![
+            ChatMessage::user()
+                .text("stable")
+                .cache(hint.clone())
+                .build(),
+            ChatMessage::user().text("current").build(),
+        ];
+        let result = apply_cache_breakpoints(&messages);
+        assert_eq!(result[0].cache, Some(hint));
+        assert_eq!(
+            result[1].cache,
+            Some(CacheHint::Ephemeral { ttl_seconds: None })
+        );
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(apply_cache_breakpoints(&result)).unwrap()
+        );
+    }
 
     #[test]
     fn test_cache_breakpoints_empty_slice() {

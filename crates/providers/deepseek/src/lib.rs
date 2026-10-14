@@ -52,6 +52,7 @@ pub struct Deepseek {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     #[serde(default, deserialize_with = "querymt::params::deserialize_system_vec")]
+    #[schemars(schema_with = "querymt::params::schema_for_system_prompts")]
     pub system: Vec<String>,
     pub timeout_seconds: Option<u64>,
     pub stream: Option<bool>,
@@ -86,8 +87,8 @@ impl OpenAIProviderConfig for Deepseek {
         self.temperature.as_ref()
     }
 
-    fn system(&self) -> &[String] {
-        &self.system
+    fn system(&self) -> std::borrow::Cow<'_, [String]> {
+        std::borrow::Cow::Borrowed(&self.system)
     }
 
     fn timeout_seconds(&self) -> Option<&u64> {

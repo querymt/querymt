@@ -113,6 +113,7 @@ pub struct Anthropic {
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub timeout_seconds: Option<u64>,
+    #[schemars(schema_with = "schema_for_anthropic_system")]
     pub system: Option<AnthropicSystemPrompt>,
     pub stream: Option<bool>,
     pub top_p: Option<f32>,
@@ -421,45 +422,72 @@ pub enum AnthropicSystemPrompt {
     Blocks(Vec<TextBlockParam>),
 }
 
+fn schema_for_anthropic_system(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let portable = generator.subschema_for::<querymt::params::SystemPrompt>();
+    let native = generator.subschema_for::<TextBlockParam>();
+    serde_json::from_value(serde_json::json!({"anyOf": [
+        {"type": "null"}, portable, native,
+        {"type": "array", "items": {"anyOf": [portable, native]}}
+    ]}))
+    .expect("valid Anthropic instruction schema")
+}
+
+fn cache_control_from_hint(hint: &querymt::chat::CacheHint) -> CacheControlEphemeral {
+    let querymt::chat::CacheHint::Ephemeral { ttl_seconds } = hint;
+    CacheControlEphemeral {
+        control_type: "ephemeral".into(),
+        ttl: match ttl_seconds {
+            Some(seconds) if *seconds > 300 => Some(CacheTTL::OneHour),
+            Some(_) => Some(CacheTTL::FiveMinutes),
+            None => None,
+        },
+    }
+}
+
 impl<'de> Deserialize<'de> for AnthropicSystemPrompt {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let value = Value::deserialize(deserializer)?;
+        let value = if value.is_object() {
+            Value::Array(vec![value])
+        } else {
+            value
+        };
         match value {
             Value::String(s) => Ok(AnthropicSystemPrompt::Text(s)),
             Value::Array(arr) => {
-                // Try to deserialize as Vec<TextBlockParam> first (objects with "type"/"text")
-                // If that fails, try as Vec<String> (plain string array from LLMParams)
-                let blocks_result: Result<Vec<TextBlockParam>, _> =
-                    serde_json::from_value(Value::Array(arr.clone()));
-                if let Ok(blocks) = blocks_result {
-                    return Ok(AnthropicSystemPrompt::Blocks(blocks));
+                let mut blocks = Vec::with_capacity(arr.len());
+                for value in arr {
+                    if value.get("type").is_some() {
+                        let hint = value
+                            .get("cache")
+                            .filter(|v| !v.is_null())
+                            .map(|hint| {
+                                serde_json::from_value::<querymt::chat::CacheHint>(hint.clone())
+                            })
+                            .transpose()
+                            .map_err(serde::de::Error::custom)?;
+                        let mut block: TextBlockParam =
+                            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                        if block.cache_control.is_none() {
+                            block.cache_control = hint.as_ref().map(cache_control_from_hint);
+                        }
+                        blocks.push(block);
+                        continue;
+                    }
+                    let part: querymt::params::SystemPrompt =
+                        serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                    let cache_control = part.cache().map(cache_control_from_hint);
+                    blocks.push(TextBlockParam {
+                        block_type: "text".into(),
+                        text: part.text().to_owned(),
+                        cache_control,
+                        citations: None,
+                    });
                 }
-
-                // Try as array of plain strings
-                let strings: Vec<String> = arr
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::String(s) => Ok(s),
-                        other => Err(serde::de::Error::custom(format!(
-                            "expected string or TextBlockParam object in system array, got {}",
-                            other
-                        ))),
-                    })
-                    .collect::<Result<_, _>>()?;
-                Ok(AnthropicSystemPrompt::Blocks(
-                    strings
-                        .into_iter()
-                        .map(|text| TextBlockParam {
-                            block_type: "text".to_string(),
-                            text,
-                            cache_control: None,
-                            citations: None,
-                        })
-                        .collect(),
-                ))
+                Ok(AnthropicSystemPrompt::Blocks(blocks))
             }
             other => Err(serde::de::Error::custom(format!(
                 "expected string or array for system prompt, got {}",
@@ -939,19 +967,7 @@ impl HTTPChatProvider for Anthropic {
                 // Apply cache_control to the last content block if present
                 if let Some(cache_hint) = &m.cache {
                     if let Some(last) = content.last_mut() {
-                        let cc = match cache_hint {
-                            querymt::chat::CacheHint::Ephemeral { ttl_seconds } => {
-                                CacheControlEphemeral {
-                                    control_type: "ephemeral".to_string(),
-                                    ttl: match ttl_seconds {
-                                        Some(s) if *s > 300 => Some(CacheTTL::OneHour),
-                                        Some(_) => Some(CacheTTL::FiveMinutes),
-                                        None => None,
-                                    },
-                                }
-                            }
-                        };
-                        last.set_cache_control(cc);
+                        last.set_cache_control(cache_control_from_hint(cache_hint));
                     }
                 }
 
@@ -1476,6 +1492,50 @@ mod tests {
         assert_eq!(body["max_tokens"], serde_json::json!(2500));
         assert_eq!(body["thinking"]["type"], serde_json::json!("enabled"));
         assert_eq!(body["thinking"]["budget_tokens"], serde_json::json!(1024));
+    }
+
+    #[test]
+    fn portable_instruction_hints_map_to_anthropic_cache_control() {
+        let prompt: AnthropicSystemPrompt = serde_json::from_value(serde_json::json!([
+            "legacy",
+            {"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}},
+            {"type": "text", "text": "native", "cache_control": {"type": "ephemeral", "ttl": "5m"}, "cache": {"ephemeral": {"ttl_seconds": 1800}}},
+            {"type": "text", "text": "native with portable hint", "cache": {"ephemeral": {"ttl_seconds": 300}}}
+        ]))
+        .unwrap();
+        let AnthropicSystemPrompt::Blocks(blocks) = prompt else {
+            panic!("blocks");
+        };
+        assert!(blocks[0].cache_control.is_none());
+        assert_eq!(
+            blocks[1].cache_control.as_ref().unwrap().ttl,
+            Some(CacheTTL::OneHour)
+        );
+        assert_eq!(
+            blocks[2].cache_control.as_ref().unwrap().ttl,
+            Some(CacheTTL::FiveMinutes)
+        );
+        assert_eq!(blocks[1].text, "stable");
+        assert_eq!(
+            blocks[3].cache_control.as_ref().unwrap().ttl,
+            Some(CacheTTL::FiveMinutes)
+        );
+    }
+
+    #[test]
+    fn portable_defaults_match_legacy_wire_controls() {
+        let portable: AnthropicSystemPrompt = serde_json::from_value(serde_json::json!([
+            {"text": "stable", "cache": {"ephemeral": {}}}
+        ]))
+        .unwrap();
+        let legacy: AnthropicSystemPrompt = serde_json::from_value(serde_json::json!([
+            {"type": "text", "text": "stable", "cache_control": {"type": "ephemeral"}}
+        ]))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(portable).unwrap(),
+            serde_json::to_value(legacy).unwrap()
+        );
     }
 
     #[test]

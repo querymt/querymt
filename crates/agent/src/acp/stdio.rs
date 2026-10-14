@@ -222,7 +222,15 @@ async fn load_session_and_enqueue_replay(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         };
+        let session_id = req.session_id.to_string();
         let outcome = prepare_session_load(agent, req, &capabilities, &preferences).await?;
+        let seeded = translator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .seed_usage_from_meta(&session_id, outcome.response.meta.as_ref());
+        if !seeded {
+            crate::acp::shared::restore_session_usage(agent, &session_id, translator).await;
+        }
         let enqueue_span = info_span!(
             "acp.replay.enqueue",
             event_count = outcome.event_count,

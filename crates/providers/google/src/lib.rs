@@ -139,6 +139,7 @@ pub struct Google {
         default,
         deserialize_with = "querymt::params::deserialize_system_string"
     )]
+    #[schemars(schema_with = "querymt::params::schema_for_system_prompts")]
     pub system: Option<String>,
     /// Request timeout in seconds
     pub timeout_seconds: Option<u64>,

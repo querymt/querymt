@@ -91,51 +91,44 @@ impl ModelDefaults {
             }
         }
 
-        // Apply Anthropic-specific system prompt caching transformation
-        if self.provider == "anthropic" {
-            self.apply_anthropic_system_caching(obj);
+        // Configured instructions normally form stable prefixes. Providers own
+        // capability checks and TTL translation; unsupported endpoints skip hints.
+        if self.provider == "anthropic"
+            || self.provider == "codex"
+            || (self.provider == "openai"
+                && obj.get("api_mode").and_then(Value::as_str) == Some("responses"))
+        {
+            self.apply_system_cache_defaults(obj);
         }
     }
 
-    /// Transform the system prompt for Anthropic to include cache_control on each block.
-    /// Converts string/string-array system prompts into TextBlockParam objects with cache_control.
-    fn apply_anthropic_system_caching(&self, obj: &mut serde_json::Map<String, Value>) {
-        if let Some(system_val) = obj.get("system").cloned() {
-            let blocks = match &system_val {
-                Value::Array(arr) => arr
-                    .iter()
-                    .map(|v| {
-                        if let Some(s) = v.as_str() {
-                            // String element → convert to TextBlockParam with cache_control
-                            json!({
-                                "type": "text",
-                                "text": s,
-                                "cache_control": { "type": "ephemeral" }
-                            })
-                        } else if let Some(o) = v.as_object() {
-                            // Already a TextBlockParam object → add cache_control if missing
-                            let mut block = o.clone();
-                            block
-                                .entry("cache_control".to_string())
-                                .or_insert(json!({ "type": "ephemeral" }));
-                            Value::Object(block)
-                        } else {
-                            v.clone()
-                        }
-                    })
-                    .collect(),
-                Value::String(s) => {
-                    // Single string → convert to array with one TextBlockParam
-                    vec![json!({
-                        "type": "text",
-                        "text": s,
-                        "cache_control": { "type": "ephemeral" }
-                    })]
+    /// Default each configured instruction section to provider-default lifetime.
+    /// Explicit hints (including null) and native controls always take precedence.
+    fn apply_system_cache_defaults(&self, obj: &mut serde_json::Map<String, Value>) {
+        let Some(system) = obj.get("system") else {
+            return;
+        };
+        let parts = match system {
+            Value::Array(parts) => parts.clone(),
+            Value::String(text) => vec![Value::String(text.clone())],
+            Value::Object(_) => vec![system.clone()],
+            _ => return,
+        };
+        let parts = parts
+            .into_iter()
+            .map(|part| match part {
+                Value::String(text) => json!({"text": text, "cache": {"ephemeral": {}}}),
+                Value::Object(mut part) => {
+                    // Explicit legacy provider controls remain an escape hatch.
+                    if !part.contains_key("cache_control") {
+                        part.entry("cache").or_insert(json!({"ephemeral": {}}));
+                    }
+                    Value::Object(part)
                 }
-                _ => return, // Unexpected type, don't transform
-            };
-            obj.insert("system".into(), Value::Array(blocks));
-        }
+                other => other,
+            })
+            .collect();
+        obj.insert("system".into(), Value::Array(parts));
     }
 
     /// Returns true if all fields are None/empty (no heuristics apply).
@@ -732,62 +725,52 @@ mod tests {
 
     #[test]
     fn test_anthropic_system_caching_string() {
-        let d = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
-        let mut config = json!({
-            "model": "claude-3-7-sonnet-20250219",
-            "system": "You are a helpful assistant."
-        });
-        d.apply_to(&mut config, "session-1");
-
-        // Should be transformed into an array of TextBlockParam with cache_control
-        assert!(config["system"].is_array());
-        let blocks = config["system"].as_array().unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "You are a helpful assistant.");
-        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let mut config = json!({"system": "You are a helpful assistant."});
+        defaults.apply_to(&mut config, "session-1");
+        assert_eq!(
+            config["system"],
+            json!([{
+                "text": "You are a helpful assistant.", "cache": {"ephemeral": {}}
+            }])
+        );
     }
 
     #[test]
     fn test_anthropic_system_caching_string_array() {
-        let d = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
-        let mut config = json!({
-            "model": "claude-3-7-sonnet-20250219",
-            "system": ["Part 1", "Part 2"]
-        });
-        d.apply_to(&mut config, "session-1");
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let mut config = json!({"system": ["Part 1", "Part 2"]});
+        defaults.apply_to(&mut config, "session-1");
+        assert_eq!(
+            config["system"],
+            json!([
+                {"text": "Part 1", "cache": {"ephemeral": {}}},
+                {"text": "Part 2", "cache": {"ephemeral": {}}}
+            ])
+        );
+    }
 
-        // Each string should be wrapped as TextBlockParam with cache_control
-        let blocks = config["system"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "Part 1");
-        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(blocks[1]["type"], "text");
-        assert_eq!(blocks[1]["text"], "Part 2");
-        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+    #[test]
+    fn anthropic_defaults_preserve_portable_instruction_hints() {
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let instruction = json!({"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
+        let mut config = json!({"system": [instruction.clone()]});
+        defaults.apply_to(&mut config, "session");
+        assert_eq!(config["system"][0], instruction);
+        assert!(config["system"][0].get("cache_control").is_none());
     }
 
     #[test]
     fn test_anthropic_system_caching_existing_blocks() {
-        let d = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
-        let mut config = json!({
-            "model": "claude-3-7-sonnet-20250219",
-            "system": [
-                {
-                    "type": "text",
-                    "text": "Already a block"
-                }
-            ]
-        });
-        d.apply_to(&mut config, "session-1");
-
-        // Should add cache_control to existing block
-        let blocks = config["system"].as_array().unwrap();
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "text");
-        assert_eq!(blocks[0]["text"], "Already a block");
-        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        let defaults = ModelDefaults::for_model("anthropic", "claude-3-7-sonnet-20250219");
+        let mut config = json!({"system": [{"type": "text", "text": "Already a block"}]});
+        defaults.apply_to(&mut config, "session-1");
+        assert_eq!(
+            config["system"][0],
+            json!({
+                "type": "text", "text": "Already a block", "cache": {"ephemeral": {}}
+            })
+        );
     }
 
     #[test]
@@ -809,6 +792,52 @@ mod tests {
         let blocks = config["system"].as_array().unwrap();
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(blocks[0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn stable_system_sections_get_portable_defaults_for_responses_and_codex() {
+        for provider in ["openai", "codex"] {
+            let defaults = ModelDefaults::for_model(provider, "gpt-6.1-sol");
+            let explicit =
+                json!({"text": "explicit", "cache": {"ephemeral": {"ttl_seconds": 1800}}});
+            let mut config = json!({
+                "api_mode": "responses",
+                "system": ["file contents", "later instructions", explicit.clone()]
+            });
+            defaults.apply_to(&mut config, "session");
+            assert_eq!(
+                config["system"][0],
+                json!({"text": "file contents", "cache": {"ephemeral": {}}})
+            );
+            assert_eq!(
+                config["system"][1],
+                json!({"text": "later instructions", "cache": {"ephemeral": {}}})
+            );
+            assert_eq!(config["system"][2], explicit);
+            let original = config.clone();
+            defaults.apply_to(&mut config, "session");
+            assert_eq!(config, original);
+        }
+    }
+
+    #[test]
+    fn default_system_hints_reach_responses_with_provider_default_ttl() {
+        let defaults = ModelDefaults::for_model("openai", "gpt-5.6");
+        let mut config = json!({"api_key": "sk-test", "model": "gpt-5.6", "api_mode": "responses", "system": ["stable", "later"]});
+        defaults.apply_to(&mut config, "session");
+        let provider: qmt_openai::OpenAI = serde_json::from_value(config).unwrap();
+        let messages = vec![querymt::chat::ChatMessage::user().text("hello").build()];
+        let request =
+            qmt_openai::api::openai_responses_request(&provider, &messages, None).unwrap();
+        let body: Value = serde_json::from_slice(request.body()).unwrap();
+        for index in 0..2 {
+            assert_eq!(
+                body["input"][0]["content"][index]["prompt_cache_breakpoint"]["mode"],
+                "explicit"
+            );
+        }
+        // Omit TTL rather than hardcoding a duration unsupported by another backend.
+        assert!(body.get("prompt_cache_options").is_none());
     }
 
     #[test]

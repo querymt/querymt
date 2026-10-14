@@ -183,19 +183,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| serde_json::json!({}));
 
-    if let Some(system) = params.get("system").and_then(|s| s.as_array()) {
-        println!("   System prompt parts: {}", system.len());
-        for (i, part) in system.iter().enumerate() {
-            if let Some(s) = part.as_str() {
-                println!("      Part {}: {} chars", i + 1, s.len());
-                // Show first 100 chars
-                let preview = if s.len() > 100 {
-                    querymt_utils::str_utils::truncate_with_ellipsis(s, 100)
-                } else {
-                    s.to_string()
-                };
-                println!("         Preview: {}", preview.replace('\n', " "));
-            }
+    if let Some(system) = params.get("system") {
+        let parts = querymt::params::deserialize_system_prompts(system.clone())
+            .map_err(|error| format!("Invalid stored system instructions: {error}"))?;
+        println!("   System prompt parts: {}", parts.len());
+        for (i, part) in parts.iter().enumerate() {
+            let text = part.text();
+            println!("      Part {}: {} chars", i + 1, text.len());
+            let preview = querymt_utils::str_utils::truncate_with_ellipsis(text, 100);
+            println!("         Preview: {}", preview.replace('\n', " "));
         }
     }
 
