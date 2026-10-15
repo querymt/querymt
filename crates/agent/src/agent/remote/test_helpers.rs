@@ -126,6 +126,7 @@ pub(crate) mod fixtures {
                             }),
                             iroh_enabled: false,
                             iroh_gso: true,
+                            iroh_dns: None,
                             iroh_scopes: Vec::new(),
                             identity_file: Some(identity_path),
                             request_timeout: std::time::Duration::from_secs(300),

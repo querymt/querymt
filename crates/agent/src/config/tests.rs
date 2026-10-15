@@ -1228,6 +1228,35 @@ name = "team-b"
 }
 
 #[test]
+fn test_mesh_iroh_dns_parses_and_round_trips() {
+    assert!(MeshTomlConfig::default().iroh_dns.is_none());
+    let config: MeshTomlConfig = toml::from_str(
+        r#"
+        enabled = true
+        transport = "iroh"
+        [iroh_dns]
+        system_defaults = false
+        fallback = "never"
+        [[iroh_dns.nameservers]]
+        addr = "127.0.0.1:5353"
+        protocol = "https"
+        tls_server_name = "dns.internal"
+    "#,
+    )
+    .unwrap();
+    let dns = config.iroh_dns.as_ref().unwrap();
+    assert!(dns.validate().is_ok());
+    assert_eq!(
+        dns.nameservers[0].tls_server_name.as_deref(),
+        Some("dns.internal")
+    );
+    let round_trip: MeshTomlConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+    assert_eq!(round_trip.iroh_dns, config.iroh_dns);
+    assert!(toml::from_str::<MeshTomlConfig>("[iroh_dns]\nfallback = 'typo'").is_err());
+    assert!(toml::from_str::<MeshTomlConfig>("[iroh_dns]\nunknown = true").is_err());
+}
+
+#[test]
 fn test_mesh_iroh_gso_parses_on_and_off() {
     assert!(MeshTomlConfig::default().iroh_gso);
     for enabled in [false, true] {

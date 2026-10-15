@@ -26,6 +26,7 @@ pub async fn join_mesh_via_invite(
     invite: &crate::agent::remote::invite::SignedInviteGrant,
     identity_file: Option<std::path::PathBuf>,
     iroh_gso: bool,
+    iroh_dns: Option<querymt_remote::IrohDnsConfig>,
 ) -> Result<MeshRuntimeHandle, MeshError> {
     use crate::agent::remote::invite::{PeerEntry, mesh_id_for};
     use crate::agent::remote::node_manager::{AdmissionRequest, AdmissionResponse};
@@ -81,6 +82,7 @@ pub async fn join_mesh_via_invite(
         lan: None,
         iroh_enabled: true,
         iroh_gso,
+        iroh_dns,
         iroh_scopes: vec![IrohMeshConfig {
             mesh_id: mesh_id.clone(),
             invite: Some(invite.encode()),

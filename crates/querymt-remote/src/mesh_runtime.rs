@@ -49,6 +49,7 @@ fn iroh_transport_config(config: &MeshRuntimeConfig) -> libp2p_iroh::TransportCo
     libp2p_iroh::TransportConfig {
         timeout: config.request_timeout,
         enable_gso: config.iroh_gso,
+        dns_resolver: config.iroh_dns.as_ref().map(crate::IrohDnsConfig::resolver),
         ..Default::default()
     }
 }
@@ -77,6 +78,9 @@ pub async fn bootstrap_mesh_runtime(
 }
 
 pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHandle, MeshError> {
+    config
+        .validate()
+        .map_err(|error| MeshError::SwarmError(error.to_string()))?;
     let has_lan = config.has_lan();
     let has_iroh = config.has_iroh();
 
@@ -361,6 +365,8 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
     let has_lan_loop = has_lan;
     let has_iroh_loop = has_iroh;
 
+    let diagnostics = crate::iroh_diagnostics::IrohDiagnostics::new(iroh_endpoint.clone());
+    let diagnostics_loop = diagnostics.clone();
     tokio::spawn(async move {
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
         let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
@@ -468,7 +474,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                             peer_iroh_scope_loop.clear();
                             finish_swarm_shutdown(
                                 iroh_endpoint.take().map(|endpoint| async move {
-                                    endpoint.close().await;
+                                    diagnostics_loop.close(endpoint).await;
                                 }),
                                 swarm,
                                 completion,
@@ -548,6 +554,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         swarm_cmd_tx,
         config.stream_reconnect_grace,
     );
+    handle.iroh_diagnostics = diagnostics;
     handle.set_config_scopes(config.active_scopes());
     Ok(handle)
 }
@@ -621,6 +628,7 @@ mod tests {
                     }),
                     iroh_enabled: true,
                     iroh_gso,
+                    iroh_dns: Some(crate::IrohDnsConfig::default()),
                     iroh_scopes: Vec::new(),
                     identity_file: None,
                     request_timeout: std::time::Duration::from_secs(19),
@@ -637,6 +645,10 @@ mod tests {
                     libp2p_iroh::TransportConfig::default().relay_mode
                 );
                 assert!(transport.peer_filter.is_none());
+                assert!(transport.dns_resolver.is_some());
+                let mut defaults = config.clone();
+                defaults.iroh_dns = None;
+                assert!(iroh_transport_config(&defaults).dns_resolver.is_none());
             }
         }
     }
@@ -728,13 +740,15 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let endpoint = local_endpoint().await;
             let addr = endpoint.bound_sockets()[0];
+            let diagnostics = crate::iroh_diagnostics::IrohDiagnostics::new(Some(endpoint.clone()));
+            let diagnostics_loop = diagnostics.clone();
             let mut iroh_endpoint = Some(endpoint.clone());
             let (completion_tx, completion_rx) = oneshot::channel();
             let (release_driver_tx, release_driver_rx) = oneshot::channel();
             let driver = tokio::spawn(async move {
                 finish_swarm_shutdown(
                     iroh_endpoint.take().map(|endpoint| async move {
-                        endpoint.close().await;
+                        diagnostics_loop.close(endpoint).await;
                     }),
                     endpoint,
                     Some(completion_tx),
@@ -745,6 +759,7 @@ mod tests {
             });
 
             completion_rx.await.unwrap();
+            assert!(diagnostics.snapshot().unwrap().closed);
             std::net::UdpSocket::bind(addr)
                 .expect("Iroh socket was not released before shutdown acknowledgement");
             release_driver_tx.send(()).unwrap();
@@ -759,6 +774,12 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let (runtime, mut swarm_cmd_rx) = test_runtime_handle(MeshTransportMode::Iroh);
             let local = local_endpoint().await;
+            let mut mesh = runtime.as_mesh_handle().clone();
+            assert!(mesh.iroh_diagnostics().is_none());
+            mesh.iroh_diagnostics =
+                crate::iroh_diagnostics::IrohDiagnostics::new(Some(local.clone()));
+            let runtime = MeshRuntimeHandle::new(mesh);
+            assert!(!runtime.iroh_diagnostics().unwrap().closed);
             let peer = local_endpoint().await;
             let addr = iroh::EndpointAddr::new(local.id()).with_ip_addr(local.bound_sockets()[0]);
             let (local_connection, peer_connection) = tokio::join!(
@@ -776,16 +797,23 @@ mod tests {
             assert_eq!(&local_payload, b"live");
 
             let local_for_loop = local.clone();
+            let diagnostics = runtime.as_mesh_handle().iroh_diagnostics.clone();
             let driver = tokio::spawn(async move {
                 match swarm_cmd_rx.recv().await.unwrap() {
                     SwarmCommand::Shutdown { completion } => {
-                        finish_swarm_shutdown(Some(local_for_loop.close()), (), completion).await;
+                        finish_swarm_shutdown(
+                            Some(diagnostics.close(local_for_loop)),
+                            (),
+                            completion,
+                        )
+                        .await;
                     }
                     other => panic!("expected Shutdown command, got {other:?}"),
                 }
             });
             tokio::join!(runtime.shutdown(), runtime.shutdown());
             driver.await.unwrap();
+            assert!(runtime.iroh_diagnostics().unwrap().closed);
             tokio::time::timeout(std::time::Duration::from_secs(3), peer_connection.closed())
                 .await
                 .expect("peer connection did not observe endpoint shutdown");
