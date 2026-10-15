@@ -200,6 +200,7 @@ impl ChatStreamParser for CodexStreamParser {
             self.state =
                 qmt_openai::api::OpenAIResponsesStreamState::for_provider(codex_provenance());
             self.policy.reject_end_turn_false = true;
+            self.policy.terminal_usage_log_target = Some("qmt_codex");
             self.initialized = true;
         }
         let chunks = qmt_openai::api::parse_openai_responses_sse_chunk_with_policy(
@@ -357,6 +358,79 @@ mod stream_parser_tests {
     use super::{ChatStreamParser, CodexStreamParser, LLMError, StreamChunk};
     use querymt::chat::{ChatOutputStatus, StructuredStreamEvent};
     use querymt::error::ProviderErrorKind;
+
+    #[test]
+    fn active_stream_parser_logs_only_raw_terminal_usage() {
+        use std::cell::RefCell;
+
+        thread_local! {
+            static MESSAGES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+        struct CaptureLogger;
+        impl log::Log for CaptureLogger {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.target() == "qmt_codex" && metadata.level() == log::Level::Debug
+            }
+
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    MESSAGES.with(|messages| messages.borrow_mut().push(record.args().to_string()));
+                }
+            }
+
+            fn flush(&self) {}
+        }
+        static LOGGER: CaptureLogger = CaptureLogger;
+        log::set_logger(&LOGGER).expect("install test logger");
+        log::set_max_level(log::LevelFilter::Debug);
+
+        let usage = serde_json::json!({
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "input_tokens_details": {"cached_tokens": 8}
+        });
+        let payload = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "usage": usage,
+                "sensitive_fixture": "must-not-be-logged"
+            }
+        });
+        let frame = format!("data: {payload}\n\n");
+        let mut parser = CodexStreamParser::default();
+        let events = parser.parse_chunk(frame.as_bytes()).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                usage: Some(_),
+                ..
+            })
+        )));
+        assert!(parser.finish().unwrap().is_empty());
+        MESSAGES.with(|messages| {
+            assert_eq!(
+                *messages.borrow(),
+                vec![format!(
+                    "cache response terminal=response.completed usage={usage}"
+                )]
+            );
+            messages.borrow_mut().clear();
+        });
+
+        // Other providers do not opt in to raw usage logging.
+        qmt_openai::api::parse_openai_responses_sse_chunk_with_policy(
+            frame.as_bytes(),
+            &mut qmt_openai::api::OpenAIResponsesStreamState::default(),
+            &qmt_openai::api::ResponsesStreamPolicy::default(),
+        )
+        .unwrap();
+        // Missing usage is a valid completion, but not a usage diagnostic.
+        CodexStreamParser::default()
+            .parse_chunk(b"data: {\"type\":\"response.completed\",\"response\":{}}\n\n")
+            .unwrap();
+        MESSAGES.with(|messages| assert!(messages.borrow().is_empty()));
+    }
 
     #[test]
     fn premature_eof_before_response_completed_is_retryable() {

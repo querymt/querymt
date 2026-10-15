@@ -80,66 +80,6 @@ path = "oci://ghcr.io/querymt/openai:latest"
 
 For a full examples-oriented setup (GHCR providers, local wasm provider builds, and run commands), see `crates/querymt/examples/README.md`.
 
-### Prompt Cache Hints
-
-`ChatMessageBuilder::cache(CacheHint::Ephemeral { ttl_seconds })` requests a reusable
-prefix ending at that message. Configured instructions accept the same metadata;
-legacy strings and string arrays remain supported. For example, in an agent config:
-
-```toml
-system = [
-  { file = "prompts/base.md", cache = { ephemeral = { ttl_seconds = 1800 } } },
-  "Changing instructions belong after the stable prefix."
-]
-```
-
-In the agent runtime, plain system strings and `{ file = "..." }` entries receive
-provider-default cache hints for Anthropic, Codex, and OpenAI Responses. Explicit
-hints/TTLs are preserved. Each instruction section is a prefix boundary, so a
-changing later section does not remove the earlier stable boundary. The standalone
-provider/CLI API still requires explicit hints; these defaults are agent policy.
-Responses currently defaults to `30m`, not unlimited session retention. Codex's
-unsupported translation remains disabled, so annotations do not guarantee reuse.
-
-Programmatic callers can pass `querymt::params::SystemPrompt::with_cache(text, hint)`
-to `.system(...)`. File references are resolved by the agent, not provider plugins.
-Providers translate hints; unsupported endpoints may skip them. Responses supports
-only a 1,800-second (`30m`) request-wide minimum lifetime: applied hints must agree
-with the provider's configured TTL. Omit `ttl_seconds` for the provider default.
-A lifetime is not a deletion deadline, and cache hits are not guaranteed.
-
-On supported OpenAI Responses models, hints become explicit prefix breakpoints;
-request-wide mode remains configurable with `extra_body.prompt_cache_options`.
-Unknown endpoints require the `supports_prompt_cache_breakpoints` override after
-support is verified. ChatGPT Codex translation is implemented but its activation is
-commented out with a FIXME because that backend rejects these controls. DEBUG logs
-under `qmt_codex` explain skipped hints. No prewarming is performed.
-
-The resolved `LLMParams.system`, `OpenAI.system`, and `Codex.system` Rust fields now
-use `Vec<SystemPrompt>`; callers assigning those fields directly should convert
-strings with `.into()`. Existing `.system("text")` builder calls remain supported.
-The providers' configuration-trait text getters use `Cow` to support both legacy
-string storage and structured instructions; `system_parts()` preserves the hints.
-
-#### Opt-In Codex Live Test
-
-Ordinary `cargo test` runs ignore live inference. The reusable diagnostic is also
-protected by `QMT_RUN_LIVE_CODEX=1`, even when running ignored tests. Build the CLI
-and Codex WASM plugin and authenticate first, then explicitly run:
-
-```sh
-QMT_RUN_LIVE_CODEX=1 \
-QMT_TEST_QMT_BIN="$PWD/target/debug/qmt" \
-QMT_TEST_PROVIDER_CONFIG="$HOME/.qmt/providers.toml" \
-QMT_TEST_CODEX_MODEL=gpt-5.6-sol \
-cargo test -p qmt-codex --no-default-features --features api \
-  --test live_cache live_codex_cache_usage -- --ignored --nocapture
-```
-
-The config must load the patched plugin. This diagnostic makes three live requests,
-consumes account quota, and prints raw usage; a cache miss is not a test failure.
-Do not enable the opt-in in routine CI. No live requests are made by unit tests.
-
 ## Agent
 
 The `querymt-agent` crate (in `crates/agent`) is the high-level agent runtime for QueryMaTe.

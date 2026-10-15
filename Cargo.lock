@@ -11174,6 +11174,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
+ "reqwest 0.13.5",
  "schemars 1.2.3",
  "serde",
  "serde_json",

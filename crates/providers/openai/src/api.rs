@@ -3510,6 +3510,8 @@ impl OpenAIResponsesStreamState {
 pub struct ResponsesStreamPolicy {
     /// Reject a completed response that reports `end_turn=false`.
     pub reject_end_turn_false: bool,
+    /// Opt-in log target for raw completed-response usage diagnostics (usage only).
+    pub terminal_usage_log_target: Option<&'static str>,
 }
 
 /// Parse Responses SSE frames using the shared item-aware codec.
@@ -3530,7 +3532,7 @@ pub fn parse_openai_responses_sse_chunk_with_policy(
             "response.completed with end_turn=false is not supported".to_string(),
         ));
     }
-    parse_openai_responses_sse_chunk(chunk, state)
+    parse_openai_responses_sse_chunk_inner(chunk, state, policy)
 }
 
 /// Whether this SSE chunk contains a `response.completed` with `end_turn=false`.
@@ -3555,6 +3557,14 @@ fn response_reports_end_turn_false(chunk: &[u8]) -> bool {
 pub fn parse_openai_responses_sse_chunk(
     chunk: &[u8],
     state: &mut OpenAIResponsesStreamState,
+) -> Result<Vec<StreamChunk>, LLMError> {
+    parse_openai_responses_sse_chunk_inner(chunk, state, &ResponsesStreamPolicy::default())
+}
+
+fn parse_openai_responses_sse_chunk_inner(
+    chunk: &[u8],
+    state: &mut OpenAIResponsesStreamState,
+    policy: &ResponsesStreamPolicy,
 ) -> Result<Vec<StreamChunk>, LLMError> {
     if chunk.is_empty() {
         return Ok(Vec::new());
@@ -3770,6 +3780,14 @@ pub fn parse_openai_responses_sse_chunk(
             "response.completed" => {
                 state.terminal_seen = true;
                 let response = event.response.unwrap_or(Value::Null);
+                if let Some(target) = policy.terminal_usage_log_target
+                    && let Some(usage_value) = response.get("usage")
+                {
+                    log::debug!(
+                        target: target,
+                        "cache response terminal=response.completed usage={usage_value}"
+                    );
+                }
                 let usage = response
                     .get("usage")
                     .and_then(|usage| {

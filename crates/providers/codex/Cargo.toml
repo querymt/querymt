@@ -29,3 +29,6 @@ base64.workspace = true
 heck.workspace = true
 log.workspace = true
 extism-pdk = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }

@@ -148,3 +148,142 @@ lossy export; transparent downgrade compatibility is not provided.
 - A complete built-in/custom-tool execution framework.
 - Universal portability of encrypted or provider-opaque state across origins.
 
+## Prompt Cache Hints
+
+`ChatMessageBuilder::cache(CacheHint::Ephemeral { ttl_seconds })` requests a reusable
+prefix ending at that message. Configured instructions accept the same metadata;
+legacy strings and string arrays remain supported. For example, in an agent config:
+
+```toml
+system = [
+  { file = "prompts/base.md", cache = { ephemeral = { ttl_seconds = 1800 } } },
+  "Changing instructions belong after the stable prefix."
+]
+```
+
+In the agent runtime, plain system strings and `{ file = "..." }` entries receive
+provider-default cache hints for Anthropic, Codex, and OpenAI Responses. Explicit
+hints/TTLs are preserved. Each instruction section is a prefix boundary, so a
+changing later section does not remove the earlier stable boundary. The standalone
+provider/CLI API still requires explicit hints; these defaults are agent policy.
+Responses currently defaults to `30m`, not unlimited session retention. Codex's
+unsupported translation remains disabled, so annotations do not guarantee reuse.
+
+Programmatic callers can pass `querymt::params::SystemPrompt::with_cache(text, hint)`
+to `.system(...)`. File references are resolved by the agent, not provider plugins.
+Providers translate hints; unsupported endpoints may skip them. Responses supports
+only a 1,800-second (`30m`) request-wide minimum lifetime: applied hints must agree
+with the provider's configured TTL. Omit `ttl_seconds` for the provider default.
+A lifetime is not a deletion deadline, and cache hits are not guaranteed.
+
+On supported OpenAI Responses models, hints become explicit prefix breakpoints;
+request-wide mode remains configurable with `extra_body.prompt_cache_options`.
+Unknown endpoints require the `supports_prompt_cache_breakpoints` override after
+support is verified. ChatGPT Codex translation is implemented but its activation is
+commented out with a FIXME because that backend rejects these controls. DEBUG logs
+under `qmt_codex` explain skipped hints. No prewarming is performed.
+
+The resolved `LLMParams.system`, `OpenAI.system`, and `Codex.system` Rust fields now
+use `Vec<SystemPrompt>`; callers assigning those fields directly should convert
+strings with `.into()`. Existing `.system("text")` builder calls remain supported.
+The providers' configuration-trait text getters use `Cow` to support both legacy
+string storage and structured instructions; `system_parts()` preserves the hints.
+
+### Opt-In Codex Live Probes
+
+Ordinary `cargo test` runs ignore live inference. Both probes also require
+`QMT_RUN_LIVE_CODEX=1`, even when running ignored tests. They consume account quota;
+do not enable them in routine CI. Authenticate with the CLI first and build the
+CLI and plugin from the same checkout:
+
+```sh
+cargo build -p querymt-cli --bin qmt
+cargo build -p qmt-codex --target wasm32-wasip1 --release
+```
+
+Ensure `providers.toml` loads the rebuilt plugin, for example
+`target/wasm32-wasip1/release/qmt_codex.wasm` (use an absolute path in the config).
+Running native integration tests does not rebuild this WASM artifact.
+
+#### Usage Reporting (Not a Cache-Hit Assertion)
+
+```sh
+QMT_RUN_LIVE_CODEX=1 \
+QMT_TEST_QMT_BIN="$PWD/target/debug/qmt" \
+QMT_TEST_PROVIDER_CONFIG="$HOME/.qmt/providers.toml" \
+QMT_TEST_CODEX_MODEL=gpt-5.6-sol \
+cargo test -p qmt-codex --no-default-features --features api \
+  --test live_cache live_codex_cache_usage -- --ignored --nocapture
+```
+
+This diagnostic makes three identical live requests with one stable
+`prompt_cache_key` and prints raw terminal usage. It requires successful inference
+and usage reporting; a cache miss is not a test failure. A positive server-reported
+`input_tokens_details.cached_tokens` indicates observed cache reuse. All-zero
+cached-token counts mean no reuse was observed, not proof that the model never
+supports caching. This probe supplies no explicit cache mode, breakpoint, or TTL.
+
+#### Cache Parameter Acceptance
+
+Use the separate acceptance probe to test the explicit controls rejected by some
+ChatGPT Codex models:
+
+```sh
+QMT_RUN_LIVE_CODEX=1 \
+QMT_TEST_QMT_BIN="$PWD/target/debug/qmt" \
+QMT_TEST_PROVIDER_CONFIG="$HOME/.qmt/providers.toml" \
+QMT_TEST_CODEX_MODEL=gpt-5.6-sol \
+QMT_TEST_CODEX_CACHE_EXPECT=accept \
+cargo test -p qmt-codex --no-default-features --features api \
+  --test live_cache_parameters live_codex_cache_parameter_acceptance -- --ignored --nocapture
+```
+
+It captures one authenticated request from the configured CLI/plugin through a
+local loopback listener, returning a synthetic completion to the CLI without
+contacting the backend. It then sends four variants of that request directly to
+`https://chatgpt.com/backend-api/codex/responses` over HTTPS (redirects disabled):
+
+| Case | Change from baseline |
+| --- | --- |
+| `baseline` | Neither cache field |
+| `options_only` | Request-level `prompt_cache_options: {"mode":"explicit"}` |
+| `breakpoint_only` | `prompt_cache_breakpoint: {"mode":"explicit"}` on the first input-text content part |
+| `combined` | Both fields |
+
+The CLI's `base_url` is temporarily overridden for capture; the live destination
+is always the ChatGPT Codex endpoint above, not a custom configured endpoint.
+Credentials come from the configured CLI/plugin. The probe supplies a fixed system
+prefix and user question; after capture, model, instructions, and input stay
+identical across the four variants. `extra_body` is cleared to isolate the controls.
+No TTL is supplied. Mutation happens after JSON serialization, avoiding duplicate
+`input` keys or silently skipped hint translation. Credentials remain in memory
+and are never printed.
+
+A successful baseline is mandatory; otherwise the probe stops. Each other case
+prints an HTTP status and one of these verdicts:
+
+- `Accepted`: a successful HTTP response containing `response.completed`.
+- `Rejected("prompt_cache_options.mode")`, `Rejected("prompt_cache_options")`, or
+  `Rejected("prompt_cache_breakpoint")`:
+  an explicit parameter-validation rejection, from HTTP 400/422 or an SSE error.
+  The raw backend error is withheld; the report prints only an allowlisted field.
+- `Inconclusive`: authentication, quota, rate-limit, transport, unrelated errors,
+  incomplete responses, or a missing terminal completion. This is always a test
+  failure, never evidence that the parameter is unsupported.
+
+`QMT_TEST_CODEX_CACHE_EXPECT=accept` is the default and requires all three parameter
+cases to be accepted. Set it to `reject` to reproduce rejection: all three cases
+must explicitly reject a tested field. Mixed support fails either strict
+expectation, with individual verdicts showing which controls the model accepts.
+Combined rejection can identify only the first field the backend rejects; the
+isolated cases identify support for each field independently.
+
+Acceptance does not establish that the fields are honored or that cache hits
+occur. This is an endpoint/model parameter probe, not a changed-suffix cache-hit
+probe, and it does not enable Codex's disabled production cache-hint translation.
+Offline request-shape and verdict tests run without OAuth or inference:
+
+```sh
+cargo test -p qmt-codex --no-default-features --features api --test live_cache_parameters
+```
+
