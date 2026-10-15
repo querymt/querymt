@@ -747,6 +747,62 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#prompt-cache-hints" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Prompt Cache Hints
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Prompt Cache Hints">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#opt-in-codex-live-probes" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Opt-In Codex Live Probes
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Opt-In Codex Live Probes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#usage-reporting-not-a-cache-hit-assertion" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Usage Reporting (Not a Cache-Hit Assertion)
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cache-parameter-acceptance" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Cache Parameter Acceptance
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
     </ul>
   
 </nav>
@@ -1916,6 +1972,152 @@ lossy export; transparent downgrade compatibility is not provided.</p>
 <li>A complete built-in/custom-tool execution framework.</li>
 <li>Universal portability of encrypted or provider-opaque state across origins.</li>
 </ul>
+<h2 id="prompt-cache-hints">Prompt Cache Hints</h2>
+<p><code>ChatMessageBuilder::cache(CacheHint::Ephemeral { ttl_seconds })</code> requests a reusable
+prefix ending at that message. Configured instructions accept the same metadata;
+legacy strings and string arrays remain supported. For example, in an agent config:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
+<span class="normal"><a href="#__codelineno-3-2">2</a></span>
+<span class="normal"><a href="#__codelineno-3-3">3</a></span>
+<span class="normal"><a href="#__codelineno-3-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="n">system</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="w">  </span><span class="p">{</span><span class="w"> </span><span class="n">file</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">"prompts/base.md"</span><span class="p">,</span><span class="w"> </span><span class="n">cache</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">ephemeral</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">ttl_seconds</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="mi">1800</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">},</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="w">  </span><span class="s2">"Changing instructions belong after the stable prefix."</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="p">]</span>
+</code></pre></div></td></tr></table></div>
+<p>In the agent runtime, plain system strings and <code>{ file = "..." }</code> entries receive
+provider-default cache hints for Anthropic, Codex, and OpenAI Responses. Explicit
+hints/TTLs are preserved. Each instruction section is a prefix boundary, so a
+changing later section does not remove the earlier stable boundary. The standalone
+provider/CLI API still requires explicit hints; these defaults are agent policy.
+Responses currently defaults to <code>30m</code>, not unlimited session retention. Codex's
+unsupported translation remains disabled, so annotations do not guarantee reuse.</p>
+<p>Programmatic callers can pass <code>querymt::params::SystemPrompt::with_cache(text, hint)</code>
+to <code>.system(...)</code>. File references are resolved by the agent, not provider plugins.
+Providers translate hints; unsupported endpoints may skip them. Responses supports
+only a 1,800-second (<code>30m</code>) request-wide minimum lifetime: applied hints must agree
+with the provider's configured TTL. Omit <code>ttl_seconds</code> for the provider default.
+A lifetime is not a deletion deadline, and cache hits are not guaranteed.</p>
+<p>On supported OpenAI Responses models, hints become explicit prefix breakpoints;
+request-wide mode remains configurable with <code>extra_body.prompt_cache_options</code>.
+Unknown endpoints require the <code>supports_prompt_cache_breakpoints</code> override after
+support is verified. ChatGPT Codex translation is implemented but its activation is
+commented out with a FIXME because that backend rejects these controls. DEBUG logs
+under <code>qmt_codex</code> explain skipped hints. No prewarming is performed.</p>
+<p>The resolved <code>LLMParams.system</code>, <code>OpenAI.system</code>, and <code>Codex.system</code> Rust fields now
+use <code>Vec&lt;SystemPrompt&gt;</code>; callers assigning those fields directly should convert
+strings with <code>.into()</code>. Existing <code>.system("text")</code> builder calls remain supported.
+The providers' configuration-trait text getters use <code>Cow</code> to support both legacy
+string storage and structured instructions; <code>system_parts()</code> preserves the hints.</p>
+<h3 id="opt-in-codex-live-probes">Opt-In Codex Live Probes</h3>
+<p>Ordinary <code>cargo test</code> runs ignore live inference. Both probes also require
+<code>QMT_RUN_LIVE_CODEX=1</code>, even when running ignored tests. They consume account quota;
+do not enable them in routine CI. Authenticate with the CLI first and build the
+CLI and plugin from the same checkout:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
+<span class="normal"><a href="#__codelineno-4-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>querymt-cli<span class="w"> </span>--bin<span class="w"> </span>qmt
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a>cargo<span class="w"> </span>build<span class="w"> </span>-p<span class="w"> </span>qmt-codex<span class="w"> </span>--target<span class="w"> </span>wasm32-wasip1<span class="w"> </span>--release
+</code></pre></div></td></tr></table></div>
+<p>Ensure <code>providers.toml</code> loads the rebuilt plugin, for example
+<code>target/wasm32-wasip1/release/qmt_codex.wasm</code> (use an absolute path in the config).
+Running native integration tests does not rebuild this WASM artifact.</p>
+<h4 id="usage-reporting-not-a-cache-hit-assertion">Usage Reporting (Not a Cache-Hit Assertion)</h4>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
+<span class="normal"><a href="#__codelineno-5-2">2</a></span>
+<span class="normal"><a href="#__codelineno-5-3">3</a></span>
+<span class="normal"><a href="#__codelineno-5-4">4</a></span>
+<span class="normal"><a href="#__codelineno-5-5">5</a></span>
+<span class="normal"><a href="#__codelineno-5-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="nv">QMT_RUN_LIVE_CODEX</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="nv">QMT_TEST_QMT_BIN</span><span class="o">=</span><span class="s2">"</span><span class="nv">$PWD</span><span class="s2">/target/debug/qmt"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="nv">QMT_TEST_PROVIDER_CONFIG</span><span class="o">=</span><span class="s2">"</span><span class="nv">$HOME</span><span class="s2">/.qmt/providers.toml"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="nv">QMT_TEST_CODEX_MODEL</span><span class="o">=</span>gpt-5.6-sol<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5"></a>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-p<span class="w"> </span>qmt-codex<span class="w"> </span>--no-default-features<span class="w"> </span>--features<span class="w"> </span>api<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="w">  </span>--test<span class="w"> </span>live_cache<span class="w"> </span>live_codex_cache_usage<span class="w"> </span>--<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</code></pre></div></td></tr></table></div>
+<p>This diagnostic makes three identical live requests with one stable
+<code>prompt_cache_key</code> and prints raw terminal usage. It requires successful inference
+and usage reporting; a cache miss is not a test failure. A positive server-reported
+<code>input_tokens_details.cached_tokens</code> indicates observed cache reuse. All-zero
+cached-token counts mean no reuse was observed, not proof that the model never
+supports caching. This probe supplies no explicit cache mode, breakpoint, or TTL.</p>
+<h4 id="cache-parameter-acceptance">Cache Parameter Acceptance</h4>
+<p>Use the separate acceptance probe to test the explicit controls rejected by some
+ChatGPT Codex models:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>
+<span class="normal"><a href="#__codelineno-6-2">2</a></span>
+<span class="normal"><a href="#__codelineno-6-3">3</a></span>
+<span class="normal"><a href="#__codelineno-6-4">4</a></span>
+<span class="normal"><a href="#__codelineno-6-5">5</a></span>
+<span class="normal"><a href="#__codelineno-6-6">6</a></span>
+<span class="normal"><a href="#__codelineno-6-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="nv">QMT_RUN_LIVE_CODEX</span><span class="o">=</span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a><span class="nv">QMT_TEST_QMT_BIN</span><span class="o">=</span><span class="s2">"</span><span class="nv">$PWD</span><span class="s2">/target/debug/qmt"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="nv">QMT_TEST_PROVIDER_CONFIG</span><span class="o">=</span><span class="s2">"</span><span class="nv">$HOME</span><span class="s2">/.qmt/providers.toml"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="nv">QMT_TEST_CODEX_MODEL</span><span class="o">=</span>gpt-5.6-sol<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="nv">QMT_TEST_CODEX_CACHE_EXPECT</span><span class="o">=</span>accept<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6"></a>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-p<span class="w"> </span>qmt-codex<span class="w"> </span>--no-default-features<span class="w"> </span>--features<span class="w"> </span>api<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7"></a><span class="w">  </span>--test<span class="w"> </span>live_cache_parameters<span class="w"> </span>live_codex_cache_parameter_acceptance<span class="w"> </span>--<span class="w"> </span>--ignored<span class="w"> </span>--nocapture
+</code></pre></div></td></tr></table></div>
+<p>It captures one authenticated request from the configured CLI/plugin through a
+local loopback listener, returning a synthetic completion to the CLI without
+contacting the backend. It then sends four variants of that request directly to
+<code>https://chatgpt.com/backend-api/codex/responses</code> over HTTPS (redirects disabled):</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Change from baseline</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>baseline</code></td>
+<td>Neither cache field</td>
+</tr>
+<tr>
+<td><code>options_only</code></td>
+<td>Request-level <code>prompt_cache_options: {"mode":"explicit"}</code></td>
+</tr>
+<tr>
+<td><code>breakpoint_only</code></td>
+<td><code>prompt_cache_breakpoint: {"mode":"explicit"}</code> on the first input-text content part</td>
+</tr>
+<tr>
+<td><code>combined</code></td>
+<td>Both fields</td>
+</tr>
+</tbody>
+</table>
+<p>The CLI's <code>base_url</code> is temporarily overridden for capture; the live destination
+is always the ChatGPT Codex endpoint above, not a custom configured endpoint.
+Credentials come from the configured CLI/plugin. The probe supplies a fixed system
+prefix and user question; after capture, model, instructions, and input stay
+identical across the four variants. <code>extra_body</code> is cleared to isolate the controls.
+No TTL is supplied. Mutation happens after JSON serialization, avoiding duplicate
+<code>input</code> keys or silently skipped hint translation. Credentials remain in memory
+and are never printed.</p>
+<p>A successful baseline is mandatory; otherwise the probe stops. Each other case
+prints an HTTP status and one of these verdicts:</p>
+<ul>
+<li><code>Accepted</code>: a successful HTTP response containing <code>response.completed</code>.</li>
+<li><code>Rejected("prompt_cache_options.mode")</code>, <code>Rejected("prompt_cache_options")</code>, or
+  <code>Rejected("prompt_cache_breakpoint")</code>:
+  an explicit parameter-validation rejection, from HTTP 400/422 or an SSE error.
+  The raw backend error is withheld; the report prints only an allowlisted field.</li>
+<li><code>Inconclusive</code>: authentication, quota, rate-limit, transport, unrelated errors,
+  incomplete responses, or a missing terminal completion. This is always a test
+  failure, never evidence that the parameter is unsupported.</li>
+</ul>
+<p><code>QMT_TEST_CODEX_CACHE_EXPECT=accept</code> is the default and requires all three parameter
+cases to be accepted. Set it to <code>reject</code> to reproduce rejection: all three cases
+must explicitly reject a tested field. Mixed support fails either strict
+expectation, with individual verdicts showing which controls the model accepts.
+Combined rejection can identify only the first field the backend rejects; the
+isolated cases identify support for each field independently.</p>
+<p>Acceptance does not establish that the fields are honored or that cache hits
+occur. This is an endpoint/model parameter probe, not a changed-suffix cache-hit
+probe, and it does not enable Codex's disabled production cache-hint translation.
+Offline request-shape and verdict tests run without OAuth or inference:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-p<span class="w"> </span>qmt-codex<span class="w"> </span>--no-default-features<span class="w"> </span>--features<span class="w"> </span>api<span class="w"> </span>--test<span class="w"> </span>live_cache_parameters
+</code></pre></div></td></tr></table></div>
 
 
 
