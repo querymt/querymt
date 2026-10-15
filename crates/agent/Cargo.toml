@@ -138,7 +138,7 @@ tree-sitter-nix = "0.3"
 tree-sitter-lua = "0.5"
 tree-sitter-svelte-ng = "1.0"
 tree-sitter-bash = "0.25"
-tree-sitter-php = "0.24"
+tree-sitter-php = "0.25"
 # crates.io tree-sitter-kotlin 0.3.x pins tree-sitter 0.20, whose C runtime
 # (linked globally via build-script flags) breaks the tree-sitter 0.26 runtime
 # already in the graph. Master binds via tree-sitter-language only.
