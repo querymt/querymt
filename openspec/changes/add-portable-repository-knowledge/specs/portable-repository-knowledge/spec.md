@@ -106,6 +106,60 @@ The system SHALL persist a locally rebuildable index and reconcile current confi
 - **THEN** it can be rebuilt solely from configured source files and portable metadata
 - **AND** authoritative files and private knowledge are unchanged
 
+### Requirement: Explicit OKF bundles coexist with existing Markdown
+
+The manifest SHALL support explicitly selected OKF bundle roots alongside plain Markdown and legacy memories. OKF concepts SHALL require YAML frontmatter with a nonempty type; reserved index/log roles SHALL apply only within bundles. Plain Markdown SHALL NOT require conversion. Selection conflicts SHALL be diagnosed deterministically.
+
+#### Scenario: Mixed portable inputs
+- **WHEN** selected inputs contain plain Markdown, a legacy memory, and an OKF v0.2 bundle
+- **THEN** all valid inputs are available through one repository projection with original source coordinates
+- **AND** existing memory parsing and enabled semantics remain unchanged
+
+#### Scenario: Invalid concept or overlapping bundle selection
+- **WHEN** an OKF concept lacks a type, bundle roots overlap, or one file is selected under conflicting formats
+- **THEN** the affected selection is diagnosed rather than resolved by enumeration order
+- **AND** valid unrelated sources remain available
+
+### Requirement: OKF metadata is extensible and structurally preserved
+
+The system SHALL consume nested OKF v0.2 metadata within bounded parsing resources, tolerate unknown types/keys, and normalize a bare verified mapping as a list. Unknown declared OKF versions SHALL receive best-effort consumption with diagnostics. Explicit metadata rewrites SHALL preserve unknown fields or refuse a lossy operation.
+
+#### Scenario: Nested metadata and future extensions
+- **WHEN** a concept contains sources, generated metadata, a bare verified mapping, and an unknown extension
+- **THEN** nested values and the extension remain structurally available and verified is interpreted as one event
+- **AND** the unknown extension or concept type does not invalidate the document
+
+#### Scenario: Excessive YAML complexity
+- **WHEN** a metadata document exceeds nesting, expansion, or byte limits
+- **THEN** it is rejected with a source diagnostic without unbounded processing or executable object construction
+
+#### Scenario: Unknown OKF version
+- **WHEN** a bundle declares an unrecognized okf_version
+- **THEN** supported structures are consumed with a version diagnostic
+- **AND** this does not change rejection of unsupported source-manifest versions
+
+### Requirement: Bundle references do not expand authorization
+
+OKF root-relative references SHALL resolve from the selected bundle root and relative references from their document. Reads SHALL remain confined to the authorized checkout. Links and provenance SHALL NOT select extra index inputs or grant access. URLs and scope descriptors SHALL remain inert metadata during indexing and checking.
+
+#### Scenario: Bundle-root link and repository-code source
+- **WHEN** a bundle document links to /subsystem.md and relatively references code outside the bundle but inside the checkout
+- **THEN** the link resolves within the bundle and the code reference resolves within the checkout
+- **AND** every read still requires host authorization and applicable source policy
+
+#### Scenario: Reference escapes or names an external URL
+- **WHEN** a reference escapes the checkout or names an external URL
+- **THEN** escaping filesystem reads are rejected and the URL is not fetched automatically
+
+### Requirement: OKF identities map to portable repository identities
+
+The system SHALL map bundle-relative OKF concept paths into repository-relative identities while retaining explicit IDs that survive moves. Public citations SHALL identify current source paths without machine-local bundle or checkout identifiers.
+
+#### Scenario: Identical bundles in two selected directories
+- **WHEN** distinct non-overlapping bundles contain the same concept-relative filename without explicit IDs
+- **THEN** repository identities remain distinct through their bundle-root paths
+- **AND** identical checkouts reproduce the same logical identities
+
 ### Requirement: Repository projection does not publish private knowledge
 
 Repository retrieval SHALL contain only authorized configured repository sources and generated records. It SHALL NOT automatically include private session entries, global protocol memories, or legacy consolidations. Existing protocol memory imports and session retention/consolidation behavior SHALL remain compatible. Repository indexing SHALL NOT ingest into or deactivate records owned by the legacy protocol loader.

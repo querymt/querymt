@@ -66,6 +66,15 @@ The system SHALL provide bounded directory/file map retrieval and explicit porta
 - **WHEN** an export targets an existing document without an unambiguous managed block
 - **THEN** it refuses to overwrite that document and reports how to select a safe generated destination
 
+### Requirement: Code maps complement portable concepts without format conversion
+
+Generated code records SHALL remain source-derived navigation aids separate from authored concepts. Indexing code SHALL NOT require generating an OKF document per file or symbol. Portable concepts SHALL be able to cite selected code records without converting them into authored explanations or automatically acknowledging evidence.
+
+#### Scenario: Curated concept links to source code
+- **WHEN** an OKF or plain-Markdown subsystem concept references selected source files
+- **THEN** code navigation and authored explanations remain distinguishable and independently citable
+- **AND** indexing does not create per-symbol OKF documents or mark the concept reviewed
+
 ### Requirement: Existing source tools retain their contracts
 
 Introducing repository code maps SHALL preserve existing `index` outline formatting, supported-language behavior, whole-file coordinate guarantees, and the source-read/edit-precondition behavior of symbol tools. Cached maps SHALL be navigation aids rather than substitutes for current-source validation before an edit. Opt-in post-index knowledge enrichment SHALL be separate attributed context, not a change to the raw outline or a second structural summary.
