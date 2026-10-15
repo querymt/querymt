@@ -282,6 +282,7 @@ impl PyMeshRuntime {
                 }),
                 iroh_enabled: false,
                 iroh_gso: true,
+                iroh_dns: None,
                 iroh_scopes: Vec::new(),
                 identity_file: None,
                 request_timeout: Duration::from_secs(request_timeout_secs),

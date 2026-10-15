@@ -31,6 +31,8 @@ dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 # Adds libp2p-based P2P networking, mDNS peer discovery, and Kademlia DHT
 # for distributed actor registry. SessionActorRef gains a Remote variant.
 remote = ["kameo/remote", "dep:libp2p", "querymt-remote/kameo-mesh", "querymt-remote/qr"]
+# Collect relay and address-lookup counters in mesh diagnostics.
+remote-metrics = ["remote", "querymt-remote/iroh-metrics"]
 
 [dependencies]
 typeshare.workspace = true

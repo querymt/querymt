@@ -2,6 +2,8 @@
 
 pub mod identity;
 pub mod invite;
+pub mod iroh_config;
+pub mod iroh_diagnostics;
 #[cfg(feature = "kameo-mesh")]
 pub mod mesh_bootstrap;
 #[cfg(feature = "kameo-mesh")]
@@ -48,6 +50,11 @@ mod transport_failure;
 
 pub use identity::*;
 pub use invite::*;
+pub use iroh_config::{IrohDnsConfig, IrohDnsFallback, IrohDnsNameserver, IrohDnsProtocol};
+pub use iroh_diagnostics::{
+    IrohLookupServiceDiagnostics, IrohMetricsDiagnostics, IrohRelayDiagnostics,
+    IrohTransportDiagnostics,
+};
 #[cfg(feature = "kameo-mesh")]
 pub use mesh_client::{KameoMeshClientTransport, MeshChatProvider, find_provider_on_mesh};
 pub use mesh_config::{MeshError, MeshTransportMode};
