@@ -15,6 +15,7 @@ common = ["llama-cpp-2/common", "llama-cpp-2/mtmd", "llama-cpp-2/llguidance", "d
 llguidance = ["common"]
 cuda = ["api", "common", "llama-cpp-2/cuda"]
 metal = ["api", "common", "llama-cpp-2/metal"]
+rocm = ["api", "common", "llama-cpp-2/rocm"]
 openmp = ["llama-cpp-2/openmp"]
 vulkan = ["api", "common", "llama-cpp-2/vulkan"]
 

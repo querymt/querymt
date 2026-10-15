@@ -164,6 +164,7 @@ Each native provider is published with multiple OCI tags corresponding to differ
 | `latest-accelerate` | macOS Accelerate framework | macOS (x86_64, arm64) — izwi, mrs only |
 | `latest-vulkan` | Vulkan GPU | Linux (x86_64, arm64), Windows (x86_64) — llama-cpp only |
 | `latest-cuda12.8` | NVIDIA CUDA 12.8 | Linux (x86_64, arm64), Windows (x86_64) — llama-cpp only |
+| `latest-rocm7.2` | AMD ROCm 7.2 | Linux x86_64 only - llama-cpp only; GPU runtime validation pending |
 | `latest-cuda12.8-sm80` | NVIDIA CUDA SM 80 | Linux x86_64 — izwi, mrs only |
 | `latest-cuda12.8-sm86` | NVIDIA CUDA SM 86 | Linux x86_64 — izwi, mrs only |
 | `latest-cuda12.8-sm87` | NVIDIA CUDA SM 87 (Jetson Orin) | Linux arm64 — izwi, mrs only |
@@ -195,6 +196,25 @@ Use this table to find the correct `cuda12.8-smXX` suffix for your GPU.
 !!! tip "Not sure which SM your GPU is?"
     Run `nvidia-smi --query-gpu=compute_cap --format=csv,noheader` to print your GPU's compute capability (e.g. `8.9` = SM 89).
 
+### AMD ROCm compatibility
+
+The `llama-cpp` `latest-rocm7.2` variant is built on Ubuntu 24.04 with **ROCm 7.2.1**, matching [llama.cpp's Linux ROCm Docker build](https://github.com/ggml-org/llama.cpp/blob/59d5fad7c111d30a547d690b69235ed9e05c035d/.devops/rocm.Dockerfile). One binary contains all of the upstream build's GPU targets; no per-GPU tag is needed:
+
+| GPU family | Compiled targets |
+|---|---|
+| Instinct (CDNA) | `gfx908`, `gfx90a`, `gfx942` |
+| RDNA 2 | `gfx1030` |
+| RDNA 3 | `gfx1100`, `gfx1101`, `gfx1102` |
+| Ryzen APUs (RDNA 3.5) | `gfx1150`, `gfx1151` |
+| RDNA 4 | `gfx1200`, `gfx1201` |
+
+!!! warning "Initial ROCm release: GPU runtime validation pending"
+    CI compiles the provider and checks ROCm linkage without an AMD GPU. Actual inference, performance, and model/backend combinations have not yet been validated on AMD hardware. The targets listed here describe compiled coverage, not a tested hardware support guarantee.
+
+The OCI artifact contains the provider library only, **not** ROCm or GPU drivers. Use Ubuntu 24.04 or a compatible environment with the ROCm 7.2.1 HIP runtime, hipBLAS, and rocBLAS (including its GPU kernel data) installed. Follow [AMD's ROCm 7.2.1 installation instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/docs-7.2.1/install/install-methods/package-manager/package-manager-ubuntu.html) and check the GPU/driver requirements for your hardware. The dynamic linker must be able to resolve `libamdhip64.so`, `libhipblas.so`, `librocblas.so`, and their dependencies. Nonstandard installations, including NixOS, require an environment providing those libraries; the downloaded artifact is not self-contained.
+
+The process also needs permission to access the AMD GPU (`/dev/kfd` and the appropriate `/dev/dri` render node). GPUs outside the compiled list can use `latest-vulkan` or a source build with a custom target list. This initial ROCm variant is not published for Windows or Linux arm64.
+
 ### Choosing a feature tag
 
 ```
@@ -207,7 +227,8 @@ What OS are you on?
 │   ├── NVIDIA GPU
 │   │   ├── llama-cpp                  → latest-cuda12.8
 │   │   └── izwi / mrs                 → latest-cuda12.8-sm{XX}  (see table above)
-│   ├── AMD / Intel GPU                → latest-vulkan  (llama-cpp only)
+│   ├── AMD GPU + ROCm 7.2 (x86_64)     → latest-rocm7.2 (llama-cpp; validation pending)
+│   ├── Other AMD / Intel GPU          → latest-vulkan  (llama-cpp only)
 │   └── CPU only                       → latest  (or latest-default)
 └── Windows
     ├── NVIDIA GPU                     → latest-cuda12.8  (llama-cpp only)
@@ -224,13 +245,15 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
 
 **Supported platforms:**
 
-| OS | Architecture | CPU | Metal | Accelerate | Vulkan | CUDA 12.8 |
-|---|---|:---:|:---:|:---:|:---:|:---:|
-| Linux | x86_64 | ✓ | — | — | ✓ | ✓ |
-| Linux | arm64 | ✓ | — | — | ✓ | ✓ |
-| macOS | x86_64 | — | ✓ | — | — | — |
-| macOS | arm64 | — | ✓ | — | — | — |
-| Windows | x86_64 | ✓ | — | — | — | ✓ |
+| OS | Architecture | CPU | Metal | Accelerate | Vulkan | CUDA 12.8 | ROCm 7.2 |
+|---|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Linux | x86_64 | ✓ | — | — | ✓ | ✓ | Build only* |
+| Linux | arm64 | ✓ | — | — | ✓ | ✓ | — |
+| macOS | x86_64 | — | ✓ | — | — | — | — |
+| macOS | arm64 | — | ✓ | — | — | — | — |
+| Windows | x86_64 | ✓ | — | — | — | ✓ | — |
+
+*ROCm is published with compiled target coverage; GPU runtime validation is pending. See [AMD ROCm compatibility](#amd-rocm-compatibility).
 
 **Configuration:**
 
@@ -269,6 +292,18 @@ Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models,
     n_ctx = 4096
     n_gpu_layers = 99
     flash_attention = "enabled"
+    ```
+
+=== "Linux (ROCm, x86_64)"
+    ```toml
+    [[providers]]
+    name = "llama-cpp"
+    path = "oci://ghcr.io/querymt/llama-cpp:latest-rocm7.2"
+
+    [providers.config]
+    model = "/path/to/model.gguf"
+    n_ctx = 4096
+    n_gpu_layers = 99
     ```
 
 === "Linux (Vulkan)"

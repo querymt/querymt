@@ -61,6 +61,26 @@ runs:
           --target ${{ inputs.target }} \
           "${FEATURE_ARGS[@]}"
 
+    - name: Verify ROCm linkage (Linux)
+      if: inputs.os == 'linux' && contains(inputs.features, 'rocm')
+      shell: bash
+      run: |
+        set -euo pipefail
+        library="target/${{ inputs.target }}/release/libqmt_$(echo '${{ inputs.crate }}' | tr '-' '_').so"
+        # No GPU required: reject CPU-only artifacts and unresolved runtime libraries.
+        readelf -d "$library"
+        ldd "$library" | tee "$RUNNER_TEMP/rocm-ldd.txt"
+        for dependency in libamdhip64 libhipblas librocblas; do
+          if ! grep -Fq "$dependency.so" "$RUNNER_TEMP/rocm-ldd.txt"; then
+            echo "Missing ROCm dependency: $dependency" >&2
+            exit 1
+          fi
+        done
+        if grep -q 'not found' "$RUNNER_TEMP/rocm-ldd.txt"; then
+          echo "ROCm runtime dependencies could not be resolved" >&2
+          exit 1
+        fi
+
     - name: Package native library
       shell: bash
       run: |
