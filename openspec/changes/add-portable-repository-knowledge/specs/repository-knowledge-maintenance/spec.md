@@ -8,7 +8,7 @@ Keep portable repository documentation inspectable and maintainable through dete
 
 ### Requirement: Index currency and evidence review are separate
 
-The system SHALL distinguish a current document index from the review status of authored claims. Portable evidence records SHALL bind a document, section, or file-table row's reviewed text hash to explicit dependency paths/selectors and versioned content hashes. Evidence states SHALL include unverified, unchanged, changed, and missing. Hash equality SHALL NOT be represented as proof that a statement is correct. Repository queries SHALL expose these states for authored results.
+The system SHALL distinguish a current document index from the hash-bound evidence acknowledgement of authored claims. Portable evidence records SHALL bind a document, section, or file-table row's reviewed text hash to explicit dependency paths/selectors and versioned content hashes. Evidence states SHALL include unverified, unchanged, changed, and missing. Hash equality SHALL NOT be represented as proof that a statement is correct. Repository queries SHALL expose these states for authored results.
 
 #### Scenario: Source changes but note does not
 - **WHEN** a note's acknowledged dependency content changes while the note is unchanged
@@ -17,7 +17,8 @@ The system SHALL distinguish a current document index from the review status of 
 
 #### Scenario: Note changes without acknowledgement
 - **WHEN** authored text changes without a matching evidence acknowledgement
-- **THEN** its review state becomes unverified
+- **THEN** its evidence acknowledgement state becomes unverified
+- **AND** any declared review events remain independently visible
 
 #### Scenario: Evidence is missing or ambiguous
 - **WHEN** an acknowledged dependency disappears or its symbol selector is ambiguous
@@ -35,7 +36,7 @@ The system SHALL support previewing and explicitly applying acknowledgements for
 #### Scenario: Source changes after acknowledgement preview
 - **WHEN** an acknowledgement preview is followed by a source or note edit before apply
 - **THEN** apply fails with a changed-preimage diagnostic
-- **AND** does not mark the new contents reviewed
+- **AND** does not acknowledge the new contents or add a review declaration
 
 ### Requirement: Maintenance checks are deterministic and non-mutating
 
@@ -49,6 +50,32 @@ The system SHALL provide read-only checks for malformed/conflicting documents, s
 - **WHEN** a file-table row or relative Markdown reference points to a path no longer present
 - **THEN** checking reports the orphan or broken reference
 - **AND** preserves the authored row and reference for review
+
+### Requirement: Declared review does not acknowledge evidence
+
+OKF authorship/review events, lifecycle status, and expiry SHALL remain independent of hash-bound acknowledgements. Indexing and review metadata edits SHALL NOT acknowledge dependency bytes. Only concrete authorized local evidence selectors SHALL participate in hash checking; provenance links, external URLs, and scope descriptors SHALL NOT become implicit dependencies.
+
+#### Scenario: Review declaration without a matching acknowledgement
+- **WHEN** a concept gains a verified event but lacks a matching reviewed-text/dependency acknowledgement
+- **THEN** the declared review is visible while evidence remains unverified
+
+#### Scenario: Sources include external or descriptive material
+- **WHEN** sources include a URL, scope descriptor, and an ordinary related-document link
+- **THEN** maintenance preserves provenance without remote requests or implicit hash acknowledgements
+
+### Requirement: Portable format checks preserve usable knowledge
+
+Checks SHALL diagnose malformed OKF concepts, unresolved source-footnote IDs, broken bundle references, expired/deprecated metadata, and selection conflicts. Findings SHALL preserve valid siblings and authored content. Missing optional indexes or unknown types/extensions SHALL NOT alone fail conformance. Synthesizing a listing SHALL NOT write a file or review metadata.
+
+#### Scenario: Bundle includes broken links and unknown metadata
+- **WHEN** otherwise valid concepts contain a missing target and unknown fields
+- **THEN** checks report the missing target without rejecting valid concepts for unknown metadata
+- **AND** no authored content is rewritten
+
+#### Scenario: Synthesize missing index
+- **WHEN** a developer requests a catalog for selected concepts without an index
+- **THEN** the listing is derived read-only from current source metadata
+- **AND** missing optional indexes alone do not fail the check
 
 ### Requirement: Optional scaffolding never invents descriptions
 
