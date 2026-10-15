@@ -40,7 +40,10 @@ impl LocalAgentHandle {
     }
 
     /// Helper method to extract system prompt from current session config
-    async fn get_session_system_prompt(&self, session_id: &str) -> Vec<String> {
+    async fn get_session_system_prompt(
+        &self,
+        session_id: &str,
+    ) -> Vec<querymt::params::SystemPrompt> {
         // Try to get the current session's LLM config
         if let Ok(Some(current_config)) = self
             .config
@@ -56,8 +59,10 @@ impl LocalAgentHandle {
                 // Parse the array of strings
                 let mut system_parts = Vec::new();
                 for item in system_array {
-                    if let Some(s) = item.as_str() {
-                        system_parts.push(s.to_string());
+                    if let Ok(part) =
+                        serde_json::from_value::<querymt::params::SystemPrompt>(item.clone())
+                    {
+                        system_parts.push(part);
                     }
                 }
                 if !system_parts.is_empty() {

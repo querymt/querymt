@@ -1065,7 +1065,7 @@ impl super::agent::Agent {
             .provider(config.planner.provider)
             .model(config.planner.model);
         for part in config.planner.system {
-            if let crate::config::SystemPart::Inline(s) = part {
+            if let Some(s) = part.resolved() {
                 llm = llm.system(s);
             }
         }
@@ -1116,7 +1116,7 @@ impl super::agent::Agent {
                 .provider(delegate.provider)
                 .model(delegate.model);
             for part in delegate.system {
-                if let crate::config::SystemPart::Inline(s) = part {
+                if let Some(s) = part.resolved() {
                     llm = llm.system(s);
                 }
             }
@@ -1439,7 +1439,7 @@ include_external = false
         let delegate = &builder.delegates[0];
         assert_eq!(
             delegate.llm_config.as_ref().map(|c| c.system.clone()),
-            Some(vec!["Coder system prompt".to_string()])
+            Some(vec!["Coder system prompt".into()])
         );
     }
 

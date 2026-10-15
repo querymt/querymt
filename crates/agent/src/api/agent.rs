@@ -192,7 +192,7 @@ impl AgentBuilder {
         self.with_llm(|c| c.api_key(key))
     }
 
-    pub fn system(self, prompt: impl Into<String>) -> Self {
+    pub fn system(self, prompt: impl Into<querymt::params::SystemPrompt>) -> Self {
         self.with_llm(|c| c.system(prompt))
     }
 
@@ -1457,7 +1457,7 @@ impl Agent {
             builder = builder.api_key(api_key);
         }
         for part in config.agent.system {
-            if let crate::config::SystemPart::Inline(s) = part {
+            if let Some(s) = part.resolved() {
                 builder = builder.system(s);
             }
         }

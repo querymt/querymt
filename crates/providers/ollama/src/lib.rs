@@ -50,6 +50,7 @@ pub struct Ollama {
         default,
         deserialize_with = "querymt::params::deserialize_system_string"
     )]
+    #[schemars(schema_with = "querymt::params::schema_for_system_prompts")]
     pub system: Option<String>,
     /// JSON schema for structured output
     pub json_schema: Option<StructuredOutputFormat>,

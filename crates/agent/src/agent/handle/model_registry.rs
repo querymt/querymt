@@ -108,7 +108,7 @@ impl LocalAgentHandle {
             ));
         };
 
-        let events = session_ref.get_event_stream().await.unwrap_or_default();
+        let events = session_ref.get_event_stream().await?;
         log::info!(
             "remote attach snapshot built from attached session ref: session_id={}, events={}",
             session_id,

@@ -1675,6 +1675,14 @@ mod node_manager_tests {
             .await
             .expect("persist SessionCreated event");
 
+        // Force the wrapper's full-history read to cross a remote page boundary.
+        for _ in 0..crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE + 1 {
+            config
+                .emit_event_persisted(&resp.session_id, crate::events::AgentEventKind::Cancelled)
+                .await
+                .expect("persist paging event");
+        }
+
         // Stop the live actor so the session is no longer in-memory.
         nm_ref
             .ask(StopRemoteSessionRuntime {
@@ -1721,10 +1729,16 @@ mod node_manager_tests {
             other => panic!("GetEventStream RPC failed after {control_timeout:?}: {other}"),
         });
 
-        assert!(
-            !events.is_empty(),
-            "resumed session should expose at least one persisted event"
+        let paged = crate::agent::remote::SessionActorRef::remote(session_ref, "test-peer".into())
+            .get_event_stream()
+            .await
+            .expect("paged remote history");
+        assert_eq!(paged.len(), events.len());
+        assert_eq!(
+            paged.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            events.iter().map(|event| event.seq).collect::<Vec<_>>()
         );
+        assert!(events.len() > crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE);
         assert!(
             events.iter().any(|e| e.session_id == resp.session_id),
             "events should belong to the resumed session"

@@ -49,6 +49,49 @@ pub enum SessionActorRef {
 
 // ── Constructors ─────────────────────────────────────────────────────────
 
+#[cfg(any(feature = "remote", test))]
+async fn collect_event_stream_pages<F, Fut>(
+    mut fetch: F,
+) -> Result<Vec<crate::events::AgentEvent>, AgentError>
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = Result<messages::EventStreamPage, AgentError>>,
+{
+    let mut events = Vec::new();
+    let mut after = 0;
+    let mut boundary = None;
+    let mut session_id = None;
+    loop {
+        let page = fetch(after).await?;
+        // Fix the boundary on the first page, rather than chasing concurrent writes.
+        let tip = *boundary.get_or_insert(page.latest_source_seq);
+        if tip < 0 || page.latest_source_seq < tip {
+            return Err(AgentError::Internal("event stream tip regressed".into()));
+        }
+        let mut previous = after;
+        for event in &page.events {
+            let expected_session = session_id.get_or_insert_with(|| event.session_id.clone());
+            if event.seq <= previous
+                || event.seq > page.latest_source_seq
+                || &event.session_id != expected_session
+            {
+                return Err(AgentError::Internal("invalid event stream page".into()));
+            }
+            previous = event.seq;
+        }
+        if previous == after && after < tip {
+            return Err(AgentError::Internal(
+                "event stream page did not advance".into(),
+            ));
+        }
+        events.extend(page.events.into_iter().filter(|event| event.seq <= tip));
+        after = previous;
+        if after >= tip {
+            return Ok(events);
+        }
+    }
+}
+
 impl From<ActorRef<SessionActor>> for SessionActorRef {
     fn from(actor_ref: ActorRef<SessionActor>) -> Self {
         Self::Local(actor_ref)
@@ -646,18 +689,11 @@ impl SessionActorRef {
                 .map_err(|e| AcpError::from(AgentError::RemoteActor(e.to_string()))),
 
             #[cfg(feature = "remote")]
-            Self::Remote { actor_ref, .. } => actor_ref
-                .ask(&messages::GetEventStream)
-                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
-                .reply_timeout(Self::REMOTE_HISTORY_REPLY_TIMEOUT)
-                .send()
-                .await
-                .map_err(|e| {
-                    AcpError::from(Self::map_agent_timeout_remote_send_error(
-                        e,
-                        "GetEventStream timed out on remote session",
-                    ))
-                }),
+            Self::Remote { .. } => collect_event_stream_pages(|after| {
+                self.get_event_stream_since(Some(after), messages::MAX_EVENT_STREAM_PAGE_SIZE)
+            })
+            .await
+            .map_err(AcpError::from),
         }
     }
 
@@ -1158,5 +1194,91 @@ impl SessionActorRef {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod history_paging_tests {
+    use super::*;
+
+    fn page(seqs: impl IntoIterator<Item = i64>, tip: i64) -> messages::EventStreamPage {
+        messages::EventStreamPage {
+            events: seqs
+                .into_iter()
+                .map(|seq| crate::events::AgentEvent {
+                    seq,
+                    timestamp: 0,
+                    session_id: "s1".into(),
+                    origin: crate::events::EventOrigin::Local,
+                    source_node: None,
+                    kind: crate::events::AgentEventKind::Cancelled,
+                })
+                .collect(),
+            latest_source_seq: tip,
+        }
+    }
+
+    #[tokio::test]
+    async fn collects_all_pages_including_histories_beyond_old_cap() {
+        for total in [0, 200, 201, 10_001] {
+            let mut calls = 0;
+            let events = collect_event_stream_pages(|after| {
+                calls += 1;
+                let end = (after + messages::MAX_EVENT_STREAM_PAGE_SIZE as i64).min(total);
+                std::future::ready(Ok(page(after + 1..=end, total)))
+            })
+            .await
+            .unwrap();
+            assert_eq!(events.len(), total as usize);
+            assert_eq!(
+                calls,
+                ((total as usize).div_ceil(messages::MAX_EVENT_STREAM_PAGE_SIZE)).max(1)
+            );
+            assert!(events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+        }
+    }
+
+    #[tokio::test]
+    async fn stops_at_initial_tip_even_when_new_events_arrive() {
+        let mut pages = vec![page([1, 3], 5), page([5, 7], 7)].into_iter();
+        let events = collect_event_stream_pages(|_| std::future::ready(Ok(pages.next().unwrap())))
+            .await
+            .unwrap();
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 3, 5]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_pages_and_propagates_midstream_errors() {
+        let mut wrong_session = page([3], 3);
+        wrong_session.events[0].session_id = "other".into();
+        for invalid in [
+            page([], 3),
+            page([2], 3),
+            page([3, 3], 3),
+            page([4], 3),
+            page([3], 2),
+            wrong_session,
+        ] {
+            let mut pages = vec![page([1, 2], 3), invalid].into_iter();
+            assert!(
+                collect_event_stream_pages(|_| std::future::ready(Ok(pages.next().unwrap())))
+                    .await
+                    .is_err()
+            );
+        }
+        let mut calls = 0;
+        let result = collect_event_stream_pages(|_| {
+            calls += 1;
+            std::future::ready(if calls == 1 {
+                Ok(page([1], 2))
+            } else {
+                Err(AgentError::Internal("page read failed".into()))
+            })
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("page read failed"));
     }
 }

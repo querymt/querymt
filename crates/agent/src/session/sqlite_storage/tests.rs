@@ -2934,6 +2934,56 @@ async fn journal_load_session_stream_respects_limit() {
 }
 
 #[tokio::test]
+async fn journal_full_history_is_not_capped_and_explicit_limits_remain_bounded() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+    for _ in 0..10_001 {
+        journal
+            .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+            .await
+            .unwrap();
+    }
+    let events = journal.load_session_stream("s1", None, None).await.unwrap();
+    assert_eq!(events.len(), 10_001);
+    assert!(
+        events
+            .windows(2)
+            .all(|pair| pair[0].stream_seq < pair[1].stream_seq)
+    );
+    assert_eq!(
+        journal.load_global_stream(None, None).await.unwrap().len(),
+        10_001
+    );
+    for limit in [0, 2, 10_000, usize::MAX] {
+        let expected = limit.min(10_001);
+        assert_eq!(
+            journal
+                .load_session_stream("s1", None, Some(limit))
+                .await
+                .unwrap()
+                .len(),
+            expected
+        );
+        assert_eq!(
+            journal
+                .load_global_stream(None, Some(limit))
+                .await
+                .unwrap()
+                .len(),
+            expected
+        );
+    }
+    assert_eq!(
+        journal
+            .load_session_stream("s1", Some(events[9_999].stream_seq), None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn journal_load_global_stream_returns_all_sessions() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let journal: &dyn EventJournal = &storage;

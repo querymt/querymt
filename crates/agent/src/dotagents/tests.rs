@@ -928,7 +928,7 @@ fn model_preset_overlay_preserves_unrelated_base_params() {
 
     let mut base = querymt::LLMParams::new();
     base.name = Some("explicit-name".to_string());
-    base.system = vec!["explicit system".to_string()];
+    base.system = vec!["explicit system".into()];
     base.temperature = Some(0.5);
     base.custom = Some(std::collections::HashMap::from([(
         "existing_custom".to_string(),

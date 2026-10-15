@@ -46,9 +46,13 @@ enum PromptResolution {
 }
 
 pub(crate) fn ensure_inline_system_parts(parts: &[SystemPart], context: &str) -> Result<()> {
-    if let Some(SystemPart::File { file }) = parts
-        .iter()
-        .find(|part| matches!(part, SystemPart::File { .. }))
+    if let Some(SystemPart::File { file } | SystemPart::CachedFile { file, .. }) =
+        parts.iter().find(|part| {
+            matches!(
+                part,
+                SystemPart::File { .. } | SystemPart::CachedFile { .. }
+            )
+        })
     {
         return Err(anyhow!(
             "{context} contains unsupported file reference '{file:?}' in inline TOML config; inline prompt text directly instead"
@@ -57,8 +61,8 @@ pub(crate) fn ensure_inline_system_parts(parts: &[SystemPart], context: &str) ->
 
     // Validate template syntax and variable names for all inline strings.
     for part in parts {
-        if let SystemPart::Inline(s) = part {
-            crate::template::validate_template(s).map_err(|e| {
+        if let Some(s) = part.resolved() {
+            crate::template::validate_template(s.text()).map_err(|e| {
                 anyhow!("Failed to validate {context} inline system prompt template: {e}")
             })?;
         }
@@ -92,7 +96,7 @@ async fn build_config_from_toml_value(
             PromptResolution::ResolveFiles { base_path } => {
                 let resolved =
                     resolve_system_parts(&config.agent.system, base_path, "agent").await?;
-                config.agent.system = resolved.into_iter().map(SystemPart::Inline).collect();
+                config.agent.system = resolved.into_iter().map(SystemPart::from).collect();
             }
             PromptResolution::RejectFileRefs => {
                 ensure_inline_system_parts(&config.agent.system, "agent.system")?;
@@ -118,12 +122,12 @@ async fn build_config_from_toml_value(
             PromptResolution::ResolveFiles { base_path } => {
                 let resolved =
                     resolve_system_parts(&config.planner.system, base_path, "planner").await?;
-                config.planner.system = resolved.into_iter().map(SystemPart::Inline).collect();
+                config.planner.system = resolved.into_iter().map(SystemPart::from).collect();
                 for delegate in &mut config.delegates {
                     let context = format!("delegate '{}'", delegate.id);
                     let resolved =
                         resolve_system_parts(&delegate.system, base_path, &context).await?;
-                    delegate.system = resolved.into_iter().map(SystemPart::Inline).collect();
+                    delegate.system = resolved.into_iter().map(SystemPart::from).collect();
                 }
             }
             PromptResolution::RejectFileRefs => {

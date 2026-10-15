@@ -530,6 +530,38 @@ mod tests {
     use querymt::chat::ToolResultPart;
 
     #[test]
+    fn append_only_history_preserves_prepared_cache_prefix() {
+        let hint = querymt::chat::CacheHint::Ephemeral {
+            ttl_seconds: Some(1800),
+        };
+        let first = ChatMessage::user().text("reference").cache(hint).build();
+        let context = ConversationContext::new(
+            Arc::from("session"),
+            Arc::from([first.clone()]),
+            Arc::new(AgentStats::default()),
+            Arc::from("provider"),
+            Arc::from("model"),
+        );
+        let previous = context.request_messages();
+        let context = ConversationContext::new(
+            Arc::from("session"),
+            Arc::from([
+                first,
+                ChatMessage::assistant().text("answer").build(),
+                ChatMessage::user().text("follow-up").build(),
+            ]),
+            Arc::new(AgentStats::default()),
+            Arc::from("provider"),
+            Arc::from("model"),
+        );
+        let current = context.request_messages();
+        assert_eq!(
+            serde_json::to_value(&previous).unwrap(),
+            serde_json::to_value(&current[..previous.len()]).unwrap()
+        );
+    }
+
+    #[test]
     fn request_messages_keep_latest_feedback_after_context_fragments() {
         let latest = ChatMessage::user().text("Delegation completed").build();
         let context = ConversationContext::new(

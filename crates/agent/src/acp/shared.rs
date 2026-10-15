@@ -388,6 +388,9 @@ async fn attach_rpc_session_locked<S: SendAgent>(
     let Some(local_agent) = agent.as_any().downcast_ref::<AgentHandle>() else {
         return Ok(ownership_inserted);
     };
+    if ownership_inserted && let Some(translator) = context.translator.as_ref() {
+        restore_session_usage(local_agent, session_id, translator).await;
+    }
     if let Some(bridge) = context.session_bridge.as_ref()
         && let Err(error) = local_agent
             .set_session_bridge(session_id, bridge.clone())
@@ -410,6 +413,42 @@ async fn attach_rpc_session_locked<S: SendAgent>(
         return Err(error);
     }
     Ok(ownership_inserted)
+}
+
+pub(crate) async fn restore_session_usage(
+    agent: &AgentHandle,
+    session_id: &str,
+    translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
+) {
+    if translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .usage
+        .get(session_id)
+        .is_some_and(|usage| usage.history_loaded)
+    {
+        return;
+    }
+    let session_ref = agent.registry.lock().await.get(session_id).cloned();
+    let Some(session_ref) = session_ref else {
+        return;
+    };
+    match session_ref.get_event_stream().await {
+        Ok(events) => translator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .seed_usage(session_id, &events),
+        Err(error) => {
+            tracing::warn!(session.id = %session_id, %error, "failed to restore ACP usage totals");
+            translator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .usage
+                .entry(session_id.to_owned())
+                .or_default()
+                .partial = true;
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -912,6 +951,7 @@ fn materialize_replay_state(
     let mut legacy_counter: usize = 0;
 
     for event in events {
+        state.usage.observe(event.seq, &event.kind);
         let envelope = EventEnvelope::from(event.clone());
         match event.kind.clone() {
             AgentEventKind::SessionModeChanged { mode } => {
@@ -1137,9 +1177,92 @@ impl AcpSessionUpdateCapabilities {
 struct SessionUsageProjection {
     context_limit: Option<u64>,
     cumulative_cost_usd: Option<f64>,
+    latest_request: Option<TokenUsageBreakdown>,
+    session_totals: Option<TokenUsageBreakdown>,
+    partial: bool,
+    request_seqs: HashSet<i64>,
+    latest_request_seq: Option<i64>,
+    provider_seq: Option<i64>,
+    cost_seq: Option<i64>,
+    history_loaded: bool,
+}
+
+/// Exclusive categories: provider adapters already separate caching and reasoning.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsageBreakdown {
+    input_tokens: u64,
+    output_tokens: u64,
+    reasoning_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+impl From<&querymt::Usage> for TokenUsageBreakdown {
+    fn from(usage: &querymt::Usage) -> Self {
+        Self {
+            input_tokens: u64::from(usage.input_tokens),
+            output_tokens: u64::from(usage.output_tokens),
+            reasoning_tokens: u64::from(usage.reasoning_tokens),
+            cache_read_tokens: u64::from(usage.cache_read),
+            cache_write_tokens: u64::from(usage.cache_write),
+        }
+    }
 }
 
 impl SessionUsageProjection {
+    fn observe(&mut self, seq: i64, kind: &AgentEventKind) {
+        match kind {
+            AgentEventKind::ProviderChanged { context_limit, .. } => {
+                if self.provider_seq.is_none_or(|previous| seq > previous) {
+                    self.context_limit = *context_limit;
+                    self.provider_seq = Some(seq);
+                }
+            }
+            AgentEventKind::LlmRequestEnd {
+                usage,
+                cumulative_cost_usd,
+                ..
+            } => {
+                if !self.request_seqs.insert(seq) {
+                    return;
+                }
+                let request = usage.as_ref().map(TokenUsageBreakdown::from);
+                if let Some(request) = request.as_ref() {
+                    let totals = self.session_totals.get_or_insert_default();
+                    totals.input_tokens = totals.input_tokens.saturating_add(request.input_tokens);
+                    totals.output_tokens =
+                        totals.output_tokens.saturating_add(request.output_tokens);
+                    totals.reasoning_tokens = totals
+                        .reasoning_tokens
+                        .saturating_add(request.reasoning_tokens);
+                    totals.cache_read_tokens = totals
+                        .cache_read_tokens
+                        .saturating_add(request.cache_read_tokens);
+                    totals.cache_write_tokens = totals
+                        .cache_write_tokens
+                        .saturating_add(request.cache_write_tokens);
+                } else {
+                    self.partial = true;
+                }
+                if self
+                    .latest_request_seq
+                    .is_none_or(|previous| seq > previous)
+                {
+                    self.latest_request = request;
+                    self.latest_request_seq = Some(seq);
+                }
+                if let Some(cost) = cumulative_cost_usd
+                    && self.cost_seq.is_none_or(|previous| seq > previous)
+                {
+                    self.cumulative_cost_usd = Some(*cost);
+                    self.cost_seq = Some(seq);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Builds a `usage_update` for the given current context occupancy, or
     /// `None` when the effective context limit is unknown or meaningless.
     fn usage_update(&self, used: u64) -> Option<UsageUpdate> {
@@ -1147,6 +1270,17 @@ impl SessionUsageProjection {
         let mut update = UsageUpdate::new(used, size);
         if let Some(amount) = self.cumulative_cost_usd {
             update = update.cost(crate::acp::protocol::Cost::new(amount, "USD"));
+        }
+        if !self.request_seqs.is_empty() {
+            update = update.meta(serde_json::Map::from_iter([(
+                QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::json!({ "usage": {
+                    "version": 1,
+                    "latestRequest": self.latest_request,
+                    "sessionTotals": self.session_totals,
+                    "partial": self.partial,
+                }}),
+            )]));
         }
         Some(update)
     }
@@ -1192,6 +1326,46 @@ impl AcpLiveEventTranslator {
     /// Currently applied Preview capability snapshot.
     pub fn capabilities(&self) -> AcpSessionUpdateCapabilities {
         self.capabilities
+    }
+
+    /// Merge history with any events already observed during attachment.
+    fn seed_usage(&mut self, session_id: &str, events: &[AgentEvent]) {
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        for event in events {
+            usage.observe(event.seq, &event.kind);
+        }
+        usage.history_loaded = true;
+    }
+
+    /// Reuse load snapshots rather than issuing a second full history read.
+    pub(crate) fn seed_usage_from_meta(
+        &mut self,
+        session_id: &str,
+        meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> bool {
+        let Some(events) = meta
+            .and_then(|meta| meta.get("querymt/sessionLoadSnapshot.v1"))
+            .and_then(|snapshot| snapshot.get("audit"))
+            .and_then(|audit| audit.get("events"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        let usage = self.usage.entry(session_id.to_owned()).or_default();
+        for event in events {
+            if !matches!(
+                event["kind"]["type"].as_str(),
+                Some("llm_request_end" | "provider_changed")
+            ) {
+                continue;
+            }
+            match serde_json::from_value::<AgentEvent>(event.clone()) {
+                Ok(event) => usage.observe(event.seq, &event.kind),
+                Err(_) => usage.partial = true,
+            }
+        }
+        usage.history_loaded = true;
+        true
     }
 
     /// Drops all per-session projection state for a closed session.
@@ -1376,19 +1550,16 @@ impl AcpLiveEventTranslator {
                 }
                 vec![SessionUpdate::SessionInfoUpdate(update)]
             }
-            AgentEventKind::ProviderChanged { context_limit, .. } => {
-                self.usage.entry(session_id).or_default().context_limit = *context_limit;
+            AgentEventKind::ProviderChanged { .. } => {
+                self.usage
+                    .entry(session_id)
+                    .or_default()
+                    .observe(event.seq(), event.kind());
                 Vec::new()
             }
-            AgentEventKind::LlmRequestEnd {
-                context_tokens,
-                cumulative_cost_usd,
-                ..
-            } => {
+            AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
                 let usage = self.usage.entry(session_id).or_default();
-                if let Some(cost) = cumulative_cost_usd {
-                    usage.cumulative_cost_usd = Some(*cost);
-                }
+                usage.observe(event.seq(), event.kind());
                 usage
                     .usage_update(*context_tokens)
                     .map(|update| vec![SessionUpdate::UsageUpdate(update)])
@@ -2013,6 +2184,11 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             let response = agent.load_session(params).await;
                             match response {
                                 Ok(r) => {
+                                    if let Some(translator) = context.translator.as_ref() {
+                                        translator.lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .seed_usage_from_meta(&session_id, r.meta.as_ref());
+                                    }
                                     let request_lock =
                                         session_owners.request_lock(&session_id, conn_id).await;
                                     let _request_guard = request_lock.lock().await;
@@ -5743,6 +5919,19 @@ mod tests {
             let fixture = crate::test_utils::TestAgent::new().await;
             let session_id = fixture.create_session().await;
             let journal = fixture.storage.event_journal();
+            for _ in 0..10_001 {
+                journal
+                    .append_durable(&NewDurableEvent {
+                        session_id: session_id.clone(),
+                        origin: EventOrigin::Local,
+                        source_node: None,
+                        source_node_id: None,
+                        source_seq: None,
+                        kind: AgentEventKind::SessionCreated,
+                    })
+                    .await
+                    .expect("persist long history");
+            }
             journal
                 .append_durable(&NewDurableEvent {
                     session_id: session_id.clone(),
@@ -5765,6 +5954,22 @@ mod tests {
                 })
                 .await
                 .expect("persist replay event");
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind: AgentEventKind::AssistantMessageStored {
+                        content: "late assistant reply".into(),
+                        thinking: None,
+                        reasoning_parts: Vec::new(),
+                        message_id: Some("late-reply".into()),
+                    },
+                })
+                .await
+                .expect("persist late assistant reply");
 
             let snapshot_capable = dispatch_session_load_with_preferences(
                 fixture.handle.as_ref(),
@@ -5778,6 +5983,21 @@ mod tests {
 
             let response = snapshot_capable.response.expect("load response");
             assert!(response.error.is_none());
+            let result = response.result.as_ref().expect("load result");
+            let events = result["_meta"]["querymt/sessionLoadSnapshot.v1"]["audit"]["events"]
+                .as_array()
+                .expect("snapshot events");
+            assert!(events.len() > 10_001);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"]["type"] == "tool_call_start")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"]["data"]["content"] == "late assistant reply")
+            );
             // No historical notifications: the client hydrates from the snapshot.
             assert!(
                 snapshot_capable.notifications.is_empty(),
@@ -5797,6 +6017,10 @@ mod tests {
                 !replaying.notifications.is_empty(),
                 "standard clients must still receive historical replay"
             );
+            assert!(replaying.notifications.iter().any(|notification| {
+                notification["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && notification["params"]["update"]["content"]["text"] == "late assistant reply"
+            }));
         }
     }
 
@@ -6331,6 +6555,176 @@ mod session_update_tests {
     }
 
     // ── 3.1/3.2 Usage meter ────────────────────────────────────────────────
+
+    fn request_with_tokens(seq: i64) -> EventEnvelope {
+        envelope(
+            seq,
+            AgentEventKind::LlmRequestEnd {
+                usage: Some(querymt::Usage {
+                    input_tokens: 75,
+                    output_tokens: 162,
+                    reasoning_tokens: 1024,
+                    cache_read: 500,
+                    cache_write: 20,
+                }),
+                context_tokens: 1781,
+                cumulative_cost_usd: Some(0.5),
+                cost_usd: None,
+                tool_calls: 0,
+                finish_reason: None,
+                metrics: Default::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn usage_metadata_separates_normalized_categories_and_replaces_totals() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        translator.translate_updates(&request_with_tokens(2));
+        let updates = translator.translate_updates(&request_with_tokens(3));
+        let value = serde_json::to_value(&updates[0]).unwrap();
+        let usage = &value["_meta"]["querymt"]["usage"];
+        assert_eq!(usage["version"], 1);
+        assert_eq!(usage["latestRequest"]["outputTokens"], 162);
+        assert_eq!(usage["latestRequest"]["reasoningTokens"], 1024);
+        assert_eq!(usage["latestRequest"]["cacheReadTokens"], 500);
+        assert_eq!(usage["latestRequest"]["cacheWriteTokens"], 20);
+        assert_eq!(usage["sessionTotals"]["outputTokens"], 324);
+        assert_eq!(usage["sessionTotals"]["reasoningTokens"], 2048);
+        assert_eq!(usage["partial"], false);
+        assert_eq!(value["used"], 1781);
+        // A repeated event must not increment cumulative counters.
+        let duplicate = translator.translate_updates(&request_with_tokens(3));
+        assert_eq!(serde_json::to_value(&duplicate[0]).unwrap(), value);
+        // Compaction changes occupancy, not the last request or cumulative usage.
+        let projection = translator.usage.get("s-1").unwrap();
+        let compacted = serde_json::to_value(projection.usage_update(100).unwrap()).unwrap();
+        assert_eq!(compacted["used"], 100);
+        assert_eq!(compacted["_meta"]["querymt"]["usage"], *usage);
+    }
+
+    #[test]
+    fn usage_seed_merges_history_and_live_events_without_double_counting() {
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(4, Some(200_000)));
+        translator.translate_updates(&request_with_tokens(5));
+        let history = vec![
+            agent_event(1, provider_changed(1, Some(100_000)).kind().clone()),
+            agent_event(2, request_with_tokens(2).kind().clone()),
+            agent_event(5, request_with_tokens(5).kind().clone()),
+        ];
+        translator.seed_usage("s-1", &history);
+        translator.seed_usage("s-1", &history);
+        let value =
+            serde_json::to_value(translator.usage["s-1"].usage_update(100).unwrap()).unwrap();
+        assert_eq!(value["size"], 200_000);
+        assert_eq!(
+            value["_meta"]["querymt"]["usage"]["sessionTotals"]["inputTokens"],
+            150
+        );
+        assert_eq!(value["_meta"]["querymt"]["usage"]["partial"], false);
+    }
+
+    #[tokio::test]
+    async fn usage_snapshot_includes_requests_beyond_old_journal_cap() {
+        use crate::session::backend::StorageBackend;
+        use crate::session::projection::NewDurableEvent;
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        let mut kinds = vec![AgentEventKind::SessionCreated; 10_001];
+        kinds.push(provider_changed(1, Some(100_000)).kind().clone());
+        kinds.push(request_with_tokens(2).kind().clone());
+        for kind in kinds {
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .unwrap();
+        }
+        let snapshot = crate::session::load_session_snapshot(
+            fixture.handle.as_ref(),
+            fixture.storage.view_store().unwrap(),
+            &session_id,
+        )
+        .await
+        .unwrap();
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".into(),
+            serde_json::to_value(snapshot).unwrap(),
+        )]);
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
+        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
+        let usage = &translator.usage[&session_id];
+        assert!(usage.history_loaded);
+        assert!(!usage.partial);
+        assert_eq!(usage.context_limit, Some(100_000));
+        assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
+    }
+
+    #[test]
+    fn usage_restores_from_load_snapshot_without_resetting_live_state() {
+        let events = vec![
+            agent_event(1, provider_changed(1, Some(100_000)).kind().clone()),
+            agent_event(2, request_with_tokens(2).kind().clone()),
+        ];
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            serde_json::json!({ "audit": { "events": events } }),
+        )]);
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&usage_end(3, 100, None));
+        assert!(translator.seed_usage_from_meta("s-1", Some(&meta)));
+        assert!(translator.seed_usage_from_meta("s-1", Some(&meta)));
+        let usage = &translator.usage["s-1"];
+        assert!(usage.history_loaded);
+        assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
+        assert!(usage.latest_request.is_none());
+        assert!(usage.partial);
+        assert_eq!(usage.cumulative_cost_usd, Some(0.5));
+        assert!(!translator.seed_usage_from_meta("s-1", None));
+    }
+
+    #[test]
+    fn usage_materialized_replay_matches_live_metadata_and_marks_missing_requests() {
+        let events = vec![
+            agent_event(1, provider_changed(1, Some(100_000)).kind().clone()),
+            agent_event(2, request_with_tokens(2).kind().clone()),
+            agent_event(3, usage_end(3, 100, None).kind().clone()),
+        ];
+        let notifications = replay_agent_events_materialized(
+            "s-1",
+            events.clone(),
+            &HashMap::new(),
+            &Default::default(),
+        );
+        let replay_usage = notifications
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::UsageUpdate(usage) => Some(serde_json::to_value(usage).unwrap()),
+                _ => None,
+            })
+            .unwrap();
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.seed_usage("s-1", &events);
+        let live_usage =
+            serde_json::to_value(translator.usage["s-1"].usage_update(100).unwrap()).unwrap();
+        assert_eq!(replay_usage, live_usage);
+        assert!(live_usage["_meta"]["querymt"]["usage"]["latestRequest"].is_null());
+        assert_eq!(live_usage["_meta"]["querymt"]["usage"]["partial"], true);
+        assert_eq!(
+            live_usage["_meta"]["querymt"]["usage"]["sessionTotals"]["outputTokens"],
+            162
+        );
+    }
 
     #[test]
     fn usage_uses_latest_limit_and_includes_cost_and_cached_tokens() {

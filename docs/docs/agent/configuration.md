@@ -110,6 +110,9 @@ assume_mutating = false
 mutating_tools = ["edit", "write_file", "shell"]
 ```
 
+For reusable system-prefix annotations, TTL behavior, and provider limitations,
+see [Prompt Cache Hints](../core/providers.md#prompt-cache-hints).
+
 ### Execution Policy
 
 ```toml

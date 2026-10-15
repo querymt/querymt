@@ -633,6 +633,22 @@ fn apply_context_window(messages: &[SftMessage], max: Option<usize>) -> Vec<&Sft
 // System prompt resolution
 // ---------------------------------------------------------------------------
 
+fn system_prompt_text(value: &serde_json::Value) -> Option<String> {
+    let parts = match querymt::params::deserialize_system_prompts(value.clone()) {
+        Ok(parts) => parts,
+        Err(error) => {
+            tracing::warn!(%error, "Invalid stored system instructions during SFT export");
+            return None;
+        }
+    };
+    let prompt = parts
+        .iter()
+        .map(|part| part.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!prompt.is_empty()).then_some(prompt)
+}
+
 /// Resolve system prompt from LLM config or session metadata.
 async fn resolve_system_prompt(
     session_store: &std::sync::Arc<dyn SessionStore>,
@@ -643,16 +659,9 @@ async fn resolve_system_prompt(
     if let Some(config_id) = llm_config_id
         && let Ok(Some(config)) = session_store.get_llm_config(config_id).await
         && let Some(params) = &config.params
-        && let Some(system_arr) = params.get("system").and_then(|v| v.as_array())
+        && let Some(prompt) = params.get("system").and_then(system_prompt_text)
     {
-        let prompt: String = system_arr
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !prompt.is_empty() {
-            return Some(prompt);
-        }
+        return Some(prompt);
     }
 
     // Fallback: middleware-injected system prompts from events
@@ -671,6 +680,20 @@ async fn resolve_system_prompt(
 mod tests {
     use super::*;
     use crate::export::turns::{TurnToolCall, TurnToolResult};
+
+    #[test]
+    fn hinted_instruction_text_is_not_dropped_from_exports() {
+        assert_eq!(
+            system_prompt_text(&serde_json::json!([
+                "legacy", {"text": "stable", "cache": {"ephemeral": {"ttl_seconds": 1800}}}
+            ])),
+            Some("legacy\nstable".into())
+        );
+        assert_eq!(
+            system_prompt_text(&serde_json::json!({"text": "single", "cache": {"ephemeral": {}}})),
+            Some("single".into())
+        );
+    }
 
     fn make_turn(user: Option<&str>, assistant: &str) -> Turn {
         Turn {

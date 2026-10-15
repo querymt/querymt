@@ -192,12 +192,12 @@ pub(crate) fn compose_prompt(params: &mut querymt::LLMParams, manifest: &Dotagen
     if let Some(prompt) = &manifest.system_prompt
         && !prompt.is_empty()
     {
-        params.system.push(prompt.body.clone());
+        params.system.push(prompt.body.clone().into());
     }
     if let Some(prompt) = &manifest.agents_md
         && !prompt.is_empty()
     {
-        params.system.push(prompt.body.clone());
+        params.system.push(prompt.body.clone().into());
     }
 }
 
