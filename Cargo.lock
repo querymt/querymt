@@ -83,7 +83,7 @@ dependencies = [
  "futures-concurrency",
  "rustc-hash 2.1.2",
  "rustix 1.1.4",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "shell-words",
@@ -110,7 +110,7 @@ checksum = "1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d"
 dependencies = [
  "anyhow",
  "derive_more",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "serde_with",
@@ -6107,7 +6107,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -8288,7 +8288,7 @@ dependencies = [
  "mistralrs-macros",
  "rand 0.9.4",
  "reqwest 0.13.5",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -8403,7 +8403,7 @@ dependencies = [
  "rustc-hash 2.1.2",
  "rustfft",
  "safetensors 0.8.0",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "scraper",
  "serde",
  "serde-big-array",
@@ -11141,7 +11141,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11156,7 +11156,7 @@ dependencies = [
  "http 1.5.0",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11174,7 +11174,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11189,7 +11189,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11205,7 +11205,7 @@ dependencies = [
  "log",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11220,7 +11220,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11236,7 +11236,7 @@ dependencies = [
  "izwi-core",
  "log",
  "querymt",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "tokio",
@@ -11253,7 +11253,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11279,7 +11279,7 @@ dependencies = [
  "querymt-provider-common",
  "querymt-utils",
  "regex",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "tokio",
@@ -11295,7 +11295,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11310,7 +11310,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11327,7 +11327,7 @@ dependencies = [
  "mistralrs",
  "querymt",
  "querymt-provider-common",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "tokio",
@@ -11343,7 +11343,7 @@ dependencies = [
  "http 1.5.0",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11360,7 +11360,7 @@ dependencies = [
  "http 1.5.0",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11375,7 +11375,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11392,7 +11392,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11407,7 +11407,7 @@ dependencies = [
  "qmt-openai",
  "querymt",
  "querymt-extism-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "url",
@@ -11458,7 +11458,7 @@ dependencies = [
  "once_cell",
  "reqwest 0.13.5",
  "rmcp",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -11536,7 +11536,7 @@ dependencies = [
  "rusqlite",
  "rust-embed",
  "rust-stemmers",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "serde_path_to_error",
@@ -12506,7 +12506,7 @@ dependencies = [
  "process-wrap",
  "reqwest 0.13.5",
  "rmcp-macros",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "sse-stream",
@@ -13063,9 +13063,9 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
  "chrono",
  "dyn-clone",
@@ -13077,9 +13077,9 @@ dependencies = [
 
 [[package]]
 name = "schemars_derive"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13453,7 +13453,7 @@ dependencies = [
  "indexmap 1.9.3",
  "indexmap 2.14.2",
  "schemars 0.9.0",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde_core",
  "serde_json",
  "serde_with_macros",
@@ -17735,7 +17735,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "windows 0.62.2",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
