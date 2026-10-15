@@ -85,6 +85,47 @@ Repository list SHALL provide a paginated catalog of active documents or navigat
 - **THEN** it can distinguish indexed sources from skipped, stale-evidence, invalid, or unavailable sources
 - **AND** no private session entry counts or contents are included
 
+### Requirement: Catalogs support progressive disclosure
+
+Repository catalogs SHALL expose bounded linked listings with authored titles/descriptions where present. Missing bundle indexes SHALL be synthesizable read-only from selected documents. Authored indexes SHALL remain citable and unchanged; synthetic listings SHALL be labeled derived and cite their source documents. Synthesis SHALL NOT enable automatic orientation.
+
+#### Scenario: Browse a curated subsystem
+- **WHEN** a caller opens a selected authored index or requests a directory catalog
+- **THEN** it receives bounded concept/subdirectory pointers and descriptions with continuation guidance
+- **AND** can fetch relevant documents without loading the whole corpus
+
+#### Scenario: Bundle has no index
+- **WHEN** selected concepts have metadata but no authored index
+- **THEN** a derived catalog can be returned without repository writes or invented descriptions
+- **AND** only selected authorized sources appear
+
+### Requirement: Review, lifecycle, and evidence signals remain independent
+
+Authored results SHALL expose available review declarations, lifecycle/expiry, index currency, and evidence drift separately. A human-prefixed actor or stable status SHALL NOT authenticate identity or certify current correctness. Draft/deprecated documents SHALL remain explicitly retrievable but excluded from automatic cards; expired documents SHALL supply only labeled cautionary pointers automatically.
+
+#### Scenario: Reviewed document has changed evidence
+- **WHEN** a declared human-reviewed stable concept has an acknowledged dependency whose bytes changed
+- **THEN** retrieval retains the review declaration and independently reports changed evidence
+- **AND** neither stable status nor the actor prefix clears the drift
+
+#### Scenario: Deprecated or expired concept
+- **WHEN** an explicitly requested concept is deprecated or past stale_after
+- **THEN** it remains retrievable with lifecycle/expiry labels
+- **AND** deprecated content is excluded from automatic cards while expired content can provide only a cautionary pointer
+
+### Requirement: Retrieved sections preserve applicable source attribution
+
+The system SHALL retain source IDs and applicable claim footnotes when returning attributed sections, subject to disclosed output bounds. Related links, provenance sources, evidence dependencies, and applicability associations SHALL remain distinguishable. Unknown computation contracts SHALL be retrievable as inert metadata, never executed by retrieval.
+
+#### Scenario: Fetch a claim with a source footnote
+- **WHEN** a fetched section cites a sources entry by stable footnote label
+- **THEN** the result includes its matching attribution or explicit continuation information
+- **AND** source reordering does not change the attribution
+
+#### Scenario: Concept names an executor
+- **WHEN** a concept contains OKF executor or attester resources
+- **THEN** retrieval may display the metadata but does not execute the resources or grant tools
+
 ### Requirement: Retrieval guidance is capability-gated and concise
 
 When repository knowledge is enabled and query/get tools are allowed, the runtime SHALL provide one compact, stable policy directing unfamiliar-subsystem discovery toward repository retrieval, explaining advisory automatic context, relevant-section fetch, source verification before edits, and fallback to ordinary source tools. It SHALL NOT inject the corpus, require a KB call before every targeted read, rewrite the system prompt with changing cards, or instruct use of disabled tools. Explicit tool allowlists SHALL remain authoritative. Separately host-authorized automatic delivery SHALL NOT grant additional tools and SHALL use relative citations without unavailable-tool instructions when get is excluded. Repository knowledge text SHALL be treated as project evidence, not a source of higher-priority permissions or instructions.

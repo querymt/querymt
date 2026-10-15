@@ -52,6 +52,11 @@ version = 1
 include = [".agents/memories/*.md", "docs/architecture/**/*.md", "crates/agent/**/AGENTS.md"]
 exclude = ["openspec/changes/archive/**"]
 
+# Explicit OKF bundles; paths are repository-relative directories.
+[[bundles]]
+root = "docs/knowledge"
+format = "okf"
+
 [code]
 include = ["crates/agent/src/**/*.rs"]
 exclude = []
@@ -59,11 +64,23 @@ exclude = []
 
 Paths/globs are relative to the selected root; excludes win. Missing manifest means diagnostic `not_configured`, not an implicit repository-wide crawl. An explicit maintenance preview can propose a manifest but cannot create it without an apply action. Unknown manifest versions are rejected. Host limits cap files, bytes per file, and total indexed bytes; skipped sources are disclosed as incomplete coverage rather than an exhaustive answer.
 
-Workspace memories retain the current frontmatter parser and enabled/id/title/tags semantics. Other Markdown needs no special frontmatter. Explicit IDs are stable across moves; otherwise identity derives from relative path. Duplicate document IDs disable the conflicting documents with diagnostics rather than selecting one nondeterministically. Optional `knowledge_sources` frontmatter is a list of relative paths with optional qualified-symbol selectors for evidence checking. Documentation remains useful without evidence metadata, but is labeled unverified.
+Use separate adapters for ordinary Markdown, existing dotagents memories, and explicitly selected OKF v0.2 bundles. Workspace memories retain legacy parsing and enabled/id/title/tags semantics; ordinary Markdown needs no frontmatter. OKF is an input/interchange format, not the internal store schema. Explicit IDs survive moves; otherwise identity derives from repository-relative path. Map OKF path-without-suffix concept IDs through the bundle's repository-relative root; do not weaken explicit-ID support. Duplicate explicit IDs disable conflicts with diagnostics. Optional `knowledge_sources` retains its relative path/qualified-symbol evidence-selector semantics. Missing acknowledgement means unverified evidence, independently of any declared review.
+
+Each `[[bundles]]` entry explicitly selects a confined directory with `format = "okf"`. Its non-reserved Markdown files require parseable YAML and a nonempty `type`; `index.md` and `log.md` follow OKF's reserved-file roles only inside that bundle. Manifest excludes, ignore policy, and host limits apply to bundle selections too. Reject overlapping bundle roots and mixed-format selection of the same file with actionable diagnostics, rather than choosing an adapter by enumeration order. An ordinary Markdown file named index.md elsewhere remains ordinary Markdown.
+
+Use a proper resource-bounded YAML reader for OKF/general Markdown metadata, isolated from the legacy dotagents parser, which supports scalar/list conventions but not general nested mappings. Limit nesting, aliases/expansion, and document size; never construct executable objects. Preserve original document coordinates and unknown fields in the normalized projection; any explicit metadata rewrite must preserve unknown keys and authored text or refuse a lossy rewrite. Normalize bare `verified` mappings to one-element lists. Tolerate unknown concept types and extension keys. Pin compatibility fixtures to OKF v0.2; unknown declared OKF versions receive best-effort consumption plus a diagnostic, unlike unsupported source-manifest versions.
+
+Interpret `/path` inside an OKF bundle as bundle-root-relative, never filesystem-absolute. Resolve relative references from the containing document, normalize them, and enforce authorized checkout confinement before any read. Relative references may name selected repository code outside the bundle; links never select additional index inputs or grant reads. External URLs and source scope descriptors are metadata only: indexing/checking performs no network requests. Keep Markdown links (related material), `sources` (provenance), `knowledge_sources` (explicit hash-checkable dependencies), and `knowledge_paths` (advisory applicability) distinct. Source IDs support claim footnotes without positional attribution; a source is not automatically an evidence dependency.
 
 All reads validate canonical confinement and reject traversal, external symlinks, and non-regular sources. Git-ignored content is excluded by default, even when a broad glob matches; an explicit host allow rule is required to include it. Selected hidden documentation such as `.agents/memories` is allowed. There is no ambient scan of home directories, global protocol memories, session stores, or unrelated worktrees.
 
 Alternative: exporting session SQLite mixes private data with derived artifacts and makes review/versioning poor. A separate proprietary document format duplicates Markdown and current protocol parsing.
+
+### 1.1. Curated concepts and progressive disclosure are the primary authoring model
+
+Favor small subsystem explanations, invariants, decisions, and playbooks connected by ordinary Markdown links. Types are open vocabulary, not a closed taxonomy. Authored `description` values supply catalog previews and automatic orientation descriptions; fall back to bounded verbatim headings/excerpts when absent, never model-generated summaries. Optional per-directory index.md listings let readers descend from repository orientation to subsystem concepts and then source citations without QueryMT tooling.
+
+Consume authored indexes as citable navigation material. When absent, synthesize a bounded listing from selected documents' titles/descriptions in memory; no write occurs and synthetic listings are labeled derived with citations to the underlying documents. Do not replace authored listings, inject whole trees, or infer evidence dependencies from index links. An index can be an explicitly configured orientation entrypoint; synthesis alone does not enable fallback delivery. Exhaustive File/Purpose tables remain an optional pilot variant, not a prerequisite for useful knowledge.
 
 ### 2. Checkout-local derived store, within the existing knowledge module
 
@@ -171,6 +188,8 @@ Index freshness means indexed bytes match current documents/source. Evidence fre
 
 Support a portable, Git-trackable `.agents/knowledge-evidence.json` sidecar. Entries identify document/section or file-table row, the reviewed text hash, and explicit dependency paths/selectors plus versioned SHA-256 hashes. Dependencies come from declared `knowledge_sources` or the file path represented by a file-table row; use whole-file hashes first and symbol hashes only for unambiguous supported selectors. Missing/ambiguous selectors are diagnostics, not a successful match. Ordinary relative Markdown links are checked separately for broken references and do not automatically imply an evidence dependency.
 
+Normalize optional OKF `sources`, `generated`, `verified`, `status`, and `stale_after` metadata without conflating their meanings. A declared human review is a self-reported event, not authenticated identity or authorization. Expose review declarations separately from evidence drift, index currency, lifecycle, and expiry. Absent status follows OKF's stable default but implies neither review nor correctness. Preserve draft/deprecated documents for explicit retrieval and links, label their lifecycle, and exclude them from automatic cards. Expired stable documents may supply only a labeled cautionary pointer, never a current invariant. Ordinary Markdown lacking these fields remains usable.
+
 Evidence states are `unverified`, `unchanged`, `changed`, and `missing`. An edited note with no corresponding acknowledgement becomes unverified; changed dependency bytes are changed, not automatically false. A vanished dependency is missing. No confident rename is inferred from a similar filename; report candidates only as suggestions. Acknowledgement is an explicit, previewable maintenance write bound to the exact note and dependency hashes, not a side effect of indexing, fetching, or generating maps. The sidecar contains no absolute paths, session IDs, timestamps required for equality, or private content.
 
 ### 8. Deterministic maintenance API and minimal executable surface
@@ -220,8 +239,9 @@ Mandatory correctness gates: no cross-session/private leakage; identical logical
 
 ## Migration Plan
 
-1. Land disabled-by-default settings, repository service/store, and fixtures without changing session DB schemas or protocol imports.
-2. Add deterministic extraction/refresh and maintenance API/example; exercise clone, rebuild, worktree, corruption, and concurrency cases.
-3. Add explicit repository tool modes and knowledge_get, then the independently opt-in orientation trigger and post-index contribution adapters, shared delivery controls, stable policy, and compaction/resume handling. Keep all default profiles unchanged until correctness gates pass.
-4. Add reviewed pilot documents and fixture corpora, run deterministic evaluation, and document how to execute optional model-backed comparisons.
-5. Roll back by disabling repository knowledge and removing only its cache if desired. Committed Markdown remains ordinary documentation; private session data and legacy imports are unchanged. Do not delete authored documents automatically during rollback.
+1. Settle the portable document contract and land disabled-by-default settings, explicit bundle selection, isolated adapters/YAML parsing, and compatibility fixtures without changing session DB schemas or protocol imports. Refer to https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md for OKF v0.2 conventions; executors/attesters remain inert metadata.
+2. Complete the pull-retrieval vertical slice: safe discovery, normalized sections/catalogs, disposable FTS index, effective-checkout service binding, query/list/stats/get, and current-source citations. Gate it on clone/rebuild, confinement, privacy, worktree, edit/deletion, and malformed-source fixtures before adding automatic delivery.
+3. Add source-derived navigation maps and deterministic maintenance, including hash-bound evidence acknowledgements, reference/lifecycle diagnostics, and optional explicit scaffolding. Declarations of review never substitute for acknowledgement preimages.
+4. Add independently opt-in orientation and post-index adapters, shared budgets, stable policy, and compaction/resume handling using the same retrieval service. Default profiles remain unchanged until their correctness gates pass.
+5. Add reviewed concept-first pilot documents and fixture corpora, run deterministic evaluation, and document optional model-backed comparisons. Exhaustive per-file coverage remains an experimental arm.
+6. Roll back by disabling repository knowledge and removing only its cache if desired. Committed Markdown remains readable without QueryMT; private session data and legacy imports are unchanged. Do not delete authored documents automatically during rollback.
