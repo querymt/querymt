@@ -124,8 +124,9 @@ pub(crate) mod fixtures {
                                 directory:
                                     querymt_remote::mesh_runtime_config::DirectoryMode::default(),
                             }),
-                            iroh_enabled: false,
-                            iroh_gso: true,
+                            // Admission tests need identity-scoped invite and membership stores.
+                            iroh_enabled: true,
+                            iroh_gso: false,
                             iroh_scopes: Vec::new(),
                             identity_file: Some(identity_path),
                             request_timeout: std::time::Duration::from_secs(300),
