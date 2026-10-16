@@ -6,11 +6,10 @@ use querymt_remote::{IrohMeshConfig, MeshRuntimeConfig, MeshRuntimeHandle};
 ///
 /// Steps:
 /// 1. Verify the invite grant signature and check expiry.
-/// 2. Check `~/.qmt/memberships.json` for an existing token for this mesh -
-///    if found, use `AdmissionRequest::Token` (reconnect path); otherwise use
+/// 2. Bootstrap the iroh swarm with the selected identity and dial the inviter.
+/// 3. Check that identity's mesh state for an existing token and fallback peers.
+///    If found, use `AdmissionRequest::Token`; otherwise use
 ///    `AdmissionRequest::Invite` (first join, consumes one invite use).
-/// 3. Bootstrap the iroh swarm and dial the inviter (or cached peers if the
-///    inviter is offline).
 /// 4. Send the admission request to the target peer's `RemoteNodeManager`.
 /// 5. On `Admitted` - persist the returned `MembershipToken` and known peers.
 /// 6. On `Rejected` - disconnect and return an error.
@@ -40,13 +39,31 @@ pub async fn join_mesh_via_invite(
         invite.grant.mesh_name.as_deref(),
     );
 
-    let mesh_state_path = crate::agent::remote::mesh_state::default_mesh_state_path()
-        .map_err(|e| MeshError::SwarmError(e.to_string()))?;
-    let mut mesh_state =
-        crate::agent::remote::mesh_state::MeshStateStore::load_or_create(&mesh_state_path)
-            .map_err(|e| MeshError::SwarmError(e.to_string()))?;
-
-    let (existing_token, fallback_peers) = match mesh_state.get(&mesh_id) {
+    let config = MeshRuntimeConfig {
+        enabled: true,
+        lan: None,
+        iroh_enabled: true,
+        iroh_gso,
+        iroh_dns,
+        iroh_scopes: vec![IrohMeshConfig {
+            mesh_id: mesh_id.clone(),
+            invite: Some(invite.encode()),
+            name: invite.grant.mesh_name.clone(),
+        }],
+        identity_file,
+        request_timeout: std::time::Duration::from_secs(300),
+        stream_reconnect_grace: std::time::Duration::from_secs(120),
+        node_name: None,
+        peers: Vec::new(),
+        auto_fallback: false,
+    };
+    let runtime = querymt_remote::bootstrap_mesh_runtime(&config).await?;
+    let mesh = runtime.as_mesh_handle();
+    let mesh_state = mesh
+        .mesh_state_store()
+        .cloned()
+        .ok_or_else(|| MeshError::SwarmError("mesh state store unavailable".into()))?;
+    let (existing_token, fallback_peers) = match mesh_state.read().get(&mesh_id) {
         Some(entry)
             if entry.status == crate::agent::remote::mesh_state::MeshStatus::Active
                 && entry
@@ -66,44 +83,12 @@ pub async fn join_mesh_via_invite(
         _ => (None, vec![]),
     };
 
-    let mut bootstrap_peers: Vec<String> = vec![];
-    if existing_token.is_some() && !fallback_peers.is_empty() {
-        for p in &fallback_peers {
-            bootstrap_peers.push(format!("/p2p/{}", p.peer_id));
-        }
-        log::info!(
-            "Reconnect: will dial {} cached peer(s) as fallback",
-            bootstrap_peers.len()
-        );
-    }
-
-    let config = MeshRuntimeConfig {
-        enabled: true,
-        lan: None,
-        iroh_enabled: true,
-        iroh_gso,
-        iroh_dns,
-        iroh_scopes: vec![IrohMeshConfig {
-            mesh_id: mesh_id.clone(),
-            invite: Some(invite.encode()),
-            name: invite.grant.mesh_name.clone(),
-        }],
-        identity_file,
-        request_timeout: std::time::Duration::from_secs(300),
-        stream_reconnect_grace: std::time::Duration::from_secs(120),
-        node_name: None,
-        peers: bootstrap_peers,
-        auto_fallback: false,
-    };
-
     log::info!(
         "Joining mesh via invite (inviter={}, name={:?})",
         invite.grant.inviter_peer_id,
         invite.grant.mesh_name
     );
 
-    let runtime = querymt_remote::bootstrap_mesh_runtime(&config).await?;
-    let mesh = runtime.as_mesh_handle();
     mesh.ensure_scope(MeshScopeId::Iroh {
         mesh_id: mesh_id.clone(),
     });
@@ -181,9 +166,14 @@ pub async fn join_mesh_via_invite(
                 })
                 .collect();
 
-            mesh_state
-                .upsert_joined_mesh(membership_token, known_peers)
-                .map_err(|e| MeshError::SwarmError(format!("failed to persist mesh state: {e}")))?;
+            crate::agent::remote::admission::persist_admission(
+                mesh_state.clone(),
+                mesh_id.clone(),
+                Some(membership_token),
+                known_peers,
+            )
+            .await
+            .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
             mesh.emit_scope_joined(MeshScopeId::Iroh {
                 mesh_id: mesh_id.clone(),
@@ -205,11 +195,22 @@ pub async fn join_mesh_via_invite(
                 }
             }
 
-            mesh_state
-                .update_known_peers(&mesh_id, fallback_peers.clone())
-                .map_err(|e| {
-                    MeshError::SwarmError(format!("failed to update mesh state timestamp: {e}"))
-                })?;
+            let known_peers = existing_peers
+                .iter()
+                .map(|peer| PeerEntry {
+                    peer_id: peer.clone(),
+                    addrs: vec![format!("/p2p/{peer}")],
+                })
+                .chain(fallback_peers.iter().cloned())
+                .collect();
+            crate::agent::remote::admission::persist_admission(
+                mesh_state.clone(),
+                mesh_id.clone(),
+                None,
+                known_peers,
+            )
+            .await
+            .map_err(|e| MeshError::SwarmError(e.to_string()))?;
 
             mesh.emit_scope_joined(MeshScopeId::Iroh {
                 mesh_id: mesh_id.clone(),
@@ -221,13 +222,6 @@ pub async fn join_mesh_via_invite(
                 "admission rejected: {reason}"
             )));
         }
-    }
-
-    if let Some(store_arc) = mesh.mesh_state_store() {
-        let fresh =
-            crate::agent::remote::mesh_state::MeshStateStore::load_or_create(&mesh_state_path)
-                .map_err(|e| MeshError::SwarmError(e.to_string()))?;
-        *store_arc.write() = fresh;
     }
 
     Ok(runtime)

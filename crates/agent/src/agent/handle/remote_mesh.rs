@@ -403,8 +403,16 @@ impl LocalAgentHandle {
                         cache.by_label.write().remove(&key);
                         model_inventory.invalidate_remote().await;
                     }
+                    Ok(crate::agent::remote::mesh::PeerEvent::ScopeJoined(_))
+                    | Ok(crate::agent::remote::mesh::PeerEvent::ScopeLeft(_)) => {
+                        cache.by_label.write().clear();
+                        model_inventory.invalidate_remote().await;
+                    }
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        cache.by_label.write().clear();
+                        model_inventory.invalidate_remote().await;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         cache
                             .invalidation_task_started

@@ -5,20 +5,20 @@ use futures_util::StreamExt as _;
 use kameo::remote;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
 use libp2p::{Multiaddr, PeerId};
-use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::mesh_bootstrap::{MeshBootstrapContext, finalize_bootstrap, prepare_runtime_bootstrap};
 use crate::mesh_events::{
-    connection_route_plan, handle_connection_closed, handle_connection_established,
-    handle_mdns_discovered, handle_mdns_expired, log_kameo_messaging_event, peer_id_from_multiaddr,
-    reconnect_backoff_duration, refresh_mesh_state_known_peers, seed_scoped_dial_peer,
-    should_dial_peer_command,
+    MeshConnections, attach_iroh_scope_routes, connection_route_plan, connection_transport,
+    handle_connection_closed, handle_connection_established, handle_mdns_discovered,
+    handle_mdns_expired, log_kameo_messaging_event, peer_id_from_multiaddr,
+    reconnect_backoff_duration, refresh_mesh_state_known_peers, run_re_registration_task,
+    seed_scoped_dial_peer, should_dial_peer_command,
 };
 use crate::mesh_runtime_support::{DialReason, SwarmCommand, resolve_local_hostname};
 use crate::{
     LanDiscovery, MeshError, MeshHandle, MeshRuntimeConfig, MeshRuntimeHandle, MeshScopeId,
-    MeshStateStore, MeshTransportMode, SignedInviteGrant, default_mesh_state_path,
+    MeshTransportKind, MeshTransportMode, SignedInviteGrant,
 };
 
 fn messaging_config(request_timeout: std::time::Duration) -> remote::messaging::Config {
@@ -101,6 +101,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         config.identity_file.as_deref(),
         &config.peers,
         resolve_local_hostname(),
+        has_iroh,
     )?;
 
     let MeshBootstrapContext {
@@ -110,12 +111,18 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         known_peers,
         re_register_fns,
         local_hostname,
+        invite_store,
+        mesh_state_store,
     } = ctx;
 
     let peer_events_tx_loop = peer_events_tx.clone();
     let known_peers_loop = Arc::clone(&known_peers);
     let routes_loop = Arc::clone(&routes);
-    let re_register_fns_loop = Arc::clone(&re_register_fns);
+    let (re_register_tx, re_register_rx) = mpsc::channel(1);
+    tokio::spawn(run_re_registration_task(
+        re_register_rx,
+        Arc::clone(&re_register_fns),
+    ));
 
     let enable_mdns = has_lan
         && config
@@ -147,14 +154,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         Vec::new()
     };
 
-    let mesh_state_store_loop: Option<Arc<RwLock<MeshStateStore>>> = if has_iroh {
-        default_mesh_state_path()
-            .ok()
-            .and_then(|p| MeshStateStore::load_or_create(&p).ok())
-            .map(|s| Arc::new(RwLock::new(s)))
-    } else {
-        None
-    };
+    let mesh_state_store_loop = mesh_state_store.clone();
 
     #[derive(NetworkBehaviour)]
     struct UnifiedMeshBehaviour {
@@ -369,6 +369,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
     let diagnostics_loop = diagnostics.clone();
     tokio::spawn(async move {
         let mut pending_dials: HashSet<PeerId> = HashSet::new();
+        let mut connections = MeshConnections::new();
         let mut reconnect_attempts: HashMap<PeerId, u32> = HashMap::new();
         let mut reconnect_next_due: HashMap<PeerId, tokio::time::Instant> = HashMap::new();
         let mut peer_iroh_scope_loop: HashMap<PeerId, MeshScopeId> = reconnect_targets_by_scope
@@ -396,7 +397,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                             continue;
                         }
                         if !should_dial_peer_command(&peer_id, DialReason::Reconnect, &peer_iroh_scope_loop, has_iroh_loop)
-                            || routes_loop.is_peer_alive(&peer_id)
+                            || swarm.is_connected(&peer_id)
                             || pending_dials.contains(&peer_id)
                             || reconnect_next_due.get(&peer_id).is_some_and(|due| *due > now)
                         {
@@ -427,9 +428,19 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                                 continue;
                             }
                             reconnect_targets.insert(peer_id);
-                            if pending_dials.contains(&peer_id) || routes_loop.is_peer_alive(&peer_id) {
+                            if matches!(reason, DialReason::Manual | DialReason::Reconnect)
+                                && reconnect_next_due.get(&peer_id).is_some_and(|due| *due > tokio::time::Instant::now()) {
                                 continue;
                             }
+                            if swarm.is_connected(&peer_id) {
+                                if let Some(scope) = peer_iroh_scope_loop.get(&peer_id)
+                                    && attach_iroh_scope_routes(&mut swarm, scope, &[peer_id], &connections,
+                                        &routes_loop, &known_peers_loop, &peer_events_tx_loop) {
+                                    refresh_mesh_state_known_peers(&mesh_state_store_loop, &routes_loop);
+                                }
+                                continue;
+                            }
+                            if pending_dials.contains(&peer_id) { continue; }
                             let addr: Multiaddr = format!("/p2p/{peer_id}").parse().expect("valid /p2p addr");
                             match swarm.dial(addr) {
                                 Ok(_) => { pending_dials.insert(peer_id); }
@@ -444,7 +455,7 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                         SwarmCommand::JoinIrohScope { mesh_id, peers } => {
                             let scope = MeshScopeId::Iroh { mesh_id: mesh_id.clone() };
                             let scoped_peers = reconnect_targets_by_scope.entry(mesh_id).or_default();
-                            for peer_id in peers {
+                            for &peer_id in &peers {
                                 if peer_id == local_peer_id {
                                     continue;
                                 }
@@ -453,15 +464,25 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                                 peer_iroh_scope_loop.insert(peer_id, scope.clone());
                                 reconnect_next_due.remove(&peer_id);
                             }
+                            if attach_iroh_scope_routes(&mut swarm, &scope, &peers, &connections,
+                                &routes_loop, &known_peers_loop, &peer_events_tx_loop) {
+                                refresh_mesh_state_known_peers(&mesh_state_store_loop, &routes_loop);
+                            }
+                            let _ = re_register_tx.try_send(());
                         }
                         SwarmCommand::LeaveIrohScope { mesh_id } => {
+                            routes_loop.remove_scope(&MeshScopeId::Iroh { mesh_id: mesh_id.clone() });
                             if let Some(peers) = reconnect_targets_by_scope.remove(&mesh_id) {
                                 for pid in peers {
-                                    reconnect_targets.remove(&pid);
-                                    pending_dials.remove(&pid);
-                                    reconnect_attempts.remove(&pid);
-                                    reconnect_next_due.remove(&pid);
-                                    peer_iroh_scope_loop.remove(&pid);
+                                    if let Some((other, _)) = reconnect_targets_by_scope.iter().find(|(_, peers)| peers.contains(&pid)) {
+                                        peer_iroh_scope_loop.insert(pid, MeshScopeId::Iroh { mesh_id: other.clone() });
+                                    } else {
+                                        reconnect_targets.remove(&pid);
+                                        pending_dials.remove(&pid);
+                                        reconnect_attempts.remove(&pid);
+                                        reconnect_next_due.remove(&pid);
+                                        peer_iroh_scope_loop.remove(&pid);
+                                    }
                                 }
                             }
                         }
@@ -489,26 +510,47 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                             log_kameo_messaging_event(&event);
                         }
                         SwarmEvent::Behaviour(UnifiedMeshBehaviourEvent::Mdns(libp2p::mdns::Event::Discovered(list))) => {
-                            handle_mdns_discovered(&mut swarm, list, &known_peers_loop, &routes_loop, &peer_events_tx_loop, &re_register_fns_loop);
+                            handle_mdns_discovered(&mut swarm, list, &known_peers_loop, &routes_loop, &peer_events_tx_loop);
                         }
                         SwarmEvent::Behaviour(UnifiedMeshBehaviourEvent::Mdns(libp2p::mdns::Event::Expired(list))) => {
                             handle_mdns_expired(&mut swarm, list, &known_peers_loop, &routes_loop, &peer_events_tx_loop);
                         }
-                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
                             pending_dials.remove(&peer_id);
                             reconnect_targets.insert(peer_id);
                             reconnect_attempts.remove(&peer_id);
                             reconnect_next_due.remove(&peer_id);
                             let remote_addr = endpoint.get_remote_address().clone();
-                            let plan = connection_route_plan(has_lan_loop, has_iroh_loop, peer_iroh_scope_loop.get(&peer_id));
+                            let transport = connection_transport(&remote_addr);
+                            connections.insert(connection_id, (peer_id, transport, remote_addr.clone()));
+                            let plan = if transport == MeshTransportKind::Iroh {
+                                reconnect_targets_by_scope.iter()
+                                    .filter(|(_, peers)| peers.contains(&peer_id))
+                                    .flat_map(|(mesh_id, _)| connection_route_plan(false, has_iroh_loop, Some(&MeshScopeId::Iroh { mesh_id: mesh_id.clone() })))
+                                    .collect()
+                            } else {
+                                connection_route_plan(has_lan_loop, false, None)
+                            };
                             for (transport, scope, priority) in plan {
-                                handle_connection_established(&mut swarm, peer_id, remote_addr.clone(), &routes_loop, &known_peers_loop, &peer_events_tx_loop, &re_register_fns_loop, transport, scope, priority);
+                                handle_connection_established(&mut swarm, peer_id, remote_addr.clone(), &routes_loop, &known_peers_loop, &peer_events_tx_loop, transport, scope, priority);
+                            }
+                            if num_established.get() == 1 {
+                                let _ = re_register_tx.try_send(());
                             }
                             refresh_mesh_state_known_peers(&mesh_state_store_loop, &routes_loop);
                         }
-                        SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
                             reconnect_targets.insert(peer_id);
-                            reconnect_next_due.remove(&peer_id);
+                            if num_established == 0 {
+                                reconnect_next_due.remove(&peer_id);
+                            }
+                            let closed = connections.remove(&connection_id);
+                            if num_established > 0 && let Some((_, transport, _)) = closed
+                                && !connections.values().any(|(peer, kind, _)| *peer == peer_id && *kind == transport) {
+                                for route in routes_loop.remove_transport(&peer_id, transport) {
+                                    let _ = peer_events_tx_loop.send(crate::MeshEvent::RouteRemoved { peer_id, route });
+                                }
+                            }
                             handle_connection_closed(peer_id, num_established, &routes_loop, &known_peers_loop, &peer_events_tx_loop);
                         }
                         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -538,6 +580,8 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
         known_peers,
         re_register_fns,
         local_hostname,
+        invite_store,
+        mesh_state_store,
     };
 
     let listen_label = match transport_mode {
