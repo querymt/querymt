@@ -57,6 +57,7 @@ jobs:
               - 'crates/providers/openai/**'
             zai:
               - 'crates/providers/zai/**'
+              - 'crates/providers/openai/**'
             shared:
               - 'crates/querymt/**'
               - 'crates/provider-common/**'
