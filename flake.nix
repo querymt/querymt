@@ -255,6 +255,31 @@
                     export PS1="(env:querymt-cuda) $PS1"
                   '';
               };
+            }
+            // pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+              rocm = pkgs.mkShell {
+                buildInputs =
+                  commonInputs
+                  ++ (with pkgs.rocmPackages; [
+                    clr
+                    hipblas
+                    rocblas
+                  ]);
+
+                shellHook =
+                  /*
+                  bash
+                  */
+                  ''
+                    export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
+                    export ROCM_PATH="${pkgs.rocmPackages.clr}"
+                    export HIP_PATH="$ROCM_PATH"
+                    export LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath (with pkgs.rocmPackages; [pkgs.gcc.cc.lib clr hipblas rocblas])}:$LIBRARY_PATH"
+                    export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath (with pkgs.rocmPackages; [pkgs.gcc.cc.lib clr hipblas rocblas])}:$LD_LIBRARY_PATH"
+
+                    export PS1="(env:querymt-rocm) $PS1"
+                  '';
+              };
             };
         };
       };
