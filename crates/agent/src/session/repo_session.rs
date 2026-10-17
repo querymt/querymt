@@ -345,6 +345,26 @@ impl SessionRepository for SqliteSessionRepository {
         }
     }
 
+    async fn get_session_ref_by_internal_id(
+        &self,
+        session_internal_id: i64,
+    ) -> SessionResult<Option<(String, Option<std::path::PathBuf>)>> {
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT public_id, cwd FROM sessions WHERE id = ?",
+                params![session_internal_id],
+                |row| {
+                    let public_id: String = row.get(0)?;
+                    let cwd: Option<String> = row.get(1)?;
+                    Ok((public_id, cwd))
+                },
+            )
+            .optional()
+        })
+        .await
+        .map(|opt| opt.map(|(public_id, cwd)| (public_id, cwd.map(std::path::PathBuf::from))))
+    }
+
     async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>> {
         let parent_internal_id = self.resolve_session_internal_id(parent_id).await?;
         self.run_blocking(move |conn| {

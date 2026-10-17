@@ -222,6 +222,10 @@ pub struct AgentEvent {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEventKind {
     SessionCreated,
+    SessionWorkspaceBound {
+        workspace: crate::session::projection::SessionWorkspaceView,
+        cwd: Option<PathBuf>,
+    },
     PromptReceived {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,6 +568,8 @@ pub enum AgentEventKind {
     },
     DelegationRequested {
         delegation: Delegation,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
     },

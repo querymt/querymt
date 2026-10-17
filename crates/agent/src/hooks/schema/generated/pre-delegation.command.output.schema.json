@@ -8,6 +8,26 @@
       ],
       "type": "string"
     },
+    "DelegationIsolationWire": {
+      "description": "Wire representation of the delegate execution isolation policy.",
+      "oneOf": [
+        {
+          "const": "inherit",
+          "description": "Resolve from the parent's execution mode.",
+          "type": "string"
+        },
+        {
+          "const": "shared",
+          "description": "Explicitly share the parent's checkout (disclosed as shared).",
+          "type": "string"
+        },
+        {
+          "const": "isolated",
+          "description": "Explicitly request a private worktree checkout for this delegate.",
+          "type": "string"
+        }
+      ]
+    },
     "PreDelegationHookSpecificOutputWire": {
       "additionalProperties": false,
       "properties": {
@@ -62,6 +82,18 @@
             "string",
             "null"
           ]
+        },
+        "isolation": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DelegationIsolationWire"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Execution isolation requested for this delegate. Absent keeps the\ncaller's resolution from the delegate tool request."
         },
         "objective": {
           "default": null,

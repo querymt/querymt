@@ -415,6 +415,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                 .unwrap();
             let delegation = store
                 .create_delegation(Delegation {
+                    isolation: Default::default(),
                     id: 0,
                     public_id: String::new(),
                     session_id: session.id,
@@ -437,6 +438,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
             let kind = AgentEventKind::DelegationRequested {
                 delegation: delegation.clone(),
                 tool_call_id: None,
+                batch_id: None,
             };
             let unrelated = tracing::info_span!(parent: None, "unrelated-relay");
             async {
@@ -1445,6 +1447,7 @@ async fn timeout_cleanup_cancels_requested_delegation_before_it_can_start() {
         .expect("session lookup")
         .expect("parent session");
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 0,
         public_id: String::new(),
         session_id: session.id,
@@ -1499,6 +1502,7 @@ async fn timeout_cleanup_does_not_overwrite_terminal_delegation() {
         .expect("session lookup")
         .expect("parent session");
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 0,
         public_id: String::new(),
         session_id: session.id,
@@ -1968,6 +1972,7 @@ async fn test_delegation_guard_blocks_duplicate() {
     }];
 
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 1,
         public_id: "del-1".to_string(),
         session_id: 1,
@@ -2045,6 +2050,7 @@ async fn test_delegation_guard_blocks_max_retries() {
     }];
 
     let delegation = Delegation {
+        isolation: Default::default(),
         id: 1,
         public_id: "del-1".to_string(),
         session_id: 1,

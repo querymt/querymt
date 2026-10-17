@@ -1,13 +1,13 @@
 //! Tool context and error types for unified tool interface
 
+use crate::knowledge::{KnowledgeStore, ScopePolicy};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-
-use crate::knowledge::{KnowledgeStore, ScopePolicy};
 
 /// Capability requirements that tools may need
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -117,6 +117,18 @@ pub trait ToolContext: Send + Sync {
         CancellationToken::new()
     }
 
+    /// The session's checkout-scoped cooperative mutation gate, when the
+    /// session participates in worktree-aware coordination.
+    ///
+    /// Mutating built-ins wrap their file writes in this gate so baseline
+    /// capture never observes a half-applied edit. The default is `None`
+    /// (plain local execution, no gating). Opaque operations (shell, MCP)
+    /// are deliberately not gated; capture validates observed content
+    /// instead.
+    fn checkout_mutation_gate(&self) -> Option<Arc<crate::worktree::gate::CheckoutMutationGate>> {
+        None
+    }
+
     /// Ask the user a structured question and wait for a response.
     /// Returns the selected answer labels, or an error if the question cannot be delivered.
     ///
@@ -212,6 +224,32 @@ pub enum ToolExecutionClass {
     ParallelSafe,
     SerialStateful,
     ClarificationBoundary,
+}
+
+/// Run a mutating tool operation under the session's checkout-scoped
+/// cooperative mutation gate when one is configured; otherwise run it
+/// unchanged.
+///
+/// Mutating built-ins wrap their write phase in this helper so a concurrent
+/// baseline capture (which holds the gate) never observes a half-applied
+/// edit, and vice versa. Opaque operations (shell commands, MCP tools) are
+/// deliberately *not* gated: their filesystem writes are invisible to
+/// QueryMT, and capture validates observed content around the window
+/// instead.
+pub async fn run_under_mutation_gate<T, F>(
+    context: &dyn ToolContext,
+    fut: F,
+) -> Result<T, ToolError>
+where
+    F: Future<Output = Result<T, ToolError>>,
+{
+    match context.checkout_mutation_gate() {
+        Some(gate) => match gate.run(fut).await {
+            Ok(inner) => inner,
+            Err(err) => Err(ToolError::Other(err.into())),
+        },
+        None => fut.await,
+    }
 }
 
 /// Unified tool trait that replaces BuiltInTool

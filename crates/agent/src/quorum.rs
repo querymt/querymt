@@ -400,6 +400,10 @@ impl AgentQuorumBuilder {
                 .downcast_ref::<crate::agent::LocalAgentHandle>()
                 .map(|handle| handle.config.delegate_model_overrides.clone())
                 .unwrap_or_default();
+            let workspace_service = planner
+                .as_any()
+                .downcast_ref::<crate::agent::LocalAgentHandle>()
+                .and_then(|handle| handle.config.workspace_service());
             let mut orch = DelegationOrchestrator::new(
                 planner.clone(),
                 delegation_sink,
@@ -416,6 +420,9 @@ impl AgentQuorumBuilder {
             .with_cancel_grace_secs(self.cancel_grace_secs)
             .with_max_parallel_delegations(self.max_parallel_delegations)
             .with_summarizer(self.delegation_summarizer.clone());
+            if let Some(service) = workspace_service {
+                orch = orch.with_workspace_service(service);
+            }
             if let Some(snap) = self.routing_snapshot {
                 orch = orch.with_routing_snapshot(snap);
             }

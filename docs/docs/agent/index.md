@@ -165,6 +165,129 @@ QueryMT implements a 3-layer context management system:
 - **Event-driven schedules**: Trigger on file changes, knowledge ingestion
 - **Automation**: Background tasks for maintenance and analysis
 
+### Worktree Workspaces
+
+Sessions execute in one of two modes: **local** (the default — the working
+directory you launched from) or **isolated** (a managed Git linked worktree
+created for the session). Isolation is strictly opt-in: sessions without
+isolation options keep existing local behavior unchanged.
+
+Key model invariants:
+
+- **Project identity vs checkout identity**: A project is identified by its
+  canonical Git common directory, so every linked worktree of one repository
+  shares a single project identity. Each checkout (the main working tree or a
+  linked worktree) keeps its own execution path; code indexes and snapshot
+  state are keyed by checkout identity, never shared by project identity.
+- **Snapshot storage is separate**: The undo/redo snapshot cache remains a
+  disposable, path-keyed store. Managed worktrees never live inside it —
+  isolated worktree storage is durable, defaulting to
+  `~/.qmt/worktrees/<repo-id>/<workspace-id>` (configurable via agent
+  configuration), never inside your project.
+- **Single writable owner**: A managed workspace is bound to at most one
+  writable session; additional connections to that same session are fine, a
+  second writable session attachment is rejected. Forks and delegates receive
+  their own workspaces.
+- **Explicit lifecycle**: Workspaces track durable states
+  (`provisioning → ready`, with `failed`, `missing`, `removing`, `removed`)
+  so crashes and externally deleted checkouts are detected and recoverable.
+  Removal never reuses a checkout path.
+- **Delegation defaults**: Delegates of isolated sessions run isolated by
+  default; local sessions keep shared (in-place) delegation unless isolation
+  is configured or explicitly requested. Shared execution is always
+  disclosed as shared — isolation is never faked, and it is not filesystem
+  sandboxing: delegates operate on a real checkout of the same repository.
+
+#### Lifecycle operations and recovery
+
+The durable lifecycle (`provisioning`, `ready`, `failed`, `missing`,
+`removing`, `removed`) is inspected and advanced through three workspace
+operations. None of them has a force flag:
+
+- **status** — live observation only: whether the checkout exists, whether
+  Git registers it on the managed branch, uncommitted/untracked/ignored
+  files, the checked-out branch, and how many commits the managed branch is
+  ahead of the recorded baseline. Dirty/clean is observed live, never
+  persisted as lifecycle state.
+- **reconcile** — when a checkout directory disappeared (deleted
+  externally), the workspace is marked `missing` with a diagnostic. Missing
+  workspaces are never silently re-created and never fall back to executing
+  in the original checkout.
+- **remove** — explicitly conservative. Removal is refused while a session
+  owns the workspace, while the checkout contains uncommitted, untracked, or
+  ignored files, when the directory is not a registered checkout of the
+  managed branch (externally owned content is never deleted), and when the
+  branch contains commits beyond the baseline that no retained result
+  reference preserves. On success it reports exactly what was deleted and
+  which refs (if any) were retained.
+
+Recovering interrupted operations:
+
+1. **Crash during creation** — a crash between persisting the intent and
+   finishing the checkout leaves the workspace `provisioning`. Recovery
+   replays the idempotent provisioning steps (branch, checkout, binding) and
+   the workspace becomes `ready`. Pre-existing unknown directories at the
+   checkout path are preserved and reported, never overwritten.
+2. **Externally deleted checkout** — the next status/reconcile marks the
+   workspace `missing`. Re-create the workspace (a new isolated session) or
+   remove the record explicitly; a `missing` workspace with no unpreserved
+   commits can be removed safely, which prunes the stale Git metadata.
+3. **Failed allocation** — the record carries `last_error` naming the
+   failing step. Fix the cause (missing Git, invalid ref, absent
+   subdirectory) and retry creation; the failed record can be removed
+   explicitly.
+
+There is deliberately **no force-delete**. To remove a workspace you must
+detach its session owner, deal with its contents yourself (commit, or delete
+files), and retain or integrate any commits. Refusals name the blocking
+state and leave every file in place.
+
+#### Baseline capture semantics and limits
+
+When a delegate (or an isolated session created with
+`include-local-changes`) must see the parent's uncommitted work, QueryMT
+captures the parent's *actual working contents* into a private, immutable
+Git baseline before the child launches. What that means, precisely:
+
+- **Supported Git layouts**: ordinary non-bare repositories and linked
+  worktrees with at least one commit. The capture refuses — with an
+  explicit diagnostic, before any child starts — repositories with unborn
+  HEAD, unresolved merge conflicts, sparse checkouts, submodules, or
+  Git-LFS-managed content, rather than silently producing an incomplete
+  checkout.
+- **Working contents, not the staging partition**: a partially staged file
+  contributes its *working-file* content to the baseline. The parent's
+  index is not read as the source of truth and is left byte-for-byte
+  unchanged; the parent's HEAD, branch, stash, and working files are never
+  modified either.
+- **Tracked and untracked handling**: tracked working edits and tracked
+  deletions are captured, including tracked files that happen to match
+  `.gitignore` patterns and tracked dotfiles. Non-ignored untracked files
+  are included. **Ignored untracked files are excluded** (secrets,
+  `node_modules`, environment files) and that exclusion is disclosed in the
+  capture result.
+- **File semantics preserved**: executable bits, symlinks, binary contents,
+  and tracked hidden paths are captured with their real Git semantics —
+  the capture drives Git's own index machinery.
+- **Shared batch baselines**: delegates dispatched as one parallel batch
+  are captured once and start from identical contents. Delegates requested
+  later capture the parent's then-current state, so subsequent parent
+  edits are visible to them.
+- **Private objects stay private**: baseline commits use an internal
+  `QueryMT` identity, never require or use your commit identity, and never
+  run commit hooks. They live only in your local object database under
+  managed refs (`refs/qmt/baselines/…`) that keep them reachable; QueryMT
+  never pushes private refs anywhere. Note that captured baselines can
+  therefore contain secret-looking content that exists in your working
+  tree.
+- **External writers**: QueryMT coordinates its own writers with a
+  checkout-scoped mutation gate and validates a HEAD/working-state manifest
+  around the capture window, retrying a bounded number of times when an
+  external editor changes files mid-capture, then failing explicitly. This
+  is cooperation, not a transactional snapshot: a write that lands after
+  validation is not detectable, and shell/MCP tool writes are opaque to
+  the gate by design.
+
 ## Getting Started
 
 ### Quick Start

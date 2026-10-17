@@ -70,6 +70,18 @@ pub enum SessionError {
     #[error("delegate assignment revision conflict: expected {expected}, found {found}")]
     DelegateAssignmentRevisionConflict { expected: u64, found: u64 },
 
+    /// Workspace not found in the registry.
+    #[error("Workspace not found: {0}")]
+    WorkspaceNotFound(String),
+
+    /// A managed workspace is already owned by another writable session.
+    #[error("Workspace {workspace} already owned by session {owner}")]
+    WorkspaceAlreadyOwned { workspace: String, owner: String },
+
+    /// A managed workspace checkout path is already registered.
+    #[error("Workspace checkout path already registered: {0}")]
+    WorkspaceCheckoutTaken(String),
+
     /// Provider error (from LLM operations)
     #[error("Provider error: {0}")]
     ProviderError(#[from] LLMError),
@@ -124,6 +136,15 @@ impl From<SessionError> for LLMError {
                     "Fork point type mismatch: expected {}, got {}",
                     expected, actual
                 ))
+            }
+            SessionError::WorkspaceNotFound(msg) => {
+                LLMError::InvalidRequest(format!("Workspace not found: {msg}"))
+            }
+            SessionError::WorkspaceAlreadyOwned { workspace, owner } => LLMError::InvalidRequest(
+                format!("Workspace {workspace} already owned by session {owner}"),
+            ),
+            SessionError::WorkspaceCheckoutTaken(msg) => {
+                LLMError::InvalidRequest(format!("Workspace checkout path taken: {msg}"))
             }
             SessionError::DatabaseError(msg) => LLMError::ProviderError(msg),
             SessionError::SerializationError(msg) => LLMError::ProviderError(msg),

@@ -118,6 +118,10 @@ mock! {
             task_id: Option<&'c str>,
         ) -> SessionResult<()>;
         async fn get_session_fork_info(&self, session_id: &str) -> SessionResult<Option<ForkInfo>>;
+        async fn get_session_ref_by_internal_id(
+            &self,
+            session_internal_id: i64,
+        ) -> SessionResult<Option<(String, Option<std::path::PathBuf>)>>;
         async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>>;
         async fn create_task(&self, task: Task) -> SessionResult<Task>;
         async fn get_task(&self, task_id: &str) -> SessionResult<Option<Task>>;

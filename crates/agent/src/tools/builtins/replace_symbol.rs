@@ -127,119 +127,124 @@ impl Tool for ReplaceSymbolTool {
         let root = resolve_root(&args, context)?;
         let requests = parse_replacements(&args)?;
 
-        // Phase 1: Read all files and resolve all symbols.
-        let mut file_contents: HashMap<PathBuf, String> = HashMap::new();
-        let mut resolved: Vec<ResolvedReplacement> = Vec::new();
+        // Read/replace/write phases run under the checkout mutation gate
+        // when the session has one (see `run_under_mutation_gate`).
+        crate::tools::run_under_mutation_gate(context, async {
+            // Phase 1: Read all files and resolve all symbols.
+            let mut file_contents: HashMap<PathBuf, String> = HashMap::new();
+            let mut resolved: Vec<ResolvedReplacement> = Vec::new();
 
-        for req in &requests {
-            let target = resolve_target(&req.path, &root, context)?;
+            for req in &requests {
+                let target = resolve_target(&req.path, &root, context)?;
 
-            // Read file if not already loaded
-            let content = match file_contents.get(&target) {
-                Some(c) => c.clone(),
-                None => {
-                    let c = tokio::fs::read_to_string(&target).await.map_err(|e| {
-                        ToolError::ProviderError(format!(
-                            "Failed to read {}: {e}",
+                // Read file if not already loaded
+                let content = match file_contents.get(&target) {
+                    Some(c) => c.clone(),
+                    None => {
+                        let c = tokio::fs::read_to_string(&target).await.map_err(|e| {
+                            ToolError::ProviderError(format!(
+                                "Failed to read {}: {e}",
+                                target.display()
+                            ))
+                        })?;
+                        file_contents.insert(target.clone(), c);
+                        file_contents.get(&target).unwrap().clone()
+                    }
+                };
+
+                let symbol_index = SymbolIndex::from_source_for_path(&target, &content)
+                    .map_err(|e| ToolError::ProviderError(e.to_string()))?;
+
+                let matches = symbol_index.find_by_name(&req.symbol, req.kind);
+                let symbol = matches.get(req.occurrence).copied().ok_or_else(|| {
+                    if matches.is_empty() {
+                        ToolError::InvalidRequest(format!(
+                            "Symbol '{}' not found in {}",
+                            req.symbol,
                             target.display()
                         ))
-                    })?;
-                    file_contents.insert(target.clone(), c);
-                    file_contents.get(&target).unwrap().clone()
-                }
-            };
-
-            let symbol_index = SymbolIndex::from_source_for_path(&target, &content)
-                .map_err(|e| ToolError::ProviderError(e.to_string()))?;
-
-            let matches = symbol_index.find_by_name(&req.symbol, req.kind);
-            let symbol = matches.get(req.occurrence).copied().ok_or_else(|| {
-                if matches.is_empty() {
-                    ToolError::InvalidRequest(format!(
-                        "Symbol '{}' not found in {}",
-                        req.symbol,
-                        target.display()
-                    ))
-                } else {
-                    ToolError::InvalidRequest(format!(
-                        "Occurrence {} out of range for '{}' in {} ({} matches available)",
-                        req.occurrence,
-                        req.symbol,
-                        target.display(),
-                        matches.len()
-                    ))
-                }
-            })?;
-
-            // Hash check
-            if let Some(ref expected) = req.expected_hash
-                && symbol.digest.hash.to_string() != *expected
-            {
-                return Err(ToolError::ProviderError(format!(
-                    "Hash mismatch for '{}' in {}: expected {}, got {}. File may have changed.",
-                    req.symbol,
-                    target.display(),
-                    expected,
-                    symbol.digest.hash
-                )));
-            }
-
-            resolved.push(ResolvedReplacement {
-                path: target,
-                kind_str: symbol.kind.as_str().to_string(),
-                qualified_name: symbol.qualified_name.clone(),
-                old_hash: symbol.digest.hash.to_string(),
-                old_start_line: symbol.start_line,
-                old_end_line: symbol.end_line,
-                start_byte: symbol.start_byte,
-                end_byte: symbol.end_byte,
-                new_text: req.new_text.clone(),
-                new_start_line: 0,
-                new_end_line: 0,
-                new_hash: String::new(),
-            });
-        }
-
-        // Phase 2: Validate no overlaps within each file.
-        validate_no_overlaps(&resolved)?;
-
-        // Phase 3: Apply replacements per file, bottom-up by byte offset.
-        let mut results = Vec::new();
-        let mut files_to_write: HashMap<PathBuf, Vec<usize>> = HashMap::new();
-        for (i, r) in resolved.iter().enumerate() {
-            files_to_write.entry(r.path.clone()).or_default().push(i);
-        }
-
-        for (file_path, indices) in &files_to_write {
-            let content = file_contents[file_path].clone();
-            let (new_content, file_results) = apply_replacements_to_file(
-                file_path,
-                &content,
-                indices.iter().map(|&i| &resolved[i]).collect(),
-            )?;
-
-            // Update resolved entries with new line/hash info
-            for (i, result_info) in indices.iter().zip(file_results.iter()) {
-                resolved[*i].new_start_line = result_info.new_start_line;
-                resolved[*i].new_end_line = result_info.new_end_line;
-                resolved[*i].new_hash = result_info.new_hash.clone();
-            }
-
-            tokio::fs::write(file_path, &new_content)
-                .await
-                .map_err(|e| {
-                    ToolError::ProviderError(format!(
-                        "Failed to write {}: {e}",
-                        file_path.display()
-                    ))
+                    } else {
+                        ToolError::InvalidRequest(format!(
+                            "Occurrence {} out of range for '{}' in {} ({} matches available)",
+                            req.occurrence,
+                            req.symbol,
+                            target.display(),
+                            matches.len()
+                        ))
+                    }
                 })?;
 
-            results.extend(file_results);
-        }
+                // Hash check
+                if let Some(ref expected) = req.expected_hash
+                    && symbol.digest.hash.to_string() != *expected
+                {
+                    return Err(ToolError::ProviderError(format!(
+                        "Hash mismatch for '{}' in {}: expected {}, got {}. File may have changed.",
+                        req.symbol,
+                        target.display(),
+                        expected,
+                        symbol.digest.hash
+                    )));
+                }
 
-        // Phase 4: Format compact output
-        let output = format_results(&results);
-        Ok(vec![ToolResultPart::text(output)])
+                resolved.push(ResolvedReplacement {
+                    path: target,
+                    kind_str: symbol.kind.as_str().to_string(),
+                    qualified_name: symbol.qualified_name.clone(),
+                    old_hash: symbol.digest.hash.to_string(),
+                    old_start_line: symbol.start_line,
+                    old_end_line: symbol.end_line,
+                    start_byte: symbol.start_byte,
+                    end_byte: symbol.end_byte,
+                    new_text: req.new_text.clone(),
+                    new_start_line: 0,
+                    new_end_line: 0,
+                    new_hash: String::new(),
+                });
+            }
+
+            // Phase 2: Validate no overlaps within each file.
+            validate_no_overlaps(&resolved)?;
+
+            // Phase 3: Apply replacements per file, bottom-up by byte offset.
+            let mut results = Vec::new();
+            let mut files_to_write: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+            for (i, r) in resolved.iter().enumerate() {
+                files_to_write.entry(r.path.clone()).or_default().push(i);
+            }
+
+            for (file_path, indices) in &files_to_write {
+                let content = file_contents[file_path].clone();
+                let (new_content, file_results) = apply_replacements_to_file(
+                    file_path,
+                    &content,
+                    indices.iter().map(|&i| &resolved[i]).collect(),
+                )?;
+
+                // Update resolved entries with new line/hash info
+                for (i, result_info) in indices.iter().zip(file_results.iter()) {
+                    resolved[*i].new_start_line = result_info.new_start_line;
+                    resolved[*i].new_end_line = result_info.new_end_line;
+                    resolved[*i].new_hash = result_info.new_hash.clone();
+                }
+
+                tokio::fs::write(file_path, &new_content)
+                    .await
+                    .map_err(|e| {
+                        ToolError::ProviderError(format!(
+                            "Failed to write {}: {e}",
+                            file_path.display()
+                        ))
+                    })?;
+
+                results.extend(file_results);
+            }
+
+            // Phase 4: Format compact output
+            let output = format_results(&results);
+            Ok(vec![ToolResultPart::text(output)])
+        })
+        .await
     }
 }
 

@@ -28,6 +28,12 @@ impl SendAgent for LocalAgentHandle {
         bridge: Option<ClientBridgeSender>,
     ) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
+        if let Some(response) = self
+            .handle_native_worktree_prompt(&req, bridge.as_ref())
+            .await?
+        {
+            return Ok(response);
+        }
         #[cfg(feature = "remote")]
         return self
             .execute_session_operation(
