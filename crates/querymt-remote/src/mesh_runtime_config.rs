@@ -11,6 +11,8 @@ pub struct MeshRuntimeConfig {
     /// Enable GSO on the shared iroh actor endpoint. Use true to preserve the default.
     pub iroh_gso: bool,
     pub iroh_scopes: Vec<IrohMeshConfig>,
+    /// Custom identities use `<identity_file>.invites.json` and
+    /// `<identity_file>.mesh_state.json` rather than the default QueryMT stores.
     pub identity_file: Option<PathBuf>,
     pub request_timeout: Duration,
     pub stream_reconnect_grace: Duration,
