@@ -16,6 +16,7 @@ echo "Generating TypeScript types..."
 typeshare \
   "$REPO_ROOT/crates/agent" \
   "$REPO_ROOT/crates/querymt" \
+  "$REPO_ROOT/crates/querymt-remote" \
   --lang=typescript \
   --output-file="$TS_OUT"
 

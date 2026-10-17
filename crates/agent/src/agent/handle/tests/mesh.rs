@@ -14,6 +14,7 @@ async fn test_querymt_mesh_status_without_mesh_is_disabled() {
     assert_eq!(result["has_invite_store"], false);
     assert_eq!(result["has_mesh_state_store"], false);
     assert_eq!(result["scopes"], serde_json::json!([]));
+    assert!(result["iroh"].is_null());
 }
 
 #[cfg(feature = "remote")]
@@ -43,6 +44,10 @@ async fn test_querymt_mesh_status_with_test_mesh_reports_runtime_details() {
     assert_eq!(result["has_invite_store"], true);
     assert_eq!(result["has_mesh_state_store"], true);
     assert!(result["scopes"].is_array());
+    assert!(
+        result["iroh"].is_null(),
+        "LAN-only runtime has no iroh endpoint"
+    );
 }
 
 #[cfg(feature = "remote")]

@@ -198,6 +198,50 @@ struct literals must add `iroh_gso: true` to preserve previous behavior.
 - Nodes behind NAT or firewalls
 - Cloud + on-premises hybrid setups
 
+#### Iroh DNS Policy
+
+Iroh 1.3 uses system DNS with deferred public fallback by default. The N0 preset
+also resolves endpoint addresses through HTTPS pkarr alongside DNS, improving
+endpoint-ID-only dialing without changing reliable actor/provider streams.
+
+Override DNS policy for the shared iroh endpoint, including hybrid runtimes:
+
+```toml
+[mesh]
+enabled = true
+transport = "iroh"
+
+[mesh.iroh_dns]
+system_defaults = true
+fallback = "never"
+
+# Optional additional primary resolver; replace with your actual DNS server.
+[[mesh.iroh_dns.nameservers]]
+addr = "192.0.2.53:443"
+protocol = "https"
+tls_server_name = "dns.internal"
+```
+
+Fallback modes are `deferred` (query fallback after primary failures), `eager`
+(race primary and fallback), `if_system_empty` (fallback only when no system
+nameservers are available), and `never`. Without system defaults, `if_system_empty`
+behaves like eager fallback, following upstream semantics. Nameserver protocols
+are `udp`, `tcp`, `tls`, and `https`; encrypted protocols optionally accept
+`tls_server_name`. To replace public fallback resolvers, configure
+`[[mesh.iroh_dns.fallback_nameservers]]` using the same nameserver fields.
+
+Omitting `iroh_dns` preserves upstream defaults. Public fallback can disclose
+queries or bypass corporate DNS policy; use explicit policy where required.
+Disabling DNS fallback does **not** disable N0's public pkarr publisher/resolver
+or relays and is not a private-network mode.
+
+Settings apply at endpoint startup across all Iroh scopes. `qmtcode` preserves
+the startup config/profile DNS policy for hosting, invite joins, reconnects, and
+profile switches; restart to change it. Rust callers set
+`MeshRuntimeConfig::iroh_dns` (`None` preserves defaults), or use
+`join_mesh_via_invite_with_dns` for ad-hoc invite joins. Exhaustive runtime-config
+struct literals must add `iroh_dns: None` to preserve existing behavior.
+
 #### Comparison Table
 
 | Feature | LAN Transport | Iroh Transport |
@@ -1501,6 +1545,38 @@ println!("Listening on: {:?}", listen_addrs);
 let peers = mesh.connected_peers().await;
 println!("Connected to {} peers", peers.len());
 ```
+
+### Iroh Transport Diagnostics
+
+The `querymt/mesh/status` response includes an optional `iroh` snapshot. It is
+`null` for disabled/LAN-only runtimes. For an iroh endpoint it contains:
+
+- `closed`: whether the endpoint has shut down.
+- `relays`: home relay URLs, connected state, the last human-readable error, and
+  an optional `auth_denied_reason` from relay authentication.
+- `metrics`: optional cumulative relay and address-lookup counters.
+
+Snapshots read the current relay-status watcher on demand and create no observer
+task. Empty relay status can mean initial startup or disabled relays. Relay
+failure does not imply that direct peer connections have failed. Relay auth denial
+is distinct from mesh admission/invite rejection; its reason is for display, not
+programmatic string matching. Treat these diagnostics as operational information
+and do not expose them to untrusted clients.
+
+Enable counters with `querymt-agent`'s `remote-metrics` feature (which includes
+`remote`), or `querymt-remote`'s `iroh-metrics` feature (which includes `kameo-mesh`).
+The adapter also offers an independent `metrics` feature. Without the remote
+metrics feature, `metrics` is `null`, not a misleading set of zero counters.
+Counters include successful/failed/closed/rate-limited relay connections, total
+and failed lookups, and results/errors for N0's `dns` and `pkarr` services.
+Counters are decimal strings to preserve 64-bit precision in JavaScript clients.
+They reset when the endpoint restarts and are not an atomic cross-counter sample.
+Rate-limited connections count affected connections, not individual warnings.
+
+Rust callers can use `MeshHandle::iroh_diagnostics()` or
+`MeshRuntimeHandle::iroh_diagnostics()`. These diagnostics do not change peer
+liveness, authorization, routing, or application reconnect/backoff behavior.
+Batched unreliable datagrams are deliberately not used for actor/provider traffic.
 
 ### Event Logging
 

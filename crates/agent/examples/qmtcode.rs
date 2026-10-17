@@ -238,11 +238,20 @@ fn configure_mesh_iroh_gso(mut config: Config, override_value: Option<bool>) -> 
     (config, iroh_gso)
 }
 
-// Keep the process-wide endpoint setting consistent across profile switches/reloads.
+#[cfg(feature = "remote")]
+fn mesh_dns(config: &Config) -> Option<querymt_remote::IrohDnsConfig> {
+    match config {
+        Config::Single(config) => config.mesh.iroh_dns.clone(),
+        Config::Multi(config) => config.mesh.iroh_dns.clone(),
+    }
+}
+
+// Keep the process-wide endpoint settings consistent across profile switches/reloads.
 #[cfg(feature = "remote")]
 struct MeshGsoProfileCatalog {
     inner: LocalProfileCatalog,
     iroh_gso: bool,
+    iroh_dns: Option<querymt_remote::IrohDnsConfig>,
 }
 
 #[cfg(feature = "remote")]
@@ -257,7 +266,11 @@ impl ProfileCatalog for MeshGsoProfileCatalog {
         id: &str,
     ) -> anyhow::Result<querymt_agent::profiles::ProfileDocument> {
         let mut document = self.inner.load_profile(id).await?;
-        let (config, _) = configure_mesh_iroh_gso(document.config, Some(self.iroh_gso));
+        let (mut config, _) = configure_mesh_iroh_gso(document.config, Some(self.iroh_gso));
+        match &mut config {
+            Config::Single(config) => config.mesh.iroh_dns = self.iroh_dns.clone(),
+            Config::Multi(config) => config.mesh.iroh_dns = self.iroh_dns.clone(),
+        }
         document.config = config;
         Ok(document)
     }
@@ -501,6 +514,8 @@ async fn run(
 
     #[cfg(feature = "remote")]
     let mesh_iroh_gso;
+    #[cfg(feature = "remote")]
+    let mesh_iroh_dns;
 
     let runner = if let Some(config_path) = &cli.config_file {
         eprintln!("Loading agent from: {}", config_path.display());
@@ -509,6 +524,7 @@ async fn run(
         let config = {
             let (config, gso) = configure_mesh_iroh_gso(config, cli.mesh_iroh_gso);
             mesh_iroh_gso = gso;
+            mesh_iroh_dns = mesh_dns(&config);
             config
         };
         from_config_value_with_infra(config, shared_infra.clone()).await?
@@ -518,11 +534,13 @@ async fn run(
         #[cfg(feature = "remote")]
         let profile_catalog = {
             let document = profile_catalog.load_profile(&selected_profile).await?;
-            let (_, gso) = configure_mesh_iroh_gso(document.config, cli.mesh_iroh_gso);
+            let (config, gso) = configure_mesh_iroh_gso(document.config, cli.mesh_iroh_gso);
             mesh_iroh_gso = gso;
+            mesh_iroh_dns = mesh_dns(&config);
             MeshGsoProfileCatalog {
                 inner: profile_catalog,
                 iroh_gso: gso,
+                iroh_dns: mesh_iroh_dns.clone(),
             }
         };
         let catalog: Arc<dyn ProfileCatalog> = Arc::new(profile_catalog);
@@ -549,7 +567,7 @@ async fn run(
     #[cfg(feature = "remote")]
     if let Some(ref token) = cli.mesh_join {
         use querymt_agent::agent::remote::invite::SignedInviteGrant;
-        use querymt_agent::agent::remote::mesh::join_mesh_via_invite_with_gso;
+        use querymt_agent::agent::remote::mesh::join_mesh_via_invite_with_dns;
 
         let invite =
             SignedInviteGrant::decode(token).map_err(|e| format!("Invalid invite token: {e}"))?;
@@ -568,7 +586,9 @@ async fn run(
             invite.grant.inviter_peer_id
         );
 
-        match join_mesh_via_invite_with_gso(&invite, None, mesh_iroh_gso).await {
+        match join_mesh_via_invite_with_dns(&invite, None, mesh_iroh_gso, mesh_iroh_dns.clone())
+            .await
+        {
             Ok(runtime) => {
                 let mesh = runtime.as_mesh_handle().clone();
                 eprintln!("Joined mesh: peer_id={}", mesh.peer_id());
@@ -638,6 +658,7 @@ async fn run(
             },
             iroh_enabled: true,
             iroh_gso: mesh_iroh_gso,
+            iroh_dns: mesh_iroh_dns.clone(),
             iroh_scopes,
             identity_file: None,
             request_timeout: DEFAULT_MESH_REQUEST_TIMEOUT,
@@ -1074,6 +1095,7 @@ system = "inline"
             let catalog = MeshGsoProfileCatalog {
                 inner: inner.clone(),
                 iroh_gso: gso,
+                iroh_dns: Some(querymt_remote::IrohDnsConfig::default()),
             };
             assert_eq!(catalog.watch_roots(), inner.watch_roots());
             assert_eq!(
@@ -1082,6 +1104,7 @@ system = "inline"
             );
             for id in ["single", "multi"] {
                 let document = catalog.load_profile(id).await.unwrap();
+                assert_eq!(mesh_dns(&document.config), catalog.iroh_dns);
                 let (_, resolved) = configure_mesh_iroh_gso(document.config, None);
                 assert_eq!(resolved, gso);
             }
