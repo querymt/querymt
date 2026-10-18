@@ -29,7 +29,8 @@ None. Existing published specs do not cover workspace isolation or undo. Agent s
 ## Impact
 
 - `crates/agent`: new worktree orchestration and durable registry, session storage/schema and materialization, session/fork configuration, delegation lifecycle and results, tool context, hooks/verification, session listing, agent APIs and command dispatch.
-- Reuse the existing `gix` dependency and snapshot backend. Use an injectable Git CLI runner for linked-worktree and private-index operations where that avoids reimplementing Git behavior.
+- Upgrade `gix` from 0.80 to 0.89 and use typed, injectable native repository operations for worktree administration, capture, refs, and result review. Production isolation operations must not require an installed Git executable. Preserve the existing native snapshot backend; Git CLI usage in test fixtures is not a production dependency.
+- Correct review gaps in authoritative fork cwd routing, fail-closed fork creation, conditional branch deletion, newly staged ignored-file capture, effective repository-layout validation, workspace-scoped slash execution, replayable provisioning, alternate Git-directory layouts, and baseline-relative result inspection for both top-level workspaces and delegates.
 - SQLite migrations add workspace associations and baseline/result provenance. Existing sessions remain local and existing undo histories remain valid in their original checkout.
 - ACP/editor/MCP integrations must expose or validate effective workspace context; unsupported remote filesystem isolation returns a clear error in this first version.
 - No WorkPacket dependency, live cwd switching, automatic result integration, generalized filesystem sandbox, remote repository transfer, ignored-file copying, or automatic cleanup sweep in this change.

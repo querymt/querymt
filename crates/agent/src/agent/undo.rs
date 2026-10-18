@@ -172,6 +172,14 @@ pub(crate) async fn undo_impl(
             // in their own checkouts, and restoring those here would
             // corrupt the parent's workspace. Children without a cwd
             // (legacy shared-checkout delegation) stay compatible.
+            //
+            // Workspace-resolution audit: `worktree` is the parent session's
+            // effective cwd as resolved through the single session-cwd path
+            // (durable workspace binding first), and a managed child's row
+            // cwd equals its own bound checkout, so this comparison matches
+            // workspaces — not merely copied source paths. Patches whose
+            // provenance disagrees are additionally rejected below by
+            // `validate_snapshot_workspace` instead of being restored.
             let compatible = match provider.history_store().get_session(scan_session_id).await {
                 Ok(Some(child)) => child
                     .cwd

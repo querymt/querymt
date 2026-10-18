@@ -20,9 +20,9 @@ use crate::worktree::domain::{
 };
 use crate::worktree::error::{WorktreeError, WorktreeResult};
 use crate::worktree::gate::CheckoutMutationGate;
-use crate::worktree::git::GitRunner;
 use crate::worktree::identity::resolve_repository;
 use crate::worktree::lifecycle::WorkspaceManager;
+use crate::worktree::repo_ops::RepositoryOps;
 use crate::worktree::repo_workspace::WorkspaceRepository;
 use crate::worktree::session_options::SessionCreationOptions;
 use std::path::{Path, PathBuf};
@@ -55,7 +55,7 @@ impl WorkspaceBinding {
 
 /// Facade over managed workspace operations for the session layer.
 pub struct WorkspaceService {
-    git: Arc<dyn GitRunner>,
+    git: Arc<dyn RepositoryOps>,
     allocator: WorkspaceAllocator,
     manager: WorkspaceManager,
     registry: Arc<dyn WorkspaceRepository>,
@@ -64,7 +64,7 @@ pub struct WorkspaceService {
 
 impl WorkspaceService {
     pub fn new(
-        git: Arc<dyn GitRunner>,
+        git: Arc<dyn RepositoryOps>,
         registry: Arc<dyn WorkspaceRepository>,
         storage_root: impl Into<PathBuf>,
     ) -> Self {
@@ -92,6 +92,11 @@ impl WorkspaceService {
 
     pub fn manager(&self) -> &WorkspaceManager {
         &self.manager
+    }
+
+    /// Typed repository operations backing this service.
+    pub fn ops(&self) -> &Arc<dyn RepositoryOps> {
+        &self.git
     }
 
     /// Execution mode of the session's bound workspace.
@@ -269,6 +274,31 @@ impl WorkspaceService {
         Ok(Some(WorkspaceBinding::new(record, &self.storage_root)?))
     }
 
+    /// Resolve a session's effective execution cwd.
+    ///
+    /// This is the single authoritative resolution path for every consumer
+    /// of a session's working directory — delegation dispatch, native
+    /// worktree creation, verification/hooks, and undo child filtering must
+    /// resolve cwd through here instead of reading the persisted session row
+    /// directly. The durable workspace binding wins: sessions whose row cwd
+    /// was copied from a source checkout (e.g. isolated forks before their
+    /// row is rewritten) still resolve to their own bound checkout.
+    /// Unbound legacy local sessions fall back to the supplied persisted cwd.
+    ///
+    /// Bound sessions fail closed: resolution errors (non-`Ready`
+    /// lifecycle, missing checkout) must never be exchanged for a shared or
+    /// original-checkout fallback.
+    pub async fn resolve_session_cwd(
+        &self,
+        session_id: &str,
+        persisted_cwd: Option<std::path::PathBuf>,
+    ) -> WorktreeResult<Option<std::path::PathBuf>> {
+        match self.resolve_existing_session(session_id, None).await? {
+            Some(binding) => Ok(Some(binding.effective_cwd)),
+            None => Ok(persisted_cwd),
+        }
+    }
+
     /// Capture the shared baseline for a delegation batch from the parent's
     /// current working state.
     ///
@@ -428,17 +458,8 @@ impl WorkspaceService {
         // Unique create-only refs preserve results even after partial publication.
         let result_ref = format!("refs/qmt/results/{}/{}", record.id, uuid::Uuid::now_v7());
         self.git
-            .run(
-                child_checkout,
-                &[
-                    "update-ref",
-                    result_ref.as_str(),
-                    captured.commit.as_str(),
-                    "",
-                ],
-            )
-            .await?
-            .into_checked(&["update-ref"])?;
+            .create_ref_if_absent(child_checkout, result_ref.as_str(), &captured.commit)
+            .await?;
 
         let provenance = ResultProvenance {
             baseline_commit: record
@@ -460,6 +481,8 @@ impl WorkspaceService {
 mod tests {
     use super::*;
     use crate::session::schema;
+    use crate::worktree::GitRunner as _;
+    use crate::worktree::GixRepoOps;
     use crate::worktree::domain::{BaselineMode, baseline_ref_for};
     use crate::worktree::git::CliGit;
     use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
@@ -491,7 +514,7 @@ mod tests {
             .await
             .unwrap();
         let svc = WorkspaceService::new(
-            Arc::new(CliGit::new()),
+            Arc::new(GixRepoOps::new()),
             storage.workspace_repository().unwrap(),
             data.path().join("worktrees"),
         );
@@ -617,7 +640,7 @@ mod tests {
             .await
             .unwrap();
         let resumed = WorkspaceService::new(
-            Arc::new(CliGit::new()),
+            Arc::new(GixRepoOps::new()),
             reopened.workspace_repository().unwrap(),
             data.path().join("worktrees"),
         );
@@ -681,7 +704,7 @@ mod tests {
             .await
             .unwrap();
         let svc = WorkspaceService::new(
-            Arc::new(CliGit::new()),
+            Arc::new(GixRepoOps::new()),
             storage.workspace_repository().unwrap(),
             &root,
         );
@@ -802,7 +825,7 @@ mod tests {
         .unwrap();
         let conn = Arc::new(StdMutex::new(conn));
         let svc = WorkspaceService::new(
-            Arc::new(CliGit::new()),
+            Arc::new(GixRepoOps::new()),
             Arc::new(SqliteWorkspaceRepository::new(conn)),
             storage.path(),
         );
@@ -1041,6 +1064,7 @@ mod tests {
     /// checkout unchanged, and the provenance is durably retained.
     #[tokio::test]
     async fn delegate_result_capture_is_baseline_relative_and_non_invasive() {
+        use crate::worktree::GitRunner as _;
         use crate::worktree::{CliGit, ResultVerificationStatus};
 
         let (repo, _storage, svc) = service().await;

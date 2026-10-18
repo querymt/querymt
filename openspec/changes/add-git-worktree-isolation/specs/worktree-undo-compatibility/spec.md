@@ -40,6 +40,12 @@ New snapshot and revert state SHALL be associated with the workspace in which it
 - **THEN** child snapshots from other workspaces are excluded from parent undo aggregation
 - **AND** parent undo can succeed without restoring or changing isolated child files
 
+#### Scenario: Parent undo with an isolated conversation fork
+- **WHEN** a parent undoes a turn after an isolated conversation fork has acquired its own snapshots
+- **THEN** child-history filtering resolves the fork's actual workspace association rather than a copied source cwd
+- **AND** parent undo succeeds without selecting, rejecting, or restoring the fork's foreign snapshots as shared-child history
+- **AND** new turns in the fork remain independently undoable after restart
+
 #### Scenario: Workspace binding mismatch
 - **WHEN** an undo or redo request directly selects a snapshot associated with another workspace
 - **THEN** it fails before filesystem restoration with an explicit provenance error
@@ -61,6 +67,11 @@ Existing local sessions and their compatible snapshot histories SHALL continue t
 #### Scenario: Legacy local undo
 - **WHEN** an existing local session with retained snapshots is resumed without isolation
 - **THEN** its undo and redo behavior remains compatible in the original checkout
+
+#### Scenario: Native repository dependency upgrade
+- **WHEN** repository support is upgraded and no Git executable is available to built-in operations
+- **THEN** supported snapshot capture, diff, restore, undo, redo, and garbage collection retain their existing behavior through the configured snapshot backend
+- **AND** linked-worktree markers, real project HEAD/index/refs, sibling files, legacy histories, and subdirectory undo scope remain unchanged by the upgrade
 
 #### Scenario: Isolation without snapshots
 - **WHEN** an isolated session is created with snapshots disabled

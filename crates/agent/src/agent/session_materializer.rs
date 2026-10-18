@@ -93,6 +93,14 @@ pub enum PreparedSessionResult {
     AlreadyRegistered(SessionActorRef),
 }
 
+/// A validated fork isolation plan, resolved entirely BEFORE any
+/// conversation copy so invalid or unhonorable requests create no fork.
+struct ForkWorkspacePlan {
+    source_cwd: std::path::PathBuf,
+    options: crate::worktree::SessionCreationOptions,
+    source_gate: Option<std::sync::Arc<crate::worktree::gate::CheckoutMutationGate>>,
+}
+
 /// Session Materializer - extracts heavy session creation/loading work from SessionRegistry.
 ///
 /// This service is responsible for the expensive async operations that were previously
@@ -321,6 +329,19 @@ impl SessionMaterializer {
         session_id: &str,
         requested_cwd: Option<&std::path::Path>,
     ) -> Result<Option<WorkspaceBinding>, Error> {
+        if self
+            .config
+            .provider
+            .history_store()
+            .get_pending_fork_isolation(session_id)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?
+            .is_some()
+        {
+            return Err(invalid_workspace_request(
+                "fork isolation is pending; refusing local fallback before workspace creation completes",
+            ));
+        }
         let Some(service) = self.workspace_service() else {
             if let Some(registry) = self.config.storage.workspace_repository()
                 && registry
@@ -772,31 +793,78 @@ impl SessionMaterializer {
             .or_else(|| history.last().map(|msg| msg.id.clone()))
             .ok_or(crate::error::AgentError::EmptySessionFork)?;
 
-        // Fork session in DB (heavy I/O). This durably records the
-        // historical message fork point separately from any workspace
-        // association (which is created below, only for isolated forks).
+        // Resolve and validate the fork's isolation policy BEFORE any
+        // conversation copy: invalid or unhonorable requests fail closed
+        // here, creating no fork row and copying no history (F2). A
+        // validated isolated fork persists its pending provisioning intent
+        // during allocation, before any Git mutation.
+        let fork_plan = self
+            .plan_fork_isolation(
+                &source_session_id,
+                session.cwd.as_deref(),
+                req.meta.as_ref(),
+            )
+            .await?;
+
+        // Persist the startup barrier atomically with the conversation copy,
+        // before allocation can fail or the process can be interrupted.
+        let pending_intent =
+            fork_plan
+                .as_ref()
+                .map(|plan| crate::session::store::PendingForkIsolation {
+                    source_session_id: source_session_id.clone(),
+                    source_cwd: plan.source_cwd.clone(),
+                    options: plan.options.to_workspace_options(),
+                });
         let new_session_id = self
             .config
             .provider
             .history_store()
-            .fork_session(
+            .fork_session_with_isolation_intent(
                 &source_session_id,
                 &target_message_id,
                 crate::session::domain::ForkOrigin::User,
+                pending_intent,
             )
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
-        // Allocate the fork's own workspace when the fork requests
-        // isolation; local forks stay pure message copies.
-        let fork_workspace = self
-            .resolve_fork_workspace(
-                &source_session_id,
-                session.cwd.as_deref(),
-                req.meta.as_ref(),
-                &new_session_id,
-            )
-            .await?;
+        // Allocate the fork's own workspace per the validated plan; local
+        // forks stay pure message copies. Allocation persists the pending
+        // isolation intent (a `Provisioning` workspace record) before any
+        // Git mutation, then binds the fork as the single writable owner.
+        let fork_workspace = match fork_plan {
+            Some(plan) => Some(self.execute_fork_isolation(plan, &new_session_id).await?),
+            None => None,
+        };
+
+        // Persist the fork's execution cwd consistently with its durable
+        // workspace owner association: the session row, workspace binding,
+        // session listing, load, and resume must all agree on the fork's
+        // checkout with no external session-row rewrite. `fork_session`
+        // copied the source's cwd into the fork row; an isolated fork must
+        // not keep it. Fail closed — a fork that cannot record its own
+        // checkout must never surface as runnable in the source checkout.
+        if let Some(binding) = &fork_workspace {
+            self.config
+                .provider
+                .history_store()
+                .set_session_cwd(&new_session_id, Some(binding.effective_cwd.clone()))
+                .await
+                .map_err(|e| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": "isolated fork could not persist its execution cwd; \
+                                    refusing to expose a runnable fork in the source checkout",
+                        "error": e.to_string(),
+                    }))
+                })?;
+            self.config
+                .provider
+                .history_store()
+                .complete_fork_isolation(&new_session_id)
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        }
 
         let mut response = ForkSessionResponse::new(new_session_id);
         if let Some(binding) = &fork_workspace {
@@ -822,28 +890,41 @@ impl SessionMaterializer {
         Ok(response)
     }
 
-    /// Allocate the fork's own workspace when the fork requests isolation.
+    /// Resolve and validate the fork's isolation policy BEFORE the
+    /// conversation copy (F2).
     ///
-    /// Returns `Ok(None)` for local forks (pure message copy, no new
-    /// workspace). The fork's checkout is provisioned through the same
-    /// create path as fresh sessions, under its own durable path — never
-    /// the source session's checkout — and becomes owned by the fork
-    /// session as its single writable owner.
-    async fn resolve_fork_workspace(
+    /// Returns `Ok(None)` for local forks of unmanaged sources (pure message
+    /// copy, no new workspace). Invalid meta, invalid option combinations, a
+    /// local request against a managed source, missing isolation support, or
+    /// a source without a usable cwd all fail closed here — no fork row is
+    /// created and no history is copied. A managed source inherits isolation
+    /// when the fork requests none.
+    async fn plan_fork_isolation(
         &self,
         source_session_id: &str,
         source_session_cwd: Option<&std::path::Path>,
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
-        fork_session_id: &str,
-    ) -> Result<Option<WorkspaceBinding>, Error> {
+    ) -> Result<Option<ForkWorkspacePlan>, Error> {
+        let requested = match crate::worktree::fork_creation_options_from_meta(meta)
+            .map_err(|message| invalid_workspace_request(&message))?
+        {
+            Some(options) => {
+                options
+                    .validate()
+                    .map_err(|message| invalid_workspace_request(&message))?;
+                Some(options)
+            }
+            None => None,
+        };
         let source_binding = self
             .resolve_existing_workspace(source_session_id, None)
             .await?;
-        let options = match crate::worktree::fork_creation_options_from_meta(meta)
-            .map_err(|message| invalid_workspace_request(&message))?
-        {
+
+        let options = match requested {
             Some(options) => options,
             None if source_binding.is_some() => {
+                // A managed source's fork stays isolated by default; there
+                // is no legacy local checkout to fall back to.
                 crate::worktree::SessionCreationOptions::isolated_worktree(
                     crate::worktree::BaselineMode::CurrentWorkingTree,
                 )
@@ -859,12 +940,12 @@ impl SessionMaterializer {
             return Ok(None);
         }
 
-        let Some(service) = self.workspace_service() else {
+        if self.workspace_service().is_none() {
             return Err(Error::internal_error().data(serde_json::json!({
                 "message": "worktree isolation requested but no workspace service is \
                             configured; refusing to downgrade to shared execution",
             })));
-        };
+        }
 
         // The source's execution cwd is its bound checkout when the source
         // itself is workspace-bound, otherwise its stored session cwd.
@@ -879,12 +960,40 @@ impl SessionMaterializer {
                     )
                 })?,
         };
+        // Isolated execution is local-filesystem-only in this version; fail
+        // before copying any conversation state.
+        crate::worktree::placement::ensure_local_filesystem_execution(&source_cwd)
+            .map_err(worktree_error_to_acp)?;
+        crate::worktree::resolve_repository(&source_cwd).map_err(worktree_error_to_acp)?;
+
         // Serialize baseline capture against cooperating writes when the
         // source is a live managed workspace.
-        let source_gate = source_binding.as_ref().map(|b| b.mutation_gate.clone());
+        Ok(Some(ForkWorkspacePlan {
+            source_cwd,
+            options,
+            source_gate: source_binding.as_ref().map(|b| b.mutation_gate.clone()),
+        }))
+    }
 
+    /// Execute a validated fork isolation plan after the conversation copy:
+    /// allocate the fork's own workspace through the same create path as
+    /// fresh sessions — under its own durable path, never the source
+    /// session's checkout — and bind the fork session as the single writable
+    /// owner. Allocation persists the pending isolation intent (a
+    /// `Provisioning` workspace record) before any Git mutation and leaves
+    /// it explicitly failed and non-runnable if provisioning fails.
+    async fn execute_fork_isolation(
+        &self,
+        plan: ForkWorkspacePlan,
+        fork_session_id: &str,
+    ) -> Result<WorkspaceBinding, Error> {
+        let service = self.workspace_service().ok_or_else(|| {
+            Error::internal_error().data(serde_json::json!({
+                "message": "workspace service disappeared during fork creation",
+            }))
+        })?;
         let binding = service
-            .allocate_for_fork(&source_cwd, &options, source_gate.as_deref())
+            .allocate_for_fork(&plan.source_cwd, &plan.options, plan.source_gate.as_deref())
             .await
             .map_err(worktree_error_to_acp)?;
 
@@ -896,7 +1005,7 @@ impl SessionMaterializer {
             .await
             .map_err(worktree_error_to_acp)?;
 
-        Ok(Some(binding))
+        Ok(binding)
     }
 
     /// Finalize session after registration: emit events, register in DHT, initialize workspace index.
@@ -1534,8 +1643,9 @@ mod worktree_binding_tests {
         MockLlmProvider, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
     };
     use crate::tools::context::ToolContext as _;
+    use crate::worktree::git::CliGit;
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
-    use crate::worktree::{CliGit, WorkspaceService};
+    use crate::worktree::{GixRepoOps, WorkspaceService};
     use querymt::LLMParams;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1574,7 +1684,7 @@ mod worktree_binding_tests {
 
         let storage_root = tempfile::TempDir::new().unwrap();
         let service = Arc::new(WorkspaceService::new(
-            Arc::new(CliGit::new()),
+            Arc::new(GixRepoOps::new()),
             storage
                 .workspace_repository()
                 .expect("sqlite storage exposes a workspace repository"),
@@ -2128,6 +2238,286 @@ mod worktree_binding_tests {
         );
     }
 
+    /// The single effective workspace/cwd resolution path supplies an
+    /// isolated fork's own files and cwd to every consumer: the durable
+    /// binding wins over the fork row's copied source cwd (restart included),
+    /// and nested delegation is provisioned from the fork's contents — never
+    /// the source's.
+    #[tokio::test]
+    async fn fork_workspace_supplies_its_own_cwd_and_files_to_consumers() {
+        let fx = worktree_fixture(true).await;
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(isolation_meta());
+        let source = fx
+            .materializer
+            .prepare_new_session(req)
+            .await
+            .expect("isolated source prepares");
+        let source_id = source.session_id.clone();
+        let source_checkout = source.cwd.clone().expect("source bound cwd");
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+
+        // Diverge the source checkout before forking: the fork's fresh
+        // working-state baseline includes this edit.
+        std::fs::write(source_checkout.join("README.md"), "edited after creation\n").unwrap();
+
+        // Isolated fork through the real fork path.
+        let response = fx
+            .materializer
+            .prepare_fork_session(
+                ForkSessionRequest::new(
+                    SessionId::from(source_id.clone()),
+                    source_checkout.clone(),
+                )
+                .meta(isolation_meta()),
+            )
+            .await
+            .expect("isolated fork prepares");
+        let fork_id = response.session_id.to_string();
+
+        let registry = fx.storage.workspace_repository().unwrap();
+        let fork_record = registry
+            .get_workspace_by_session(&fork_id)
+            .await
+            .unwrap()
+            .expect("fork bound to its own workspace");
+        let fork_checkout = fork_record.checkout_path.clone();
+        assert_ne!(fork_checkout, source_checkout);
+
+        // The fork row's cwd is persisted consistently with its durable
+        // binding by the fork path itself — no manual session-row rewrite.
+        let fork_row = fx
+            .storage
+            .get_session(&fork_id)
+            .await
+            .unwrap()
+            .expect("fork row exists");
+        assert_eq!(
+            fork_row.cwd.as_deref(),
+            Some(fork_checkout.as_path()),
+            "fork row cwd agrees with its workspace binding"
+        );
+
+        // Consumer: the single resolution path. The durable binding wins
+        // over the stale row cwd.
+        let resolved = fx
+            .service
+            .resolve_session_cwd(&fork_id, fork_row.cwd.clone())
+            .await
+            .expect("resolution succeeds for a ready binding");
+        assert_eq!(resolved.as_deref(), Some(fork_checkout.as_path()));
+
+        // The fork's contents now differ from its source.
+        std::fs::write(fork_checkout.join("README.md"), "fork-only edit\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(source_checkout.join("README.md")).unwrap(),
+            "edited after creation\n"
+        );
+
+        // Consumer: restart (load). The binding resolves the fork's own
+        // checkout with its own files, and a request echoing the stale row
+        // cwd is rejected instead of attaching the source checkout.
+        {
+            let load = LoadSessionRequest::new(SessionId::from(fork_id.clone()), PathBuf::new());
+            let loaded = match fx
+                .materializer
+                .prepare_load_session(load, None)
+                .await
+                .unwrap()
+            {
+                PreparedSessionResult::Prepared(p) => p,
+                PreparedSessionResult::AlreadyRegistered(_) => {
+                    panic!("fork was never registered")
+                }
+            };
+            assert_eq!(loaded.cwd.as_deref(), Some(fork_checkout.as_path()));
+            assert_eq!(
+                std::fs::read_to_string(loaded.cwd.expect("bound cwd").join("README.md")).unwrap(),
+                "fork-only edit\n",
+                "the fork supplies its own files after restart"
+            );
+        }
+        let conflicting =
+            LoadSessionRequest::new(SessionId::from(fork_id.clone()), source_checkout.clone());
+        let err = match fx
+            .materializer
+            .prepare_load_session(conflicting, None)
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("stale fork row cwd must not attach the source checkout"),
+        };
+        assert!(
+            format!("{err:?}").contains("conflicting cwd"),
+            "diagnostic: {err:?}"
+        );
+
+        // Consumer: nested delegation. The fork delegates with the resolved
+        // cwd; the child is provisioned from the FORK's contents, links to
+        // the fork's workspace, and never reuses a parent checkout.
+        let fork_gate = crate::worktree::CheckoutMutationGate::new(
+            fx.service.storage_root(),
+            &fork_record.checkout_path,
+        )
+        .expect("fork gate");
+        let child = fx
+            .service
+            .allocate_for_delegation(
+                &fork_id,
+                Some(&fork_record),
+                resolved.as_deref().expect("resolved cwd"),
+                Some(&fork_gate),
+                "nested-delegation",
+                None,
+            )
+            .await
+            .expect("nested delegate allocates");
+        assert_ne!(child.record.checkout_path, fork_record.checkout_path);
+        assert!(
+            !child.record.checkout_path.starts_with(&source_checkout),
+            "nested delegation never provisions from the source checkout"
+        );
+        assert_eq!(
+            child
+                .record
+                .ownership
+                .parent_workspace_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some(fork_record.id.as_str()),
+            "nested delegation links to the fork's workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(child.effective_cwd.join("README.md")).unwrap(),
+            "fork-only edit\n",
+            "nested delegation inherits the fork's contents, not the source's"
+        );
+    }
+
+    /// The fork path persists the fork's execution cwd consistently with its
+    /// durable workspace owner association: the session row, workspace
+    /// binding, disclosed/list metadata, load, and resume all agree on the
+    /// fork checkout — established by the real fork path, with no manual
+    /// `sessions.cwd` rewrite in test setup.
+    #[tokio::test]
+    async fn fork_persists_execution_cwd_consistently_with_its_workspace_binding() {
+        let fx = worktree_fixture(true).await;
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(isolation_meta());
+        let source = fx
+            .materializer
+            .prepare_new_session(req)
+            .await
+            .expect("isolated source prepares");
+        let source_id = source.session_id.clone();
+        let source_checkout = source.cwd.clone().expect("source bound cwd");
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+        std::fs::write(source_checkout.join("README.md"), "edited after creation\n").unwrap();
+
+        let response = fx
+            .materializer
+            .prepare_fork_session(
+                ForkSessionRequest::new(
+                    SessionId::from(source_id.clone()),
+                    source_checkout.clone(),
+                )
+                .meta(isolation_meta()),
+            )
+            .await
+            .expect("isolated fork prepares");
+        let fork_id = response.session_id.to_string();
+
+        let registry = fx.storage.workspace_repository().unwrap();
+        let binding = registry
+            .get_workspace_by_session(&fork_id)
+            .await
+            .unwrap()
+            .expect("fork bound to its own workspace");
+        let fork_checkout = binding.checkout_path.clone();
+        assert_ne!(fork_checkout, source_checkout);
+        let disclosed = workspace_meta_of(&response)["sessionCwd"]
+            .as_str()
+            .expect("disclosed session cwd")
+            .to_string();
+
+        // Row, binding, and disclosed metadata agree — persisted by the
+        // real fork path.
+        let stored = fx
+            .storage
+            .get_session(&fork_id)
+            .await
+            .unwrap()
+            .expect("fork row exists");
+        assert_eq!(stored.cwd.as_deref(), Some(fork_checkout.as_path()));
+        assert!(
+            fx.storage
+                .get_pending_fork_isolation(&fork_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(binding.session_cwd(), fork_checkout);
+        assert_eq!(std::path::PathBuf::from(disclosed), fork_checkout);
+        let listed = fx.storage.list_sessions().await.unwrap();
+        let listed_fork = listed
+            .iter()
+            .find(|session| session.public_id == fork_id)
+            .expect("fork appears in the session listing");
+        assert_eq!(listed_fork.cwd.as_deref(), Some(fork_checkout.as_path()));
+
+        // Load agrees with the persisted row/binding (restart).
+        {
+            let load = LoadSessionRequest::new(SessionId::from(fork_id.clone()), PathBuf::new());
+            let loaded = match fx
+                .materializer
+                .prepare_load_session(load, None)
+                .await
+                .unwrap()
+            {
+                PreparedSessionResult::Prepared(p) => p,
+                PreparedSessionResult::AlreadyRegistered(_) => {
+                    panic!("fork was never registered")
+                }
+            };
+            assert_eq!(loaded.cwd.as_deref(), Some(fork_checkout.as_path()));
+        }
+
+        // Resume agrees with the persisted row/binding.
+        {
+            let resume =
+                ResumeSessionRequest::new(SessionId::from(fork_id.clone()), fork_checkout.clone());
+            let resumed = match fx
+                .materializer
+                .prepare_resume_session(resume, None)
+                .await
+                .unwrap()
+            {
+                PreparedSessionResult::Prepared(p) => p,
+                PreparedSessionResult::AlreadyRegistered(_) => {
+                    panic!("fork was never registered")
+                }
+            };
+            assert_eq!(resumed.cwd.as_deref(), Some(fork_checkout.as_path()));
+        }
+
+        // Resuming in the copied-source cwd is rejected: the fork owns its
+        // own checkout.
+        let conflicting =
+            ResumeSessionRequest::new(SessionId::from(fork_id.clone()), source_checkout);
+        let err = match fx
+            .materializer
+            .prepare_resume_session(conflicting, None)
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("fork must not resume in the source checkout"),
+        };
+        assert!(
+            format!("{err:?}").contains("conflicting cwd"),
+            "diagnostic: {err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn isolated_fork_from_local_source_uses_the_source_checkout() {
         let fx = worktree_fixture(true).await;
@@ -2249,6 +2639,7 @@ mod worktree_binding_tests {
         let source_id = source.session_id.clone();
         drop(source);
         seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+        let sessions_before = fx.storage.list_sessions().await.unwrap().len();
 
         let err = match fx
             .materializer
@@ -2267,6 +2658,335 @@ mod worktree_binding_tests {
         assert!(
             format!("{err:?}").contains("no workspace service"),
             "diagnostic: {err:?}"
+        );
+        // The request failed closed BEFORE the conversation copy: no fork
+        // row was created and the source history is untouched.
+        assert_eq!(
+            fx.storage.list_sessions().await.unwrap().len(),
+            sessions_before,
+            "an unhonorable fork request must not create a session row"
+        );
+    }
+
+    /// An invalid fork request fails closed before any conversation copy:
+    /// no fork row, no copied messages, and the source session untouched.
+    #[tokio::test]
+    async fn invalid_fork_request_copies_no_conversation() {
+        let fx = worktree_fixture(true).await;
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf());
+        let source = fx
+            .materializer
+            .prepare_new_session(req)
+            .await
+            .expect("local source prepares");
+        let source_id = source.session_id.clone();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1", "msg-2"]).await;
+        let sessions_before = fx.storage.list_sessions().await.unwrap().len();
+        let source_messages = fx.storage.get_history(&source_id).await.unwrap().len();
+
+        // Invalid option combination: current-working-tree baseline with an
+        // explicit base ref.
+        let mut meta = isolation_meta();
+        meta.insert(
+            "querymt".to_string(),
+            serde_json::json!({
+                crate::worktree::SESSION_WORKSPACE_META_KEY: {
+                    "execution": "worktree",
+                    "baseline": "current_working_tree",
+                    "baseRef": "main",
+                },
+            }),
+        );
+        let err = match fx
+            .materializer
+            .prepare_fork_session(
+                ForkSessionRequest::new(
+                    SessionId::from(source_id.clone()),
+                    fx.repo.path().to_path_buf(),
+                )
+                .meta(meta),
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("invalid fork options must fail closed"),
+        };
+        assert!(
+            format!("{err:?}").contains("base ref"),
+            "diagnostic: {err:?}"
+        );
+        assert_eq!(
+            fx.storage.list_sessions().await.unwrap().len(),
+            sessions_before,
+            "an invalid fork request must not create a session row"
+        );
+        assert_eq!(
+            fx.storage.get_history(&source_id).await.unwrap().len(),
+            source_messages,
+            "an invalid fork request must not copy history"
+        );
+    }
+
+    /// Forking a managed source with an explicit local request fails closed
+    /// before the copy: there is no legacy checkout to fall back to.
+    #[tokio::test]
+    async fn local_fork_of_managed_source_fails_before_copy() {
+        let fx = worktree_fixture(true).await;
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(isolation_meta());
+        let source = fx
+            .materializer
+            .prepare_new_session(req)
+            .await
+            .expect("isolated source prepares");
+        let source_id = source.session_id.clone();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+        let sessions_before = fx.storage.list_sessions().await.unwrap().len();
+
+        let mut meta = isolation_meta();
+        meta.insert(
+            "querymt".to_string(),
+            serde_json::json!({
+                crate::worktree::SESSION_WORKSPACE_META_KEY: { "execution": "local" },
+            }),
+        );
+        let err = match fx
+            .materializer
+            .prepare_fork_session(
+                ForkSessionRequest::new(
+                    SessionId::from(source_id.clone()),
+                    fx.repo.path().to_path_buf(),
+                )
+                .meta(meta),
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a local fork of a managed source must fail closed"),
+        };
+        assert!(
+            format!("{err:?}").contains("requires an independent worktree"),
+            "diagnostic: {err:?}"
+        );
+        assert_eq!(
+            fx.storage.list_sessions().await.unwrap().len(),
+            sessions_before,
+            "the rejected fork must not create a session row"
+        );
+    }
+
+    /// A copied isolated fork remains blocked even before a workspace record exists.
+    #[tokio::test]
+    async fn pending_fork_provisioning_is_not_runnable_as_local() {
+        let fx = worktree_fixture(false).await;
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .unwrap();
+        let source_id = source.session_id.clone();
+        let source_cwd = source.cwd.clone().unwrap();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+
+        let intent = crate::session::store::PendingForkIsolation {
+            source_session_id: source_id.clone(),
+            source_cwd: source_cwd.clone(),
+            options: crate::worktree::SessionCreationOptions::isolated_worktree(
+                crate::worktree::BaselineMode::CurrentWorkingTree,
+            )
+            .to_workspace_options(),
+        };
+        // Stop at the actual copy transaction boundary, before any workspace
+        // exists. Both history and intent must already be durable here.
+        let fork_id = fx
+            .storage
+            .fork_session_with_isolation_intent(
+                &source_id,
+                "msg-1",
+                crate::session::domain::ForkOrigin::User,
+                Some(intent.clone()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fx.storage.get_history(&fork_id).await.unwrap().len(), 1);
+        assert_eq!(
+            fx.storage
+                .get_pending_fork_isolation(&fork_id)
+                .await
+                .unwrap(),
+            Some(intent)
+        );
+        assert!(
+            fx.storage
+                .workspace_repository()
+                .unwrap()
+                .get_workspace_by_session(&fork_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fx.storage.complete_fork_isolation(&fork_id).await.is_err(),
+            "an unbound fork cannot release its startup barrier"
+        );
+
+        // A fresh materializer without an isolation service must still reject
+        // the pending fork rather than treating it as a legacy local session.
+        let restarted = SessionMaterializer::new(fx.materializer.config.clone());
+        let load = LoadSessionRequest::new(SessionId::from(fork_id.clone()), PathBuf::new());
+        let err = match restarted.prepare_load_session(load, None).await {
+            Err(err) => err,
+            Ok(_) => panic!("a pending fork must not be loadable"),
+        };
+        assert!(
+            format!("{err:?}").contains("fork isolation is pending"),
+            "{err:?}"
+        );
+        let resume = ResumeSessionRequest::new(SessionId::from(fork_id.clone()), source_cwd);
+        assert!(
+            restarted
+                .prepare_resume_session(resume, None)
+                .await
+                .is_err()
+        );
+        let listed = fx.storage.list_sessions().await.unwrap();
+        assert!(listed.iter().any(|session| session.public_id == fork_id));
+        assert!(
+            fx.storage
+                .get_pending_fork_isolation(&fork_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_fork_allocation_retains_pending_intent() {
+        let fx = worktree_fixture(true).await;
+        // Git cannot materialize an empty directory in the child checkout,
+        // so allocation fails after the conversation copy has committed.
+        let cwd = fx.repo.path().join("empty-session-cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(cwd.clone()))
+            .await
+            .unwrap();
+        let source_id = source.session_id.clone();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+        assert!(
+            fx.materializer
+                .prepare_fork_session(
+                    ForkSessionRequest::new(SessionId::from(source_id.clone()), cwd)
+                        .meta(isolation_meta()),
+                )
+                .await
+                .is_err()
+        );
+        let sessions = fx.storage.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        let fork = sessions.iter().find(|s| s.public_id != source_id).unwrap();
+        assert_eq!(
+            fx.storage.get_history(&fork.public_id).await.unwrap().len(),
+            1
+        );
+        assert!(
+            fx.storage
+                .get_pending_fork_isolation(&fork.public_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let restarted = SessionMaterializer::new(fx.materializer.config.clone());
+        assert!(
+            restarted
+                .prepare_load_session(
+                    LoadSessionRequest::new(
+                        SessionId::from(fork.public_id.clone()),
+                        PathBuf::new()
+                    ),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    /// A local fork of an unmanaged source retains its cwd and stays unmanaged.
+    #[tokio::test]
+    async fn legacy_local_fork_stays_local() {
+        let fx = worktree_fixture(true).await;
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf());
+        let source = fx
+            .materializer
+            .prepare_new_session(req)
+            .await
+            .expect("local source prepares");
+        let source_id = source.session_id.clone();
+        let source_cwd = source.cwd.clone().expect("local source cwd");
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+
+        let response = fx
+            .materializer
+            .prepare_fork_session(ForkSessionRequest::new(
+                SessionId::from(source_id.clone()),
+                source_cwd.clone(),
+            ))
+            .await
+            .expect("local fork prepares");
+        let fork_id = response.session_id.to_string();
+
+        let registry = fx.storage.workspace_repository().unwrap();
+        assert!(
+            registry
+                .get_workspace_by_session(&fork_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a local fork creates no workspace record"
+        );
+        let fork_row = fx
+            .storage
+            .get_session(&fork_id)
+            .await
+            .unwrap()
+            .expect("fork row exists");
+        assert_eq!(
+            fork_row.cwd.as_deref(),
+            Some(source_cwd.as_path()),
+            "a local fork keeps the copied row cwd"
+        );
+
+        // Loading keeps the original checkout without claiming managed isolation.
+        let load = LoadSessionRequest::new(SessionId::from(fork_id.clone()), source_cwd.clone());
+        let loaded = match fx
+            .materializer
+            .prepare_load_session(load, None)
+            .await
+            .unwrap()
+        {
+            PreparedSessionResult::Prepared(p) => p,
+            PreparedSessionResult::AlreadyRegistered(_) => panic!("fork was never registered"),
+        };
+        assert_eq!(loaded.cwd.as_deref(), Some(source_cwd.as_path()));
+        assert!(
+            !loaded
+                .runtime
+                .managed_checkout
+                .get()
+                .copied()
+                .unwrap_or(false)
+        );
+        assert!(
+            fx.storage
+                .get_pending_fork_isolation(&fork_id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

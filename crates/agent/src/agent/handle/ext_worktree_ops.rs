@@ -204,7 +204,21 @@ impl LocalAgentHandle {
                     || args.iter().filter(|s| s.as_str() == "--include-local-changes").count() > 1 {
                     return Err(Error::invalid_params().data("usage: /worktree create [ref] [name] OR /worktree create --include-local-changes [name]"));
                 }
-                serde_json::json!({"cwd": session.cwd.ok_or_else(|| Error::invalid_request().data("session has no cwd"))?,
+                // Resolve the isolation source through the single session-cwd
+                // path: a bound session isolates from its own bound checkout,
+                // never from a stale row cwd copied from a fork source.
+                let source_cwd = match self.config.workspace_service() {
+                    Some(service) => service
+                        .resolve_session_cwd(&session_id, session.cwd.clone())
+                        .await
+                        .map_err(|err| {
+                            Error::invalid_request().data(format!(
+                                "cannot resolve the session's effective workspace: {err}"
+                            ))
+                        })?,
+                    None => session.cwd,
+                };
+                serde_json::json!({"cwd": source_cwd.ok_or_else(|| Error::invalid_request().data("session has no cwd"))?,
                     "include_local_changes": include, "base_ref": if include { None } else { positional.first() }, "name": positional.get(if include { 0 } else { 1 })})
             }
             "list" if args.is_empty() => serde_json::json!({}),
@@ -273,27 +287,14 @@ impl LocalAgentHandle {
         let service = self.workspace_service()?;
         let parsed: WorktreeCreateRequest = parse_workspace_op_request(req)?;
         let ignored_files = if parsed.include_local_changes {
-            use crate::worktree::GitRunner;
             let source = crate::worktree::resolve_repository(std::path::Path::new(&parsed.cwd))
                 .map_err(|e| Error::invalid_request().data(e.to_string()))?;
-            let args = [
-                "ls-files",
-                "--others",
-                "--ignored",
-                "--exclude-standard",
-                "-z",
-            ];
-            let output = crate::worktree::CliGit::new()
-                .run(&source.checkout.root, &args)
+            service
+                .ops()
+                .checkout_status(&source.checkout.root)
                 .await
-                .and_then(|output| output.into_checked(&args))
-                .map_err(|e| Error::invalid_request().data(e.to_string()))?;
-            output
-                .stdout
-                .split(|byte| *byte == 0)
-                .filter(|path| !path.is_empty())
-                .map(|path| String::from_utf8_lossy(path).into_owned())
-                .collect()
+                .map_err(|e| Error::invalid_request().data(e.to_string()))?
+                .ignored
         } else {
             Vec::new()
         };

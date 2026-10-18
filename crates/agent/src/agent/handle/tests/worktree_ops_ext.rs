@@ -224,7 +224,7 @@ async fn worktree_fixture(configure_service: bool) -> WorktreeExtFixture {
 
     let storage_root = tempfile::TempDir::new().unwrap();
     let service = Arc::new(crate::worktree::WorkspaceService::new(
-        Arc::new(crate::worktree::CliGit::new()),
+        Arc::new(crate::worktree::GixRepoOps::new()),
         storage
             .workspace_repository()
             .expect("sqlite storage exposes a workspace repository"),

@@ -20,11 +20,11 @@ builder; without it every session executes locally exactly as before:
 
 ```rust
 use std::sync::Arc;
-use querymt_agent::worktree::{CliGit, WorkspaceService};
+use querymt_agent::worktree::{GixRepoOps, WorkspaceService};
 
 let storage_root = dirs::data_dir().unwrap().join("qmt/worktrees");
 let service = Arc::new(WorkspaceService::new(
-    Arc::new(CliGit::new()),
+    Arc::new(GixRepoOps::new()),
     storage.workspace_repository().expect("backend exposes a workspace repository"),
     storage_root, // durable worktree storage, e.g. ~/.local/share/qmt/worktrees
 ));
@@ -74,6 +74,28 @@ Semantics that matter:
 - **Requested isolation never falls back.** If Git, the repository, durable
   storage, or local filesystem placement is unavailable, creation fails with
   an actionable error instead of silently running shared.
+
+## Native Git operations
+
+All built-in workspace operations — baseline capture, branch and ref
+administration, linked-worktree creation/inventory/removal, status, and
+ancestry checks — are implemented natively in Rust on top of `gix` (0.89).
+No Git executable is required, installed, or invoked for these built-in
+operations; QueryMT needs a supported toolchain (Rust ≥ 1.88) but nothing
+else. Building the `WorkspaceService` takes a `GixRepoOps` value (see the
+example above); there is no Git-CLI configuration knob.
+
+Repository-opening policy: every operation opens the explicit checkout path
+it was given, with an isolated open that ignores inherited `GIT_DIR`,
+`GIT_WORK_TREE`, and `GIT_INDEX_FILE` overrides, so an ambient environment
+cannot redirect operations to a different repository, worktree, or index.
+Repository-local configuration is still honored.
+
+This native layer is distinct from the Git activity a session may perform
+through its own tools: arbitrary shell commands the model runs, and any
+configured external filters or hooks, execute Git however they choose and
+are neither intercepted nor restricted by this service. Built-in typed
+operations never shell out and never parse Git command output.
 
 ## Native commands and typed operations
 

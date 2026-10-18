@@ -23,8 +23,8 @@ use crate::worktree::domain::{
 };
 use crate::worktree::error::{WorktreeError, WorktreeResult};
 use crate::worktree::gate::CheckoutMutationGate;
-use crate::worktree::git::{GitRunner, validate_ref_name};
 use crate::worktree::identity::{ResolvedRepository, ensure_relative_cwd_exists};
+use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
 use crate::worktree::repo_workspace::WorkspaceRepository;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -63,14 +63,14 @@ pub struct AllocationRequest<'a> {
 
 /// Provisions managed worktree workspaces under a durable storage root.
 pub struct WorkspaceAllocator {
-    git: Arc<dyn GitRunner>,
+    git: Arc<dyn RepositoryOps>,
     registry: Arc<dyn WorkspaceRepository>,
     storage_root: PathBuf,
 }
 
 impl WorkspaceAllocator {
     pub fn new(
-        git: Arc<dyn GitRunner>,
+        git: Arc<dyn RepositoryOps>,
         registry: Arc<dyn WorkspaceRepository>,
         storage_root: impl Into<PathBuf>,
     ) -> Self {
@@ -318,15 +318,9 @@ impl WorkspaceAllocator {
         // 2. Keep the baseline reachable across restarts/GC through a
         //    managed ref (retained and reported on removal, never deleted).
         let ref_name = baseline_ref_for(id);
-        let ref_args = [
-            "update-ref",
-            ref_name.as_str(),
-            baseline.baseline_commit.as_str(),
-        ];
         self.git
-            .run(repo_root, &ref_args)
-            .await?
-            .into_checked(&ref_args)?;
+            .set_ref(repo_root, ref_name.as_str(), &baseline.baseline_commit)
+            .await?;
 
         // 3. Allocate the managed branch at the baseline commit.
         self.ensure_branch(repo_root, branch, &baseline.baseline_commit)
@@ -354,10 +348,7 @@ impl WorkspaceAllocator {
         branch: &ManagedBranch,
         expected_base: &str,
     ) -> WorktreeResult<()> {
-        let probe_args = ["rev-parse", "--verify", branch.as_str()];
-        let probe = self.git.run(repo_root, &probe_args).await?;
-        if probe.success {
-            let tip = probe.stdout_str().trim().to_string();
+        if let Some(tip) = self.git.branch_tip(repo_root, branch).await? {
             if tip == expected_base {
                 return Ok(());
             }
@@ -366,9 +357,9 @@ impl WorkspaceAllocator {
                 branch, tip, expected_base
             )));
         }
-        let create = ["branch", branch.as_str(), expected_base];
-        let out = self.git.run(repo_root, &create).await?;
-        out.into_checked(&create).map(|_| ())
+        self.git
+            .create_branch(repo_root, branch, expected_base)
+            .await
     }
 
     /// Create the linked checkout unless the path is already a registered
@@ -382,10 +373,7 @@ impl WorkspaceAllocator {
         branch: &ManagedBranch,
     ) -> WorktreeResult<()> {
         if checkout_path.exists() {
-            let args = ["worktree", "list", "--porcelain"];
-            let out = self.git.run(repo_root, &args).await?;
-            let out = out.into_checked(&args)?;
-            if worktree_registered_at(&out.stdout_str(), checkout_path, branch) {
+            if worktree_registered(self.git.as_ref(), repo_root, checkout_path, branch).await? {
                 return Ok(());
             }
             return Err(WorktreeError::InvalidOperation(format!(
@@ -395,10 +383,9 @@ impl WorkspaceAllocator {
             )));
         }
 
-        let checkout_str = checkout_path.to_string_lossy().into_owned();
-        let add_args = ["worktree", "add", &checkout_str, branch.as_str()];
-        let out = self.git.run(repo_root, &add_args).await?;
-        out.into_checked(&add_args).map(|_| ())
+        self.git
+            .add_worktree(repo_root, checkout_path, branch)
+            .await
     }
 
     /// Idempotently finish an interrupted provisioning attempt.
@@ -505,39 +492,35 @@ impl WorkspaceAllocator {
         }
     }
 
-    /// Access the Git runner (used by tests to cross-check Git state).
+    /// Access the typed repository operations (used by tests).
     #[cfg(test)]
-    pub(crate) fn git(&self) -> &Arc<dyn GitRunner> {
+    pub(crate) fn git(&self) -> &Arc<dyn RepositoryOps> {
         &self.git
     }
 }
 
-/// Whether `git worktree list --porcelain` registers `checkout_path` as a
-/// linked worktree on `branch`.
-pub(crate) fn worktree_registered_at(
-    listing: &str,
+/// Whether `checkout_path` is a linked worktree of the shared repository
+/// registered on `branch`.
+pub(crate) async fn worktree_registered(
+    ops: &dyn RepositoryOps,
+    repo_root: &Path,
     checkout_path: &Path,
     branch: &ManagedBranch,
-) -> bool {
+) -> WorktreeResult<bool> {
     let checkout_canonical = std::fs::canonicalize(checkout_path).ok();
-    let mut current: Option<PathBuf> = None;
-    for line in listing.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current = Some(PathBuf::from(path.trim_matches('"')));
-        } else if let Some(ref_name) = line.strip_prefix("branch refs/heads/") {
-            if ref_name != branch.as_str() {
-                continue;
-            }
-            if let (Some(listed), Some(canonical)) = (current.clone(), checkout_canonical.clone())
-                && std::fs::canonicalize(&listed)
-                    .ok()
-                    .is_some_and(|p| p == canonical)
-            {
-                return true;
-            }
+    for registered in ops.list_worktrees(repo_root).await? {
+        if registered.is_main || registered.branch.as_deref() != Some(branch.as_str()) {
+            continue;
+        }
+        if let Ok(registered_canonical) = std::fs::canonicalize(&registered.path)
+            && checkout_canonical
+                .as_ref()
+                .is_some_and(|c| *c == registered_canonical)
+        {
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 /// Durable checkout path: `<storage_root>/<repo-slug>/<workspace-id>`.
@@ -567,17 +550,21 @@ pub(crate) fn repo_slug(common_dir: &Path) -> String {
 
 /// Resolve `base_ref` (or HEAD) to a full commit object id.
 async fn resolve_base_commit(
-    git: &dyn GitRunner,
+    ops: &dyn RepositoryOps,
     repo_root: &Path,
     base_ref: Option<&str>,
 ) -> WorktreeResult<String> {
     let expr = base_ref.unwrap_or("HEAD");
     validate_rev_expression(expr)?;
     let rev = format!("{expr}^{{commit}}");
-    let args = ["rev-parse", "--verify", rev.as_str()];
-    let out = git.run(repo_root, &args).await?;
-    let out = out.into_checked(&args)?;
-    Ok(out.stdout_str().trim().to_string())
+    match ops.resolve_commit(repo_root, &rev).await? {
+        Some(commit) => Ok(commit),
+        None => Err(WorktreeError::GitCommand {
+            argv: rev,
+            status: "rev-parse failed".to_string(),
+            stderr: format!("{expr} does not resolve to a commit"),
+        }),
+    }
 }
 
 /// Validate a revision *expression* (may contain `~`, `^`, `@{…}` unlike a
@@ -612,6 +599,8 @@ fn validate_rev_expression(expr: &str) -> WorktreeResult<()> {
 mod tests {
     use super::*;
     use crate::session::schema;
+    use crate::worktree::GitRunner as _;
+    use crate::worktree::GixRepoOps;
     use crate::worktree::git::CliGit;
     use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
     use crate::worktree::test_support::{init_repo_with_subdir, materialize};
@@ -625,7 +614,7 @@ mod tests {
         conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
         schema::init_schema(&mut conn).unwrap();
         WorkspaceAllocator::new(
-            Arc::new(CliGit::new()),
+            Arc::new(GixRepoOps::new()),
             Arc::new(SqliteWorkspaceRepository::new(Arc::new(Mutex::new(conn)))),
             storage.to_path_buf(),
         )
@@ -693,8 +682,7 @@ mod tests {
         );
 
         // The managed branch points at the source HEAD.
-        let out = alloc
-            .git()
+        let out = CliGit::new()
             .run(repo.path(), &["rev-parse", record.branch.as_str()])
             .await
             .unwrap()
@@ -725,8 +713,7 @@ mod tests {
 
         // Give the source a real index to observe (gix commits alone don't
         // write one), then snapshot HEAD, index bytes, and working files.
-        alloc
-            .git()
+        CliGit::new()
             .run(repo.path(), &["reset", "--mixed", "HEAD"])
             .await
             .unwrap()
@@ -774,8 +761,7 @@ mod tests {
         );
 
         // Source HEAD, index, and working files unchanged.
-        let head_after = alloc
-            .git()
+        let head_after = CliGit::new()
             .run(repo.path(), &["rev-parse", "HEAD"])
             .await
             .unwrap()
@@ -908,9 +894,12 @@ mod tests {
         record
     }
 
-    async fn branch_tip(alloc: &WorkspaceAllocator, repo: &Path, branch: &ManagedBranch) -> String {
-        alloc
-            .git()
+    async fn branch_tip(
+        _alloc: &WorkspaceAllocator,
+        repo: &Path,
+        branch: &ManagedBranch,
+    ) -> String {
+        CliGit::new()
             .run(repo, &["rev-parse", "--verify", branch.as_str()])
             .await
             .unwrap()
@@ -962,8 +951,7 @@ mod tests {
         )
         .await;
         // Crash boundary: branch exists, checkout does not.
-        alloc
-            .git()
+        CliGit::new()
             .run(
                 repo.path(),
                 &["branch", record.branch.as_str(), &head.to_string()],
@@ -999,8 +987,7 @@ mod tests {
         )
         .await;
         // Crash boundary: branch and registered checkout exist, binding does not.
-        alloc
-            .git()
+        CliGit::new()
             .run(
                 repo.path(),
                 &["branch", record.branch.as_str(), &head.to_string()],
@@ -1010,8 +997,7 @@ mod tests {
             .into_checked(&["branch", record.branch.as_str()])
             .unwrap();
         let path = record.checkout_path.to_string_lossy().into_owned();
-        alloc
-            .git()
+        CliGit::new()
             .run(
                 repo.path(),
                 &["worktree", "add", &path, record.branch.as_str()],
@@ -1086,8 +1072,7 @@ mod tests {
         )
         .await;
         // The branch exists but at a different commit than the recorded base.
-        alloc
-            .git()
+        CliGit::new()
             .run(
                 repo.path(),
                 &["branch", record.branch.as_str(), &second.to_string()],
@@ -1163,16 +1148,14 @@ mod tests {
 
         let head_before = head.to_string();
         let index_before = {
-            let out = alloc
-                .git()
+            let out = CliGit::new()
                 .run(repo.path(), &["ls-files", "-s"])
                 .await
                 .unwrap();
             out.stdout_str()
         };
         let status_before = {
-            let out = alloc
-                .git()
+            let out = CliGit::new()
                 .run(repo.path(), &["status", "--porcelain"])
                 .await
                 .unwrap();
@@ -1218,8 +1201,7 @@ mod tests {
 
         // Immutable baseline ref keeps the private commit reachable.
         let ref_name = baseline_ref_for(&record.id);
-        let out = alloc
-            .git()
+        let out = CliGit::new()
             .run(repo.path(), &["rev-parse", ref_name.as_str()])
             .await
             .unwrap();
@@ -1228,8 +1210,7 @@ mod tests {
 
         // The source is untouched: HEAD, index bytes, status, and files.
         let head_after = {
-            let out = alloc
-                .git()
+            let out = CliGit::new()
                 .run(repo.path(), &["rev-parse", "HEAD"])
                 .await
                 .unwrap();
@@ -1237,8 +1218,7 @@ mod tests {
         };
         assert_eq!(head_after, head_before);
         assert_eq!(
-            alloc
-                .git()
+            CliGit::new()
                 .run(repo.path(), &["ls-files", "-s"])
                 .await
                 .unwrap()
@@ -1246,8 +1226,7 @@ mod tests {
             index_before
         );
         assert_eq!(
-            alloc
-                .git()
+            CliGit::new()
                 .run(repo.path(), &["status", "--porcelain"])
                 .await
                 .unwrap()
@@ -1277,8 +1256,7 @@ mod tests {
             .unwrap();
 
         let ref_name = baseline_ref_for(&record.id);
-        let out = alloc
-            .git()
+        let out = CliGit::new()
             .run(repo.path(), &["rev-parse", ref_name.as_str()])
             .await
             .unwrap();
@@ -1316,22 +1294,21 @@ mod tests {
             vec!["reflog", "expire", "--expire=now", "--all"],
             vec!["gc", "--prune=now"],
         ] {
-            let out = alloc.git().run(repo.path(), &args).await.unwrap();
+            let out = CliGit::new().run(repo.path(), &args).await.unwrap();
             assert!(out.success, "git {args:?} failed: {}", out.stderr_str());
         }
 
         // The baseline ref still resolves and the private commit object
         // still exists — reachability survived the GC.
         let ref_name = baseline_ref_for(&record.id);
-        let out = alloc
-            .git()
+        let out = CliGit::new()
             .run(repo.path(), &["rev-parse", ref_name.as_str()])
             .await
             .unwrap();
         assert!(out.success);
         assert_eq!(out.stdout_str().trim(), baseline);
         let probe = ["cat-file", "-e", baseline.as_str()];
-        let out = alloc.git().run(repo.path(), &probe).await.unwrap();
+        let out = CliGit::new().run(repo.path(), &probe).await.unwrap();
         assert!(out.success, "baseline commit must survive GC");
     }
 

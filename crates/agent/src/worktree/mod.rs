@@ -18,11 +18,13 @@ pub mod capture;
 pub mod domain;
 pub mod error;
 pub mod gate;
-pub mod git;
+#[cfg(test)]
+pub(crate) mod git;
 pub mod identity;
 pub mod lifecycle;
 pub mod lock;
 pub mod placement;
+pub mod repo_ops;
 pub mod repo_workspace;
 pub mod service;
 pub mod session_options;
@@ -41,13 +43,18 @@ pub use domain::{
 };
 pub use error::{WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;
-pub use git::{CliGit, DEFAULT_GIT_TIMEOUT, GitOutput, GitRunner, validate_ref_name};
+#[cfg(test)]
+pub(crate) use git::{CliGit, DEFAULT_GIT_TIMEOUT, GitOutput, GitRunner};
 pub use identity::{
     CheckoutIdentity, ResolvedRepository, ensure_relative_cwd_exists, relative_cwd,
     resolve_repository,
 };
 pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
+pub use repo_ops::{
+    CapturedWorkingState, CheckoutStatus, FailurePoint, FaultInjectingRepoOps, GixRepoOps,
+    RegisteredWorktree, RepositoryOps, validate_ref_name,
+};
 pub use repo_workspace::{SqliteWorkspaceRepository, WorkspaceRepository};
 pub use service::{WorkspaceBinding, WorkspaceService};
 pub use session_options::{

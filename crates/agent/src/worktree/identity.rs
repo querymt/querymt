@@ -46,13 +46,14 @@ pub struct ResolvedRepository {
 /// directories and bare repositories (explicitly unsupported in this
 /// version). All returned paths are canonicalized.
 pub fn resolve_repository(cwd: &Path) -> WorktreeResult<ResolvedRepository> {
-    let repo = gix::discover(cwd).map_err(|err| match err {
-        gix::discover::Error::Discover(e) if is_no_repository(&e) => {
+    let repo = gix::discover(cwd).map_err(|err| {
+        if is_no_repository(&err) {
             WorktreeError::NotGitRepository {
                 path: cwd.to_path_buf(),
             }
+        } else {
+            WorktreeError::GitDiscovery(err.to_string())
         }
-        other => WorktreeError::GitDiscovery(other.to_string()),
     })?;
 
     let work_dir = repo
@@ -80,21 +81,18 @@ pub fn resolve_repository(cwd: &Path) -> WorktreeResult<ResolvedRepository> {
     })
 }
 
-/// Classify gix-discover 0.48 (paired with gix 0.80) upwards-discovery
-/// errors that mean "no usable repository here".
+/// Classify gix 0.89 discovery failures that mean "no usable repository
+/// here".
 ///
-/// gix 0.80 predates the `gix::discover::is_not_found` helper (added by
-/// 0.85-era releases), so the variants are matched explicitly; revisit when
-/// the crate upgrades past 0.84.
-fn is_no_repository(err: &gix::discover::upwards::Error) -> bool {
-    use gix::discover::upwards::Error as E;
-    matches!(
-        err,
-        E::NoGitRepository { .. }
-            | E::NoGitRepositoryWithinCeiling { .. }
-            | E::NoGitRepositoryWithinFs { .. }
-            | E::NoTrustedGitRepository { .. }
-    )
+/// `gix::discover()` returns `gix::Result`, whose erased `gix::Error`
+/// (gix-error) preserves the concrete cause. The upwards-discovery error
+/// (`gix::discover::upwards::Error`, paired with gix 0.89) is recovered from
+/// the error chain; every one of its variants means no usable repository was
+/// found (including the untrusted-repository case), matching the previous
+/// gix 0.80 classification.
+fn is_no_repository(err: &gix::Error) -> bool {
+    err.downcast_any_ref::<gix::discover::upwards::Error>()
+        .is_some()
 }
 
 /// Resolve `cwd` relative to `checkout_root` (both canonicalized).

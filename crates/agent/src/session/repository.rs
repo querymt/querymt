@@ -39,6 +39,21 @@ pub trait SessionRepository: Send + Sync {
         ))
     }
 
+    /// Overwrite a session's durable working directory (RFC 3339 `updated_at`
+    /// bump included). Used when a session's execution workspace changes
+    /// durably — e.g. an isolated fork binding its own checkout so the session
+    /// row, workspace association, listing, load, and resume all agree.
+    async fn set_session_cwd(
+        &self,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<()> {
+        let _ = (session_id, cwd);
+        Err(crate::session::error::SessionError::InvalidOperation(
+            "set_session_cwd is not supported by this store".to_string(),
+        ))
+    }
+
     /// List all sessions
     async fn list_sessions(&self) -> SessionResult<Vec<Session>>;
 

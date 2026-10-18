@@ -465,6 +465,15 @@ impl SessionStore for SqliteStorage {
         repo.set_session_name(session_id, name).await
     }
 
+    async fn set_session_cwd(
+        &self,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<()> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.set_session_cwd(session_id, cwd).await
+    }
+
     async fn list_sessions(&self) -> SessionResult<Vec<Session>> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
         repo.list_sessions().await
@@ -661,6 +670,77 @@ impl SessionStore for SqliteStorage {
         target_message_id: &str,
         fork_origin: ForkOrigin,
     ) -> SessionResult<String> {
+        self.fork_session_with_isolation_intent(
+            source_session_id,
+            target_message_id,
+            fork_origin,
+            None,
+        )
+        .await
+    }
+
+    async fn get_pending_fork_isolation(
+        &self,
+        session_id: &str,
+    ) -> SessionResult<Option<crate::session::store::PendingForkIsolation>> {
+        let session_id = session_id.to_string();
+        let json: Option<String> = self
+            .run_blocking(move |conn| {
+                conn.query_row(
+                    "SELECT intent_json FROM session_fork_isolation_intents i
+                 JOIN sessions s ON s.id = i.session_id WHERE s.public_id = ?",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .await?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|err| {
+                SessionError::InvalidOperation(format!(
+                    "invalid pending fork isolation intent: {err}"
+                ))
+            })
+        })
+        .transpose()
+    }
+
+    async fn complete_fork_isolation(&self, session_id: &str) -> SessionResult<()> {
+        let session_id = session_id.to_string();
+        self.run_blocking(move |conn| {
+            let tx = conn.transaction()?;
+            let (cwd, checkout, relative): (String, String, String) = tx.query_row(
+                "SELECT s.cwd, w.checkout_path, w.relative_cwd FROM sessions s
+                 JOIN workspaces w ON w.owner_session_id = s.public_id
+                 WHERE s.public_id = ? AND w.lifecycle = 'ready'",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if PathBuf::from(cwd) != PathBuf::from(checkout).join(relative) {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tx.execute(
+                "DELETE FROM session_fork_isolation_intents
+                 WHERE session_id = (SELECT id FROM sessions WHERE public_id = ?)",
+                params![session_id],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn fork_session_with_isolation_intent(
+        &self,
+        source_session_id: &str,
+        target_message_id: &str,
+        fork_origin: ForkOrigin,
+        intent: Option<crate::session::store::PendingForkIsolation>,
+    ) -> SessionResult<String> {
+        let intent_json = intent
+            .map(|intent| serde_json::to_string(&intent))
+            .transpose()
+            .map_err(|err| SessionError::InvalidOperation(err.to_string()))?;
         // Resolve source session public_id → internal i64
         let source_session_internal_id =
             self.resolve_session_internal_id(source_session_id).await?;
@@ -705,6 +785,14 @@ impl SessionStore for SqliteStorage {
 
             // Get new session internal ID
             let new_session_internal_id: i64 = tx.last_insert_rowid();
+            // The copied conversation and its startup barrier commit together:
+            // interruption cannot leave an isolated fork looking legacy-local.
+            if let Some(intent_json) = intent_json {
+                tx.execute(
+                    "INSERT INTO session_fork_isolation_intents (session_id, intent_json) VALUES (?, ?)",
+                    params![new_session_internal_id, intent_json],
+                )?;
+            }
 
             // 2. Identify messages to copy (up to target_message_id internal ID).
             // Use deterministic internal-id ordering so same-second timestamps don't truncate

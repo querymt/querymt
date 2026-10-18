@@ -7,47 +7,36 @@
 //! materialization for isolated workspaces (design decision 4), not a
 //! replacement for undo snapshots.
 //!
-//! Mechanics: a private temporary index is seeded from HEAD and then
-//! reconciled with the working tree via `git add -A`, so Git itself handles
-//! file modes, symlinks, binary contents, path exclusions (.gitignore), and
-//! deletions. The staging partition is deliberately *not* propagated: a
-//! partially staged file contributes its working content, and the real
-//! index stays byte-for-byte unchanged. Ignored untracked files are
-//! excluded and reported for disclosure.
+//! Mechanics: a private index is seeded from HEAD and then reconciled
+//! with the working tree (native gix index/object primitives — the
+//! equivalent of `git add -A` against a throwaway index), so file modes,
+//! symlinks, binary contents, path exclusions (.gitignore), and deletions
+//! are handled with Git semantics. The staging partition is deliberately
+//! *not* propagated: a partially staged file contributes its working
+//! content, and the real index stays byte-for-byte unchanged. Ignored
+//! untracked files are excluded and reported for disclosure.
 //!
 //! When the captured tree equals HEAD's tree, HEAD is reused as the
 //! baseline (no private commit). Otherwise a private commit parented by
-//! HEAD is created with an explicit internal identity via `commit-tree`,
-//! which requires no user commit identity and never runs commit hooks.
-//! Ref creation for the baseline lives with the caller (section 3.3).
+//! HEAD is created with an explicit internal identity, which requires no
+//! user commit identity and never runs commit hooks. Ref creation for the
+//! baseline lives with the caller (section 3.3).
 
 use crate::worktree::error::{WorktreeError, WorktreeResult};
-use crate::worktree::git::GitRunner;
+use crate::worktree::repo_ops::{CapturedWorkingState, RepositoryOps};
 use std::path::Path;
+
+/// Result of capturing a checkout's working state.
+///
+/// Re-exported from the typed operations layer; fields and semantics are
+/// identical.
+pub use crate::worktree::repo_ops::CapturedWorkingState as CapturedState;
 
 /// Author/committer identity for QueryMT's private commits. Private
 /// commits never require the user's commit identity and never invoke user
-/// commit hooks (`commit-tree` runs none).
+/// commit hooks.
 pub const INTERNAL_COMMIT_NAME: &str = "QueryMT";
 pub const INTERNAL_COMMIT_EMAIL: &str = "querymt@localhost";
-const INTERNAL_COMMIT_MESSAGE: &str = "QueryMT private baseline";
-
-/// Result of capturing a checkout's working state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapturedState {
-    /// Full object id of the checkout HEAD at capture time.
-    pub source_head: String,
-    /// Captured working-state tree object id.
-    pub tree: String,
-    /// Immutable commit for the captured state. Equals `source_head` when
-    /// the working state matched HEAD (no private commit created).
-    pub commit: String,
-    /// Whether a private commit was created (false when HEAD was reused).
-    pub created_commit: bool,
-    /// Ignored untracked files excluded from the capture (disclosed to the
-    /// user, never silently copied).
-    pub ignored_files: Vec<String>,
-}
 
 /// Bounded retry policy for validated capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,16 +63,16 @@ impl Default for CaptureRetryPolicy {
 /// lands after the post-manifest is undetectable; the documented limitation
 /// is surfaced through capture diagnostics instead (design decision 4).
 pub async fn capture_working_state_validated(
-    git: &dyn GitRunner,
+    ops: &dyn RepositoryOps,
     checkout_root: &Path,
     policy: CaptureRetryPolicy,
-) -> WorktreeResult<CapturedState> {
+) -> WorktreeResult<CapturedWorkingState> {
     let attempts = policy.max_attempts.max(1);
     let mut last_diagnostic = String::new();
     for attempt in 0..attempts {
-        let before = source_manifest(git, checkout_root).await?;
-        let captured = capture_working_state(git, checkout_root).await?;
-        let after = source_manifest(git, checkout_root).await?;
+        let before = source_manifest(ops, checkout_root).await?;
+        let captured = capture_working_state(ops, checkout_root).await?;
+        let after = source_manifest(ops, checkout_root).await?;
         if before == after && captured.source_head == before.0 && captured.tree == before.1 {
             return Ok(captured);
         }
@@ -98,18 +87,13 @@ pub async fn capture_working_state_validated(
 
 /// Content manifest of the source: HEAD, private working tree and real index entries.
 async fn source_manifest(
-    git: &dyn GitRunner,
+    ops: &dyn RepositoryOps,
     checkout_root: &Path,
 ) -> WorktreeResult<(String, String, Vec<u8>)> {
     // A private tree records contents, modes, symlink targets and untracked
     // files. Status labels cannot detect edits to an already-dirty path.
-    let state = capture_working_state(git, checkout_root).await?;
-    let args = ["ls-files", "--stage", "-z"];
-    let index = git
-        .run(checkout_root, &args)
-        .await?
-        .into_checked(&args)?
-        .stdout;
+    let state = capture_working_state(ops, checkout_root).await?;
+    let index = ops.index_manifest(checkout_root).await?;
     Ok((state.source_head, state.tree, index))
 }
 
@@ -122,100 +106,11 @@ async fn source_manifest(
 /// rejected explicitly *before* capture rather than silently producing an
 /// incomplete baseline.
 pub async fn capture_working_state(
-    git: &dyn GitRunner,
+    ops: &dyn RepositoryOps,
     checkout_root: &Path,
-) -> WorktreeResult<CapturedState> {
-    validate_supported_layout(git, checkout_root).await?;
-
-    let source_head = rev_parse(git, checkout_root, "HEAD").await?;
-
-    // Private temporary index; removed on all exit paths.
-    let index_file = std::env::temp_dir().join(format!(
-        "qmt-baseline-index-{}-{}",
-        std::process::id(),
-        uuid::Uuid::now_v7()
-    ));
-    let index_path = index_file.to_string_lossy().into_owned();
-    let index_env = [("GIT_INDEX_FILE", index_path.as_str())];
-
-    let captured = capture_with_private_index(git, checkout_root, &index_env, &source_head).await;
-    let _ = std::fs::remove_file(&index_file);
-    captured
-}
-
-async fn capture_with_private_index(
-    git: &dyn GitRunner,
-    checkout_root: &Path,
-    index_env: &[(&str, &str)],
-    source_head: &str,
-) -> WorktreeResult<CapturedState> {
-    // 1. Seed the private index from HEAD (design: capture reconciles *from*
-    //    HEAD), then reconcile it with actual working contents. `add -A`
-    //    covers tracked modifications/deletions and non-ignored untracked
-    //    files, applies .gitignore exclusions, and preserves Git file
-    //    semantics — all in the private index.
-    let args = ["read-tree", "HEAD"];
-    git.run_with_env(checkout_root, &args, index_env)
-        .await?
-        .into_checked(&args)?;
-
-    let args = ["add", "-A"];
-    git.run_with_env(checkout_root, &args, index_env)
-        .await?
-        .into_checked(&args)?;
-
-    let args = ["write-tree"];
-    let tree = git
-        .run_with_env(checkout_root, &args, index_env)
-        .await?
-        .into_checked(&args)?
-        .stdout_str()
-        .trim()
-        .to_string();
-
-    // 2. Reuse HEAD when the working state matches it; otherwise create a
-    //    private commit parented by source HEAD. `commit-tree` needs no
-    //    user identity and runs no hooks.
-    let head_tree = rev_parse(git, checkout_root, "HEAD^{tree}").await?;
-    if tree == head_tree {
-        return Ok(CapturedState {
-            source_head: source_head.to_string(),
-            tree,
-            commit: source_head.to_string(),
-            created_commit: false,
-            ignored_files: list_ignored(git, checkout_root).await?,
-        });
-    }
-
-    let commit_env = [
-        ("GIT_AUTHOR_NAME", INTERNAL_COMMIT_NAME),
-        ("GIT_AUTHOR_EMAIL", INTERNAL_COMMIT_EMAIL),
-        ("GIT_COMMITTER_NAME", INTERNAL_COMMIT_NAME),
-        ("GIT_COMMITTER_EMAIL", INTERNAL_COMMIT_EMAIL),
-    ];
-    let args = [
-        "commit-tree",
-        tree.as_str(),
-        "-p",
-        source_head,
-        "-m",
-        INTERNAL_COMMIT_MESSAGE,
-    ];
-    let commit = git
-        .run_with_env(checkout_root, &args, &commit_env)
-        .await?
-        .into_checked(&args)?
-        .stdout_str()
-        .trim()
-        .to_string();
-
-    Ok(CapturedState {
-        source_head: source_head.to_string(),
-        tree,
-        commit,
-        created_commit: true,
-        ignored_files: list_ignored(git, checkout_root).await?,
-    })
+) -> WorktreeResult<CapturedWorkingState> {
+    validate_supported_layout(ops, checkout_root).await?;
+    ops.capture_working_state(checkout_root).await
 }
 
 /// Reject source layouts this first version cannot materialize faithfully.
@@ -224,14 +119,11 @@ async fn capture_with_private_index(
 /// names the unsupported state (spec: unsupported states fail explicitly
 /// rather than omitting content silently).
 async fn validate_supported_layout(
-    git: &dyn GitRunner,
+    ops: &dyn RepositoryOps,
     checkout_root: &Path,
 ) -> WorktreeResult<()> {
     // Unborn HEAD has nothing to seed from or parent by.
-    let probe = git
-        .run(checkout_root, &["rev-parse", "--verify", "HEAD"])
-        .await?;
-    if !probe.success {
+    if ops.head_commit(checkout_root).await?.is_none() {
         return Err(WorktreeError::InvalidOperation(
             "cannot capture baseline: checkout has no commits (unborn HEAD); \
              create an initial commit first"
@@ -241,9 +133,7 @@ async fn validate_supported_layout(
 
     // Unresolved merge conflicts cannot be represented faithfully: conflict
     // markers on disk would be captured as ordinary content.
-    let args = ["ls-files", "-u"];
-    let unmerged = git.run(checkout_root, &args).await?.into_checked(&args)?;
-    if !unmerged.stdout_str().trim().is_empty() {
+    if ops.has_unmerged_entries(checkout_root).await? {
         return Err(WorktreeError::InvalidOperation(
             "cannot capture baseline: source has unresolved index conflicts; \
              resolve them before requesting isolation"
@@ -260,11 +150,7 @@ async fn validate_supported_layout(
 
     // Sparse checkouts: tracked paths absent from disk would be captured as
     // deletions.
-    let args = ["config", "--get", "core.sparseCheckout"];
-    if let Ok(out) = git.run(checkout_root, &args).await
-        && out.success
-        && out.stdout_str().trim() == "true"
-    {
+    if ops.sparse_checkout_enabled(checkout_root).await? {
         return Err(WorktreeError::InvalidOperation(
             "cannot capture baseline: sparse checkouts are unsupported in this version".to_string(),
         ));
@@ -283,33 +169,10 @@ async fn validate_supported_layout(
     Ok(())
 }
 
-async fn rev_parse(git: &dyn GitRunner, repo_root: &Path, expr: &str) -> WorktreeResult<String> {
-    let args = ["rev-parse", expr];
-    git.run(repo_root, &args)
-        .await?
-        .into_checked(&args)
-        .map(|out| out.stdout_str().trim().to_string())
-}
-
-/// Ignored untracked files in the checkout, for disclosure.
-async fn list_ignored(git: &dyn GitRunner, checkout_root: &Path) -> WorktreeResult<Vec<String>> {
-    let args = ["status", "--porcelain=v1", "--ignored=matching"];
-    let out = git
-        .run(checkout_root, &args)
-        .await?
-        .into_checked(&args)?
-        .stdout_str();
-    Ok(out
-        .lines()
-        .filter(|line| line.len() >= 4 && line.starts_with("!!"))
-        .map(|line| line[3..].to_string())
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worktree::git::{CliGit, GitOutput};
+    use crate::worktree::repo_ops::{CapturedWorkingState, GixRepoOps, RepositoryOps};
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -402,7 +265,7 @@ mod tests {
     }
 
     async fn capture(root: &Path) -> WorktreeResult<CapturedState> {
-        capture_working_state(&CliGit::new(), root).await
+        capture_working_state(&GixRepoOps::new(), root).await
     }
 
     // -- Clean and dirty captures ---------------------------------------------
@@ -768,18 +631,20 @@ mod tests {
 
     // -- Validated capture: manifest check + bounded retry ---------------------
 
-    /// Real-git runner that simulates an external editor writing to the
-    /// checkout right after the first `git add -A` (mid-capture).
-    struct FlakyWriterGit {
-        inner: CliGit,
+    /// Typed-ops wrapper that simulates an external editor writing to the
+    /// checkout right after the first capture attempt begins (mid-capture).
+    /// It delegates to the real native implementation — no argv, no
+    /// fabricated output.
+    struct FlakyWriterOps {
+        inner: GixRepoOps,
         remaining_mutations: std::sync::atomic::AtomicU32,
         mutations: std::sync::atomic::AtomicU32,
     }
 
-    impl FlakyWriterGit {
+    impl FlakyWriterOps {
         fn flaky_once() -> Self {
             Self {
-                inner: CliGit::new(),
+                inner: GixRepoOps::new(),
                 remaining_mutations: std::sync::atomic::AtomicU32::new(1),
                 mutations: std::sync::atomic::AtomicU32::new(0),
             }
@@ -787,7 +652,7 @@ mod tests {
 
         fn always_flaky() -> Self {
             Self {
-                inner: CliGit::new(),
+                inner: GixRepoOps::new(),
                 remaining_mutations: std::sync::atomic::AtomicU32::new(u32::MAX),
                 mutations: std::sync::atomic::AtomicU32::new(0),
             }
@@ -799,34 +664,165 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl GitRunner for FlakyWriterGit {
-        async fn run_with_env(
+    impl RepositoryOps for FlakyWriterOps {
+        async fn capture_working_state(
             &self,
-            repo_root: &Path,
-            args: &[&str],
-            extra_env: &[(&str, &str)],
-        ) -> WorktreeResult<GitOutput> {
-            let out = self.inner.run_with_env(repo_root, args, extra_env).await?;
-            if args.first() == Some(&"add")
-                && self
-                    .remaining_mutations
-                    .try_update(
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst,
-                        |remaining| remaining.checked_sub(1),
-                    )
-                    .is_ok()
+            checkout: &Path,
+        ) -> WorktreeResult<CapturedWorkingState> {
+            let out = self.inner.capture_working_state(checkout).await?;
+            if self
+                .remaining_mutations
+                .try_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
             {
                 self.mutations
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                // Content-only changes retain identical porcelain status.
+                // Content-only changes keep the real index untouched while
+                // the captured tree changes.
                 std::fs::write(
-                    repo_root.join("race.txt"),
+                    checkout.join("race.txt"),
                     format!("race-{}", self.mutation_count()),
                 )
                 .unwrap();
             }
             Ok(out)
+        }
+
+        async fn resolve_commit(
+            &self,
+            repo_root: &Path,
+            expr: &str,
+        ) -> WorktreeResult<Option<String>> {
+            self.inner.resolve_commit(repo_root, expr).await
+        }
+
+        async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>> {
+            self.inner.index_manifest(checkout).await
+        }
+
+        async fn head_commit(&self, checkout: &Path) -> WorktreeResult<Option<String>> {
+            self.inner.head_commit(checkout).await
+        }
+
+        async fn has_unmerged_entries(&self, checkout: &Path) -> WorktreeResult<bool> {
+            self.inner.has_unmerged_entries(checkout).await
+        }
+
+        async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool> {
+            self.inner.sparse_checkout_enabled(checkout).await
+        }
+
+        async fn branch_tip(
+            &self,
+            repo_root: &Path,
+            branch: &crate::worktree::domain::ManagedBranch,
+        ) -> WorktreeResult<Option<String>> {
+            self.inner.branch_tip(repo_root, branch).await
+        }
+
+        async fn create_branch(
+            &self,
+            repo_root: &Path,
+            branch: &crate::worktree::domain::ManagedBranch,
+            target: &str,
+        ) -> WorktreeResult<()> {
+            self.inner.create_branch(repo_root, branch, target).await
+        }
+
+        async fn delete_branch(
+            &self,
+            repo_root: &Path,
+            branch: &crate::worktree::domain::ManagedBranch,
+        ) -> WorktreeResult<()> {
+            self.inner.delete_branch(repo_root, branch).await
+        }
+
+        async fn set_ref(
+            &self,
+            repo_root: &Path,
+            ref_name: &str,
+            commit: &str,
+        ) -> WorktreeResult<()> {
+            self.inner.set_ref(repo_root, ref_name, commit).await
+        }
+
+        async fn create_ref_if_absent(
+            &self,
+            repo_root: &Path,
+            ref_name: &str,
+            commit: &str,
+        ) -> WorktreeResult<()> {
+            self.inner
+                .create_ref_if_absent(repo_root, ref_name, commit)
+                .await
+        }
+
+        async fn list_worktrees(
+            &self,
+            repo_root: &Path,
+        ) -> WorktreeResult<Vec<crate::worktree::RegisteredWorktree>> {
+            self.inner.list_worktrees(repo_root).await
+        }
+
+        async fn add_worktree(
+            &self,
+            repo_root: &Path,
+            path: &Path,
+            branch: &crate::worktree::domain::ManagedBranch,
+        ) -> WorktreeResult<()> {
+            self.inner.add_worktree(repo_root, path, branch).await
+        }
+
+        async fn remove_worktree(&self, repo_root: &Path, path: &Path) -> WorktreeResult<()> {
+            self.inner.remove_worktree(repo_root, path).await
+        }
+
+        async fn prune_worktrees(&self, repo_root: &Path) -> WorktreeResult<()> {
+            self.inner.prune_worktrees(repo_root).await
+        }
+
+        async fn checkout_status(
+            &self,
+            checkout: &Path,
+        ) -> WorktreeResult<crate::worktree::CheckoutStatus> {
+            self.inner.checkout_status(checkout).await
+        }
+
+        async fn current_branch(&self, checkout: &Path) -> WorktreeResult<Option<String>> {
+            self.inner.current_branch(checkout).await
+        }
+
+        async fn commits_between_count(
+            &self,
+            repo_root: &Path,
+            base: &str,
+            tip: &str,
+        ) -> WorktreeResult<usize> {
+            self.inner.commits_between_count(repo_root, base, tip).await
+        }
+
+        async fn commits_between(
+            &self,
+            repo_root: &Path,
+            base: &str,
+            tip: &str,
+        ) -> WorktreeResult<Vec<String>> {
+            self.inner.commits_between(repo_root, base, tip).await
+        }
+
+        async fn is_ancestor(
+            &self,
+            repo_root: &Path,
+            ancestor: &str,
+            descendant: &str,
+        ) -> WorktreeResult<bool> {
+            self.inner
+                .is_ancestor(repo_root, ancestor, descendant)
+                .await
         }
     }
 
@@ -836,7 +832,7 @@ mod tests {
         fs::write(repo.path().join("file.txt"), "one").unwrap();
         commit_all(repo.path(), "init");
 
-        let git = FlakyWriterGit::flaky_once();
+        let git = FlakyWriterOps::flaky_once();
         let captured =
             capture_working_state_validated(&git, repo.path(), CaptureRetryPolicy::default())
                 .await
@@ -859,7 +855,7 @@ mod tests {
         fs::write(repo.path().join("file.txt"), "one").unwrap();
         commit_all(repo.path(), "init");
 
-        let git = FlakyWriterGit::always_flaky();
+        let git = FlakyWriterOps::always_flaky();
         let policy = CaptureRetryPolicy { max_attempts: 2 };
         let err = capture_working_state_validated(&git, repo.path(), policy)
             .await
@@ -885,7 +881,7 @@ mod tests {
         commit_all(repo.path(), "init");
 
         let captured =
-            capture_working_state_validated(&CliGit::new(), repo.path(), Default::default())
+            capture_working_state_validated(&GixRepoOps::new(), repo.path(), Default::default())
                 .await
                 .unwrap();
         assert_eq!(captured.commit, captured.source_head);

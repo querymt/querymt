@@ -22,6 +22,95 @@ use super::SqliteStorage;
 use super::migrations::{MIGRATIONS, apply_migrations};
 
 #[tokio::test]
+async fn fork_isolation_intent_is_atomic_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sessions.db");
+    let storage = SqliteStorage::connect(db.clone()).await.unwrap();
+    let source = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let message = AgentMessage {
+        id: "fork-intent-message".into(),
+        session_id: source.public_id.clone(),
+        role: ChatRole::User,
+        parts: vec![],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    storage
+        .add_message(&source.public_id, message)
+        .await
+        .unwrap();
+    let intent = crate::session::store::PendingForkIsolation {
+        source_session_id: source.public_id.clone(),
+        source_cwd: dir.path().to_path_buf(),
+        options: crate::worktree::SessionCreationOptions::isolated_worktree(
+            crate::worktree::BaselineMode::CurrentWorkingTree,
+        )
+        .to_workspace_options(),
+    };
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_fork_intent BEFORE INSERT ON session_fork_isolation_intents
+             BEGIN SELECT RAISE(ABORT, 'injected intent failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .fork_session_with_isolation_intent(
+                &source.public_id,
+                "fork-intent-message",
+                ForkOrigin::User,
+                Some(intent.clone()),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(storage.list_sessions().await.unwrap().len(), 1);
+    assert_eq!(
+        storage.get_history(&source.public_id).await.unwrap().len(),
+        1
+    );
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch("DROP TRIGGER reject_fork_intent;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let fork_id = storage
+        .fork_session_with_isolation_intent(
+            &source.public_id,
+            "fork-intent-message",
+            ForkOrigin::User,
+            Some(intent.clone()),
+        )
+        .await
+        .unwrap();
+    drop(storage);
+    let reopened = SqliteStorage::connect(db).await.unwrap();
+    assert_eq!(
+        reopened.get_pending_fork_isolation(&fork_id).await.unwrap(),
+        Some(intent)
+    );
+    assert_eq!(reopened.get_history(&fork_id).await.unwrap().len(), 1);
+    assert!(
+        reopened
+            .get_pending_fork_isolation(&source.public_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn prompt_blocks_round_trip_through_persistence_and_fork() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let session = storage

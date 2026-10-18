@@ -125,7 +125,20 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0025_workspace_archival",
         apply: migration_0025_workspace_archival,
     },
+    Migration {
+        version: "0026_pending_fork_isolation",
+        apply: migration_0026_pending_fork_isolation,
+    },
 ];
+
+fn migration_0026_pending_fork_isolation(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE session_fork_isolation_intents (
+            session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            intent_json TEXT NOT NULL
+        );",
+    )
+}
 
 fn migration_0025_workspace_archival(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     let definition: String = conn.query_row(

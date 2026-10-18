@@ -56,6 +56,11 @@ The system SHALL initialize filesystem tools, indexes, workspace-dependent confi
 - **WHEN** an isolated session reads, edits, searches, or executes a command with default cwd
 - **THEN** the operation and workspace index use its isolated workspace rather than the original checkout
 
+#### Scenario: Workspace-scoped slash-command execution
+- **WHEN** a slash command has different prompt, include, or script contents in the original and isolated checkouts
+- **THEN** the advertised command and its actual expansion/execution use the isolated workspace sources
+- **AND** a command present only in the isolated checkout can be invoked without consulting the original checkout's registry
+
 #### Scenario: Fixed-root integration mismatch
 - **WHEN** an editor bridge or workspace-dependent external tool cannot operate against the isolated root
 - **THEN** that integration is disabled or rejected with an explicit diagnostic rather than silently serving the original checkout
@@ -68,6 +73,28 @@ Forking an isolated session SHALL create a new workspace from the source's curre
 - **THEN** the new session has a distinct checkout based on current source working contents
 - **AND** the response explains that selecting a historical message did not rewind filesystem state
 
+#### Scenario: Fork binding is authoritative for downstream operations
+- **WHEN** an isolated fork changes files independently of its source and creates a delegate or another workspace
+- **THEN** those operations use the fork's bound execution cwd and current contents rather than the copied source cwd
+- **AND** persisted session execution cwd and the workspace association remain consistent after restart
+
+### Requirement: Crash-safe isolated fork creation
+An isolated fork SHALL remain non-runnable until its independent workspace is durably bound. Invalid options, allocation/binding failure, or process interruption SHALL NOT leave a conversation that can load, resume, or dispatch as shared local execution. Pending or failed isolation SHALL be distinguishable from a legacy local session.
+
+#### Scenario: Invalid fork request
+- **WHEN** isolation options are invalid
+- **THEN** the request fails before creating a runnable fork or allocating workspace resources
+
+#### Scenario: Failure after conversation copy
+- **WHEN** workspace allocation or owner binding fails after fork history has been persisted
+- **THEN** the fork is compensated or retained with explicit non-runnable isolation intent
+- **AND** listing and load/resume cannot expose it as a runnable local fork
+
+#### Scenario: Crash before owner binding
+- **WHEN** the process restarts after copying fork history but before binding its independent workspace
+- **THEN** recovery retains or completes the isolated intent without executing in the source checkout
+- **AND** only a fully bound fork becomes runnable
+
 ### Requirement: Workspace inspection and project grouping
 The system SHALL provide creation, listing, status, result inspection, and removal through agent operations and a worktree command surface. Creating through that surface SHALL return a new session identity without moving the current session. Workspace views SHALL distinguish project identity from execution path and SHALL expose ownership, branch, baseline mode, live change status, and lifecycle errors.
 
@@ -79,6 +106,23 @@ The system SHALL provide creation, listing, status, result inspection, and remov
 - **WHEN** a user requests worktree creation through the current conversation's command surface
 - **THEN** the result identifies the new isolated session and path
 - **AND** the current conversation keeps its existing workspace
+
+### Requirement: Baseline-relative workspace result inspection
+Result publication and inspection SHALL support top-level workspaces as well as delegates. Review SHALL identify the immutable baseline and result, baseline-relative changed paths and change kinds, verification state, and captured HEAD. Live HEAD/dirty state SHALL be labeled separately. Dirty-parent baselines SHALL carry a warning against directly merging inherited baseline edits.
+
+#### Scenario: Top-level uncommitted result
+- **WHEN** a top-level workspace explicitly publishes a result containing uncommitted edits
+- **THEN** the system retains an immutable result reference and exposes its baseline-relative delta through the API and native command surface
+- **AND** publication does not modify its real index, working files, or source checkout
+
+#### Scenario: Live files change after publication
+- **WHEN** files or HEAD change after a result has been published
+- **THEN** inspection of that retained result still presents its original immutable delta
+- **AND** live state is reported separately and a subsequent publication does not overwrite the retained result
+
+#### Scenario: Result capture fails
+- **WHEN** result publication cannot faithfully capture the checkout
+- **THEN** the error and recoverable workspace are reported without claiming a complete result or successful integration
 
 ### Requirement: Conservative lifecycle and recovery
 Managed workspaces SHALL use durable storage, survive session completion/cancellation, and support reconciliation after interrupted provisioning or removal. Removal SHALL reject active ownership, uncommitted files (including untracked and ignored files), or committed results lacking a retained recovery reference or integration proof. The system SHALL NOT delete externally owned worktrees or unknown pre-existing directories. Retained references SHALL be disclosed.
@@ -104,12 +148,49 @@ Managed workspaces SHALL use durable storage, survive session completion/cancell
 - **THEN** removal is refused unless those results have an explicitly retained recovery reference
 - **AND** any successful removal reports the preserved reference
 
+#### Scenario: Branch changes after preservation check
+- **WHEN** an external process moves a managed branch after removal inspects its target but before branch deletion
+- **THEN** the moved branch is retained or removal is refused and its preservation is revalidated
+- **AND** neither normal removal nor interrupted-removal recovery unconditionally deletes the newly observed history
+
 #### Scenario: Crash during creation
 - **WHEN** the process restarts after worktree allocation but before session startup completed
 - **THEN** reconciliation identifies the allocated resources and reports or completes their binding without overwriting user directories or launching duplicate owners
 
+#### Scenario: Recovery from initial provisioning intent
+- **WHEN** allocation stops after persisting intent but before capturing or binding a baseline
+- **THEN** recovery has sufficient durable source, policy, and placement information to retry safely or retain an actionable non-runnable state
+- **AND** a newly captured recovery-time baseline is disclosed rather than represented as an immutable capture from before the interruption
+
+#### Scenario: Recovery after baseline binding
+- **WHEN** allocation stops after binding a baseline but before publishing its retained reference or checkout
+- **THEN** recovery preserves that exact baseline and restores the missing reference before marking the workspace ready
+- **AND** a conflicting existing reference is diagnosed rather than overwritten
+
+### Requirement: Supported repository administration layouts
+For a usable non-bare source checkout, workspace creation, inspection, capture, review, recovery, and removal SHALL use its actual Git common-directory and checkout identities. Separate Git-directory layouts and linked checkouts backed by bare common repositories SHALL NOT be misinterpreted as ordinary directories. A bare source without a working checkout SHALL be rejected explicitly.
+
+#### Scenario: Separate Git directory
+- **WHEN** a supported source checkout stores its Git directory outside the checkout root
+- **THEN** its full workspace lifecycle operates on the correct repository without assuming a .git directory directly below a checkout
+
+#### Scenario: Linked checkout backed by a bare common repository
+- **WHEN** a usable linked source checkout belongs to a bare common repository
+- **THEN** managed workspace creation, status, result review, recovery, and removal use the correct shared repository and per-checkout state
+
+### Requirement: Repository operations do not require a Git executable
+Built-in workspace lifecycle, baseline/result capture, inspection, and recovery SHALL operate without an installed Git executable. Inherited Git repository/index environment overrides SHALL NOT redirect these operations. This requirement SHALL NOT imply that arbitrary user shell commands or configured external tools are available.
+
+#### Scenario: Git executable unavailable
+- **WHEN** the Git executable is unavailable and a supported source repository already exists
+- **THEN** built-in creation, capture, inspection, result publication, recovery, and conservative removal remain available
+
+#### Scenario: Inherited Git environment overrides
+- **WHEN** the process inherits Git directory, worktree, or index overrides pointing at another repository
+- **THEN** built-in operations use only the resolved workspace repository and leave the other repository unchanged
+
 ### Requirement: Requested isolation fails closed
-When Git, a usable repository/base, supported repository layout, durable storage, or local filesystem execution is unavailable, requested isolation SHALL fail with an actionable error before agent execution. The system SHALL NOT downgrade to shared execution. Concurrent administration SHALL prevent duplicate allocation and ownership across processes.
+When a usable repository/base, supported repository layout, durable storage, or local filesystem execution is unavailable, requested isolation SHALL fail with an actionable error before agent execution. The system SHALL NOT downgrade to shared execution. Concurrent administration SHALL prevent duplicate allocation and ownership across processes.
 
 #### Scenario: Unsupported remote filesystem execution
 - **WHEN** isolated execution is requested on a remote filesystem host unsupported by this version

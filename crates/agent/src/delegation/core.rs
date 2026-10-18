@@ -985,8 +985,13 @@ async fn execute_delegation(
     };
 
     // 1. Create session via AgentHandle trait
-    // Prefer parent session's cwd over orchestrator default
-    let parent_cwd = match ctx.store.get_session(&parent_session_id).await {
+    // Resolve the parent's effective cwd through the single session-cwd
+    // resolution path (worktree::WorkspaceService::resolve_session_cwd):
+    // the durable workspace binding wins over the persisted row cwd, which
+    // a fork copies from its source checkout. A bound parent whose
+    // workspace cannot be resolved fails the delegation closed — the child
+    // is never launched into a shared or source checkout as a fallback.
+    let persisted_parent_cwd = match ctx.store.get_session(&parent_session_id).await {
         Ok(Some(session)) => session.cwd,
         Ok(None) => {
             warn!("Parent session not found for cwd lookup, using orchestrator default");
@@ -997,7 +1002,39 @@ async fn execute_delegation(
             None
         }
     };
-    let effective_cwd = parent_cwd.or(ctx.config.cwd.clone());
+    let effective_cwd = match ctx.workspace_service.as_ref() {
+        Some(service) => {
+            match service
+                .resolve_session_cwd(&parent_session_id, persisted_parent_cwd.clone())
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &ctx.event_sink,
+                            delegator: &ctx.delegator,
+                            store: &ctx.store,
+                            hooks: Some(&ctx.hooks),
+                            config: &ctx.config,
+                            parent_session_id: &parent_session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                            execution_cwd: None,
+                            child_session: None,
+                        },
+                        &format!("failed to resolve parent execution workspace: {err}"),
+                    )
+                    .await;
+                    ctx.active_delegations.lock().await.remove(&delegation_id);
+                    return;
+                }
+            }
+        }
+        None => persisted_parent_cwd,
+    }
+    .or(ctx.config.cwd.clone());
     let source_parent_cwd = effective_cwd.clone();
 
     // 1a. Isolated delegates allocate their private workspace BEFORE the
@@ -3054,7 +3091,7 @@ mod tests {
         if configure_service {
             orchestrator = orchestrator.with_workspace_service(Arc::new(
                 crate::worktree::WorkspaceService::new(
-                    Arc::new(crate::worktree::CliGit::new()),
+                    Arc::new(crate::worktree::GixRepoOps::new()),
                     storage.workspace_repository().unwrap(),
                     storage_root.path(),
                 ),

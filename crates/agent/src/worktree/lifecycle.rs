@@ -19,12 +19,12 @@
 //! all removal decisions are re-validated from durable state inside that
 //! lock, so concurrent processes cannot interleave or double-remove.
 
-use crate::worktree::allocate::worktree_registered_at;
+use crate::worktree::allocate::worktree_registered;
 use crate::worktree::domain::{
     ManagedBranch, WorkspaceId, WorkspaceLifecycle, WorkspaceRecord, baseline_ref_for,
 };
 use crate::worktree::error::{WorktreeError, WorktreeResult};
-use crate::worktree::git::{GitRunner, validate_ref_name};
+use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
 use crate::worktree::repo_workspace::WorkspaceRepository;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -108,14 +108,14 @@ impl fmt::Display for RemovalReport {
 /// Live-status, reconciliation, and removal operations for managed
 /// workspaces recorded in a [`WorkspaceRepository`].
 pub struct WorkspaceManager {
-    git: Arc<dyn GitRunner>,
+    git: Arc<dyn RepositoryOps>,
     registry: Arc<dyn WorkspaceRepository>,
     storage_root: PathBuf,
 }
 
 impl WorkspaceManager {
     pub fn new(
-        git: Arc<dyn GitRunner>,
+        git: Arc<dyn RepositoryOps>,
         registry: Arc<dyn WorkspaceRepository>,
         storage_root: impl Into<PathBuf>,
     ) -> Self {
@@ -352,10 +352,8 @@ impl WorkspaceManager {
                     checkout.display()
                 )));
             }
-            let args = ["worktree", "list", "--porcelain"];
-            let out = self.git.run(repo_root, &args).await?;
-            let out = out.into_checked(&args)?;
-            if !worktree_registered_at(&out.stdout_str(), &checkout, &record.branch) {
+            if !worktree_registered(self.git.as_ref(), repo_root, &checkout, &record.branch).await?
+            {
                 return Err(WorktreeError::InvalidOperation(format!(
                     "preserving {}: it is not a registered checkout of managed branch {}",
                     checkout.display(),
@@ -452,23 +450,16 @@ impl WorkspaceManager {
         //    metadata of a checkout that already vanished.
         let mut checkout_removed = false;
         if checkout_exists {
-            let checkout_str = checkout.to_string_lossy().into_owned();
-            let args = ["worktree", "remove", checkout_str.as_str()];
-            let out = self.git.run(repo_root, &args).await?;
-            out.into_checked(&args)?;
+            self.git.remove_worktree(repo_root, &checkout).await?;
             checkout_removed = true;
         }
-        let args = ["worktree", "prune"];
-        let out = self.git.run(repo_root, &args).await?;
-        out.into_checked(&args)?;
+        self.git.prune_worktrees(repo_root).await?;
 
         // 5. Branch disposition: delete an empty managed branch; retain one
         //    whose commits are preserved elsewhere.
         let mut removed_branch = None;
         if branch_tip.is_some() && !commits_preserved {
-            let args = ["branch", "-D", record.branch.as_str()];
-            let out = self.git.run(repo_root, &args).await?;
-            out.into_checked(&args)?;
+            self.git.delete_branch(repo_root, &record.branch).await?;
             removed_branch = Some(record.branch.clone());
         }
 
@@ -534,47 +525,30 @@ impl WorkspaceManager {
         let repo_root = main_repo_root(&record.repository.common_dir)?;
 
         // Registration of the checkout at the managed branch.
-        let args = ["worktree", "list", "--porcelain"];
-        let out = self.git.run(repo_root, &args).await?;
-        let out = out.into_checked(&args)?;
-        status.registered = worktree_registered_at(&out.stdout_str(), checkout, &record.branch);
+        status.registered =
+            worktree_registered(self.git.as_ref(), repo_root, checkout, &record.branch).await?;
 
         // Live working-tree state across the whole checkout.
-        let args = ["status", "--porcelain=v1", "--ignored=matching"];
-        let out = self.git.run(checkout, &args).await?;
-        let out = out.into_checked(&args)?;
-        let (uncommitted, untracked, ignored) = parse_status(&out.stdout_str());
-        status.uncommitted = uncommitted;
-        status.untracked = untracked;
-        status.ignored = ignored;
+        let live = self.git.checkout_status(checkout).await?;
+        status.uncommitted = live.uncommitted;
+        status.untracked = live.untracked;
+        status.ignored = live.ignored;
 
         // HEAD and branch probes (lenient: failed records may lack them).
-        let head_args = ["rev-parse", "HEAD"];
-        if let Ok(out) = self.git.run(checkout, &head_args).await
-            && out.success
-        {
-            status.head_commit = Some(out.stdout_str().trim().to_string());
-        }
-        let branch_args = ["rev-parse", "--abbrev-ref", "HEAD"];
-        if let Ok(out) = self.git.run(checkout, &branch_args).await
-            && out.success
-        {
-            let name = out.stdout_str().trim().to_string();
-            if name != "HEAD" {
-                status.branch = Some(name);
-            }
-        }
+        status.head_commit = self.git.head_commit(checkout).await.unwrap_or(None);
+        status.branch = self.git.current_branch(checkout).await.unwrap_or(None);
 
         // Commits on the managed branch beyond the recorded baseline.
         if let Some(baseline) = &record.baseline
             && let Some(tip) = self.branch_tip(repo_root, &record.branch).await?
             && tip != baseline.baseline_commit
         {
-            let expr = format!("{}..{}", baseline.baseline_commit, tip);
-            let args = ["rev-list", "--count", expr.as_str()];
-            let out = self.git.run(repo_root, &args).await?;
-            let out = out.into_checked(&args)?;
-            status.unique_commit_count = out.stdout_str().trim().parse().unwrap_or(0);
+            status.unique_commit_count = u64::try_from(
+                self.git
+                    .commits_between_count(repo_root, &baseline.baseline_commit, &tip)
+                    .await?,
+            )
+            .unwrap_or(0);
         }
 
         Ok(status)
@@ -586,9 +560,7 @@ impl WorkspaceManager {
         repo_root: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<Option<String>> {
-        let args = ["rev-parse", "--verify", branch.as_str()];
-        let out = self.git.run(repo_root, &args).await?;
-        Ok(out.success.then(|| out.stdout_str().trim().to_string()))
+        self.git.branch_tip(repo_root, branch).await
     }
 
     /// Commits reachable from `tip` but not `base` (newest first).
@@ -598,38 +570,17 @@ impl WorkspaceManager {
         base: &str,
         tip: &str,
     ) -> WorktreeResult<Vec<String>> {
-        let expr = format!("{base}..{tip}");
-        let args = ["rev-list", expr.as_str()];
-        let out = self.git.run(repo_root, &args).await?;
-        let out = out.into_checked(&args)?;
-        Ok(out
-            .stdout_str()
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect())
+        self.git.commits_between(repo_root, base, tip).await
     }
 
     /// Whether `ancestor` is contained in `descendant`.
-    ///
-    /// `git merge-base --is-ancestor` exits 1 for "false"; any other
-    /// non-zero exit is a real error.
     async fn is_ancestor(
         &self,
         repo_root: &Path,
         ancestor: &str,
         descendant: &str,
     ) -> WorktreeResult<bool> {
-        let args = ["merge-base", "--is-ancestor", ancestor, descendant];
-        let out = self.git.run(repo_root, &args).await?;
-        if out.success {
-            return Ok(true);
-        }
-        match out.code {
-            Some(1) => Ok(false),
-            _ => out.into_checked(&args).map(|_| false),
-        }
+        self.git.is_ancestor(repo_root, ancestor, descendant).await
     }
 
     /// Access the registry (used by tests to cross-check durable state).
@@ -650,29 +601,6 @@ fn main_repo_root(common_dir: &Path) -> WorktreeResult<&Path> {
     })
 }
 
-/// Parse `git status --porcelain=v1` output into uncommitted, untracked,
-/// and ignored path lists.
-fn parse_status(output: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
-    let mut uncommitted = Vec::new();
-    let mut untracked = Vec::new();
-    let mut ignored = Vec::new();
-    for line in output.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        // Porcelain v1 columns: "XY<space>path". Status codes are ASCII, so
-        // byte-level splits at 2 and 3 are always on char boundaries.
-        let (code, rest) = line.split_at(2);
-        let path = &rest[1..];
-        match code {
-            "!!" => ignored.push(path.to_string()),
-            "??" => untracked.push(path.to_string()),
-            _ => uncommitted.push(format!("{code} {path}")),
-        }
-    }
-    (uncommitted, untracked, ignored)
-}
-
 /// Bounded commit list for removal-refusal diagnostics.
 fn preview_commits(commits: &[String]) -> String {
     const MAX: usize = 5;
@@ -690,6 +618,8 @@ fn preview_commits(commits: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::session::schema;
+    use crate::worktree::GitRunner as _;
+    use crate::worktree::GixRepoOps;
     use crate::worktree::allocate::WorkspaceAllocator;
     use crate::worktree::allocate::checkout_path_for;
     use crate::worktree::domain::{
@@ -733,13 +663,14 @@ mod tests {
         let storage = TempDir::new().unwrap();
         let (_conn, store) = shared_db();
         let store = Arc::new(store);
-        let alloc = WorkspaceAllocator::new(Arc::new(CliGit::new()), store.clone(), storage.path());
+        let alloc =
+            WorkspaceAllocator::new(Arc::new(GixRepoOps::new()), store.clone(), storage.path());
         let resolved = resolve_repository(repo.path()).unwrap();
         let record = alloc
             .allocate(&resolved, Path::new(""), None)
             .await
             .unwrap();
-        let manager = WorkspaceManager::new(Arc::new(CliGit::new()), store, storage.path());
+        let manager = WorkspaceManager::new(Arc::new(GixRepoOps::new()), store, storage.path());
         (repo, storage, record, manager)
     }
 
@@ -1255,31 +1186,6 @@ mod tests {
         assert!(record.checkout_path.is_dir());
     }
 
-    // -- Porcelain parsing ----------------------------------------------------
-
-    #[test]
-    fn parse_status_classifies_porcelain_columns() {
-        let output = " M a.txt\n?? new.txt\n!! ign.log\nR  old.txt -> new-name.txt\n";
-        let (uncommitted, untracked, ignored) = parse_status(output);
-        assert_eq!(
-            uncommitted,
-            vec![
-                " M a.txt".to_string(),
-                "R  old.txt -> new-name.txt".to_string()
-            ]
-        );
-        assert_eq!(untracked, vec!["new.txt".to_string()]);
-        assert_eq!(ignored, vec!["ign.log".to_string()]);
-    }
-
-    #[test]
-    fn parse_status_ignores_short_lines() {
-        let (uncommitted, untracked, ignored) = parse_status("\n  \n?? x\n");
-        assert!(uncommitted.is_empty());
-        assert_eq!(untracked, vec!["x".to_string()]);
-        assert!(ignored.is_empty());
-    }
-
     // -- Documented recovery runbook ------------------------------------------
     //
     // Verifies the runbook in docs/docs/agent/index.md ("Worktree Workspaces
@@ -1295,8 +1201,9 @@ mod tests {
         let storage = TempDir::new().unwrap();
         let (_conn, store) = shared_db();
         let store = Arc::new(store);
-        let alloc = WorkspaceAllocator::new(Arc::new(CliGit::new()), store.clone(), storage.path());
-        let manager = WorkspaceManager::new(Arc::new(CliGit::new()), store, storage.path());
+        let alloc =
+            WorkspaceAllocator::new(Arc::new(GixRepoOps::new()), store.clone(), storage.path());
+        let manager = WorkspaceManager::new(Arc::new(GixRepoOps::new()), store, storage.path());
         let resolved = resolve_repository(repo.path()).unwrap();
 
         // Step 1: crash during creation. The intent is persisted and the

@@ -39,6 +39,12 @@ An isolated delegate SHALL start from a validated immutable baseline containing 
 - **WHEN** the parent's captured working contents equal HEAD
 - **THEN** the delegate baseline identifies that committed state without requiring a parent commit
 
+#### Scenario: Newly staged ignored file
+- **WHEN** a file absent from HEAD was explicitly staged despite an ignore rule and its working contents subsequently changed
+- **THEN** the baseline includes its working contents as a tracked file
+- **AND** genuinely untracked ignored files remain excluded
+- **AND** capture leaves the real index byte-for-byte unchanged
+
 ### Requirement: Consistent baseline capture and provenance
 Delegates dispatched as one parallel batch SHALL use the same immutable baseline. Independently requested delegates SHALL capture the then-current parent state. Capture SHALL coordinate with cooperating QueryMT mutations, validate for observed concurrent external changes, and retry or fail instead of launching from a known inconsistent capture. Unsupported or conflicted repository states SHALL fail explicitly before child execution rather than omit content silently.
 
@@ -58,8 +64,23 @@ Delegates dispatched as one parallel batch SHALL use the same immutable baseline
 - **WHEN** the source has unresolved index conflicts or an unsupported repository feature that prevents faithful materialization
 - **THEN** delegation fails before execution and identifies the unsupported state
 
+#### Scenario: Unsupported features from a subdirectory session
+- **WHEN** capture is requested from a repository subdirectory and the repository contains unsupported submodules or sparse checkout
+- **THEN** validation examines the actual checkout root and Git index/tree state and rejects the unsupported source before child execution
+
+#### Scenario: Effective LFS attributes
+- **WHEN** captured paths use unsupported LFS filters declared by nested attributes, Git-directory attributes, or attribute macros
+- **THEN** capture fails with an actionable feature/path diagnostic before launching a child
+- **AND** the source is not accepted merely because the root attribute file lacks a literal filter declaration
+
 ### Requirement: Child-workspace verification and execution context
 The system SHALL run delegate tools and verification against the child's effective workspace. Execution-related hook context SHALL distinguish the parent and child workspace; pre-allocation policy hooks SHALL identify parent context explicitly. Workspace-dependent integrations SHALL use the child root or fail explicitly.
+
+#### Scenario: Delegation from an isolated conversation fork
+- **WHEN** an isolated fork diverges from its source and dispatches an isolated delegate
+- **THEN** the delegate baseline includes the fork's current contents rather than the source session's contents
+- **AND** default shared execution where explicitly permitted uses the fork's effective cwd, not the source checkout
+- **AND** this routing remains correct after restart and for nested delegation
 
 #### Scenario: Verification distinguishes child from parent
 - **WHEN** a delegate changes code so that a verification check has a different result in its checkout than in the parent checkout
@@ -85,6 +106,17 @@ A completed isolated delegate SHALL report its workspace, branch, baseline ident
 #### Scenario: Interrupted delegate
 - **WHEN** a delegate fails or is cancelled after editing files
 - **THEN** its checkout is retained and reported as recoverable rather than automatically removed
+
+#### Scenario: Immutable review after subsequent edits
+- **WHEN** the delegate publishes a result and then changes files or HEAD
+- **THEN** review of the retained result reports the original baseline-to-result paths and change kinds
+- **AND** captured HEAD and immutable result identity are distinct from live HEAD/dirty state
+- **AND** subsequent publication retains the previous result reference
+
+#### Scenario: Completion exposes review information
+- **WHEN** an isolated delegate completes and its output is summarized for the parent
+- **THEN** completion and summarizer output provide baseline-relative review information or a durable reference to that review
+- **AND** verification not performed and capture failures are explicit rather than represented as verified or complete results
 
 #### Scenario: Dirty-baseline integration guidance
 - **WHEN** a user inspects a result based on uncommitted parent edits

@@ -229,6 +229,31 @@ impl SessionRepository for SqliteSessionRepository {
         Ok(updated_at)
     }
 
+    async fn set_session_cwd(
+        &self,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<()> {
+        let cwd = cwd.map(|cwd| normalize_session_cwd(&cwd)).transpose()?;
+        let session_id = session_id.to_string();
+        let cwd_for_write = cwd.as_ref().map(|p| p.to_string_lossy().to_string());
+        let updated_at = format_rfc3339(&OffsetDateTime::now_utc());
+
+        self.run_blocking(move |conn| {
+            let affected = conn.execute(
+                "UPDATE sessions SET cwd = ?, updated_at = ? WHERE public_id = ?",
+                params![cwd_for_write, updated_at, session_id],
+            )?;
+            if affected == 0 {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            }
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
     async fn set_current_intent_snapshot(
         &self,
         session_id: &str,
