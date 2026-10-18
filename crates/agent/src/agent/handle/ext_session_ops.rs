@@ -1,5 +1,6 @@
 use super::utils::{ext_json_response, format_prefixed_error_chain};
 use super::*;
+use serde::Deserialize;
 use typeshare::typeshare;
 
 #[derive(Debug, serde::Deserialize)]
@@ -11,6 +12,29 @@ struct UndoSessionRequest {
 #[derive(Debug, serde::Deserialize)]
 struct SessionIdRequest {
     session_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetSessionLifecycleRequest {
+    session_id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSessionLifecycleRequest {
+    session_id: String,
+    #[serde(default, deserialize_with = "deserialize_patch_bool")]
+    resolved: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_patch_bool")]
+    archived: Option<bool>,
+}
+
+fn deserialize_patch_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -61,6 +85,37 @@ struct UndoStackResponse {
 }
 
 impl LocalAgentHandle {
+    pub(super) async fn handle_ext_session_get_lifecycle(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: GetSessionLifecycleRequest = parse_session_op_request(req)?;
+        let lifecycle = self
+            .get_session_lifecycle_unloaded(&parsed.session_id)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?;
+        ext_json_response(&lifecycle)
+    }
+
+    pub(super) async fn handle_ext_session_set_lifecycle(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: SetSessionLifecycleRequest = parse_session_op_request(req)?;
+        let patch = crate::session::lifecycle::SessionLifecyclePatch {
+            resolved: parsed.resolved,
+            archived: parsed.archived,
+        };
+        patch
+            .validate()
+            .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+        let lifecycle = self
+            .patch_session_lifecycle_unloaded(&parsed.session_id, &patch)
+            .await
+            .map_err(|error| Error::internal_error().data(error.to_string()))?;
+        ext_json_response(&lifecycle)
+    }
+
     pub(super) async fn handle_ext_session_submit_input(
         &self,
         req: ExtRequest,

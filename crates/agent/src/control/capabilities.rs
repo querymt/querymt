@@ -107,6 +107,13 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD.to_string(),
     ];
 
+    if agent.supports_session_lifecycle_contract() {
+        methods.extend([
+            "querymt/session/getLifecycle".to_string(),
+            "querymt/session/setLifecycle".to_string(),
+        ]);
+    }
+
     if agent.profiles().is_some() {
         methods.extend([
             "querymt/profiles".to_string(),

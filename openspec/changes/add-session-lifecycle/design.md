@@ -8,7 +8,7 @@ See `proposal.md` for motivation. Sessions already have SQL-backed listing/searc
 
 **Goal:** a small metadata-and-query feature with backward-compatible defaults.
 
-**Non-goals:** arbitrary labels, automatic transitions other than successful delegation resolution, bulk actions, inherited/cascading state, an undo history, new notification infrastructure, or a pagination redesign.
+**Non-goals:** arbitrary labels, automatic transitions other than terminal one-shot delegation resolution, bulk actions, inherited/cascading state, an undo history, new notification infrastructure, or a pagination redesign.
 
 ## Decisions
 
@@ -43,9 +43,9 @@ Forward remote reads, patches, and filters to the existing authoritative owner a
 
 Roots, user forks, and delegates retain independent state. There is no parent traversal or cascading write; existing relationship filtering still determines which sessions are listed.
 
-The one automatic transition is resolving a one-shot delegated child on successful completion. Add the lifecycle write to the existing delegation finalization path after successful execution and configured verification, alongside returning the final result to the planner. Use the child's authoritative owner, not the planner's session or a local remote bookmark. Change only resolution; do not archive it or resolve its parent.
+The automatic transition is resolving a one-shot delegated child after its delegation's first successful expected-state transition to `Complete`, `Failed`, or `Cancelled`. Resolution means the attempt's purpose is finished, not that execution succeeded; an agent may retry by creating another delegation with its own child. Apply the lifecycle write only after a real child session has been created, using the target `AgentHandle` that owns that child rather than the planner's store or a local remote bookmark. Change only resolution; do not archive the child or resolve its parent. Failures before child creation have no child to resolve.
 
-Do not attach this behavior to generic turn-end events, listing, history replay, or session loading. Failed, cancelled, interrupted, or verification-failed delegations do not trigger it. An explicitly reopened delegate stays open; replaying an old completion must not undo that choice. Existing completed delegates are not retroactively backfilled by this migration.
+Do not attach this behavior to generic turn-end events, listing, history replay, or session loading. A transient interruption or a merely running state is not terminal and does not resolve the child. Failed execution, including verification failure, and terminal cancellation do resolve it. The first successful expected-state transition gates the lifecycle write, so replay after an explicit reopen cannot resolve the child again. If the lifecycle write fails or is unsupported, log the delegation and child context but preserve the existing delegation status, error/result exposure, and execution outcome; do not claim the lifecycle update persisted. Existing terminal delegates are not retroactively backfilled by this migration.
 
 ## Risks / Trade-offs
 

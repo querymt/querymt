@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Let users resolve or archive sessions, automatically resolve completed one-shot delegations, and retrieve matching sessions without deleting history or changing agent execution.
+Let users resolve or archive sessions, automatically resolve terminal one-shot delegation attempts, and retrieve matching sessions without deleting history or changing delegation outcomes.
 
 ## ADDED Requirements
 
@@ -35,23 +35,39 @@ QueryMT SHALL allow resolve, reopen, archive, and restore through explicit desir
 - **WHEN** an update contains invalid values or references an unknown session
 - **THEN** the backend returns an error and persists no partial change
 
-### Requirement: Resolve completed delegated sessions
-QueryMT SHALL automatically resolve a delegated child session when its one-shot delegation successfully completes and its final result is made available to the planner. This SHALL preserve its archived state and all other sessions' states. Failed, cancelled, or interrupted delegations SHALL NOT trigger automatic resolution. Ordinary turn completion and user-created forks SHALL NOT trigger it.
+### Requirement: Resolve terminal one-shot delegation attempts
+QueryMT SHALL resolve a created one-shot delegation child after the first successful expected-state transition to `Complete`, `Failed`, or `Cancelled`. This marks the attempt finished, not successful. Only the child's resolved state changes; its archive state and other sessions remain unchanged. The update SHALL use the target handle owning the child. Pre-creation failure, running state, and transient interruption SHALL NOT resolve it.
 
 #### Scenario: Delegation finishes successfully
-- **WHEN** a delegation successfully completes, including configured verification, and returns its final result
-- **THEN** its child session is persisted as resolved as part of completion handling
-- **AND** subsequent listings report it as resolved without requiring a client action
+- **WHEN** a delegation's first expected-state transition to `Complete` succeeds after execution and configured verification
+- **THEN** its child session is persisted as resolved
+- **AND** its final result is made available to the planner unchanged
 - **AND** its archived state and the planner session's lifecycle state remain unchanged
 
-#### Scenario: Delegation does not complete successfully
-- **WHEN** a delegation fails, is cancelled, is interrupted, or fails verification
-- **THEN** its lifecycle state is not automatically changed
+#### Scenario: Execution or verification fails
+- **WHEN** a delegation's first expected-state transition to `Failed` succeeds, including after a verification failure
+- **THEN** its existing failure status, error, and result exposure remain unchanged
+- **AND** its created child session is resolved because the attempt is terminal, not because it succeeded
+- **AND** its archived state and the planner session's lifecycle state remain unchanged
 
-#### Scenario: Reopen a completed delegate
-- **WHEN** a user explicitly reopens a completed delegated session
-- **THEN** it remains open when loaded or listed again
-- **AND** replaying its earlier completion does not resolve it again
+#### Scenario: Failure occurs before child creation
+- **WHEN** setup fails before a child session is created
+- **THEN** no session lifecycle state is changed
+
+#### Scenario: Delegation is terminally cancelled
+- **WHEN** cancellation successfully transitions a running delegation to `Cancelled`
+- **THEN** its created child session is resolved
+- **AND** a merely running or transiently interrupted attempt remains unchanged
+
+#### Scenario: Reopen and replay a terminal attempt
+- **WHEN** a user explicitly reopens a completed, failed, or cancelled delegated child
+- **AND** the terminal delegation event is replayed
+- **THEN** the child remains open because the expected-state transition can succeed only once
+
+#### Scenario: Start a new attempt after failure
+- **WHEN** an agent chooses to retry by creating another delegation
+- **THEN** the new child starts open and unarchived
+- **AND** the new attempt is not restricted by the prior attempt's terminal state
 
 ### Requirement: Optional lifecycle filters
 Session listing and search SHALL accept independent resolution filters (`any`, `open`, `resolved`) and archive filters (`any`, `excluded`, `only`). Omitted filters SHALL mean `any`, preserving current visibility. Unknown filter values SHALL be rejected rather than silently ignored.
@@ -78,8 +94,16 @@ Lifecycle filters SHALL compose with existing workspace, relationship, and text 
 - **THEN** the filtered first page includes those matches up to its limit
 - **AND** counts and subsequent pages describe matching sessions, not the unfiltered set
 
+### Requirement: Preserve delegation outcomes on lifecycle write failure
+An automatic lifecycle write failure or unsupported owner SHALL be logged with delegation and child context. It SHALL NOT alter the terminal delegation status, existing result or error exposure, or execution outcome, and SHALL NOT claim the child was persisted as resolved.
+
+#### Scenario: Lifecycle persistence is unavailable
+- **WHEN** the terminal delegation transition succeeds but the child's lifecycle write fails or is unsupported
+- **THEN** the delegation's existing result or error is still returned or exposed unchanged
+- **AND** the lifecycle write failure is logged without claiming the child was persisted as resolved
+
 ### Requirement: Execution and history are unaffected
-Lifecycle state SHALL NOT change loading, prompting, cancellation, tasks, schedules, history, deletion semantics, or conversation activity timestamps. Successful one-shot delegation completion SHALL be the only automatic lifecycle transition; all other changes SHALL require an explicit update.
+Lifecycle state SHALL NOT change loading, prompting, cancellation, tasks, schedules, history, deletion semantics, or conversation activity timestamps. The first successful terminal status transition of a created one-shot delegation SHALL be the only automatic lifecycle transition; ordinary turns and non-terminal interruptions SHALL NOT trigger it.
 
 #### Scenario: Continue a hidden session
 - **WHEN** a resolved or archived session is loaded or receives another prompt

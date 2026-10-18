@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, params, params_from_iter};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -14,6 +14,7 @@ use crate::session::domain::{
     ProgressKind, RevertState, Task, TaskKind, TaskStatus,
 };
 use crate::session::error::{SessionError, SessionResult};
+use crate::session::lifecycle::{SessionLifecycle, SessionLifecyclePatch};
 use crate::session::repo_artifact::SqliteArtifactRepository;
 use crate::session::repo_decision::SqliteDecisionRepository;
 use crate::session::repo_delegation::SqliteDelegationRepository;
@@ -217,6 +218,143 @@ impl SessionStore for SqliteStorage {
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>> {
         let repo = SqliteSessionRepository::new(self.conn.clone());
         repo.get_session(session_id).await
+    }
+
+    fn supports_session_lifecycle(&self) -> bool {
+        true
+    }
+
+    async fn get_session_lifecycle(&self, session_id: &str) -> SessionResult<SessionLifecycle> {
+        let mut lifecycles = self
+            .get_session_lifecycles(&[session_id.to_owned()])
+            .await?;
+        lifecycles
+            .remove(session_id)
+            .ok_or_else(|| SessionError::SessionNotFound(session_id.to_owned()))
+    }
+
+    async fn patch_session_lifecycle(
+        &self,
+        session_id: &str,
+        patch: &SessionLifecyclePatch,
+    ) -> SessionResult<SessionLifecycle> {
+        patch.validate()?;
+        let session_id = session_id.to_owned();
+        let patch = patch.clone();
+        self.run_blocking_session(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let internal_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(internal_id) = internal_id else {
+                return Err(SessionError::SessionNotFound(session_id));
+            };
+
+            let now = if patch.resolved == Some(true) || patch.archived == Some(true) {
+                Some(
+                    OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|error| SessionError::SerializationError(error.to_string()))?,
+                )
+            } else {
+                None
+            };
+            let resolved = patch
+                .resolved
+                .map(|value| if value { 1_i64 } else { 0_i64 });
+            let archived = patch
+                .archived
+                .map(|value| if value { 1_i64 } else { 0_i64 });
+            tx.execute(
+                "INSERT INTO session_lifecycle (session_id, resolved_at, archived_at)
+                 VALUES (?1, CASE WHEN ?2 = 1 THEN ?3 ELSE NULL END,
+                         CASE WHEN ?4 = 1 THEN ?5 ELSE NULL END)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     resolved_at = CASE
+                         WHEN ?2 IS NULL THEN session_lifecycle.resolved_at
+                         WHEN ?2 = 0 THEN NULL
+                         WHEN session_lifecycle.resolved_at IS NULL THEN ?3
+                         ELSE session_lifecycle.resolved_at
+                     END,
+                     archived_at = CASE
+                         WHEN ?4 IS NULL THEN session_lifecycle.archived_at
+                         WHEN ?4 = 0 THEN NULL
+                         WHEN session_lifecycle.archived_at IS NULL THEN ?5
+                         ELSE session_lifecycle.archived_at
+                     END",
+                params![internal_id, resolved, now, archived, now],
+            )?;
+
+            let lifecycle = tx.query_row(
+                "SELECT s.public_id, l.resolved_at, l.archived_at
+                 FROM sessions s JOIN session_lifecycle l ON l.session_id = s.id
+                 WHERE s.id = ?1",
+                params![internal_id],
+                |row| {
+                    let session_id: String = row.get(0)?;
+                    let resolved_at: Option<String> = row.get(1)?;
+                    let archived_at: Option<String> = row.get(2)?;
+                    Ok(SessionLifecycle {
+                        session_id,
+                        resolved: resolved_at.is_some(),
+                        archived: archived_at.is_some(),
+                        resolved_at,
+                        archived_at,
+                    })
+                },
+            )?;
+            tx.commit()?;
+            Ok(lifecycle)
+        })
+        .await
+    }
+
+    async fn get_session_lifecycles(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let session_ids = session_ids.to_vec();
+        self.run_blocking_session(move |conn| {
+            let mut lifecycles = HashMap::with_capacity(session_ids.len());
+            for chunk in session_ids.chunks(500) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT s.public_id, l.resolved_at, l.archived_at
+                     FROM sessions s LEFT JOIN session_lifecycle l ON l.session_id = s.id
+                     WHERE s.public_id IN ({placeholders})"
+                ))?;
+                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                    let session_id: String = row.get(0)?;
+                    let resolved_at: Option<String> = row.get(1)?;
+                    let archived_at: Option<String> = row.get(2)?;
+                    Ok(SessionLifecycle {
+                        session_id,
+                        resolved: resolved_at.is_some(),
+                        archived: archived_at.is_some(),
+                        resolved_at,
+                        archived_at,
+                    })
+                })?;
+                for row in rows {
+                    let lifecycle = row?;
+                    lifecycles.insert(lifecycle.session_id.clone(), lifecycle);
+                }
+            }
+            if let Some(missing_id) = session_ids.iter().find(|id| !lifecycles.contains_key(*id)) {
+                return Err(SessionError::SessionNotFound(missing_id.clone()));
+            }
+            Ok(lifecycles)
+        })
+        .await
     }
 
     async fn set_session_name(

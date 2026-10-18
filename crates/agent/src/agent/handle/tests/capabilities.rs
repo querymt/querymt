@@ -73,6 +73,8 @@ async fn test_querymt_capabilities_lists_control_surface() {
         "querymt/session/undo",
         "querymt/session/redo",
         "querymt/session/undoStack",
+        "querymt/session/getLifecycle",
+        "querymt/session/setLifecycle",
         "querymt/auth/status",
         "querymt/auth/start",
         "querymt/auth/complete",
@@ -91,6 +93,7 @@ async fn test_querymt_capabilities_lists_control_surface() {
         );
     }
     assert_eq!(result["features"]["auth"], true);
+    assert_eq!(result["features"]["session_lifecycle"], true);
     assert_eq!(result["elicitation_recovery"]["version"], 1);
     for method in [
         "querymt/elicitation/listPendingSessions",

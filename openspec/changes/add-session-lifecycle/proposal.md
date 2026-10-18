@@ -8,7 +8,7 @@ Sessions have no explicit indication that their purpose is finished or that they
 
 - Persist independent resolved and archived states for each session.
 - Add explicit resolve/reopen and archive/restore operations through one metadata update API.
-- Automatically resolve one-shot delegated child sessions on successful completion, without changing their parent or archive state.
+- Automatically resolve a one-shot delegated child when its attempt reaches a terminal success, failure (including verification failure), or cancellation, without changing its parent or archive state.
 - Include lifecycle metadata in session listings whenever authoritative state is available.
 - Add optional server-side resolution/archive filters to session listing and search, including unresolved-only queries.
 - Preserve existing sessions, unfiltered listing defaults, and execution behavior.

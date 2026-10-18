@@ -97,6 +97,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0021_normalize_session_cwd_slashes",
         apply: migration_0021_normalize_session_cwd_slashes,
     },
+    Migration {
+        version: "0022_session_lifecycle",
+        apply: migration_0022_session_lifecycle,
+    },
 ];
 
 fn migration_0021_normalize_session_cwd_slashes(
@@ -122,6 +126,17 @@ fn migration_0021_normalize_session_cwd_slashes(
         }
     }
     Ok(())
+}
+
+fn migration_0022_session_lifecycle(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_lifecycle (
+            session_id INTEGER PRIMARY KEY,
+            resolved_at TEXT,
+            archived_at TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );",
+    )
 }
 
 /// Protocol-owned automation session bindings.

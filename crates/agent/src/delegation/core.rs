@@ -19,16 +19,69 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
-// Type alias to simplify complex type signature
-type ActiveDelegations = Arc<Mutex<HashMap<String, (String, CancellationToken, JoinHandle<()>)>>>;
+type ActiveDelegations = Arc<Mutex<HashMap<String, ActiveDelegation>>>;
+
+struct ActiveDelegation {
+    parent_session_id: String,
+    cancel_token: CancellationToken,
+    handle: JoinHandle<()>,
+    cancellation: Arc<DelegationCancellation>,
+}
+
+#[derive(Default)]
+struct DelegationCancellation {
+    child: OnceLock<(Arc<dyn crate::agent::handle::AgentHandle>, String)>,
+    finalized: AtomicBool,
+}
+
+impl DelegationCancellation {
+    async fn resolve(&self, delegation_id: &str) {
+        if let Some((target, child_session_id)) = self.child.get()
+            && !self.finalized.swap(true, Ordering::AcqRel)
+        {
+            let target = target.clone();
+            let child_session_id = child_session_id.clone();
+            let delegation_id = delegation_id.to_owned();
+            // A grace-period abort of the execution task must not drop the owner patch.
+            let _ = tokio::spawn(async move {
+                resolve_terminal_delegate_attempt(
+                    target.as_ref(),
+                    &child_session_id,
+                    &delegation_id,
+                )
+                .await;
+            })
+            .await;
+        }
+    }
+
+    async fn resolve_if_cancelled(&self, store: &dyn SessionStore, delegation_id: &str) {
+        if self.finalized.load(Ordering::Acquire) {
+            return;
+        }
+        match store.get_delegation(delegation_id).await {
+            Ok(Some(delegation)) if delegation.status == DelegationStatus::Cancelled => {
+                // Timeout cleanup can own the terminal claim before the task sees
+                // cancellation. The active attempt transfers that finalization here;
+                // its shared one-shot guard prevents replays from undoing a reopen.
+                self.resolve(delegation_id).await;
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                "Failed to read cancelled delegation {} for child finalization: {}",
+                delegation_id, error
+            ),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {
@@ -239,9 +292,17 @@ impl DelegationOrchestrator {
     pub async fn cancel_active_delegations(&self) {
         self.begin_shutdown();
         let active = std::mem::take(&mut *self.active_delegations.lock().await);
-        for (delegation_id, (_, cancel_token, mut handle)) in active {
+        for (delegation_id, entry) in active {
+            let ActiveDelegation {
+                cancel_token,
+                mut handle,
+                cancellation,
+                ..
+            } = entry;
             cancel_token.cancel();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle).await;
+            let timed_out = tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle)
+                .await
+                .is_err();
             handle.abort();
             if self
                 .store
@@ -258,6 +319,16 @@ impl DelegationOrchestrator {
                     delegation_id
                 );
             }
+            let store = self.store.clone();
+            // Owner finalization must not extend shutdown's execution grace period.
+            tokio::spawn(async move {
+                if timed_out {
+                    let _ = handle.await;
+                }
+                cancellation
+                    .resolve_if_cancelled(store.as_ref(), &delegation_id)
+                    .await;
+            });
         }
     }
 
@@ -457,6 +528,7 @@ impl DelegationOrchestrator {
                             delegation_id: &delegation.public_id,
                             target_agent_id: Some(&delegation.target_agent_id),
                             objective: Some(&delegation.objective),
+                            child_session: None,
                         },
                         &format!(
                             "Agent '{}' is not registered with a handle",
@@ -481,6 +553,8 @@ impl DelegationOrchestrator {
                 let parent_session_id_for_insert = parent_session_id.clone();
                 let delegation = delegation.clone();
                 let cancel_token = CancellationToken::new();
+                let cancellation = Arc::new(DelegationCancellation::default());
+                let cancellation_for_spawn = cancellation.clone();
                 let active_delegations = self.active_delegations.clone();
                 let active_delegations_for_spawn = active_delegations.clone();
                 let hooks = self.hooks.clone();
@@ -509,6 +583,7 @@ impl DelegationOrchestrator {
                                         delegation_id: &delegation.public_id,
                                         target_agent_id: Some(&delegation.target_agent_id),
                                         objective: Some(&delegation.objective),
+                                        child_session: None,
                                     },
                                     "Delegation queue closed before execution could start",
                                 )
@@ -529,6 +604,7 @@ impl DelegationOrchestrator {
                             delegate_model_overrides,
                             profile_id,
                             routing_snapshot,
+                            cancellation: cancellation_for_spawn,
                         };
                         execute_delegation(
                             ctx,
@@ -557,6 +633,7 @@ impl DelegationOrchestrator {
                             delegation_id: &delegation_id,
                             target_agent_id: None,
                             objective: None,
+                            child_session: None,
                         },
                         "Delegation cancelled because the orchestrator is shutting down",
                     )
@@ -565,7 +642,12 @@ impl DelegationOrchestrator {
                 }
                 active.insert(
                     delegation_id,
-                    (parent_session_id_for_insert, cancel_token_clone, handle),
+                    ActiveDelegation {
+                        parent_session_id: parent_session_id_for_insert,
+                        cancel_token: cancel_token_clone,
+                        handle,
+                        cancellation,
+                    },
                 );
                 drop(active);
                 let _ = start_tx.send(());
@@ -577,7 +659,14 @@ impl DelegationOrchestrator {
                 let entry = active.remove(&delegation_id_owned);
                 drop(active);
 
-                if let Some((_parent_id, cancel_token, mut handle)) = entry {
+                if let Some(entry) = entry {
+                    let ActiveDelegation {
+                        cancel_token,
+                        mut handle,
+                        cancellation,
+                        ..
+                    } = entry;
+                    let store = self.store.clone();
                     let grace_secs = self.config.cancel_grace_secs;
                     cancel_token.cancel();
                     tokio::spawn(async move {
@@ -588,8 +677,12 @@ impl DelegationOrchestrator {
                             _ = tokio::time::sleep(std::time::Duration::from_secs(grace_secs)) => {
                                 warn!("Delegation {} did not terminate within {}s timeout after cancel request, force aborting", delegation_id_owned, grace_secs);
                                 handle.abort();
+                                let _ = handle.await;
                             }
                         }
+                        cancellation
+                            .resolve_if_cancelled(store.as_ref(), &delegation_id_owned)
+                            .await;
                     });
                 }
             }
@@ -599,21 +692,26 @@ impl DelegationOrchestrator {
                 let mut active = self.active_delegations.lock().await;
 
                 // Find all delegations for this session
-                let to_cancel: Vec<(String, tokio::task::JoinHandle<()>)> = active
+                let to_cancel: Vec<_> = active
                     .iter_mut()
-                    .filter(|(_, (parent_id, _, _))| parent_id == session_id)
-                    .map(|(delegation_id, (_, cancel_token, handle))| {
-                        cancel_token.cancel();
+                    .filter(|(_, entry)| entry.parent_session_id == session_id)
+                    .map(|(delegation_id, entry)| {
+                        entry.cancel_token.cancel();
                         let dummy_handle = tokio::spawn(async {});
-                        let real_handle = std::mem::replace(handle, dummy_handle);
-                        (delegation_id.clone(), real_handle)
+                        let real_handle = std::mem::replace(&mut entry.handle, dummy_handle);
+                        (
+                            delegation_id.clone(),
+                            real_handle,
+                            entry.cancellation.clone(),
+                        )
                     })
                     .collect();
 
                 drop(active);
 
                 let grace_secs = self.config.cancel_grace_secs;
-                for (delegation_id, mut handle) in to_cancel {
+                for (delegation_id, mut handle, cancellation) in to_cancel {
+                    let store = self.store.clone();
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = &mut handle => {
@@ -622,8 +720,12 @@ impl DelegationOrchestrator {
                             _ = tokio::time::sleep(std::time::Duration::from_secs(grace_secs)) => {
                                 warn!("Delegation {} did not terminate within {}s timeout, force aborting", delegation_id, grace_secs);
                                 handle.abort();
+                                let _ = handle.await;
                             }
                         }
+                        cancellation
+                            .resolve_if_cancelled(store.as_ref(), &delegation_id)
+                            .await;
                     });
                 }
             }
@@ -645,6 +747,7 @@ struct DelegationContext {
     delegate_model_overrides: super::DelegateModelOverrideStore,
     profile_id: Option<String>,
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
+    cancellation: Arc<DelegationCancellation>,
 }
 
 struct DelegationFailureContext<'a> {
@@ -657,6 +760,7 @@ struct DelegationFailureContext<'a> {
     delegation_id: &'a str,
     target_agent_id: Option<&'a str>,
     objective: Option<&'a str>,
+    child_session: Option<(&'a Arc<dyn crate::agent::handle::AgentHandle>, &'a str)>,
 }
 
 async fn teardown_failed_delegate_session(
@@ -790,6 +894,7 @@ async fn execute_delegation(
                         delegation_id: &delegation.public_id,
                         target_agent_id: Some(&delegation.target_agent_id),
                         objective: Some(&delegation.objective),
+                        child_session: None,
                     },
                     &error_message,
                 )
@@ -814,6 +919,7 @@ async fn execute_delegation(
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
+                    child_session: None,
                 },
                 &error_message,
             )
@@ -837,6 +943,7 @@ async fn execute_delegation(
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
+                    child_session: None,
                 },
                 &error_message,
             )
@@ -883,6 +990,7 @@ async fn execute_delegation(
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
+                    child_session: None,
                 },
                 &error_message,
             )
@@ -890,6 +998,11 @@ async fn execute_delegation(
             return;
         }
     };
+    let _ = ctx
+        .cancellation
+        .child
+        .set((target.clone(), child_session_id.clone()));
+    let child_session = Some((&target, child_session_id.as_str()));
 
     let mut child_bridge_connection_id = None;
     let parent_bridge = ctx
@@ -966,6 +1079,7 @@ async fn execute_delegation(
                 delegation_id: &delegation.public_id,
                 target_agent_id: Some(&delegation.target_agent_id),
                 objective: Some(&delegation.objective),
+                child_session,
             },
             &format!("Failed to persist delegate session route: {err}"),
         )
@@ -1056,6 +1170,7 @@ async fn execute_delegation(
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
+                    child_session,
                 },
                 &format!("Failed to read delegate model assignment: {error}"),
             )
@@ -1090,6 +1205,7 @@ async fn execute_delegation(
                         delegation_id: &delegation.public_id,
                         target_agent_id: Some(&delegation.target_agent_id),
                         objective: Some(&delegation.objective),
+                        child_session,
                     },
                     &error_message,
                 )
@@ -1127,6 +1243,7 @@ async fn execute_delegation(
                     delegation_id: &delegation.public_id,
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
+                    child_session,
                 },
                 &error_message,
             )
@@ -1167,6 +1284,7 @@ async fn execute_delegation(
                 delegation_id: &delegation.public_id,
                 target_agent_id: Some(&delegation.target_agent_id),
                 objective: Some(&delegation.objective),
+                child_session,
             },
             &error_message,
         )
@@ -1317,7 +1435,9 @@ async fn execute_delegation(
                 )
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => {
+                    ctx.cancellation.resolve(&delegation_id).await;
+                }
                 Ok(false) => {
                     let mut active = ctx.active_delegations.lock().await;
                     active.remove(&delegation_id);
@@ -1368,6 +1488,7 @@ async fn execute_delegation(
                     delegation_id: &delegation_id,
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
+                    child_session,
                 },
                 &error_message,
             )
@@ -1439,6 +1560,7 @@ async fn execute_delegation(
                         delegation_id: &delegation.public_id,
                         target_agent_id: Some(&delegation.target_agent_id),
                         objective: Some(&delegation.objective),
+                        child_session,
                     },
                     &error_message,
                 )
@@ -1501,7 +1623,14 @@ async fn execute_delegation(
                 )
                 .await
             {
-                Ok(true) => {}
+                Ok(true) => {
+                    resolve_terminal_delegate_attempt(
+                        target.as_ref(),
+                        &child_session_id,
+                        &delegation_id,
+                    )
+                    .await;
+                }
                 Ok(false) => {
                     let mut active = ctx.active_delegations.lock().await;
                     active.remove(&delegation_id);
@@ -1551,6 +1680,7 @@ async fn execute_delegation(
                     delegation_id: &delegation_id,
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
+                    child_session,
                 },
                 &error_message,
             )
@@ -1586,6 +1716,29 @@ async fn persist_delegate_runtime_binding(
             matching_binding.and_then(|binding| binding.provider_locks_json.as_deref()),
         )
         .await
+}
+
+async fn resolve_terminal_delegate_attempt(
+    target: &dyn crate::agent::handle::AgentHandle,
+    child_session_id: &str,
+    delegation_id: &str,
+) {
+    // Resolution marks the one-shot attempt as finished, not as successful execution.
+    if let Err(error) = target
+        .set_session_lifecycle(
+            child_session_id,
+            crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await
+    {
+        warn!(
+            "Failed to resolve terminal delegation child session for delegation {} child {}: {}",
+            delegation_id, child_session_id, error
+        );
+    }
 }
 
 #[instrument(
@@ -1630,6 +1783,11 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
     };
     if !transitioned {
         return;
+    }
+
+    if let Some((target, child_session_id)) = ctx.child_session {
+        resolve_terminal_delegate_attempt(target.as_ref(), child_session_id, ctx.delegation_id)
+            .await;
     }
 
     let mut failure_message = error_message.to_string();
@@ -2216,6 +2374,63 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_finalization_uses_owner_once() {
+        let fixture = crate::test_utils::helpers::DelegateTestFixture::new()
+            .await
+            .expect("separate planner and owner stores");
+        let owner_store = fixture.delegate_storage.session_store();
+        let child = owner_store
+            .create_session(None, None, None, None)
+            .await
+            .expect("owner child");
+        let cancellation = DelegationCancellation::default();
+        cancellation.resolve("attempt").await;
+        assert!(
+            cancellation
+                .child
+                .set((fixture.delegate.clone(), child.public_id.clone()))
+                .is_ok()
+        );
+        tokio::join!(
+            cancellation.resolve("attempt"),
+            cancellation.resolve("attempt")
+        );
+        assert!(
+            owner_store
+                .get_session_lifecycle(&child.public_id)
+                .await
+                .expect("owner lifecycle")
+                .resolved
+        );
+        assert!(
+            fixture
+                .planner_storage
+                .session_store()
+                .get_session(&child.public_id)
+                .await
+                .expect("planner lookup")
+                .is_none()
+        );
+        owner_store
+            .patch_session_lifecycle(
+                &child.public_id,
+                &crate::session::lifecycle::SessionLifecyclePatch {
+                    resolved: Some(false),
+                    archived: Some(true),
+                },
+            )
+            .await
+            .expect("explicit owner reopen");
+        cancellation.resolve("attempt").await;
+        let lifecycle = owner_store
+            .get_session_lifecycle(&child.public_id)
+            .await
+            .expect("owner lifecycle after replay");
+        assert!(!lifecycle.resolved);
+        assert!(lifecycle.archived);
     }
 
     #[tokio::test]

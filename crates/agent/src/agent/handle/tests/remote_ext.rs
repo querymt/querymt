@@ -76,6 +76,352 @@ async fn test_querymt_remote_sessions_returns_shared_shape() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn remote_owner_lifecycle_updates_and_filters_before_paging() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let remote = RealStorageHandleFixture::new().await;
+    let (_node_id, manager) = register_remote_node(mesh, &remote, "lifecycle-owner", false).await;
+    let store = remote.handle.config.provider.history_store();
+    for index in 0..25 {
+        store
+            .create_session(
+                Some(format!("Lifecycle {index}")),
+                Some(std::path::PathBuf::from("/remote/work")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist owner session");
+    }
+    let unfiltered = manager
+        .ask(crate::agent::remote::ListRemoteSessions {
+            offset: Some(0),
+            limit: Some(100),
+        })
+        .await
+        .expect("list owner sessions");
+    for session in unfiltered.sessions.iter().take(10) {
+        store
+            .patch_session_lifecycle(
+                &session.session_id,
+                &crate::session::lifecycle::SessionLifecyclePatch {
+                    resolved: Some(true),
+                    archived: None,
+                },
+            )
+            .await
+            .expect("resolve first unfiltered page");
+    }
+    let remote_handle = crate::agent::remote::RemoteAgentHandle::new(
+        "lifecycle-owner".to_string(),
+        Some(_node_id.clone()),
+        mesh.clone(),
+    );
+    let state = crate::agent::handle::AgentHandle::set_session_lifecycle(
+        &remote_handle,
+        &unfiltered.sessions[10].session_id,
+        crate::session::lifecycle::SessionLifecyclePatch {
+            resolved: None,
+            archived: Some(true),
+        },
+    )
+    .await
+    .expect("patch lifecycle via remote agent handle");
+    assert!(state.archived);
+    let read = manager
+        .ask(crate::agent::remote::GetRemoteSessionLifecycle {
+            session_id: state.session_id.clone(),
+        })
+        .await
+        .expect("read owner lifecycle");
+    assert!(read.archived);
+
+    let request = |offset| crate::agent::remote::ListRemoteSessionsWithLifecycle {
+        offset: Some(offset),
+        limit: Some(10),
+        cwd: Some("/remote/work".to_string()),
+        scope: crate::session::projection::SessionScope::All,
+        lifecycle: crate::session::lifecycle::SessionLifecycleFilter {
+            resolution: crate::session::lifecycle::ResolutionFilter::Open,
+            archive: crate::session::lifecycle::ArchiveFilter::Excluded,
+        },
+    };
+    let first_page = manager
+        .ask(request(0))
+        .await
+        .expect("owner filters lifecycle before paging");
+    assert_eq!(first_page.total_count, 14);
+    assert_eq!(first_page.sessions.len(), 10);
+    assert_eq!(first_page.next_offset, Some(10));
+    assert!(
+        first_page
+            .sessions
+            .iter()
+            .all(|session| !session.lifecycle.resolved && !session.lifecycle.archived)
+    );
+
+    let second_page = manager.ask(request(10)).await.expect("second owner page");
+    assert_eq!(second_page.total_count, 14);
+    assert_eq!(second_page.sessions.len(), 4);
+    assert_eq!(second_page.next_offset, None);
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn lifecycle_location_conflicts_reject_get_patch_and_acp_hydration() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let local = RealStorageHandleFixture::new().await;
+    local.handle.set_mesh(mesh.clone());
+    let owner = RealStorageHandleFixture::new().await;
+    let (node_id, _manager) = register_remote_node(mesh, &owner, "lifecycle-owner", false).await;
+    let owner_store = owner.handle.config.provider.history_store();
+
+    let owner_session = owner_store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create remote owner session");
+    owner_store
+        .patch_session_lifecycle(
+            &owner_session.public_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await
+        .expect("resolve remote owner session");
+
+    let local_store = local.handle.config.provider.history_store();
+    let collision = local_store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create colliding local session");
+    local
+        .storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET public_id = ?1 WHERE public_id = ?2",
+            rusqlite::params![owner_session.public_id, collision.public_id],
+        )
+        .expect("assign colliding public id");
+    local_store
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: owner_session.public_id.clone(),
+            node_id: node_id.clone(),
+            peer_label: "lifecycle-owner".into(),
+            cwd: None,
+            created_at: 0,
+            title: None,
+        })
+        .await
+        .expect("bookmark colliding owner session");
+
+    let get_error = local
+        .handle
+        .get_session_lifecycle_unloaded(&owner_session.public_id)
+        .await
+        .expect_err("conflicting location must not route to remote owner");
+    assert!(get_error.to_string().contains("Session location conflict"));
+    let patch_error = local
+        .handle
+        .patch_session_lifecycle_unloaded(
+            &owner_session.public_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(false),
+                archived: Some(true),
+            },
+        )
+        .await
+        .expect_err("conflicting location must not patch either owner");
+    assert!(
+        patch_error
+            .to_string()
+            .contains("Session location conflict")
+    );
+
+    let list_error = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &local.handle,
+        local.storage.view_store().expect("view store"),
+        crate::acp::protocol::ListSessionsRequest::new(),
+    )
+    .await
+    .expect_err("local ACP hydration must reject an ambiguous owner");
+    assert!(list_error.to_string().contains("Session location conflict"));
+
+    let local_state = local_store
+        .get_session_lifecycle(&owner_session.public_id)
+        .await
+        .expect("read local collision state");
+    assert!(!local_state.resolved);
+    assert!(!local_state.archived);
+    let owner_state = owner_store
+        .get_session_lifecycle(&owner_session.public_id)
+        .await
+        .expect("read remote owner state");
+    assert!(owner_state.resolved);
+    assert!(!owner_state.archived);
+
+    let bookmark_only = owner_store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create bookmark-only owner session");
+    owner_store
+        .patch_session_lifecycle(
+            &bookmark_only.public_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await
+        .expect("resolve bookmark-only owner session");
+    local_store
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: bookmark_only.public_id.clone(),
+            node_id,
+            peer_label: "lifecycle-owner".into(),
+            cwd: None,
+            created_at: 0,
+            title: None,
+        })
+        .await
+        .expect("bookmark remote-only owner session");
+    let owner_read = local
+        .handle
+        .get_session_lifecycle_unloaded(&bookmark_only.public_id)
+        .await
+        .expect("bookmark-only ID resolves to its remote owner");
+    assert!(owner_read.resolved);
+    local
+        .handle
+        .patch_session_lifecycle_unloaded(
+            &bookmark_only.public_id,
+            &crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .expect("bookmark-only patch routes to the owner");
+    let owner_after_patch = owner_store
+        .get_session_lifecycle(&bookmark_only.public_id)
+        .await
+        .expect("read patched owner state");
+    assert!(owner_after_patch.resolved);
+    assert!(owner_after_patch.archived);
+
+    let lifecycle_list = crate::api::AgentSessions::new(
+        Arc::new(local.handle),
+        local.storage.view_store().expect("view store"),
+        local_store,
+        None,
+    );
+    let list_error = lifecycle_list
+        .list_with_lifecycle(
+            crate::api::ListSessionsOptions {
+                remote: crate::api::RemoteSessionMode::None,
+                ..Default::default()
+            },
+            crate::session::lifecycle::SessionLifecycleFilter {
+                resolution: crate::session::lifecycle::ResolutionFilter::Open,
+                archive: crate::session::lifecycle::ArchiveFilter::Any,
+            },
+        )
+        .await
+        .expect_err("lifecycle list must reject a local/bookmark ownership conflict");
+    assert!(list_error.to_string().contains("Session location conflict"));
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn acp_remote_lifecycle_filter_uses_owner_before_page_and_includes_metadata() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let f = RealStorageHandleFixture::new().await;
+    f.handle.set_mesh(mesh.clone());
+    let remote = RealStorageHandleFixture::new().await;
+    let (node_id, manager) = register_remote_node(mesh, &remote, "filtered-owner", false).await;
+    let store = remote.handle.config.provider.history_store();
+    for index in 0..30 {
+        store
+            .create_session(
+                Some(format!("Remote session {index}")),
+                Some(std::path::PathBuf::from("/remote/work")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist remote session");
+    }
+    let all_sessions = manager
+        .ask(crate::agent::remote::ListRemoteSessions {
+            offset: Some(0),
+            limit: Some(100),
+        })
+        .await
+        .expect("list all owner sessions");
+    for session in all_sessions.sessions.iter().take(10) {
+        store
+            .patch_session_lifecycle(
+                &session.session_id,
+                &crate::session::lifecycle::SessionLifecyclePatch {
+                    resolved: Some(true),
+                    archived: None,
+                },
+            )
+            .await
+            .expect("resolve first owner page");
+    }
+
+    let mut meta = crate::acp::protocol::Meta::new();
+    meta.insert("remoteNodeIds".into(), serde_json::json!([node_id]));
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({
+            "sessionFilters": { "resolution": "open", "archive": "excluded" }
+        }),
+    );
+    let request = |cursor| {
+        crate::acp::protocol::ListSessionsRequest::new()
+            .cwd("/remote/work")
+            .meta(meta.clone())
+            .cursor(cursor)
+    };
+    let first_page = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(None),
+    )
+    .await
+    .expect("owner-filtered first ACP page");
+    assert_eq!(first_page.sessions.len(), 10);
+    assert_eq!(first_page.next_cursor.as_deref(), Some("remote:0:10:live"));
+    for session in &first_page.sessions {
+        let lifecycle = session
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("querymt"))
+            .and_then(|meta| meta.get("lifecycle"))
+            .expect("authoritative owner lifecycle metadata");
+        assert_eq!(lifecycle["resolved"], false);
+        assert_eq!(lifecycle["archived"], false);
+        assert!(lifecycle["resolved_at"].is_null());
+        assert!(lifecycle["archived_at"].is_null());
+    }
+
+    let second_page = crate::api::AgentSessions::list_for_acp_with_runtime(
+        &f.handle,
+        f.storage.view_store().expect("view store"),
+        request(first_page.next_cursor),
+    )
+    .await
+    .expect("owner-filtered second ACP page");
+    assert_eq!(second_page.sessions.len(), 10);
+    assert_eq!(second_page.next_cursor, None);
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load() {
     use crate::profiles::{
         LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager, SessionProfileBinding,

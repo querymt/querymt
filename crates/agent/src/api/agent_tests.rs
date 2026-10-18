@@ -8,12 +8,14 @@ use crate::config::SlashCommandsConfig;
 use crate::events::{AgentEventKind, EventOrigin, ExecutionMetrics};
 use crate::model::AgentMessage;
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog};
+use crate::send_agent::SendAgent;
 use crate::session::backend::StorageBackend;
-use crate::session::projection::{EventJournal, NewDurableEvent};
+use crate::session::projection::{EventJournal, NewDurableEvent, ViewStore};
 #[cfg(feature = "remote")]
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::helpers::empty_plugin_registry;
 use anyhow::Result;
+use async_trait::async_trait;
 use querymt::chat::{ChatRole, FinishReason};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,13 +27,17 @@ async fn test_agent() -> Result<Agent> {
 async fn test_agent_with_storage(
     storage: Option<Arc<crate::session::sqlite_storage::SqliteStorage>>,
 ) -> Result<Agent> {
-    let (registry, _temp_dir) = empty_plugin_registry()?;
     let storage = match storage {
         Some(storage) => storage,
         None => Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
         ),
     };
+    test_agent_with_backend(storage).await
+}
+
+async fn test_agent_with_backend(storage: Arc<dyn StorageBackend>) -> Result<Agent> {
+    let (registry, _temp_dir) = empty_plugin_registry()?;
     Agent::single()
         .provider("openai", "gpt-4o-mini")
         .infra(AgentInfra {
@@ -42,6 +48,155 @@ async fn test_agent_with_storage(
         })
         .build()
         .await
+}
+
+struct DefaultLifecycleViewStore(Arc<crate::session::sqlite_storage::SqliteStorage>);
+
+#[async_trait]
+impl ViewStore for DefaultLifecycleViewStore {
+    async fn get_audit_view(
+        &self,
+        session_id: &str,
+        include_children: bool,
+    ) -> crate::session::error::SessionResult<crate::session::projection::AuditView> {
+        self.0.get_audit_view(session_id, include_children).await
+    }
+
+    async fn get_redacted_view(
+        &self,
+        session_id: &str,
+        policy: crate::session::projection::RedactionPolicy,
+    ) -> crate::session::error::SessionResult<crate::session::projection::RedactedView> {
+        self.0.get_redacted_view(session_id, policy).await
+    }
+
+    async fn get_summary_view(
+        &self,
+        session_id: &str,
+    ) -> crate::session::error::SessionResult<crate::session::projection::SummaryView> {
+        self.0.get_summary_view(session_id).await
+    }
+
+    async fn get_session_list_view(
+        &self,
+        filter: Option<crate::session::projection::SessionListFilter>,
+    ) -> crate::session::error::SessionResult<crate::session::projection::SessionListView> {
+        self.0.get_session_list_view(filter).await
+    }
+
+    async fn browse_session_groups(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(
+        Vec<crate::session::projection::SessionGroup>,
+        Option<String>,
+        usize,
+    )> {
+        self.0
+            .browse_session_groups(cursor, group_limit, session_limit_per_group, session_scope)
+            .await
+    }
+
+    async fn list_group_sessions(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(crate::session::projection::SessionGroup, usize)>
+    {
+        self.0
+            .list_group_sessions(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    async fn list_session_items(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(
+        Vec<crate::session::projection::SessionListItem>,
+        Option<String>,
+        usize,
+    )> {
+        self.0
+            .list_session_items(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    async fn get_session_list_meta_stats(
+        &self,
+        session_ids: &[String],
+    ) -> crate::session::error::SessionResult<
+        std::collections::HashMap<String, crate::session::projection::SessionListMetaStats>,
+    > {
+        self.0.get_session_list_meta_stats(session_ids).await
+    }
+
+    async fn search_sessions(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: crate::session::projection::SessionScope,
+    ) -> crate::session::error::SessionResult<(
+        Vec<crate::session::projection::SessionGroup>,
+        Option<String>,
+        usize,
+    )> {
+        self.0
+            .search_sessions(query, cursor, limit, session_scope)
+            .await
+    }
+
+    async fn list_session_children(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+    ) -> crate::session::error::SessionResult<(crate::session::projection::SessionGroup, usize)>
+    {
+        self.0
+            .list_session_children(parent_session_id, cursor, limit)
+            .await
+    }
+
+    async fn get_atif(
+        &self,
+        session_id: &str,
+        options: &crate::export::AtifExportOptions,
+    ) -> crate::session::error::SessionResult<crate::export::ATIF> {
+        self.0.get_atif(session_id, options).await
+    }
+
+    async fn get_recent_models_view(
+        &self,
+        limit_per_workspace: usize,
+    ) -> crate::session::error::SessionResult<crate::session::projection::RecentModelsView> {
+        self.0.get_recent_models_view(limit_per_workspace).await
+    }
+}
+
+struct SplitLifecycleBackend(Arc<crate::session::sqlite_storage::SqliteStorage>);
+
+#[async_trait]
+impl StorageBackend for SplitLifecycleBackend {
+    fn session_store(&self) -> Arc<dyn crate::session::store::SessionStore> {
+        Arc::new(self.0.as_ref().clone())
+    }
+
+    fn event_journal(&self) -> Arc<dyn EventJournal> {
+        Arc::new(self.0.as_ref().clone())
+    }
+
+    fn view_store(&self) -> Option<Arc<dyn ViewStore>> {
+        Some(Arc::new(DefaultLifecycleViewStore(self.0.clone())))
+    }
 }
 
 async fn agent_with_slash_config(config: SlashCommandsConfig) -> Result<Agent> {
@@ -1460,6 +1615,160 @@ global_enabled = false
     assert!(
         names.contains(&"protocol-server"),
         "protocol server appended: {names:?}"
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_api_filters_before_paging_and_acp_returns_metadata() -> Result<()> {
+    let agent = test_agent().await?;
+    let store = agent.storage_backend().session_store();
+    let open = store.create_session(None, None, None, None).await?;
+    let resolved = store.create_session(None, None, None, None).await?;
+    agent
+        .sessions()
+        .set_session_lifecycle(
+            &resolved.public_id,
+            crate::session::lifecycle::SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await?;
+
+    let page = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions {
+                limit: Some(1),
+                ..ListSessionsOptions::default()
+            },
+            crate::session::lifecycle::SessionLifecycleFilter {
+                resolution: crate::session::lifecycle::ResolutionFilter::Open,
+                archive: crate::session::lifecycle::ArchiveFilter::Any,
+            },
+        )
+        .await?;
+    assert_eq!(page.total_count, 1);
+    let row = page
+        .groups
+        .iter()
+        .flat_map(|group| &group.sessions)
+        .next()
+        .expect("open session in filtered page");
+    assert_eq!(row.summary.session_id, open.public_id);
+    assert_eq!(
+        row.lifecycle.as_ref().map(|state| state.resolved),
+        Some(false)
+    );
+
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionFilters": { "resolution": "resolved" } }),
+    );
+    let acp_page = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new().meta(meta))
+        .await?;
+    assert_eq!(acp_page.sessions.len(), 1);
+    let acp_row = &acp_page.sessions[0];
+    assert_eq!(acp_row.session_id.to_string(), resolved.public_id);
+    assert_eq!(
+        acp_row
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("querymt"))
+            .and_then(|meta| meta.get("lifecycle"))
+            .and_then(|lifecycle| lifecycle.get("resolved"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    let mut invalid_meta = serde_json::Map::new();
+    invalid_meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionFilters": { "resolution": null } }),
+    );
+    assert!(
+        agent
+            .sessions()
+            .list_for_acp(AcpListSessionsRequest::new().meta(invalid_meta))
+            .await
+            .is_err()
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_capabilities_require_session_store_and_view_filter_support() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let backend: Arc<dyn StorageBackend> = Arc::new(SplitLifecycleBackend(sqlite));
+    let agent = test_agent_with_backend(backend).await?;
+
+    let store = agent.storage_backend().session_store();
+    assert!(store.supports_session_lifecycle());
+    let view_store = agent
+        .storage_backend()
+        .view_store()
+        .expect("split backend view store");
+    assert!(!view_store.supports_session_lifecycle());
+    assert!(!view_store.supports_session_lifecycle_filtering());
+
+    let handle = agent.handle();
+    let capabilities = crate::control::capabilities::get_capabilities(&handle);
+    assert!(
+        !capabilities
+            .methods
+            .iter()
+            .any(|method| method == "querymt/session/getLifecycle")
+    );
+    assert!(
+        !capabilities
+            .methods
+            .iter()
+            .any(|method| method == "querymt/session/setLifecycle")
+    );
+
+    let response = handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/capabilities",
+            Arc::from(serde_json::value::RawValue::from_string("{}".into())?),
+        ))
+        .await?;
+    let extension_capabilities: serde_json::Value = serde_json::from_str(response.0.get())?;
+    assert_eq!(
+        extension_capabilities["features"]["session_lifecycle"],
+        false
+    );
+    assert!(
+        !extension_capabilities["methods"]
+            .as_array()
+            .expect("methods")
+            .iter()
+            .any(|method| method == "querymt/session/getLifecycle")
+    );
+
+    let filter_error = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions::default(),
+            crate::session::lifecycle::SessionLifecycleFilter {
+                resolution: crate::session::lifecycle::ResolutionFilter::Open,
+                archive: crate::session::lifecycle::ArchiveFilter::Any,
+            },
+        )
+        .await
+        .expect_err("unsupported view lifecycle filters must fail");
+    assert!(
+        filter_error
+            .to_string()
+            .contains("lifecycle filtering is unsupported")
     );
 
     agent.shutdown().await;

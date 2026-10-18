@@ -6,7 +6,8 @@
 //! - Summary view (quick status for UI)
 
 use crate::events::{AgentEvent, AgentEventKind, DurableEvent, EventOrigin};
-use crate::session::error::SessionResult;
+use crate::session::error::{SessionError, SessionResult};
+use crate::session::lifecycle::{SessionLifecycle, SessionLifecycleFilter};
 use async_trait::async_trait;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
@@ -320,6 +321,129 @@ pub trait ViewStore: Send + Sync {
         &self,
         limit_per_workspace: usize,
     ) -> SessionResult<RecentModelsView>;
+
+    /// Whether this view store can authoritatively provide lifecycle metadata.
+    fn supports_session_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Whether lifecycle filters are supported across all lifecycle-aware queries.
+    fn supports_session_lifecycle_filtering(&self) -> bool {
+        false
+    }
+
+    /// Batch-fetch lifecycle metadata for listed sessions.
+    async fn get_session_list_lifecycles(
+        &self,
+        _session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this view store".into(),
+        ))
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::get_session_list_view`].
+    async fn get_session_list_view_with_lifecycle(
+        &self,
+        filter: Option<SessionListFilter>,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<SessionListView> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.get_session_list_view(filter).await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::browse_session_groups`].
+    async fn browse_session_groups_with_lifecycle(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.browse_session_groups(cursor, group_limit, session_limit_per_group, session_scope)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::list_group_sessions`].
+    async fn list_group_sessions_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_group_sessions(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::list_session_items`].
+    async fn list_session_items_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_session_items(cwd, cursor, limit, session_scope)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::search_sessions`].
+    async fn search_sessions_with_lifecycle(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.search_sessions(query, cursor, limit, session_scope)
+            .await
+    }
+
+    /// Lifecycle-aware variant of [`ViewStore::list_session_children`].
+    async fn list_session_children_with_lifecycle(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
+        if lifecycle.is_filtered() {
+            return Err(SessionError::InvalidOperation(
+                "Session lifecycle filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_session_children(parent_session_id, cursor, limit)
+            .await
+    }
 }
 
 /// Helper trait for redacting sensitive content
