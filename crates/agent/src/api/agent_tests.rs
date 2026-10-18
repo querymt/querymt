@@ -10,7 +10,10 @@ use crate::model::AgentMessage;
 use crate::profiles::{LocalProfileCatalog, ProfileCatalog};
 use crate::send_agent::SendAgent;
 use crate::session::backend::StorageBackend;
-use crate::session::projection::{EventJournal, NewDurableEvent, ViewStore};
+use crate::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
+};
+use crate::session::projection::{EventJournal, NewDurableEvent, SessionScope, ViewStore};
 #[cfg(feature = "remote")]
 use crate::session::store::RemoteSessionBookmark;
 use crate::test_utils::helpers::empty_plugin_registry;
@@ -1700,6 +1703,494 @@ async fn lifecycle_api_filters_before_paging_and_acp_returns_metadata() -> Resul
             .is_err()
     );
 
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_modes_preserve_filters_pages_and_metadata() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(sqlite.clone())).await?;
+    let store = agent.storage_backend().session_store();
+    let mut ids = Vec::new();
+    for (name, cwd, updated_at, resolved, archived) in [
+        (
+            "needle first",
+            Some("/work"),
+            "2025-02-01T00:00:00Z",
+            false,
+            true,
+        ),
+        (
+            "needle second",
+            Some("/work"),
+            "2025-01-01T00:00:00Z",
+            false,
+            true,
+        ),
+        (
+            "needle hidden",
+            Some("/work"),
+            "2025-03-01T00:00:00Z",
+            true,
+            true,
+        ),
+        (
+            "unrelated",
+            Some("/elsewhere"),
+            "2024-12-01T00:00:00Z",
+            false,
+            true,
+        ),
+        ("ungrouped", None, "2024-11-01T00:00:00Z", false, true),
+        (
+            "needle unarchived",
+            Some("/work"),
+            "2025-04-01T00:00:00Z",
+            false,
+            false,
+        ),
+    ] {
+        let session = store
+            .create_session(Some(name.into()), cwd.map(PathBuf::from), None, None)
+            .await?;
+        store
+            .patch_session_lifecycle(
+                &session.public_id,
+                &SessionLifecyclePatch {
+                    resolved: Some(resolved),
+                    archived: Some(archived),
+                },
+            )
+            .await?;
+        sqlite.conn_for_test().lock().unwrap().execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE public_id = ?2",
+            rusqlite::params![updated_at, session.public_id],
+        )?;
+        ids.push(session.public_id);
+    }
+    let child = store
+        .create_session(
+            Some("needle child".into()),
+            Some("/work".into()),
+            Some(ids[2].clone()),
+            Some(crate::session::domain::ForkOrigin::User),
+        )
+        .await?;
+    store
+        .patch_session_lifecycle(
+            &child.public_id,
+            &SessionLifecyclePatch {
+                archived: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Open,
+        archive: ArchiveFilter::Only,
+    };
+    let options = ListSessionsOptions {
+        // Convenience methods must replace the caller's mode, cwd and query.
+        mode: SessionListMode::Search,
+        cwd: Some("/wrong".into()),
+        query: Some("not-found".into()),
+        limit: Some(1),
+        session_scope: Some(SessionScope::Root),
+        ..Default::default()
+    };
+    let sessions = agent.sessions();
+    let first = sessions
+        .list_group_with_lifecycle(Some("/work/".into()), options.clone(), filter)
+        .await?;
+    assert_eq!(first.total_count, 2);
+    assert_eq!(first.next_cursor.as_deref(), Some("1"));
+    let group = &first.groups[0];
+    assert_eq!(group.cwd.as_deref(), Some("/work"));
+    assert_eq!(group.total_count, Some(2));
+    assert_eq!(group.next_cursor, first.next_cursor);
+    assert_eq!(
+        group.latest_activity.as_deref(),
+        Some("2025-02-01T00:00:00Z")
+    );
+    assert_eq!(group.sessions.len(), 1);
+    assert_eq!(group.sessions[0].summary.session_id, ids[0]);
+    assert_eq!(group.sessions[0].summary.cwd, group.cwd);
+    assert_eq!(
+        group.sessions[0].lifecycle,
+        Some(sessions.get_session_lifecycle(&ids[0]).await?)
+    );
+    let second = sessions
+        .list_group_with_lifecycle(
+            Some("/work".into()),
+            ListSessionsOptions {
+                cursor: first.next_cursor,
+                ..options.clone()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(second.total_count, 2);
+    assert_eq!(second.groups[0].sessions[0].summary.session_id, ids[1]);
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(second.groups[0].next_cursor, None);
+
+    let ungrouped = sessions
+        .list_group_with_lifecycle(Some("__none__".into()), options.clone(), filter)
+        .await?;
+    assert_eq!(ungrouped.total_count, 1);
+    assert_eq!(ungrouped.groups[0].cwd, None);
+    assert_eq!(ungrouped.groups[0].sessions[0].summary.session_id, ids[4]);
+
+    let browse = sessions
+        .browse_with_lifecycle(options.clone(), filter)
+        .await?;
+    assert_eq!(browse.total_count, 4);
+    assert_eq!(browse.groups.len(), 1);
+    assert_eq!(browse.groups[0].cwd, None);
+    assert_eq!(browse.next_cursor.as_deref(), Some("1"));
+    let browse = sessions
+        .browse_with_lifecycle(
+            ListSessionsOptions {
+                cursor: browse.next_cursor,
+                ..options.clone()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(browse.total_count, 4);
+    assert_eq!(browse.groups[0].cwd.as_deref(), Some("/work"));
+    assert_eq!(browse.groups[0].total_count, Some(2));
+    assert_eq!(browse.groups[0].sessions.len(), 2);
+    assert_eq!(browse.groups[0].latest_activity, group.latest_activity);
+    assert_eq!(browse.next_cursor.as_deref(), Some("2"));
+
+    let search = sessions
+        .search_with_lifecycle(
+            "needle",
+            ListSessionsOptions {
+                mode: SessionListMode::Browse,
+                ..options.clone()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(search.total_count, 2);
+    assert_eq!(search.groups.len(), 1);
+    assert_eq!(search.groups[0].cwd.as_deref(), Some("/work"));
+    assert_eq!(search.groups[0].total_count, Some(2));
+    assert_eq!(search.groups[0].latest_activity, group.latest_activity);
+    assert_eq!(search.groups[0].sessions[0].summary.session_id, ids[0]);
+    assert_eq!(
+        search.groups[0].sessions[0].lifecycle,
+        group.sessions[0].lifecycle
+    );
+    assert_eq!(search.next_cursor.as_deref(), Some("1"));
+    let search = sessions
+        .search_with_lifecycle(
+            "needle",
+            ListSessionsOptions {
+                cursor: search.next_cursor,
+                ..options
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(search.total_count, 2);
+    assert_eq!(search.groups[0].sessions[0].summary.session_id, ids[1]);
+    assert_eq!(search.next_cursor, None);
+
+    let empty = sessions
+        .list_with_lifecycle(
+            ListSessionsOptions {
+                mode: SessionListMode::Search,
+                ..Default::default()
+            },
+            filter,
+        )
+        .await?;
+    assert_eq!(empty.total_count, 0);
+    assert!(empty.groups.is_empty());
+    assert_eq!(empty.next_cursor, None);
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_children_keep_parent_and_authoritative_state() -> Result<()> {
+    let agent = test_agent().await?;
+    let store = agent.storage_backend().session_store();
+    let parent = store
+        .create_session(None, Some("/parent".into()), None, None)
+        .await?;
+    let mut children = Vec::new();
+    for archived in [false, true, false] {
+        let child = store
+            .create_session(
+                None,
+                Some("/children".into()),
+                Some(parent.public_id.clone()),
+                Some(crate::session::domain::ForkOrigin::User),
+            )
+            .await?;
+        store
+            .patch_session_lifecycle(
+                &child.public_id,
+                &SessionLifecyclePatch {
+                    resolved: Some(true),
+                    archived: Some(archived),
+                },
+            )
+            .await?;
+        children.push(child.public_id);
+    }
+    // An open user fork must not leak through the resolution filter.
+    store
+        .create_session(
+            None,
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(crate::session::domain::ForkOrigin::User),
+        )
+        .await?;
+    // The children endpoint retains its existing user-fork semantics, not delegates.
+    store
+        .create_session(
+            None,
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(crate::session::domain::ForkOrigin::Delegation),
+        )
+        .await?;
+    let sessions = agent.sessions();
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Resolved,
+        archive: ArchiveFilter::Excluded,
+    };
+    let first = sessions
+        .children_with_lifecycle(&parent.public_id, None, Some(0), filter)
+        .await?;
+    assert_eq!(first.parent_session_id, parent.public_id);
+    assert_eq!(first.total_count, 2);
+    assert_eq!(first.sessions.len(), 1, "zero limit is clamped to one");
+    assert_eq!(first.next_cursor.as_deref(), Some("1"));
+    let second = sessions
+        .children_with_lifecycle(&parent.public_id, first.next_cursor, Some(1), filter)
+        .await?;
+    assert_eq!(second.total_count, 2);
+    assert_eq!(second.next_cursor, None);
+    let mut listed = Vec::new();
+    for row in first.sessions.iter().chain(&second.sessions) {
+        assert_eq!(
+            row.summary.parent_session_id.as_deref(),
+            Some(parent.public_id.as_str())
+        );
+        assert_eq!(row.summary.fork_origin.as_deref(), Some("user"));
+        assert_eq!(row.summary.cwd.as_deref(), Some("/children"));
+        assert_eq!(
+            row.lifecycle,
+            Some(
+                sessions
+                    .get_session_lifecycle(&row.summary.session_id)
+                    .await?
+            )
+        );
+        listed.push(row.summary.session_id.clone());
+    }
+    listed.sort();
+    let mut expected = vec![children[0].clone(), children[2].clone()];
+    expected.sort();
+    assert_eq!(listed, expected);
+    let all = sessions
+        .children_with_lifecycle(
+            &parent.public_id,
+            None,
+            None,
+            SessionLifecycleFilter::default(),
+        )
+        .await?;
+    assert_eq!(all.total_count, 4);
+    let archived = all
+        .sessions
+        .iter()
+        .find(|row| row.summary.session_id == children[1])
+        .unwrap();
+    assert_eq!(
+        archived.lifecycle,
+        Some(sessions.get_session_lifecycle(&children[1]).await?)
+    );
+    assert!(archived.lifecycle.as_ref().unwrap().archived);
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_metadata_errors_fail_instead_of_fabricating_open_state() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_storage(Some(sqlite.clone())).await?;
+    let store = agent.storage_backend().session_store();
+    store.create_session(None, None, None, None).await?;
+    // Leave listing intact but make authoritative lifecycle hydration unavailable.
+    sqlite
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .execute("DROP TABLE session_lifecycle", [])?;
+    let error = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions::default(),
+            SessionLifecycleFilter::default(),
+        )
+        .await
+        .expect_err("metadata backend failures must not become known-open rows");
+    assert!(error.to_string().contains("session_lifecycle"));
+    let error = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await
+        .expect_err("ACP must propagate metadata backend failures too");
+    assert!(error.to_string().contains("session_lifecycle"));
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_query_unsupported_store_and_invalid_filters_fail_closed() -> Result<()> {
+    let sqlite =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let agent = test_agent_with_backend(Arc::new(SplitLifecycleBackend(sqlite))).await?;
+    let parent = agent
+        .storage_backend()
+        .session_store()
+        .create_session(None, None, None, None)
+        .await?;
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Open,
+        archive: ArchiveFilter::Any,
+    };
+    let error = agent
+        .sessions()
+        .children_with_lifecycle(&parent.public_id, None, None, filter)
+        .await
+        .expect_err("unsupported child filters must not silently list all children");
+    assert!(
+        error
+            .to_string()
+            .contains("lifecycle filtering is unsupported")
+    );
+    let all = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions::default(),
+            SessionLifecycleFilter::default(),
+        )
+        .await?;
+    assert_eq!(all.total_count, 1);
+    assert_eq!(
+        all.groups[0].sessions[0].summary.session_id,
+        parent.public_id
+    );
+    assert_eq!(all.groups[0].sessions[0].lifecycle, None);
+    let acp = agent
+        .sessions()
+        .list_for_acp(AcpListSessionsRequest::new())
+        .await?;
+    assert_eq!(acp.sessions.len(), 1);
+    assert!(
+        acp.sessions[0]
+            .meta
+            .as_ref()
+            .unwrap()
+            .get("querymt")
+            .and_then(|value| value.get("lifecycle"))
+            .is_none()
+    );
+    for (querymt, expected_error) in [
+        (serde_json::json!(false), "_meta.querymt must be an object"),
+        (
+            serde_json::json!({ "sessionFilters": { "archive": "invalid" } }),
+            "invalid _meta.querymt.sessionFilters",
+        ),
+        (
+            serde_json::json!({ "sessionFilters": { "resolved": true } }),
+            "invalid _meta.querymt.sessionFilters",
+        ),
+        (
+            serde_json::json!({ "sessionFilters": { "resolution": "open" } }),
+            "lifecycle filtering is unsupported",
+        ),
+    ] {
+        let mut meta = serde_json::Map::new();
+        meta.insert("querymt".into(), querymt);
+        let error = agent
+            .sessions()
+            .list_for_acp(AcpListSessionsRequest::new().meta(meta))
+            .await
+            .expect_err("malformed or unsupported filters must not be ignored");
+        assert!(error.to_string().contains(expected_error), "{error}");
+    }
+    agent.shutdown().await;
+    Ok(())
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn lifecycle_query_offline_bookmark_metadata_is_unknown_and_filters_reject_merges()
+-> Result<()> {
+    let agent = test_agent().await?;
+    agent
+        .storage_backend()
+        .session_store()
+        .save_remote_session_bookmark(&RemoteSessionBookmark {
+            session_id: "offline-owner-session".into(),
+            node_id: "offline-node".into(),
+            peer_label: "offline-owner".into(),
+            cwd: Some("/remote".into()),
+            created_at: 1,
+            title: None,
+        })
+        .await?;
+    let all = agent
+        .sessions()
+        .list_with_lifecycle(
+            ListSessionsOptions {
+                remote: RemoteSessionMode::Bookmarks,
+                ..Default::default()
+            },
+            SessionLifecycleFilter::default(),
+        )
+        .await?;
+    let row = &all.groups[0].sessions[0];
+    assert_eq!(row.summary.session_id, "offline-owner-session");
+    assert_eq!(row.summary.node_id.as_deref(), Some("offline-node"));
+    assert_eq!(
+        row.lifecycle, None,
+        "an offline bookmark is not a known-open session"
+    );
+    for remote in [RemoteSessionMode::Bookmarks, RemoteSessionMode::Live] {
+        let error = agent
+            .sessions()
+            .list_with_lifecycle(
+                ListSessionsOptions {
+                    remote,
+                    ..Default::default()
+                },
+                SessionLifecycleFilter {
+                    resolution: ResolutionFilter::Open,
+                    archive: ArchiveFilter::Any,
+                },
+            )
+            .await
+            .expect_err("merging remote rows cannot implement complete lifecycle filtering");
+        assert!(
+            error
+                .to_string()
+                .contains("remote bookmark/live merge is unsupported")
+        );
+    }
     agent.shutdown().await;
     Ok(())
 }

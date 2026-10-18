@@ -167,6 +167,225 @@ async fn remote_owner_lifecycle_updates_and_filters_before_paging() {
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn lifecycle_query_remote_owner_scopes_relationships_and_live_metadata() {
+    use crate::agent::remote::{
+        GetRemoteSessionLifecycle, ListRemoteSessionsWithLifecycle, SetRemoteSessionLifecycle,
+    };
+    use crate::session::lifecycle::{
+        ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
+    };
+    use crate::session::projection::SessionScope;
+
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let local = RealStorageHandleFixture::new().await;
+    local.handle.set_mesh(mesh.clone());
+    let owner = RealStorageHandleFixture::new().await;
+    let (node_id, manager) = register_remote_node(mesh, &owner, "scoped-owner", false).await;
+    let root = manager
+        .ask(crate::agent::remote::CreateRemoteSession {
+            cwd: Some("/remote/work".into()),
+        })
+        .await
+        .expect("create live owner session");
+    let store = owner.handle.config.provider.history_store();
+    let fork = store
+        .create_session(
+            Some("Archived fork".into()),
+            Some("/remote/work".into()),
+            Some(root.session_id.clone()),
+            Some(crate::session::domain::ForkOrigin::User),
+        )
+        .await
+        .expect("create persisted fork");
+    let delegate = store
+        .create_session(
+            Some("Archived delegate".into()),
+            Some("/remote/elsewhere".into()),
+            Some(root.session_id.clone()),
+            Some(crate::session::domain::ForkOrigin::Delegation),
+        )
+        .await
+        .expect("create persisted delegate");
+    for id in [&fork.public_id, &delegate.public_id] {
+        manager
+            .ask(SetRemoteSessionLifecycle {
+                session_id: id.clone(),
+                patch: SessionLifecyclePatch {
+                    resolved: Some(true),
+                    archived: Some(true),
+                },
+            })
+            .await
+            .expect("resolve and archive child at owner");
+    }
+    // Each lifecycle dimension must exclude a same-workspace user fork independently.
+    for (resolved, archived) in [(false, true), (true, false)] {
+        let excluded = store
+            .create_session(
+                None,
+                Some("/remote/work".into()),
+                Some(root.session_id.clone()),
+                Some(crate::session::domain::ForkOrigin::User),
+            )
+            .await
+            .expect("create nonmatching fork");
+        store
+            .patch_session_lifecycle(
+                &excluded.public_id,
+                &SessionLifecyclePatch {
+                    resolved: Some(resolved),
+                    archived: Some(archived),
+                },
+            )
+            .await
+            .expect("set nonmatching fork lifecycle");
+    }
+    let request = ListRemoteSessionsWithLifecycle {
+        offset: None,
+        limit: Some(0),
+        cwd: Some("/remote/work/".into()),
+        scope: SessionScope::Forks,
+        lifecycle: SessionLifecycleFilter {
+            resolution: ResolutionFilter::Resolved,
+            archive: ArchiveFilter::Only,
+        },
+    };
+    let forks = manager
+        .ask(request.clone())
+        .await
+        .expect("filtered fork page");
+    assert_eq!(forks.total_count, 1);
+    assert_eq!(forks.sessions.len(), 1, "zero limit is clamped to one");
+    assert_eq!(forks.next_offset, None);
+    let row = &forks.sessions[0];
+    assert_eq!(row.session.session_id, fork.public_id);
+    assert_eq!(
+        row.session.parent_session_id.as_deref(),
+        Some(root.session_id.as_str())
+    );
+    assert_eq!(row.session.fork_origin.as_deref(), Some("user"));
+    assert_eq!(row.session.actor_id, 0);
+    assert_eq!(row.session.runtime_state.as_deref(), Some("persisted"));
+    assert_eq!(row.session.title.as_deref(), Some("Archived fork"));
+    assert!(row.lifecycle.resolved && row.lifecycle.archived);
+    assert!(row.lifecycle.resolved_at.is_some() && row.lifecycle.archived_at.is_some());
+    let delegates = manager
+        .ask(ListRemoteSessionsWithLifecycle {
+            scope: SessionScope::Delegates,
+            cwd: None,
+            limit: None,
+            ..request.clone()
+        })
+        .await
+        .expect("delegate scope crosses workspaces only when requested");
+    assert_eq!(delegates.total_count, 1);
+    assert_eq!(delegates.sessions[0].session.session_id, delegate.public_id);
+    let children = manager
+        .ask(ListRemoteSessionsWithLifecycle {
+            scope: SessionScope::Children,
+            cwd: None,
+            limit: None,
+            lifecycle: SessionLifecycleFilter::default(),
+            ..request.clone()
+        })
+        .await
+        .expect("children include forks and delegates");
+    assert_eq!(children.total_count, 4);
+    assert_eq!(children.sessions.len(), 4);
+    assert!(
+        children
+            .sessions
+            .iter()
+            .all(|row| row.session.parent_session_id.as_deref() == Some(root.session_id.as_str()))
+    );
+    let roots = manager
+        .ask(ListRemoteSessionsWithLifecycle {
+            scope: SessionScope::Root,
+            cwd: None,
+            limit: None,
+            lifecycle: SessionLifecycleFilter::default(),
+            ..request.clone()
+        })
+        .await
+        .expect("root scope includes live owner metadata");
+    assert_eq!(roots.total_count, 1);
+    assert_eq!(roots.sessions[0].session.session_id, root.session_id);
+    assert_ne!(roots.sessions[0].session.actor_id, 0);
+    assert_eq!(
+        roots.sessions[0].session.runtime_state.as_deref(),
+        Some("idle")
+    );
+    assert_eq!(roots.sessions[0].session.parent_session_id, None);
+    assert!(!roots.sessions[0].lifecycle.resolved);
+    let exhausted = manager
+        .ask(ListRemoteSessionsWithLifecycle {
+            offset: Some(1),
+            ..request
+        })
+        .await
+        .expect("offset after last matching fork");
+    assert_eq!(exhausted.total_count, 1);
+    assert!(exhausted.sessions.is_empty());
+    assert_eq!(exhausted.next_offset, None);
+
+    let local_store = local.handle.config.provider.history_store();
+    local_store
+        .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+            session_id: fork.public_id.clone(),
+            node_id: node_id.clone(),
+            peer_label: "scoped-owner".into(),
+            cwd: Some("/remote/work".into()),
+            created_at: 0,
+            title: None,
+        })
+        .await
+        .expect("bookmark owner fork");
+    let sessions = crate::api::AgentSessions::new(
+        Arc::new(local.handle),
+        local.storage.view_store().expect("view store"),
+        local_store,
+        None,
+    );
+    let page = sessions
+        .list_with_lifecycle(
+            crate::api::ListSessionsOptions {
+                remote: crate::api::RemoteSessionMode::Bookmarks,
+                ..Default::default()
+            },
+            SessionLifecycleFilter::default(),
+        )
+        .await
+        .expect("enrich bookmark from authoritative online owner");
+    assert_eq!(
+        page.groups[0].sessions[0].summary.node_id.as_deref(),
+        Some(node_id.as_str())
+    );
+    assert_eq!(
+        page.groups[0].sessions[0].lifecycle.as_ref(),
+        Some(&row.lifecycle)
+    );
+    let error = manager
+        .ask(GetRemoteSessionLifecycle {
+            session_id: "missing-owner-session".into(),
+        })
+        .await
+        .expect_err("unknown owner session must not become known-open");
+    assert!(error.to_string().contains("not found"));
+    let error = manager
+        .ask(SetRemoteSessionLifecycle {
+            session_id: "missing-owner-session".into(),
+            patch: SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        })
+        .await
+        .expect_err("unknown owner session must not be created by a patch");
+    assert!(error.to_string().contains("not found"));
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn lifecycle_location_conflicts_reject_get_patch_and_acp_hydration() {
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let local = RealStorageHandleFixture::new().await;
