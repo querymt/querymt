@@ -74,7 +74,7 @@ fn session_load_span(req: &LoadSessionRequest) -> tracing::Span {
     let session_id = req.session_id.to_string();
     let span = info_span!(
         "acp.load_session",
-        rpc.system = "jsonrpc",
+        rpc.system.name = "jsonrpc",
         rpc.method = "session/load",
         session.id = %session_id,
         session.load.event_count = tracing::field::Empty,

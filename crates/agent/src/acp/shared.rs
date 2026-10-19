@@ -5823,10 +5823,13 @@ mod tests {
                 .map(|kv| (kv.key.as_str(), &kv.value))
                 .collect();
 
-            assert!(attrs.contains_key("rpc.system"), "missing rpc.system");
+            assert!(
+                attrs.contains_key("rpc.system.name"),
+                "missing rpc.system.name"
+            );
             assert!(attrs.contains_key("rpc.method"), "missing rpc.method");
 
-            assert_eq!(attrs["rpc.system"].as_str(), "jsonrpc");
+            assert_eq!(attrs["rpc.system.name"].as_str(), "jsonrpc");
             assert_eq!(
                 attrs["rpc.method"].as_str(),
                 AGENT_METHOD_NAMES.session_prompt
