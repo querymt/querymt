@@ -20,6 +20,8 @@ pub struct MeshStatusInfo {
     pub has_invite_store: bool,
     pub has_mesh_state_store: bool,
     pub scopes: Vec<MeshScopeInfo>,
+    #[serde(default)]
+    pub iroh: Option<querymt_remote::IrohTransportDiagnostics>,
 }
 
 #[typeshare]
@@ -161,6 +163,7 @@ pub async fn status(agent: &LocalAgentHandle) -> MeshStatusInfo {
                 has_invite_store: mesh.invite_store().is_some(),
                 has_mesh_state_store: mesh.mesh_state_store().is_some(),
                 scopes,
+                iroh: runtime.iroh_diagnostics(),
             };
         }
     }
@@ -173,6 +176,7 @@ pub async fn status(agent: &LocalAgentHandle) -> MeshStatusInfo {
         has_invite_store: false,
         has_mesh_state_store: false,
         scopes: Vec::new(),
+        iroh: None,
     }
 }
 

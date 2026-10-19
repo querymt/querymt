@@ -36,7 +36,7 @@ pub enum MeshSpec {
     Lan,
     Iroh,
     Hybrid,
-    Toml(MeshTomlConfig),
+    Toml(Box<MeshTomlConfig>),
 }
 
 #[cfg(not(feature = "remote"))]
@@ -116,7 +116,7 @@ impl Mesh {
 
     pub fn from_toml(config: MeshTomlConfig) -> Self {
         Self {
-            spec: MeshSpec::Toml(config),
+            spec: MeshSpec::Toml(Box::new(config)),
             remote_agents: Vec::new(),
         }
     }
@@ -218,7 +218,7 @@ impl MeshSpec {
                 cfg.invite = None;
                 cfg
             }
-            MeshSpec::Toml(cfg) => cfg,
+            MeshSpec::Toml(cfg) => *cfg,
         }
     }
 }

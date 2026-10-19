@@ -35,6 +35,10 @@ impl MeshRuntimeHandle {
         &self.inner
     }
 
+    pub fn iroh_diagnostics(&self) -> Option<crate::IrohTransportDiagnostics> {
+        self.inner.iroh_diagnostics()
+    }
+
     pub fn peer_id(&self) -> &PeerId {
         self.inner.peer_id()
     }

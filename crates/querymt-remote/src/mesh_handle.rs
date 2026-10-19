@@ -46,6 +46,7 @@ pub struct MeshHandle {
     stream_reconnect_grace: std::time::Duration,
     config_scopes: Arc<RwLock<Vec<MeshScopeId>>>,
     peer_node_resolver: Option<PeerNodeResolver>,
+    pub(crate) iroh_diagnostics: crate::iroh_diagnostics::IrohDiagnostics,
 }
 
 impl std::fmt::Debug for MeshHandle {
@@ -91,12 +92,18 @@ impl MeshHandle {
             stream_reconnect_grace,
             config_scopes: Arc::new(RwLock::new(Vec::new())),
             peer_node_resolver: None,
+            iroh_diagnostics: Default::default(),
         }
     }
 
     pub fn with_peer_node_resolver(mut self, resolver: PeerNodeResolver) -> Self {
         self.peer_node_resolver = Some(resolver);
         self
+    }
+
+    /// Relay health is independent of peer liveness and mesh authorization.
+    pub fn iroh_diagnostics(&self) -> Option<crate::IrohTransportDiagnostics> {
+        self.iroh_diagnostics.snapshot()
     }
 
     pub fn peer_id(&self) -> &PeerId {

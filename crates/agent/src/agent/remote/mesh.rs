@@ -27,5 +27,15 @@ pub async fn join_mesh_via_invite_with_gso(
     identity_file: Option<std::path::PathBuf>,
     iroh_gso: bool,
 ) -> Result<MeshRuntimeHandle, MeshError> {
-    join::join_mesh_via_invite(invite, identity_file, iroh_gso).await
+    join_mesh_via_invite_with_dns(invite, identity_file, iroh_gso, None).await
+}
+
+/// Join with explicit endpoint GSO and DNS policy, including stored-membership reconnects.
+pub async fn join_mesh_via_invite_with_dns(
+    invite: &SignedInviteGrant,
+    identity_file: Option<std::path::PathBuf>,
+    iroh_gso: bool,
+    iroh_dns: Option<querymt_remote::IrohDnsConfig>,
+) -> Result<MeshRuntimeHandle, MeshError> {
+    join::join_mesh_via_invite(invite, identity_file, iroh_gso, iroh_dns).await
 }
