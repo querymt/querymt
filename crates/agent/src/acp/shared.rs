@@ -2726,54 +2726,54 @@ where
 /// names for direct readability in Grafana.  Extension and unknown methods
 /// get a single `acp.ext_method` span with the method name as attribute.
 fn acp_method_span(method: &str) -> tracing::Span {
-    use opentelemetry_semantic_conventions::attribute::{RPC_METHOD, RPC_SYSTEM};
+    use opentelemetry_semantic_conventions::attribute::{RPC_METHOD, RPC_SYSTEM_NAME};
 
     let names = &AGENT_METHOD_NAMES;
 
     match method {
         m if m == names.initialize => tracing::info_span!(
             "acp.initialize",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.authenticate => tracing::info_span!(
             "acp.authenticate",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_new => tracing::info_span!(
             "acp.new_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_prompt => tracing::info_span!(
             "acp.prompt",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_cancel => tracing::info_span!(
             "acp.cancel",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_load => tracing::info_span!(
             "acp.load_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_list => tracing::info_span!(
             "acp.list_sessions",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_close => tracing::info_span!(
             "acp.close_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         m if m == names.session_resume => tracing::info_span!(
             "acp.resume_session",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
         // Extension methods and everything else: single acp.ext_method span
@@ -2781,7 +2781,7 @@ fn acp_method_span(method: &str) -> tracing::Span {
         // from ext_method so this is the only span for extension requests.
         _ => tracing::info_span!(
             "acp.ext_method",
-            { RPC_SYSTEM } = "jsonrpc",
+            { RPC_SYSTEM_NAME } = "jsonrpc",
             { RPC_METHOD } = %method,
         ),
     }
