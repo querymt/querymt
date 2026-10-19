@@ -68,17 +68,17 @@
     "querymt-desktop": {
       "flake": false,
       "locked": {
-        "lastModified": 1792366555,
-        "narHash": "sha256-C/kHcb3VlKJwOs62sW9FeGdCRE12dVmGdxYq6DK5WaA=",
+        "lastModified": 1792370237,
+        "narHash": "sha256-M0joCSKG1wbOIINMzA/xHjHNS3d93hJ/NXwQUZxLntw=",
         "owner": "querymt",
         "repo": "querymt-desktop",
-        "rev": "c582b1e7294c7df3afd09d11752441a2432dcabf",
+        "rev": "c2cbd87b5cc53160ef6743cdc246fbdba546e2ba",
         "type": "github"
       },
       "original": {
         "owner": "querymt",
         "repo": "querymt-desktop",
-        "rev": "c582b1e7294c7df3afd09d11752441a2432dcabf",
+        "rev": "c2cbd87b5cc53160ef6743cdc246fbdba546e2ba",
         "type": "github"
       }
     },
