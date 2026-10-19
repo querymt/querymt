@@ -7,7 +7,7 @@ use crate::multimodal::MultimodalContext;
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::{MtmdBitmap, MtmdInputChunkType, MtmdInputText};
 use querymt::error::LLMError;
 use std::num::NonZeroU32;
@@ -51,8 +51,8 @@ pub(crate) fn prefill_for_tool_generation<'a>(
             parse_special: true,
         };
         let bitmap_refs: Vec<&MtmdBitmap> = bitmaps.iter().collect();
+        let mut mm_ctx = mm_ctx.lock()?;
         let chunks = mm_ctx
-            .ctx
             .tokenize(input_text, &bitmap_refs)
             .map_err(|e| LLMError::ProviderError(format!("MTMD tokenization failed: {}", e)))?;
 
@@ -116,7 +116,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
         }
 
         let n_past = chunks
-            .eval_chunks(&mm_ctx.ctx, &mut ctx, 0, 0, n_batch as i32, true)
+            .eval_chunks(&mut mm_ctx, &mut ctx, 0, 0, n_batch as i32, true)
             .map_err(|e| LLMError::ProviderError(format!("MTMD evaluation failed: {}", e)))?;
 
         return Ok(ToolPrefillState {
@@ -130,16 +130,7 @@ pub(crate) fn prefill_for_tool_generation<'a>(
 
     // Text-only path.
     let add_bos = cfg.add_bos.unwrap_or(true);
-    let tokens = model
-        .str_to_token(
-            prompt,
-            if add_bos {
-                AddBos::Always
-            } else {
-                AddBos::Never
-            },
-        )
-        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+    let tokens = model.vocab().tokenize(prompt.as_bytes(), add_bos, true);
 
     if tokens.is_empty() {
         return Err(LLMError::InvalidRequest(

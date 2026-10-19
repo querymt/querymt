@@ -256,8 +256,8 @@ fn render_template(
         messages: messages_value,
         tools: tools_value,
         add_generation_prompt,
-        bos_token: token_piece(model, model.token_bos()),
-        eos_token: token_piece(model, model.token_eos()),
+        bos_token: token_piece(model, model.vocab().bos()),
+        eos_token: token_piece(model, model.vocab().eos()),
         enable_thinking,
         reasoning_effort,
         reasoning_preservation: ReasoningPreservationContext::new(cfg.preserve_reasoning),
@@ -296,8 +296,8 @@ fn render_template(
 }
 
 fn token_piece(model: &LlamaModel, token: llama_cpp_2::token::LlamaToken) -> String {
-    model
-        .token_to_piece(token, &mut encoding_rs::UTF_8.new_decoder(), true, None)
+    let bytes = model.vocab().token_to_piece(token, true, None);
+    crate::generation::decode_piece(&mut encoding_rs::UTF_8.new_decoder(), &bytes)
         .unwrap_or_default()
 }
 

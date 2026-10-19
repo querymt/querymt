@@ -1,6 +1,7 @@
 use crate::chat_format::ParsedDelta;
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
+use crate::generation::decode_token_piece;
 use crate::multimodal::MultimodalContext;
 use crate::response::GenerationTermination;
 use crate::tools::generation::parse_tool_response;
@@ -8,7 +9,7 @@ use crate::tools::prefill::prefill_for_tool_generation;
 use crate::tools::sampler::{SamplingParams, build_structured_sampler, build_tool_sampler};
 use futures::channel::mpsc;
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::mtmd::MtmdBitmap;
 use querymt::Usage;
 use querymt::error::LLMError;
@@ -40,9 +41,8 @@ pub(crate) fn generate_streaming_with_tools(
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut preserved = HashSet::new();
         for value in &result.preserved_tokens {
-            if let Ok(tokens) = model.str_to_token(value, AddBos::Never)
-                && tokens.len() == 1
-            {
+            let tokens = model.vocab().tokenize(value.as_bytes(), false, true);
+            if tokens.len() == 1 {
                 preserved.insert(tokens[0]);
             }
         }
@@ -60,9 +60,7 @@ pub(crate) fn generate_streaming_with_tools(
                     return Ok(Some(GenerationTermination::ConsumerClosed));
                 }
 
-                let piece = model
-                    .token_to_piece(token, &mut decoder, preserved.contains(&token), None)
-                    .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+                let piece = decode_token_piece(model, &mut decoder, &preserved, token)?;
                 text.push_str(&piece);
                 let stop_now = result
                     .additional_stops
@@ -157,10 +155,9 @@ pub(crate) fn generate_streaming_with_tools(
 
     let mut preserved = HashSet::new();
     for token_str in &result.preserved_tokens {
-        if let Ok(preserved_tokens) = model.str_to_token(token_str, AddBos::Never) {
-            if preserved_tokens.len() == 1 {
-                preserved.insert(preserved_tokens[0]);
-            }
+        let tokens = model.vocab().tokenize(token_str.as_bytes(), false, true);
+        if tokens.len() == 1 {
+            preserved.insert(tokens[0]);
         }
     }
 
@@ -193,19 +190,12 @@ pub(crate) fn generate_streaming_with_tools(
         }
 
         let token = sampler.sample(&state.ctx, batch.n_tokens() - 1);
-        if model.is_eog_token(token) {
+        if model.vocab().is_eog(token) {
             termination = GenerationTermination::Eog;
             break;
         }
 
-        let special = preserved.contains(&token);
-        let bytes = model
-            .token_to_piece_bytes(token, 128, special, None)
-            .map_err(|e| LLMError::ProviderError(e.to_string()))?;
-        let chunk = match model.token_to_piece(token, &mut decoder, special, None) {
-            Ok(piece) => piece,
-            Err(_) => String::from_utf8_lossy(&bytes).to_string(),
-        };
+        let chunk = decode_token_piece(model, &mut decoder, &preserved, token)?;
         generated_text.push_str(&chunk);
 
         let stop_now = result

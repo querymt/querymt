@@ -1,6 +1,6 @@
 use crate::common_chat::ChatTemplateResult;
 use crate::config::LlamaCppConfig;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 use querymt::error::LLMError;
 use std::sync::Arc;
@@ -81,28 +81,21 @@ pub(crate) fn build_tool_sampler(
             let mut trigger_tokens = Vec::new();
 
             for trigger in &tool_grammar.triggers {
-                match model.str_to_token(&trigger.value, AddBos::Never) {
-                    Ok(tokens) if tokens.len() == 1 => {
+                let tokens = model.vocab().tokenize(trigger.value.as_bytes(), false, true);
+                match tokens.as_slice() {
+                    [token] => {
                         log::debug!(
                             "build_tool_sampler: trigger '{}' tokenized to single token {}",
                             trigger.value,
-                            tokens[0]
+                            token
                         );
-                        trigger_tokens.push(tokens[0]);
+                        trigger_tokens.push(*token);
                     }
-                    Ok(tokens) => {
+                    tokens => {
                         log::debug!(
                             "build_tool_sampler: trigger '{}' tokenized to {} tokens, using regex pattern instead",
                             trigger.value,
                             tokens.len()
-                        );
-                        trigger_patterns.push(regex_escape(&trigger.value));
-                    }
-                    Err(e) => {
-                        log::debug!(
-                            "build_tool_sampler: trigger '{}' failed to tokenize ({}), using regex pattern",
-                            trigger.value,
-                            e
                         );
                         trigger_patterns.push(regex_escape(&trigger.value));
                     }
@@ -216,21 +209,18 @@ pub(crate) fn build_structured_sampler(
     use toktrie::{ApproximateTokEnv, TokRxInfo, TokTrie};
 
     let n_vocab = model.n_vocab() as u32;
-    let eos = model.token_eos().0 as u32;
+    let vocab = model.vocab();
+    let eos = vocab.eos().0 as u32;
     let mut eog_tokens = vec![eos];
     let mut words = Vec::with_capacity(n_vocab as usize);
     for id in 0..n_vocab as i32 {
         let token = llama_cpp_2::token::LlamaToken(id);
-        if model.is_eog_token(token) && id as u32 != eos {
+        if vocab.is_eog(token) && id as u32 != eos {
             eog_tokens.push(id as u32);
         }
-        let mut bytes = model
-            .token_to_piece_bytes(token, 32, false, None)
-            .unwrap_or_default();
+        let mut bytes = vocab.token_to_piece(token, false, None);
         if bytes.is_empty() {
-            bytes = model
-                .token_to_piece_bytes(token, 32, true, None)
-                .unwrap_or_default();
+            bytes = vocab.token_to_piece(token, true, None);
             if !bytes.is_empty() {
                 bytes.insert(0, 0xff);
             }

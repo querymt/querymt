@@ -6,7 +6,7 @@ use crate::tools::sampler::{SamplingParams, build_standard_sampler};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::speculative::MtpSpeculative;
 use llama_cpp_2::token::LlamaToken;
@@ -94,15 +94,8 @@ pub(crate) fn run_mtp(
     validate_models(model, draft_model)?;
 
     let tokens = model
-        .str_to_token(
-            prompt,
-            if cfg.add_bos.unwrap_or(true) {
-                AddBos::Always
-            } else {
-                AddBos::Never
-            },
-        )
-        .map_err(|e| LLMError::ProviderError(e.to_string()))?;
+        .vocab()
+        .tokenize(prompt.as_bytes(), cfg.add_bos.unwrap_or(true), true);
     if tokens.is_empty() {
         return Err(LLMError::InvalidRequest(
             "Prompt tokenization resulted in an empty sequence".into(),
@@ -193,7 +186,7 @@ pub(crate) fn run_mtp(
     let mut pending = sampler.sample(spec.target_context(), batch.n_tokens() - 1);
 
     'generate: while stats.output_tokens < max_tokens {
-        if model.is_eog_token(pending) {
+        if model.vocab().is_eog(pending) {
             stats.termination = GenerationTermination::Eog;
             break;
         }
@@ -254,7 +247,7 @@ pub(crate) fn run_mtp(
                 Some(draft) if sampled == *draft && accepted < remaining => {
                     accepted += 1;
                     stats.accepted += 1;
-                    if model.is_eog_token(sampled) {
+                    if model.vocab().is_eog(sampled) {
                         next_pending = Some(sampled);
                         break;
                     }
@@ -281,7 +274,7 @@ pub(crate) fn run_mtp(
 
         for token in drafts.iter().take(accepted) {
             committed_prefix.push(*token);
-            if model.is_eog_token(*token) {
+            if model.vocab().is_eog(*token) {
                 stats.termination = GenerationTermination::Eog;
                 break 'generate;
             }

@@ -18,16 +18,21 @@ use querymt_provider_common::{
 };
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Mutex, MutexGuard};
 
 /// Wrapper around MtmdContext with provider-specific utilities.
-#[derive(Clone)]
 pub(crate) struct MultimodalContext {
-    pub(crate) ctx: Arc<MtmdContext>,
+    ctx: Mutex<MtmdContext>,
     pub(crate) marker: String,
 }
 
 impl MultimodalContext {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, MtmdContext>, LLMError> {
+        self.ctx
+            .lock()
+            .map_err(|_| LLMError::ProviderError("multimodal context lock poisoned".into()))
+    }
+
     /// Initialize multimodal context from config.
     ///
     /// Resolution strategy (first match wins):
@@ -52,7 +57,7 @@ impl MultimodalContext {
 
         if let Some(ctx) = Self::load_projection(model, cfg, model_hf_repo)? {
             Ok(Some(Self {
-                ctx: Arc::new(ctx),
+                ctx: Mutex::new(ctx),
                 marker,
             }))
         } else {

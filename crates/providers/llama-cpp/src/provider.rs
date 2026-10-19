@@ -350,10 +350,11 @@ impl ChatProvider for LlamaCppProvider {
         }
 
         // Convert media to bitmaps (if multimodal context available)
-        let bitmaps = if let Some(ref mm_ctx) = self.multimodal {
+        let bitmaps = if let Some(mm_ctx) = self.multimodal.as_ref().filter(|_| !media.is_empty()) {
+            let ctx = mm_ctx.lock()?;
             media
                 .iter()
-                .map(|m| m.to_bitmap(&mm_ctx.ctx))
+                .map(|m| m.to_bitmap(&ctx))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             vec![]
@@ -521,10 +522,11 @@ impl ChatProvider for LlamaCppProvider {
         }
 
         // Convert media to bitmaps
-        let bitmaps = if let Some(ref mm_ctx) = self.multimodal {
+        let bitmaps = if let Some(mm_ctx) = self.multimodal.as_ref().filter(|_| !media.is_empty()) {
+            let ctx = mm_ctx.lock()?;
             media
                 .iter()
-                .map(|m| m.to_bitmap(&mm_ctx.ctx))
+                .map(|m| m.to_bitmap(&ctx))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             vec![]
