@@ -1031,6 +1031,105 @@ mod tests {
         )));
     }
 
+    #[tokio::test]
+    async fn tool_results_stay_ahead_of_steering_in_live_and_reloaded_history() {
+        use crate::model::{AgentMessage, MessagePart};
+        use querymt::chat::{ChatMessage, ChatRole, ToolResultPart};
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let steering = Arc::new(crate::agent::turn_control::SteeringInbox::new(
+            "run-1".into(),
+        ));
+        steering
+            .push(
+                "input-1".into(),
+                None,
+                vec![crate::acp::protocol::ContentBlock::Text(
+                    crate::acp::protocol::TextContent::new("change direction"),
+                )],
+            )
+            .await
+            .unwrap();
+        let mut exec_ctx = fixture
+            .execution_context()
+            .await
+            .with_turn_id("run-1")
+            .with_steering(steering);
+        let assistant = ChatMessage::assistant()
+            .tool_use("call-1", "read_file", json!({"path": "."}))
+            .build();
+        let mut stored = AgentMessage::new(exec_ctx.session_id.clone(), ChatRole::Assistant);
+        stored.parts.push(MessagePart::Output {
+            output: assistant.output().unwrap().clone(),
+        });
+        exec_ctx.add_message(stored).await.unwrap();
+        let context = Arc::new(crate::middleware::ConversationContext::new(
+            exec_ctx.session_id.clone().into(),
+            Arc::from(vec![assistant]),
+            Arc::new(crate::middleware::AgentStats::default()),
+            "mock".into(),
+            "mock".into(),
+        ));
+        let steered = apply_pending_steering(
+            &fixture.config,
+            &mut exec_ctx,
+            &context,
+            "before_tool_batch",
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(steered.messages[1].text(), "change direction");
+        let results = Arc::from(vec![crate::middleware::ToolResult::new(
+            "call-1".into(),
+            vec![ToolResultPart::text(
+                "Skipped because new user steering was received",
+            )],
+            true,
+            Some("read_file".into()),
+            Some("{\"path\":\".\"}".into()),
+        )]);
+        let next = super::tool_calls::store_all_tool_results(
+            &fixture.config,
+            &results,
+            &steered,
+            &mut exec_ctx,
+        )
+        .await
+        .unwrap();
+        let crate::middleware::ExecutionState::BeforeLlmCall { context: live } = next else {
+            panic!("expected another model request");
+        };
+        assert_eq!(live.messages.len(), 3);
+        assert!(live.messages[0].has_tool_use());
+        assert!(live.messages[1].has_tool_result());
+        assert_eq!(live.messages[2].text(), "change direction");
+
+        // Storage retains the real chronology; replay normalizes only in memory.
+        let stored = fixture
+            .config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        assert!(matches!(&stored[1].parts[0], MessagePart::Steering { .. }));
+        assert!(matches!(
+            &stored[2].parts[0],
+            MessagePart::ToolResult { .. }
+        ));
+        let replay = exec_ctx.session_handle.history().await.unwrap();
+        assert_eq!(replay.len(), 2);
+        assert!(replay[0].has_tool_use());
+        let parts = replay[1].portable_input_parts();
+        assert!(
+            matches!(&parts[0], querymt::chat::ChatInputPart::ToolResult(result)
+            if result.call_id == "call-1" && result.parts[0].as_text().unwrap().starts_with("Skipped"))
+        );
+        assert_eq!(replay[1].text(), "change direction");
+    }
+
     #[test]
     fn completion_guard_requires_complete_task_in_effective_tools() {
         assert!(!has_effective_task_completion_tool(&[]));

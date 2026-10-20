@@ -902,79 +902,62 @@ impl AgentMessage {
     }
 }
 
-/// Repair persisted transcripts that contain assistant tool calls without an
-/// immediately following result. This keeps legacy or interrupted sessions
-/// acceptable to providers that strictly validate call/result pairing.
+/// Normalize tool-result batches across intervening user messages and synthesize
+/// cancellations only for calls unanswered before the next assistant turn or EOF.
+/// This repairs request history in memory without changing the stored transcript.
 pub(crate) fn repair_unmatched_tool_calls(messages: &mut Vec<AgentMessage>) -> usize {
     let mut repaired = 0;
-    let mut pending = Vec::<ToolCall>::new();
-    let mut index = 0;
+    let mut history = std::mem::take(messages).into_iter().peekable();
 
-    while index < messages.len() {
-        if !pending.is_empty() {
-            if messages[index].role == ChatRole::User {
-                let returned = messages[index]
-                    .parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
-                        _ => None,
-                    })
-                    .collect::<std::collections::HashSet<_>>();
-                pending.retain(|call| !returned.contains(call.id.as_str()));
-                if !pending.is_empty() {
-                    let mut results = cancelled_tool_result_parts(&pending);
-                    repaired += results.len();
-                    results.append(&mut messages[index].parts);
-                    messages[index].parts = results;
+    while let Some(message) = history.next() {
+        let mut pending = if message.role == ChatRole::Assistant {
+            message.function_calls()
+        } else {
+            Vec::new()
+        };
+        let session_id = message.session_id.clone();
+        messages.push(message);
+        if pending.is_empty() {
+            continue;
+        }
+
+        // Steering and split result batches can occupy several user messages.
+        // Gather the entire response span before deciding which calls are missing.
+        let mut responses = Vec::new();
+        let mut results = Vec::new();
+        while let Some(mut response) = history.next_if(|message| message.role == ChatRole::User) {
+            let mut context = Vec::new();
+            for part in std::mem::take(&mut response.parts) {
+                if matches!(part, MessagePart::ToolResult { .. }) {
+                    results.push(part);
+                } else {
+                    context.push(part);
                 }
-                pending.clear();
-            } else {
-                let session_id = messages[index].session_id.clone();
-                let created_at = messages[index].created_at;
-                let parts = cancelled_tool_result_parts(&pending);
-                repaired += parts.len();
-                messages.insert(
-                    index,
-                    AgentMessage {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        session_id,
-                        role: ChatRole::User,
-                        parts,
-                        created_at,
-                        parent_message_id: None,
-                        source_provider: None,
-                        source_model: None,
-                    },
-                );
-                pending.clear();
-                index += 1;
             }
+            response.parts = context;
+            responses.push(response);
         }
+        let returned = results
+            .iter()
+            .filter_map(|part| match part {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        pending.retain(|call| !returned.contains(call.id.as_str()));
+        repaired += pending.len();
+        results.extend(cancelled_tool_result_parts(&pending));
 
-        if messages[index].role == ChatRole::Assistant {
-            pending = messages[index].function_calls();
-        }
-        index += 1;
-    }
-
-    if !pending.is_empty() {
-        let session_id = messages
-            .last()
-            .map(|message| message.session_id.clone())
-            .unwrap_or_default();
-        let parts = cancelled_tool_result_parts(&pending);
-        repaired += parts.len();
-        messages.push(AgentMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id,
-            role: ChatRole::User,
-            parts,
-            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
-            parent_message_id: None,
-            source_provider: None,
-            source_model: None,
-        });
+        // Keep all results in the first user message, ahead of supplemental
+        // context, so no steering message interrupts the provider's tool batch.
+        let mut responses = responses.into_iter();
+        let mut first = responses
+            .next()
+            .unwrap_or_else(|| AgentMessage::new(session_id, ChatRole::User));
+        results.append(&mut first.parts);
+        first.parts = results;
+        messages.push(first);
+        messages.extend(responses.filter(|message| !message.parts.is_empty()));
     }
 
     repaired
@@ -1835,6 +1818,158 @@ mod tests {
 
         assert_eq!(repair_unmatched_tool_calls(&mut messages), 0);
         assert_eq!(messages[1].parts.len(), 1);
+    }
+
+    fn assistant_with_calls(ids: &[&str]) -> AgentMessage {
+        let mut builder = querymt::chat::ChatMessage::assistant().text("Inspecting files");
+        for id in ids {
+            builder = builder.tool_use(*id, "read_file", serde_json::json!({"path": "."}));
+        }
+        let mut message = AgentMessage::new("s1".into(), ChatRole::Assistant);
+        message.source_provider = Some("zai".into());
+        message.parts.push(MessagePart::Output {
+            output: builder.build().output().unwrap().clone(),
+        });
+        message
+    }
+
+    fn result_message(id: &str) -> AgentMessage {
+        let mut message = AgentMessage::new("s1".into(), ChatRole::User);
+        message.parts.push(MessagePart::ToolResult {
+            call_id: id.into(),
+            content: vec![ToolResultPart::text(format!("real result for {id}"))],
+            is_error: false,
+            tool_name: Some("read_file".into()),
+            tool_arguments: Some("{\"path\":\".\"}".into()),
+            compacted_at: None,
+        });
+        message
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_collects_real_results_across_steering() {
+        let mut steering = AgentMessage::new("s1".into(), ChatRole::User);
+        steering.parts.push(MessagePart::Steering {
+            run_id: "run-1".into(),
+            client_input_id: Some("input-1".into()),
+            blocks: vec![
+                ContentBlock::Text(TextContent::new("change direction")),
+                image(&[1, 2, 3], "image/png"),
+            ],
+        });
+        let feedback = prompt_message(vec![ContentBlock::Text(TextContent::new("keep changes"))]);
+        let mut messages = vec![
+            assistant_with_calls(&["a", "b"]),
+            steering,
+            result_message("a"),
+            feedback,
+            result_message("b"),
+        ];
+
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 0);
+        assert_eq!(messages.len(), 3);
+        assert!(
+            matches!(&messages[1].parts[0], MessagePart::ToolResult { call_id, is_error: false, .. } if call_id == "a")
+        );
+        assert!(
+            matches!(&messages[1].parts[1], MessagePart::ToolResult { call_id, is_error: false, .. } if call_id == "b")
+        );
+        assert!(
+            matches!(&messages[1].parts[2], MessagePart::Steering { client_input_id: Some(id), .. } if id == "input-1")
+        );
+        let chats = messages
+            .iter()
+            .map(|message| message.to_chat_message().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            chats[1]
+                .portable_input_parts()
+                .iter()
+                .any(|part| matches!(part, querymt::chat::ChatInputPart::Attachment(_)))
+        );
+        assert_eq!(chats[2].text(), "keep changes");
+
+        // This is the same Chat Completions encoder used by DeepSeek. Provider
+        // switching must retain call IDs and emit exactly one response per call.
+        let provider: qmt_openai::OpenAI = serde_json::from_value(serde_json::json!({
+            "api_key": "test-key", "model": "test-model"
+        }))
+        .unwrap();
+        let request = qmt_openai::api::openai_chat_request(&provider, &chats, None).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+        let wire = body["messages"].as_array().unwrap();
+        assert_eq!(wire[0]["tool_calls"][0]["id"], "a");
+        assert_eq!(wire[0]["tool_calls"][1]["id"], "b");
+        assert_eq!(wire[1]["role"], "tool");
+        assert_eq!(wire[1]["tool_call_id"], "a");
+        assert_eq!(wire[1]["content"], "real result for a");
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[2]["tool_call_id"], "b");
+        assert!(
+            wire[2]["content"]
+                .as_str()
+                .unwrap()
+                .contains("change direction")
+        );
+        assert_eq!(
+            wire.iter()
+                .filter(|message| message["role"] == "tool")
+                .count(),
+            2
+        );
+
+        let normalized = serde_json::to_value(&messages).unwrap();
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 0);
+        assert_eq!(serde_json::to_value(&messages).unwrap(), normalized);
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_synthesizes_only_missing_results() {
+        for next_assistant in [false, true] {
+            let mut messages = vec![
+                assistant_with_calls(&["a", "b"]),
+                prompt_message(vec![ContentBlock::Text(TextContent::new("continue"))]),
+                result_message("a"),
+            ];
+            if next_assistant {
+                messages.push(assistant_with_calls(&[]));
+            }
+            assert_eq!(repair_unmatched_tool_calls(&mut messages), 1);
+            assert!(
+                matches!(&messages[1].parts[0], MessagePart::ToolResult { call_id, is_error: false, .. } if call_id == "a")
+            );
+            assert!(
+                matches!(&messages[1].parts[1], MessagePart::ToolResult { call_id, is_error: true, .. } if call_id == "b")
+            );
+            assert!(matches!(&messages[1].parts[2], MessagePart::Prompt { .. }));
+            assert_eq!(repair_unmatched_tool_calls(&mut messages), 0);
+        }
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_does_not_match_results_across_assistant_turns() {
+        let mut messages = vec![
+            assistant_with_calls(&["a"]),
+            assistant_with_calls(&["b"]),
+            result_message("b"),
+        ];
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 1);
+        assert_eq!(messages.len(), 4);
+        assert!(
+            matches!(&messages[1].parts[0], MessagePart::ToolResult { call_id, is_error: true, .. } if call_id == "a")
+        );
+        assert!(
+            matches!(&messages[3].parts[0], MessagePart::ToolResult { call_id, is_error: false, .. } if call_id == "b")
+        );
+    }
+
+    #[test]
+    fn repair_unmatched_tool_calls_closes_an_unanswered_final_batch() {
+        let mut messages = vec![assistant_with_calls(&["a", "b"])];
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 2);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].parts.len(), 2);
+        assert_eq!(repair_unmatched_tool_calls(&mut messages), 0);
     }
 
     #[test]

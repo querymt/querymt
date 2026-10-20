@@ -1202,7 +1202,15 @@ pub(super) async fn store_all_tool_results(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to store tool results: {}", e))?;
 
-    messages.push(
+    // Steering may have been accepted after the assistant requested these tools.
+    // Persist its original order, but keep the request's result batch adjacent
+    // to the assistant instead of inserting a user message between them.
+    let result_index = messages
+        .iter()
+        .rposition(|message| message.role == ChatRole::Assistant)
+        .map_or(messages.len(), |index| index + 1);
+    messages.insert(
+        result_index,
         result_msg
             .to_chat_message()
             .map_err(|error| anyhow::anyhow!("Invalid stored tool result content: {error}"))?,

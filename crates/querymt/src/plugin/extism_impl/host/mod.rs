@@ -1616,7 +1616,13 @@ mod tests {
             for _ in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = [0; 4096];
-                socket.read(&mut buffer).await.unwrap();
+                let mut received = 0;
+                while !buffer[..received].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    assert!(received < buffer.len(), "request headers exceed buffer size");
+                    let read = socket.read(&mut buffer[received..]).await.unwrap();
+                    assert!(read > 0, "connection closed before request headers completed");
+                    received += read;
+                }
                 socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
