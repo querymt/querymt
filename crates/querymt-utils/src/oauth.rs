@@ -187,7 +187,9 @@ impl OAuthProvider for AnthropicProvider {
                 Err(error) => {
                     let retryable = match &error {
                         anthropic_auth::AnthropicAuthError::Http { status, .. } => *status >= 500,
-                        anthropic_auth::AnthropicAuthError::Network(error) => error.is_connect() || error.is_timeout(),
+                        anthropic_auth::AnthropicAuthError::Network(error) => {
+                            error.is_connect() || error.is_timeout()
+                        }
                         _ => false,
                     };
                     if !retryable || attempt == 2 {

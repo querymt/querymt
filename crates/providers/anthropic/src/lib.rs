@@ -678,7 +678,10 @@ impl From<AnthropicCompleteResponse> for ChatOutput {
 
 fn oauth_text_block(text: String) -> TextBlockParam {
     TextBlockParam {
-        block_type: "text".to_string(), text, cache_control: None, citations: None,
+        block_type: "text".to_string(),
+        text,
+        cache_control: None,
+        citations: None,
     }
 }
 
@@ -729,27 +732,48 @@ fn oauth_billing_header(text: &str, version: &str) -> String {
         .collect();
     // JavaScript indexes UTF-16 code units, not UTF-8 bytes or Unicode scalars.
     let utf16: Vec<u16> = text.encode_utf16().collect();
-    let sampled: Vec<u16> = [4, 7, 20].iter().map(|&i| utf16.get(i).copied().unwrap_or(u16::from(b'0'))).collect();
+    let sampled: Vec<u16> = [4, 7, 20]
+        .iter()
+        .map(|&i| utf16.get(i).copied().unwrap_or(u16::from(b'0')))
+        .collect();
     let suffix: String = Sha256::digest(
-        format!("59cf53e54c78{}{}", String::from_utf16_lossy(&sampled), version).as_bytes(),
+        format!(
+            "59cf53e54c78{}{}",
+            String::from_utf16_lossy(&sampled),
+            version
+        )
+        .as_bytes(),
     )
     .iter()
     .map(|byte| format!("{byte:02x}"))
     .collect();
-    format!("x-anthropic-billing-header: cc_version={version}.{}; cc_entrypoint=sdk-cli; cch={};", &suffix[..3], &cch[..5])
+    format!(
+        "x-anthropic-billing-header: cc_version={version}.{}; cc_entrypoint=sdk-cli; cch={};",
+        &suffix[..3],
+        &cch[..5]
+    )
 }
 
 fn validate_client_version(version: &str) -> Result<(), LLMError> {
     let parts: Vec<_> = version.split('.').collect();
-    if parts.len() != 3 || parts.iter().any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit())) {
-        return Err(LLMError::InvalidRequest("claude_code_version must be major.minor.patch".to_string()));
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(LLMError::InvalidRequest(
+            "claude_code_version must be major.minor.patch".to_string(),
+        ));
     }
     Ok(())
 }
 
 impl Anthropic {
     fn oauth_version(&self) -> &str {
-        self.claude_code_version.as_deref().map(str::trim).unwrap_or(CLAUDE_CODE_VERSION)
+        self.claude_code_version
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or(CLAUDE_CODE_VERSION)
     }
 
     fn validate_oauth_version(&self) -> Result<(), LLMError> {
@@ -810,17 +834,26 @@ impl Anthropic {
         }
         let mut blocks = match &self.system {
             None => Vec::new(),
-            Some(AnthropicSystemPrompt::Text(text)) => vec![oauth_text_block(sanitize_oauth_text(text))],
-            Some(AnthropicSystemPrompt::Blocks(blocks)) => blocks.iter().cloned().map(|mut block| {
-                block.text = sanitize_oauth_text(&block.text);
-                block
-            }).collect(),
+            Some(AnthropicSystemPrompt::Text(text)) => {
+                vec![oauth_text_block(sanitize_oauth_text(text))]
+            }
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => blocks
+                .iter()
+                .cloned()
+                .map(|mut block| {
+                    block.text = sanitize_oauth_text(&block.text);
+                    block
+                })
+                .collect(),
         };
         // Anthropic rejects empty text blocks; identity-only prompts prune to
         // nothing here and only the injected identity block remains.
         blocks.retain(|block| !block.text.is_empty());
         // Keep the identity separate from cached application instructions.
-        if blocks.first().is_none_or(|block| block.text != OAUTH_SYSTEM_PROMPT) {
+        if blocks
+            .first()
+            .is_none_or(|block| block.text != OAUTH_SYSTEM_PROMPT)
+        {
             blocks.insert(0, oauth_text_block(OAUTH_SYSTEM_PROMPT.to_string()));
         }
         Some(AnthropicSystemPrompt::Blocks(blocks))
@@ -830,7 +863,15 @@ impl Anthropic {
     fn prefix_tool_name(&self, name: &str) -> String {
         if self.is_oauth() {
             let mut chars = name.chars();
-            format!("{}{}{}", TOOL_PREFIX, chars.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default(), chars.as_str())
+            format!(
+                "{}{}{}",
+                TOOL_PREFIX,
+                chars
+                    .next()
+                    .map(|c| c.to_uppercase().to_string())
+                    .unwrap_or_default(),
+                chars.as_str()
+            )
         } else {
             name.to_string()
         }
@@ -860,7 +901,14 @@ impl Anthropic {
             return name.to_string();
         }
         let mut chars = name.chars();
-        format!("{}{}", chars.next().map(|c| c.to_lowercase().to_string()).unwrap_or_default(), chars.as_str())
+        format!(
+            "{}{}",
+            chars
+                .next()
+                .map(|c| c.to_lowercase().to_string())
+                .unwrap_or_default(),
+            chars.as_str()
+        )
     }
 
     /// Adds authentication headers to the request builder based on auth type
@@ -874,7 +922,10 @@ impl Anthropic {
                     "anthropic-beta",
                     "oauth-2025-04-20,interleaved-thinking-2025-05-14",
                 )
-                .header(USER_AGENT, format!("claude-cli/{} (external, cli)", self.oauth_version())), 
+                .header(
+                    USER_AGENT,
+                    format!("claude-cli/{} (external, cli)", self.oauth_version()),
+                ),
             AuthType::ApiKey => builder.header("x-api-key", &key),
         };
         builder.header("anthropic-version", "2023-06-01")
@@ -1118,13 +1169,23 @@ impl HTTPChatProvider for Anthropic {
         let mut sanitized_system = self.sanitize_system_prompt();
         if self.is_oauth() {
             self.validate_oauth_version()?;
-            if let Some(first_user) = anthropic_messages.iter().find(|message| message.role == "user") {
-                let text = first_user.content.iter().find_map(|block| match block {
-                    MessageContent::Text { text, .. } => Some(text.as_str()),
-                    _ => None,
-                }).unwrap_or_default();
+            if let Some(first_user) = anthropic_messages
+                .iter()
+                .find(|message| message.role == "user")
+            {
+                let text = first_user
+                    .content
+                    .iter()
+                    .find_map(|block| match block {
+                        MessageContent::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 if let Some(AnthropicSystemPrompt::Blocks(blocks)) = &mut sanitized_system {
-                    blocks.insert(0, oauth_text_block(oauth_billing_header(text, self.oauth_version())));
+                    blocks.insert(
+                        0,
+                        oauth_text_block(oauth_billing_header(text, self.oauth_version())),
+                    );
                 }
             }
         }
@@ -1964,7 +2025,8 @@ mod tests {
             },
             TextBlockParam {
                 block_type: "text".to_string(),
-                text: "# Code search policy\n- Use `search_text` first for content search.".to_string(),
+                text: "# Code search policy\n- Use `search_text` first for content search."
+                    .to_string(),
                 cache_control: Some(CacheControlEphemeral {
                     control_type: "ephemeral".to_string(),
                     ttl: None,
