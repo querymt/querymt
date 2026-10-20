@@ -129,10 +129,19 @@ impl LocalAgentHandle {
         // includes reflect the workspace's contents instead of the agent
         // builder's working directory. Local sessions keep the registry
         // built at agent startup.
-        let registry = self
-            .workspace_catalog_registry(session_id)
-            .await
-            .unwrap_or(registry);
+        //
+        // A live session advertises exactly the registry it expands prompts
+        // with (installed once at materialization), so the catalog and
+        // invocation cannot diverge while the session is active. Only
+        // sessions without a live local actor re-resolve from the checkout.
+        let registry = match self.live_session_slash_registry(session_id).await {
+            Some(Some(live)) => (*live).clone(),
+            Some(None) => registry,
+            None => self
+                .workspace_catalog_registry(session_id)
+                .await
+                .unwrap_or(registry),
+        };
         let mut update = crate::slash_commands::acp::registry_to_acp_update(&registry);
         if self.config.workspace_service().is_some() {
             update
@@ -141,7 +150,7 @@ impl LocalAgentHandle {
             update.available_commands.push(crate::acp::protocol::AvailableCommand::new(
                 "/worktree", "Create and inspect isolated sessions; conservative removal, no automatic integration",
             ).input(crate::acp::protocol::AvailableCommandInput::Unstructured(
-                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | remove <id>"),
+                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | remove <id> | recover <id> | archive <id>"),
             )));
         }
         if update.available_commands.is_empty() {
@@ -151,6 +160,29 @@ impl LocalAgentHandle {
             session_id.to_owned(),
             crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(update),
         ))
+    }
+
+    /// The slash registry of the live local session actor.
+    ///
+    /// - `None`: no live local actor for `session_id`.
+    /// - `Some(None)`: live session without a session-scoped registry
+    ///   (legacy local session; the agent-level registry applies).
+    /// - `Some(Some(registry))`: the registry the actor expands with.
+    async fn live_session_slash_registry(
+        &self,
+        session_id: &str,
+    ) -> Option<Option<Arc<crate::slash_commands::SlashCommandRegistry>>> {
+        let actor = {
+            let registry = self.registry_lock().await;
+            registry.local_actor_ref(session_id).cloned()
+        }?;
+        actor
+            .ask(crate::agent::messages::GetSessionSlashRegistry)
+            .mailbox_timeout(std::time::Duration::from_secs(5))
+            .reply_timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()
     }
 
     /// Prompt catalog re-resolved from the session's bound workspace

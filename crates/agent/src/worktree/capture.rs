@@ -628,6 +628,67 @@ mod tests {
         assert_eq!(index_before, index_after);
     }
 
+    /// `foo.c` must precede the directory `foo` (Git compares the directory
+    /// as `foo/`). A rewritten tree with both must pass `fsck --strict`.
+    #[tokio::test]
+    async fn captured_trees_use_gits_directory_aware_entry_order() {
+        let repo = init_repo();
+        fs::create_dir_all(repo.path().join("foo")).unwrap();
+        fs::write(repo.path().join("foo/a"), "a").unwrap();
+        fs::write(repo.path().join("foo.c"), "c").unwrap();
+        commit_all(repo.path(), "init");
+
+        // Clean checkout: reuses HEAD's tree.
+        let clean = capture(repo.path()).await.unwrap();
+        // Dirty checkout: the root tree is rewritten by the native writer.
+        fs::write(repo.path().join("foo.c"), "changed").unwrap();
+        fs::write(repo.path().join("foo/b"), "new").unwrap();
+        let dirty = capture(repo.path()).await.unwrap();
+        assert_ne!(clean.tree, dirty.tree);
+
+        let listing = out_git(repo.path(), &["ls-tree", &dirty.tree]);
+        let names: Vec<&str> = listing
+            .lines()
+            .filter_map(|line| line.split('\t').nth(1))
+            .collect();
+        assert_eq!(names, vec!["foo.c", "foo"], "Git-canonical order");
+        run_git_ok(repo.path(), &["fsck", "--strict", "--no-dangling"]);
+    }
+
+    /// A file staged (or intent-to-add) and then deleted from disk is a
+    /// working-tree deletion: it must be omitted, never serialized with a
+    /// placeholder object id, and the real index stays untouched.
+    #[tokio::test]
+    async fn staged_additions_deleted_from_disk_are_omitted() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        commit_all(repo.path(), "init");
+
+        fs::write(repo.path().join("staged-gone.txt"), "x").unwrap();
+        run_git_ok(repo.path(), &["add", "staged-gone.txt"]);
+        fs::write(repo.path().join("intent-gone.txt"), "y").unwrap();
+        run_git_ok(repo.path(), &["add", "-N", "intent-gone.txt"]);
+        fs::write(repo.path().join("staged-kept.txt"), "z").unwrap();
+        run_git_ok(repo.path(), &["add", "staged-kept.txt"]);
+        fs::remove_file(repo.path().join("staged-gone.txt")).unwrap();
+        fs::remove_file(repo.path().join("intent-gone.txt")).unwrap();
+
+        let ops = GixRepoOps::new();
+        let index_before = ops.index_manifest(repo.path()).await.unwrap();
+        let captured = capture(repo.path()).await.unwrap();
+
+        let paths: Vec<String> = tree_paths(repo.path(), &captured.tree)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert!(!paths.iter().any(|p| p == "staged-gone.txt"), "{paths:?}");
+        assert!(!paths.iter().any(|p| p == "intent-gone.txt"), "{paths:?}");
+        assert!(paths.iter().any(|p| p == "staged-kept.txt"), "{paths:?}");
+        // The tree is intact: every referenced blob exists.
+        run_git_ok(repo.path(), &["fsck", "--strict", "--no-dangling"]);
+        assert_eq!(index_before, ops.index_manifest(repo.path()).await.unwrap());
+    }
+
     // -- Repository-layout normalization (F5) ----------------------------------
 
     /// Active submodules are rejected from gitlink entries in the real index
@@ -1069,8 +1130,8 @@ mod tests {
             self.inner.remove_worktree(common_dir, path).await
         }
 
-        async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
-            self.inner.prune_worktrees(common_dir).await
+        async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
+            self.inner.prune_worktrees(common_dir, checkout).await
         }
 
         async fn checkout_status(

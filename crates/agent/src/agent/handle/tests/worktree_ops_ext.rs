@@ -245,6 +245,19 @@ async fn worktree_fixture(configure_service: bool) -> WorktreeExtFixture {
 }
 
 #[tokio::test]
+async fn local_workspace_support_reflects_target_readiness() {
+    use crate::agent::handle::AgentHandle as _;
+
+    // A target without its own workspace service must not claim support:
+    // delegation preflight would otherwise provision a checkout that the
+    // target then rejects, leaking an unowned Ready allocation.
+    let without = worktree_fixture(false).await;
+    assert!(!without.handle.supports_local_workspaces());
+    let with = worktree_fixture(true).await;
+    assert!(with.handle.supports_local_workspaces());
+}
+
+#[tokio::test]
 async fn worktree_operations_fail_closed_without_a_workspace_service() {
     let f = worktree_fixture(false).await;
 

@@ -414,6 +414,102 @@ async fn shared_child_in_a_managed_checkout_uses_the_checkout_commands() {
     f.handle.shutdown().await;
 }
 
+/// An active session advertises exactly the registry it expands prompts
+/// with. A command file added to the checkout while the session is running
+/// (no reload) must not appear in the catalog while remaining
+/// un-invocable, for both the owner and a shared child.
+#[tokio::test]
+async fn active_session_catalog_and_invocation_share_one_registry() {
+    let f = slash_worktree_fixture(agent_level_registry()).await;
+    let command = "---\ndescription: Deploy the service\n---\nROOT-DEPLOY: $ARGUMENTS\n";
+    crate::worktree::test_support::commit_files(
+        f.repo.path(),
+        "initial",
+        &[
+            ("README.md", "hello\n"),
+            (".qmt/commands/deploy.md", command),
+        ],
+    );
+    crate::worktree::test_support::materialize(
+        f.repo.path(),
+        &[
+            ("README.md", "hello\n"),
+            (".qmt/commands/deploy.md", command),
+        ],
+    );
+
+    let source = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    let source_id = source.session_id.to_string();
+    let created = native_command(
+        &f.handle,
+        &source_id,
+        "/worktree create --include-local-changes w1",
+    )
+    .await
+    .unwrap();
+    let owner_id = created["session_id"].as_str().unwrap().to_owned();
+    let checkout = std::path::PathBuf::from(created["checkout_path"].as_str().unwrap());
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("parent_session_id".into(), owner_id.clone().into());
+    let shared = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(checkout.clone()).meta(meta))
+        .await
+        .expect("a shared child attaches to its owner's managed checkout");
+    let shared_id = shared.session_id.to_string();
+
+    // A command appears on disk after both sessions started.
+    std::fs::write(
+        checkout.join(".qmt/commands/late.md"),
+        "---\ndescription: Added mid-session\n---\nLATE: $ARGUMENTS\n",
+    )
+    .unwrap();
+
+    for session_id in [&owner_id, &shared_id] {
+        let catalog = f.handle.slash_command_catalog(session_id).await.unwrap();
+        let names = advertised_names(&catalog);
+        assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
+        assert!(
+            !names.contains(&"/late".to_string()),
+            "the catalog must not advertise a command the running session cannot \
+             expand: {names:?}"
+        );
+        prompt(&f.handle, session_id, "/late now").await.unwrap();
+        assert!(
+            stored_user_text(&f, session_id).await.contains("/late now"),
+            "an unadvertised command stays unexpanded in the active session"
+        );
+    }
+
+    // After the runtime is rebuilt both surfaces pick the command up
+    // together.
+    f.handle.registry.lock().await.remove(&owner_id);
+    f.handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(owner_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    let catalog = f.handle.slash_command_catalog(&owner_id).await.unwrap();
+    assert!(advertised_names(&catalog).contains(&"/late".to_string()));
+    prompt(&f.handle, &owner_id, "/late again").await.unwrap();
+    assert!(
+        stored_user_text(&f, &owner_id)
+            .await
+            .contains("LATE: again")
+    );
+
+    f.handle.shutdown().await;
+}
+
 /// Native `/worktree` interception, global command policy, and
 /// scripts-disabled behavior are preserved: a checkout command named
 /// `worktree` never competes with native dispatch, and script-required

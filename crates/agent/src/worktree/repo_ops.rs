@@ -147,7 +147,7 @@ pub trait RepositoryOps: Send + Sync {
 
     /// Prune registration metadata of linked worktrees whose checkout
     /// directory no longer exists.
-    async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()>;
+    async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()>;
 
     /// Working-tree state (uncommitted/untracked/ignored) for a checkout.
     async fn checkout_status(&self, checkout: &Path) -> WorktreeResult<CheckoutStatus>;
@@ -586,15 +586,23 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
+    async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
         let common_dir = common_dir.to_path_buf();
+        let target = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let repo = open_repo(&common_dir)?;
             let common_dir = repo.common_dir().to_path_buf();
             for proxy in repo.worktrees().map_err(native_err)? {
                 // Locked registrations (e.g. worktrees on removable media)
                 // are kept, matching `git worktree prune`.
-                if proxy.is_locked() || proxy.base().map_err(native_err)?.exists() {
+                if proxy.is_locked() {
+                    continue;
+                }
+                // Only the registration of the checkout being removed may
+                // be swept; unrelated registrations (even stale ones) are
+                // never touched by a targeted removal.
+                let base = proxy.base().map_err(native_err)?;
+                if base.exists() || !same_checkout_path(&base, &target) {
                     continue;
                 }
                 // Registration metadata of a vanished checkout: remove the
@@ -1232,7 +1240,11 @@ fn classify_and_reconcile(
             gix::index::entry::Mode::FILE,
             path.as_bstr(),
         );
-        kept.insert(path);
+        // Deliberately not added to `kept` here: a staged addition is only
+        // captured once its working contents are read below. A file that
+        // was staged (or marked intent-to-add) and then deleted from disk
+        // stays out of `kept`, so the placeholder null object id is never
+        // serialized into the tree.
     }
     private_index.sort_entries();
 
@@ -1284,6 +1296,24 @@ fn classify_and_reconcile(
 
     ignored.sort();
     Ok((ignored, kept))
+}
+
+/// Whether a registered worktree base path names `target`. A vanished
+/// checkout cannot be canonicalized, so compare its canonical parent plus
+/// file name, falling back to the literal spelling.
+fn same_checkout_path(base: &Path, target: &Path) -> bool {
+    if base == target {
+        return true;
+    }
+    let normalize = |path: &Path| -> PathBuf {
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                .map(|parent| parent.join(name))
+                .unwrap_or_else(|_| path.to_path_buf()),
+            _ => path.to_path_buf(),
+        }
+    };
+    normalize(base) == normalize(target)
 }
 
 fn gix_pathbuf(path: &gix::bstr::BStr) -> PathBuf {
@@ -1539,6 +1569,11 @@ fn write_tree_from_index(
                 oid,
             });
         }
+        // Git orders tree entries with directories compared as `name/`
+        // (so `foo.c` precedes the directory `foo`); a plain filename
+        // `BTreeMap` order is not canonical. `Entry`'s `Ord` implements
+        // Git's rule and the serializer does not sort for us.
+        entries.sort();
         let tree = gix::objs::Tree { entries };
         repo.write_object(&tree)
             .map_err(native_err)
@@ -1778,11 +1813,11 @@ impl RepositoryOps for FaultInjectingRepoOps {
         self.inner().remove_worktree(common_dir, path).await
     }
 
-    async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
+    async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
         if let Some(err) = self.take_failure(FailurePoint::PruneWorktrees) {
             return Err(err);
         }
-        self.inner().prune_worktrees(common_dir).await
+        self.inner().prune_worktrees(common_dir, checkout).await
     }
 
     async fn checkout_status(&self, checkout: &Path) -> WorktreeResult<CheckoutStatus> {
@@ -1983,12 +2018,69 @@ mod tests {
         std::fs::write(admin.join("locked"), "on removable media").unwrap();
         std::fs::remove_dir_all(&checkout).unwrap();
 
-        ops.prune_worktrees(&common).await.unwrap();
+        ops.prune_worktrees(&common, &checkout).await.unwrap();
         assert!(admin.is_dir(), "a locked registration must be kept");
 
         std::fs::remove_file(admin.join("locked")).unwrap();
-        ops.prune_worktrees(&common).await.unwrap();
+        ops.prune_worktrees(&common, &checkout).await.unwrap();
         assert!(!admin.exists(), "an unlocked stale registration is pruned");
+    }
+
+    /// Removing one missing workspace must not sweep the registration of an
+    /// unrelated (stale or offline) worktree.
+    #[tokio::test]
+    async fn prune_only_removes_the_target_registration() {
+        use crate::worktree::domain::ManagedBranch;
+
+        let repo = init_repo();
+        let head = commit_files(repo.path(), "root", &[("a.txt", "1")]);
+        let ops = GixRepoOps::new();
+        let common = repo.path().join(".git");
+        let parent = tempfile::TempDir::new().unwrap();
+        let target = parent.path().join("target-wt");
+        let sibling = parent.path().join("sibling-wt");
+
+        for (name, path) in [("target-b", &target), ("sibling-b", &sibling)] {
+            ops.create_branch(&common, &ManagedBranch::from_raw(name), &head.to_string())
+                .await
+                .unwrap();
+            gix::open(&common)
+                .unwrap()
+                .add_worktree(
+                    path,
+                    gix::worktree::add::Head::Attached(
+                        gix::refs::FullName::try_from(format!("refs/heads/{name}")).unwrap(),
+                    ),
+                    gix::progress::Discard,
+                    &std::sync::atomic::AtomicBool::new(false),
+                )
+                .unwrap();
+        }
+        let admin_for = |branch: &str| {
+            std::fs::read_dir(common.join("worktrees"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|admin| {
+                    std::fs::read_to_string(admin.join("HEAD"))
+                        .map(|head| head.contains(branch))
+                        .unwrap_or(false)
+                })
+                .expect("registration")
+        };
+        let target_admin = admin_for("target-b");
+        let sibling_admin = admin_for("sibling-b");
+
+        // Both checkouts vanish (the sibling stands in for an offline
+        // worktree on an unmounted volume).
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&sibling).unwrap();
+
+        ops.prune_worktrees(&common, &target).await.unwrap();
+        assert!(!target_admin.exists(), "the target registration is pruned");
+        assert!(
+            sibling_admin.join("HEAD").is_file(),
+            "an unrelated registration must be left untouched"
+        );
     }
 
     /// Inherited Git environment overrides must not redirect native

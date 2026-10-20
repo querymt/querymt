@@ -664,6 +664,19 @@ impl SessionStore for SqliteStorage {
         .await
     }
 
+    async fn create_session_with_isolation_intent(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
+        intent: Option<crate::session::store::PendingForkIsolation>,
+    ) -> SessionResult<Session> {
+        let repo = SqliteSessionRepository::new(self.conn.clone());
+        repo.create_session_with_isolation_intent(name, cwd, parent_session_id, fork_origin, intent)
+            .await
+    }
+
     async fn fork_session(
         &self,
         source_session_id: &str,

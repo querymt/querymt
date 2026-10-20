@@ -62,7 +62,11 @@ impl AgentHandle for LocalAgentHandle {
     }
 
     fn supports_local_workspaces(&self) -> bool {
-        true
+        // Ready only when this target can actually bind and run a managed
+        // workspace. A target without its own workspace service would
+        // reject the preallocated checkout after the parent had already
+        // provisioned it, leaking an unowned Ready allocation.
+        self.config.workspace_service().is_some()
     }
 
     async fn create_isolated_delegation_session(

@@ -467,7 +467,7 @@ impl WorkspaceManager {
             self.git.remove_worktree(common_dir, &checkout).await?;
             checkout_removed = true;
         }
-        self.git.prune_worktrees(common_dir).await?;
+        self.git.prune_worktrees(common_dir, &checkout).await?;
 
         // 5. Branch disposition: delete an empty managed branch — but only
         //    while it still points at the tip observed during the
@@ -1316,8 +1316,8 @@ mod tests {
             self.inner.remove_worktree(common_dir, path).await
         }
 
-        async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
-            self.inner.prune_worktrees(common_dir).await
+        async fn prune_worktrees(&self, common_dir: &Path, checkout: &Path) -> WorktreeResult<()> {
+            self.inner.prune_worktrees(common_dir, checkout).await
         }
 
         async fn checkout_status(

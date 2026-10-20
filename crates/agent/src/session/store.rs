@@ -503,6 +503,26 @@ pub trait SessionStore: Send + Sync {
             .await
     }
 
+    /// Create a session and persist its non-runnable isolation barrier in the
+    /// same transaction. Stores without this capability must reject isolated
+    /// creation before the session row exists.
+    async fn create_session_with_isolation_intent(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
+        intent: Option<PendingForkIsolation>,
+    ) -> SessionResult<Session> {
+        if intent.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "atomic session isolation intent is unsupported by this store".into(),
+            ));
+        }
+        self.create_session(name, cwd, parent_session_id, fork_origin)
+            .await
+    }
+
     /// Return the pending isolation intent; absent for legacy local sessions.
     async fn get_pending_fork_isolation(
         &self,

@@ -268,6 +268,12 @@ pub struct GetRuntimeStatus;
 #[derive(Serialize, Deserialize)]
 pub struct GetLlmConfig;
 
+/// Local-only query: the slash-command registry this session actually
+/// expands prompts with (set at materialization for managed-checkout
+/// sessions). Lets the advertised catalog and invocation share one
+/// authority. Not serializable: it never crosses the mesh.
+pub struct GetSessionSlashRegistry;
+
 // ══════════════════════════════════════════════════════════════════════════
 //  Undo / Redo
 // ══════════════════════════════════════════════════════════════════════════

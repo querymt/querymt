@@ -253,12 +253,31 @@ impl SessionMaterializer {
         }
 
         if let Some(service) = self.workspace_service() {
-            let workspace = service
+            // Decide from checkout identity, not ownership: an explicitly
+            // shared child (at any nesting depth) executes in a managed
+            // checkout without owning a workspace binding, and its MCP
+            // integrations must be validated against that checkout too.
+            let owns_workspace = service
                 .registry()
                 .get_workspace_by_session(session_id)
                 .await
-                .map_err(|err| Error::internal_error().data(err.to_string()))?;
-            if workspace.is_some() {
+                .map_err(|err| Error::internal_error().data(err.to_string()))?
+                .is_some();
+            let in_managed_checkout = if owns_workspace {
+                true
+            } else if let Some(cwd) = cwd.as_deref()
+                && let Ok(repo) = crate::worktree::identity::resolve_repository(cwd)
+            {
+                service
+                    .registry()
+                    .get_workspace_by_checkout(&repo.checkout.root)
+                    .await
+                    .map_err(|err| Error::internal_error().data(err.to_string()))?
+                    .is_some()
+            } else {
+                false
+            };
+            if in_managed_checkout {
                 self.config
                     .session_mcp_attachment_source
                     .validate_workspace_roots(&ctx, &server_configs, &connected_peers)
@@ -470,6 +489,25 @@ impl SessionMaterializer {
         } else {
             None
         };
+        // Durable non-runnable isolation barrier for an isolated session,
+        // written atomically with the session row. Until the session has
+        // bound its owner AND started, a later load/resume (even one that
+        // supplies the original unmanaged source cwd) is refused instead of
+        // silently executing in the source checkout.
+        let isolation_intent =
+            workspace
+                .as_ref()
+                .map(|binding| crate::session::store::PendingForkIsolation {
+                    source_session_id: String::new(),
+                    source_cwd: requested_cwd
+                        .clone()
+                        .unwrap_or_else(|| binding.record.repository.origin_path.clone()),
+                    options: crate::worktree::WorkspaceCreationOptions {
+                        execution: crate::worktree::ExecutionMode::Worktree,
+                        baseline: binding.record.requested_baseline_mode,
+                        base_ref: binding.record.requested_base_ref.clone(),
+                    },
+                });
         let cwd = match &workspace {
             Some(binding) => Some(binding.effective_cwd.clone()),
             None => requested_cwd,
@@ -480,10 +518,11 @@ impl SessionMaterializer {
         let session_context = self
             .config
             .provider
-            .create_session(
+            .create_session_with_isolation_intent(
                 cwd.clone(),
                 parent_session_id,
                 &self.config.execution_config_snapshot(),
+                isolation_intent,
             )
             .await
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -551,6 +590,18 @@ impl SessionMaterializer {
                 &resolved.connected_peers,
             )
             .await?;
+
+            // The session is bound and running: release the isolation
+            // barrier. Any failure above leaves it in place, so the session
+            // stays non-runnable instead of falling back to local execution.
+            if workspace.is_some() {
+                self.config
+                    .provider
+                    .history_store()
+                    .complete_fork_isolation(&session_id)
+                    .await
+                    .map_err(|err| Error::internal_error().data(err.to_string()))?;
+            }
             Ok::<_, Error>((resolved, materialization))
         }
         .await;
@@ -2401,6 +2452,91 @@ mod worktree_binding_tests {
     /// rejected. The workspace was already allocated and bound, so it must
     /// not stay Ready and owned by a session that never started: it is
     /// released as Failed (resources retained) with a diagnostic.
+    /// A shared child owns no workspace binding but executes inside the
+    /// owner's managed checkout. Its MCP integrations must be validated
+    /// against that checkout exactly like the owner's: a server pinned to
+    /// the original project must be rejected, at any nesting depth.
+    #[tokio::test]
+    async fn shared_children_validate_mcp_roots_inside_managed_checkouts() {
+        let fx = worktree_fixture(true).await;
+        let owner = fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(isolation_meta()),
+            )
+            .await
+            .unwrap();
+        let cwd = owner.cwd.clone().unwrap();
+        let parent_meta = |parent: &str| {
+            let mut meta = serde_json::Map::new();
+            meta.insert("parent_session_id".into(), parent.to_string().into());
+            meta
+        };
+        let pinned = || {
+            McpServer::Stdio(
+                crate::acp::protocol::McpServerStdio::new("pinned", "/bin/false")
+                    .args(vec![fx.repo.path().display().to_string()]),
+            )
+        };
+
+        // Direct shared child with a fixed-root integration: rejected.
+        let err = match fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(cwd.clone())
+                    .meta(parent_meta(&owner.session_id))
+                    .mcp_servers(vec![pinned()]),
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a shared child must not start a root pinned to the source checkout"),
+        };
+        assert!(
+            format!("{err:?}").contains("different checkout"),
+            "expected a root-mismatch diagnostic, got: {err:?}"
+        );
+
+        // Nested shared descendant: same rule through the ancestry chain.
+        let child = fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(cwd.clone()).meta(parent_meta(&owner.session_id)),
+            )
+            .await
+            .expect("an unpinned shared child attaches");
+        let nested_err = match fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(cwd.clone())
+                    .meta(parent_meta(&child.session_id))
+                    .mcp_servers(vec![pinned()]),
+            )
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a nested shared child must be validated too"),
+        };
+        assert!(
+            format!("{nested_err:?}").contains("different checkout"),
+            "{nested_err:?}"
+        );
+
+        // The owner's workspace is untouched by a rejected shared child.
+        let records = fx
+            .storage
+            .workspace_repository()
+            .unwrap()
+            .list_workspaces()
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].lifecycle,
+            crate::worktree::WorkspaceLifecycle::Ready
+        );
+    }
+
     #[tokio::test]
     async fn mcp_root_mismatch_rejects_startup_and_releases_the_workspace() {
         let fx = worktree_fixture(true).await;
@@ -3354,6 +3490,75 @@ mod worktree_binding_tests {
     /// survives, load/resume (including on a fresh materializer) refuse to
     /// run the fork anywhere — least of all the source checkout — and the
     /// listing exposes the pending-isolation state (11.4/11.5).
+    #[tokio::test]
+    async fn failed_isolated_new_session_cannot_resume_in_the_source_checkout() {
+        let fx = worktree_fixture_with_flaky_owner(1).await;
+        let source_cwd = fx.repo.path().to_path_buf();
+
+        // The owner binding fails after the session row was persisted.
+        let err = match fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(source_cwd.clone()).meta(isolation_meta()))
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("injected owner-binding failure must fail creation"),
+        };
+        assert!(
+            format!("{err:?}").contains("injected owner-binding failure"),
+            "{err:?}"
+        );
+
+        // The leftover row carries the durable non-runnable barrier.
+        let sessions = fx.storage.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1, "the leftover session row exists");
+        let session_id = sessions[0].public_id.clone();
+        assert!(
+            fx.storage
+                .get_pending_fork_isolation(&session_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "isolation intent must be persisted with the session row"
+        );
+
+        // Neither a resume supplying the original unmanaged source cwd nor a
+        // load can run it: not in the source checkout, not anywhere.
+        let restarted = SessionMaterializer::new(fx.materializer.config.clone());
+        let resume =
+            ResumeSessionRequest::new(SessionId::from(session_id.clone()), source_cwd.clone());
+        let resume_err = match restarted.prepare_resume_session(resume, None).await {
+            Err(err) => err,
+            Ok(_) => panic!("a failed isolated session must not resume in the source checkout"),
+        };
+        assert!(
+            format!("{resume_err:?}").contains("fork isolation is pending"),
+            "{resume_err:?}"
+        );
+        let load = LoadSessionRequest::new(SessionId::from(session_id), source_cwd);
+        assert!(restarted.prepare_load_session(load, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn successful_isolated_new_session_releases_its_barrier() {
+        let fx = worktree_fixture(true).await;
+        let prepared = fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(isolation_meta()),
+            )
+            .await
+            .expect("isolated session prepares");
+        assert!(
+            fx.storage
+                .get_pending_fork_isolation(&prepared.session_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a started isolated session is runnable: no pending barrier"
+        );
+    }
+
     #[tokio::test]
     async fn injected_owner_binding_failure_compensates_and_stays_non_runnable() {
         let fx = worktree_fixture_with_flaky_owner(1).await;

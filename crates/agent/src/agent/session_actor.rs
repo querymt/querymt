@@ -1182,6 +1182,19 @@ impl Message<GetSessionLimits> for SessionActor {
     }
 }
 
+impl Message<crate::agent::messages::GetSessionSlashRegistry> for SessionActor {
+    type Reply =
+        Result<Option<Arc<crate::slash_commands::SlashCommandRegistry>>, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: crate::agent::messages::GetSessionSlashRegistry,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.runtime.slash_registry.get().cloned())
+    }
+}
+
 impl Message<GetRuntimeStatus> for SessionActor {
     type Reply = Result<SessionRuntimeStatus, kameo::error::Infallible>;
 

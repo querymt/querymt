@@ -512,8 +512,11 @@ impl WorkspaceService {
                     )
                 })?,
                 None => {
+                    // Repository-wide capture runs from the resolved checkout
+                    // root; the parent's relative cwd only affects where the
+                    // delegate executes.
                     self.capture_batch_baseline(
-                        parent_cwd,
+                        &resolved.checkout.root,
                         BaselineMode::CurrentWorkingTree,
                         parent_gate,
                     )
@@ -695,9 +698,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn real_git_cross_feature_acceptance_retains_independent_work_and_resume() {
-        let _git_path = git_path_lock();
         use crate::session::backend::StorageBackend;
         use crate::snapshot::{GitSnapshotBackend, SnapshotBackend};
         use crate::verification::service::{VerificationContext, VerificationService};
@@ -1020,11 +1021,44 @@ mod tests {
     /// gix API (no Git CLI), and `PATH` is emptied for the duration of the
     /// test so any accidental subprocess spawn would fail loudly.
     ///
-    /// `PATH` is process-global, so this test serializes against the
-    /// `PATH_ENV_LOCK` used by the few CLI-adapter tests that need a real
-    /// executable.
+    /// The empty `PATH` is set only on a child process (a re-exec of this
+    /// test binary running [`no_git_lifecycle_child`]), so the parent
+    /// process environment is never mutated while other tests run in
+    /// parallel threads.
+    #[test]
+    fn production_lifecycle_works_without_a_git_executable() {
+        let empty_path = TempDir::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree::service::tests::no_git_lifecycle_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("QMT_NO_GIT_CHILD", "1")
+            .env("PATH", empty_path.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "lifecycle must work without a Git executable:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child probe must actually run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Child half of [`production_lifecycle_works_without_a_git_executable`];
+    /// a no-op unless launched by it with an empty `PATH`.
     #[tokio::test]
-    async fn production_lifecycle_works_without_a_git_executable() {
+    async fn no_git_lifecycle_child() {
+        if std::env::var_os("QMT_NO_GIT_CHILD").is_none() {
+            return;
+        }
         use crate::session::backend::StorageBackend;
         use crate::worktree::{
             BaselineSource, ManagedBranch, ProvisioningPhase, WorkspaceAllocator, WorkspaceId,
@@ -1072,7 +1106,6 @@ mod tests {
         // From here on no Git executable is reachable. Negative control: a
         // plain `git --version` must fail, so the lifecycle below cannot
         // accidentally succeed by shelling out.
-        let _path = PathEnvGuard::hide_path();
         assert!(
             std::process::Command::new("git")
                 .arg("--version")
@@ -1229,53 +1262,6 @@ mod tests {
             fs::read_to_string(repo.path().join("file.txt")).unwrap(),
             "parent dirty"
         );
-    }
-
-    /// Serializes process-global `PATH` mutation across tests that care
-    /// about whether a real Git executable is reachable.
-    static PATH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
-
-    /// Held by tests that spawn the real `git` executable so they never run
-    /// while [`PathEnvGuard`] has emptied `PATH` in another test thread.
-    fn git_path_lock() -> std::sync::MutexGuard<'static, ()> {
-        PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Hides every executable from spawned processes for the guard's
-    /// lifetime (`PATH` points at an empty directory) and restores the
-    /// previous value on drop.
-    struct PathEnvGuard {
-        previous: Option<std::ffi::OsString>,
-        empty_dir: TempDir,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl PathEnvGuard {
-        fn hide_path() -> Self {
-            let lock = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let empty_dir = TempDir::new().unwrap();
-            let previous = std::env::var_os("PATH");
-            // SAFETY: `PATH` is process-global. The guard holds
-            // `PATH_ENV_LOCK` for its whole lifetime and restores the value on
-            // drop, so no other locked reader observes the temporary state.
-            unsafe { std::env::set_var("PATH", empty_dir.path()) };
-            Self {
-                previous,
-                empty_dir,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for PathEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: see `hide_path`; `PATH_ENV_LOCK` is still held here.
-            match &self.previous {
-                Some(value) => unsafe { std::env::set_var("PATH", value) },
-                None => unsafe { std::env::remove_var("PATH") },
-            }
-            let _ = &self.empty_dir;
-        }
     }
 
     async fn service() -> (TempDir, TempDir, WorkspaceService) {
@@ -1624,9 +1610,7 @@ mod tests {
     /// result publication leaves the child's staging state and the parent
     /// checkout unchanged, and the provenance is durably retained.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn delegate_result_capture_is_baseline_relative_and_non_invasive() {
-        let _git_path = git_path_lock();
         use crate::worktree::GitRunner as _;
         use crate::worktree::{CliGit, ResultVerificationStatus};
 

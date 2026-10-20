@@ -80,14 +80,16 @@ impl SqliteSessionRepository {
     }
 }
 
-#[async_trait]
-impl SessionRepository for SqliteSessionRepository {
-    async fn create_session(
+impl SqliteSessionRepository {
+    /// Create a session row; when `intent` is present the durable
+    /// pending-isolation barrier is written in the same transaction.
+    pub(crate) async fn create_session_with_isolation_intent(
         &self,
         name: Option<String>,
         cwd: Option<std::path::PathBuf>,
         parent_session_id: Option<String>,
         fork_origin: Option<ForkOrigin>,
+        intent: Option<crate::session::store::PendingForkIsolation>,
     ) -> SessionResult<Session> {
         let cwd = cwd.map(|cwd| normalize_session_cwd(&cwd)).transpose()?;
         let now = OffsetDateTime::now_utc();
@@ -119,9 +121,19 @@ impl SessionRepository for SqliteSessionRepository {
         let fork_origin_str = fork_origin.as_ref().map(|fo| fo.to_string());
         let fork_origin_clone = fork_origin;
 
+        let intent_json = intent
+            .map(|intent| serde_json::to_string(&intent))
+            .transpose()
+            .map_err(|err| SessionError::InvalidOperation(err.to_string()))?;
         let inserted_id = self
             .run_blocking(move |conn| {
-                conn.execute(
+                // Take the write lock up front (honoring the busy timeout)
+                // rather than upgrading a deferred read transaction, which
+                // fails immediately with "database is locked" when other
+                // processes write concurrently.
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute(
                     "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at, current_intent_snapshot_id, active_task_id, llm_config_id, parent_session_id, fork_origin, session_kind, fork_point_type, fork_point_ref, fork_instructions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         public_id_for_insert,
@@ -140,7 +152,18 @@ impl SessionRepository for SqliteSessionRepository {
                         Option::<String>::None,
                     ],
                 )?;
-                Ok(conn.last_insert_rowid())
+                let inserted = tx.last_insert_rowid();
+                // The non-runnable isolation barrier commits atomically with
+                // the session row: interruption can never leave an isolated
+                // session looking like a legacy local one.
+                if let Some(intent_json) = intent_json {
+                    tx.execute(
+                        "INSERT INTO session_fork_isolation_intents (session_id, intent_json) VALUES (?, ?)",
+                        params![inserted, intent_json],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(inserted)
             })
             .await?;
 
@@ -161,6 +184,20 @@ impl SessionRepository for SqliteSessionRepository {
             fork_point_ref: None,
             fork_instructions: None,
         })
+    }
+}
+
+#[async_trait]
+impl SessionRepository for SqliteSessionRepository {
+    async fn create_session(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
+    ) -> SessionResult<Session> {
+        self.create_session_with_isolation_intent(name, cwd, parent_session_id, fork_origin, None)
+            .await
     }
 
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>> {

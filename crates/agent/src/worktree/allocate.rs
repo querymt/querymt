@@ -634,12 +634,20 @@ impl WorkspaceAllocator {
                 })
             }
             BaselineMode::CurrentWorkingTree => {
-                let captured = crate::worktree::capture::capture_working_state_validated(
-                    self.git.as_ref(),
-                    &record.repository.origin_path,
-                    Default::default(),
-                )
-                .await?;
+                // Serialize against cooperating writers of the source
+                // checkout (same gate local sessions install), exactly as
+                // the original allocation capture does. Lock order matches
+                // `provision`: administration lock (held by the caller),
+                // then the checkout gate.
+                let gate =
+                    CheckoutMutationGate::new(&self.storage_root, &record.repository.origin_path)?;
+                let captured = gate
+                    .run(crate::worktree::capture::capture_working_state_validated(
+                        self.git.as_ref(),
+                        &record.repository.origin_path,
+                        Default::default(),
+                    ))
+                    .await??;
                 Ok(Baseline {
                     mode: BaselineMode::CurrentWorkingTree,
                     source_head: captured.source_head,
@@ -1586,6 +1594,54 @@ mod tests {
             fs::read_to_string(repo.path().join("file.txt")).unwrap(),
             "recovered"
         );
+    }
+
+    /// Baseline-absent recovery of a working-tree intent captures the source
+    /// under the source checkout's cooperative mutation gate: while a
+    /// cooperating writer holds the gate, recovery must wait instead of
+    /// accepting a stable-looking half-applied multi-file operation.
+    #[tokio::test]
+    async fn recover_baseline_absent_capture_waits_for_the_source_gate() {
+        let (repo, _, _) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+        let (alloc, _conn) = file_allocator(storage.path(), &db.path().join("state.db"));
+        let resolved = resolve(repo.path());
+        let record = insert_intent_only(
+            &alloc,
+            storage.path(),
+            &resolved,
+            "ws-gated",
+            BaselineMode::CurrentWorkingTree,
+            None,
+        )
+        .await;
+
+        let gate =
+            CheckoutMutationGate::new(storage.path(), &resolved.identity.origin_path).unwrap();
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let hold = std::time::Duration::from_millis(700);
+        let holder = tokio::spawn(async move {
+            gate.run(async {
+                let _ = held_tx.send(());
+                tokio::time::sleep(hold).await;
+            })
+            .await
+            .unwrap();
+        });
+        held_rx.await.unwrap();
+
+        let started = std::time::Instant::now();
+        let done = alloc.recover(&record).await.unwrap();
+        let waited = started.elapsed();
+        holder.await.unwrap();
+
+        assert!(
+            waited >= std::time::Duration::from_millis(400),
+            "recovery capture must wait for the held source gate (waited {waited:?})"
+        );
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert_eq!(done.baseline_source, BaselineSource::CapturedDuringRecovery);
     }
 
     /// Commit-mode baseline-absent recovery re-resolves the recorded
