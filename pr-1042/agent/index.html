@@ -2193,15 +2193,16 @@ isolation options keep existing local behavior unchanged.</p>
   state are keyed by checkout identity, never shared by project identity.</li>
 <li><strong>Snapshot storage is separate</strong>: The undo/redo snapshot cache remains a
   disposable, path-keyed store. Managed worktrees never live inside it —
-  isolated worktree storage is durable, defaulting to
-  <code>~/.qmt/worktrees/&lt;repo-id&gt;/&lt;workspace-id&gt;</code> (configurable via agent
-  configuration), never inside your project.</li>
+  isolated worktree storage is durable and lives under the storage root you
+  pass to <code>WorkspaceService::new</code> (there is no built-in default), laid out as
+  <code>&lt;storage-root&gt;/&lt;repo-slug&gt;/&lt;workspace-id&gt;</code>, never inside your project.</li>
 <li><strong>Single writable owner</strong>: A managed workspace is bound to at most one
   writable session; additional connections to that same session are fine, a
   second writable session attachment is rejected. Forks and delegates receive
   their own workspaces.</li>
 <li><strong>Explicit lifecycle</strong>: Workspaces track durable states
-  (<code>provisioning → ready</code>, with <code>failed</code>, <code>missing</code>, <code>removing</code>, <code>removed</code>)
+  (<code>provisioning → ready</code>, with <code>failed</code>, <code>missing</code>, <code>archived</code>, <code>removing</code>,
+  <code>removed</code>)
   so crashes and externally deleted checkouts are detected and recoverable.
   Removal never reuses a checkout path.</li>
 <li><strong>Delegation defaults</strong>: Delegates of isolated sessions run isolated by
@@ -2212,7 +2213,7 @@ isolation options keep existing local behavior unchanged.</p>
 </ul>
 <h4 id="lifecycle-operations-and-recovery">Lifecycle operations and recovery</h4>
 <p>The durable lifecycle (<code>provisioning</code>, <code>ready</code>, <code>failed</code>, <code>missing</code>,
-<code>removing</code>, <code>removed</code>) is inspected and advanced through three workspace
+<code>archived</code>, <code>removing</code>, <code>removed</code>) is inspected and advanced through three workspace
 operations. None of them has a force flag:</p>
 <ul>
 <li><strong>status</strong> — live observation only: whether the checkout exists, whether

@@ -2001,7 +2001,7 @@ extension (additive; upstream protocol types are unchanged):</p>
 <li><strong>Omitted options keep local behavior.</strong> No managed worktree is created.</li>
 <li><strong>The actual working directory is disclosed.</strong> The session materializes
   with <code>cwd</code> set to the bound checkout — e.g.
-  <code>~/.local/share/qmt/worktrees/project/ws_01ABCdef…</code> — and that path, not
+  <code>~/.local/share/qmt/worktrees/&lt;repo-slug&gt;/ws_01ABCdef…</code> — and that path, not
   the source directory, is what file tools, the shell, indexes, prompts, and
   hooks use. Ignored (gitignored) untracked files are never copied; the
   response discloses that exclusion for current-working-tree baselines.</li>
