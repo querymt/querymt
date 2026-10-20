@@ -431,17 +431,48 @@ impl LLMProviderFactory for ExtismFactory {
         };
 
         if self.supports_http_adapter_abi() {
-            if let Some(result) = <Self as HTTPLLMProviderFactory>::list_models_static(self, cfg) {
-                return Box::pin(async move { result });
+            enum ModelList {
+                Static(Vec<String>),
+                Request(Box<http::Request<Vec<u8>>>),
             }
 
-            let req = match <Self as HTTPLLMProviderFactory>::list_models_request(self, cfg) {
-                Ok(req) => req,
-                Err(e) => return Box::pin(async move { Err(e) }),
-            };
+            let factory = self.clone();
+            let cfg = cfg.to_owned();
+            let caller_span = tracing::Span::current();
             return async move {
+                // Even short WASM calls can invoke synchronous WASI, which blocks on Tokio.
+                let prepared = tokio::task::spawn_blocking(move || {
+                    let _guard = caller_span.enter();
+                    if let Some(result) = factory.list_models_static(&cfg) {
+                        return result.map(ModelList::Static);
+                    }
+                    factory
+                        .list_models_request(&cfg)
+                        .map(Box::new)
+                        .map(ModelList::Request)
+                })
+                .await
+                .map_err(|e| {
+                    LLMError::PluginError(format!(
+                        "Extism list_models preparation join error: {e:#}"
+                    ))
+                })??;
+
+                let req = match prepared {
+                    ModelList::Static(models) => return Ok(models),
+                    ModelList::Request(req) => *req,
+                };
                 let resp = crate::outbound::call_outbound(req).await?;
-                <Self as HTTPLLMProviderFactory>::parse_list_models(self, resp)
+                let factory = self.clone();
+                let caller_span = tracing::Span::current();
+                tokio::task::spawn_blocking(move || {
+                    let _guard = caller_span.enter();
+                    factory.parse_list_models(resp)
+                })
+                .await
+                .map_err(|e| {
+                    LLMError::PluginError(format!("Extism list_models parsing join error: {e:#}"))
+                })?
             }
             .boxed();
         }
@@ -1513,6 +1544,125 @@ impl HTTPLLMProvider for ExtismProvider {
 mod tests {
     use super::*;
     use crate::{Usage, chat::StreamChunk};
+
+    // Each export writes to WASI stdout, exercising Wasmtime's synchronous Tokio bridge.
+    fn model_listing_factory(static_models: Option<&str>, request_json: &str) -> ExtismFactory {
+        fn export(name: &str, output: &str) -> String {
+            let stores = output
+                .bytes()
+                .enumerate()
+                .map(|(i, byte)| {
+                    format!(
+                        "(call $store_u8 (i64.add (local.get $ptr) (i64.const {i})) (i32.const {byte}))"
+                    )
+                })
+                .collect::<String>();
+            let len = output.len();
+            format!(
+                r#"(func (export "{name}") (result i32)
+                    (local $ptr i64)
+                    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0)))
+                    (local.set $ptr (call $alloc (i64.const {len})))
+                    {stores}
+                    (call $output_set (local.get $ptr) (i64.const {len}))
+                    (i32.const 0))"#
+            )
+        }
+
+        let static_export = static_models
+            .map(|models| export("list_models_static", models))
+            .unwrap_or_default();
+        let request_export = export("list_models_request", request_json);
+        let parse_export = export("parse_list_models_response", r#"["parsed-model"]"#);
+        let wasm = format!(
+            r#"(module
+                (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                (import "extism:host/env" "alloc" (func $alloc (param i64) (result i64)))
+                (import "extism:host/env" "store_u8" (func $store_u8 (param i64 i32)))
+                (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
+                (memory (export "memory") 1)
+                (func (export "chat_request") (result i32) (i32.const 0))
+                (func (export "chat_stream_request") (result i32) (i32.const 0))
+                (func (export "parse_chat_response") (result i32) (i32.const 0))
+                {static_export}
+                {request_export}
+                {parse_export})"#
+        );
+        let plugin = PluginBuilder::new(Manifest::new([Wasm::data(wasm.into_bytes())]))
+            .with_wasi(true)
+            .build()
+            .expect("test plugin should build");
+        ExtismFactory {
+            plugin: Arc::new(Mutex::new(plugin)),
+            name: "test".to_string(),
+            user_data: None,
+            allowed_hosts: vec!["127.0.0.1".to_string()],
+        }
+    }
+
+    async fn check_http_model_listing_wasi() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let static_factory = model_listing_factory(Some(r#"["static-model"]"#), "invalid");
+        let models = LLMProviderFactory::list_models(&static_factory, "{}")
+            .await
+            .expect("static listing should not construct an HTTP request");
+        assert_eq!(models, ["static-model"]);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                socket.read(&mut buffer).await.unwrap();
+                socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let request = SerializableHttpRequest {
+            req: http::Request::builder()
+                .uri(format!("http://{addr}/models"))
+                .body(Vec::new())
+                .unwrap(),
+        };
+        // Cover both a missing static export and a static export returning None.
+        for static_models in [None, Some("null")] {
+            let factory =
+                model_listing_factory(static_models, &serde_json::to_string(&request).unwrap());
+            let models = LLMProviderFactory::list_models(&factory, "{}")
+                .await
+                .expect("HTTP listing should prepare and parse off the async thread");
+            assert_eq!(models, ["parsed-model"]);
+        }
+        server.await.unwrap();
+
+        let invalid_factory = model_listing_factory(Some("null"), "invalid");
+        assert!(
+            LLMProviderFactory::list_models(&invalid_factory, "{}")
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            LLMProviderFactory::list_models(&invalid_factory, "{").await,
+            Err(LLMError::JsonError(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_model_listing_wasi_current_thread() {
+        check_http_model_listing_wasi().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_model_listing_wasi_multi_thread() {
+        check_http_model_listing_wasi().await;
+    }
 
     #[test]
     fn malformed_config_is_json_error() {
