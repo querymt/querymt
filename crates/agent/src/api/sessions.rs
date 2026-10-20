@@ -346,17 +346,20 @@ where
                     Ok(None) | Err(_) => return HashMap::new(),
                 };
 
+                let mut session_requests =
+                    futures_util::stream::iter(session_ids.into_iter().map(|session_id| {
+                        let fetch_lifecycle = Arc::clone(&fetch_lifecycle);
+                        let manager = manager.clone();
+                        async move {
+                            let lifecycle = fetch_lifecycle(manager, session_id.clone()).await;
+                            (session_id, lifecycle)
+                        }
+                    }))
+                    .buffer_unordered(REMOTE_LIFECYCLE_CONCURRENCY);
                 let mut node_lifecycles = HashMap::new();
-                for session_id in session_ids {
-                    let lifecycle = match tokio::time::timeout_at(
-                        deadline,
-                        fetch_lifecycle(manager.clone(), session_id.clone()),
-                    )
-                    .await
-                    {
-                        Ok(lifecycle) => lifecycle,
-                        Err(_) => break,
-                    };
+                while let Ok(Some((session_id, lifecycle))) =
+                    tokio::time::timeout_at(deadline, session_requests.next()).await
+                {
                     node_lifecycles.insert(session_id, lifecycle);
                 }
                 node_lifecycles
@@ -1943,6 +1946,74 @@ mod remote_page_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn lifecycle_enrichment_fetches_100_healthy_sessions_within_shared_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let find_calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let summaries = (0..100)
+            .map(|index| summary(&format!("session-{index:03}"), "healthy-owner"))
+            .collect::<Vec<_>>();
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            {
+                let find_calls = Arc::clone(&find_calls);
+                move |_node_id: String| {
+                    let find_calls = Arc::clone(&find_calls);
+                    async move {
+                        find_calls.fetch_add(1, Ordering::SeqCst);
+                        Some("healthy-owner".to_string())
+                    }
+                }
+            },
+            {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                move |manager: String, session_id: String| {
+                    let fetch_calls = Arc::clone(&fetch_calls);
+                    let in_flight = Arc::clone(&in_flight);
+                    let max_in_flight = Arc::clone(&max_in_flight);
+                    async move {
+                        assert_eq!(manager, "healthy-owner");
+                        fetch_calls.fetch_add(1, Ordering::SeqCst);
+                        let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(active, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        let index = session_id
+                            .strip_prefix("session-")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        Some(lifecycle(&session_id, index % 2 == 0))
+                    }
+                }
+            },
+        )
+        .await;
+
+        let completed_count = lifecycles.values().filter(|state| state.is_some()).count();
+        assert_eq!(
+            completed_count,
+            summaries.len(),
+            "all healthy lifecycle lookups should fit within the shared node deadline"
+        );
+        for (index, summary) in summaries.iter().enumerate() {
+            assert_eq!(
+                lifecycles.get(&summary.session_id),
+                Some(&Some(lifecycle(&summary.session_id, index % 2 == 0)))
+            );
+        }
+        assert_eq!(find_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), summaries.len());
+        assert!(max_in_flight.load(Ordering::SeqCst) > 1);
+        assert!(max_in_flight.load(Ordering::SeqCst) <= REMOTE_LIFECYCLE_CONCURRENCY);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn lifecycle_enrichment_keeps_completed_states_and_bounds_offline_or_slow_nodes() {
         use std::sync::{Arc, Mutex};
 
@@ -1986,10 +2057,22 @@ mod remote_page_tests {
             Some(&Some(lifecycle("known", true)))
         );
         assert_eq!(lifecycles.get("slow"), Some(&None));
-        assert_eq!(lifecycles.get("after-timeout"), Some(&None));
         assert_eq!(
-            fetch_calls.lock().unwrap().clone(),
-            vec!["known".to_string(), "slow".to_string()]
+            lifecycles.get("after-timeout"),
+            Some(&Some(lifecycle("after-timeout", true)))
+        );
+        let fetch_calls = fetch_calls.lock().unwrap();
+        assert_eq!(fetch_calls.len(), 3);
+        assert_eq!(
+            fetch_calls
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([
+                "known".to_string(),
+                "slow".to_string(),
+                "after-timeout".to_string(),
+            ])
         );
     }
 }
