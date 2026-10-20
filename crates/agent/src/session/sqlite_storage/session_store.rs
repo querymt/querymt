@@ -357,6 +357,104 @@ impl SessionStore for SqliteStorage {
         .await
     }
 
+    fn supports_session_pins(&self) -> bool {
+        true
+    }
+
+    async fn set_session_pinned(
+        &self,
+        session_id: &str,
+        pinned: bool,
+    ) -> SessionResult<(crate::session::store::SessionPin, bool)> {
+        let session_id = session_id.to_owned();
+        self.run_blocking_session(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let internal_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM sessions WHERE public_id = ?1",
+                    params![session_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(internal_id) = internal_id else {
+                return Err(SessionError::SessionNotFound(session_id));
+            };
+
+            let changed = if pinned {
+                let pinned_at = OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|error| SessionError::SerializationError(error.to_string()))?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO session_pins (session_id, pinned_at) VALUES (?1, ?2)",
+                    params![internal_id, pinned_at],
+                )?
+            } else {
+                tx.execute(
+                    "DELETE FROM session_pins WHERE session_id = ?1",
+                    params![internal_id],
+                )?
+            } > 0;
+            let pinned_at = tx
+                .query_row(
+                    "SELECT pinned_at FROM session_pins WHERE session_id = ?1",
+                    params![internal_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            tx.commit()?;
+            Ok((
+                crate::session::store::SessionPin {
+                    session_id,
+                    pinned,
+                    pinned_at,
+                },
+                changed,
+            ))
+        })
+        .await
+    }
+
+    async fn get_session_pins(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, crate::session::store::SessionPin>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let session_ids = session_ids.to_vec();
+        self.run_blocking_session(move |conn| {
+            let mut pins = HashMap::with_capacity(session_ids.len());
+            for chunk in session_ids.chunks(500) {
+                let placeholders = std::iter::repeat_n("?", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT s.public_id, p.pinned_at
+                     FROM sessions s LEFT JOIN session_pins p ON p.session_id = s.id
+                     WHERE s.public_id IN ({placeholders})"
+                ))?;
+                let rows = stmt.query_map(params_from_iter(chunk.iter()), |row| {
+                    let session_id: String = row.get(0)?;
+                    let pinned_at: Option<String> = row.get(1)?;
+                    Ok(crate::session::store::SessionPin {
+                        session_id,
+                        pinned: pinned_at.is_some(),
+                        pinned_at,
+                    })
+                })?;
+                for row in rows {
+                    let pin = row?;
+                    pins.insert(pin.session_id.clone(), pin);
+                }
+            }
+            if let Some(missing_id) = session_ids.iter().find(|id| !pins.contains_key(*id)) {
+                return Err(SessionError::SessionNotFound(missing_id.clone()));
+            }
+            Ok(pins)
+        })
+        .await
+    }
+
     async fn set_session_name(
         &self,
         session_id: &str,

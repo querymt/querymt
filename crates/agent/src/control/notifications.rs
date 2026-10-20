@@ -78,3 +78,27 @@ pub struct SessionInputStateNotification {
     #[typeshare(serialized_as = "number")]
     pub latency_ms: Option<u64>,
 }
+
+pub(crate) async fn emit_session_pins_changed_notification(
+    agent: &crate::LocalAgentHandle,
+    session_id: &str,
+) {
+    let params = match serde_json::value::RawValue::from_string(
+        serde_json::json!({ "session_id": session_id }).to_string(),
+    ) {
+        Ok(raw) => std::sync::Arc::from(raw),
+        Err(_) => return,
+    };
+    let notification = crate::acp::protocol::ExtNotification::new(
+        crate::acp::shared::QMT_NOTIFICATION_SESSION_PINS_CHANGED,
+        params,
+    );
+    agent.broadcast_ext_notification(notification.clone());
+
+    let bridge = agent.bridge.lock().ok().and_then(|guard| guard.clone());
+    if let Some(bridge) = bridge
+        && let Err(error) = bridge.notify_ext(notification).await
+    {
+        log::warn!("Failed to send session-pins-changed notification: {error}");
+    }
+}

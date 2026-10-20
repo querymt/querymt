@@ -34,27 +34,39 @@ use typeshare::typeshare;
 struct AcpSessionLifecycleFilters {
     resolution: ResolutionFilter,
     archive: ArchiveFilter,
+    #[serde(default, deserialize_with = "deserialize_filter_pinned")]
+    pinned: Option<bool>,
 }
 
-fn acp_session_lifecycle_filter(
+fn deserialize_filter_pinned<'de, D>(deserializer: D) -> std::result::Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
+}
+
+fn acp_session_filters(
     meta: Option<&Meta>,
-) -> std::result::Result<SessionLifecycleFilter, AcpSessionListError> {
+) -> std::result::Result<(SessionLifecycleFilter, Option<bool>), AcpSessionListError> {
     let Some(querymt) = meta.and_then(|meta| meta.get("querymt")) else {
-        return Ok(SessionLifecycleFilter::default());
+        return Ok((SessionLifecycleFilter::default(), None));
     };
     let Some(filters) = querymt
         .as_object()
         .ok_or_else(|| anyhow!("_meta.querymt must be an object"))?
         .get("sessionFilters")
     else {
-        return Ok(SessionLifecycleFilter::default());
+        return Ok((SessionLifecycleFilter::default(), None));
     };
     let filters: AcpSessionLifecycleFilters = serde_json::from_value(filters.clone())
         .map_err(|error| anyhow!("invalid _meta.querymt.sessionFilters: {error}"))?;
-    Ok(SessionLifecycleFilter {
-        resolution: filters.resolution,
-        archive: filters.archive,
-    })
+    Ok((
+        SessionLifecycleFilter {
+            resolution: filters.resolution,
+            archive: filters.archive,
+        },
+        filters.pinned,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -771,9 +783,15 @@ impl AgentSessions {
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
-        let lifecycle = acp_session_lifecycle_filter(request.meta.as_ref())?;
+        let (lifecycle, pinned) = acp_session_filters(request.meta.as_ref())?;
         #[cfg(feature = "remote")]
         let remote_nodes = acp_remote_node_ids(request.meta.as_ref());
+        #[cfg(feature = "remote")]
+        if pinned.is_some() && !remote_nodes.is_empty() {
+            return Err(
+                anyhow!("pinned session filters cannot be combined with remoteNodeIds").into(),
+            );
+        }
         #[cfg(feature = "remote")]
         let remote_cursor = request
             .cursor
@@ -805,7 +823,15 @@ impl AgentSessions {
             .await;
         }
 
-        let mut page = if lifecycle.is_filtered() {
+        let mut page = if pinned.is_some() {
+            Self::list_for_acp_from_view_store_with_pins(
+                view_store.clone(),
+                request,
+                lifecycle,
+                pinned,
+            )
+            .await?
+        } else if lifecycle.is_filtered() {
             Self::list_for_acp_from_view_store_with_lifecycle(
                 view_store.clone(),
                 request,
@@ -1063,6 +1089,15 @@ impl AgentSessions {
         request: AcpListSessionsRequest,
         lifecycle: SessionLifecycleFilter,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
+        Self::list_for_acp_from_view_store_with_pins(view_store, request, lifecycle, None).await
+    }
+
+    async fn list_for_acp_from_view_store_with_pins(
+        view_store: Arc<dyn ViewStore>,
+        request: AcpListSessionsRequest,
+        lifecycle: SessionLifecycleFilter,
+        pinned: Option<bool>,
+    ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let cursor = AcpSessionCursor::parse(request.cursor.as_deref())?;
         let requested_cwd = request
             .cwd
@@ -1072,12 +1107,13 @@ impl AgentSessions {
         let limit = if requested_cwd.is_some() { 10 } else { 100 };
 
         let (sessions, next_cursor, total_count) = view_store
-            .list_session_items_with_lifecycle(
+            .list_session_items_with_pins(
                 requested_cwd,
                 cursor.map(AcpSessionCursor::into_string),
                 limit,
                 session_scope,
                 lifecycle,
+                pinned,
             )
             .await
             .map_err(anyhow::Error::from)?;
@@ -1137,6 +1173,11 @@ impl AgentSessions {
         } else {
             HashMap::new()
         };
+        let pins = if session_store.supports_session_pins() && !local_session_ids.is_empty() {
+            session_store.get_session_pins(&local_session_ids).await?
+        } else {
+            HashMap::new()
+        };
         let actor_refs = {
             let registry = agent.registry.lock().await;
             registry.get_many(session_ids.iter().map(String::as_str))
@@ -1175,6 +1216,9 @@ impl AgentSessions {
             acp_meta.extend(meta.to_acp_meta());
             if let Some(lifecycle) = lifecycles.get(&session_id) {
                 insert_acp_lifecycle_meta(&mut acp_meta, lifecycle);
+            }
+            if let Some(pin) = pins.get(&session_id) {
+                insert_acp_pin_meta(&mut acp_meta, pin);
             }
             info.meta = Some(acp_meta);
         }
@@ -1285,13 +1329,19 @@ impl AgentSessions {
 
     pub async fn delete(&self, session_id: impl AsRef<str>) -> Result<()> {
         let session_id = session_id.as_ref().to_string();
+        let store = self.session_store();
         // Remove the durable remote bookmark first: if that fails, return
         // early with the session row intact instead of deleting the row and
         // leaving a dangling bookmark behind.
-        self.session_store()
-            .remove_remote_session_bookmark(&session_id)
-            .await?;
-        self.session_store().delete_session(&session_id).await?;
+        store.remove_remote_session_bookmark(&session_id).await?;
+        store.delete_session(&session_id).await?;
+        if store.supports_session_pins() {
+            crate::control::notifications::emit_session_pins_changed_notification(
+                &self.agent,
+                &session_id,
+            )
+            .await;
+        }
         self.agent.clear_delegate_model_overrides(&session_id).await;
         #[cfg(feature = "remote")]
         {
@@ -1617,6 +1667,24 @@ fn insert_acp_lifecycle_meta(meta: &mut Meta, lifecycle: &SessionLifecycle) {
         namespace.insert(
             "lifecycle".into(),
             serde_json::to_value(lifecycle).expect("serialize lifecycle metadata"),
+        );
+    }
+}
+
+fn insert_acp_pin_meta(meta: &mut Meta, pin: &crate::session::store::SessionPin) {
+    let namespace = meta
+        .entry("querymt")
+        .or_insert_with(|| serde_json::json!({}));
+    if !namespace.is_object() {
+        *namespace = serde_json::json!({});
+    }
+    if let Some(namespace) = namespace.as_object_mut() {
+        namespace.insert(
+            "pin".into(),
+            serde_json::json!({
+                "pinned": pin.pinned,
+                "pinned_at": pin.pinned_at,
+            }),
         );
     }
 }

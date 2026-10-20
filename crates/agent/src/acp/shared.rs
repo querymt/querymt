@@ -488,6 +488,7 @@ pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed"
 pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
 pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/delegateModelsChanged";
 pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
+pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
     serde_json::json!({

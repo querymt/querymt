@@ -410,6 +410,25 @@ pub trait ViewStore: Send + Sync {
             .await
     }
 
+    /// ACP flat-list variant that composes an optional persisted pin filter in storage.
+    async fn list_session_items_with_pins(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+        pinned: Option<bool>,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        if pinned.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "Session pin filtering is unsupported by this view store".into(),
+            ));
+        }
+        self.list_session_items_with_lifecycle(cwd, cursor, limit, session_scope, lifecycle)
+            .await
+    }
+
     /// Lifecycle-aware variant of [`ViewStore::search_sessions`].
     async fn search_sessions_with_lifecycle(
         &self,

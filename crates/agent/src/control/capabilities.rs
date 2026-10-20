@@ -115,6 +115,14 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             "querymt/session/setLifecycle".to_string(),
         ]);
     }
+    let session_pins = agent
+        .config
+        .provider
+        .history_store()
+        .supports_session_pins();
+    if session_pins {
+        methods.push("querymt/session/setPinned".to_string());
+    }
 
     if agent.profiles().is_some() {
         methods.extend([
@@ -160,6 +168,9 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
     if agent.profiles().is_some() {
         notifications
             .push(crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED.to_string());
+    }
+    if session_pins {
+        notifications.push(crate::acp::shared::QMT_NOTIFICATION_SESSION_PINS_CHANGED.to_string());
     }
 
     CapabilitiesInfo {

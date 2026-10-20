@@ -98,6 +98,7 @@ async fn test_querymt_capabilities_lists_control_surface() {
         "querymt/session/undoStack",
         "querymt/session/getLifecycle",
         "querymt/session/setLifecycle",
+        "querymt/session/setPinned",
         "querymt/auth/status",
         "querymt/auth/start",
         "querymt/auth/complete",
@@ -117,6 +118,7 @@ async fn test_querymt_capabilities_lists_control_surface() {
     }
     assert_eq!(result["features"]["auth"], true);
     assert_eq!(result["features"]["session_lifecycle"], true);
+    assert_eq!(result["features"]["session_pins"], true);
     assert_eq!(result["elicitation_recovery"]["version"], 1);
     for method in [
         "querymt/elicitation/listPendingSessions",
@@ -148,6 +150,11 @@ async fn test_querymt_capabilities_lists_control_surface() {
         notifications
             .iter()
             .any(|method| method == "querymt/session/inputState")
+    );
+    assert!(
+        notifications
+            .iter()
+            .any(|method| method == "querymt/session/pinsChanged")
     );
     assert_eq!(result["features"]["steering"], true);
     assert_eq!(result["transport"]["mesh_transport"], "none");

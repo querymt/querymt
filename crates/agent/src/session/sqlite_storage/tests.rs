@@ -3732,6 +3732,86 @@ async fn session_lifecycle_storage_defaults_patches_and_cascades() {
 }
 
 #[tokio::test]
+async fn session_pins_are_idempotent_and_cascade_without_activity_writes() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("pinned".into()), None, None, None)
+        .await
+        .unwrap();
+    let store: &dyn SessionStore = &storage;
+    assert!(store.supports_session_pins());
+    let before_activity = store
+        .get_session(&session.public_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .updated_at;
+
+    let (pinned, changed) = store
+        .set_session_pinned(&session.public_id, true)
+        .await
+        .unwrap();
+    assert!(changed);
+    assert!(pinned.pinned);
+    let pinned_at = pinned.pinned_at.expect("pin timestamp");
+    let (repeated, changed) = store
+        .set_session_pinned(&session.public_id, true)
+        .await
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(repeated.pinned_at.as_deref(), Some(pinned_at.as_str()));
+
+    assert_eq!(
+        store
+            .get_session(&session.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        before_activity
+    );
+    let (unpinned, changed) = store
+        .set_session_pinned(&session.public_id, false)
+        .await
+        .unwrap();
+    assert!(changed);
+    assert!(!unpinned.pinned);
+    assert_eq!(unpinned.pinned_at, None);
+    let (_, changed) = store
+        .set_session_pinned(&session.public_id, false)
+        .await
+        .unwrap();
+    assert!(!changed);
+
+    store
+        .set_session_pinned(&session.public_id, true)
+        .await
+        .unwrap();
+    let internal_id: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM sessions WHERE public_id = ?1",
+            rusqlite::params![session.public_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store.delete_session(&session.public_id).await.unwrap();
+    let remaining_pin_rows: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_pins WHERE session_id = ?1",
+            rusqlite::params![internal_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_pin_rows, 0, "session deletion cascades pins");
+}
+
+#[tokio::test]
 async fn session_lifecycle_state_survives_reopening_storage() {
     let db = tempfile::NamedTempFile::new().unwrap();
     let db_path = db.path().to_path_buf();

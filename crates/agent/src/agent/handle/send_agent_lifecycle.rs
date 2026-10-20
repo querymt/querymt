@@ -250,10 +250,8 @@ impl LocalAgentHandle {
             tracing::warn!(session_id, %error, "session_end hook failed during delete");
         }
 
-        let exists = self
-            .config
-            .provider
-            .history_store()
+        let store = self.config.provider.history_store();
+        let exists = store
             .get_session(&session_id)
             .await
             .map_err(|e| Error::internal_error().data(serde_json::json!({"error": e.to_string()})))?
@@ -266,14 +264,16 @@ impl LocalAgentHandle {
             return Ok(DeleteSessionResponse::new());
         }
 
-        self.config
-            .provider
-            .history_store()
-            .delete_session(&session_id)
-            .await
-            .map_err(|e| {
-                Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
-            })?;
+        store.delete_session(&session_id).await.map_err(|e| {
+            Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
+        })?;
+        if store.supports_session_pins() {
+            crate::control::notifications::emit_session_pins_changed_notification(
+                self,
+                &session_id,
+            )
+            .await;
+        }
         self.clear_delegate_model_overrides(&session_id).await;
         if let Some(profiles) = self.profiles() {
             profiles.forget_session_binding(&session_id).await;

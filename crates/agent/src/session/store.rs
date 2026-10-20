@@ -18,6 +18,13 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPin {
+    pub session_id: String,
+    pub pinned: bool,
+    pub pinned_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeBinding {
     pub profile_id: String,
     pub agent_id: Option<String>,
@@ -341,6 +348,32 @@ pub trait SessionStore: Send + Sync {
     ) -> SessionResult<HashMap<String, SessionLifecycle>> {
         Err(SessionError::InvalidOperation(
             "Session lifecycle is unsupported by this store".into(),
+        ))
+    }
+
+    /// Whether this store provides authoritative persisted session pin state.
+    fn supports_session_pins(&self) -> bool {
+        false
+    }
+
+    /// Atomically pin or unpin a locally stored session, returning whether its state changed.
+    async fn set_session_pinned(
+        &self,
+        _session_id: &str,
+        _pinned: bool,
+    ) -> SessionResult<(SessionPin, bool)> {
+        Err(SessionError::InvalidOperation(
+            "Session pins are unsupported by this store".into(),
+        ))
+    }
+
+    /// Batch-read pin state for existing local sessions.
+    async fn get_session_pins(
+        &self,
+        _session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionPin>> {
+        Err(SessionError::InvalidOperation(
+            "Session pins are unsupported by this store".into(),
         ))
     }
 
