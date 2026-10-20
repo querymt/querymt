@@ -177,6 +177,7 @@ to run Git commands:
 /worktree list
 /worktree status <workspace-id>
 /worktree result <workspace-id>
+/worktree publish [workspace-id]
 /worktree archive <workspace-id>
 /worktree remove <workspace-id>
 /worktree recover <workspace-id>
@@ -188,9 +189,9 @@ issuing the command does not switch roots. The optional name labels the new
 session, not its managed branch. Names and refs are single whitespace-separated
 tokens. With `--include-local-changes`, an optional name is accepted but a base
 ref is not. Without that flag local edits are excluded. Ignored untracked
-files are always excluded. `status` and `result` default to the current
-session's workspace when no ID is supplied; local sessions must supply an ID.
-Results are also returned in prompt response `_meta["querymt.worktree"]`.
+files are always excluded. `status`, `result`, and `publish` default to the
+current session's workspace when no ID is supplied; local sessions must supply
+an ID. Results are also returned in prompt response `_meta["querymt.worktree"]`.
 
 The same service backs additive ACP extension methods:
 
@@ -200,17 +201,28 @@ The same service backs additive ACP extension methods:
 | `querymt/worktree/list` | `{}` |
 | `querymt/worktree/status` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/result` | `{"workspace_id":"<id>"}` |
+| `querymt/worktree/publish` | `{"workspace_id":"<id>"}` or `{"session_id":"<id>"}` |
 | `querymt/worktree/archive` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/remove` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/recover` | `{"workspace_id":"<id>"}` or `{"session_id":"<id>"}` (pending isolated forks) |
 
 Commit-based creation also accepts `base_ref` (or `baseRef`). Result responses
-contain immutable baseline/result OIDs, retained result refs, and verification
-status; an empty result list does not imply integration. Session views include
-workspace provenance and distinct execution cwd values. Managed sessions group
-under `repository:<canonical-common-dir>`; local sessions retain cwd grouping.
-A durable `session_workspace_bound` event exposes the same binding without
+carry the immutable baseline/result OIDs and retained result refs, the
+baseline-relative changed paths with change kinds, the verification state, and
+the **captured HEAD**; live HEAD and dirty status are reported separately. An
+empty result list does not imply integration. Session views include workspace
+provenance and distinct execution cwd values. Managed sessions group under
+`repository:<canonical-common-dir>`; local sessions retain cwd grouping. A
+durable `session_workspace_bound` event exposes the same binding without
 changing existing ACP session updates.
+
+`publish` is the explicit top-level publication entry point. It captures the
+workspace's current uncommitted working state as an immutable result through
+the same private-index capture used for delegates, so the real index, working
+files, and every other checkout remain unchanged. Publication performs no
+verification, which is reported as `skipped`. A failed capture reports an
+explicit error and keeps the checkout untouched; it never records a partial
+result. Inspection (`result`) is read-only and never republishes live state.
 
 ### Opt-in workflow
 
@@ -219,7 +231,8 @@ changing existing ACP session updates.
 2. Attach to its returned session ID. Its delegates inherit isolation; a local
    parent can explicitly request `"isolation":"isolated"` on the delegate tool.
 3. Inspect the retained child ID/path and `/worktree result <id>`. Review only
-   baseline-to-result changes using the exact OIDs/refs in the response.
+   baseline-to-result changes using the exact OIDs/refs in the response. A
+   top-level workspace publishes its own delta with `/worktree publish`.
 4. Integrate that delta manually after review. No completion, cancellation,
    disconnection, or command merges it for you.
 5. Close the owning session and any explicitly shared delegates. From another
@@ -447,49 +460,64 @@ snapshot backend, and undo reports its usual unavailable-backend behavior
 rather than substituting workspace Git refs as undo history. Enabling
 isolation never silently enables snapshots when they were disabled.
 
-## Reviewing and integrating delegate results
+## Reviewing and integrating results
 
-Nothing is ever merged back automatically. When an isolated delegate
-finishes, its workspace — checkout path, managed branch, baseline, and (for
-uncommitted output) a captured result — is retained exactly as it was, and
-the completion, failure, cancellation, and summary output identify what was
-retained.
+Nothing is ever merged back automatically. Delegates publish their uncommitted
+output automatically on completion; top-level workspaces publish explicitly
+with `/worktree publish` or `querymt/worktree/publish`. Either way the
+workspace — checkout path, managed branch, baseline, and a captured immutable
+result — is retained exactly as it was, and the completion, failure,
+cancellation, and summary output identify what was retained.
 
-A retained result is **baseline-relative**. The delegate started from a
-private baseline commit (which included the parent's working state at
-dispatch); the captured result contains that baseline plus the delegate's
-own work. To see only what the delegate did, diff the two refs:
+A retained result is **baseline-relative**. The workspace started from a
+private baseline commit (which included the parent's working state at dispatch
+for delegates); the captured result contains that baseline plus the
+workspace's own work. Review reports the baseline-to-result changes without
+consulting the live checkout:
+
+- `baseline_commit` / `result_commit` and the retained `result_ref`
+  (`refs/qmt/results/<workspace-id>/<result-id>`),
+- `changed_paths` with change kinds (`added`, `modified`, `deleted`),
+- `captured_head` — the checkout HEAD when the result was captured — and the
+  `verification` state (`passed`, `failed`, `pending`, or `skipped`),
+- live `live_head`/`dirty` state separately; later edits or commits never
+  rewrite an existing result, and each new publication gets its own
+  create-only ref.
+
+You can also reproduce the delta with Git directly:
 
 ```sh
-git diff --name-only "refs/qmt/baselines/<workspace-id>" \
-                      "refs/qmt/results/<workspace-id>/<result-id>"
+git diff --name-status "refs/qmt/baselines/<workspace-id>" \
+                        "refs/qmt/results/<workspace-id>/<result-id>"
 ```
 
 Example: a parent with uncommitted edits to `config.rs` dispatches an
 isolated delegate that changes `auth.rs` and leaves `notes.md` untracked.
 The baseline already contains the `config.rs` edit, so the baseline→result
-diff lists exactly `auth.rs` and `notes.md` — the delegate's delta — and
-never reports the inherited `config.rs` change as delegate work.
+review lists exactly `auth.rs` and `notes.md` — the delegate's delta — and
+never reports the inherited `config.rs` change as delegate work. The same
+applies to an explicit top-level publication, which reports only that
+workspace's changes since its baseline.
 
 !!! warning "Do not raw-merge a private branch from a dirty parent"
-    The delegate's managed branch points at (or beyond) its baseline, and
-    the baseline embeds the parent's uncommitted edits at dispatch time.
-    `git merge <managed-branch>` (or cherry-picking its tip wholesale) can
-    therefore bring the parent's baseline edits along with the delegate's
-    work. Integrate the delta deliberately instead:
+    When the baseline captured uncommitted parent edits, result responses set
+    `baseline_includes_uncommitted_edits` and include an
+    `integration_warning`. The managed branch points at (or beyond) that
+    baseline, so `git merge <managed-branch>` (or cherry-picking its tip
+    wholesale) can bring the parent's baseline edits along with the
+    workspace's work. Integrate the delta deliberately instead:
 
     ```sh
-    # Apply only the delegate's delta onto your current branch:
+    # Apply only the published delta onto your current branch:
     git diff "refs/qmt/baselines/<workspace-id>" \
              "refs/qmt/results/<workspace-id>/<result-id>" | git apply
     ```
 
-    or, if the delegate produced real commits and the parent was clean,
-    cherry-pick the delegate's commit range. If the parent was dirty, either
-    commit the parent's state coherently first, or apply the baseline-relative
-    patch as above. A clean worktree or a completed status never implies the
-    result has been applied or accepted — review the delta and integrate it
-    yourself.
+    or, if the workspace produced real commits and the parent was clean,
+    cherry-pick the commit range. If the parent was dirty, either commit the
+    parent's state coherently first, or apply the baseline-relative patch as
+    above. A clean worktree or a completed status never implies the result has
+    been applied or accepted — review the delta and integrate it yourself.
 
 ## What isolation does not do
 

@@ -1816,7 +1816,9 @@ impl RepositoryOps for FaultInjectingRepoOps {
         if let Some(err) = self.take_failure(FailurePoint::ChangedPaths) {
             return Err(err);
         }
-        self.inner().changed_paths_between(common_dir, base, tip).await
+        self.inner()
+            .changed_paths_between(common_dir, base, tip)
+            .await
     }
 
     async fn capture_working_state(&self, checkout: &Path) -> WorktreeResult<CapturedWorkingState> {

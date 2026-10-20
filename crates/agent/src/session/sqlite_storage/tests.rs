@@ -2527,6 +2527,7 @@ fn worktree_workspace_migration_upgrades_existing_database() {
                 "result_ref",
                 "verification",
                 "captured_at",
+                "captured_head",
             ],
         ),
     ] {

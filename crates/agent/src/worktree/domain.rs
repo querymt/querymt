@@ -973,6 +973,7 @@ mod tests {
             result_ref: Some("refs/qmt/results/ws-1".into()),
             verification: Some(ResultVerificationStatus::Passed),
             captured_at: datetime!(2026-01-15 12:00:00 UTC),
+            captured_head: Some("head789".into()),
         };
         assert_eq!(roundtrip(&provenance), provenance);
     }
@@ -985,8 +986,74 @@ mod tests {
             result_ref: None,
             verification: Some(ResultVerificationStatus::Failed),
             captured_at: datetime!(2026-01-15 12:00:00 UTC),
+            captured_head: None,
         };
         assert_eq!(roundtrip(&provenance), provenance);
+    }
+
+    #[test]
+    fn legacy_provenance_without_captured_head_deserializes() {
+        let legacy = serde_json::json!({
+            "baseline_commit": "base123",
+            "result_commit": "res456",
+            "result_ref": "refs/qmt/results/ws-1/one",
+            "verification": "passed",
+            "captured_at": "2026-01-15T12:00:00Z",
+        });
+        let provenance: ResultProvenance = serde_json::from_value(legacy).unwrap();
+        assert_eq!(provenance.captured_head, None);
+    }
+
+    #[test]
+    fn change_kind_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&ChangeKind::Added).unwrap(),
+            "\"added\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ChangeKind::Modified).unwrap(),
+            "\"modified\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ChangeKind::Deleted).unwrap(),
+            "\"deleted\""
+        );
+        for kind in [ChangeKind::Added, ChangeKind::Modified, ChangeKind::Deleted] {
+            assert_eq!(ChangeKind::from_str(&kind.to_string()), Ok(kind));
+        }
+    }
+
+    #[test]
+    fn review_summary_lists_delta_and_warns_on_dirty_baseline() {
+        let clean = ResultReview {
+            baseline_commit: "base".into(),
+            result_commit: "res".into(),
+            result_ref: Some("refs/qmt/results/ws/one".into()),
+            captured_head: "head".into(),
+            verification: Some(ResultVerificationStatus::Skipped),
+            captured_at: datetime!(2026-01-15 12:00:00 UTC),
+            changed_paths: vec![
+                ChangedPath {
+                    path: "b.txt".into(),
+                    kind: ChangeKind::Modified,
+                },
+                ChangedPath {
+                    path: "c.txt".into(),
+                    kind: ChangeKind::Added,
+                },
+            ],
+            baseline_includes_uncommitted_edits: false,
+        };
+        let text = clean.summary_text();
+        assert!(text.contains("b.txt (modified)"));
+        assert!(text.contains("c.txt (added)"));
+        assert!(!text.contains("WARNING"));
+
+        let dirty = ResultReview {
+            baseline_includes_uncommitted_edits: true,
+            ..clean
+        };
+        assert!(dirty.summary_text().contains("WARNING"));
     }
 
     #[test]

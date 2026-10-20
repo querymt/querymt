@@ -56,6 +56,7 @@ impl LocalAgentHandle {
             "querymt/worktree/list" => self.handle_ext_worktree_list().await,
             "querymt/worktree/status" => self.handle_ext_worktree_status(req).await,
             "querymt/worktree/result" => self.handle_ext_worktree_result(req).await,
+            "querymt/worktree/publish" => self.handle_ext_worktree_publish(req).await,
             "querymt/worktree/remove" => self.handle_ext_worktree_remove(req).await,
             "querymt/worktree/recover" => self.handle_ext_worktree_recover(req).await,
             "querymt/worktree/archive" => self.handle_ext_worktree_archive(req).await,

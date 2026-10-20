@@ -811,7 +811,7 @@ mod tests {
             "original"
         );
         let result = svc
-            .capture_delegate_result(
+            .publish_result(
                 &child1.record,
                 &child1.effective_cwd,
                 Some(&child1.mutation_gate),
@@ -916,7 +916,7 @@ mod tests {
         );
         fs::write(bound.effective_cwd.join("file.txt"), "recoverable child").unwrap();
         let result = svc
-            .capture_delegate_result(
+            .publish_result(
                 &bound.record,
                 &bound.effective_cwd,
                 Some(&bound.mutation_gate),
@@ -1293,7 +1293,7 @@ mod tests {
         fs::write(child.effective_cwd.join("out.txt"), "delegate work").unwrap();
 
         let provenance = svc
-            .capture_delegate_result(
+            .publish_result(
                 &child.record,
                 &child.effective_cwd,
                 Some(&child.mutation_gate),
@@ -1339,28 +1339,57 @@ mod tests {
             "untracked"
         );
 
-        // Baseline-relative diff shows only the delegate's own delta —
-        // the inherited parent edit to file.txt is not misattributed.
-        let changed = git
-            .run(
-                child.effective_cwd.as_path(),
-                &[
-                    "diff",
-                    "--name-only",
-                    baseline_commit.as_str(),
-                    result_commit,
-                ],
-            )
-            .await
-            .unwrap()
-            .stdout_str();
-        let mut files: Vec<&str> = changed.lines().map(str::trim).collect();
-        files.retain(|f| !f.is_empty());
-        files.sort_unstable();
-        assert_eq!(files, vec!["notes.txt", "out.txt"], "changed: {changed}");
+        // Baseline-relative review of the immutable result reports only the
+        // delegate's own delta — the inherited parent edit to file.txt is
+        // part of the baseline and is not misattributed to the child.
+        let review = svc.review_result(&child.record, &provenance).await.unwrap();
+        assert_eq!(review.baseline_commit, baseline_commit);
+        assert_eq!(review.result_commit, result_commit);
+        assert_eq!(review.result_ref.as_deref(), Some(result_ref));
+        assert_eq!(
+            review.changed_paths,
+            vec![
+                crate::worktree::ChangedPath {
+                    path: "notes.txt".into(),
+                    kind: crate::worktree::ChangeKind::Modified,
+                },
+                crate::worktree::ChangedPath {
+                    path: "out.txt".into(),
+                    kind: crate::worktree::ChangeKind::Added,
+                },
+            ]
+        );
+        assert_eq!(
+            review.verification,
+            Some(ResultVerificationStatus::Passed),
+            "verification state is reported with the review"
+        );
+        assert_eq!(
+            &review.captured_head,
+            child
+                .record
+                .baseline
+                .as_ref()
+                .map(|b| &b.baseline_commit)
+                .expect("delegated workspace has a baseline"),
+            "captured HEAD is the checkout HEAD at capture time"
+        );
+        assert!(
+            review.baseline_includes_uncommitted_edits,
+            "the parent edit makes this a dirty-baseline result"
+        );
+        let review_text = review.summary_text();
+        assert!(
+            review_text.contains("notes.txt (modified)"),
+            "{review_text}"
+        );
+        assert!(review_text.contains("out.txt (added)"), "{review_text}");
+        assert!(!review_text.contains("file.txt"), "{review_text}");
+        assert!(review_text.contains("WARNING"), "{review_text}");
+
         fs::write(child.effective_cwd.join("out.txt"), "second result").unwrap();
         let second = svc
-            .capture_delegate_result(
+            .publish_result(
                 &child.record,
                 &child.effective_cwd,
                 Some(&child.mutation_gate),
@@ -1370,13 +1399,15 @@ mod tests {
             .unwrap();
         assert_ne!(second.result_ref.as_deref(), Some(result_ref));
         assert_eq!(
-            git.run(&child.effective_cwd, &["rev-parse", result_ref])
-                .await
-                .unwrap()
-                .stdout_str()
-                .trim(),
-            result_commit,
-            "new publication never overwrites old refs"
+            svc.review_result(&child.record, &provenance).await.unwrap(),
+            review,
+            "a later publication never changes the earlier immutable review"
+        );
+        let second_review = svc.review_result(&child.record, &second).await.unwrap();
+        assert_eq!(second_review.result_ref, second.result_ref);
+        assert_eq!(
+            second_review.verification,
+            Some(ResultVerificationStatus::Skipped)
         );
         assert_eq!(
             svc.registry()
@@ -1385,6 +1416,179 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// Section 17.1/17.2: an explicit top-level publication uses the same
+    /// service as delegates and reviews only the workspace's own
+    /// baseline-relative delta, leaving its index and files untouched.
+    #[tokio::test]
+    async fn top_level_publication_reviews_only_its_own_delta() {
+        use crate::worktree::{ChangeKind, ChangedPath, ResultVerificationStatus};
+
+        let (repo, _storage, svc) = service().await;
+        let record = provision_owned(&svc, repo.path(), "sess-owner").await;
+        let baseline = record.baseline.as_ref().unwrap().baseline_commit.clone();
+
+        // A modified tracked file plus a new file (never staged).
+        fs::write(record.checkout_path.join("file.txt"), "top-level edit").unwrap();
+        fs::write(record.checkout_path.join("added.txt"), "new").unwrap();
+
+        let provenance = svc
+            .publish_result(
+                &record,
+                &record.checkout_path,
+                None,
+                Some(ResultVerificationStatus::Skipped),
+            )
+            .await
+            .unwrap();
+        let review = svc.review_result(&record, &provenance).await.unwrap();
+
+        assert_eq!(review.baseline_commit, baseline);
+        assert_eq!(
+            review.changed_paths,
+            vec![
+                ChangedPath {
+                    path: "added.txt".into(),
+                    kind: ChangeKind::Added,
+                },
+                ChangedPath {
+                    path: "file.txt".into(),
+                    kind: ChangeKind::Modified,
+                },
+            ]
+        );
+        assert_eq!(
+            review.verification,
+            Some(ResultVerificationStatus::Skipped),
+            "explicit publication performs no verification"
+        );
+        assert_eq!(review.captured_head, baseline);
+        // Commit-mode baseline: no inherited uncommitted edits.
+        assert!(!review.baseline_includes_uncommitted_edits);
+        assert!(!review.summary_text().contains("WARNING"));
+
+        // Publication does not modify the checked-out files.
+        assert_eq!(
+            fs::read_to_string(record.checkout_path.join("file.txt")).unwrap(),
+            "top-level edit"
+        );
+        assert!(record.checkout_path.join("added.txt").exists());
+    }
+
+    /// Section 17.2: review reports the captured HEAD separately from live
+    /// state, so moving HEAD afterwards never rewrites the review.
+    #[tokio::test]
+    async fn review_reports_captured_head_separately_from_live_head() {
+        let (repo, _storage, svc) = service().await;
+        let record = provision_owned(&svc, repo.path(), "sess-owner").await;
+        let baseline = record.baseline.as_ref().unwrap().baseline_commit.clone();
+
+        fs::write(record.checkout_path.join("file.txt"), "edit").unwrap();
+        let provenance = svc
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+        let review = svc.review_result(&record, &provenance).await.unwrap();
+        assert_eq!(review.captured_head, baseline);
+
+        // Move the managed branch to a new commit and change the working
+        // file afterwards.
+        commit_files(&record.checkout_path, "later commit", &[("other.txt", "x")]);
+        fs::write(record.checkout_path.join("file.txt"), "later edit").unwrap();
+
+        let again = svc.review_result(&record, &provenance).await.unwrap();
+        assert_eq!(again, review, "later edits never rewrite the review");
+        assert_eq!(again.captured_head, baseline);
+    }
+
+    /// Section 17.3: review survives restart (fresh service over the same
+    /// durable registry/objects) and inspection never republishes.
+    #[tokio::test]
+    async fn review_is_available_after_restart_without_republishing() {
+        let (repo, _storage, mut svc) = service().await;
+        let record = provision_owned(&svc, repo.path(), "sess-owner").await;
+        fs::write(record.checkout_path.join("out.txt"), "work").unwrap();
+        let provenance = svc
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap();
+        let before = svc.review_result(&record, &provenance).await.unwrap();
+
+        // Simulate a restart: a brand-new service over the same event log,
+        // with a different storage root (gates/paths are not consulted by
+        // review) and no in-memory state from the first instance.
+        svc = WorkspaceService::new(
+            Arc::new(GixRepoOps::new()),
+            svc.registry().clone(),
+            TempDir::new().unwrap().path(),
+        );
+        let after = svc.review_result(&record, &provenance).await.unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.changed_paths.len(), 1);
+        assert_eq!(after.changed_paths[0].path, "out.txt");
+
+        // Inspection itself never publishes: whatever the checkout looks like
+        // now, the result list is unchanged by reading it.
+        fs::write(record.checkout_path.join("more.txt"), "more").unwrap();
+        let listed = svc.registry().list_results(&record.id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let _ = svc.review_latest_result(&record).await.unwrap();
+        assert_eq!(
+            svc.registry().list_results(&record.id).await.unwrap().len(),
+            1,
+            "review never publishes live state"
+        );
+    }
+
+    /// Section 17.1: a failed publication reports an explicit error, records
+    /// nothing, and leaves the checkout and its files untouched.
+    #[tokio::test]
+    async fn failed_publication_preserves_checkout_and_records_nothing() {
+        use crate::worktree::{FailurePoint, FaultInjectingRepoOps, GixRepoOps};
+
+        let (repo, storage, _svc) = service().await;
+        let faults = std::sync::Arc::new(FaultInjectingRepoOps::new(std::sync::Arc::new(
+            GixRepoOps::new(),
+        )));
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        schema::init_schema(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (public_id, name, created_at, updated_at) \
+             VALUES ('sess-owner', 'owner', '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let svc = WorkspaceService::new(
+            faults.clone(),
+            Arc::new(SqliteWorkspaceRepository::new(Arc::new(StdMutex::new(
+                conn,
+            )))),
+            storage.path(),
+        );
+        let record = provision_owned(&svc, repo.path(), "sess-owner").await;
+        fs::write(record.checkout_path.join("file.txt"), "kept").unwrap();
+
+        faults.fail_next(FailurePoint::CaptureWorkingState, 1, "disk unavailable");
+        let err = svc
+            .publish_result(&record, &record.checkout_path, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("disk unavailable"), "{err}");
+        assert!(
+            svc.registry()
+                .list_results(&record.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no result is recorded by a failed publication"
+        );
+        assert_eq!(
+            fs::read_to_string(record.checkout_path.join("file.txt")).unwrap(),
+            "kept",
+            "the checkout is preserved for recovery"
         );
     }
 

@@ -648,8 +648,28 @@ pub fn ensure_workspace_provisioning_columns(conn: &mut Connection) -> Result<()
     Ok(())
 }
 
-/// DDL for managed worktree workspaces and their retained result provenance.
+/// Add the `captured_head` column to `workspace_results` when an existing
+/// database predates it.
 ///
+/// Fresh installs get the column from [`WORKSPACE_TABLES_DDL`]; guarded so
+/// the paired migration stays idempotent. Existing rows keep NULL and review
+/// falls back to the workspace baseline commit.
+pub fn ensure_workspace_result_columns(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspace_results)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("captured_head") {
+        conn.execute(
+            "ALTER TABLE workspace_results ADD COLUMN captured_head TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// DDL for managed worktree workspaces and their retained result provenance.///
 /// Shared between `init_schema` (fresh installs) and the additive
 /// `0022_worktree_workspaces` migration (existing databases) so the two can
 /// never drift. All statements are `IF NOT EXISTS` and safe to re-run.
@@ -712,6 +732,10 @@ pub const WORKSPACE_TABLES_DDL: &str = r#"
         result_ref TEXT,
         verification TEXT CHECK (verification IN ('pending', 'passed', 'failed', 'skipped')),
         captured_at TEXT NOT NULL,
+        -- Checkout HEAD at capture time, kept distinct from live HEAD so
+        -- review stays accurate after later commits. NULL for rows written
+        -- before the column existed.
+        captured_head TEXT,
         FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
     );
 

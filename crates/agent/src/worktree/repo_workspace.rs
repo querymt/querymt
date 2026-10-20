@@ -647,19 +647,21 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         let result_ref = provenance.result_ref.clone();
         let verification = provenance.verification.map(|v| v.to_string());
         let captured_at = format_dt(&provenance.captured_at);
+        let captured_head = provenance.captured_head.clone();
         self.run_blocking(move |conn| {
             conn.execute(
                 "INSERT INTO workspace_results (
                     workspace_public_id, baseline_commit, result_commit, result_ref,
-                    verification, captured_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    verification, captured_at, captured_head
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     id,
                     baseline_commit,
                     result_commit,
                     result_ref,
                     verification,
-                    captured_at
+                    captured_at,
+                    captured_head
                 ],
             )?;
             Ok(())
@@ -671,8 +673,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         let id = id.as_str().to_string();
         self.run_blocking(move |conn| {
             let mut stmt = conn.prepare(
-                "SELECT baseline_commit, result_commit, result_ref, verification, captured_at \
-                 FROM workspace_results WHERE workspace_public_id = ?1 \
+                "SELECT baseline_commit, result_commit, result_ref, verification, captured_at, \
+                 captured_head FROM workspace_results WHERE workspace_public_id = ?1 \
                  ORDER BY captured_at DESC, id DESC",
             )?;
             let rows = stmt
@@ -682,6 +684,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     let result_ref: Option<String> = row.get(2)?;
                     let verification: Option<String> = row.get(3)?;
                     let captured_at: String = row.get(4)?;
+                    let captured_head: Option<String> = row.get(5)?;
                     Ok(ResultProvenance {
                         baseline_commit,
                         result_commit,
@@ -691,6 +694,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                             .transpose()
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
                         captured_at: parse_dt(&captured_at)?,
+                        captured_head,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1221,6 +1225,7 @@ mod tests {
             result_ref: Some("refs/qmt/results/ws-1/old".into()),
             verification: Some(ResultVerificationStatus::Failed),
             captured_at: datetime!(2026-01-15 10:00:00 UTC),
+            captured_head: Some("head-old".into()),
         };
         let newer = ResultProvenance {
             baseline_commit: "base".into(),
@@ -1228,6 +1233,7 @@ mod tests {
             result_ref: None,
             verification: Some(ResultVerificationStatus::Passed),
             captured_at: datetime!(2026-01-15 12:00:00 UTC),
+            captured_head: None,
         };
         repo.record_result(&id, &older).await.unwrap();
         repo.record_result(&id, &newer).await.unwrap();
@@ -1244,6 +1250,7 @@ mod tests {
             result_ref: Some("refs/qmt/results/ws-1/old".into()),
             verification: None,
             captured_at: datetime!(2026-01-15 13:00:00 UTC),
+            captured_head: Some("head-dup".into()),
         };
         assert!(repo.record_result(&id, &dup).await.is_err());
     }

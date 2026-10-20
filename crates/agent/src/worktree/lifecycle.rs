@@ -1122,6 +1122,7 @@ mod tests {
                     result_ref: Some("refs/qmt/results/test".into()),
                     verification: Some(ResultVerificationStatus::Passed),
                     captured_at: time::OffsetDateTime::now_utc(),
+                    captured_head: None,
                 },
             )
             .await
@@ -1365,6 +1366,17 @@ mod tests {
                 .await
         }
 
+        async fn changed_paths_between(
+            &self,
+            common_dir: &Path,
+            base: &str,
+            tip: &str,
+        ) -> WorktreeResult<Vec<crate::worktree::ChangedPath>> {
+            self.inner
+                .changed_paths_between(common_dir, base, tip)
+                .await
+        }
+
         async fn capture_working_state(
             &self,
             checkout: &Path,
@@ -1603,6 +1615,7 @@ mod tests {
                     result_ref: Some("refs/qmt/results/test".into()),
                     verification: Some(ResultVerificationStatus::Passed),
                     captured_at: time::OffsetDateTime::now_utc(),
+                    captured_head: None,
                 },
             )
             .await

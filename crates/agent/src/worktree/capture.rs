@@ -1114,6 +1114,17 @@ mod tests {
                 .is_ancestor(common_dir, ancestor, descendant)
                 .await
         }
+
+        async fn changed_paths_between(
+            &self,
+            common_dir: &Path,
+            base: &str,
+            tip: &str,
+        ) -> WorktreeResult<Vec<crate::worktree::ChangedPath>> {
+            self.inner
+                .changed_paths_between(common_dir, base, tip)
+                .await
+        }
     }
 
     #[tokio::test]

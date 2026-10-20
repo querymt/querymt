@@ -38,10 +38,11 @@ pub use capture::{
     CaptureRetryPolicy, CapturedState, capture_working_state, capture_working_state_validated,
 };
 pub use domain::{
-    Baseline, BaselineMode, DelegationIsolation, ExecutionMode, ManagedBranch, ProvisioningPhase,
-    RepositoryIdentity, ResolvedIsolation, ResultProvenance, ResultVerificationStatus,
-    WorkspaceCreationOptions, WorkspaceId, WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord,
-    baseline_ref_for, resolve_delegation_isolation,
+    Baseline, BaselineMode, ChangeKind, ChangedPath, DelegationIsolation, ExecutionMode,
+    ManagedBranch, ProvisioningPhase, RepositoryIdentity, ResolvedIsolation, ResultProvenance,
+    ResultReview, ResultVerificationStatus, WorkspaceCreationOptions, WorkspaceId,
+    WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
+    resolve_delegation_isolation,
 };
 pub use error::{WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;

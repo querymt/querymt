@@ -84,6 +84,16 @@ struct WorktreeIdRequest {
     workspace_id: String,
 }
 
+/// Explicit publication target: a workspace id, or (defaulting to the
+/// caller's own binding) a session id.
+#[derive(Debug, Deserialize)]
+struct WorktreePublishRequest {
+    #[serde(default, alias = "workspaceId")]
+    workspace_id: Option<String>,
+    #[serde(default, alias = "sessionId")]
+    session_id: Option<String>,
+}
+
 /// Recovery targets: a workspace with an interrupted provisioning/removal
 /// intent, or (forks only) a session whose pending isolation startup barrier
 /// still blocks load/resume.
@@ -111,12 +121,28 @@ struct WorktreeStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct WorktreeChangedPath {
+    path: String,
+    kind: String,
+}
+
+#[derive(Debug, Serialize)]
 struct WorktreeResultEntry {
     baseline_commit: String,
     result_commit: Option<String>,
     result_ref: Option<String>,
+    /// HEAD of the checkout at capture time — distinct from the live
+    /// `branch_head` reported by `status`.
+    captured_head: Option<String>,
     verification: Option<&'static str>,
     captured_at: String,
+    /// Baseline-relative changes from the immutable result; empty when the
+    /// delta could not be computed (see `review_error`).
+    changed_paths: Vec<WorktreeChangedPath>,
+    /// Present when the immutable diff could not be computed; the entry is
+    /// then unverified rather than silently omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    review_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +151,14 @@ struct WorktreeResultResponse {
     checkout_path: String,
     branch: String,
     results: Vec<WorktreeResultEntry>,
+    /// Whether the workspace baseline captured uncommitted parent edits;
+    /// merging the private branch directly would import them.
+    baseline_includes_uncommitted_edits: bool,
+    /// Present when the baseline is dirty; never implies integration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integration_warning: Option<String>,
+    // -- live state, reported separately from immutable review data --------
+    live_head: Option<String>,
     dirty: bool,
 }
 
@@ -164,6 +198,76 @@ fn summarize_record(record: &crate::worktree::WorkspaceRecord) -> WorktreeSummar
         delegation_id: record.ownership.delegation_id.clone(),
         delegation_batch_id: record.ownership.delegation_batch_id.clone(),
     }
+}
+
+/// Summary of one retained result: immutable provenance plus its
+/// baseline-relative delta. A failed diff is disclosed via `review_error`
+/// rather than silently omitted or replaced by live state.
+async fn summarize_result(
+    service: &crate::worktree::WorkspaceService,
+    record: &crate::worktree::WorkspaceRecord,
+    provenance: &crate::worktree::ResultProvenance,
+) -> WorktreeResultEntry {
+    let review = service.review_result(record, provenance).await;
+    match review {
+        Ok(review) => WorktreeResultEntry {
+            baseline_commit: review.baseline_commit,
+            result_commit: Some(review.result_commit),
+            result_ref: review.result_ref,
+            captured_head: Some(review.captured_head),
+            verification: review.verification.map(verification_label),
+            captured_at: review
+                .captured_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            changed_paths: review
+                .changed_paths
+                .into_iter()
+                .map(|changed| WorktreeChangedPath {
+                    path: changed.path,
+                    kind: changed.kind.to_string(),
+                })
+                .collect(),
+            review_error: None,
+        },
+        Err(err) => WorktreeResultEntry {
+            baseline_commit: provenance.baseline_commit.clone(),
+            result_commit: provenance.result_commit.clone(),
+            result_ref: provenance.result_ref.clone(),
+            captured_head: provenance.captured_head.clone(),
+            verification: provenance.verification.map(verification_label),
+            captured_at: provenance
+                .captured_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            changed_paths: Vec::new(),
+            review_error: Some(err.to_string()),
+        },
+    }
+}
+
+fn verification_label(value: crate::worktree::ResultVerificationStatus) -> &'static str {
+    match value {
+        crate::worktree::ResultVerificationStatus::Passed => "passed",
+        crate::worktree::ResultVerificationStatus::Failed => "failed",
+        crate::worktree::ResultVerificationStatus::Pending => "pending",
+        crate::worktree::ResultVerificationStatus::Skipped => "skipped",
+    }
+}
+
+/// Dirty-baseline guidance: a private branch based on uncommitted parent
+/// edits must not be merged raw.
+fn dirty_baseline_warning(record: &crate::worktree::WorkspaceRecord) -> Option<String> {
+    record
+        .baseline
+        .as_ref()
+        .is_some_and(|b| b.mode == crate::worktree::BaselineMode::CurrentWorkingTree)
+        .then(|| {
+            "the baseline includes inherited uncommitted parent edits; merging the \
+             private branch directly can import them — apply only the reviewed \
+             baseline-relative delta"
+                .to_string()
+        })
 }
 
 /// Native commands are parsed before prompt expansion and never sent to a model.
@@ -243,8 +347,14 @@ impl LocalAgentHandle {
                 };
                 serde_json::json!({"workspace_id": id})
             }
+            // Explicit top-level publication; defaults to the current
+            // session's workspace.
+            "publish" if args.len() <= 1 => match args.first() {
+                Some(id) => serde_json::json!({"workspace_id": id}),
+                None => serde_json::json!({"session_id": session_id}),
+            },
             "remove" | "recover" | "archive" if args.len() == 1 && !args[0].starts_with('-') => serde_json::json!({"workspace_id": args[0]}),
-            _ => return Err(Error::invalid_params().data("usage: /worktree create [ref] [name] [--include-local-changes], list, status [id], result [id], remove <id>, recover <id>, archive <id>; no force removal")),
+            _ => return Err(Error::invalid_params().data("usage: /worktree create [ref] [name] [--include-local-changes], list, status [id], result [id], publish [id], remove <id>, recover <id>, archive <id>; no force removal")),
         };
         let raw = serde_json::value::RawValue::from_string(params.to_string())
             .map_err(|e| Error::internal_error().data(e.to_string()))?;
@@ -424,8 +534,9 @@ impl LocalAgentHandle {
         })
     }
 
-    /// `querymt/worktree/result`: retained baseline-relative result
-    /// provenance for review; absence never implies integration.
+    /// `querymt/worktree/result`: retained baseline-relative review of
+    /// published results; absence never implies integration. Inspection is
+    /// read-only and never republishes live state.
     pub(super) async fn handle_ext_worktree_result(
         &self,
         req: ExtRequest,
@@ -446,30 +557,86 @@ impl LocalAgentHandle {
                 ))
             })?;
         let status = service.manager().status(&record).await.ok();
+        let mut entries = Vec::with_capacity(results.len());
+        for result in &results {
+            entries.push(summarize_result(&service, &record, result).await);
+        }
         ext_json_response(&WorktreeResultResponse {
             workspace_id: record.id.to_string(),
             checkout_path: record.checkout_path.display().to_string(),
             branch: record.branch.as_str().to_string(),
-            results: results
-                .into_iter()
-                .map(|result| WorktreeResultEntry {
-                    baseline_commit: result.baseline_commit,
-                    result_commit: result.result_commit,
-                    result_ref: result.result_ref,
-                    verification: result.verification.map(|v| match v {
-                        crate::worktree::ResultVerificationStatus::Passed => "passed",
-                        crate::worktree::ResultVerificationStatus::Failed => "failed",
-                        crate::worktree::ResultVerificationStatus::Pending => "pending",
-                        crate::worktree::ResultVerificationStatus::Skipped => "skipped",
-                    }),
-                    captured_at: result
-                        .captured_at
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .unwrap_or_default(),
-                })
-                .collect(),
+            baseline_includes_uncommitted_edits: record
+                .baseline
+                .as_ref()
+                .is_some_and(|b| b.mode == crate::worktree::BaselineMode::CurrentWorkingTree),
+            integration_warning: dirty_baseline_warning(&record),
+            results: entries,
+            live_head: status.as_ref().and_then(|s| s.head_commit.clone()),
             dirty: status.map(|s| s.is_dirty()).unwrap_or(true),
         })
+    }
+
+    /// `querymt/worktree/publish`: explicitly publish the current working
+    /// state of a workspace checkout as an immutable, reviewable result.
+    ///
+    /// Shared with automatic delegate publication; this is the explicit
+    /// top-level entry point. Publishing never stages, commits, resets, or
+    /// merges anything in the checkout. Verification state is reported as
+    /// `skipped` because publication performs none.
+    pub(super) async fn handle_ext_worktree_publish(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let service = self.workspace_service()?;
+        let parsed: WorktreePublishRequest = parse_workspace_op_request(req)?;
+        let workspace_id = match parsed.workspace_id {
+            Some(id) => id,
+            None => service
+                .registry()
+                .get_workspace_by_session(&parsed.session_id.ok_or_else(|| {
+                    Error::invalid_params().data("provide workspace_id or session_id")
+                })?)
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?
+                .ok_or_else(|| Error::invalid_request().data("session has no managed workspace"))?
+                .id
+                .to_string(),
+        };
+        let record = self.lookup_workspace(&service, &workspace_id).await?;
+        // Publication coordinates with cooperating writers through the same
+        // checkout-keyed mutation gate used by capture.
+        let gate = crate::worktree::CheckoutMutationGate::new(
+            service.storage_root(),
+            &record.checkout_path,
+        )
+        .map_err(|err| Error::invalid_request().data(err.to_string()))?;
+        let provenance = service
+            .publish_result(
+                &record,
+                &record.checkout_path,
+                Some(&gate),
+                Some(crate::worktree::ResultVerificationStatus::Skipped),
+            )
+            .await
+            .map_err(|err| {
+                Error::invalid_request().data(format!(
+                    "workspace {} result was not published: {err}. The checkout and its \
+                     files are retained unchanged; nothing was integrated.",
+                    record.id
+                ))
+            })?;
+        let entry = summarize_result(&service, &record, &provenance).await;
+        ext_json_response(&serde_json::json!({
+            "workspace_id": record.id.to_string(),
+            "checkout_path": record.checkout_path.display().to_string(),
+            "branch": record.branch.as_str().to_string(),
+            "baseline_includes_uncommitted_edits": record
+                .baseline
+                .as_ref()
+                .is_some_and(|b| b.mode == crate::worktree::BaselineMode::CurrentWorkingTree),
+            "integration_warning": dirty_baseline_warning(&record),
+            "result": entry,
+        }))
     }
 
     /// `querymt/worktree/remove`: conservative removal. Refuses active

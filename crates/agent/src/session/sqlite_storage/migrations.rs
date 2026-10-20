@@ -133,6 +133,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0027_workspace_provisioning_intent",
         apply: migration_0027_workspace_provisioning_intent,
     },
+    Migration {
+        version: "0028_workspace_result_captured_head",
+        apply: migration_0028_workspace_result_captured_head,
+    },
 ];
 
 fn migration_0026_pending_fork_isolation(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -155,6 +159,18 @@ fn migration_0027_workspace_provisioning_intent(
     conn: &mut Connection,
 ) -> Result<(), rusqlite::Error> {
     schema::ensure_workspace_provisioning_columns(conn)
+}
+
+/// Record the checkout HEAD at result-capture time on retained results.
+///
+/// Keeps captured HEAD distinct from live HEAD so baseline-relative review
+/// stays accurate after later commits/branch movement. Existing result rows
+/// keep NULL; review falls back to the workspace baseline commit. Guarded so
+/// the migration is idempotent for fresh installs.
+fn migration_0028_workspace_result_captured_head(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_result_columns(conn)
 }
 
 fn migration_0025_workspace_archival(conn: &mut Connection) -> Result<(), rusqlite::Error> {

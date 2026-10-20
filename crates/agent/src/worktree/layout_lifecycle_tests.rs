@@ -268,7 +268,7 @@ async fn assert_full_lifecycle(source_cwd: &Path, svc: &WorkspaceService, storag
     //    edit below is removed again before removal safety checks).
     fs::write(record.checkout_path.join("edit.txt"), "workspace result\n").unwrap();
     let provenance = svc
-        .capture_delegate_result(&record, &record.checkout_path, None, None)
+        .publish_result(&record, &record.checkout_path, None, None)
         .await
         .unwrap();
     let result_ref = provenance

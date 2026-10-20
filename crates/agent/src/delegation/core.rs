@@ -1872,7 +1872,7 @@ async fn execute_delegation(
                 (child_workspace.as_ref(), ctx.workspace_service.as_ref())
             {
                 match service
-                    .capture_delegate_result(
+                    .publish_result(
                         &binding.record,
                         &binding.effective_cwd,
                         Some(&binding.mutation_gate),
@@ -1889,14 +1889,47 @@ async fn execute_delegation(
                     .await
                 {
                     Ok(provenance) => {
-                        summary.push_str(&format!(
-                            "\n\nWorkspace result (retained for review; nothing was merged): \
-                             workspace {}, branch {}, result commit {} (ref {}).",
-                            binding.record.id,
-                            binding.record.branch.as_str(),
-                            provenance.result_commit.as_deref().unwrap_or("(none)"),
-                            provenance.result_ref.as_deref().unwrap_or("(none)"),
-                        ));
+                        // Completion output carries the baseline-relative
+                        // review (changed paths and kinds) or an explicit
+                        // reference to it — never just an opaque commit id —
+                        // and never claims the result was integrated.
+                        let review = service
+                            .review_result(&binding.record, &provenance)
+                            .await
+                            .ok();
+                        match review {
+                            Some(review) => {
+                                summary.push_str(&format!(
+                                    "\n\nWorkspace result (retained for review; nothing was merged): \
+                                     workspace {}, branch {}, result {} (ref {}), captured HEAD {}, \
+                                     verification {}. Nothing was integrated; publish/review \
+                                     remain available through /worktree result {}.\n{}",
+                                    binding.record.id,
+                                    binding.record.branch.as_str(),
+                                    review.result_commit,
+                                    review.result_ref.as_deref().unwrap_or("(none)"),
+                                    review.captured_head,
+                                    review
+                                        .verification
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_else(|| "not reported".to_string()),
+                                    binding.record.id,
+                                    review.summary_text(),
+                                ));
+                            }
+                            None => {
+                                summary.push_str(&format!(
+                                    "\n\nWorkspace result (retained for review; nothing was merged): \
+                                     workspace {}, branch {}, result commit {} (ref {}). Review \
+                                     via /worktree result {}.",
+                                    binding.record.id,
+                                    binding.record.branch.as_str(),
+                                    provenance.result_commit.as_deref().unwrap_or("(none)"),
+                                    provenance.result_ref.as_deref().unwrap_or("(none)"),
+                                    binding.record.id,
+                                ));
+                            }
+                        }
                     }
                     Err(err) => {
                         summary.push_str(&format!(

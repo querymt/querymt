@@ -277,6 +277,119 @@ async fn worktree_operations_fail_closed_without_a_workspace_service() {
     );
 }
 
+/// Explicit top-level publication and immutable review: `/worktree publish`
+/// and `querymt/worktree/result` expose baseline-relative changed paths and
+/// change kinds, captured HEAD distinct from live state, and never republish
+/// on inspection.
+#[tokio::test]
+async fn explicit_publication_exposes_immutable_baseline_relative_review() {
+    let f = worktree_fixture(true).await;
+    let session = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    let session_id = session.session_id.to_string();
+    let created = native_command(
+        &f.handle,
+        &session_id,
+        "/worktree create --include-local-changes review-target",
+    )
+    .await
+    .unwrap();
+    let child_id = created["session_id"].as_str().unwrap().to_string();
+    let workspace_id = created["workspace_id"].as_str().unwrap().to_string();
+    let checkout = std::path::PathBuf::from(created["checkout_path"].as_str().unwrap());
+    let baseline = created["baseline_commit"].as_str().unwrap().to_string();
+
+    // Uncommitted top-level work inside the new workspace.
+    std::fs::write(checkout.join("README.md"), "published edit\n").unwrap();
+    std::fs::write(checkout.join("new.txt"), "new\n").unwrap();
+
+    // Publishing through the session's own binding.
+    let published = native_command(&f.handle, &child_id, "/worktree publish")
+        .await
+        .unwrap();
+    let entry = &published["result"];
+    let result_commit = entry["result_commit"].as_str().expect("result commit");
+    let result_ref = entry["result_ref"].as_str().expect("result ref");
+    assert!(result_ref.starts_with("refs/qmt/results/"), "{result_ref}");
+    assert_eq!(entry["baseline_commit"].as_str().unwrap(), baseline);
+    assert_eq!(entry["captured_head"].as_str().unwrap(), baseline);
+    assert_eq!(entry["verification"], "skipped");
+    let changed = entry["changed_paths"].as_array().expect("changed paths");
+    let pairs: Vec<(String, String)> = changed
+        .iter()
+        .map(|c| {
+            (
+                c["path"].as_str().unwrap().to_string(),
+                c["kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            ("README.md".to_string(), "modified".to_string()),
+            ("new.txt".to_string(), "added".to_string()),
+        ],
+        "{published:?}"
+    );
+    assert_eq!(published["baseline_includes_uncommitted_edits"], true);
+    assert!(published["integration_warning"].as_str().is_some());
+
+    // Later edits and a moved HEAD never rewrite the retained review.
+    std::fs::write(checkout.join("later.txt"), "later\n").unwrap();
+    let reviewed = ext_method_json(
+        &f.handle,
+        "querymt/worktree/result",
+        serde_json::json!({ "workspace_id": workspace_id }),
+    )
+    .await;
+    let results = reviewed["results"].as_array().unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "inspection never republishes: {reviewed:?}"
+    );
+    assert_eq!(results[0]["result_commit"].as_str().unwrap(), result_commit);
+    assert_eq!(results[0]["changed_paths"], entry["changed_paths"]);
+    assert!(
+        results[0]["changed_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["path"].as_str() != Some("later.txt"))
+    );
+    assert_eq!(reviewed["dirty"], true, "live state is reported separately");
+
+    // A second explicit publication gets its own create-only ref.
+    let second = native_command(&f.handle, &child_id, "/worktree publish")
+        .await
+        .unwrap();
+    let second_ref = second["result"]["result_ref"].as_str().unwrap();
+    assert_ne!(second_ref, result_ref);
+    let reviewed = ext_method_json(
+        &f.handle,
+        "querymt/worktree/result",
+        serde_json::json!({ "workspace_id": workspace_id }),
+    )
+    .await;
+    let results = reviewed["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    let refs: Vec<&str> = results
+        .iter()
+        .filter_map(|r| r["result_ref"].as_str())
+        .collect();
+    assert!(
+        refs.contains(&result_ref),
+        "previous ref retained: {reviewed:?}"
+    );
+    assert!(refs.contains(&second_ref));
+}
+
 #[tokio::test]
 async fn worktree_lifecycle_reports_ids_paths_baselines_and_errors_consistently() {
     use crate::worktree::SessionCreationOptions;
