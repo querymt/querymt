@@ -617,6 +617,8 @@ impl Tool for EditTool {
             .await
             .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
+        edit_output::verify_written_content(&file_path, replacement.content.as_bytes()).await?;
+
         // Build compact line-numbered hunk output from the actual file diff so
         // large context-matching replacements only mark lines that really changed.
         let file_output =

@@ -180,6 +180,8 @@ pub struct SessionRuntime {
     pub mcp_tool_state: Arc<McpToolState>,
     pub permission_cache: ParkingMutex<HashMap<String, bool>>,
     pub tool_validator_cache: ParkingMutex<HashMap<String, Arc<jsonschema::Validator>>>,
+    /// Notices edited files that are changed by something other than the file tools.
+    pub(crate) merkle_watch: Arc<crate::agent::snapshots::MerkleWatch>,
     /// Workspace handle for duplicate code detection (built asynchronously on session start)
     pub workspace_handle: Arc<OnceCell<crate::index::WorkspaceHandle>>,
     /// Turn snapshot: (turn_id, snapshot_id) taken at the start of the turn for undo/redo
@@ -217,6 +219,7 @@ impl SessionRuntime {
             mcp_tool_state,
             permission_cache: ParkingMutex::new(HashMap::new()),
             tool_validator_cache: ParkingMutex::new(HashMap::new()),
+            merkle_watch: Arc::new(Default::default()),
             workspace_handle: Arc::new(OnceCell::new()),
             turn_snapshot: ParkingMutex::new(None),
             pre_turn_snapshot_task: ParkingMutex::new(None),

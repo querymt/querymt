@@ -234,6 +234,7 @@ impl Tool for ReplaceSymbolTool {
                     ))
                 })?;
 
+            super::edit_output::verify_written_content(file_path, new_content.as_bytes()).await?;
             results.extend(file_results);
         }
 

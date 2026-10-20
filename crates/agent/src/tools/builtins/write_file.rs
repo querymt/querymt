@@ -93,6 +93,8 @@ impl ToolTrait for WriteFileTool {
             .await
             .map_err(|e| ToolError::ProviderError(format!("write failed: {}", e)))?;
 
+        super::edit_output::verify_written_content(&path, content.as_bytes()).await?;
+
         let result = json!({
             "path": path.display().to_string(),
             "bytes": content.len()

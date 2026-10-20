@@ -18,6 +18,27 @@ use imara_diff::{Algorithm, Diff, InternedInput};
 
 const CONTEXT_LINES: usize = 3;
 
+/// Verify the complete on-disk result before issuing a successful edit receipt.
+/// A failure does not roll back: doing so could overwrite a concurrent writer.
+pub(crate) async fn verify_written_content(
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), crate::tools::ToolError> {
+    let actual = tokio::fs::read(path).await.map_err(|error| {
+        crate::tools::ToolError::ProviderError(format!(
+            "post-write verification failed for {}: {error}; the write may have occurred, re-read before retrying",
+            path.display()
+        ))
+    })?;
+    if actual != expected {
+        return Err(crate::tools::ToolError::ProviderError(format!(
+            "post-write verification failed for {}: on-disk content differs from the intended result; a concurrent writer may have overwritten the edit; re-read before retrying",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// A single line in a diff hunk.
 #[derive(Debug, Clone)]
 pub enum DiffLineKind {
@@ -295,6 +316,27 @@ fn context_new_count(lines: &[DiffLine]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn post_write_verification_requires_the_complete_intended_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("edited.txt");
+        let expected = b"before\nreplacement\nafter\n";
+        tokio::fs::write(&path, expected).await.unwrap();
+        verify_written_content(&path, expected).await.unwrap();
+
+        // Merely finding the inserted string does not prove the edit persisted.
+        let overwritten = b"unrelated\nreplacement\nafter\n";
+        tokio::fs::write(&path, overwritten).await.unwrap();
+        let error = verify_written_content(&path, expected).await.unwrap_err();
+        assert!(error.to_string().contains("post-write verification failed"));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), overwritten);
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        let error = verify_written_content(&path, expected).await.unwrap_err();
+        assert!(error.to_string().contains("re-read before retrying"));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn test_replace_hunk_basic() {

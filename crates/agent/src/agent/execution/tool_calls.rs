@@ -170,6 +170,8 @@ async fn execute_tool_call_inner(
         },
     );
 
+    let mut watch_warnings: Vec<String> = Vec::new();
+    let mut watch_ticket = None;
     let snapshot = if config.should_snapshot_tool(&call.function.name) {
         info_span!(
             "agent.tool.snapshot.prepare",
@@ -190,6 +192,12 @@ async fn execute_tool_call_inner(
                     match policy {
                         SnapshotPolicy::Diff => {
                             let pre_tree = crate::index::merkle::MerkleTree::scan(root.as_path());
+                            let (ticket, warnings) = exec_ctx
+                                .runtime
+                                .merkle_watch
+                                .begin(root.as_path(), &pre_tree);
+                            watch_ticket = Some(ticket);
+                            watch_warnings = warnings;
                             SnapshotState::Diff { pre_tree, root }
                         }
                         SnapshotPolicy::Metadata => SnapshotState::Metadata { root },
@@ -535,6 +543,15 @@ async fn execute_tool_call_inner(
                 let changed_paths = post_tree.diff_paths(&pre_tree);
                 (post_tree, changed_paths)
             });
+            let root_hash = post_tree.root_hash;
+            if let Some(ticket) = watch_ticket.take() {
+                watch_warnings.extend(ticket.finish(
+                    &call.function.name,
+                    &pre_tree,
+                    post_tree,
+                    &changed_paths,
+                ));
+            }
             config.emit_event(
                 &exec_ctx.session_id,
                 AgentEventKind::SnapshotEnd {
@@ -542,7 +559,7 @@ async fn execute_tool_call_inner(
                 },
             );
             Some(MessagePart::Snapshot {
-                root_hash: post_tree.root_hash,
+                root_hash,
                 changed_paths,
             })
         }
@@ -562,6 +579,13 @@ async fn execute_tool_call_inner(
         }
         SnapshotState::None => None,
     };
+
+    // Integrity warnings are appended after hook rewriting and truncation so
+    // neither can drop them.
+    for warning in watch_warnings {
+        log::warn!("session={}: {warning}", exec_ctx.session_id);
+        result_blocks.push(querymt::chat::ToolResultPart::text(warning));
+    }
 
     let mut hook_contexts = hook_result.context_contributions;
     hook_contexts.extend(post_hook.context_contributions);
@@ -1292,6 +1316,284 @@ mod genai_trace_tests {
                 "type": "command", "command": format!("printf '%s' '{output}'"), "timeout_sec": 5
             }]}]
         })).unwrap()).unwrap()
+    }
+
+    fn tool_text(result: &ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|part| part.as_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Config with Merkle snapshots on and the real built-in file tools.
+    fn watched_config(
+        fixture: &TestAgent,
+        policy: SnapshotPolicy,
+    ) -> crate::agent::agent_config::AgentConfig {
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.extend(crate::tools::builtins::all_builtin_tools());
+        AgentConfigBuilder::from_provider(
+            fixture.storage.clone(),
+            fixture.config.provider.clone(),
+            fixture.storage.event_journal(),
+        )
+        .with_snapshot_policy(policy)
+        .with_tool_registry(registry)
+        .build()
+    }
+
+    // Replacement text is longer than the original so snapshots never depend on
+    // file timestamps to notice the change.
+    const ORIGINAL: &str = "fn answer() -> u32 { 1 }\n";
+    const EDITED: &str = "fn answer() -> u32 { 22 }\n";
+
+    #[tokio::test]
+    async fn external_reversion_of_a_file_tool_edit_is_reported_between_tool_calls() {
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let config = watched_config(&fixture, SnapshotPolicy::Diff);
+        // A plain directory: no Git repository, and the file starts out "dirty".
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edited.rs");
+        let path_str = path.to_str().unwrap();
+        for (name, args) in [
+            (
+                "edit",
+                serde_json::json!({"filePath": path_str, "oldString": "{ 1 }", "newString": "{ 22 }"}),
+            ),
+            (
+                "multiedit",
+                serde_json::json!({"filePath": path_str, "edits": [{"oldString": "{ 1 }", "newString": "{ 22 }"}]}),
+            ),
+            (
+                "replace_symbol",
+                serde_json::json!({"root": dir.path(), "replacements": [{"path": path_str, "symbol": "answer", "newText": EDITED.trim_end()}]}),
+            ),
+            (
+                "write_file",
+                serde_json::json!({"path": path_str, "content": EDITED}),
+            ),
+        ] {
+            let exec = fixture
+                .execution_context_in(Some(dir.path().to_path_buf()))
+                .await;
+            tokio::fs::write(&path, ORIGINAL).await.unwrap();
+            let read = mock_tool_call(
+                "read-call",
+                "read_tool",
+                &serde_json::json!({"path": path_str}).to_string(),
+            );
+
+            let call = mock_tool_call("edit-call", name, &args.to_string());
+            let result = execute_tool_call(&config, &call, &exec, None)
+                .await
+                .unwrap();
+            assert!(!result.is_error, "{name}: {}", tool_text(&result));
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), EDITED);
+
+            // Nothing happened outside the session: no warning.
+            let result = execute_tool_call(&config, &read, &exec, None)
+                .await
+                .unwrap();
+            assert!(
+                !tool_text(&result).contains("Warning"),
+                "{name}: {}",
+                tool_text(&result)
+            );
+
+            // Something outside the session puts the original content back.
+            tokio::fs::write(&path, ORIGINAL).await.unwrap();
+            let result = execute_tool_call(&config, &read, &exec, None)
+                .await
+                .unwrap();
+            let text = tool_text(&result);
+            assert!(!result.is_error, "{name}: {text}");
+            assert!(
+                text.contains("possible external reversion"),
+                "{name}: {text}"
+            );
+            assert!(text.contains("edited.rs"), "{name}: {text}");
+            assert_eq!(
+                tokio::fs::read_to_string(&path).await.unwrap(),
+                ORIGINAL,
+                "never restored"
+            );
+
+            // Reported once only.
+            let result = execute_tool_call(&config, &read, &exec, None)
+                .await
+                .unwrap();
+            assert!(
+                !tool_text(&result).contains("Warning"),
+                "{name}: {}",
+                tool_text(&result)
+            );
+
+            // Any other outside modification between calls is reported too, but
+            // not as a reversion.
+            tokio::fs::write(&path, "fn answer() -> u32 { 333 }\n")
+                .await
+                .unwrap();
+            let result = execute_tool_call(&config, &read, &exec, None)
+                .await
+                .unwrap();
+            let text = tool_text(&result);
+            assert!(text.contains("modified outside"), "{name}: {text}");
+            assert!(
+                !text.contains("possible external reversion"),
+                "{name}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn intentional_changes_through_file_tools_and_untouched_files_do_not_warn() {
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let config = watched_config(&fixture, SnapshotPolicy::Diff);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edited.rs");
+        let other = dir.path().join("other.txt");
+        let path_str = path.to_str().unwrap();
+        tokio::fs::write(&path, ORIGINAL).await.unwrap();
+        tokio::fs::write(&other, "unrelated").await.unwrap();
+        let exec = fixture
+            .execution_context_in(Some(dir.path().to_path_buf()))
+            .await;
+        let run = |id: &str, name: &str, args: serde_json::Value| {
+            mock_tool_call(id, name, &args.to_string())
+        };
+
+        let edit = run(
+            "e",
+            "edit",
+            serde_json::json!({"filePath": path_str, "oldString": "{ 1 }", "newString": "{ 22 }"}),
+        );
+        execute_tool_call(&config, &edit, &exec, None)
+            .await
+            .unwrap();
+        // Restoring through write_file is the agent's own decision.
+        let restore = run(
+            "r",
+            "write_file",
+            serde_json::json!({"path": path_str, "content": ORIGINAL}),
+        );
+        let result = execute_tool_call(&config, &restore, &exec, None)
+            .await
+            .unwrap();
+        assert!(
+            !tool_text(&result).contains("Warning"),
+            "{}",
+            tool_text(&result)
+        );
+        // A file the session never edited can change freely.
+        tokio::fs::write(&other, "changed outside").await.unwrap();
+        let read = run("rd", "read_tool", serde_json::json!({"path": path_str}));
+        let result = execute_tool_call(&config, &read, &exec, None)
+            .await
+            .unwrap();
+        assert!(
+            !tool_text(&result).contains("Warning"),
+            "{}",
+            tool_text(&result)
+        );
+        // After delete_file the path is no longer watched.
+        let delete = run("d", "delete_file", serde_json::json!({"path": path_str}));
+        execute_tool_call(&config, &delete, &exec, None)
+            .await
+            .unwrap();
+        tokio::fs::write(&path, ORIGINAL).await.unwrap();
+        let result = execute_tool_call(&config, &read, &exec, None)
+            .await
+            .unwrap();
+        assert!(
+            !tool_text(&result).contains("Warning"),
+            "{}",
+            tool_text(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn reversion_caused_by_a_non_file_tool_is_reported_without_failing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edited.rs");
+        let path_str = path.to_str().unwrap().to_string();
+        let target = path.clone();
+        let mut mock = MockLlmProvider::new();
+        // Stands in for `git stash` / `git checkout -- .` run by a shell tool.
+        mock.expect_call_tool().times(1).returning(move |_, _| {
+            std::fs::write(&target, ORIGINAL).unwrap();
+            Ok(vec![querymt::chat::ToolResultPart::text(
+                "command completed",
+            )])
+        });
+        let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+        let config = watched_config(&fixture, SnapshotPolicy::Diff);
+        let exec = fixture
+            .execution_context_in(Some(dir.path().to_path_buf()))
+            .await;
+        tokio::fs::write(&path, ORIGINAL).await.unwrap();
+        let edit = mock_tool_call(
+            "e",
+            "edit",
+            &serde_json::json!({"filePath": path_str, "oldString": "{ 1 }", "newString": "{ 22 }"})
+                .to_string(),
+        );
+        execute_tool_call(&config, &edit, &exec, None)
+            .await
+            .unwrap();
+
+        let command = mock_tool_call("c", "telemetry_tool", "{}");
+        let result = execute_tool_call(&config, &command, &exec, None)
+            .await
+            .unwrap();
+        let text = tool_text(&result);
+        assert!(!result.is_error);
+        assert!(text.contains("command completed"), "{text}");
+        assert!(text.contains("possible reversion"), "{text}");
+        assert!(text.contains("edited.rs"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn no_snapshots_means_no_reversion_detection() {
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let config = watched_config(&fixture, SnapshotPolicy::None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edited.rs");
+        let path_str = path.to_str().unwrap();
+        tokio::fs::write(&path, ORIGINAL).await.unwrap();
+        let exec = fixture
+            .execution_context_in(Some(dir.path().to_path_buf()))
+            .await;
+        let edit = mock_tool_call(
+            "e",
+            "edit",
+            &serde_json::json!({"filePath": path_str, "oldString": "{ 1 }", "newString": "{ 22 }"})
+                .to_string(),
+        );
+        execute_tool_call(&config, &edit, &exec, None)
+            .await
+            .unwrap();
+        tokio::fs::write(&path, ORIGINAL).await.unwrap();
+        let read = mock_tool_call(
+            "rd",
+            "read_tool",
+            &serde_json::json!({"path": path_str}).to_string(),
+        );
+        let result = execute_tool_call(&config, &read, &exec, None)
+            .await
+            .unwrap();
+        assert!(
+            !tool_text(&result).contains("Warning"),
+            "{}",
+            tool_text(&result)
+        );
     }
 
     #[tokio::test]
