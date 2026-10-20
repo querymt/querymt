@@ -8,7 +8,8 @@ use std::collections::HashMap;
 const TOOL_PREFIX: &str = "mcp_";
 
 /// OAuth system prompt
-const OAUTH_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+const OAUTH_SYSTEM_PROMPT: &str = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+const CLAUDE_CODE_VERSION: &str = "2.1.284";
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use http::{
@@ -33,6 +34,7 @@ use querymt::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use url::Url;
 
@@ -109,6 +111,9 @@ pub struct Anthropic {
     /// - API keys: `sk-ant-api<digits>-...` (e.g., sk-ant-api03-...)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_type: Option<AuthType>,
+    /// Reported OAuth client version (major.minor.patch), shared by headers and billing metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_version: Option<String>,
     pub model: String,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
@@ -671,7 +676,86 @@ impl From<AnthropicCompleteResponse> for ChatOutput {
     }
 }
 
+fn oauth_text_block(text: String) -> TextBlockParam {
+    TextBlockParam {
+        block_type: "text".to_string(), text, cache_control: None, citations: None,
+    }
+}
+
+/// Identity lines injected by QueryMT application prompts.
+///
+/// OAuth requests already carry Anthropic's Claude identity via
+/// `OAUTH_SYSTEM_PROMPT`, so application-level identity declarations would
+/// compete with it and are pruned. Everything else — operational rules,
+/// `<env>`/`<directories>` metadata, mentions of QueryMT in instructions —
+/// is preserved verbatim.
+const IDENTITY_LINE_PREFIXES: [&str; 2] =
+    ["You are QueryMT, a coding agent", "You are powered by "];
+
+fn sanitize_oauth_text(text: &str) -> String {
+    // Drop only whole lines that declare an application identity.
+    let kept: Vec<&str> = text
+        .split('\n')
+        .filter(|line| {
+            !IDENTITY_LINE_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .collect();
+
+    // Collapse paragraphs left empty by the pruning above.
+    let mut paragraphs = Vec::new();
+    let mut current = Vec::new();
+    for line in kept {
+        if line.is_empty() {
+            if !current.is_empty() {
+                paragraphs.push(current.join("\n"));
+                current.clear();
+            }
+        } else {
+            current.push(line);
+        }
+    }
+    if !current.is_empty() {
+        paragraphs.push(current.join("\n"));
+    }
+    paragraphs.join("\n\n").trim().to_string()
+}
+
+fn oauth_billing_header(text: &str, version: &str) -> String {
+    let cch: String = Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    // JavaScript indexes UTF-16 code units, not UTF-8 bytes or Unicode scalars.
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let sampled: Vec<u16> = [4, 7, 20].iter().map(|&i| utf16.get(i).copied().unwrap_or(u16::from(b'0'))).collect();
+    let suffix: String = Sha256::digest(
+        format!("59cf53e54c78{}{}", String::from_utf16_lossy(&sampled), version).as_bytes(),
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+    format!("x-anthropic-billing-header: cc_version={version}.{}; cc_entrypoint=sdk-cli; cch={};", &suffix[..3], &cch[..5])
+}
+
+fn validate_client_version(version: &str) -> Result<(), LLMError> {
+    let parts: Vec<_> = version.split('.').collect();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(LLMError::InvalidRequest("claude_code_version must be major.minor.patch".to_string()));
+    }
+    Ok(())
+}
+
 impl Anthropic {
+    fn oauth_version(&self) -> &str {
+        self.claude_code_version.as_deref().map(str::trim).unwrap_or(CLAUDE_CODE_VERSION)
+    }
+
+    fn validate_oauth_version(&self) -> Result<(), LLMError> {
+        validate_client_version(self.oauth_version())
+    }
+
     /// Map a raw Anthropic `stop_reason` string to a typed `FinishReason`.
     ///
     /// Reuses the same mapping logic as `AnthropicCompleteResponse::finish_reason()`.
@@ -712,48 +796,41 @@ impl Anthropic {
 
     /// Sanitizes the system prompt for OAuth requests.
     ///
-    /// For OAuth: always prepends `OAUTH_SYSTEM_PROMPT` as the first block,
-    /// converting a plain `Text` prompt to `Blocks` in the process.
-    /// When no system prompt is configured and OAuth is active, returns the
-    /// `OAUTH_SYSTEM_PROMPT` const wrapped in a single-element `Blocks`.
+    /// For OAuth: prunes application identity lines (see
+    /// `IDENTITY_LINE_PREFIXES`), drops blocks left empty by that pruning,
+    /// and prepends `OAUTH_SYSTEM_PROMPT` as the first block, converting a
+    /// plain `Text` prompt to `Blocks` in the process. When no system prompt
+    /// is configured and OAuth is active, returns the `OAUTH_SYSTEM_PROMPT`
+    /// const wrapped in a single-element `Blocks`.
     ///
     /// For non-OAuth: returns the configured system prompt unchanged.
     fn sanitize_system_prompt(&self) -> Option<AnthropicSystemPrompt> {
         if !self.is_oauth() {
             return self.system.clone();
         }
-
-        let oauth_block = TextBlockParam {
-            block_type: "text".to_string(),
-            text: OAUTH_SYSTEM_PROMPT.to_string(),
-            cache_control: None,
-            citations: None,
+        let mut blocks = match &self.system {
+            None => Vec::new(),
+            Some(AnthropicSystemPrompt::Text(text)) => vec![oauth_text_block(sanitize_oauth_text(text))],
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => blocks.iter().cloned().map(|mut block| {
+                block.text = sanitize_oauth_text(&block.text);
+                block
+            }).collect(),
         };
-
-        match &self.system {
-            None => Some(AnthropicSystemPrompt::Blocks(vec![oauth_block])),
-            Some(AnthropicSystemPrompt::Text(s)) => Some(AnthropicSystemPrompt::Blocks(vec![
-                oauth_block,
-                TextBlockParam {
-                    block_type: "text".to_string(),
-                    text: s.clone(),
-                    cache_control: None,
-                    citations: None,
-                },
-            ])),
-            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
-                let mut result = Vec::with_capacity(1 + blocks.len());
-                result.push(oauth_block);
-                result.extend(blocks.iter().cloned());
-                Some(AnthropicSystemPrompt::Blocks(result))
-            }
+        // Anthropic rejects empty text blocks; identity-only prompts prune to
+        // nothing here and only the injected identity block remains.
+        blocks.retain(|block| !block.text.is_empty());
+        // Keep the identity separate from cached application instructions.
+        if blocks.first().is_none_or(|block| block.text != OAUTH_SYSTEM_PROMPT) {
+            blocks.insert(0, oauth_text_block(OAUTH_SYSTEM_PROMPT.to_string()));
         }
+        Some(AnthropicSystemPrompt::Blocks(blocks))
     }
 
     /// Prefixes a tool name with TOOL_PREFIX if using OAuth
     fn prefix_tool_name(&self, name: &str) -> String {
         if self.is_oauth() {
-            format!("{}{}", TOOL_PREFIX, name)
+            let mut chars = name.chars();
+            format!("{}{}{}", TOOL_PREFIX, chars.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default(), chars.as_str())
         } else {
             name.to_string()
         }
@@ -778,7 +855,12 @@ impl Anthropic {
 
     /// Strips the TOOL_PREFIX from a tool name if present (used for responses)
     fn strip_tool_prefix(name: &str) -> String {
-        name.strip_prefix(TOOL_PREFIX).unwrap_or(name).to_string()
+        let name = name.strip_prefix(TOOL_PREFIX).unwrap_or(name);
+        if name == "StructuredOutput" {
+            return name.to_string();
+        }
+        let mut chars = name.chars();
+        format!("{}{}", chars.next().map(|c| c.to_lowercase().to_string()).unwrap_or_default(), chars.as_str())
     }
 
     /// Adds authentication headers to the request builder based on auth type
@@ -792,7 +874,7 @@ impl Anthropic {
                     "anthropic-beta",
                     "oauth-2025-04-20,interleaved-thinking-2025-05-14",
                 )
-                .header(USER_AGENT, "claude-cli/2.1.2 (external, cli)"),
+                .header(USER_AGENT, format!("claude-cli/{} (external, cli)", self.oauth_version())), 
             AuthType::ApiKey => builder.header("x-api-key", &key),
         };
         builder.header("anthropic-version", "2023-06-01")
@@ -1033,7 +1115,19 @@ impl HTTPChatProvider for Anthropic {
         });
 
         // Use sanitized system prompt for OAuth requests
-        let sanitized_system = self.sanitize_system_prompt();
+        let mut sanitized_system = self.sanitize_system_prompt();
+        if self.is_oauth() {
+            self.validate_oauth_version()?;
+            if let Some(first_user) = anthropic_messages.iter().find(|message| message.role == "user") {
+                let text = first_user.content.iter().find_map(|block| match block {
+                    MessageContent::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                }).unwrap_or_default();
+                if let Some(AnthropicSystemPrompt::Blocks(blocks)) = &mut sanitized_system {
+                    blocks.insert(0, oauth_text_block(oauth_billing_header(text, self.oauth_version())));
+                }
+            }
+        }
 
         let req_body = AnthropicCompleteRequest {
             messages: anthropic_messages,
@@ -1405,11 +1499,25 @@ pub use factory::create_http_factory;
 mod tests {
     use super::*;
 
+    /// The default qmtcode system prompt, shared with the agent crate's
+    /// embedded profiles (see `crates/agent/examples/confs/single_coder.toml`).
+    const DEFAULT_QMTCODE_SYSTEM_PROMPT: &str =
+        include_str!("../../../agent/examples/prompts/default_system.txt");
+
+    #[test]
+    fn billing_header_matches_opencode_fixture() {
+        assert_eq!(
+            oauth_billing_header("hello world test message", "2.1.87"),
+            "x-anthropic-billing-header: cc_version=2.1.87.6ff; cc_entrypoint=sdk-cli; cch=4ffc3;"
+        );
+    }
+
     /// Build a minimal `Anthropic` instance for use in unit tests.
     fn test_anthropic(api_key: &str) -> Anthropic {
         Anthropic {
             api_key: api_key.to_string(),
             auth_type: None,
+            claude_code_version: None,
             model: "claude-3-7-sonnet-20250219".to_string(),
             max_tokens: 100,
             temperature: Some(1.0),
@@ -1779,6 +1887,101 @@ mod tests {
                 "You are QueryMT assistant.".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn sanitize_oauth_text_prunes_identity_paragraph() {
+        // Identity in its own paragraph is removed along with the paragraph.
+        let text = "You are QueryMT, a coding agent for software engineering tasks.\n\nUse the available tools to help the user accurately and efficiently.";
+        assert_eq!(
+            sanitize_oauth_text(text),
+            "Use the available tools to help the user accurately and efficiently."
+        );
+    }
+
+    #[test]
+    fn sanitize_oauth_text_prunes_identity_line_within_paragraph() {
+        // Only the identity line is removed; sibling lines in the same
+        // paragraph survive.
+        let text = "You are QueryMT, a coding agent for software engineering tasks.\nUse the available tools to help the user accurately and efficiently.";
+        assert_eq!(
+            sanitize_oauth_text(text),
+            "Use the available tools to help the user accurately and efficiently."
+        );
+    }
+
+    #[test]
+    fn sanitize_oauth_text_keeps_env_metadata_next_to_powered_by() {
+        // code_meta.jinja2 renders the identity line and `<env>` metadata in
+        // one paragraph; only the identity line must be pruned.
+        let text = "You are powered by anthropic/claude-sonnet-4-5-20250929.\n<env>\n  Is directory a git repo: yes\n  Platform: macos\n</env>";
+        let sanitized = sanitize_oauth_text(text);
+        assert!(!sanitized.contains("You are powered by"));
+        assert!(sanitized.contains("<env>"));
+        assert!(sanitized.contains("Platform: macos"));
+    }
+
+    #[test]
+    fn sanitize_oauth_text_preserves_default_qmtcode_prompt_instructions() {
+        let sanitized = sanitize_oauth_text(DEFAULT_QMTCODE_SYSTEM_PROMPT);
+        assert!(!sanitized.contains("You are QueryMT,"));
+        // Operational instructions and QueryMT references in guidance stay.
+        assert!(sanitized.contains("# Task management"));
+        assert!(sanitized.contains("# Code search policy"));
+        assert!(sanitized.contains("# Tool usage policy"));
+        assert!(sanitized.contains("answer from QueryMT docs"));
+    }
+
+    #[test]
+    fn sanitize_system_prompt_oauth_prunes_identity_only_text_prompt() {
+        // A prompt consisting solely of the identity line prunes to nothing;
+        // only the injected OAuth identity block remains.
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.system = Some(AnthropicSystemPrompt::Text(
+            "You are QueryMT, a coding agent for software engineering tasks.".to_string(),
+        ));
+        let sanitized = anthropic.sanitize_system_prompt();
+        match sanitized {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].text, OAUTH_SYSTEM_PROMPT);
+            }
+            other => panic!("Expected single OAuth identity block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sanitize_system_prompt_oauth_drops_identity_only_blocks() {
+        // Identity-only blocks are dropped; instruction blocks (with their
+        // cache_control) are preserved alongside the injected identity block.
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.system = Some(AnthropicSystemPrompt::Blocks(vec![
+            TextBlockParam {
+                block_type: "text".to_string(),
+                text: "You are QueryMT, a coding agent for software engineering tasks.".to_string(),
+                cache_control: None,
+                citations: None,
+            },
+            TextBlockParam {
+                block_type: "text".to_string(),
+                text: "# Code search policy\n- Use `search_text` first for content search.".to_string(),
+                cache_control: Some(CacheControlEphemeral {
+                    control_type: "ephemeral".to_string(),
+                    ttl: None,
+                }),
+                citations: None,
+            },
+        ]));
+        let sanitized = anthropic.sanitize_system_prompt();
+        match sanitized {
+            Some(AnthropicSystemPrompt::Blocks(blocks)) => {
+                assert_eq!(blocks.len(), 2);
+                assert_eq!(blocks[0].text, OAUTH_SYSTEM_PROMPT);
+                assert!(blocks[1].text.starts_with("# Code search policy"));
+                assert!(blocks[1].cache_control.is_some());
+            }
+            other => panic!("Expected Blocks with two entries, got {:?}", other),
+        }
     }
 
     #[test]

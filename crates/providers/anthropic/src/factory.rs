@@ -48,9 +48,14 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
                     .uri(url.as_str());
 
                 let builder = match auth_type {
-                    crate::AuthType::OAuth => builder
-                        .header("Authorization", format!("Bearer {}", api_key))
-                        .header("anthropic-beta", "oauth-2025-04-20"),
+                    crate::AuthType::OAuth => {
+                        let version = cfg.get("claude_code_version").and_then(Value::as_str).map(str::trim).unwrap_or(crate::CLAUDE_CODE_VERSION);
+                        crate::validate_client_version(version)?;
+                        builder
+                            .header("Authorization", format!("Bearer {}", api_key))
+                            .header("anthropic-beta", "oauth-2025-04-20,interleaved-thinking-2025-05-14")
+                            .header("user-agent", format!("claude-cli/{version} (external, cli)"))
+                    },
                     crate::AuthType::ApiKey => builder.header("x-api-key", api_key),
                 };
 

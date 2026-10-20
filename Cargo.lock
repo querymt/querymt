@@ -279,15 +279,15 @@ dependencies = [
 
 [[package]]
 name = "anthropic-auth"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bd0bcaf163c5feef09718db8d32f27ec1fd1c1f747e2ab68fcba7dce6d8fb5f"
+checksum = "87149067342ea4249602e6de0a319e80cb74caf2698ce03cc4a578b7354e43b0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "oauth2",
  "rand 0.8.8",
- "reqwest 0.12.28",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -11261,6 +11261,7 @@ dependencies = [
  "schemars 1.2.3",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "url",
 ]
 

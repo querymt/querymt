@@ -25,4 +25,5 @@ base64 = { workspace = true }
 url = { workspace = true }
 http = { workspace = true }
 schemars = { workspace = true }
+sha2 = "0.11"
 extism-pdk = { workspace = true, optional = true }

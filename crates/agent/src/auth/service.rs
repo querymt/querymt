@@ -411,8 +411,7 @@ impl OAuthService {
                             message: "Authorization response is required".to_string(),
                         };
                     }
-                    crate::auth::extract_code_from_query(code_input)
-                        .unwrap_or_else(|| code_input.to_string())
+                    code_input.to_string()
                 }
                 crate::auth::OAuthFlowKind::DevicePoll => code_input.to_string(),
             };
