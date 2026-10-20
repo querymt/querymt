@@ -47,7 +47,7 @@ pub use domain::{
 pub use error::{WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;
 #[cfg(test)]
-pub(crate) use git::{CliGit, DEFAULT_GIT_TIMEOUT, GitOutput, GitRunner};
+pub(crate) use git::{CliGit, GitRunner};
 pub use identity::{
     CheckoutIdentity, ResolvedRepository, ensure_relative_cwd_exists, relative_cwd,
     resolve_repository,

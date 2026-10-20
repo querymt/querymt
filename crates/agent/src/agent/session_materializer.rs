@@ -1746,7 +1746,6 @@ mod worktree_binding_tests {
         MockLlmProvider, SharedLlmProvider, TestProviderFactory, mock_plugin_registry,
     };
     use crate::tools::context::ToolContext as _;
-    use crate::worktree::git::CliGit;
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
     use crate::worktree::{GixRepoOps, WorkspaceService};
     use querymt::LLMParams;
@@ -1846,7 +1845,7 @@ mod worktree_binding_tests {
         ) -> crate::session::error::SessionResult<crate::worktree::WorkspaceRecord> {
             let consumed = self
                 .remaining
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| n.checked_sub(1),
@@ -3550,7 +3549,6 @@ mod worktree_binding_tests {
         cwd: &std::path::Path,
     ) -> (String, String) {
         use crate::model::MessagePart;
-        use crate::session::store::SessionStore as _;
         use crate::snapshot::SnapshotBackend as _;
         let snapshot_id = backend.track(cwd).await.expect("track pre snapshot");
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -3588,7 +3586,6 @@ mod worktree_binding_tests {
         cwd: &std::path::Path,
     ) -> Vec<String> {
         use crate::model::MessagePart;
-        use crate::session::store::SessionStore as _;
         use crate::snapshot::SnapshotBackend as _;
         let post_snapshot = backend.track(cwd).await.expect("track post snapshot");
         let changed = backend

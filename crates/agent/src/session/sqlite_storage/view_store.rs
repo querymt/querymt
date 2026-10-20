@@ -645,13 +645,12 @@ impl ViewStore for SqliteStorage {
         let workspace_views = self.run_blocking(|conn| load_workspace_views(conn)).await?;
         let pending_isolation: std::collections::HashSet<String> = self
             .run_blocking(|conn| {
-                Ok(conn
-                    .prepare(
-                        "SELECT s.public_id FROM session_fork_isolation_intents i
+                conn.prepare(
+                    "SELECT s.public_id FROM session_fork_isolation_intents i
                          JOIN sessions s ON s.id = i.session_id",
-                    )?
-                    .query_map([], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()?)
+                )?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()
             })
             .await?
             .into_iter()

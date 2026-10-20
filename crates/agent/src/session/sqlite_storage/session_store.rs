@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use querymt::LLMParams;
 use querymt::chat::ChatRole;
 use rusqlite::{OptionalExtension, params, params_from_iter};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -716,7 +716,7 @@ impl SessionStore for SqliteStorage {
                 params![session_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            if PathBuf::from(cwd) != PathBuf::from(checkout).join(relative) {
+            if Path::new(&cwd) != Path::new(&checkout).join(relative) {
                 return Err(rusqlite::Error::InvalidQuery);
             }
             tx.execute(

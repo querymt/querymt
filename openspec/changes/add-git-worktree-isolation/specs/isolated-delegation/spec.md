@@ -23,17 +23,12 @@ The system SHALL support explicit isolated delegation from local or isolated par
 - **THEN** the operation is labeled shared rather than isolated
 
 ### Requirement: Private baseline includes parent edits
-An isolated delegate SHALL start from a validated immutable baseline containing the parent's tracked working-file contents, tracked deletions, and non-ignored untracked files. The capture SHALL preserve supported Git file semantics including executable bits, symlinks, binary contents, and tracked hidden files. It SHALL NOT modify the parent's HEAD, branch, index, stash, or working files. It SHALL exclude ignored untracked files and disclose that exclusion. The baseline SHALL reflect working contents rather than reproduce the staging partition.
+An isolated delegate SHALL start from a validated immutable baseline containing the parent's tracked working-file contents, tracked deletions, and non-ignored untracked files. It SHALL exclude ignored untracked files and disclose that exclusion. The baseline SHALL reflect working contents rather than reproduce the staging partition.
 
 #### Scenario: Parent has partially staged edits
 - **WHEN** the parent has different staged and unstaged contents for a file and starts an isolated delegate
 - **THEN** the delegate sees the working-file contents
 - **AND** the parent's staged contents, working contents, HEAD, and stash remain unchanged
-
-#### Scenario: Mixed local changes
-- **WHEN** parent changes include a tracked deletion, a tracked dotfile, a binary file, an executable, a symlink, a non-ignored new file, and an ignored untracked environment file
-- **THEN** the supported tracked and non-ignored changes appear in the delegate baseline with their Git file semantics preserved
-- **AND** the ignored environment file is not copied and the exclusion is disclosed
 
 #### Scenario: Baseline equals HEAD
 - **WHEN** the parent's captured working contents equal HEAD
@@ -44,6 +39,14 @@ An isolated delegate SHALL start from a validated immutable baseline containing 
 - **THEN** the baseline includes its working contents as a tracked file
 - **AND** genuinely untracked ignored files remain excluded
 - **AND** capture leaves the real index byte-for-byte unchanged
+
+### Requirement: Baseline capture preserves file semantics without touching the source
+Capture SHALL preserve supported Git file semantics, including executable bits, symlinks, binary contents, and tracked hidden files. It SHALL NOT modify the parent's HEAD, branch, index, stash, or working files.
+
+#### Scenario: Mixed local changes
+- **WHEN** parent changes include a tracked deletion, a tracked dotfile, a binary file, an executable, a symlink, a non-ignored new file, and an ignored untracked environment file
+- **THEN** the supported tracked and non-ignored changes appear in the delegate baseline with their Git file semantics preserved
+- **AND** the ignored environment file is not copied and the exclusion is disclosed
 
 ### Requirement: Consistent baseline capture and provenance
 Delegates dispatched as one parallel batch SHALL use the same immutable baseline. Independently requested delegates SHALL capture the then-current parent state. Capture SHALL coordinate with cooperating QueryMT mutations, validate for observed concurrent external changes, and retry or fail instead of launching from a known inconsistent capture. Unsupported or conflicted repository states SHALL fail explicitly before child execution rather than omit content silently.

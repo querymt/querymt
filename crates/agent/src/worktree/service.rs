@@ -995,6 +995,265 @@ mod tests {
         );
     }
 
+    /// Every production step of the workspace lifecycle must work when the
+    /// Git executable is unavailable: creation, private working-state
+    /// capture, immutable publication/inspection, provisioning and removal
+    /// recovery, and conservative removal. Fixtures are built with the typed
+    /// gix API (no Git CLI), and `PATH` is emptied for the duration of the
+    /// test so any accidental subprocess spawn would fail loudly.
+    ///
+    /// `PATH` is process-global, so this test serializes against the
+    /// `PATH_ENV_LOCK` used by the few CLI-adapter tests that need a real
+    /// executable.
+    #[tokio::test]
+    async fn production_lifecycle_works_without_a_git_executable() {
+        use crate::session::backend::StorageBackend;
+        use crate::worktree::{
+            BaselineSource, ManagedBranch, ProvisioningPhase, WorkspaceAllocator, WorkspaceId,
+            checkout_path_for, resolve_repository,
+        };
+
+        // Fixtures first: the repository is fully materialized before Git is
+        // made unavailable.
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &[("file.txt", "one")]);
+        materialize(repo.path(), &[("file.txt", "parent dirty")]);
+
+        // A baseline-absent provisioning intent, as a process that died after
+        // persisting intent would leave behind. Recovery must be able to
+        // replay it without a Git executable.
+        let data = TempDir::new().unwrap();
+        let db = data.path().join("sessions.db");
+        let storage = crate::session::sqlite_storage::SqliteStorage::connect(db.clone())
+            .await
+            .unwrap();
+        let registry = storage.workspace_repository().unwrap();
+        let storage_root = data.path().join("worktrees");
+        let resolved = resolve_repository(repo.path()).unwrap();
+        let id = WorkspaceId::generate();
+        let intent = WorkspaceRecord {
+            id: id.clone(),
+            checkout_path: checkout_path_for(&storage_root, &resolved.identity.common_dir, &id),
+            branch: ManagedBranch::for_workspace(&id),
+            repository: resolved.identity.clone(),
+            relative_cwd: PathBuf::new(),
+            execution: crate::worktree::ExecutionMode::Worktree,
+            baseline: None,
+            lifecycle: WorkspaceLifecycle::Provisioning,
+            ownership: crate::worktree::WorkspaceOwnership::default(),
+            last_error: None,
+            requested_baseline_mode: BaselineMode::CurrentWorkingTree,
+            requested_base_ref: None,
+            operation_id: "op-interrupted".into(),
+            provisioning_phase: Some(ProvisioningPhase::IntentPersisted),
+            created_at: time::OffsetDateTime::now_utc(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        registry.insert_workspace(intent).await.unwrap();
+
+        // From here on no Git executable is reachable. Negative control: a
+        // plain `git --version` must fail, so the lifecycle below cannot
+        // accidentally succeed by shelling out.
+        let _path = PathEnvGuard::hide_path();
+        assert!(
+            std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .is_err(),
+            "test invariant: Git must be unreachable while PATH is hidden"
+        );
+
+        let allocator =
+            WorkspaceAllocator::new(Arc::new(GixRepoOps::new()), registry.clone(), &storage_root);
+        let pending = registry
+            .get_workspace(&id)
+            .await
+            .unwrap()
+            .expect("intent persists");
+        assert!(pending.baseline.is_none());
+        assert_eq!(pending.lifecycle, WorkspaceLifecycle::Provisioning);
+        let recovered = allocator.recover(&pending).await.unwrap();
+        assert_eq!(recovered.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert_eq!(
+            recovered.baseline_source,
+            BaselineSource::CapturedDuringRecovery
+        );
+        assert_eq!(
+            fs::read_to_string(recovered.record.checkout_path.join("file.txt")).unwrap(),
+            "parent dirty"
+        );
+
+        // Fresh creation, capture, publication and inspection.
+        let svc = WorkspaceService::new(
+            Arc::new(GixRepoOps::new()),
+            storage.workspace_repository().unwrap(),
+            data.path().join("worktrees"),
+        );
+        let owner = storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let bound = svc
+            .allocate_for_new_session(
+                repo.path(),
+                &SessionCreationOptions::isolated_worktree(BaselineMode::CurrentWorkingTree),
+            )
+            .await
+            .unwrap()
+            .expect("isolation allocates");
+        svc.bind_owner(&bound.record.id, &owner.public_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(bound.effective_cwd.join("file.txt")).unwrap(),
+            "parent dirty"
+        );
+        fs::write(bound.effective_cwd.join("file.txt"), "child edit").unwrap();
+        let result = svc
+            .publish_result(
+                &bound.record,
+                &bound.effective_cwd,
+                Some(&bound.mutation_gate),
+                Some(ResultVerificationStatus::Passed),
+            )
+            .await
+            .unwrap();
+        let review = svc.review_result(&bound.record, &result).await.unwrap();
+        assert_eq!(review.changed_paths.len(), 1);
+        assert_eq!(review.changed_paths[0].path, "file.txt");
+        assert_eq!(
+            review.changed_paths[0].kind,
+            crate::worktree::ChangeKind::Modified
+        );
+
+        // Conservative removal: unpreserved edits are refused, then a clean
+        // checkout is removed with retained refs after archiving.
+        svc.registry().detach_owner(&bound.record.id).await.unwrap();
+        let current = svc
+            .registry()
+            .get_workspace(&bound.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(svc.manager().remove(&current).await.is_err());
+        assert_eq!(
+            fs::read_to_string(bound.effective_cwd.join("file.txt")).unwrap(),
+            "child edit"
+        );
+        fs::write(bound.effective_cwd.join("file.txt"), "parent dirty").unwrap();
+        svc.manager().archive(&current).await.unwrap();
+        let archived = svc
+            .registry()
+            .get_workspace(&bound.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived.lifecycle, WorkspaceLifecycle::Archived);
+        let removed = svc.manager().remove(&archived).await.unwrap();
+        assert!(removed.checkout_removed);
+        assert!(
+            removed
+                .retained_refs
+                .contains(result.result_ref.as_ref().unwrap())
+        );
+
+        // An interrupted removal recovers idempotently without Git.
+        let recovery_owner = storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let third = svc
+            .allocate_for_new_session(
+                repo.path(),
+                &SessionCreationOptions::isolated_worktree(BaselineMode::Commit),
+            )
+            .await
+            .unwrap()
+            .expect("isolation allocates");
+        svc.bind_owner(&third.record.id, &recovery_owner.public_id)
+            .await
+            .unwrap();
+        svc.registry().detach_owner(&third.record.id).await.unwrap();
+        svc.manager().archive(&third.record).await.unwrap();
+        // Simulate a removal interrupted after its intent was persisted and
+        // the checkout had already been deleted: recovery completes it
+        // idempotently (the vanished checkout is not recreated).
+        std::fs::remove_dir_all(&third.record.checkout_path).unwrap();
+        svc.registry()
+            .transition_lifecycle(
+                &third.record.id,
+                WorkspaceLifecycle::Archived,
+                WorkspaceLifecycle::Removing,
+            )
+            .await
+            .unwrap();
+        let third = svc
+            .registry()
+            .get_workspace(&third.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let finished = svc.manager().remove(&third).await.unwrap();
+        // The checkout had already vanished; recovery only pruned the
+        // remaining Git administration, so it reports no on-disk deletion.
+        assert!(!finished.checkout_removed);
+        let done = svc
+            .registry()
+            .get_workspace(&third.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.lifecycle, WorkspaceLifecycle::Removed);
+
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+            "parent dirty"
+        );
+    }
+
+    /// Serializes process-global `PATH` mutation across tests that care
+    /// about whether a real Git executable is reachable.
+    static PATH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Hides every executable from spawned processes for the guard's
+    /// lifetime (`PATH` points at an empty directory) and restores the
+    /// previous value on drop.
+    struct PathEnvGuard {
+        previous: Option<std::ffi::OsString>,
+        empty_dir: TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl PathEnvGuard {
+        fn hide_path() -> Self {
+            let lock = PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let empty_dir = TempDir::new().unwrap();
+            let previous = std::env::var_os("PATH");
+            // SAFETY: `PATH` is process-global. The guard holds
+            // `PATH_ENV_LOCK` for its whole lifetime and restores the value on
+            // drop, so no other locked reader observes the temporary state.
+            unsafe { std::env::set_var("PATH", empty_dir.path()) };
+            Self {
+                previous,
+                empty_dir,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for PathEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `hide_path`; `PATH_ENV_LOCK` is still held here.
+            match &self.previous {
+                Some(value) => unsafe { std::env::set_var("PATH", value) },
+                None => unsafe { std::env::remove_var("PATH") },
+            }
+            let _ = &self.empty_dir;
+        }
+    }
+
     async fn service() -> (TempDir, TempDir, WorkspaceService) {
         let repo = init_repo();
         commit_files(repo.path(), "init", &[("file.txt", "one")]);

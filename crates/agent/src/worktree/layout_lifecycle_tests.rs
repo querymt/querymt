@@ -297,13 +297,13 @@ async fn assert_full_lifecycle(source_cwd: &Path, svc: &WorkspaceService, storag
     assert!(report.checkout_removed);
     assert!(!record.checkout_path.exists());
     assert!(
-        report.retained_refs.iter().any(|r| *r == result_ref),
+        report.retained_refs.contains(&result_ref),
         "result ref is retained and disclosed: {:?}",
         report.retained_refs
     );
     let baseline_ref = baseline_ref_for(&record.id);
     assert!(
-        report.retained_refs.iter().any(|r| *r == baseline_ref),
+        report.retained_refs.contains(&baseline_ref),
         "baseline ref is retained and disclosed: {:?}",
         report.retained_refs
     );
@@ -342,7 +342,7 @@ async fn separate_git_directory_layout_runs_the_full_lifecycle() {
 /// is a sibling linked worktree of the same repository.
 #[tokio::test]
 async fn existing_linked_source_runs_the_full_lifecycle() {
-    let (_repo_tmp, wt_tmp, source) = linked_source_of_standard_repo().await;
+    let (_repo_tmp, _wt_tmp, source) = linked_source_of_standard_repo().await;
     let (storage, svc) = layout_service();
 
     let resolved = resolve_repository(&source).unwrap();
@@ -357,7 +357,7 @@ async fn existing_linked_source_runs_the_full_lifecycle() {
 /// the shared administration handle.
 #[tokio::test]
 async fn bare_backed_linked_source_runs_the_full_lifecycle() {
-    let (repo_tmp, source, bare) = bare_backed_linked_source();
+    let (_repo_tmp, source, bare) = bare_backed_linked_source();
     let (storage, svc) = layout_service();
 
     let resolved = resolve_repository(&source).unwrap();

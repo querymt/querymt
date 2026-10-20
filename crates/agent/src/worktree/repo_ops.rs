@@ -1290,10 +1290,10 @@ fn find_gitlink_in_tree(
         if entry.mode().kind() == gix::objs::tree::EntryKind::Commit {
             return Ok(Some(path));
         }
-        if entry.mode().kind() == gix::objs::tree::EntryKind::Tree {
-            if let Some(found) = find_gitlink_in_tree(repo, entry.oid().into(), &path)? {
-                return Ok(Some(found));
-            }
+        if entry.mode().kind() == gix::objs::tree::EntryKind::Tree
+            && let Some(found) = find_gitlink_in_tree(repo, entry.oid().into(), &path)?
+        {
+            return Ok(Some(found));
         }
     }
     Ok(None)
@@ -1868,7 +1868,7 @@ mod tests {
         let saved: Vec<(&str, Option<String>)> = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]
             .map(|name| {
                 // SAFETY: test process; no other thread reads these keys.
-                (name, unsafe { std::env::var(name).ok() })
+                (name, std::env::var(name).ok())
             })
             .into();
         // SAFETY: single-threaded mutation for this test's duration; native
