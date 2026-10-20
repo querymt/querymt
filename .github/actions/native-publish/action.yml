@@ -37,6 +37,33 @@ inputs:
 runs:
   using: composite
   steps:
+    # CUDA kernel builds (cudaforge, used by the mistral.rs/candle build scripts)
+    # write all objects under one shared root and clone external deps (CUTLASS)
+    # into CUDAFORGE_HOME. Point both at RUNNER_TEMP so the cache step below can
+    # restore them; cudaforge skips kernels whose source hash, arch and args are
+    # unchanged, so warm builds skip nearly all nvcc invocations.
+    - name: Set CUDA kernel build cache paths
+      if: inputs.os == 'linux' && contains(inputs.features, 'cuda')
+      shell: bash
+      run: |
+        echo "MISTRALRS_CUDA_BUILD_ROOT=${RUNNER_TEMP}/mistralrs-cuda-objects" >> "$GITHUB_ENV"
+        echo "CUDAFORGE_HOME=${RUNNER_TEMP}/cudaforge-deps" >> "$GITHUB_ENV"
+
+    - name: Restore CUDA kernel cache
+      if: inputs.os == 'linux' && contains(inputs.features, 'cuda')
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ runner.temp }}/mistralrs-cuda-objects
+          ${{ runner.temp }}/cudaforge-deps
+        # v1: bump when the compiler or cudaforge build semantics change.
+        # Keyed per crate and feature_tag (sm) so providers never share objects;
+        # the Cargo.lock hash invalidates on dependency bumps. Mind the 10GB
+        # repo-wide cache budget: every CUDA variant stores one entry.
+        key: cuda-kernels-v1-${{ inputs.crate }}-${{ inputs.feature_tag }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          cuda-kernels-v1-${{ inputs.crate }}-${{ inputs.feature_tag }}-
+
     - name: Build native library
       shell: bash
       run: |
@@ -54,6 +81,18 @@ runs:
         FEATURE_ARGS=()
         if [ -n "$FEATURES" ]; then
           FEATURE_ARGS=( --features "$FEATURES" )
+        fi
+
+        # Cap concurrent CUDA compilation on hosted runners. nvcc's cicc peaks
+        # ~7GB on the worst CUTLASS kernels and each crate's build script spawns
+        # its own nvcc pool (mistralrs-quant, -flash-attn, -paged-attn, -core all
+        # start together); uncapped, this exhausts 16GB ubuntu-latest runners,
+        # which then thrash and are torn down mid-build ("exit code 143").
+        # CUDAFORGE_THREADS=1 serializes nvcc within a crate; CARGO_BUILD_JOBS=2
+        # limits how many crates (and thus nvcc pools) build concurrently.
+        if [[ "${{ inputs.os }}" == "linux" && "$FEATURES" == *cuda* ]]; then
+          export CUDAFORGE_THREADS=1
+          export CARGO_BUILD_JOBS=2
         fi
 
         cargo build -p qmt-${{ inputs.crate }} \

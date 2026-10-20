@@ -117,14 +117,16 @@ runs:
         echo "$envVarName=$cudaPath" >> $env:GITHUB_ENV
 
     - name: Install cuDNN (Linux)
-      if: inputs.os == 'linux' && inputs.needs_cuda == 'true'
+      # Only needed when the built features actually enable cuDNN; candle/mistral.rs
+      # CUDA builds without the `cudnn` feature never link it.
+      if: inputs.os == 'linux' && inputs.needs_cuda == 'true' && contains(inputs.features, 'cudnn')
       shell: bash
       run: |
         sudo apt-get update
         sudo apt-get install -y libcudnn9-dev-cuda-12
 
     - name: Install cuDNN (Windows)
-      if: inputs.os == 'windows' && inputs.needs_cuda == 'true'
+      if: inputs.os == 'windows' && inputs.needs_cuda == 'true' && contains(inputs.features, 'cudnn')
       shell: powershell
       run: |
         $url = "https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.0.0.312_cuda12-archive.zip"
