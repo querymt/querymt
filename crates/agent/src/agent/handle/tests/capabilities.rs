@@ -20,6 +20,7 @@ fn legacy_capabilities_fixture_has_no_recovery_contract() {
             "mesh": false,
             "mesh_invites": false,
             "remote_sessions": false,
+            "session_pins": false,
             "schedules": true,
             "remote_schedules": false,
             "profiles": false,
@@ -220,6 +221,7 @@ async fn capabilities_report_lifecycle_unsupported_without_a_view_store() {
     let result = ext_method_json(&handle, "querymt/capabilities", serde_json::json!({})).await;
 
     assert_eq!(result["features"]["session_lifecycle"], false);
+    assert_eq!(result["features"]["session_pins"], true);
     let methods = result["methods"].as_array().expect("methods array");
     for unavailable in [
         "querymt/session/getLifecycle",
@@ -227,6 +229,54 @@ async fn capabilities_report_lifecycle_unsupported_without_a_view_store() {
     ] {
         assert!(!methods.iter().any(|method| method == unavailable));
     }
+    assert!(
+        methods
+            .iter()
+            .any(|method| method == "querymt/session/setPinned")
+    );
+}
+
+#[tokio::test]
+async fn capabilities_report_session_pins_unsupported_for_default_store() {
+    let (plugin_registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+    let event_storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("test storage"),
+    );
+    let backend = Arc::new(TestStorageBackend {
+        session_store: Arc::new(MockSessionStore::new()),
+        event_storage,
+    });
+    let config = Arc::new(
+        AgentConfigBuilder::new(
+            Arc::new(plugin_registry),
+            backend,
+            querymt::LLMParams::new()
+                .provider("mock")
+                .model("mock-model"),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .build(),
+    );
+    let handle = LocalAgentHandle::from_config(config);
+    let result = ext_method_json(&handle, "querymt/capabilities", serde_json::json!({})).await;
+
+    assert_eq!(result["features"]["session_pins"], false);
+    assert!(
+        !result["methods"]
+            .as_array()
+            .expect("methods array")
+            .iter()
+            .any(|method| method == "querymt/session/setPinned")
+    );
+    assert!(
+        !result["notifications"]
+            .as_array()
+            .expect("notifications array")
+            .iter()
+            .any(|notification| notification == "querymt/session/pinsChanged")
+    );
 }
 
 #[tokio::test]
