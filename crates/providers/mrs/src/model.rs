@@ -2,8 +2,8 @@ use mistralrs::core::{
     EmbeddingLoaderType, MultimodalLoaderType, NormalLoaderType, PagedCacheType, SpeechLoaderType,
 };
 use mistralrs::{
-    AudioInput, DeviceMapSetting, EmbeddingModelBuilder, EmbeddingRequestBuilder, GgufModelBuilder,
-    IsqType, MemoryGpuConfig, Model, ModelDType, MtpConfig, MultimodalModelBuilder,
+    AudioInput, DeviceMapMetadata, EmbeddingModelBuilder, EmbeddingRequestBuilder,
+    GgufModelBuilder, IsqType, MemoryGoal, Model, ModelDType, MtpConfig, MultimodalModelBuilder,
     PagedAttentionConfig, RequestBuilder, SpeechModelBuilder, TextMessageRole, TextModelBuilder,
     TokenSource, Topology, parse_isq_value, speech_utils,
 };
@@ -343,16 +343,19 @@ fn load_model_config_from_hf(
     })
 }
 
-fn device_map_setting(cfg: &MistralRSConfig, kind: MistralRSModelKind) -> Option<DeviceMapSetting> {
+fn device_map_setting(
+    cfg: &MistralRSConfig,
+    kind: MistralRSModelKind,
+) -> Option<DeviceMapMetadata> {
     match cfg.device_map {
-        Some(MistralRSDeviceMap::Single) => Some(DeviceMapSetting::dummy()),
+        Some(MistralRSDeviceMap::Single) => Some(DeviceMapMetadata::dummy()),
         Some(MistralRSDeviceMap::Auto) => None,
         None => {
             if matches!(kind, MistralRSModelKind::Vision | MistralRSModelKind::Audio)
                 && cfg!(feature = "metal")
                 && !cfg.force_cpu.unwrap_or(false)
             {
-                Some(DeviceMapSetting::dummy())
+                Some(DeviceMapMetadata::dummy())
             } else {
                 None
             }
@@ -491,22 +494,30 @@ pub(crate) fn paged_attn_config(
         .map(paged_cache_type_from_config)
         .unwrap_or(PagedCacheType::Auto);
 
-    let mem_gpu = match (
+    if let Some(usage) = cfg.paged_attn_gpu_mem_usage {
+        if !usage.is_finite() || usage <= 0.0 || usage > 1.0 {
+            return Err(LLMError::InvalidRequest(format!(
+                "paged_attn_gpu_mem_usage must be a fraction in (0, 1], got {usage}"
+            )));
+        }
+    }
+
+    let mem_goal = match (
         cfg.paged_attn_gpu_mem,
         cfg.paged_attn_gpu_mem_usage,
         cfg.paged_attn_context_len,
     ) {
-        (None, None, None) => MemoryGpuConfig::ContextSize(4096),
-        (None, None, Some(ctxt)) => MemoryGpuConfig::ContextSize(ctxt),
-        (None, Some(usage), None) => MemoryGpuConfig::Utilization(usage),
-        (Some(mem), None, None) => MemoryGpuConfig::MbAmount(mem),
-        (Some(_), Some(usage), None) => MemoryGpuConfig::Utilization(usage),
-        (Some(_), None, Some(ctxt)) => MemoryGpuConfig::ContextSize(ctxt),
-        (None, Some(usage), Some(_)) => MemoryGpuConfig::Utilization(usage),
-        (Some(_), Some(usage), Some(_)) => MemoryGpuConfig::Utilization(usage),
+        (None, None, None) => MemoryGoal::KvTokens(4096),
+        (None, None, Some(ctxt)) => MemoryGoal::KvTokens(ctxt),
+        (None, Some(usage), None) => MemoryGoal::Utilization(usage),
+        (Some(mem), None, None) => MemoryGoal::KvBytes(mem * 1024 * 1024),
+        (Some(_), Some(usage), None) => MemoryGoal::Utilization(usage),
+        (Some(_), None, Some(ctxt)) => MemoryGoal::KvTokens(ctxt),
+        (None, Some(usage), Some(_)) => MemoryGoal::Utilization(usage),
+        (Some(_), Some(usage), Some(_)) => MemoryGoal::Utilization(usage),
     };
 
-    PagedAttentionConfig::new(cfg.paged_attn_block_size, mem_gpu, cache_type)
+    PagedAttentionConfig::new(cfg.paged_attn_block_size, mem_goal, cache_type)
         .map(Some)
         .map_err(|e| LLMError::InvalidRequest(format!("invalid paged_attn config: {e}")))
 }

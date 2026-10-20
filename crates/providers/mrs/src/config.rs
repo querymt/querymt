@@ -33,7 +33,10 @@ pub struct MistralRSConfig {
     pub mtp: Option<MistralRSMtpConfig>,
     pub paged_attn: Option<bool>,
     pub paged_attn_block_size: Option<usize>,
+    /// Max GPU memory for the paged KV cache, in MiB.
     pub paged_attn_gpu_mem: Option<usize>,
+    /// Fraction of GPU memory usable for the paged KV cache, in `(0, 1]` (e.g. `0.9`).
+    /// Not a percentage; values outside the range are rejected.
     pub paged_attn_gpu_mem_usage: Option<f32>,
     pub paged_attn_context_len: Option<usize>,
     pub paged_attn_cache_type: Option<MistralRSPagedCacheType>,
