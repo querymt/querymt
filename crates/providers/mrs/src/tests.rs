@@ -126,6 +126,22 @@ fn mtp_rejects_invalid_or_incompatible_config() {
 }
 
 #[test]
+fn paged_attn_rejects_out_of_range_gpu_mem_usage() {
+    for usage in [0.0, -0.5, 1.5, f32::NAN] {
+        let mut cfg = test_config();
+        cfg.paged_attn_gpu_mem_usage = Some(usage);
+        assert!(
+            matches!(paged_attn_config(&cfg), Err(LLMError::InvalidRequest(_))),
+            "usage {usage} should be rejected"
+        );
+    }
+
+    let mut cfg = test_config();
+    cfg.paged_attn_gpu_mem_usage = Some(0.9);
+    assert!(paged_attn_config(&cfg).unwrap().is_some());
+}
+
+#[test]
 fn mtp_config_rejects_unknown_fields() {
     let mut value = serde_json::to_value(test_config()).unwrap();
     value["mtp"] = serde_json::json!({"n_max": 3});
