@@ -20,7 +20,6 @@ fn legacy_capabilities_fixture_has_no_recovery_contract() {
             "mesh": false,
             "mesh_invites": false,
             "remote_sessions": false,
-            "session_lifecycle": false,
             "schedules": true,
             "remote_schedules": false,
             "profiles": false,
@@ -35,7 +34,30 @@ fn legacy_capabilities_fixture_has_no_recovery_contract() {
     let capabilities: crate::control::capabilities::CapabilitiesInfo =
         serde_json::from_value(legacy).expect("deserialize legacy capabilities");
 
+    assert!(!capabilities.features.session_lifecycle);
     assert!(capabilities.elicitation_recovery.is_none());
+}
+
+#[test]
+fn session_lifecycle_feature_deserializes_explicit_values() {
+    for expected in [false, true] {
+        let features: crate::control::capabilities::ControlFeatureInfo =
+            serde_json::from_value(serde_json::json!({
+                "mesh": false,
+                "mesh_invites": false,
+                "remote_sessions": false,
+                "session_lifecycle": expected,
+                "schedules": false,
+                "remote_schedules": false,
+                "profiles": false,
+                "auth": false,
+                "models": false,
+                "steering": false
+            }))
+            .expect("deserialize explicit session lifecycle capability");
+
+        assert_eq!(features.session_lifecycle, expected);
+    }
 }
 
 #[tokio::test]

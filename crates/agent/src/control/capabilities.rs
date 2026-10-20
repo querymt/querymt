@@ -27,6 +27,7 @@ pub struct ControlFeatureInfo {
     pub mesh: bool,
     pub mesh_invites: bool,
     pub remote_sessions: bool,
+    #[serde(default)]
     pub session_lifecycle: bool,
     pub schedules: bool,
     pub remote_schedules: bool,
