@@ -24,7 +24,7 @@ querymt-service-client = { path = "../service-client", optional = true }
 url.workspace = true
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-rustyline = "18"
+rustyline = "19"
 rustyline-derive = "0.12"
 colored = "3.0"
 spinners = "4.1"
