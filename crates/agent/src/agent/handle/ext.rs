@@ -2,18 +2,7 @@ use super::*;
 
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_capabilities(&self) -> Result<ExtResponse, Error> {
-        let mut capabilities =
-            serde_json::to_value(crate::control::capabilities::get_capabilities(self))
-                .map_err(Error::into_internal_error)?;
-        if let Some(features) = capabilities
-            .get_mut("features")
-            .and_then(serde_json::Value::as_object_mut)
-        {
-            features.insert(
-                "session_lifecycle".into(),
-                serde_json::Value::Bool(self.supports_session_lifecycle_contract()),
-            );
-        }
+        let capabilities = crate::control::capabilities::get_capabilities(self);
         super::utils::ext_json_response(&capabilities)
     }
 

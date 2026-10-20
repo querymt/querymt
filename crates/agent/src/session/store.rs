@@ -293,6 +293,24 @@ pub trait SessionStore: Send + Sync {
     /// Retrieves session metadata by its unique ID.
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;
 
+    /// Resolve durable local/remote ownership for a set of session IDs.
+    /// Custom stores retain point-lookup semantics unless they provide a batch implementation.
+    async fn resolve_session_locations(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, crate::session::location::SessionLocation>> {
+        let mut locations = HashMap::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let bookmark = self.get_remote_session_bookmark(session_id).await?;
+            let local_exists = self.get_session(session_id).await?.is_some();
+            locations.insert(
+                session_id.clone(),
+                crate::session::location::classify_session_location(local_exists, bookmark),
+            );
+        }
+        Ok(locations)
+    }
+
     /// Whether this store provides authoritative persisted session lifecycle state.
     fn supports_session_lifecycle(&self) -> bool {
         false

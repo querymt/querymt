@@ -20,6 +20,7 @@ fn legacy_capabilities_fixture_has_no_recovery_contract() {
             "mesh": false,
             "mesh_invites": false,
             "remote_sessions": false,
+            "session_lifecycle": false,
             "schedules": true,
             "remote_schedules": false,
             "profiles": false,
@@ -146,6 +147,57 @@ async fn test_querymt_capabilities_lists_control_surface() {
             .iter()
             .any(|method| method == "querymt/session/delegateModelsChanged")
     );
+}
+
+struct NoViewStoreBackend {
+    storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
+}
+
+impl crate::session::backend::StorageBackend for NoViewStoreBackend {
+    fn session_store(&self) -> Arc<dyn crate::session::store::SessionStore> {
+        self.storage.clone()
+    }
+
+    fn event_journal(&self) -> Arc<dyn crate::session::projection::EventJournal> {
+        self.storage.clone()
+    }
+
+    fn view_store(&self) -> Option<Arc<dyn crate::session::projection::ViewStore>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn capabilities_report_lifecycle_unsupported_without_a_view_store() {
+    let (plugin_registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+    let storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("test storage"),
+    );
+    let backend = Arc::new(NoViewStoreBackend { storage });
+    let config = Arc::new(
+        AgentConfigBuilder::new(
+            Arc::new(plugin_registry),
+            backend,
+            querymt::LLMParams::new()
+                .provider("mock")
+                .model("mock-model"),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .build(),
+    );
+    let handle = LocalAgentHandle::from_config(config);
+    let result = ext_method_json(&handle, "querymt/capabilities", serde_json::json!({})).await;
+
+    assert_eq!(result["features"]["session_lifecycle"], false);
+    let methods = result["methods"].as_array().expect("methods array");
+    for unavailable in [
+        "querymt/session/getLifecycle",
+        "querymt/session/setLifecycle",
+    ] {
+        assert!(!methods.iter().any(|method| method == unavailable));
+    }
 }
 
 #[tokio::test]

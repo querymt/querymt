@@ -61,12 +61,19 @@ pub async fn resolve_session_location(
     //    storage failure and must propagate — never guess.
     let local_exists = session_store.get_session(session_id).await?.is_some();
 
-    Ok(match (local_exists, bookmark) {
+    Ok(classify_session_location(local_exists, bookmark))
+}
+
+pub(crate) fn classify_session_location(
+    local_exists: bool,
+    bookmark: Option<RemoteSessionBookmark>,
+) -> SessionLocation {
+    match (local_exists, bookmark) {
         (true, Some(bookmark)) => SessionLocation::Conflict { bookmark },
         (true, None) => SessionLocation::Local,
         (false, Some(bookmark)) => SessionLocation::Remote { bookmark },
         (false, None) => SessionLocation::NotFound,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +174,64 @@ mod tests {
             SessionLocation::Conflict {
                 bookmark: bookmark.clone()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_resolution_preserves_local_remote_conflict_and_missing_states() {
+        let fx = Fixture::new().await;
+        let local = fx
+            .store
+            .create_session(None, None, None, None)
+            .await
+            .expect("create local session");
+        let remote = fx.bookmark("sess-batch-remote");
+        fx.store
+            .save_remote_session_bookmark(&remote)
+            .await
+            .expect("persist remote bookmark");
+        let conflict = fx
+            .store
+            .create_session(None, None, None, None)
+            .await
+            .expect("create colliding local session");
+        let conflict_bookmark = fx.bookmark(&conflict.public_id);
+        fx.store
+            .save_remote_session_bookmark(&conflict_bookmark)
+            .await
+            .expect("persist conflicting bookmark");
+
+        let ids = vec![
+            local.public_id.clone(),
+            remote.session_id.clone(),
+            conflict.public_id.clone(),
+            "sess-batch-missing".to_string(),
+        ];
+        let locations = fx
+            .store
+            .resolve_session_locations(&ids)
+            .await
+            .expect("resolve locations in one batch");
+
+        assert_eq!(
+            locations.get(&local.public_id),
+            Some(&SessionLocation::Local)
+        );
+        assert_eq!(
+            locations.get(&remote.session_id),
+            Some(&SessionLocation::Remote {
+                bookmark: remote.clone()
+            })
+        );
+        assert_eq!(
+            locations.get(&conflict.public_id),
+            Some(&SessionLocation::Conflict {
+                bookmark: conflict_bookmark
+            })
+        );
+        assert_eq!(
+            locations.get("sess-batch-missing"),
+            Some(&SessionLocation::NotFound)
         );
     }
 }

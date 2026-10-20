@@ -2169,13 +2169,39 @@ async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill()
         )
         .unwrap();
     }
+
+    let lifecycle_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        lifecycle_table_exists,
+        "migration 0001 initializes the current schema"
+    );
+    conn.execute_batch("DROP TABLE session_lifecycle;").unwrap();
+    let lifecycle_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !lifecycle_table_exists,
+        "fixture must predate lifecycle support"
+    );
+
     conn.execute(
         "INSERT INTO sessions (public_id, name, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?3)",
+         VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![
             "pre-lifecycle-session",
             "Legacy session",
-            "2026-01-01T00:00:00Z"
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z"
         ],
     )
     .unwrap();
@@ -2184,12 +2210,48 @@ async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill()
     let storage = SqliteStorage::connect(db.path().to_path_buf())
         .await
         .unwrap();
+    {
+        let conn = storage.conn_for_test();
+        let conn = conn.lock().unwrap();
+        let lifecycle_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(lifecycle_table_exists, "connection applies migration 0022");
+        let lifecycle_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_lifecycle", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lifecycle_rows, 0, "legacy sessions are not backfilled");
+        let legacy_row: (String, String, String, String) = conn
+            .query_row(
+                "SELECT public_id, name, created_at, updated_at FROM sessions WHERE public_id = ?1",
+                ["pre-lifecycle-session"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_row,
+            (
+                "pre-lifecycle-session".into(),
+                "Legacy session".into(),
+                "2026-01-01T00:00:00Z".into(),
+                "2026-01-02T00:00:00Z".into(),
+            )
+        );
+    }
+
     let session = storage
         .get_session("pre-lifecycle-session")
         .await
         .unwrap()
         .expect("pre-existing session survives the lifecycle migration");
     assert_eq!(session.public_id, "pre-lifecycle-session");
+    assert_eq!(session.name.as_deref(), Some("Legacy session"));
 
     let lifecycle = storage
         .get_session_lifecycle(&session.public_id)

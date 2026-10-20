@@ -13,11 +13,19 @@ use crate::session::load_snapshot::{SessionLoadSnapshot, load_session_snapshot};
 use crate::session::projection::{SessionListItem, SessionScope, ViewStore};
 use crate::session::store::SessionStore;
 use anyhow::{Result, anyhow};
+#[cfg(feature = "remote")]
+use futures_util::StreamExt;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "remote")]
+use std::collections::{BTreeMap, HashSet};
+#[cfg(feature = "remote")]
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "remote")]
+use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use typeshare::typeshare;
 
@@ -286,6 +294,79 @@ pub struct AgentSessions {
     view_store: Arc<dyn ViewStore>,
     session_store: Arc<dyn SessionStore>,
     default_cwd: Option<PathBuf>,
+}
+
+#[cfg(feature = "remote")]
+const REMOTE_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "remote")]
+const REMOTE_LIFECYCLE_CONCURRENCY: usize = 8;
+
+#[cfg(feature = "remote")]
+async fn load_remote_lifecycles_for_summaries<M, Find, FindFuture, Fetch, FetchFuture>(
+    summaries: &[SessionSummary],
+    find_manager: Find,
+    fetch_lifecycle: Fetch,
+) -> HashMap<String, Option<SessionLifecycle>>
+where
+    M: Clone + Send + Sync + 'static,
+    Find: Fn(String) -> FindFuture + Send + Sync + 'static,
+    FindFuture: Future<Output = Option<M>> + Send + 'static,
+    Fetch: Fn(M, String) -> FetchFuture + Send + Sync + 'static,
+    FetchFuture: Future<Output = Option<SessionLifecycle>> + Send + 'static,
+{
+    let mut node_sessions = BTreeMap::<String, Vec<String>>::new();
+    let mut seen_session_ids = HashSet::new();
+    for summary in summaries {
+        if let Some(node_id) = &summary.node_id
+            && seen_session_ids.insert(summary.session_id.clone())
+        {
+            node_sessions
+                .entry(node_id.clone())
+                .or_default()
+                .push(summary.session_id.clone());
+        }
+    }
+
+    let mut lifecycles_by_id = node_sessions
+        .values()
+        .flatten()
+        .cloned()
+        .map(|session_id| (session_id, None))
+        .collect::<HashMap<_, _>>();
+    let find_manager = Arc::new(find_manager);
+    let fetch_lifecycle = Arc::new(fetch_lifecycle);
+    let mut node_requests =
+        futures_util::stream::iter(node_sessions.into_iter().map(|(node_id, session_ids)| {
+            let find_manager = Arc::clone(&find_manager);
+            let fetch_lifecycle = Arc::clone(&fetch_lifecycle);
+            async move {
+                let deadline = tokio::time::Instant::now() + REMOTE_LIFECYCLE_TIMEOUT;
+                let manager = match tokio::time::timeout_at(deadline, find_manager(node_id)).await {
+                    Ok(Some(manager)) => manager,
+                    Ok(None) | Err(_) => return HashMap::new(),
+                };
+
+                let mut node_lifecycles = HashMap::new();
+                for session_id in session_ids {
+                    let lifecycle = match tokio::time::timeout_at(
+                        deadline,
+                        fetch_lifecycle(manager.clone(), session_id.clone()),
+                    )
+                    .await
+                    {
+                        Ok(lifecycle) => lifecycle,
+                        Err(_) => break,
+                    };
+                    node_lifecycles.insert(session_id, lifecycle);
+                }
+                node_lifecycles
+            }
+        }))
+        .buffer_unordered(REMOTE_LIFECYCLE_CONCURRENCY);
+    while let Some(node_lifecycles) = node_requests.next().await {
+        lifecycles_by_id.extend(node_lifecycles);
+    }
+    lifecycles_by_id
 }
 
 impl AgentSessions {
@@ -600,21 +681,26 @@ impl AgentSessions {
     ) -> Result<HashMap<String, Option<SessionLifecycle>>> {
         let mut lifecycle_by_id = HashMap::new();
         let session_store = self.agent.config.provider.history_store();
+        let local_candidate_ids = summaries
+            .iter()
+            .filter(|summary| summary.node_id.is_none())
+            .map(|summary| summary.session_id.clone())
+            .collect::<Vec<_>>();
+        let locations = session_store
+            .resolve_session_locations(&local_candidate_ids)
+            .await?;
         let mut local_ids = Vec::new();
-        for summary in summaries.iter().filter(|summary| summary.node_id.is_none()) {
-            match crate::session::location::resolve_session_location(
-                session_store.as_ref(),
-                &summary.session_id,
-            )
-            .await?
-            {
+        for session_id in &local_candidate_ids {
+            let Some(location) = locations.get(session_id) else {
+                continue;
+            };
+            match location {
                 crate::session::location::SessionLocation::Local => {
-                    local_ids.push(summary.session_id.clone());
+                    local_ids.push(session_id.clone());
                 }
                 crate::session::location::SessionLocation::Conflict { .. } => {
                     return Err(anyhow!(
-                        "Session location conflict: {} exists locally and as a remote bookmark",
-                        summary.session_id
+                        "Session location conflict: {session_id} exists locally and as a remote bookmark"
                     ));
                 }
                 crate::session::location::SessionLocation::Remote { .. }
@@ -634,26 +720,25 @@ impl AgentSessions {
         }
         #[cfg(feature = "remote")]
         {
-            let remote = summaries.into_iter().filter_map(|summary| {
-                let node_id = summary.node_id?;
-                let session_id = summary.session_id;
-                Some((node_id, session_id))
-            });
-            let remote_states =
-                futures_util::future::join_all(remote.map(|(node_id, session_id)| {
-                    let agent = self.agent.clone();
+            let find_agent = self.agent.clone();
+            let fetch_agent = self.agent.clone();
+            let remote_states = load_remote_lifecycles_for_summaries(
+                &summaries,
+                move |node_id| {
+                    let agent = find_agent.clone();
+                    async move { agent.find_node_manager(&node_id).await.ok() }
+                },
+                move |manager, session_id| {
+                    let agent = fetch_agent.clone();
                     async move {
-                        let state = match agent.find_node_manager(&node_id).await {
-                            Ok(manager) => agent
-                                .get_remote_session_lifecycle(&manager, session_id.clone())
-                                .await
-                                .ok(),
-                            Err(_) => None,
-                        };
-                        (session_id, state)
+                        agent
+                            .get_remote_session_lifecycle(&manager, session_id)
+                            .await
+                            .ok()
                     }
-                }))
-                .await;
+                },
+            )
+            .await;
             lifecycle_by_id.extend(remote_states);
         }
         #[cfg(not(feature = "remote"))]
@@ -1018,14 +1103,15 @@ impl AgentSessions {
         }
 
         let session_store = agent.config.provider.history_store();
+        let locations = session_store
+            .resolve_session_locations(&session_ids)
+            .await?;
         let mut local_session_ids = Vec::with_capacity(session_ids.len());
         for session_id in &session_ids {
-            match crate::session::location::resolve_session_location(
-                session_store.as_ref(),
-                session_id,
-            )
-            .await?
-            {
+            let Some(location) = locations.get(session_id) else {
+                continue;
+            };
+            match location {
                 crate::session::location::SessionLocation::Local => {
                     local_session_ids.push(session_id.clone());
                 }
@@ -1708,5 +1794,202 @@ mod remote_page_tests {
         ] {
             assert!(validate_acp_remote_page(&response(count, next), offset, 10).is_err());
         }
+    }
+
+    fn summary(session_id: &str, node_id: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: session_id.to_string(),
+            name: None,
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            parent_session_id: None,
+            fork_origin: None,
+            session_kind: None,
+            has_children: false,
+            fork_count: 0,
+            node: None,
+            node_id: Some(node_id.to_string()),
+            attached: None,
+            connection_state: None,
+            runtime_state: None,
+        }
+    }
+
+    fn lifecycle(session_id: &str, resolved: bool) -> SessionLifecycle {
+        SessionLifecycle {
+            session_id: session_id.to_string(),
+            resolved,
+            archived: false,
+            resolved_at: resolved.then(|| "2026-01-01T00:00:00Z".to_string()),
+            archived_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_enrichment_discovers_each_node_once_and_fetches_session_states() {
+        use std::sync::{Arc, Mutex};
+
+        let find_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let fetch_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let summaries = vec![
+            summary("a-open", "node-a"),
+            summary("a-resolved", "node-a"),
+            summary("b-open", "node-b"),
+        ];
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            {
+                let calls = Arc::clone(&find_calls);
+                move |node_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        *calls.lock().unwrap().entry(node_id.clone()).or_default() += 1;
+                        Some(node_id)
+                    }
+                }
+            },
+            {
+                let calls = Arc::clone(&fetch_calls);
+                move |_manager: String, session_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        *calls.lock().unwrap().entry(session_id.clone()).or_default() += 1;
+                        Some(lifecycle(&session_id, session_id == "a-resolved"))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            find_calls.lock().unwrap().clone(),
+            HashMap::from([("node-a".to_string(), 1), ("node-b".to_string(), 1)])
+        );
+        assert_eq!(
+            fetch_calls.lock().unwrap().clone(),
+            HashMap::from([
+                ("a-open".to_string(), 1),
+                ("a-resolved".to_string(), 1),
+                ("b-open".to_string(), 1),
+            ])
+        );
+        assert_eq!(
+            lifecycles.get("a-open"),
+            Some(&Some(lifecycle("a-open", false)))
+        );
+        assert_eq!(
+            lifecycles.get("a-resolved"),
+            Some(&Some(lifecycle("a-resolved", true)))
+        );
+        assert_eq!(
+            lifecycles.get("b-open"),
+            Some(&Some(lifecycle("b-open", false)))
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_enrichment_processes_rows_beyond_node_and_session_windows() {
+        use std::sync::{Arc, Mutex};
+
+        let find_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let fetch_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let mut summaries = (0..8)
+            .map(|node| summary(&format!("node-session-{node}"), &format!("node-{node:02}")))
+            .collect::<Vec<_>>();
+        summaries
+            .extend((0..101).map(|session| summary(&format!("session-{session:03}"), "node-08")));
+
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            {
+                let calls = Arc::clone(&find_calls);
+                move |node_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        *calls.lock().unwrap().entry(node_id).or_default() += 1;
+                        Some("healthy-owner".to_string())
+                    }
+                }
+            },
+            {
+                let calls = Arc::clone(&fetch_calls);
+                move |manager: String, session_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        assert_eq!(manager, "healthy-owner");
+                        *calls.lock().unwrap().entry(session_id.clone()).or_default() += 1;
+                        Some(lifecycle(&session_id, session_id == "session-100"))
+                    }
+                }
+            },
+        )
+        .await;
+
+        let find_calls = find_calls.lock().unwrap();
+        assert_eq!(find_calls.len(), 9);
+        assert!(find_calls.values().all(|count| *count == 1));
+        let fetch_calls = fetch_calls.lock().unwrap();
+        assert_eq!(fetch_calls.len(), 109);
+        assert!(fetch_calls.values().all(|count| *count == 1));
+        for summary in &summaries {
+            let resolved = summary.session_id == "session-100";
+            assert_eq!(
+                lifecycles.get(&summary.session_id),
+                Some(&Some(lifecycle(&summary.session_id, resolved)))
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_enrichment_keeps_completed_states_and_bounds_offline_or_slow_nodes() {
+        use std::sync::{Arc, Mutex};
+
+        let fetch_calls = Arc::new(Mutex::new(Vec::new()));
+        let summaries = vec![
+            summary("offline-a", "node-offline"),
+            summary("offline-b", "node-offline"),
+            summary("known", "node-slow"),
+            summary("slow", "node-slow"),
+            summary("after-timeout", "node-slow"),
+        ];
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            |node_id: String| async move {
+                if node_id == "node-offline" {
+                    None
+                } else {
+                    Some(node_id)
+                }
+            },
+            {
+                let calls = Arc::clone(&fetch_calls);
+                move |_manager: String, session_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.lock().unwrap().push(session_id.clone());
+                        if session_id == "slow" {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                        }
+                        Some(lifecycle(&session_id, true))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(lifecycles.get("offline-a"), Some(&None));
+        assert_eq!(lifecycles.get("offline-b"), Some(&None));
+        assert_eq!(
+            lifecycles.get("known"),
+            Some(&Some(lifecycle("known", true)))
+        );
+        assert_eq!(lifecycles.get("slow"), Some(&None));
+        assert_eq!(lifecycles.get("after-timeout"), Some(&None));
+        assert_eq!(
+            fetch_calls.lock().unwrap().clone(),
+            vec!["known".to_string(), "slow".to_string()]
+        );
     }
 }

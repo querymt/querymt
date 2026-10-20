@@ -30,7 +30,7 @@ use crate::session::store::{
     CustomModel, DelegateAssignmentWrite, DelegateAssignments, LLMConfig, RemoteSessionBookmark,
     Session, SessionExecutionConfig, SessionStore, TaskPatch, extract_llm_config_values,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
@@ -2354,6 +2354,69 @@ impl SessionStore for SqliteStorage {
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn resolve_session_locations(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, crate::session::location::SessionLocation>> {
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let session_ids = session_ids.to_vec();
+        self.run_blocking_session(move |conn| {
+            let mut locations = HashMap::with_capacity(session_ids.len());
+            for chunk in session_ids.chunks(400) {
+                let placeholders = vec!["?"; chunk.len()].join(", ");
+                let tx = conn.transaction()?;
+                let local_ids = {
+                    let sql = format!(
+                        "SELECT public_id FROM sessions WHERE public_id IN ({placeholders})"
+                    );
+                    let mut stmt = tx.prepare(&sql)?;
+                    stmt.query_map(params_from_iter(chunk.iter().map(String::as_str)), |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<HashSet<_>, _>>()?
+                };
+                let bookmarks = {
+                    let sql = format!(
+                        "SELECT session_id, node_id, peer_label, cwd, created_at, title
+                         FROM remote_session_bookmarks WHERE session_id IN ({placeholders})"
+                    );
+                    let mut stmt = tx.prepare(&sql)?;
+                    let rows = stmt.query_map(
+                        params_from_iter(chunk.iter().map(String::as_str)),
+                        |row| {
+                            Ok(RemoteSessionBookmark {
+                                session_id: row.get(0)?,
+                                node_id: row.get(1)?,
+                                peer_label: row.get(2)?,
+                                cwd: row.get(3)?,
+                                created_at: row.get(4)?,
+                                title: row.get(5)?,
+                            })
+                        },
+                    )?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .map(|bookmark| (bookmark.session_id.clone(), bookmark))
+                        .collect::<HashMap<_, _>>()
+                };
+
+                for session_id in chunk {
+                    let location = crate::session::location::classify_session_location(
+                        local_ids.contains(session_id),
+                        bookmarks.get(session_id).cloned(),
+                    );
+                    locations.insert(session_id.clone(), location);
+                }
+                tx.commit()?;
+            }
+            Ok(locations)
         })
         .await
     }
