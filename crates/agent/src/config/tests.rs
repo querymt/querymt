@@ -166,6 +166,47 @@ fn test_mutating_tool_settings_parse() {
 }
 
 #[test]
+fn test_shell_absent_defaults_to_none() {
+    let agent = parse_agent("");
+    assert!(agent.shell.is_none());
+}
+
+#[test]
+fn test_shell_string_form_uses_default_args() {
+    let agent = parse_agent("shell = \"/bin/zsh\"");
+    let spec = agent.shell.expect("shell should be set").resolve();
+    assert_eq!(spec.path, "/bin/zsh");
+    assert_eq!(spec.args, crate::config::default_shell_args());
+}
+
+#[test]
+fn test_shell_table_form_parses_path_and_args() {
+    let agent = parse_agent("[agent.shell]\npath = \"/bin/bash\"\nargs = [\"-c\"]");
+    let spec = agent.shell.expect("shell should be set").resolve();
+    assert_eq!(spec.path, "/bin/bash");
+    assert_eq!(spec.args, vec!["-c".to_string()]);
+}
+
+#[test]
+fn test_shell_table_without_args_uses_default_args() {
+    let agent = parse_agent("[agent.shell]\npath = \"/bin/bash\"");
+    let spec = agent.shell.expect("shell should be set").resolve();
+    assert_eq!(spec.path, "/bin/bash");
+    assert_eq!(spec.args, crate::config::default_shell_args());
+}
+
+#[test]
+fn test_shell_invalid_type_rejected() {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Wrapper {
+        agent: AgentSettings,
+    }
+    let full = "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\nshell = 42";
+    assert!(toml::from_str::<Wrapper>(full).is_err());
+}
+
+#[test]
 fn test_system_single_string() {
     let agent = parse_agent("system = \"hello\"");
     assert_eq!(agent.system.len(), 1);

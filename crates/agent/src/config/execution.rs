@@ -574,6 +574,93 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
 }
 
 // ============================================================================
+// Shell Configuration
+// ============================================================================
+
+/// Platform-default arguments used when invoking the configured shell.
+///
+/// - Unix: `["-l", "-c"]` (login shell, execute command)
+/// - Windows: `["/C"]`
+pub fn default_shell_args() -> Vec<String> {
+    if cfg!(target_os = "windows") {
+        vec!["/C".to_string()]
+    } else {
+        vec!["-l".to_string(), "-c".to_string()]
+    }
+}
+
+/// Resolved shell invocation used by the built-in `shell` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ShellSpec {
+    /// Shell binary to spawn.
+    pub path: String,
+    /// Arguments passed to the shell; the command string is appended last.
+    pub args: Vec<String>,
+}
+
+impl Default for ShellSpec {
+    fn default() -> Self {
+        if cfg!(target_os = "windows") {
+            Self {
+                path: "cmd".to_string(),
+                args: default_shell_args(),
+            }
+        } else {
+            Self {
+                path: "/bin/sh".to_string(),
+                args: default_shell_args(),
+            }
+        }
+    }
+}
+
+/// Shell interpreter used by the built-in `shell` tool to run commands.
+///
+/// Accepts either a plain path (invoked with platform-default arguments) or
+/// a table specifying the path and argument list:
+///
+/// ```toml
+/// [agent]
+/// shell = "/bin/zsh"
+/// ```
+///
+/// ```toml
+/// [agent.shell]
+/// path = "/opt/homebrew/bin/zsh"
+/// args = ["-l", "-c"]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ShellConfig {
+    /// Shell binary path; invoked with platform-default arguments.
+    Path(String),
+    /// Shell binary with an explicit argument list.
+    Full {
+        /// Shell binary to spawn.
+        path: String,
+        /// Arguments passed to the shell; the command string is appended last.
+        /// Defaults to the platform defaults (`["-l", "-c"]` on unix).
+        args: Option<Vec<String>>,
+    },
+}
+
+impl ShellConfig {
+    /// Resolve this configuration into a concrete shell invocation.
+    pub fn resolve(&self) -> ShellSpec {
+        match self {
+            ShellConfig::Path(path) => ShellSpec {
+                path: path.clone(),
+                args: default_shell_args(),
+            },
+            ShellConfig::Full { path, args } => ShellSpec {
+                path: path.clone(),
+                args: args.clone().unwrap_or_else(default_shell_args),
+            },
+        }
+    }
+}
+
+// ============================================================================
 
 #[cfg(test)]
 mod tests {

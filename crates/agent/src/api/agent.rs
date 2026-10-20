@@ -17,7 +17,7 @@ use crate::agent::agent_config_builder::AgentConfigBuilder;
 use crate::agent::core::{SnapshotPolicy, ToolPolicy};
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{
-    ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SingleAgentConfig,
+    ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, ShellConfig, SingleAgentConfig,
     SkillsConfig, SlashCommandsConfig,
 };
 use crate::event_fanout::EventFanout;
@@ -135,6 +135,8 @@ pub struct AgentBuilder {
     max_prompt_bytes_override: Option<usize>,
     /// Override: execution timeout in seconds (forwarded to AgentConfigBuilder).
     execution_timeout_secs_override: Option<u64>,
+    /// Override: shell interpreter for the built-in `shell` tool (from TOML config).
+    shell: Option<ShellConfig>,
 }
 
 impl Default for AgentBuilder {
@@ -171,6 +173,7 @@ impl AgentBuilder {
             max_steps_override: None,
             max_prompt_bytes_override: None,
             execution_timeout_secs_override: None,
+            shell: None,
         }
     }
 
@@ -613,6 +616,13 @@ impl AgentBuilder {
                     &skills_config,
                     project_root,
                 ));
+        }
+
+        // Replace the default shell tool when a custom interpreter is configured.
+        if let Some(shell) = self.shell.take() {
+            builder.tool_registry_mut().add(Arc::new(
+                crate::tools::builtins::ShellTool::with_shell(shell.resolve()),
+            ));
         }
 
         if !self.tools.is_empty() {
@@ -1487,6 +1497,7 @@ impl Agent {
         builder.skills_config = Some(config.agent.skills);
         builder.slash_commands_config = Some(config.agent.slash_commands);
         builder.hooks_config = Some(config.agent.hooks);
+        builder.shell = config.agent.shell;
 
         // Wire MCP servers from TOML `[[mcp]]` config.
         if !config.mcp.is_empty() {

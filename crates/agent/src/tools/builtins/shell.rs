@@ -5,9 +5,12 @@ use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
+use crate::config::ShellSpec;
 use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
 
-pub struct ShellTool;
+pub struct ShellTool {
+    shell: ShellSpec,
+}
 
 #[cfg(unix)]
 fn detach_session() -> std::io::Result<()> {
@@ -40,7 +43,21 @@ impl Default for ShellTool {
 
 impl ShellTool {
     pub fn new() -> Self {
-        Self
+        Self {
+            shell: ShellSpec::default(),
+        }
+    }
+
+    /// Create a shell tool that invokes a custom shell interpreter.
+    ///
+    /// The command string is passed as the final argument after `shell.args`.
+    pub fn with_shell(shell: ShellSpec) -> Self {
+        Self { shell }
+    }
+
+    /// The shell invocation used to run string commands.
+    pub fn shell(&self) -> &ShellSpec {
+        &self.shell
     }
 }
 
@@ -109,17 +126,17 @@ impl ToolTrait for ShellTool {
 
         let arg_list = args.get("args").and_then(Value::as_array);
 
+        // Explicit args execute the binary directly; otherwise the command
+        // string is interpreted by the configured shell (`agent.shell` config,
+        // defaulting to `/bin/sh` as a login shell on unix, `cmd /C` on Windows).
         let mut cmd = if let Some(args) = arg_list {
             let mut cmd = Command::new(command);
             cmd.args(args.iter().filter_map(Value::as_str));
             cmd
-        } else if cfg!(target_os = "windows") {
-            let mut cmd = Command::new("cmd");
-            cmd.args(["/C", command]);
-            cmd
         } else {
-            let mut cmd = Command::new("sh");
-            cmd.args(["-lc", command]);
+            let mut cmd = Command::new(&self.shell.path);
+            cmd.args(self.shell.args.iter());
+            cmd.arg(command);
             cmd
         };
 
@@ -146,9 +163,14 @@ impl ToolTrait for ShellTool {
         // SIGKILL to the direct child automatically.
         cmd.kill_on_drop(true);
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| ToolError::ProviderError(format!("command failed to spawn: {}", e)))?;
+        let spawn_target = if arg_list.is_some() {
+            command.to_string()
+        } else {
+            self.shell.path.clone()
+        };
+        let child = cmd.spawn().map_err(|e| {
+            ToolError::ProviderError(format!("failed to spawn {spawn_target}: {e}"))
+        })?;
 
         #[cfg(unix)]
         let mut group_guard = KillProcessGroup(child.id());
@@ -288,6 +310,77 @@ mod tests {
 
         assert_eq!(parsed["exit_code"], 0);
         assert!(parsed["stdout"].as_str().unwrap().contains("hello world"));
+    }
+
+    #[test]
+    fn default_shell_spec_matches_platform() {
+        let tool = ShellTool::new();
+        if cfg!(target_os = "windows") {
+            assert_eq!(tool.shell().path, "cmd");
+            assert_eq!(tool.shell().args, vec!["/C".to_string()]);
+        } else {
+            assert_eq!(tool.shell().path, "/bin/sh");
+            assert_eq!(tool.shell().args, vec!["-l".to_string(), "-c".to_string()]);
+        }
+    }
+
+    /// A custom shell should be spawned with its configured arguments and the
+    /// command string appended last.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn custom_shell_receives_command_as_final_arg() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let fake = temp_dir.path().join("fake-shell");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor arg in \"$@\"; do printf 'arg:%s\\n' \"$arg\"; done\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tool = ShellTool::with_shell(ShellSpec {
+            path: fake.display().to_string(),
+            args: vec!["-x".to_string(), "--run".to_string()],
+        });
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let result = tool
+            .call(json!({"command": "echo hi"}), &context)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&first_text_block(result)).unwrap();
+        let stdout = parsed["stdout"].as_str().unwrap();
+        assert!(stdout.contains("arg:-x"), "{stdout}");
+        assert!(stdout.contains("arg:--run"), "{stdout}");
+        assert!(stdout.contains("arg:echo hi"), "{stdout}");
+    }
+
+    #[tokio::test]
+    async fn spawn_failure_mentions_configured_shell() {
+        let temp_dir = TempDir::new().unwrap();
+        let tool = ShellTool::with_shell(ShellSpec {
+            path: "/nonexistent/qmt-missing-shell".to_string(),
+            args: vec!["-c".to_string()],
+        });
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+
+        let err = tool
+            .call(json!({"command": "echo hi"}), &context)
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::ProviderError(message) => {
+                assert!(
+                    message.contains("/nonexistent/qmt-missing-shell"),
+                    "unexpected error: {message}"
+                );
+            }
+            other => panic!("expected ProviderError, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]

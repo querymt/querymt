@@ -1465,3 +1465,81 @@ global_enabled = false
     agent.shutdown().await;
     Ok(())
 }
+
+/// `agent.shell` config must replace the default `/bin/sh` shell tool in the
+/// built registry. Verified by executing the tool and observing that the
+/// configured interpreter (a marker script) ran instead of a real shell.
+#[cfg(unix)]
+#[tokio::test]
+async fn configured_shell_replaces_builtin_shell_tool() -> Result<()> {
+    use crate::tools::AgentToolContext;
+
+    fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {
+        blocks
+            .into_iter()
+            .find_map(|b| match b {
+                querymt::chat::ToolResultPart::Text { text } => Some(text),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    // A marker "shell" whose invocation is observable in stdout.
+    let dir = tempfile::tempdir().unwrap();
+    let marker_shell = dir.path().join("marker-shell");
+    std::fs::write(
+        &marker_shell,
+        "#!/bin/sh\nprintf 'MARKER:'; printf ' %s' \"$@\"; printf '\\n'\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&marker_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let toml = format!(
+        r#"
+[agent]
+provider = "openai"
+model = "gpt-4o-mini"
+
+[agent.shell]
+path = "{}"
+args = []
+"#,
+        marker_shell.display()
+    );
+    let config: crate::config::SingleAgentConfig = toml::from_str(&toml).unwrap();
+
+    let builder = Agent::builder_from_config(config, None)?;
+    let agent = builder
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(empty_plugin_registry()?.0),
+            storage: Some(Arc::new(
+                crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?,
+            )),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .build()
+        .await?;
+
+    let tool = agent
+        .inner
+        .config
+        .tool_registry
+        .find("shell")
+        .expect("shell tool should be registered");
+    let context = AgentToolContext::basic("test".to_string(), Some(dir.path().to_path_buf()));
+    let result = tool
+        .call(serde_json::json!({"command": "hello"}), &context)
+        .await
+        .expect("shell tool call should succeed");
+
+    let stdout = first_text_block(result);
+    assert!(
+        stdout.contains("MARKER: hello"),
+        "expected configured shell to run, got: {stdout}"
+    );
+
+    agent.shutdown().await;
+    Ok(())
+}

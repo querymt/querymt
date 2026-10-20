@@ -134,6 +134,23 @@ pub struct AgentSettings {
     /// Optional for local providers (ollama, llama_cpp).
     pub api_key: Option<String>,
 
+    /// Shell interpreter used by the built-in `shell` tool to run commands.
+    /// Defaults to `/bin/sh` invoked as a login shell on unix (`cmd /C` on
+    /// Windows). A plain path keeps the platform-default arguments; the table
+    /// form customizes them, e.g. to disable login mode or use PowerShell:
+    ///
+    /// ```toml
+    /// shell = "/bin/zsh"
+    /// ```
+    ///
+    /// ```toml
+    /// [agent.shell]
+    /// path = "pwsh"
+    /// args = ["-NoProfile", "-Command"]
+    /// ```
+    #[serde(default)]
+    pub shell: Option<ShellConfig>,
+
     /// Built-in tool names to enable, or MCP tool patterns.
     /// When empty, all built-in tools are available.
     ///
