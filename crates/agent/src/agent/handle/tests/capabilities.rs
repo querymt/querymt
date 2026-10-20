@@ -20,7 +20,6 @@ fn legacy_capabilities_fixture_has_no_recovery_contract() {
             "mesh": false,
             "mesh_invites": false,
             "remote_sessions": false,
-            "session_pins": false,
             "schedules": true,
             "remote_schedules": false,
             "profiles": false,
@@ -36,6 +35,7 @@ fn legacy_capabilities_fixture_has_no_recovery_contract() {
         serde_json::from_value(legacy).expect("deserialize legacy capabilities");
 
     assert!(!capabilities.features.session_lifecycle);
+    assert!(!capabilities.features.session_pins);
     assert!(capabilities.elicitation_recovery.is_none());
 }
 
@@ -58,6 +58,32 @@ fn session_lifecycle_feature_deserializes_explicit_values() {
             .expect("deserialize explicit session lifecycle capability");
 
         assert_eq!(features.session_lifecycle, expected);
+        assert!(!features.session_pins);
+    }
+}
+
+#[test]
+fn session_pins_feature_preserves_explicit_values_and_serializes_them() {
+    for expected in [false, true] {
+        let features: crate::control::capabilities::ControlFeatureInfo =
+            serde_json::from_value(serde_json::json!({
+                "mesh": false,
+                "mesh_invites": false,
+                "remote_sessions": false,
+                "session_lifecycle": false,
+                "session_pins": expected,
+                "schedules": false,
+                "remote_schedules": false,
+                "profiles": false,
+                "auth": false,
+                "models": false,
+                "steering": false
+            }))
+            .expect("deserialize explicit session pins capability");
+
+        assert_eq!(features.session_pins, expected);
+        let serialized = serde_json::to_value(features).expect("serialize session pins capability");
+        assert_eq!(serialized["session_pins"], expected);
     }
 }
 
