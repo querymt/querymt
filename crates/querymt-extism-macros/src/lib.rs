@@ -256,6 +256,26 @@ macro_rules! impl_extism_http_plugin {
         }
 
         #[plugin_fn]
+        pub fn prepared_chat_contract_version() -> FnResult<Json<u32>> {
+            Ok(Json(querymt::plugin::extism_impl::PREPARED_CHAT_CONTRACT_VERSION))
+        }
+
+        #[plugin_fn]
+        pub fn prepare_chat_request(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismChatPrepareRequest<$Config>>,
+        ) -> FnResult<Json<querymt::plugin::extism_impl::ExtismPreparedChatRequest>> {
+            let prepared = input.chat.cfg.prepare_chat_request(
+                &input.chat.messages,
+                input.chat.tools.as_deref(),
+                input.stream,
+            ).map_err(llm_err_to_pdk)?;
+            Ok(Json(querymt::plugin::extism_impl::ExtismPreparedChatRequest {
+                request: querymt::plugin::extism_impl::SerializableHttpRequest { req: prepared.request },
+                context: prepared.context,
+            }))
+        }
+
+        #[plugin_fn]
         pub fn chat_request(
             Json(input): Json<ExtismChatRequest<$Config>>,
         ) -> FnResult<Json<querymt::plugin::extism_impl::SerializableHttpRequest>> {
@@ -292,7 +312,7 @@ macro_rules! impl_extism_http_plugin {
         ) -> FnResult<Json<ExtismChatResponse>> {
             let chat_response = input
                 .cfg
-                .parse_chat(input.resp.resp)
+                .parse_chat_with_context(input.resp.resp, input.context)
                 .map_err(llm_err_to_pdk)?;
             Ok(Json(chat_response.into()))
         }
@@ -304,8 +324,13 @@ macro_rules! impl_extism_http_plugin {
         }
 
         #[plugin_fn]
-        pub fn chat_stream_parser_start(Json(cfg): Json<$Config>) -> FnResult<Json<i64>> {
-            let parser = cfg.chat_stream_parser().map_err(llm_err_to_pdk)?;
+        pub fn chat_stream_parser_start(
+            Json(input): Json<querymt::plugin::extism_impl::ExtismChatStreamParserRequest<$Config>>,
+        ) -> FnResult<Json<i64>> {
+            let parser = input
+                .cfg
+                .chat_stream_parser_with_context(input.context)
+                .map_err(llm_err_to_pdk)?;
             let parser_id = NEXT_STREAM_PARSER_ID.with(|next| {
                 let id = next.get();
                 next.set(id + 1);

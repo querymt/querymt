@@ -4,7 +4,7 @@ use crate::{
     chat::{ChatMessage, ChatOutput, FinishReason, Tool},
     completion::CompletionRequest,
     error::{LLMError, LLMErrorPayload},
-    plugin::extism_impl::SerializableHttpResponse,
+    plugin::extism_impl::{SerializableHttpRequest, SerializableHttpResponse},
     stt, tts,
 };
 use serde::{Deserialize, Serialize};
@@ -169,6 +169,29 @@ pub struct ExtismChatRequest<C> {
 pub struct ExtismChatParseRequest<C> {
     pub cfg: C,
     pub resp: SerializableHttpResponse,
+    #[serde(default)]
+    pub context: serde_json::Value,
+}
+
+/// Versioned opaque request-context contract shared by host and plugin.
+pub const PREPARED_CHAT_CONTRACT_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismPreparedChatRequest {
+    pub request: SerializableHttpRequest,
+    pub context: serde_json::Value,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismChatPrepareRequest<C> {
+    pub chat: ExtismChatRequest<C>,
+    pub stream: bool,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct ExtismChatStreamParserRequest<C> {
+    pub cfg: C,
+    pub context: serde_json::Value,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -464,6 +487,32 @@ mod item_aware_tests {
     use super::*;
     use crate::chat::{ChatOutput, ChatOutputStatus};
     use serde_json::json;
+
+    #[test]
+    fn prepared_chat_context_roundtrips_separately_from_http() {
+        let private = json!({"tool_names": {"mcp_GetWeather": "GetWeather"}});
+        let prepared = ExtismPreparedChatRequest {
+            request: SerializableHttpRequest {
+                req: http::Request::builder()
+                    .uri("https://example.invalid/chat")
+                    .body(b"request body".to_vec())
+                    .unwrap(),
+            },
+            context: private.clone(),
+        };
+        let decoded: ExtismPreparedChatRequest =
+            serde_json::from_slice(&serde_json::to_vec(&prepared).unwrap()).unwrap();
+        assert_eq!(decoded.context, private);
+        assert_eq!(decoded.request.req.body(), b"request body");
+        assert!(decoded.request.req.headers().is_empty());
+        let parser = ExtismChatStreamParserRequest {
+            cfg: json!({}),
+            context: decoded.context,
+        };
+        let decoded: ExtismChatStreamParserRequest<serde_json::Value> =
+            serde_json::from_slice(&serde_json::to_vec(&parser).unwrap()).unwrap();
+        assert_eq!(decoded.context, private);
+    }
 
     #[test]
     fn legacy_extism_payloads_default_item_aware_fields() {

@@ -894,13 +894,50 @@ impl Anthropic {
         }
     }
 
-    /// Strips the TOOL_PREFIX from a tool name if present (used for responses)
-    fn strip_tool_prefix(name: &str) -> String {
-        let name = name.strip_prefix(TOOL_PREFIX).unwrap_or(name);
-        if name == "StructuredOutput" {
-            return name.to_string();
+    /// Wire-to-original names for the effective request tools, never shared
+    /// between requests or streams.
+    fn declared_tool_names(
+        &self,
+        tools: Option<&[Tool]>,
+    ) -> Result<HashMap<String, String>, LLMError> {
+        let mut names = HashMap::new();
+        for tool in tools.or(self.tools.as_deref()).unwrap_or_default() {
+            let original = &tool.function.name;
+            let wire = self.prefix_tool_name(original);
+            if let Some(previous) = names.insert(wire.clone(), original.clone()) {
+                return Err(LLMError::InvalidRequest(format!(
+                    "Tool names {previous:?} and {original:?} both encode as {wire:?}",
+                )));
+            }
         }
-        let mut chars = name.chars();
+        Ok(names)
+    }
+
+    fn tool_names_from_context(&self, context: Value) -> Result<HashMap<String, String>, LLMError> {
+        if context.is_null() {
+            self.declared_tool_names(None)
+        } else {
+            Ok(serde_json::from_value(context)?)
+        }
+    }
+
+    /// Reverses [`prefix_tool_name`] for tool names echoed back by the API.
+    ///
+    /// Names that never carried [`TOOL_PREFIX`] were never transformed and are
+    /// returned unchanged so their capitalization is preserved exactly. Prefixed
+    /// names are restored through the request's wire-to-original mapping,
+    /// falling back to legacy lowercasing only for unknown prefixed names.
+    fn strip_tool_prefix(name: &str, declared: Option<&HashMap<String, String>>) -> String {
+        let Some(stripped) = name.strip_prefix(TOOL_PREFIX) else {
+            return name.to_string();
+        };
+        if let Some(original) = declared.and_then(|names| names.get(name)) {
+            return original.clone();
+        }
+        if stripped == "StructuredOutput" {
+            return stripped.to_string();
+        }
+        let mut chars = stripped.chars();
         format!(
             "{}{}",
             chars
@@ -1000,6 +1037,24 @@ fn tool_result_content(part: &ToolResultPart) -> Option<ToolResultContent> {
 }
 
 impl HTTPChatProvider for Anthropic {
+    fn prepare_chat_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        stream: bool,
+    ) -> Result<querymt::chat::http::PreparedChatRequest, LLMError> {
+        let names = self.declared_tool_names(tools)?;
+        let request = if stream {
+            self.chat_stream_request(messages, tools)?
+        } else {
+            self.chat_request(messages, tools)?
+        };
+        Ok(querymt::chat::http::PreparedChatRequest {
+            request,
+            context: serde_json::to_value(names)?,
+        })
+    }
+
     fn chat_request(
         &self,
         messages: &[ChatMessage],
@@ -1008,6 +1063,7 @@ impl HTTPChatProvider for Anthropic {
         if self.resolved_key().is_empty() {
             return Err(LLMError::AuthError("Missing Anthropic API key".to_string()));
         }
+        self.declared_tool_names(tools)?;
 
         let anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
@@ -1242,6 +1298,14 @@ impl HTTPChatProvider for Anthropic {
     }
 
     fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        self.parse_chat_with_context(resp, Value::Null)
+    }
+
+    fn parse_chat_with_context(
+        &self,
+        resp: Response<Vec<u8>>,
+        context: Value,
+    ) -> Result<ChatOutput, LLMError> {
         let mut json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
             .map_err(|e| LLMError::ResponseFormatError {
                 message: format!("Failed to parse Anthropic response JSON: {e}"),
@@ -1250,9 +1314,10 @@ impl HTTPChatProvider for Anthropic {
 
         // Strip tool prefix from tool names in response (for OAuth)
         if self.is_oauth() {
+            let declared = self.tool_names_from_context(context)?;
             for content in &mut json_resp.content {
                 if let Some(ref mut name) = content.name {
-                    *name = Self::strip_tool_prefix(name);
+                    *name = Self::strip_tool_prefix(name, Some(&declared));
                 }
             }
         }
@@ -1265,8 +1330,16 @@ impl HTTPChatProvider for Anthropic {
     }
 
     fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        self.chat_stream_parser_with_context(Value::Null)
+    }
+
+    fn chat_stream_parser_with_context(
+        &self,
+        context: Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         Ok(Box::new(AnthropicStreamParser {
             oauth: self.is_oauth(),
+            tool_names: self.tool_names_from_context(context)?,
             tool_state_buffer: HashMap::new(),
             thinking_state_buffer: HashMap::new(),
         }))
@@ -1275,6 +1348,8 @@ impl HTTPChatProvider for Anthropic {
 
 struct AnthropicStreamParser {
     oauth: bool,
+    /// Request-scoped wire-to-original tool-name mapping.
+    tool_names: HashMap<String, String>,
     tool_state_buffer: HashMap<usize, AnthropicToolUseState>,
     thinking_state_buffer: HashMap<usize, AnthropicThinkingState>,
 }
@@ -1319,7 +1394,7 @@ impl ChatStreamParser for AnthropicStreamParser {
                             if block.block_type == "tool_use" {
                                 let name = block.name.unwrap_or_default();
                                 let name = if self.oauth {
-                                    Anthropic::strip_tool_prefix(&name)
+                                    Anthropic::strip_tool_prefix(&name, Some(&self.tool_names))
                                 } else {
                                     name
                                 };
@@ -2044,6 +2119,253 @@ mod tests {
             }
             other => panic!("Expected Blocks with two entries, got {:?}", other),
         }
+    }
+
+    fn tool_response(name: &str) -> Response<Vec<u8>> {
+        Response::builder()
+            .status(200)
+            .body(
+                serde_json::to_vec(&serde_json::json!({
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": name, "input": {}}],
+                    "stop_reason": "tool_use"
+                }))
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn output_tool_name(output: ChatOutput) -> String {
+        output
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                ChatOutputItem::FunctionCall(call) => Some(call.name),
+                _ => None,
+            })
+            .expect("tool call")
+    }
+
+    #[test]
+    fn prepared_context_restores_per_call_names_without_configured_tools() {
+        let anthropic = test_anthropic("sk-ant-oat01-test");
+        for name in [
+            "GetWeather",
+            "getWeather",
+            "mcp_custom",
+            "StructuredOutput",
+            "structuredOutput",
+        ] {
+            let tools = [test_tool(name)];
+            let prepared = anthropic
+                .prepare_chat_request(&[], Some(&tools), false)
+                .unwrap();
+            let wire = anthropic.prefix_tool_name(name);
+            let request: Value = serde_json::from_slice(prepared.request.body()).unwrap();
+            assert_eq!(request["tools"][0]["name"], wire);
+            let output = anthropic
+                .parse_chat_with_context(tool_response(&wire), prepared.context)
+                .unwrap();
+            assert_eq!(output_tool_name(output), name);
+        }
+    }
+
+    #[test]
+    fn prepared_context_uses_overrides_and_survives_out_of_order_responses() {
+        let mut anthropic = test_anthropic("sk-ant-oat01-test");
+        anthropic.tools = Some(vec![test_tool("getWeather")]);
+        let upper = [test_tool("GetWeather")];
+        let first = anthropic
+            .prepare_chat_request(&[], Some(&upper), false)
+            .unwrap();
+        let second = anthropic.prepare_chat_request(&[], None, false).unwrap();
+        assert_eq!(
+            output_tool_name(
+                anthropic
+                    .parse_chat_with_context(tool_response("mcp_GetWeather"), second.context,)
+                    .unwrap()
+            ),
+            "getWeather"
+        );
+        assert_eq!(
+            output_tool_name(
+                anthropic
+                    .parse_chat_with_context(tool_response("mcp_GetWeather"), first.context,)
+                    .unwrap()
+            ),
+            "GetWeather"
+        );
+
+        let empty = anthropic
+            .prepare_chat_request(&[], Some(&[]), false)
+            .unwrap();
+        assert_eq!(empty.context, serde_json::json!({}));
+        let request: Value = serde_json::from_slice(empty.request.body()).unwrap();
+        assert_eq!(request["tools"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn prepared_stream_parsers_own_independent_tool_mappings() {
+        let anthropic = test_anthropic("sk-ant-oat01-test");
+        let upper = [test_tool("GetWeather")];
+        let lower = [test_tool("getWeather")];
+        let a = anthropic
+            .prepare_chat_request(&[], Some(&upper), true)
+            .unwrap();
+        let b = anthropic
+            .prepare_chat_request(&[], Some(&lower), true)
+            .unwrap();
+        let request: Value = serde_json::from_slice(a.request.body()).unwrap();
+        assert_eq!(request["stream"], true);
+        // Exercise the same JSON boundary used by the plugin transport.
+        let context = serde_json::from_slice(&serde_json::to_vec(&a.context).unwrap()).unwrap();
+        let mut a = anthropic.chat_stream_parser_with_context(context).unwrap();
+        let mut b = anthropic
+            .chat_stream_parser_with_context(b.context)
+            .unwrap();
+        let frame = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp_GetWeather"}}
+"#;
+        for (parser, expected) in [(&mut b, "getWeather"), (&mut a, "GetWeather")] {
+            let chunks = parser.parse_chunk(frame).unwrap();
+            assert!(
+                matches!(&chunks[0], querymt::chat::StreamChunk::ToolUseStart { name, .. } if name == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_rejects_colliding_tool_names_before_sending() {
+        let anthropic = test_anthropic("sk-ant-oat01-test");
+        let tools = [test_tool("getWeather"), test_tool("GetWeather")];
+        for stream in [false, true] {
+            let error = anthropic
+                .prepare_chat_request(&[], Some(&tools), stream)
+                .err()
+                .expect("collision");
+            assert!(
+                matches!(error, LLMError::InvalidRequest(message) if message.contains("mcp_GetWeather"))
+            );
+        }
+        assert!(anthropic.chat_request(&[], Some(&tools)).is_err());
+        let api_key = test_anthropic("sk-ant-api03-test");
+        assert!(
+            api_key
+                .prepare_chat_request(&[], Some(&tools), false)
+                .is_ok()
+        );
+    }
+
+    fn test_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: name.to_string(),
+                description: "test tool".to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+                strict: None,
+            },
+        }
+    }
+
+    #[test]
+    fn strip_tool_prefix_preserves_unprefixed_names() {
+        // Names without TOOL_PREFIX were never transformed: keep them exact.
+        assert_eq!(
+            Anthropic::strip_tool_prefix("GetWeather", None),
+            "GetWeather"
+        );
+        assert_eq!(Anthropic::strip_tool_prefix("read_file", None), "read_file");
+        assert_eq!(
+            Anthropic::strip_tool_prefix("StructuredOutput", None),
+            "StructuredOutput"
+        );
+    }
+
+    #[test]
+    fn strip_tool_prefix_restores_declared_capitalization() {
+        let declared = HashMap::from([("mcp_GetWeather".to_string(), "GetWeather".to_string())]);
+
+        // Prefixed names of declared tools are restored exactly.
+        assert_eq!(
+            Anthropic::strip_tool_prefix("mcp_GetWeather", Some(&declared)),
+            "GetWeather"
+        );
+        // Undeclared tools keep the legacy first-character lowercasing.
+        assert_eq!(
+            Anthropic::strip_tool_prefix("mcp_get_weather", Some(&declared)),
+            "get_weather"
+        );
+        // Prefixed StructuredOutput keeps its legacy handling.
+        assert_eq!(
+            Anthropic::strip_tool_prefix("mcp_StructuredOutput", Some(&declared)),
+            "StructuredOutput"
+        );
+    }
+
+    #[test]
+    fn tool_name_prefixing_round_trips_declared_names() {
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.tools = Some(vec![test_tool("GetWeather")]);
+
+        let wire = anthropic.prefix_tool_name("GetWeather");
+        assert_eq!(wire, "mcp_GetWeather");
+        assert_eq!(
+            Anthropic::strip_tool_prefix(
+                &wire,
+                Some(&anthropic.declared_tool_names(None).unwrap())
+            ),
+            "GetWeather"
+        );
+    }
+
+    #[test]
+    fn parse_chat_restores_declared_tool_names() {
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.tools = Some(vec![test_tool("GetWeather")]);
+
+        let body = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "mcp_GetWeather", "input": {}},
+                {"type": "text", "text": "Checking the weather."}
+            ],
+            "stop_reason": "tool_use"
+        });
+        let resp = Response::builder()
+            .status(200)
+            .body(serde_json::to_vec(&body).expect("json should serialize"))
+            .expect("response should build");
+
+        let output = anthropic.parse_chat(resp).expect("response should parse");
+        let names: Vec<&str> = output
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ChatOutputItem::FunctionCall(call) => Some(call.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["GetWeather"]);
+    }
+
+    #[test]
+    fn streaming_oauth_tool_names_restore_declared_capitalization() {
+        let mut anthropic = test_anthropic("sk-ant-oat01-abc123");
+        anthropic.tools = Some(vec![test_tool("GetWeather")]);
+
+        let lines = [
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_01","name":"mcp_GetWeather"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ];
+        let chunks = collect_chunks(&anthropic, &lines);
+
+        assert!(
+            matches!(
+                &chunks[0],
+                querymt::chat::StreamChunk::ToolUseStart { name, .. }
+                if name == "GetWeather"
+            ),
+            "expected ToolUseStart with exact name, got {:?}",
+            chunks[0]
+        );
     }
 
     #[test]

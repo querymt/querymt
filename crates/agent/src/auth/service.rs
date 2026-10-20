@@ -316,13 +316,22 @@ impl OAuthService {
                 crate::auth::OAuthFlowKind::DevicePoll => "device_poll",
             };
 
-            // Auto-spawn callback listener for redirect flows.
-            if flow_kind == crate::auth::OAuthFlowKind::RedirectCode {
-                self.spawn_callback_listener(FlowIdentity {
-                    flow_id: flow_id.clone(),
-                    owner: owner.to_string(),
-                    provider: provider_name.clone(),
-                })
+            // Auto-spawn a loopback callback listener for redirect flows that
+            // declare one. Providers with a hosted callback (e.g. Anthropic)
+            // report no callback port and complete via `complete_flow` instead;
+            // spawning a listener for them would needlessly replace any pending
+            // loopback flow (e.g. a Codex login waiting on the same port).
+            if let Some(callback_port) =
+                callback_listener_port(flow_kind, oauth_provider.callback_port())
+            {
+                self.spawn_callback_listener(
+                    FlowIdentity {
+                        flow_id: flow_id.clone(),
+                        owner: owner.to_string(),
+                        provider: provider_name.clone(),
+                    },
+                    callback_port,
+                )
                 .await;
             }
 
@@ -778,7 +787,7 @@ impl OAuthService {
     // ── Callback listener lifecycle ───────────────────────────────────────
 
     #[cfg(feature = "oauth")]
-    async fn spawn_callback_listener(&self, identity: FlowIdentity) {
+    async fn spawn_callback_listener(&self, identity: FlowIdentity, callback_port: u16) {
         let previous = {
             let active = self.listener_slot.lock().await;
             active
@@ -816,7 +825,7 @@ impl OAuthService {
         let provider = identity.provider.clone();
 
         let task = tokio::spawn(async move {
-            run_callback_listener_task(svc, identity, stop_rx).await;
+            run_callback_listener_task(svc, identity, stop_rx, callback_port).await;
         });
 
         let mut active = self.listener_slot.lock().await;
@@ -906,6 +915,23 @@ fn oauth_mode_for_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
+/// Resolves the loopback port a redirect flow should listen on.
+///
+/// Returns `None` unless the flow is a `RedirectCode` flow whose provider
+/// declares a loopback callback port. Providers with a hosted callback (e.g.
+/// Anthropic) return `None`; their flows complete via [`OAuthService::complete_flow`]
+/// and must not claim a loopback port.
+#[cfg(feature = "oauth")]
+fn callback_listener_port(
+    flow_kind: crate::auth::OAuthFlowKind,
+    callback_port: Option<u16>,
+) -> Option<u16> {
+    match flow_kind {
+        crate::auth::OAuthFlowKind::RedirectCode => callback_port,
+        crate::auth::OAuthFlowKind::DevicePoll => None,
+    }
+}
+
 // ── Callback listener task (free fn for 'static tokio::spawn) ─────────────────
 
 #[cfg(feature = "oauth")]
@@ -939,6 +965,7 @@ async fn run_callback_listener_task(
     svc: OAuthService,
     identity: FlowIdentity,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+    callback_port: u16,
 ) {
     use axum::{
         Router,
@@ -964,14 +991,6 @@ async fn run_callback_listener_task(
         (flow.state.clone(), flow.verifier.clone())
     };
 
-    let mode = oauth_mode_for_provider(&provider);
-    let callback_port = match crate::auth::get_oauth_provider(&provider, mode) {
-        Ok(oauth_provider) => oauth_provider.callback_port().unwrap_or(1455),
-        Err(err) => {
-            log::warn!("OAuth provider lookup failed for '{}': {}", provider, err);
-            return;
-        }
-    };
     let callback_bind_addr = format!("{}:{}", OAUTH_CALLBACK_HOST, callback_port);
 
     #[derive(Clone)]
@@ -1223,5 +1242,41 @@ async fn stop_listener_for_owner_provider(
     if let Some(active) = active {
         let _ = active.stop_tx.send(());
         let _ = active.task.await;
+    }
+}
+
+#[cfg(all(test, feature = "oauth"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_listener_port_follows_provider_declarations() {
+        // Loopback redirect providers listen on their declared port.
+        let codex = crate::auth::get_oauth_provider("codex", None).unwrap();
+        assert_eq!(
+            callback_listener_port(codex.flow_kind(), codex.callback_port()),
+            Some(1455)
+        );
+        let xai = crate::auth::get_oauth_provider("xai", None).unwrap();
+        assert_eq!(
+            callback_listener_port(xai.flow_kind(), xai.callback_port()),
+            Some(56121)
+        );
+
+        // Hosted-callback providers (Anthropic) must not spawn a listener:
+        // their redirect completes via `complete_flow`, and claiming a loopback
+        // port here would cancel a pending loopback flow for another provider.
+        let anthropic = crate::auth::get_oauth_provider("anthropic", None).unwrap();
+        assert_eq!(
+            callback_listener_port(anthropic.flow_kind(), anthropic.callback_port()),
+            None
+        );
+
+        // Device-poll flows never listen on a loopback port.
+        let kimi = crate::auth::get_oauth_provider("kimi-code", None).unwrap();
+        assert_eq!(
+            callback_listener_port(kimi.flow_kind(), kimi.callback_port()),
+            None
+        );
     }
 }

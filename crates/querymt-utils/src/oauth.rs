@@ -796,6 +796,31 @@ pub async fn authenticate(
     Ok(())
 }
 
+/// Upper bound for one provider token refresh, including provider-side retries
+/// and api-key creation.
+///
+/// The underlying OAuth HTTP clients do not configure a request timeout, so a
+/// stalled connection would otherwise hold the per-provider refresh lock in
+/// [`get_or_refresh_token`] indefinitely and block all subsequent token reads
+/// for that provider.
+const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs `future` under [`TOKEN_REFRESH_TIMEOUT`].
+async fn bound_refresh<F>(provider: &str, future: F) -> Result<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout(TOKEN_REFRESH_TIMEOUT, future)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "{} OAuth token refresh timed out after {}s",
+                provider,
+                TOKEN_REFRESH_TIMEOUT.as_secs()
+            )
+        })
+}
+
 /// Refresh OAuth tokens for a provider
 ///
 /// # Arguments
@@ -814,16 +839,23 @@ pub async fn refresh_tokens(
         .get_oauth_tokens(provider.name())
         .ok_or_else(|| anyhow!("No OAuth tokens found for {}", provider.display_name()))?;
 
-    let new_tokens = provider.refresh_token(&tokens.refresh_token).await?;
+    // Bound the refresh so a stalled transport releases the per-provider
+    // refresh lock promptly instead of blocking every later token read.
+    let new_tokens = bound_refresh(provider.display_name(), async {
+        let new_tokens = provider.refresh_token(&tokens.refresh_token).await?;
 
-    // Store the new tokens
-    store.set_oauth_tokens(provider.name(), &new_tokens)?;
+        // Store the new tokens
+        store.set_oauth_tokens(provider.name(), &new_tokens)?;
 
-    if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await
-        && let Some(key_name) = provider.api_key_name()
-    {
-        let _ = store.set(key_name, &api_key);
-    }
+        if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await
+            && let Some(key_name) = provider.api_key_name()
+        {
+            let _ = store.set(key_name, &api_key);
+        }
+
+        Ok::<TokenSet, anyhow::Error>(new_tokens)
+    })
+    .await??;
 
     Ok(new_tokens)
 }
@@ -1321,5 +1353,16 @@ mod tests {
     #[test]
     fn get_oauth_provider_rejects_unknown() {
         assert!(get_oauth_provider("unknown-provider", None).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_refresh_deadline_bounds_hanging_refresh() {
+        // A refresh future that never completes must surface a timeout error
+        // instead of holding the per-provider refresh lock forever.
+        let result = bound_refresh("test-provider", std::future::pending::<()>()).await;
+        let err = result.expect_err("hanging refresh should time out");
+        let message = err.to_string();
+        assert!(message.contains("test-provider"), "message: {message}");
+        assert!(message.contains("timed out"), "message: {message}");
     }
 }

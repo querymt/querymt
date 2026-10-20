@@ -17,11 +17,12 @@ use crate::{
         Fut, HTTPLLMProviderFactory, LLMProviderFactory,
         extism_impl::{
             ExtismChatChunk, ExtismChatChunkParseRequest, ExtismChatParseRequest,
-            ExtismChatRequest, ExtismChatResponse, ExtismCompleteParseRequest,
-            ExtismEmbedParseRequest, ExtismEmbedRequest, ExtismListModelsParseRequest,
-            ExtismListModelsRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
+            ExtismChatPrepareRequest, ExtismChatRequest, ExtismChatResponse,
+            ExtismChatStreamParserRequest, ExtismCompleteParseRequest, ExtismEmbedParseRequest,
+            ExtismEmbedRequest, ExtismListModelsParseRequest, ExtismListModelsRequest,
+            ExtismPreparedChatRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
             ExtismTtsResponse, ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION,
-            SerializableHttpRequest, SerializableHttpResponse,
+            PREPARED_CHAT_CONTRACT_VERSION, SerializableHttpRequest, SerializableHttpResponse,
             messages_require_item_aware_contract,
         },
     },
@@ -1290,6 +1291,49 @@ impl ChatStreamParser for ExtismStreamParser {
 }
 
 impl HTTPChatProvider for ExtismProvider {
+    fn prepare_chat_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        stream: bool,
+    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
+        let item_aware_contract_version = self.validate_item_aware_messages(messages)?;
+        let cfg = self.effective_config()?;
+        let chat = ExtismChatRequest {
+            cfg,
+            messages: messages.to_vec(),
+            tools: tools.map(<[Tool]>::to_vec),
+            item_aware_contract_version,
+        };
+        self.call_short_blocking("prepare_chat_request", move |plug| {
+            if !plug.function_exists("prepared_chat_contract_version") {
+                return Err(LLMError::PluginError(
+                    "Provider plugin lacks the prepared-chat context contract; rebuild the plugin"
+                        .into(),
+                ));
+            }
+            let version: Json<u32> = plug
+                .call_get_error_code("prepared_chat_contract_version", ())
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            if version.0 != PREPARED_CHAT_CONTRACT_VERSION {
+                return Err(LLMError::PluginError(format!(
+                    "Prepared-chat contract mismatch: expected {}, got {}; rebuild the plugin",
+                    PREPARED_CHAT_CONTRACT_VERSION, version.0,
+                )));
+            }
+            let out: Json<ExtismPreparedChatRequest> = plug
+                .call_get_error_code(
+                    "prepare_chat_request",
+                    Json(ExtismChatPrepareRequest { chat, stream }),
+                )
+                .map_err(|(e, code)| decode_plugin_error(e, code))?;
+            Ok(crate::chat::http::PreparedChatRequest {
+                request: out.0.request.req,
+                context: out.0.context,
+            })
+        })
+    }
+
     fn classify_chat_error_async<'a>(
         &'a self,
         response: &'a http::Response<Vec<u8>>,
@@ -1322,6 +1366,7 @@ impl HTTPChatProvider for ExtismProvider {
                             Json(ExtismChatParseRequest {
                                 cfg,
                                 resp: SerializableHttpResponse { resp: response },
+                                context: Value::Null,
                             }),
                         )
                         .map_err(|(e, code)| decode_plugin_error(e, code))?;
@@ -1410,6 +1455,14 @@ impl HTTPChatProvider for ExtismProvider {
     }
 
     fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        self.parse_chat_with_context(resp, Value::Null)
+    }
+
+    fn parse_chat_with_context(
+        &self,
+        resp: http::Response<Vec<u8>>,
+        context: Value,
+    ) -> Result<ChatOutput, LLMError> {
         let cfg = self.effective_config()?;
         let out = self.call_short_blocking("parse_chat_response", move |plug| {
             let out: Json<ExtismChatResponse> = plug
@@ -1418,6 +1471,7 @@ impl HTTPChatProvider for ExtismProvider {
                     Json(ExtismChatParseRequest {
                         cfg,
                         resp: SerializableHttpResponse { resp },
+                        context,
                     }),
                 )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
@@ -1436,10 +1490,20 @@ impl HTTPChatProvider for ExtismProvider {
     }
 
     fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        self.chat_stream_parser_with_context(Value::Null)
+    }
+
+    fn chat_stream_parser_with_context(
+        &self,
+        context: Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         let cfg = self.effective_config()?;
         let parser_id = self.call_short_blocking("chat_stream_parser_start", move |plug| {
             let out: Json<i64> = plug
-                .call_get_error_code("chat_stream_parser_start", Json(cfg))
+                .call_get_error_code(
+                    "chat_stream_parser_start",
+                    Json(ExtismChatStreamParserRequest { cfg, context }),
+                )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
             Ok(out.0)
         })?;
