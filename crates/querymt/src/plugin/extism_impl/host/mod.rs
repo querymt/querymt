@@ -1617,10 +1617,19 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = [0; 4096];
                 let mut received = 0;
-                while !buffer[..received].windows(4).any(|bytes| bytes == b"\r\n\r\n") {
-                    assert!(received < buffer.len(), "request headers exceed buffer size");
+                while !buffer[..received]
+                    .windows(4)
+                    .any(|bytes| bytes == b"\r\n\r\n")
+                {
+                    assert!(
+                        received < buffer.len(),
+                        "request headers exceed buffer size"
+                    );
                     let read = socket.read(&mut buffer[received..]).await.unwrap();
-                    assert!(read > 0, "connection closed before request headers completed");
+                    assert!(
+                        read > 0,
+                        "connection closed before request headers completed"
+                    );
                     received += read;
                 }
                 socket
