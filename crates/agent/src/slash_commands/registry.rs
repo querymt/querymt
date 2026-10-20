@@ -212,6 +212,45 @@ mod tests {
     }
 
     #[test]
+    fn registry_for_workspace_preserves_script_and_configured_path_policy() {
+        let workspace = TempDir::new().unwrap();
+        let commands = workspace.path().join(".qmt/commands");
+        fs::create_dir_all(&commands).unwrap();
+        fs::write(
+            commands.join("needs-script.md"),
+            "---\ndescription: Needs a script\nrequires-script: true\n---\nBody\n",
+        )
+        .unwrap();
+        let extra = TempDir::new().unwrap();
+        fs::write(
+            extra.path().join("configured.md"),
+            "---\ndescription: Configured command\n---\nBody\n",
+        )
+        .unwrap();
+
+        let config = crate::config::SlashCommandsConfig {
+            enabled: true,
+            include_global: false,
+            include_project: true,
+            paths: vec![extra.path().to_path_buf()],
+            ..Default::default()
+        };
+
+        // Scripts are disabled by default: script-required commands stay
+        // hidden, while configured (non-workspace) sources remain part of
+        // the global command policy.
+        let registry = SlashCommandRegistry::registry_for_workspace(&config, workspace.path());
+        assert!(registry.get("needs-script").is_none());
+        assert!(registry.get("configured").is_some());
+
+        let mut scripts_enabled = config.clone();
+        scripts_enabled.scripts.enabled = true;
+        let registry =
+            SlashCommandRegistry::registry_for_workspace(&scripts_enabled, workspace.path());
+        assert!(registry.get("needs-script").is_some());
+    }
+
+    #[test]
     fn test_names_sorted() {
         let mut reg = SlashCommandRegistry::new();
         reg.register(make_command("charlie", "C", false));

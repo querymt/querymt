@@ -75,6 +75,38 @@ Semantics that matter:
   storage, or local filesystem placement is unavailable, creation fails with
   an actionable error instead of silently running shared.
 
+`current_working_tree` capture details:
+
+- **Tracked membership comes from HEAD plus the real index.** A file
+  force-added to the index is captured with its working contents — even when
+  ignore rules would exclude it — and later working edits to it are captured
+  too. Genuinely untracked ignored files stay excluded and disclosed. The
+  parent's staging partition is not imported: a partially staged file uses
+  its working content, and the real index stays byte-for-byte unchanged.
+- **Capture is repository-wide.** A session started in a subdirectory still
+  captures from the resolved checkout root; the relative cwd only applies to
+  child execution. Root-level `core.sparseCheckout` therefore cannot be
+  bypassed from a subdirectory.
+- **Unsupported content is rejected with path diagnostics before any child
+  launches.** Active submodules are detected from gitlink entries in HEAD or
+  the index (no `.gitmodules` required); sparse checkouts and unborn HEAD or
+  unresolved conflicts fail as before.
+- **External filter processes are unsupported and rejected via effective
+  attributes.** Attribute resolution follows Git semantics — nested
+  `.gitattributes` files, `$GIT_DIR/info/attributes`, global attribute
+  files, and `[attr]` macros — and any path resolving to `filter=lfs` (or
+  any other external clean/smudge filter) fails capture with a diagnostic
+  naming the path. A filter configuration with no matching paths is not a
+  blocker: rejection is path-based, never a root-file text scan. Working
+  contents are captured as raw bytes; text/eol normalization and external
+  filters are not applied.
+- **Externally changing sources are retried, then rejected.** The source
+  HEAD, index (including newly staged files), and captured tree are
+  validated before and after capture; a mismatch retriggers a bounded retry
+  and fails explicitly rather than launching from a known-inconsistent
+  baseline. This is not a transactional snapshot against arbitrary hostile
+  writers — a write landing after the post-validation is undetectable.
+
 ## Native Git operations
 
 All built-in workspace operations — baseline capture, branch and ref
@@ -85,11 +117,46 @@ operations; QueryMT needs a supported toolchain (Rust ≥ 1.88) but nothing
 else. Building the `WorkspaceService` takes a `GixRepoOps` value (see the
 example above); there is no Git-CLI configuration knob.
 
-Repository-opening policy: every operation opens the explicit checkout path
-it was given, with an isolated open that ignores inherited `GIT_DIR`,
+Repository-opening policy: administration operations (branches, refs,
+worktree registration/inventory/removal, ancestry) open the canonical Git
+**common directory** resolved from the source at creation time and stored on
+every workspace record — never a working directory guessed from a checkout.
+Per-checkout operations (status, HEAD, capture, index reads) open the explicit
+checkout path. Both use an isolated open that ignores inherited `GIT_DIR`,
 `GIT_WORK_TREE`, and `GIT_INDEX_FILE` overrides, so an ambient environment
 cannot redirect operations to a different repository, worktree, or index.
 Repository-local configuration is still honored.
+
+### Supported repository layouts
+
+Workspace creation, status, capture, result review, recovery, and removal
+work for all of these source layouts:
+
+- **Ordinary checkout** — `.git` directory directly below the working tree.
+- **Separate Git directory** — the checkout carries a `.git` *file* pointing
+  at a Git directory stored elsewhere (the `git init --separate-git-dir`
+  layout, with `core.worktree` pointing back). Administration targets the
+  external Git directory; the checkout is never assumed to contain one.
+- **Existing linked source** — the session starts in a linked worktree of an
+  ordinary repository. Its managed checkout becomes a sibling linked worktree
+  of the same shared repository.
+- **Linked checkout backed by a bare common repository** — the source is a
+  linked worktree whose common repository is bare (e.g. `project.git`). The
+  bare registration itself has no working tree and is never misread as a
+  usable checkout; the linked checkout is the only one listed and managed.
+
+A bare source without a working checkout is rejected explicitly with
+`BareRepositoryUnsupported` before any workspace resources are allocated.
+Other layout diagnostics: `NotGitRepository` (no repository at or above the
+path), `RelativeCwdOutsideCheckout`, and `RelativeCwdAbsent` (a subdirectory
+session whose directory the selected baseline lacks).
+
+All paths are canonicalized at resolution time, so path aliases (symlinks)
+resolve to identical repository and checkout identities: a durable workspace
+has exactly one owner and one administration lock no matter which alias a
+caller uses, and project grouping keys on the canonical common directory.
+Grouped sessions share the project identity but keep distinct execution
+paths and per-checkout indexes — grouping never merges execution state.
 
 This native layer is distinct from the Git activity a session may perform
 through its own tools: arbitrary shell commands the model runs, and any
@@ -135,7 +202,7 @@ The same service backs additive ACP extension methods:
 | `querymt/worktree/result` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/archive` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/remove` | `{"workspace_id":"<id>"}` |
-| `querymt/worktree/recover` | `{"workspace_id":"<id>"}` |
+| `querymt/worktree/recover` | `{"workspace_id":"<id>"}` or `{"session_id":"<id>"}` (pending isolated forks) |
 
 Commit-based creation also accepts `base_ref` (or `baseRef`). Result responses
 contain immutable baseline/result OIDs, retained result refs, and verification
@@ -165,9 +232,85 @@ changing existing ACP session updates.
    Dirty, untracked, ignored, externally owned, or unpreserved-result checkouts
    remain protected. There is no `--force`; successful removal reports retained refs.
 
+Removal safety does not depend on Git status configuration: untracked and
+ignored files are detected even when `status.showUntrackedFiles=no` is set,
+and any such content refuses removal with nothing deleted.
+
+### Removal, external writers, and retained refs
+
+The repository-administration lock coordinates QueryMT processes only; plain
+Git commands and editors never honor it. Removal therefore assumes external
+writers and is race-safe by construction:
+
+- The managed branch is observed during the preservation checks and deleted
+  with an **expected-target transaction** (delete only while it still points
+  at the observed commit). If an external writer moves the branch between
+  check and deletion, the branch — together with its new history — is
+  **retained, never deleted**, and the removal response discloses the race in
+  `branch_moved_during_removal` plus the branch in `retained_refs`.
+- Removal responses always report exactly what remains:
+  `checkout_removed`, `removed_branch`, `branch_moved_during_removal`, and
+  `retained_refs`. A response never claims complete deletion when anything
+  was retained or refused; baseline refs of removed workspaces are always
+  retained and listed.
+- Interrupted `removing` state recovers through the same safety checks, run
+  freshly: a branch moved while removal was interrupted is refused as
+  unpreserved until its commits are contained in a retained result ref, and
+  an already-deleted branch or vanished checkout is completed idempotently
+  without unconditional deletion.
+
 For an interrupted `provisioning` or `removing` operation, use
 `/worktree recover <id>` (or its typed extension). Recovery completes the
 persisted intent conservatively and never starts an actor or changes its owner.
+Pending isolated forks recover by session id through the typed extension:
+`querymt/worktree/recover` with `{"session_id":"<id>"}`.
+
+### Provisioning phases and recovery
+
+Provisioning records its progress durably after every step, so a crash at any
+boundary can be replayed from the recorded state instead of guessing:
+
+1. **Intent persisted** — the workspace row exists with its source identity
+   (source checkout and repository), requested baseline policy and ref,
+   relative cwd, intended branch and checkout path, and a unique operation id.
+   Nothing has been captured or allocated yet.
+2. **Baseline bound** — the immutable baseline identity is durably bound.
+3. **Baseline ref published** — `refs/qmt/baselines/<workspace-id>` exists at
+   the bound baseline.
+4. **Branch created** — the managed branch exists at the baseline commit.
+5. **Checkout created** — the linked worktree exists; only the final
+   `ready` transition remains.
+
+Recovery behavior depends on how far the interrupted allocation got:
+
+- **Intent-only (no baseline bound).** The recorded source and policy are
+  sufficient to finish: recovery re-resolves the recorded ref (or source
+  HEAD) or re-runs the validated current-working-tree capture against the
+  recorded source checkout. The source must still exist and be a usable
+  repository — recovery never fabricates a baseline. If the source is
+  unavailable or the recorded ref no longer resolves, the workspace stays
+  non-runnable (`provisioning`) with an actionable diagnostic in
+  `last_error`, and a later explicit retry succeeds once the source is back.
+- **Recovery-time captures are disclosed.** A baseline captured during
+  recovery reflects the source contents at recovery time — not the state
+  before the interruption — and is reported as
+  `baselineSource: "captured-during-recovery"`; a baseline that was already
+  bound before the crash is reported as `"bound-before-interruption"` and is
+  preserved exactly. Recovery never recaptures or replaces a bound baseline.
+- **Retained baseline refs are repaired, never rewritten.** If the process
+  crashed after binding the baseline but before publishing its ref, recovery
+  recreates `refs/qmt/baselines/<workspace-id>` at that exact baseline. If a
+  ref with that name already exists at a different commit, recovery refuses
+  with an explicit conflict instead of overwriting it; resolve the conflict
+  manually, then retry.
+- **No duplicates, no silent startup.** Recovery reuses the recorded branch,
+  checkout path, and operation id — including branches or checkouts that
+  were already created before the crash — and never registers a second
+  workspace row or a second writable owner for the same checkout.
+  Pre-existing directories at the checkout path that QueryMT does not own
+  are preserved untouched. Recovery never launches an actor; only a fully
+  provisioned and durably bound workspace becomes runnable, and a pending
+  isolated fork still cannot load or resume as local execution.
 
 ## Resuming and loading
 
@@ -175,7 +318,10 @@ A session's workspace binding is persisted independently of conversation
 contents. Resume/load always resolve that binding first:
 
 - The session runs in its **persisted checkout** — the same path across
-  restarts — regardless of where the client reattaches from.
+  restarts — regardless of where the client reattaches from. The binding,
+  not any caller-supplied path, is the single authority for the effective
+  working directory; tool context, indexes, hooks, and delegation all
+  resolve it the same way.
 - A **conflicting `cwd` request fails** with a workspace-specific diagnostic;
   it is never silently re-bound to a different directory.
 - A **missing checkout fails closed**. Deleted worktrees are recorded
@@ -185,6 +331,39 @@ contents. Resume/load always resolve that binding first:
 One workspace has exactly **one writable owner session**. A second session
 cannot attach to an owned checkout; it creates its own through an explicit
 creation request.
+
+## Workspace-scoped slash commands
+
+Slash commands follow the effective workspace. A managed session discovers
+its commands from its **bound checkout**, not from the directory the agent
+process was started in:
+
+- **Project commands** (`.qmt/commands/*.md`) are re-resolved from the
+  checkout for both the advertised catalog and the actual `/command`
+  expansion, so the two always agree. Two checkouts of the same project can
+  define the same command differently, and each session expands its own
+  version.
+- A command that exists **only in an isolated checkout** can be invoked in
+  that session; the original checkout does not consult the isolated one.
+- **Global and configured sources** (for example `~/.qmt/commands` and
+  explicitly configured paths) follow the same discovery configuration as
+  agent startup, and the scripts policy (enabled/disabled) is unchanged.
+
+```console
+# In the original checkout, /deploy may read:
+#   "Deploy to staging"  (project command committed on main)
+/worktree create feature-x
+# In the isolated session, the same .qmt/commands/deploy.md now reads:
+#   "Deploy the service"  (as defined in that checkout)
+/deploy api
+```
+
+Absolute paths inside command prompts are **not rewritten** — a prompt that
+hard-codes `/Users/me/project/src` keeps referring there, so prefer
+repository-relative paths in shared command files. The native `/worktree`
+command family keeps its built-in interception and is never expanded as a
+prompt command, and legacy local sessions continue to use the registry
+built at agent startup.
 
 ## Forking
 
@@ -197,11 +376,44 @@ workspace, even without metadata. A local source can request isolation explicitl
   response discloses this via
   `_meta.querymt.sessionWorkspace.disclosure = "fresh-working-state"` and
   includes the fork's `workspaceId` and `sessionCwd`.
+- The fork's persisted session cwd **is** its bound checkout: the row, the
+  workspace binding, listing, load, and resume all agree with no external
+  rewrite. Historical absolute paths in copied messages are context only —
+  they are not rewritten, and there is **no live workspace switching**.
 - The message fork point and the workspace association are recorded
   **separately**: selecting an older message does not rewind files.
 - Forks never share a checkout with the source, a sibling, or the parent.
 - Forks of local sources without workspace options remain pure message copies.
 - An explicit local fork of an isolated source is rejected rather than sharing its checkout.
+
+### Pending and failed fork creation
+
+Creation is fail-closed at every boundary. An invalid request creates no
+fork row and copies no history. Once the conversation copy commits, a
+durable **startup barrier** (a pending isolation intent) travels with the
+fork until its workspace is allocated, bound as the single writable owner,
+and the execution cwd is published atomically in SQLite:
+
+- A pending or failed fork is **not runnable**: load and resume reject it
+  with `fork isolation is pending; refusing local fallback` instead of
+  running it in the source checkout — including after a restart or when no
+  workspace service is configured.
+- Failures compensate only newly allocated, unused resources: a workspace
+  whose owner binding failed is marked `failed` (diagnostic retained, Git
+  resources preserved for explicit recovery/removal); the copied history is
+  always preserved.
+- Session **listing flags these forks** (`pending_isolation`), and the
+  workspace view carries the failed lifecycle when one exists, so a pending
+  fork is never mistaken for a legacy local session.
+- **Recovery is explicit** and creates no duplicate owners:
+  `querymt/worktree/recover` with `{"session_id": ...}` completes a pending
+  fork — reusing its bound workspace when a previous attempt already
+  attached it, otherwise allocating one (with a baseline captured at
+  recovery time, disclosed in the response) — persists the execution cwd,
+  and releases the barrier in one validated SQLite transaction. Workspace
+  records with interrupted provisioning/removal intents recover by id via
+  `/worktree recover <workspace-id>` as before. A recovered fork runs in its
+  own checkout; retries are refused once nothing is pending.
 
 ## Undo, snapshots, and workspace references
 
@@ -311,5 +523,6 @@ never reports the inherited `config.rs` change as delegate work.
 
 ## See also
 
+- [Slash Commands](slash-commands.md) — command discovery and format
 - [Delegation](delegation.md) — multi-agent delegation
 - [API Reference](api_reference.md) — session creation and fork requests

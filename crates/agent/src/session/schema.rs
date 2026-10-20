@@ -6,6 +6,7 @@
 //! - Internal-only tables skip public_id to save space
 
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// Initialize the hybrid INTEGER PK + UUID v7 public_id schema
 pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -610,7 +611,40 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     )?;
 
     conn.execute_batch(WORKSPACE_TABLES_DDL)?;
+    ensure_workspace_provisioning_columns(conn)?;
 
+    Ok(())
+}
+
+/// Additive provisioning-intent columns for the `workspaces` table.
+///
+/// Persist the replayable provisioning inputs (requested baseline ref,
+/// operation id, and the last completed provisioning phase) so an
+/// interrupted allocation can be recovered without a fabricated baseline.
+/// Kept out of [`WORKSPACE_TABLES_DDL`]'s `workspaces` CREATE TABLE because
+/// the `0025_workspace_archival` rebuild copies rows with
+/// `INSERT ... SELECT *`; guarding each `ALTER TABLE` keeps this idempotent
+/// for both fresh installs (where [`init_schema`] calls it right after
+/// creating the tables) and existing databases (via the
+/// `0027_workspace_provisioning_intent` migration).
+pub fn ensure_workspace_provisioning_columns(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    for (column, definition) in [
+        ("requested_base_ref", "TEXT"),
+        ("operation_id", "TEXT"),
+        ("provisioning_phase", "TEXT"),
+    ] {
+        if !existing.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE workspaces ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 

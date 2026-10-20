@@ -15,7 +15,7 @@ use crate::session::error::SessionResult;
 use crate::worktree::allocate::{AllocationRequest, WorkspaceAllocator};
 use crate::worktree::capture::{CaptureRetryPolicy, capture_working_state_validated};
 use crate::worktree::domain::{
-    Baseline, BaselineMode, ResultProvenance, ResultVerificationStatus, WorkspaceId,
+    Baseline, BaselineMode, ResultProvenance, ResultReview, ResultVerificationStatus, WorkspaceId,
     WorkspaceLifecycle, WorkspaceRecord,
 };
 use crate::worktree::error::{WorktreeError, WorktreeResult};
@@ -164,6 +164,108 @@ impl WorkspaceService {
         session_id: &str,
     ) -> WorktreeResult<WorkspaceRecord> {
         Ok(self.registry.attach_owner(workspace_id, session_id).await?)
+    }
+
+    /// Compensation for a failed owner binding: mark a freshly allocated,
+    /// never-owned workspace `Failed` with the binding diagnostic.
+    ///
+    /// The workspace is unused by construction — no session was ever bound —
+    /// so this is purely bookkeeping: Git resources (branch, checkout,
+    /// baseline ref) are retained for the explicit recovery/removal surface
+    /// instead of being deleted here. The record becomes visibly failed and
+    /// can never be attached as-is afterwards.
+    ///
+    /// A workspace that already has an owner is left untouched (there is
+    /// nothing unused to compensate), as is an unknown id.
+    pub async fn mark_owner_binding_failed(
+        &self,
+        workspace_id: &WorkspaceId,
+        diagnostic: &str,
+    ) -> WorktreeResult<()> {
+        let Some(mut record) = self.registry.get_workspace(workspace_id).await? else {
+            return Ok(());
+        };
+        if record.ownership.owner_session_id.is_some() {
+            return Ok(());
+        }
+        if self
+            .registry
+            .transition_lifecycle(
+                workspace_id,
+                WorkspaceLifecycle::Ready,
+                WorkspaceLifecycle::Failed,
+            )
+            .await?
+        {
+            record.lifecycle = WorkspaceLifecycle::Failed;
+        }
+        record.last_error = Some(diagnostic.to_string());
+        self.registry.update_workspace(record).await?;
+        Ok(())
+    }
+
+    /// Explicit recovery for a pending isolated fork: complete provisioning
+    /// for `fork_session_id` from its persisted intent and bind the fork as
+    /// the single writable owner.
+    ///
+    /// Duplicate-owner-safe by construction:
+    /// - an existing binding already owned by this session is reused
+    ///   verbatim (the retry resumes after a crash between binding and
+    ///   barrier release);
+    /// - otherwise a fresh workspace is allocated. Resources from prior
+    ///   failed attempts remain as explicit failed/unowned records and are
+    ///   never reowned; the unique-owner index guarantees this session owns
+    ///   at most one workspace, so retries cannot create duplicate owners.
+    ///
+    /// The baseline of a fresh attempt is captured at recovery time from the
+    /// recorded source; the caller must disclose that it reflects
+    /// recovery-time contents. After this returns, the caller persists the
+    /// execution cwd and releases the startup barrier
+    /// ([`crate::session::store::SessionStore::complete_fork_isolation`]).
+    pub async fn recover_fork_isolation(
+        &self,
+        fork_session_id: &str,
+        intent: &crate::session::store::PendingForkIsolation,
+    ) -> WorktreeResult<WorkspaceBinding> {
+        let options = SessionCreationOptions::from_workspace_options(&intent.options);
+        options
+            .validate()
+            .map_err(WorktreeError::InvalidOperation)?;
+        if !options.requests_isolation() {
+            return Err(WorktreeError::InvalidOperation(
+                "pending fork isolation intent does not request a worktree; refusing \
+                 to publish it as a local session"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(record) = self
+            .registry
+            .get_workspace_by_session(fork_session_id)
+            .await?
+        {
+            if record.lifecycle != WorkspaceLifecycle::Ready {
+                return Err(WorktreeError::InvalidOperation(format!(
+                    "workspace {} for session {fork_session_id} is {} and cannot be attached",
+                    record.id, record.lifecycle
+                )));
+            }
+            return WorkspaceBinding::new(record, &self.storage_root);
+        }
+
+        let binding = self
+            .allocate_for_fork(&intent.source_cwd, &options, None)
+            .await?;
+        if let Err(err) = self.bind_owner(&binding.record.id, fork_session_id).await {
+            let _ = self
+                .mark_owner_binding_failed(
+                    &binding.record.id,
+                    &format!("fork owner binding failed during recovery: {err}"),
+                )
+                .await;
+            return Err(err);
+        }
+        Ok(binding)
     }
 
     /// Allocate a fresh working-state workspace for an isolated
@@ -425,29 +527,38 @@ impl WorkspaceService {
         .await
     }
 
-    /// Capture an isolated delegate's uncommitted working state as an
-    /// immutable, reviewable result (design decision 5).
+    /// Publish the uncommitted working state of a workspace checkout as an
+    /// immutable, reviewable result (design decision 5). This is the single
+    /// publication/review path for delegates **and** top-level workspaces;
+    /// the explicit top-level publication operation uses it with verification
+    /// state `Skipped` (no verification is performed for publication).
     ///
     /// Reuses the repository capture primitive (a private temporary index),
-    /// so the child's real staging state is untouched and no commit hooks
+    /// so the checkout's real staging state is untouched and no commit hooks
     /// run. The result commit's tree is the full working state at capture
     /// time; diffing it against the workspace baseline yields exactly the
-    /// delegate's delta — inherited parent edits are part of the baseline
+    /// delta — for delegates, inherited parent edits are part of the baseline
     /// and are never misattributed to the child. The result is pinned by a
-    /// retained ref in the shared repository; the parent checkout is never
-    /// touched.
-    pub async fn capture_delegate_result(
+    /// unique create-only retained ref in the shared repository; no other
+    /// checkout is touched.
+    ///
+    /// # Errors
+    /// Returns an explicit error when execution is not local, capture
+    /// validation fails, or the retained ref cannot be written. The checkout
+    /// and its index are left unchanged by a failed publication; a partially
+    /// written ref is never silently replaced (create-only semantics).
+    pub async fn publish_result(
         &self,
         record: &WorkspaceRecord,
-        child_checkout: &Path,
+        checkout: &Path,
         gate: Option<&CheckoutMutationGate>,
         verification: Option<ResultVerificationStatus>,
     ) -> WorktreeResult<ResultProvenance> {
-        crate::worktree::placement::ensure_local_filesystem_execution(child_checkout)?;
+        crate::worktree::placement::ensure_local_filesystem_execution(checkout)?;
 
         let capture = capture_working_state_validated(
             self.git.as_ref(),
-            child_checkout,
+            checkout,
             CaptureRetryPolicy::default(),
         );
         let captured = match gate {
@@ -455,10 +566,17 @@ impl WorkspaceService {
             None => capture.await?,
         };
 
-        // Unique create-only refs preserve results even after partial publication.
+        // Unique create-only refs preserve results even after partial
+        // publication. The ref is written through the record's canonical
+        // common directory — the administration handle — never through the
+        // checkout path.
         let result_ref = format!("refs/qmt/results/{}/{}", record.id, uuid::Uuid::now_v7());
         self.git
-            .create_ref_if_absent(child_checkout, result_ref.as_str(), &captured.commit)
+            .create_ref_if_absent(
+                &record.repository.common_dir,
+                result_ref.as_str(),
+                &captured.commit,
+            )
             .await?;
 
         let provenance = ResultProvenance {
@@ -471,9 +589,77 @@ impl WorkspaceService {
             result_ref: Some(result_ref),
             verification,
             captured_at: time::OffsetDateTime::now_utc(),
+            captured_head: Some(captured.source_head),
         };
         self.registry.record_result(&record.id, &provenance).await?;
         Ok(provenance)
+    }
+
+    /// Build the immutable baseline-relative review for one retained result.
+    ///
+    /// Changed paths and change kinds are diffed between the pinned
+    /// baseline and result commits through the canonical common directory —
+    /// never from live working-tree state — so review is identical after
+    /// later edits, HEAD movement, restart, or snapshot GC. Provenance rows
+    /// persisted before `captured_head` existed report the workspace
+    /// baseline commit in its place.
+    ///
+    /// # Errors
+    /// Returns an explicit error when the result was not captured
+    /// (`result_commit` absent), a pinned object is missing from the
+    /// repository, or the diff cannot be computed.
+    pub async fn review_result(
+        &self,
+        record: &WorkspaceRecord,
+        provenance: &ResultProvenance,
+    ) -> WorktreeResult<ResultReview> {
+        let result_commit = provenance.result_commit.as_deref().ok_or_else(|| {
+            WorktreeError::InvalidOperation(
+                "result was not captured; there is no immutable result to review".to_string(),
+            )
+        })?;
+        let changed_paths = self
+            .git
+            .changed_paths_between(
+                &record.repository.common_dir,
+                &provenance.baseline_commit,
+                result_commit,
+            )
+            .await?;
+        Ok(ResultReview {
+            baseline_commit: provenance.baseline_commit.clone(),
+            result_commit: result_commit.to_string(),
+            result_ref: provenance.result_ref.clone(),
+            captured_head: provenance
+                .captured_head
+                .clone()
+                .unwrap_or_else(|| provenance.baseline_commit.clone()),
+            verification: provenance.verification,
+            captured_at: provenance.captured_at,
+            changed_paths,
+            baseline_includes_uncommitted_edits: record
+                .baseline
+                .as_ref()
+                .is_some_and(|b| b.mode == BaselineMode::CurrentWorkingTree),
+        })
+    }
+
+    /// Review the newest retained result of a workspace, if any.
+    ///
+    /// Inspection never publishes: absence returns `None` instead of
+    /// silently recapturing live state.
+    ///
+    /// # Errors
+    /// Propagates registry and diff errors from [`Self::review_result`].
+    pub async fn review_latest_result(
+        &self,
+        record: &WorkspaceRecord,
+    ) -> WorktreeResult<Option<ResultReview>> {
+        let results = self.registry.list_results(&record.id).await?;
+        match results.into_iter().find(|r| r.result_commit.is_some()) {
+            Some(provenance) => self.review_result(record, &provenance).await.map(Some),
+            None => Ok(None),
+        }
     }
 }
 

@@ -310,6 +310,15 @@ Commands are discovered at startup:
 2. **Project commands**: `.qmt/commands/*.md`
 3. **Merged**: Project commands override user commands with same name
 
+For sessions running in an isolated Git worktree (see
+[Git Worktree Workspaces](./worktrees.md)), project commands are
+re-discovered from the session's **bound checkout**: the catalog shown to
+the client and the actual `/command` expansion both use that checkout's
+files, so differently defined commands in different checkouts each expand
+their own version. Global and configured sources and the scripts policy
+follow the same configuration as a local session. Absolute paths inside
+command prompts are never rewritten.
+
 ## Command Format
 
 ### Basic Structure

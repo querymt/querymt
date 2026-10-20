@@ -2585,9 +2585,17 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
+    // Managed sessions expand against the registry resolved from their
+    // bound checkout, matching the advertised catalog; legacy local
+    // sessions keep the agent-level registry built at startup.
+    let slash_registry = runtime
+        .slash_registry
+        .get()
+        .map(Arc::as_ref)
+        .unwrap_or(&config.slash_command_registry);
     if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
-            crate::slash_commands::try_expand(&text_content.text, &config.slash_command_registry)
+            crate::slash_commands::try_expand(&text_content.text, slash_registry)
     {
         log::info!(
             "Session {}: expanding slash command '/{}'",

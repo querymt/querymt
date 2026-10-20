@@ -57,6 +57,7 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
         session_kind: row.get(7)?,
         has_children: fork_count > 0,
         fork_count,
+        pending_isolation: false,
     })
 }
 
@@ -94,6 +95,43 @@ fn enrich_workspace_views(
         item.workspace = views.get(&item.session_id).cloned();
     }
     Ok(())
+}
+
+/// Sessions with an outstanding fork-isolation intent are not runnable;
+/// expose that pending/failed creation state on the list item so consumers
+/// never mistake an isolated fork for a legacy local session.
+fn enrich_fork_isolation_state(
+    conn: &rusqlite::Connection,
+    items: &mut [SessionListItem],
+) -> rusqlite::Result<()> {
+    let pending: std::collections::HashSet<String> = conn
+        .prepare(
+            "SELECT s.public_id FROM session_fork_isolation_intents i
+             JOIN sessions s ON s.id = i.session_id",
+        )?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    for item in items.iter_mut() {
+        if pending.contains(&item.session_id) {
+            item.pending_isolation = true;
+        }
+    }
+    Ok(())
+}
+
+/// Enrich items with durable workspace provenance and pending fork-isolation
+/// state.
+fn enrich_workspace_and_isolation_views(
+    conn: &rusqlite::Connection,
+    items: &mut [SessionListItem],
+) -> rusqlite::Result<()> {
+    enrich_workspace_views(conn, items)?;
+    enrich_fork_isolation_state(conn, items)
 }
 
 fn parse_finish_reason(value: &str) -> Option<FinishReason> {
@@ -585,6 +623,7 @@ impl ViewStore for SqliteStorage {
             items.push(SessionListItem {
                 session_id: row.public_id,
                 workspace: None,
+                pending_isolation: false,
                 name: row.name,
                 cwd: row.cwd,
                 title,
@@ -604,8 +643,24 @@ impl ViewStore for SqliteStorage {
             });
         }
         let workspace_views = self.run_blocking(|conn| load_workspace_views(conn)).await?;
+        let pending_isolation: std::collections::HashSet<String> = self
+            .run_blocking(|conn| {
+                Ok(conn
+                    .prepare(
+                        "SELECT s.public_id FROM session_fork_isolation_intents i
+                         JOIN sessions s ON s.id = i.session_id",
+                    )?
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()?)
+            })
+            .await?
+            .into_iter()
+            .collect();
         for item in &mut items {
             item.workspace = workspace_views.get(&item.session_id).cloned();
+            if pending_isolation.contains(&item.session_id) {
+                item.pending_isolation = true;
+            }
         }
         let title_lookup_ms = title_lookup_started.elapsed().as_millis() as u64;
 
@@ -868,7 +923,7 @@ impl ViewStore for SqliteStorage {
                         .collect::<Result<Vec<_>, _>>()?
                 };
 
-                enrich_workspace_views(conn, &mut sessions)?;
+                enrich_workspace_and_isolation_views(conn, &mut sessions)?;
                 let next_cursor = if sessions.len() < total_count {
                     Some(sessions.len().to_string())
                 } else {
@@ -1034,7 +1089,7 @@ impl ViewStore for SqliteStorage {
                     .collect::<Result<Vec<_>, _>>()?
             };
 
-            enrich_workspace_views(conn, &mut sessions)?;
+            enrich_workspace_and_isolation_views(conn, &mut sessions)?;
             let next_cursor = if offset + sessions.len() < total_count {
                 Some((offset + sessions.len()).to_string())
             } else {
@@ -1146,7 +1201,7 @@ impl ViewStore for SqliteStorage {
                 .query_map(params![parent_db_id, limit as i64, offset as i64], map_session_list_item_row)?
                 .collect::<Result<Vec<_>, _>>()?;
 
-            enrich_workspace_views(conn, &mut sessions)?;
+            enrich_workspace_and_isolation_views(conn, &mut sessions)?;
             let next_cursor = if offset + sessions.len() < total_count {
                 Some((offset + sessions.len()).to_string())
             } else {
@@ -1306,7 +1361,7 @@ impl ViewStore for SqliteStorage {
                     .collect::<Result<Vec<_>, _>>()?
             };
 
-            enrich_workspace_views(conn, &mut sessions)?;
+            enrich_workspace_and_isolation_views(conn, &mut sessions)?;
             let next_cursor = offset.checked_add(sessions.len() as i64).and_then(|next_offset| {
                 (usize::try_from(next_offset).ok()? < total_count).then_some(next_offset.to_string())
             });
@@ -1502,7 +1557,7 @@ impl ViewStore for SqliteStorage {
             let mut items = stmt
                 .query_map(params![fts_query, limit as i64, offset as i64], map_session_list_item_row)?
                 .collect::<Result<Vec<_>, _>>()?;
-            enrich_workspace_views(conn, &mut items)?;
+            enrich_workspace_and_isolation_views(conn, &mut items)?;
 
             let mut by_cwd: std::collections::HashMap<Option<String>, Vec<SessionListItem>> =
                 std::collections::HashMap::new();

@@ -483,17 +483,24 @@ impl SessionMaterializer {
 
         // Persist the durable session-to-workspace association. The registry
         // enforces a single writable owner atomically, so a duplicate owner
-        // attempt fails closed instead of sharing the checkout.
+        // attempt fails closed instead of sharing the checkout. A failed
+        // binding is compensated: the never-owned workspace is marked
+        // `Failed` (resources retained for explicit recovery/removal).
         if let Some(binding) = &workspace {
             let service = self.workspace_service().ok_or_else(|| {
                 Error::internal_error().data(serde_json::json!({
                     "message": "workspace service disappeared during session creation",
                 }))
             })?;
-            service
-                .bind_owner(&binding.record.id, &session_id)
-                .await
-                .map_err(worktree_error_to_acp)?;
+            if let Err(err) = service.bind_owner(&binding.record.id, &session_id).await {
+                let _ = service
+                    .mark_owner_binding_failed(
+                        &binding.record.id,
+                        &format!("owner binding failed; workspace retained unused: {err}"),
+                    )
+                    .await;
+                return Err(worktree_error_to_acp(err));
+            }
         }
 
         // Resolve MCP inputs (config + request + runtime attachments)
@@ -838,55 +845,12 @@ impl SessionMaterializer {
             None => None,
         };
 
-        // Persist the fork's execution cwd consistently with its durable
-        // workspace owner association: the session row, workspace binding,
-        // session listing, load, and resume must all agree on the fork's
-        // checkout with no external session-row rewrite. `fork_session`
-        // copied the source's cwd into the fork row; an isolated fork must
-        // not keep it. Fail closed — a fork that cannot record its own
-        // checkout must never surface as runnable in the source checkout.
-        if let Some(binding) = &fork_workspace {
-            self.config
-                .provider
-                .history_store()
-                .set_session_cwd(&new_session_id, Some(binding.effective_cwd.clone()))
-                .await
-                .map_err(|e| {
-                    Error::internal_error().data(serde_json::json!({
-                        "message": "isolated fork could not persist its execution cwd; \
-                                    refusing to expose a runnable fork in the source checkout",
-                        "error": e.to_string(),
-                    }))
-                })?;
-            self.config
-                .provider
-                .history_store()
-                .complete_fork_isolation(&new_session_id)
-                .await
-                .map_err(|err| Error::internal_error().data(err.to_string()))?;
-        }
-
-        let mut response = ForkSessionResponse::new(new_session_id);
-        if let Some(binding) = &fork_workspace {
-            // Disclose the fresh working state: files reflect the source's
-            // current contents, not the historical filesystem state at the
-            // message fork point.
-            let meta = serde_json::json!({
-                crate::acp::shared::QUERYMT_META_NAMESPACE: {
-                    crate::worktree::SESSION_WORKSPACE_META_KEY: {
-                        "execution": "worktree",
-                        "workspaceId": binding.record.id.as_str(),
-                        "sessionCwd": binding.effective_cwd.display().to_string(),
-                        "baseline": binding.record.baseline.as_ref().map(|b| b.mode.to_string()),
-                        "disclosure": "fresh-working-state",
-                        "message": "This fork runs in a fresh isolated worktree whose files \
-                                   reflect the source repository's current contents, not the \
-                                   historical filesystem state at the fork point.",
-                    },
-                },
-            });
-            response = response.meta(meta.as_object().cloned());
-        }
+        let response = if let Some(binding) = &fork_workspace {
+            self.finalize_fork_isolation(&new_session_id, binding)
+                .await?
+        } else {
+            ForkSessionResponse::new(new_session_id)
+        };
         Ok(response)
     }
 
@@ -982,6 +946,11 @@ impl SessionMaterializer {
     /// owner. Allocation persists the pending isolation intent (a
     /// `Provisioning` workspace record) before any Git mutation and leaves
     /// it explicitly failed and non-runnable if provisioning fails.
+    ///
+    /// A failed owner binding is compensated: the freshly allocated,
+    /// never-owned workspace is marked `Failed` (resources retained for
+    /// explicit recovery/removal) and the pending intent stays in place, so
+    /// the fork can never surface as a runnable local session.
     async fn execute_fork_isolation(
         &self,
         plan: ForkWorkspacePlan,
@@ -1000,12 +969,124 @@ impl SessionMaterializer {
         // Persist the association: the fork session is the new workspace's
         // single writable owner. The message fork point was recorded by the
         // session store and remains independent of this association.
-        service
+        if let Err(err) = service
             .bind_owner(&binding.record.id, fork_session_id)
             .await
-            .map_err(worktree_error_to_acp)?;
+        {
+            let _ = service
+                .mark_owner_binding_failed(
+                    &binding.record.id,
+                    &format!("fork owner binding failed; workspace retained unused: {err}"),
+                )
+                .await;
+            return Err(worktree_error_to_acp(err));
+        }
 
         Ok(binding)
+    }
+
+    /// Explicitly complete a pending isolated fork's startup (retry path for
+    /// failed or interrupted fork creation).
+    ///
+    /// Refuses when the session has no pending isolation intent or no
+    /// workspace service — a pending fork is never downgraded to local
+    /// execution. On success the fork owns exactly one ready workspace, its
+    /// row cwd is the bound checkout, and the barrier is released, so
+    /// load/resume resolve inside the fork's own checkout, never the
+    /// source's. The response discloses that files reflect the source's
+    /// contents at recovery time, not at fork-request time.
+    ///
+    /// # Errors
+    /// Returns an error when the intent is missing, the workspace service is
+    /// unavailable, provisioning/owner binding fails, or the binding cannot
+    /// be published (cwd persistence or barrier release). The pending intent
+    /// survives every failure so the fork stays non-runnable and retryable.
+    pub async fn recover_pending_fork(
+        &self,
+        session_id: &str,
+    ) -> Result<ForkSessionResponse, Error> {
+        let intent = self
+            .config
+            .provider
+            .history_store()
+            .get_pending_fork_isolation(session_id)
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?
+            .ok_or_else(|| {
+                invalid_workspace_request("session has no pending fork isolation to recover")
+            })?;
+        let service = self.workspace_service().ok_or_else(|| {
+            Error::internal_error().data(serde_json::json!({
+                "message": "worktree isolation pending but no workspace service is \
+                            configured; refusing to downgrade to shared execution",
+            }))
+        })?;
+        let binding = service
+            .recover_fork_isolation(session_id, &intent)
+            .await
+            .map_err(worktree_error_to_acp)?;
+        self.finalize_fork_isolation(session_id, &binding).await
+    }
+
+    /// Publish an isolated fork as runnable: persist the execution cwd,
+    /// release the durable startup barrier, and build the disclosure
+    /// response.
+    ///
+    /// The barrier release is the atomic publication point: SQLite validates
+    /// in one transaction that the session row cwd equals the ready
+    /// workspace's bound execution path before deleting the pending intent.
+    /// Until that transaction commits, load/resume reject the session, so a
+    /// fork interrupted anywhere before it can never run — in its own
+    /// checkout or its source's.
+    async fn finalize_fork_isolation(
+        &self,
+        fork_session_id: &str,
+        binding: &WorkspaceBinding,
+    ) -> Result<ForkSessionResponse, Error> {
+        // Persist the fork's execution cwd consistently with its durable
+        // workspace owner association: the session row, workspace binding,
+        // session listing, load, and resume must all agree on the fork's
+        // checkout with no external session-row rewrite. `fork_session`
+        // copied the source's cwd into the fork row; an isolated fork must
+        // not keep it. Fail closed — a fork that cannot record its own
+        // checkout must never surface as runnable in the source checkout.
+        self.config
+            .provider
+            .history_store()
+            .set_session_cwd(fork_session_id, Some(binding.effective_cwd.clone()))
+            .await
+            .map_err(|e| {
+                Error::internal_error().data(serde_json::json!({
+                    "message": "isolated fork could not persist its execution cwd; \
+                                refusing to expose a runnable fork in the source checkout",
+                    "error": e.to_string(),
+                }))
+            })?;
+        self.config
+            .provider
+            .history_store()
+            .complete_fork_isolation(fork_session_id)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+
+        // Disclose the fresh working state: files reflect the source's
+        // current contents, not the historical filesystem state at the
+        // message fork point.
+        let meta = serde_json::json!({
+            crate::acp::shared::QUERYMT_META_NAMESPACE: {
+                crate::worktree::SESSION_WORKSPACE_META_KEY: {
+                    "execution": "worktree",
+                    "workspaceId": binding.record.id.as_str(),
+                    "sessionCwd": binding.effective_cwd.display().to_string(),
+                    "baseline": binding.record.baseline.as_ref().map(|b| b.mode.to_string()),
+                    "disclosure": "fresh-working-state",
+                    "message": "This fork runs in a fresh isolated worktree whose files \
+                               reflect the source repository's current contents, not the \
+                               historical filesystem state at the fork point.",
+                },
+            },
+        });
+        Ok(ForkSessionResponse::new(fork_session_id.to_string()).meta(meta.as_object().cloned()))
     }
 
     /// Finalize session after registration: emit events, register in DHT, initialize workspace index.
@@ -1196,6 +1277,7 @@ impl SessionMaterializer {
         mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
     ) -> Result<SessionMaterialization, Error> {
         let mut mutation_gate = mutation_gate;
+        let mut slash_registry: Option<Arc<crate::slash_commands::SlashCommandRegistry>> = None;
         let mut activity = None;
         if let (Some(service), Some(cwd)) = (self.workspace_service(), cwd.as_deref())
             && let Ok(repo) = crate::worktree::identity::resolve_repository(cwd)
@@ -1272,6 +1354,23 @@ impl SessionMaterializer {
                         &record.checkout_path,
                     )
                     .map_err(worktree_error_to_acp)?,
+                ));
+            }
+            // Managed sessions advertise and expand slash commands from
+            // their bound checkout so catalog and execution agree on the
+            // same workspace sources. Discovery config (global/configured
+            // paths, scripts policy) follows the agent startup config.
+            if let Some(slash_config) = self
+                .config
+                .slash_commands_config
+                .as_ref()
+                .filter(|config| config.enabled)
+            {
+                slash_registry = Some(Arc::new(
+                    crate::slash_commands::SlashCommandRegistry::registry_for_workspace(
+                        slash_config,
+                        cwd,
+                    ),
                 ));
             }
             activity = Some(lease);
@@ -1363,6 +1462,10 @@ impl SessionMaterializer {
         };
         let runtime = SessionRuntime::new(cwd.clone(), mcp_services, tool_state);
         let _ = runtime.managed_checkout.set(mutation_gate.is_some());
+        if let Some(registry) = slash_registry {
+            // Freshly created runtime, so this cannot already be initialized.
+            let _ = runtime.slash_registry.set(registry);
+        }
         if let Some(activity) = activity {
             let _ = runtime.workspace_activity.set(activity);
         }
@@ -1659,7 +1762,158 @@ mod worktree_binding_tests {
         storage_root: tempfile::TempDir,
     }
 
+    /// Registry wrapper failing the first N `attach_owner` calls to inject
+    /// an owner-binding failure after allocation has already succeeded.
+    /// Every other operation is forwarded verbatim.
+    struct FlakyOwnerBinding {
+        inner: Arc<dyn crate::worktree::WorkspaceRepository>,
+        remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::worktree::WorkspaceRepository for FlakyOwnerBinding {
+        async fn insert_workspace(
+            &self,
+            record: crate::worktree::WorkspaceRecord,
+        ) -> crate::session::error::SessionResult<crate::worktree::WorkspaceRecord> {
+            self.inner.insert_workspace(record).await
+        }
+
+        async fn get_workspace(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+        ) -> crate::session::error::SessionResult<Option<crate::worktree::WorkspaceRecord>>
+        {
+            self.inner.get_workspace(id).await
+        }
+
+        async fn get_workspace_by_checkout(
+            &self,
+            checkout_path: &std::path::Path,
+        ) -> crate::session::error::SessionResult<Option<crate::worktree::WorkspaceRecord>>
+        {
+            self.inner.get_workspace_by_checkout(checkout_path).await
+        }
+
+        async fn get_workspace_by_session(
+            &self,
+            session_id: &str,
+        ) -> crate::session::error::SessionResult<Option<crate::worktree::WorkspaceRecord>>
+        {
+            self.inner.get_workspace_by_session(session_id).await
+        }
+
+        async fn list_workspaces(
+            &self,
+        ) -> crate::session::error::SessionResult<Vec<crate::worktree::WorkspaceRecord>> {
+            self.inner.list_workspaces().await
+        }
+
+        async fn list_workspaces_by_repository(
+            &self,
+            common_dir: &std::path::Path,
+        ) -> crate::session::error::SessionResult<Vec<crate::worktree::WorkspaceRecord>> {
+            self.inner.list_workspaces_by_repository(common_dir).await
+        }
+
+        async fn list_workspaces_by_batch(
+            &self,
+            batch_id: &str,
+        ) -> crate::session::error::SessionResult<Vec<crate::worktree::WorkspaceRecord>> {
+            self.inner.list_workspaces_by_batch(batch_id).await
+        }
+
+        async fn update_workspace(
+            &self,
+            record: crate::worktree::WorkspaceRecord,
+        ) -> crate::session::error::SessionResult<()> {
+            self.inner.update_workspace(record).await
+        }
+
+        async fn transition_lifecycle(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+            from: crate::worktree::WorkspaceLifecycle,
+            to: crate::worktree::WorkspaceLifecycle,
+        ) -> crate::session::error::SessionResult<bool> {
+            self.inner.transition_lifecycle(id, from, to).await
+        }
+
+        async fn attach_owner(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+            owner_session_id: &str,
+        ) -> crate::session::error::SessionResult<crate::worktree::WorkspaceRecord> {
+            let consumed = self
+                .remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok();
+            if consumed {
+                return Err(crate::session::error::SessionError::Other(
+                    "injected owner-binding failure".to_string(),
+                ));
+            }
+            self.inner.attach_owner(id, owner_session_id).await
+        }
+
+        async fn detach_owner(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+        ) -> crate::session::error::SessionResult<crate::worktree::WorkspaceRecord> {
+            self.inner.detach_owner(id).await
+        }
+
+        async fn bind_baseline(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+            baseline: &crate::worktree::Baseline,
+        ) -> crate::session::error::SessionResult<()> {
+            self.inner.bind_baseline(id, baseline).await
+        }
+
+        async fn record_provisioning_phase(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+            phase: crate::worktree::ProvisioningPhase,
+        ) -> crate::session::error::SessionResult<bool> {
+            self.inner.record_provisioning_phase(id, phase).await
+        }
+
+        async fn record_result(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+            provenance: &crate::worktree::ResultProvenance,
+        ) -> crate::session::error::SessionResult<()> {
+            self.inner.record_result(id, provenance).await
+        }
+
+        async fn list_results(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+        ) -> crate::session::error::SessionResult<Vec<crate::worktree::ResultProvenance>> {
+            self.inner.list_results(id).await
+        }
+    }
+
     async fn worktree_fixture(configure_service: bool) -> WorktreeFixture {
+        worktree_fixture_inner(configure_service, 0).await
+    }
+
+    /// Fixture whose workspace service fails the first `owner_failures`
+    /// owner-binding attempts, injecting a crash/failure after allocation
+    /// but before the owner is published.
+    async fn worktree_fixture_with_flaky_owner(owner_failures: usize) -> WorktreeFixture {
+        worktree_fixture_inner(true, owner_failures).await
+    }
+
+    async fn worktree_fixture_inner(
+        configure_service: bool,
+        owner_failures: usize,
+    ) -> WorktreeFixture {
         let storage = Arc::new(
             SqliteStorage::connect(":memory:".into())
                 .await
@@ -1683,11 +1937,21 @@ mod worktree_binding_tests {
         materialize(repo.path(), &[("README.md", "hello\n")]);
 
         let storage_root = tempfile::TempDir::new().unwrap();
-        let service = Arc::new(WorkspaceService::new(
-            Arc::new(GixRepoOps::new()),
+        let registry: Arc<dyn crate::worktree::WorkspaceRepository> = if owner_failures > 0 {
+            Arc::new(FlakyOwnerBinding {
+                inner: storage
+                    .workspace_repository()
+                    .expect("sqlite storage exposes a workspace repository"),
+                remaining: std::sync::atomic::AtomicUsize::new(owner_failures),
+            })
+        } else {
             storage
                 .workspace_repository()
-                .expect("sqlite storage exposes a workspace repository"),
+                .expect("sqlite storage exposes a workspace repository")
+        };
+        let service = Arc::new(WorkspaceService::new(
+            Arc::new(GixRepoOps::new()),
+            registry,
             storage_root.path(),
         ));
         let mut builder =
@@ -2912,6 +3176,639 @@ mod worktree_binding_tests {
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    /// Injected owner-binding failure after a successful allocation: the
+    /// fork compensates the unused workspace to `Failed`, the pending intent
+    /// survives, load/resume (including on a fresh materializer) refuse to
+    /// run the fork anywhere — least of all the source checkout — and the
+    /// listing exposes the pending-isolation state (11.4/11.5).
+    #[tokio::test]
+    async fn injected_owner_binding_failure_compensates_and_stays_non_runnable() {
+        let fx = worktree_fixture_with_flaky_owner(1).await;
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .unwrap();
+        let source_id = source.session_id.clone();
+        let source_cwd = source.cwd.clone().unwrap();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+
+        // The owner binding fails after the workspace was fully provisioned.
+        let err = fx
+            .materializer
+            .prepare_fork_session(
+                ForkSessionRequest::new(SessionId::from(source_id.clone()), source_cwd.clone())
+                    .meta(isolation_meta()),
+            )
+            .await
+            .expect_err("injected owner-binding failure must fail the fork");
+        assert!(
+            format!("{err:?}").contains("injected owner-binding failure"),
+            "{err:?}"
+        );
+
+        // The fork row and its history exist and the intent is retained.
+        let sessions = fx.storage.list_sessions().await.unwrap();
+        let fork = sessions.iter().find(|s| s.public_id != source_id).unwrap();
+        let fork_id = fork.public_id.clone();
+        assert_eq!(fx.storage.get_history(&fork_id).await.unwrap().len(), 1);
+        assert!(
+            fx.storage
+                .get_pending_fork_isolation(&fork_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Compensation: the provisioned-but-unused workspace is marked
+        // Failed with a diagnostic and never owned.
+        let registry = fx.storage.workspace_repository().unwrap();
+        let records = registry.list_workspaces().await.unwrap();
+        assert_eq!(records.len(), 1, "exactly the compensated workspace exists");
+        let record = &records[0];
+        assert_eq!(
+            record.lifecycle,
+            crate::worktree::WorkspaceLifecycle::Failed
+        );
+        assert!(record.ownership.owner_session_id.is_none());
+        let diagnostic = record.last_error.clone().expect("compensation diagnostic");
+        assert!(
+            diagnostic.contains("fork owner binding failed"),
+            "unexpected diagnostic: {diagnostic}"
+        );
+
+        // A fresh materializer must not run the pending fork: neither in its
+        // own (failed) workspace nor in the source checkout.
+        let restarted = SessionMaterializer::new(fx.materializer.config.clone());
+        let load = LoadSessionRequest::new(SessionId::from(fork_id.clone()), PathBuf::new());
+        let load_err = match restarted.prepare_load_session(load, None).await {
+            Err(err) => err,
+            Ok(_) => panic!("a pending fork must not be loadable"),
+        };
+        assert!(
+            format!("{load_err:?}").contains("fork isolation is pending"),
+            "{load_err:?}"
+        );
+        let resume = ResumeSessionRequest::new(SessionId::from(fork_id.clone()), source_cwd);
+        assert!(
+            restarted
+                .prepare_resume_session(resume, None)
+                .await
+                .is_err()
+        );
+
+        // The listing exposes the outstanding isolation state so consumers
+        // never mistake the fork for a legacy local session.
+        use crate::session::ViewStore as _;
+        let view = fx.storage.get_session_list_view(None).await.unwrap();
+        let item = view
+            .groups
+            .iter()
+            .flat_map(|group| group.sessions.iter())
+            .find(|item| item.session_id == fork_id)
+            .expect("fork appears in the listing");
+        assert!(
+            item.pending_isolation,
+            "fork listing must expose pending isolation"
+        );
+    }
+
+    /// Simulated crash after owner binding but before the execution cwd and
+    /// barrier release: the fork stays non-runnable, and explicit recovery
+    /// reuses the existing binding — no duplicate owners — then publishes
+    /// the fork inside its own checkout (11.4).
+    #[tokio::test]
+    async fn crash_after_owner_binding_is_recovered_without_duplicate_owners() {
+        let fx = worktree_fixture(true).await;
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .unwrap();
+        let source_id = source.session_id.clone();
+        let source_cwd = source.cwd.clone().unwrap();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+
+        let intent = crate::session::store::PendingForkIsolation {
+            source_session_id: source_id.clone(),
+            source_cwd: source_cwd.clone(),
+            options: crate::worktree::SessionCreationOptions::isolated_worktree(
+                crate::worktree::BaselineMode::CurrentWorkingTree,
+            )
+            .to_workspace_options(),
+        };
+        let fork_id = fx
+            .storage
+            .fork_session_with_isolation_intent(
+                &source_id,
+                "msg-1",
+                crate::session::domain::ForkOrigin::User,
+                Some(intent.clone()),
+            )
+            .await
+            .unwrap();
+        // "Crash" here: allocation + binding succeeded, cwd/barrier did not.
+        let service = fx.service.clone();
+        let binding = service
+            .allocate_for_fork(
+                &source_cwd,
+                &crate::worktree::SessionCreationOptions::isolated_worktree(
+                    crate::worktree::BaselineMode::CurrentWorkingTree,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        let bound_cwd = binding.effective_cwd.clone();
+        let workspace_id = binding.record.id.as_str().to_string();
+        service
+            .bind_owner(&binding.record.id, &fork_id)
+            .await
+            .unwrap();
+        assert_ne!(bound_cwd, source_cwd);
+
+        // Not runnable before recovery: load/resume refuse (pending intent).
+        let restarted = SessionMaterializer::new(fx.materializer.config.clone());
+        assert!(
+            restarted
+                .prepare_load_session(
+                    LoadSessionRequest::new(SessionId::from(fork_id.clone()), PathBuf::new()),
+                    None,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            restarted
+                .prepare_resume_session(ResumeSessionRequest::new(
+                    SessionId::from(fork_id.clone()),
+                    source_cwd.clone(),
+                ), None)
+                .await
+                .is_err()
+        );
+
+        // Explicit recovery reuses the existing binding (no second workspace
+        // is ever owned) and releases the barrier.
+        let response = fx
+            .materializer
+            .recover_pending_fork(&fork_id)
+            .await
+            .expect("pending fork recovers");
+        let meta = response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("querymt"))
+            .and_then(|querymt| querymt.get(crate::worktree::SESSION_WORKSPACE_META_KEY))
+            .cloned()
+            .expect("recovery discloses the workspace");
+        assert_eq!(
+            meta.get("workspaceId").and_then(|value| value.as_str()),
+            Some(workspace_id.as_str()),
+            "recovery must reuse the bound workspace, not allocate another"
+        );
+        assert_eq!(
+            fx.storage
+                .get_pending_fork_isolation(&fork_id)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Exactly one workspace is owned by the fork, at the bound cwd.
+        let registry = fx.storage.workspace_repository().unwrap();
+        let owned = registry.get_workspace_by_session(&fork_id).await.unwrap();
+        assert_eq!(
+            owned.expect("fork owns a workspace").id.as_str(),
+            workspace_id
+        );
+        let owned_count = registry
+            .list_workspaces()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| {
+                record
+                    .ownership
+                    .owner_session_id
+                    .as_deref()
+                    .is_some_and(|owner| owner == fork_id)
+            })
+            .count();
+        assert_eq!(owned_count, 1, "no duplicate owners across retries");
+
+        // The barrier is gone and the fork loads inside its own checkout —
+        // a retry of recovery is refused (nothing pending) and the loaded
+        // session resolves the bound execution cwd.
+        assert!(
+            fx.materializer
+                .recover_pending_fork(&fork_id)
+                .await
+                .is_err()
+        );
+        let reloaded = match restarted
+            .prepare_load_session(
+                LoadSessionRequest::new(SessionId::from(fork_id.clone()), PathBuf::new()),
+                None,
+            )
+            .await
+        {
+            Ok(crate::agent::session_materializer::PreparedSessionResult::Prepared(prepared)) => {
+                prepared
+            }
+            Ok(_) => panic!("unexpected non-prepared load result"),
+            Err(err) => panic!("recovered fork loads on a fresh materializer: {err:?}"),
+        };
+        assert_eq!(reloaded.cwd.as_deref(), Some(bound_cwd.as_path()));
+    }
+
+    /// Full retry path after a compensated failure: the failed attempt's
+    /// workspace stays retained and unowned, recovery allocates a fresh
+    /// workspace for the same fork session (single owner), and the source
+    /// checkout is never used (11.5).
+    #[tokio::test]
+    async fn failed_fork_creation_recovers_through_the_retry_path() {
+        let fx = worktree_fixture_with_flaky_owner(1).await;
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .unwrap();
+        let source_id = source.session_id.clone();
+        let source_cwd = source.cwd.clone().unwrap();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+
+        // First attempt fails at the owner binding and is compensated.
+        assert!(
+            fx.materializer
+                .prepare_fork_session(
+                    ForkSessionRequest::new(SessionId::from(source_id.clone()), source_cwd.clone())
+                        .meta(isolation_meta()),
+                )
+                .await
+                .is_err()
+        );
+        let sessions = fx.storage.list_sessions().await.unwrap();
+        let fork = sessions.iter().find(|s| s.public_id != source_id).unwrap();
+        let fork_id = fork.public_id.clone();
+
+        // Retry through the explicit recovery surface.
+        let response = fx
+            .materializer
+            .recover_pending_fork(&fork_id)
+            .await
+            .expect("retry recovers the pending fork");
+
+        // The fork owns exactly one ready workspace — a fresh one; the
+        // failed attempt's workspace is retained but never owned.
+        let registry = fx.storage.workspace_repository().unwrap();
+        let records = registry.list_workspaces().await.unwrap();
+        let owned: Vec<_> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .ownership
+                    .owner_session_id
+                    .as_deref()
+                    .is_some_and(|owner| owner == fork_id)
+            })
+            .collect();
+        assert_eq!(owned.len(), 1, "retries create no duplicate owners");
+        assert_eq!(
+            owned[0].lifecycle,
+            crate::worktree::WorkspaceLifecycle::Ready
+        );
+        assert_eq!(
+            records.len(),
+            2,
+            "the failed attempt's workspace stays as an explicit failed record"
+        );
+        assert!(
+            records.iter().any(|record| record.lifecycle
+                == crate::worktree::WorkspaceLifecycle::Failed
+                && record.ownership.owner_session_id.is_none()),
+            "the compensated record remains retained and unowned"
+        );
+
+        // The disclosure names the new workspace and the fork is runnable in
+        // its own checkout afterwards (fresh materializer, restart-safe).
+        let meta = response
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("querymt"))
+            .and_then(|querymt| querymt.get(crate::worktree::SESSION_WORKSPACE_META_KEY))
+            .cloned()
+            .expect("recovery discloses the workspace");
+        assert_eq!(
+            meta.get("workspaceId").and_then(|value| value.as_str()),
+            Some(owned[0].id.as_str())
+        );
+        assert_eq!(
+            fx.storage
+                .get_session(&fork_id)
+                .await
+                .unwrap()
+                .expect("fork row exists")
+                .cwd
+                .as_deref(),
+            Some(owned[0].session_cwd().as_path()),
+            "the session row cwd is the fork's own checkout"
+        );
+        let restarted = SessionMaterializer::new(fx.materializer.config.clone());
+        let reloaded = match restarted
+            .prepare_load_session(
+                LoadSessionRequest::new(SessionId::from(fork_id.clone()), PathBuf::new()),
+                None,
+            )
+            .await
+        {
+            Ok(crate::agent::session_materializer::PreparedSessionResult::Prepared(prepared)) => {
+                prepared
+            }
+            Ok(_) => panic!("unexpected non-prepared load result"),
+            Err(err) => panic!("recovered fork loads after restart: {err:?}"),
+        };
+        assert_eq!(
+            reloaded.cwd.as_deref(),
+            Some(owned[0].session_cwd().as_path()),
+            "the fork resolves its own checkout, never the source's"
+        );
+    }
+
+    /// Record a pre-turn snapshot (TurnSnapshotStart) in `session_id`'s
+    /// history exactly as the runtime would, scoped to an explicit workspace.
+    async fn record_pre_snapshot(
+        storage: &SqliteStorage,
+        backend: &crate::snapshot::GitSnapshotBackend,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) -> (String, String) {
+        use crate::model::MessagePart;
+        use crate::session::store::SessionStore as _;
+        use crate::snapshot::SnapshotBackend as _;
+        let snapshot_id = backend.track(cwd).await.expect("track pre snapshot");
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let msg = crate::model::AgentMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: querymt::chat::ChatRole::Assistant,
+            parts: vec![MessagePart::TurnSnapshotStart {
+                turn_id: turn_id.clone(),
+                snapshot_id: snapshot_id.clone(),
+                workspace_root: Some(cwd.to_path_buf()),
+                inherited: false,
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        storage
+            .session_store()
+            .add_message(session_id, msg)
+            .await
+            .expect("record pre snapshot");
+        (turn_id, snapshot_id)
+    }
+
+    /// Record a post-turn snapshot (TurnSnapshotPatch) and return the changed
+    /// paths, scoped to an explicit workspace.
+    async fn record_post_snapshot(
+        storage: &SqliteStorage,
+        backend: &crate::snapshot::GitSnapshotBackend,
+        session_id: &str,
+        turn_id: &str,
+        pre_snapshot: &str,
+        cwd: &std::path::Path,
+    ) -> Vec<String> {
+        use crate::model::MessagePart;
+        use crate::session::store::SessionStore as _;
+        use crate::snapshot::SnapshotBackend as _;
+        let post_snapshot = backend.track(cwd).await.expect("track post snapshot");
+        let changed = backend
+            .diff(cwd, &pre_snapshot.to_string(), &post_snapshot)
+            .await
+            .expect("diff post snapshot");
+        let changed_strs: Vec<String> = changed
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let msg = crate::model::AgentMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            role: querymt::chat::ChatRole::Assistant,
+            parts: vec![MessagePart::TurnSnapshotPatch {
+                turn_id: turn_id.to_string(),
+                snapshot_id: post_snapshot,
+                changed_paths: changed_strs.clone(),
+                workspace_root: Some(cwd.to_path_buf()),
+                inherited: false,
+            }],
+            created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+            parent_message_id: None,
+            source_provider: None,
+            source_model: None,
+        };
+        storage
+            .session_store()
+            .add_message(session_id, msg)
+            .await
+            .expect("record post snapshot");
+        changed_strs
+    }
+
+    /// Parent/fork undo regression through the REAL fork creation path
+    /// (11.6): parent undo excludes the isolated fork's snapshots despite
+    /// source ancestry (the fork is a child session) while still aggregating
+    /// compatible shared-checkout children; fork-local undo/redo works after
+    /// a restart (fresh materializer over the same store plus a fresh
+    /// backend over the same snapshot base).
+    #[tokio::test]
+    async fn parent_undo_excludes_isolated_fork_and_fork_undo_redo_works_after_restart() {
+        let fx = worktree_fixture(true).await;
+        let snapshot_base = tempfile::TempDir::new().unwrap();
+        let backend = crate::snapshot::GitSnapshotBackend::with_snapshot_base(
+            snapshot_base.path().to_path_buf(),
+        );
+
+        // Parent: a plain local session in the real repository.
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .unwrap();
+        let parent_id = source.session_id.clone();
+        let parent_cwd = source.cwd.clone().unwrap();
+        drop(source);
+        seed_history(fx.storage.as_ref(), &parent_id, &["msg-1"]).await;
+
+        // Real isolated fork through prepare_fork_session.
+        let response = fx
+            .materializer
+            .prepare_fork_session(
+                ForkSessionRequest::new(SessionId::from(parent_id.clone()), parent_cwd.clone())
+                    .meta(isolation_meta()),
+            )
+            .await
+            .unwrap();
+        let fork_id = response.session_id.to_string();
+        let registry = fx.storage.workspace_repository().unwrap();
+        let fork_record = registry
+            .get_workspace_by_session(&fork_id)
+            .await
+            .unwrap()
+            .expect("fork bound to its own workspace");
+        let fork_cwd = fork_record.session_cwd();
+        assert_ne!(fork_cwd, parent_cwd);
+
+        // A legacy shared child still bound to the parent's checkout.
+        let shared_child = fx
+            .storage
+            .session_store()
+            .create_session(
+                None,
+                Some(parent_cwd.clone()),
+                Some(parent_id.clone()),
+                Some(crate::session::domain::ForkOrigin::Delegation),
+            )
+            .await
+            .unwrap()
+            .public_id;
+
+        // Parent turn (its own checkout).
+        let (parent_turn, parent_pre) =
+            record_pre_snapshot(fx.storage.as_ref(), &backend, &parent_id, &parent_cwd).await;
+        std::fs::write(parent_cwd.join("README.md"), "parent-edit\n").unwrap();
+        record_post_snapshot(
+            fx.storage.as_ref(),
+            &backend,
+            &parent_id,
+            &parent_turn,
+            &parent_pre,
+            &parent_cwd,
+        )
+        .await;
+
+        // Shared child turn (same checkout).
+        let (shared_turn, shared_pre) =
+            record_pre_snapshot(fx.storage.as_ref(), &backend, &shared_child, &parent_cwd).await;
+        std::fs::write(parent_cwd.join("README.md"), "shared-edit\n").unwrap();
+        record_post_snapshot(
+            fx.storage.as_ref(),
+            &backend,
+            &shared_child,
+            &shared_turn,
+            &shared_pre,
+            &parent_cwd,
+        )
+        .await;
+
+        // Fork turn (its OWN checkout).
+        let (fork_turn, fork_pre) =
+            record_pre_snapshot(fx.storage.as_ref(), &backend, &fork_id, &fork_cwd).await;
+        std::fs::write(fork_cwd.join("README.md"), "fork-edit\n").unwrap();
+        record_post_snapshot(
+            fx.storage.as_ref(),
+            &backend,
+            &fork_id,
+            &fork_turn,
+            &fork_pre,
+            &fork_cwd,
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(parent_cwd.join("README.md")).unwrap(),
+            "shared-edit\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork_cwd.join("README.md")).unwrap(),
+            "fork-edit\n"
+        );
+
+        // Parent undo: succeeds despite the isolated fork existing and
+        // aggregates only the parent's and the shared child's patches.
+        let result = crate::agent::undo::undo_impl(
+            &backend,
+            &fx.materializer.config.provider,
+            &parent_id,
+            "msg-1",
+            &parent_cwd,
+        )
+        .await
+        .expect("parent undo succeeds with an isolated fork present");
+        assert!(
+            !result.reverted_files.is_empty(),
+            "parent undo reverts the shared-checkout edits"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent_cwd.join("README.md")).unwrap(),
+            "hello\n",
+            "parent undo reverts the shared-checkout edits to the original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fork_cwd.join("README.md")).unwrap(),
+            "fork-edit\n",
+            "parent undo must not touch the isolated fork's workspace"
+        );
+
+        // Restart: a fresh materializer over the same store and a fresh
+        // backend over the same snapshot base. Fork-local undo rewinds the
+        // fork's OWN workspace to its baseline contents; redo reapplies it.
+        let restarted = SessionMaterializer::new(fx.materializer.config.clone());
+        let restarted_backend = crate::snapshot::GitSnapshotBackend::with_snapshot_base(
+            snapshot_base.path().to_path_buf(),
+        );
+        // The fork's copied messages carry new public ids; target the
+        // copied user message (first entry of the fork's history).
+        let fork_target = fx
+            .storage
+            .get_history(&fork_id)
+            .await
+            .unwrap()
+            .first()
+            .expect("fork history has the copied message")
+            .id
+            .clone();
+        let fork_undo = crate::agent::undo::undo_impl(
+            &restarted_backend,
+            &restarted.config.provider,
+            &fork_id,
+            &fork_target,
+            &fork_cwd,
+        )
+        .await
+        .expect("fork-local undo works after restart");
+        assert!(!fork_undo.reverted_files.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(fork_cwd.join("README.md")).unwrap(),
+            "hello\n",
+            "fork-local undo rewinds the fork's own workspace"
+        );
+        assert_eq!(
+            std::fs::read_to_string(parent_cwd.join("README.md")).unwrap(),
+            "hello\n",
+            "fork-local undo does not touch the parent"
+        );
+
+        crate::agent::undo::redo_impl(
+            &restarted_backend,
+            &restarted.config.provider,
+            &fork_id,
+            &fork_cwd,
+        )
+        .await
+        .expect("fork-local redo works after restart");
+        assert_eq!(
+            std::fs::read_to_string(fork_cwd.join("README.md")).unwrap(),
+            "fork-edit\n",
+            "fork-local redo reapplies the fork's own edit"
         );
     }
 

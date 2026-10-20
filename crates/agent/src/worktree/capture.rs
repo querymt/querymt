@@ -141,13 +141,6 @@ async fn validate_supported_layout(
         ));
     }
 
-    // Submodules are unsupported in the first version.
-    if checkout_root.join(".gitmodules").is_file() {
-        return Err(WorktreeError::InvalidOperation(
-            "cannot capture baseline: submodules are unsupported in this version".to_string(),
-        ));
-    }
-
     // Sparse checkouts: tracked paths absent from disk would be captured as
     // deletions.
     if ops.sparse_checkout_enabled(checkout_root).await? {
@@ -156,15 +149,11 @@ async fn validate_supported_layout(
         ));
     }
 
-    // LFS-managed content would be captured as pointer files.
-    let attributes = checkout_root.join(".gitattributes");
-    if let Ok(text) = std::fs::read_to_string(&attributes)
-        && text.contains("filter=lfs")
-    {
-        return Err(WorktreeError::InvalidOperation(
-            "cannot capture baseline: Git LFS content is unsupported in this version".to_string(),
-        ));
-    }
+    // Submodules and externally filtered content (Git LFS, custom
+    // clean/smudge processes) are rejected inside the native capture itself,
+    // from HEAD/index gitlink entries and *effective* Git attributes
+    // (nested `.gitattributes`, Git-directory attributes, macros) — not
+    // from a `.gitmodules` presence check or a root-file text scan.
 
     Ok(())
 }
@@ -562,10 +551,275 @@ mod tests {
         )
         .unwrap();
         fs::write(repo.path().join("file.txt"), "one").unwrap();
+        // LFS-managed content must be present: a filter configuration
+        // without matching paths is not itself a blocker (effective
+        // attribute resolution is path-based, not a config text scan).
+        fs::write(repo.path().join("media.bin"), "lfs pointer").unwrap();
         commit_all(repo.path(), "init");
 
         let err = capture(repo.path()).await.unwrap_err();
-        assert!(err.to_string().contains("LFS"), "error: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("LFS"), "error: {msg}");
+        assert!(msg.contains("media.bin"), "names the path: {msg}");
+    }
+
+    // -- Newly staged tracked files (F4) ---------------------------------------
+
+    /// A file force-added to the real index is tracked for capture even
+    /// though ignore rules would exclude it, subsequent working edits are
+    /// captured, genuinely untracked ignored files stay excluded, and the
+    /// real index remains byte-for-byte unchanged (13.1).
+    #[tokio::test]
+    async fn newly_staged_ignored_file_is_captured_and_untracked_ignored_excluded() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        fs::write(repo.path().join(".gitignore"), "secret*\n").unwrap();
+        commit_all(repo.path(), "init");
+
+        fs::write(repo.path().join("secret-staged.txt"), "staged version").unwrap();
+        run_git_ok(repo.path(), &["add", "-f", "secret-staged.txt"]);
+        fs::write(repo.path().join("secret-untracked.txt"), "never captured").unwrap();
+
+        let ops = GixRepoOps::new();
+        let index_before = ops.index_manifest(repo.path()).await.unwrap();
+
+        let captured = capture(repo.path()).await.unwrap();
+
+        // The staged ignored file is captured with its working content.
+        let staged_blob = out_git(repo.path(), &["hash-object", "secret-staged.txt"])
+            .trim()
+            .to_string();
+        assert_eq!(
+            blob_of(repo.path(), &captured.tree, "secret-staged.txt"),
+            staged_blob
+        );
+        // The genuinely untracked ignored file is excluded and disclosed.
+        assert!(
+            tree_paths(repo.path(), &captured.tree)
+                .iter()
+                .all(|(p, _)| p != "secret-untracked.txt")
+        );
+        assert!(
+            captured
+                .ignored_files
+                .iter()
+                .any(|p| p.contains("secret-untracked.txt")),
+            "ignored files are disclosed: {:?}",
+            captured.ignored_files
+        );
+
+        // Subsequent working edits to the newly staged file are captured.
+        fs::write(
+            repo.path().join("secret-staged.txt"),
+            "edited after staging",
+        )
+        .unwrap();
+        let recaptured = capture(repo.path()).await.unwrap();
+        let edited_blob = out_git(repo.path(), &["hash-object", "secret-staged.txt"])
+            .trim()
+            .to_string();
+        assert_eq!(
+            blob_of(repo.path(), &recaptured.tree, "secret-staged.txt"),
+            edited_blob
+        );
+
+        // The real index stays byte-for-byte unchanged across captures.
+        let index_after = ops.index_manifest(repo.path()).await.unwrap();
+        assert_eq!(index_before, index_after);
+    }
+
+    // -- Repository-layout normalization (F5) ----------------------------------
+
+    /// Active submodules are rejected from gitlink entries in the real index
+    /// or the HEAD tree — no `.gitmodules` file required — with the path
+    /// named in the diagnostic (13.3).
+    #[tokio::test]
+    async fn gitlinks_in_index_or_head_fail_even_without_gitmodules() {
+        // A gitlink in the real index — no `.gitmodules` anywhere.
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        commit_all(repo.path(), "init");
+        let sha = out_git(repo.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        run_git_ok(
+            repo.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},vendored"),
+            ],
+        );
+        let err = capture(repo.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("submodules"), "{msg}");
+        assert!(msg.contains("vendored"), "diagnostic names the path: {msg}");
+
+        // The same for a gitlink committed into HEAD.
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        commit_all(repo.path(), "init");
+        let sha = out_git(repo.path(), &["rev-parse", "HEAD"])
+            .trim()
+            .to_string();
+        run_git_ok(
+            repo.path(),
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},vendored"),
+            ],
+        );
+        run_git_ok(repo.path(), &["commit", "-m", "add gitlink"]);
+        let err = capture(repo.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("submodules") && msg.contains("vendored"),
+            "{msg}"
+        );
+    }
+
+    /// Capture normalizes to the resolved checkout root: a session whose
+    /// cwd is a subdirectory still captures the repository-wide baseline.
+    #[tokio::test]
+    async fn subdirectory_sessions_capture_the_repository_wide_baseline() {
+        let repo = init_repo();
+        fs::write(repo.path().join("root.txt"), "root").unwrap();
+        fs::create_dir_all(repo.path().join("crates/sub")).unwrap();
+        fs::write(repo.path().join("crates/sub/lib.rs"), "sub").unwrap();
+        commit_all(repo.path(), "init");
+
+        let resolved =
+            crate::worktree::identity::resolve_repository(&repo.path().join("crates/sub")).unwrap();
+        let captured = capture(&resolved.checkout.root).await.unwrap();
+        let captured_paths = tree_paths(repo.path(), &captured.tree);
+        let paths: Vec<&str> = captured_paths.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"root.txt"), "{paths:?}");
+        assert!(paths.contains(&"crates/sub/lib.rs"), "{paths:?}");
+    }
+
+    /// Root-level sparse-checkout configuration is detected no matter which
+    /// subdirectory the session started in.
+    #[tokio::test]
+    async fn sparse_checkouts_fail_even_from_subdirectory() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        fs::create_dir_all(repo.path().join("deep/sub")).unwrap();
+        fs::write(repo.path().join("deep/sub/leaf.txt"), "leaf").unwrap();
+        commit_all(repo.path(), "init");
+        run_git_ok(repo.path(), &["config", "core.sparseCheckout", "true"]);
+
+        let resolved =
+            crate::worktree::identity::resolve_repository(&repo.path().join("deep/sub")).unwrap();
+        let err = capture(&resolved.checkout.root).await.unwrap_err();
+        assert!(err.to_string().contains("sparse"), "{err}");
+    }
+
+    // -- Effective attribute resolution (F5) -----------------------------------
+
+    /// LFS is detected through *effective* attributes: a nested
+    /// `.gitattributes` selects the filter, and the diagnostic names the
+    /// affected path (13.4).
+    #[tokio::test]
+    async fn lfs_via_nested_gitattributes_fails_with_path_diagnostic() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        fs::create_dir_all(repo.path().join("assets")).unwrap();
+        fs::write(
+            repo.path().join("assets/.gitattributes"),
+            "*.psd filter=lfs\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("assets/art.psd"), "fake lfs content").unwrap();
+        commit_all(repo.path(), "init");
+
+        let err = capture(repo.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("LFS"), "{msg}");
+        assert!(msg.contains("assets/art.psd"), "names the path: {msg}");
+    }
+
+    /// Git-directory attributes (`$GIT_DIR/info/attributes`) participate in
+    /// effective attribute resolution.
+    #[tokio::test]
+    async fn lfs_via_git_directory_attributes_fails_with_path_diagnostic() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        fs::write(repo.path().join("media.bin"), "binary").unwrap();
+        commit_all(repo.path(), "init");
+        fs::create_dir_all(repo.path().join(".git/info")).unwrap();
+        fs::write(
+            repo.path().join(".git/info/attributes"),
+            "*.bin filter=lfs\n",
+        )
+        .unwrap();
+
+        let err = capture(repo.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("LFS") && msg.contains("media.bin"), "{msg}");
+    }
+
+    /// `[attr]` macros expand during effective attribute resolution; an LFS
+    /// filter reached only through a macro is still rejected with a path
+    /// diagnostic rather than accepted via a text scan miss.
+    #[tokio::test]
+    async fn lfs_via_attribute_macro_fails_with_path_diagnostic() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        fs::write(repo.path().join("model.big"), "big").unwrap();
+        commit_all(repo.path(), "init");
+        fs::write(
+            repo.path().join(".gitattributes"),
+            "[attr]lfs-heavy filter=lfs\n*.big lfs-heavy\n",
+        )
+        .unwrap();
+
+        let err = capture(repo.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("LFS") && msg.contains("model.big"), "{msg}");
+    }
+
+    /// Any external filter process (not just LFS) is rejected with the
+    /// filter name and path before child execution.
+    #[tokio::test]
+    async fn custom_external_filter_fails_with_filter_name_and_path() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        fs::write(repo.path().join("arch.zip"), "zip").unwrap();
+        commit_all(repo.path(), "init");
+        fs::write(repo.path().join(".gitattributes"), "*.zip filter=zipper\n").unwrap();
+
+        let err = capture(repo.path()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("external filter") && msg.contains("zipper") && msg.contains("arch.zip"),
+            "{msg}"
+        );
+    }
+
+    // -- Validated capture with changing candidate sets (F4/F5) ----------------
+
+    /// An external writer staging a new tracked file mid-capture changes the
+    /// candidate set; the validated capture detects the index change and
+    /// retries against fresh state instead of launching from an inconsistent
+    /// baseline (13.5).
+    #[tokio::test]
+    async fn externally_staged_new_file_mid_capture_triggers_bounded_retry() {
+        let repo = init_repo();
+        fs::write(repo.path().join("file.txt"), "one").unwrap();
+        commit_all(repo.path(), "init");
+
+        let ops = FlakyWriterOps::stage_flaky_once();
+        let captured =
+            capture_working_state_validated(&ops, repo.path(), CaptureRetryPolicy::default())
+                .await
+                .unwrap();
+        assert!(captured.created_commit, "the staged file changed the tree");
+        let late_paths = tree_paths(repo.path(), &captured.tree);
+        let paths: Vec<&str> = late_paths.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"late.txt"), "{paths:?}");
     }
 
     // -- Private commit identity and hooks ------------------------------------
@@ -639,6 +893,7 @@ mod tests {
         inner: GixRepoOps,
         remaining_mutations: std::sync::atomic::AtomicU32,
         mutations: std::sync::atomic::AtomicU32,
+        stage_once: std::sync::atomic::AtomicBool,
     }
 
     impl FlakyWriterOps {
@@ -647,6 +902,7 @@ mod tests {
                 inner: GixRepoOps::new(),
                 remaining_mutations: std::sync::atomic::AtomicU32::new(1),
                 mutations: std::sync::atomic::AtomicU32::new(0),
+                stage_once: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -655,6 +911,18 @@ mod tests {
                 inner: GixRepoOps::new(),
                 remaining_mutations: std::sync::atomic::AtomicU32::new(u32::MAX),
                 mutations: std::sync::atomic::AtomicU32::new(0),
+                stage_once: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// No content mutation, but an external writer stages a new tracked
+        /// file once — changing the candidate set itself mid-capture.
+        fn stage_flaky_once() -> Self {
+            Self {
+                inner: GixRepoOps::new(),
+                remaining_mutations: std::sync::atomic::AtomicU32::new(0),
+                mutations: std::sync::atomic::AtomicU32::new(0),
+                stage_once: std::sync::atomic::AtomicBool::new(true),
             }
         }
 
@@ -689,15 +957,24 @@ mod tests {
                 )
                 .unwrap();
             }
+            if self
+                .stage_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                // A tracked-file addition lands in the real index while the
+                // capture is running: the candidate set itself changes.
+                std::fs::write(checkout.join("late.txt"), "staged mid capture").unwrap();
+                run_git_ok(checkout, &["add", "late.txt"]);
+            }
             Ok(out)
         }
 
         async fn resolve_commit(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             expr: &str,
         ) -> WorktreeResult<Option<String>> {
-            self.inner.resolve_commit(repo_root, expr).await
+            self.inner.resolve_commit(common_dir, expr).await
         }
 
         async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>> {
@@ -718,71 +995,82 @@ mod tests {
 
         async fn branch_tip(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             branch: &crate::worktree::domain::ManagedBranch,
         ) -> WorktreeResult<Option<String>> {
-            self.inner.branch_tip(repo_root, branch).await
+            self.inner.branch_tip(common_dir, branch).await
         }
 
         async fn create_branch(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             branch: &crate::worktree::domain::ManagedBranch,
             target: &str,
         ) -> WorktreeResult<()> {
-            self.inner.create_branch(repo_root, branch, target).await
+            self.inner.create_branch(common_dir, branch, target).await
         }
 
         async fn delete_branch(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             branch: &crate::worktree::domain::ManagedBranch,
         ) -> WorktreeResult<()> {
-            self.inner.delete_branch(repo_root, branch).await
+            self.inner.delete_branch(common_dir, branch).await
+        }
+
+        async fn delete_branch_if_unchanged(
+            &self,
+            common_dir: &Path,
+            branch: &crate::worktree::domain::ManagedBranch,
+            expected_target: &str,
+        ) -> WorktreeResult<bool> {
+            self.inner
+                .delete_branch_if_unchanged(common_dir, branch, expected_target)
+                .await
         }
 
         async fn set_ref(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             ref_name: &str,
             commit: &str,
         ) -> WorktreeResult<()> {
-            self.inner.set_ref(repo_root, ref_name, commit).await
+            self.inner.set_ref(common_dir, ref_name, commit).await
         }
 
         async fn create_ref_if_absent(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             ref_name: &str,
             commit: &str,
         ) -> WorktreeResult<()> {
             self.inner
-                .create_ref_if_absent(repo_root, ref_name, commit)
+                .create_ref_if_absent(common_dir, ref_name, commit)
                 .await
         }
 
         async fn list_worktrees(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
         ) -> WorktreeResult<Vec<crate::worktree::RegisteredWorktree>> {
-            self.inner.list_worktrees(repo_root).await
+            self.inner.list_worktrees(common_dir).await
         }
 
         async fn add_worktree(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             path: &Path,
             branch: &crate::worktree::domain::ManagedBranch,
         ) -> WorktreeResult<()> {
-            self.inner.add_worktree(repo_root, path, branch).await
+            self.inner.add_worktree(common_dir, path, branch).await
         }
 
-        async fn remove_worktree(&self, repo_root: &Path, path: &Path) -> WorktreeResult<()> {
-            self.inner.remove_worktree(repo_root, path).await
+        async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
+            self.inner.remove_worktree(common_dir, path).await
         }
 
-        async fn prune_worktrees(&self, repo_root: &Path) -> WorktreeResult<()> {
-            self.inner.prune_worktrees(repo_root).await
+        async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
+            self.inner.prune_worktrees(common_dir).await
         }
 
         async fn checkout_status(
@@ -798,30 +1086,32 @@ mod tests {
 
         async fn commits_between_count(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             base: &str,
             tip: &str,
         ) -> WorktreeResult<usize> {
-            self.inner.commits_between_count(repo_root, base, tip).await
+            self.inner
+                .commits_between_count(common_dir, base, tip)
+                .await
         }
 
         async fn commits_between(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             base: &str,
             tip: &str,
         ) -> WorktreeResult<Vec<String>> {
-            self.inner.commits_between(repo_root, base, tip).await
+            self.inner.commits_between(common_dir, base, tip).await
         }
 
         async fn is_ancestor(
             &self,
-            repo_root: &Path,
+            common_dir: &Path,
             ancestor: &str,
             descendant: &str,
         ) -> WorktreeResult<bool> {
             self.inner
-                .is_ancestor(repo_root, ancestor, descendant)
+                .is_ancestor(common_dir, ancestor, descendant)
                 .await
         }
     }

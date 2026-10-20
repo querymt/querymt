@@ -412,3 +412,130 @@ async fn worktree_lifecycle_reports_ids_paths_baselines_and_errors_consistently(
         "removal retains the baseline ref: {removed:?}"
     );
 }
+
+/// Session-scoped recovery: a fork interrupted after the conversation copy
+/// stays non-runnable (pending isolation barrier) until
+/// `querymt/worktree/recover` is called with its session id; recovery
+/// completes provisioning, releases the barrier, and discloses the fresh
+/// working state without ever exposing the source checkout.
+#[tokio::test]
+async fn ext_recover_releases_a_pending_fork_barrier_by_session_id() {
+    use crate::session::store::SessionStore as _;
+
+    let f = worktree_fixture(true).await;
+    let source = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    let source_id = source.session_id.to_string();
+    std::fs::write(f.repo.path().join("README.md"), "parent edits\n").unwrap();
+
+    // Seed one message so the fork has a fork point, then simulate a crash
+    // right after the conversation copy: intent persisted, no workspace.
+    let seeded = crate::model::AgentMessage {
+        id: "msg-1".to_string(),
+        session_id: source_id.clone(),
+        role: querymt::chat::ChatRole::User,
+        parts: vec![crate::model::MessagePart::Text {
+            content: "hello".to_string(),
+        }],
+        created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    f.storage
+        .session_store()
+        .add_message(&source_id, seeded)
+        .await
+        .unwrap();
+    let intent = crate::session::store::PendingForkIsolation {
+        source_session_id: source_id.clone(),
+        source_cwd: f.repo.path().to_path_buf(),
+        options: crate::worktree::WorkspaceCreationOptions {
+            execution: crate::worktree::ExecutionMode::Worktree,
+            baseline: crate::worktree::BaselineMode::CurrentWorkingTree,
+            base_ref: None,
+        },
+    };
+    let fork_id = f
+        .storage
+        .fork_session_with_isolation_intent(
+            &source_id,
+            "msg-1",
+            crate::session::domain::ForkOrigin::User,
+            Some(intent),
+        )
+        .await
+        .unwrap();
+    assert!(
+        f.storage
+            .get_pending_fork_isolation(&fork_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the interrupted fork keeps its startup barrier"
+    );
+    assert!(
+        f.storage
+            .workspace_repository()
+            .unwrap()
+            .get_workspace_by_session(&fork_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no workspace was allocated before the crash"
+    );
+
+    // Ambiguous or empty requests are rejected.
+    let err = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/worktree/recover",
+            raw_params(r#"{"workspace_id":"ws-1","session_id":"sess-1"}"#),
+        ))
+        .await
+        .expect_err("ambiguous recover request");
+    assert_eq!(err.code, agent_client_protocol::ErrorCode::InvalidParams);
+
+    // Session-scoped recovery completes provisioning and releases the barrier.
+    let recovered = ext_method_json(
+        &f.handle,
+        "querymt/worktree/recover",
+        serde_json::json!({ "session_id": fork_id }),
+    )
+    .await;
+    assert_eq!(recovered["session_id"], fork_id);
+    let workspace = &recovered["sessionWorkspace"];
+    assert_eq!(workspace["execution"], "worktree");
+    assert_eq!(workspace["disclosure"], "fresh-working-state");
+    let session_cwd = std::path::PathBuf::from(workspace["sessionCwd"].as_str().unwrap());
+    assert_ne!(session_cwd, f.repo.path());
+    assert_eq!(
+        std::fs::read_to_string(session_cwd.join("README.md")).unwrap(),
+        "parent edits\n",
+        "the recovered checkout reflects the source's current contents"
+    );
+    assert!(
+        f.storage
+            .get_pending_fork_isolation(&fork_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the startup barrier is released"
+    );
+    let owned = f
+        .service
+        .registry()
+        .get_workspace_by_session(&fork_id)
+        .await
+        .unwrap()
+        .expect("recovery binds the fork as single owner");
+    assert_eq!(owned.lifecycle, crate::worktree::WorkspaceLifecycle::Ready);
+    // Source row was never moved.
+    let source_row = f.storage.get_session(&source_id).await.unwrap().unwrap();
+    assert_eq!(source_row.cwd.as_deref(), Some(f.repo.path()));
+}

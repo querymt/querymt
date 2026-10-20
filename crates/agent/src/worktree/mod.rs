@@ -21,6 +21,8 @@ pub mod gate;
 #[cfg(test)]
 pub(crate) mod git;
 pub mod identity;
+#[cfg(test)]
+mod layout_lifecycle_tests;
 pub mod lifecycle;
 pub mod lock;
 pub mod placement;
@@ -31,15 +33,15 @@ pub mod session_options;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-pub use allocate::{WorkspaceAllocator, checkout_path_for};
+pub use allocate::{BaselineSource, RecoveredWorkspace, WorkspaceAllocator, checkout_path_for};
 pub use capture::{
     CaptureRetryPolicy, CapturedState, capture_working_state, capture_working_state_validated,
 };
 pub use domain::{
-    Baseline, BaselineMode, DelegationIsolation, ExecutionMode, ManagedBranch, RepositoryIdentity,
-    ResolvedIsolation, ResultProvenance, ResultVerificationStatus, WorkspaceCreationOptions,
-    WorkspaceId, WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
-    resolve_delegation_isolation,
+    Baseline, BaselineMode, DelegationIsolation, ExecutionMode, ManagedBranch, ProvisioningPhase,
+    RepositoryIdentity, ResolvedIsolation, ResultProvenance, ResultVerificationStatus,
+    WorkspaceCreationOptions, WorkspaceId, WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord,
+    baseline_ref_for, resolve_delegation_isolation,
 };
 pub use error::{WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;

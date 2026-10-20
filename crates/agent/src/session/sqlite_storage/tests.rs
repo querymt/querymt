@@ -2512,6 +2512,9 @@ fn worktree_workspace_migration_upgrades_existing_database() {
                 "last_error",
                 "created_at",
                 "updated_at",
+                "requested_base_ref",
+                "operation_id",
+                "provisioning_phase",
             ],
         ),
         (
@@ -2583,6 +2586,93 @@ fn worktree_workspace_migration_upgrades_existing_database() {
         [],
     );
     assert!(dup_checkout.is_err(), "checkout paths are never reused");
+}
+
+/// The 0027 provisioning-intent migration upgrades an existing database:
+/// the replayable provisioning inputs (requested ref, operation id, phase)
+/// are added idempotently, pre-existing rows are preserved, and a true
+/// first intent (no baseline) round-trips through the repository without a
+/// fabricated capture.
+#[tokio::test]
+async fn provisioning_intent_migration_upgrades_existing_database() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    // Model an upgrade from the pre-0027 schema: run every migration, then
+    // recreate the workspace tables in their pre-0027 shape (the shared DDL
+    // predates the new columns), so only 0027 has to add them.
+    for migration in MIGRATIONS.iter().filter(|m| {
+        m.version != "0027_workspace_provisioning_intent" && m.version != "0022_worktree_workspaces"
+    }) {
+        (migration.apply)(&mut conn).unwrap();
+    }
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    conn.execute_batch(crate::session::schema::WORKSPACE_TABLES_DDL)
+        .unwrap();
+
+    // A workspace provisioned by the older binary: no replay inputs.
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         created_at, updated_at) \
+         VALUES('pre-27', '/repo/.git', '/repo', 'repo', '/wt/pre-27', 'qmt/pre-27', '', \
+         'worktree', 'current_working_tree', 'provisioning', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0027_workspace_provisioning_intent")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent on re-run.
+    (migration.apply)(&mut conn).unwrap();
+
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in ["requested_base_ref", "operation_id", "provisioning_phase"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "missing column {expected} after upgrade"
+            );
+        }
+    }
+
+    // The pre-migration row survives with NULL replay inputs.
+    use crate::worktree::repo_workspace::WorkspaceRepository as _;
+    let store = crate::worktree::SqliteWorkspaceRepository::new(std::sync::Arc::new(
+        std::sync::Mutex::new(conn),
+    ));
+    let id = crate::worktree::WorkspaceId::from_raw("pre-27");
+    let record = store.get_workspace(&id).await.unwrap().unwrap();
+    assert_eq!(
+        record.lifecycle,
+        crate::worktree::WorkspaceLifecycle::Provisioning
+    );
+    assert!(record.baseline.is_none(), "no fabricated baseline");
+    assert_eq!(
+        record.requested_baseline_mode,
+        crate::worktree::BaselineMode::CurrentWorkingTree
+    );
+    assert_eq!(record.requested_base_ref, None);
+    assert_eq!(record.operation_id, "");
+    assert_eq!(record.provisioning_phase, None);
+
+    // The true first persisted intent round-trips once the replay inputs
+    // are recorded.
+    let mut intent = record.clone();
+    intent.requested_base_ref = Some("refs/heads/main".into());
+    intent.operation_id = "op-first".into();
+    intent.provisioning_phase = Some(crate::worktree::ProvisioningPhase::IntentPersisted);
+    store.update_workspace(intent.clone()).await.unwrap();
+    let loaded = store.get_workspace(&id).await.unwrap().unwrap();
+    assert_eq!(loaded, intent);
 }
 
 #[tokio::test]

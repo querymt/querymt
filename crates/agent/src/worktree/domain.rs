@@ -276,6 +276,67 @@ impl FromStr for WorkspaceLifecycle {
     }
 }
 
+/// Durable provisioning progress of an intent, persisted after each
+/// completed allocation step so interrupted creation can be replayed from
+/// the last recorded boundary.
+///
+/// The phase is strictly forward-only while the workspace is
+/// [`WorkspaceLifecycle::Provisioning`]; reaching [`ProvisioningPhase::CheckoutCreated`]
+/// means every Git resource exists and only the final lifecycle transition to
+/// `Ready` remains. Rows recorded before this field existed have `None` and
+/// are reconciled from the presence of a bound baseline instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvisioningPhase {
+    /// The replayable intent (source, requested ref/policy, relative cwd,
+    /// operation id, intended branch/checkout) is durably persisted; nothing
+    /// has been captured or allocated yet.
+    IntentPersisted,
+    /// The immutable baseline identity is durably bound to the workspace.
+    BaselineBound,
+    /// The retained baseline ref has been published at the bound baseline.
+    BaselineRefPublished,
+    /// The managed branch exists at the baseline commit.
+    BranchCreated,
+    /// The linked worktree checkout exists; only `Ready` remains.
+    CheckoutCreated,
+}
+
+impl ProvisioningPhase {
+    /// Whether `next` is a forward step from `self`.
+    pub fn can_advance_to(self, next: ProvisioningPhase) -> bool {
+        next > self
+    }
+}
+
+impl fmt::Display for ProvisioningPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ProvisioningPhase::IntentPersisted => "intent_persisted",
+            ProvisioningPhase::BaselineBound => "baseline_bound",
+            ProvisioningPhase::BaselineRefPublished => "baseline_ref_published",
+            ProvisioningPhase::BranchCreated => "branch_created",
+            ProvisioningPhase::CheckoutCreated => "checkout_created",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for ProvisioningPhase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "intent_persisted" => Ok(ProvisioningPhase::IntentPersisted),
+            "baseline_bound" => Ok(ProvisioningPhase::BaselineBound),
+            "baseline_ref_published" => Ok(ProvisioningPhase::BaselineRefPublished),
+            "branch_created" => Ok(ProvisioningPhase::BranchCreated),
+            "checkout_created" => Ok(ProvisioningPhase::CheckoutCreated),
+            other => Err(format!("unknown provisioning phase: {other}")),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Execution policy
 // ---------------------------------------------------------------------------
@@ -448,10 +509,11 @@ impl FromStr for ResultVerificationStatus {
     }
 }
 
-/// Provenance of a retained delegate result relative to its baseline.
+/// Provenance of a retained result (delegate or top-level workspace)
+/// relative to its baseline.
 ///
 /// `baseline_commit` is inherited from the workspace baseline;
-/// `result_commit` is the immutable capture of uncommitted delegate output,
+/// `result_commit` is the immutable capture of uncommitted working output,
 /// if capture succeeded. Absent results never imply integration: nothing in
 /// this type causes a parent merge or claims the result was applied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,8 +521,8 @@ pub struct ResultProvenance {
     /// Baseline the result is measured against (matches the workspace
     /// baseline at delegation time).
     pub baseline_commit: String,
-    /// Immutable result commit capturing uncommitted delegate output, when
-    /// capture succeeded.
+    /// Immutable result commit capturing uncommitted output, when capture
+    /// succeeded.
     pub result_commit: Option<String>,
     /// Retained ref holding `result_commit` (e.g. `refs/qmt/results/<id>`).
     pub result_ref: Option<String>,
@@ -469,6 +531,112 @@ pub struct ResultProvenance {
     /// When the result was captured.
     #[serde(with = "time::serde::rfc3339")]
     pub captured_at: OffsetDateTime,
+    /// HEAD of the checkout at capture time, recorded separately from live
+    /// HEAD so review stays accurate after later branch movement. Rows
+    /// persisted before this field existed read as `None`; review derives
+    /// from the workspace baseline in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_head: Option<String>,
+}
+
+/// How a path changed between two immutable trees (baseline → result).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+impl fmt::Display for ChangeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ChangeKind::Added => "added",
+            ChangeKind::Modified => "modified",
+            ChangeKind::Deleted => "deleted",
+        };
+        f.write_str(s)
+    }
+}
+
+impl FromStr for ChangeKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "added" => Ok(ChangeKind::Added),
+            "modified" => Ok(ChangeKind::Modified),
+            "deleted" => Ok(ChangeKind::Deleted),
+            other => Err(format!("unknown change kind: {other}")),
+        }
+    }
+}
+
+/// One baseline-relative change: a repository-relative path and its kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangedPath {
+    /// Repository-relative path, forward-slash separated.
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+/// Immutable baseline-relative review of a published result.
+///
+/// Every field except the live-state disclosure derives from the retained
+/// refs, so review is identical after restart, later edits, or further
+/// publication. `baseline_includes_uncommitted_edits` marks results whose
+/// baseline captured a dirty parent: merging the private branch directly
+/// would also import those inherited edits, so integration must apply the
+/// listed delta deliberately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultReview {
+    /// Baseline commit the delta is measured against.
+    pub baseline_commit: String,
+    /// Immutable result commit under review.
+    pub result_commit: String,
+    /// Retained ref pinning [`Self::result_commit`], when publication wrote
+    /// one.
+    pub result_ref: Option<String>,
+    /// HEAD of the checkout at capture time — distinct from live HEAD.
+    pub captured_head: String,
+    /// Verification outcome, when known.
+    pub verification: Option<ResultVerificationStatus>,
+    /// When the result was captured.
+    #[serde(with = "time::serde::rfc3339")]
+    pub captured_at: OffsetDateTime,
+    /// Baseline-relative changes (added/modified/deleted), sorted by path.
+    pub changed_paths: Vec<ChangedPath>,
+    /// Whether the baseline captured uncommitted parent edits; carries the
+    /// dirty-baseline merge warning.
+    pub baseline_includes_uncommitted_edits: bool,
+}
+
+impl ResultReview {
+    /// Human-readable review summary used in completion/summarizer output.
+    /// Lists only the baseline-relative delta and never claims the result
+    /// was integrated.
+    pub fn summary_text(&self) -> String {
+        let mut lines = Vec::with_capacity(self.changed_paths.len().max(1));
+        for changed in &self.changed_paths {
+            lines.push(format!("  {} ({})", changed.path, changed.kind));
+        }
+        if lines.is_empty() {
+            lines.push("  (no baseline-relative changes)".to_string());
+        }
+        let mut text = format!(
+            "Baseline-relative changes (immutable result {}):\n{}",
+            self.result_commit,
+            lines.join("\n")
+        );
+        if self.baseline_includes_uncommitted_edits {
+            text.push_str(
+                "\nWARNING: the baseline includes inherited uncommitted parent edits; \
+                 merging the private branch directly would import them too — apply \
+                 only the listed delta deliberately.",
+            );
+        }
+        text
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +670,22 @@ pub struct WorkspaceRecord {
     pub ownership: WorkspaceOwnership,
     /// Last failure diagnostic for `Failed`/`Missing` states.
     pub last_error: Option<String>,
+    /// Baseline policy requested at intent time (`commit` or
+    /// `current_working_tree`). Persisted even while `baseline` is `None`
+    /// so baseline-absent recovery knows which capture to retry.
+    pub requested_baseline_mode: BaselineMode,
+    /// Explicit ref requested at intent time, if any. Re-resolved during
+    /// baseline-absent recovery; the resolved commit itself is never
+    /// fabricated.
+    pub requested_base_ref: Option<String>,
+    /// Unique id of the provisioning operation. Generated with the intent so
+    /// replay attempts can be identified and never re-generate resources
+    /// under a different identity.
+    pub operation_id: String,
+    /// Last completed provisioning step. `None` for rows recorded before
+    /// phase tracking existed; `Some` only while `lifecycle` is
+    /// `Provisioning` (cleared once the workspace becomes ready).
+    pub provisioning_phase: Option<ProvisioningPhase>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -842,6 +1026,10 @@ mod tests {
                 ..Default::default()
             },
             last_error: None,
+            requested_baseline_mode: BaselineMode::Commit,
+            requested_base_ref: None,
+            operation_id: "op-1".into(),
+            provisioning_phase: None,
             created_at: datetime!(2026-01-15 12:00:00 UTC),
             updated_at: datetime!(2026-01-15 12:00:00 UTC),
         }
@@ -851,6 +1039,43 @@ mod tests {
     fn workspace_record_roundtrip() {
         let record = sample_record();
         assert_eq!(roundtrip(&record), record);
+    }
+
+    /// The true first persisted intent has no baseline yet: the requested
+    /// policy, operation id, and phase round-trip without any fabricated
+    /// capture.
+    #[test]
+    fn intent_only_record_roundtrips_without_baseline() {
+        let record = WorkspaceRecord {
+            baseline: None,
+            lifecycle: WorkspaceLifecycle::Provisioning,
+            requested_baseline_mode: BaselineMode::CurrentWorkingTree,
+            requested_base_ref: None,
+            provisioning_phase: Some(ProvisioningPhase::IntentPersisted),
+            ..sample_record()
+        };
+        let back = roundtrip(&record);
+        assert_eq!(back, record);
+        assert!(back.baseline.is_none());
+        assert_eq!(
+            back.provisioning_phase,
+            Some(ProvisioningPhase::IntentPersisted)
+        );
+    }
+
+    #[test]
+    fn provisioning_phase_serializes_snake_case_and_orders_forward() {
+        let phase = ProvisioningPhase::BaselineBound;
+        assert_eq!(phase.to_string(), "baseline_bound");
+        assert_eq!(roundtrip(&phase), phase);
+        assert!(ProvisioningPhase::IntentPersisted.can_advance_to(phase));
+        assert!(!phase.can_advance_to(ProvisioningPhase::IntentPersisted));
+        assert!(phase.can_advance_to(ProvisioningPhase::CheckoutCreated));
+        assert_eq!(
+            "checkout_created".parse::<ProvisioningPhase>().unwrap(),
+            ProvisioningPhase::CheckoutCreated
+        );
+        assert!("nonsense".parse::<ProvisioningPhase>().is_err());
     }
 
     #[test]

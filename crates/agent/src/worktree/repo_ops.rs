@@ -14,7 +14,7 @@
 //! Tests never fabricate command output: fault injection happens at the
 //! operation level through [`FaultInjectingRepoOps`].
 
-use crate::worktree::domain::ManagedBranch;
+use crate::worktree::domain::{ChangeKind, ChangedPath, ManagedBranch};
 use crate::worktree::error::{WorktreeError, WorktreeResult};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
 use gix::objs::tree::EntryKind;
+use gix::refs::Target;
 use gix::refs::transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog};
 
 /// A linked-worktree registration observed in the shared repository.
@@ -71,12 +72,18 @@ pub struct CapturedWorkingState {
 pub trait RepositoryOps: Send + Sync {
     /// Resolve a revision expression (e.g. `HEAD`, `HEAD^{commit}`, a ref
     /// name) to a full commit object id; `None` when it does not resolve.
-    async fn resolve_commit(&self, repo_root: &Path, expr: &str) -> WorktreeResult<Option<String>>;
+    ///
+    /// `common_dir` is the repository administration handle: the canonical
+    /// Git common directory shared by every checkout of the project. It is
+    /// never a working directory guessed from a checkout (see
+    /// [`crate::worktree::identity`]).
+    async fn resolve_commit(&self, common_dir: &Path, expr: &str)
+    -> WorktreeResult<Option<String>>;
 
     /// Full object id at the branch tip, or `None` when the branch is absent.
     async fn branch_tip(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<Option<String>>;
 
@@ -84,34 +91,51 @@ pub trait RepositoryOps: Send + Sync {
     /// already exists.
     async fn create_branch(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
         target: &str,
     ) -> WorktreeResult<()>;
 
     /// Delete a local branch unconditionally (safety policy lives in the
     /// lifecycle layer; conditional deletion is a later remediation).
-    async fn delete_branch(&self, repo_root: &Path, branch: &ManagedBranch) -> WorktreeResult<()>;
+    async fn delete_branch(&self, common_dir: &Path, branch: &ManagedBranch) -> WorktreeResult<()>;
+
+    /// Delete a local branch only while it still points at
+    /// `expected_target` (an expected-target reference transaction).
+    ///
+    /// Returns `Ok(true)` when the branch was deleted, including when it had
+    /// already been deleted concurrently. Returns `Ok(false)` when an
+    /// external writer moved the branch between observation and deletion —
+    /// the branch and its new history are retained and the caller must
+    /// disclose the race. The branch is never deleted unconditionally.
+    async fn delete_branch_if_unchanged(
+        &self,
+        common_dir: &Path,
+        branch: &ManagedBranch,
+        expected_target: &str,
+    ) -> WorktreeResult<bool>;
 
     /// Create or move a ref to `commit` (plain `update-ref` semantics).
-    async fn set_ref(&self, repo_root: &Path, ref_name: &str, commit: &str) -> WorktreeResult<()>;
+    async fn set_ref(&self, common_dir: &Path, ref_name: &str, commit: &str) -> WorktreeResult<()>;
 
     /// Create a ref only when it does not already exist.
     async fn create_ref_if_absent(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         ref_name: &str,
         commit: &str,
     ) -> WorktreeResult<()>;
 
-    /// Linked worktrees registered in the repository, including the main
-    /// checkout.
-    async fn list_worktrees(&self, repo_root: &Path) -> WorktreeResult<Vec<RegisteredWorktree>>;
+    /// Linked worktrees registered in the repository, including a main
+    /// checkout that has a working tree. The main registration of a bare
+    /// common repository has no working tree and is not a usable checkout;
+    /// it is skipped rather than reported.
+    async fn list_worktrees(&self, common_dir: &Path) -> WorktreeResult<Vec<RegisteredWorktree>>;
 
     /// Create a linked worktree at `path` checking out `branch`.
     async fn add_worktree(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         path: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<()>;
@@ -119,11 +143,11 @@ pub trait RepositoryOps: Send + Sync {
     /// Remove a linked worktree (checkout directory plus registration
     /// metadata). Refuses dirty checkouts; the lifecycle layer has already
     /// verified content safety.
-    async fn remove_worktree(&self, repo_root: &Path, path: &Path) -> WorktreeResult<()>;
+    async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()>;
 
     /// Prune registration metadata of linked worktrees whose checkout
     /// directory no longer exists.
-    async fn prune_worktrees(&self, repo_root: &Path) -> WorktreeResult<()>;
+    async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()>;
 
     /// Working-tree state (uncommitted/untracked/ignored) for a checkout.
     async fn checkout_status(&self, checkout: &Path) -> WorktreeResult<CheckoutStatus>;
@@ -137,7 +161,7 @@ pub trait RepositoryOps: Send + Sync {
     /// Count of commits reachable from `tip` but not `base`.
     async fn commits_between_count(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         base: &str,
         tip: &str,
     ) -> WorktreeResult<usize>;
@@ -145,7 +169,7 @@ pub trait RepositoryOps: Send + Sync {
     /// Commits reachable from `tip` but not `base`, newest first.
     async fn commits_between(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         base: &str,
         tip: &str,
     ) -> WorktreeResult<Vec<String>>;
@@ -153,10 +177,21 @@ pub trait RepositoryOps: Send + Sync {
     /// Whether `ancestor` is reachable from `descendant`.
     async fn is_ancestor(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         ancestor: &str,
         descendant: &str,
     ) -> WorktreeResult<bool>;
+
+    /// Paths changed between two immutable commits (or trees), sorted by
+    /// path, with their change kinds. Operates purely on repository objects
+    /// through the canonical common directory — live working-tree state is
+    /// never consulted, so results stay stable across later edits.
+    async fn changed_paths_between(
+        &self,
+        common_dir: &Path,
+        base: &str,
+        tip: &str,
+    ) -> WorktreeResult<Vec<ChangedPath>>;
 
     // -- working-state capture primitives (private index/tree/commit) ----
 
@@ -203,12 +238,33 @@ fn is_not_found(err: &gix::Error) -> bool {
     )
 }
 
+/// Open a repository for administration at `path`.
+///
+/// Callers pass the canonical common directory (the administration handle
+/// resolved by [`crate::worktree::identity`]) — a `.git` directory, an
+/// external Git directory, or a bare repository — never a working directory
+/// reconstructed from a checkout.
 fn open_repo(path: &Path) -> Result<gix::Repository, WorktreeError> {
     // `isolated()` ignores inherited GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE
     // overrides so an ambient environment cannot redirect operations to a
     // different repository, worktree, or index (repository-local config is
     // still honored).
     gix::open_opts(path, gix::open::Options::isolated()).map_err(native_err)
+}
+
+/// Open a checkout for status enumeration.
+///
+/// `status.showUntrackedFiles=no` in repository config disables gix's
+/// directory walk entirely, which would silently hide untracked and ignored
+/// content from removal-safety checks. The override guarantees the walk
+/// stays available; the explicit builder in [`RepositoryOps::checkout_status`]
+/// then selects per-file emission.
+fn open_repo_for_status(path: &Path) -> Result<gix::Repository, WorktreeError> {
+    gix::open_opts(
+        path,
+        gix::open::Options::isolated().config_overrides(["status.showUntrackedFiles=all"]),
+    )
+    .map_err(native_err)
 }
 
 fn full_branch_name(branch: &ManagedBranch) -> gix::refs::FullName {
@@ -248,11 +304,15 @@ fn ref_edit_update(
 
 #[async_trait]
 impl RepositoryOps for GixRepoOps {
-    async fn resolve_commit(&self, repo_root: &Path, expr: &str) -> WorktreeResult<Option<String>> {
-        let repo_root = repo_root.to_path_buf();
+    async fn resolve_commit(
+        &self,
+        common_dir: &Path,
+        expr: &str,
+    ) -> WorktreeResult<Option<String>> {
+        let common_dir = common_dir.to_path_buf();
         let expr = expr.to_string();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             match repo.rev_parse_single(expr.as_bytes()) {
                 Ok(id) => Ok(Some(id.detach().to_string())),
                 Err(err) if is_not_found(&err) => Ok(None),
@@ -265,13 +325,13 @@ impl RepositoryOps for GixRepoOps {
 
     async fn branch_tip(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<Option<String>> {
-        let repo_root = repo_root.to_path_buf();
+        let common_dir = common_dir.to_path_buf();
         let full = full_branch_name(branch);
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             match repo.try_find_reference(full.as_bstr()) {
                 Ok(Some(mut reference)) => {
                     let id = reference.peel_to_id().map_err(native_err)?;
@@ -287,15 +347,15 @@ impl RepositoryOps for GixRepoOps {
 
     async fn create_branch(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
         target: &str,
     ) -> WorktreeResult<()> {
-        let repo_root = repo_root.to_path_buf();
+        let common_dir = common_dir.to_path_buf();
         let full = full_branch_name(branch);
         let target = parse_oid(target)?;
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             let edit = RefEdit {
                 change: Change::Update {
                     log: LogChange {
@@ -316,11 +376,11 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn delete_branch(&self, repo_root: &Path, branch: &ManagedBranch) -> WorktreeResult<()> {
-        let repo_root = repo_root.to_path_buf();
+    async fn delete_branch(&self, common_dir: &Path, branch: &ManagedBranch) -> WorktreeResult<()> {
+        let common_dir = common_dir.to_path_buf();
         let full = full_branch_name(branch);
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             let edit = RefEdit {
                 change: Change::Delete {
                     log: RefLog::AndReference,
@@ -336,12 +396,61 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn set_ref(&self, repo_root: &Path, ref_name: &str, commit: &str) -> WorktreeResult<()> {
-        let repo_root = repo_root.to_path_buf();
+    async fn delete_branch_if_unchanged(
+        &self,
+        common_dir: &Path,
+        branch: &ManagedBranch,
+        expected_target: &str,
+    ) -> WorktreeResult<bool> {
+        let common_dir = common_dir.to_path_buf();
+        let full = full_branch_name(branch);
+        let expected = parse_oid(expected_target)?;
+        tokio::task::spawn_blocking(move || {
+            let repo = open_repo(&common_dir)?;
+            let edit = RefEdit {
+                change: Change::Delete {
+                    log: RefLog::AndReference,
+                    // Expected-target transaction: the deletion applies only
+                    // while the branch still points at the observed commit.
+                    expected: PreviousValue::MustExistAndMatch(Target::Object(expected)),
+                },
+                name: full.clone(),
+                deref: false,
+            };
+            match repo.edit_reference(edit) {
+                Ok(_) => Ok(true),
+                Err(_) => {
+                    // Classify by current state instead of matching gix
+                    // error variants: an absent reference means the goal was
+                    // achieved concurrently; a moved target means an
+                    // external writer won the race and the branch (with its
+                    // new history) must be retained.
+                    match repo.find_reference(&full) {
+                        Err(_) => Ok(true),
+                        Ok(mut reference) => {
+                            let current = reference.peel_to_id().map_err(native_err)?;
+                            if current == expected {
+                                Err(native_err(format!(
+                                    "conditional deletion of {full} failed unexpectedly"
+                                )))
+                            } else {
+                                Ok(false)
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(native_err)?
+    }
+
+    async fn set_ref(&self, common_dir: &Path, ref_name: &str, commit: &str) -> WorktreeResult<()> {
+        let common_dir = common_dir.to_path_buf();
         let full = full_name(ref_name)?;
         let target = parse_oid(commit)?;
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             repo.edit_reference(ref_edit_update(full, target, "QueryMT retained ref"))
                 .map_err(native_err)?;
             Ok(())
@@ -352,16 +461,16 @@ impl RepositoryOps for GixRepoOps {
 
     async fn create_ref_if_absent(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         ref_name: &str,
         commit: &str,
     ) -> WorktreeResult<()> {
-        let repo_root = repo_root.to_path_buf();
+        let common_dir = common_dir.to_path_buf();
         let full = full_name(ref_name)?;
         let target = parse_oid(commit)?;
         let exists_msg = format!("ref {ref_name} already exists");
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             if repo
                 .try_find_reference(full.as_bstr())
                 .map_err(native_err)?
@@ -389,19 +498,27 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn list_worktrees(&self, repo_root: &Path) -> WorktreeResult<Vec<RegisteredWorktree>> {
-        let repo_root = repo_root.to_path_buf();
+    async fn list_worktrees(&self, common_dir: &Path) -> WorktreeResult<Vec<RegisteredWorktree>> {
+        let common_dir_param = common_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
-            let common_dir = repo.common_dir().to_path_buf();
+            // Opened at the canonical common directory itself: this is the
+            // shared administration handle that works for ordinary `.git`
+            // directories, separate Git directories, and bare common
+            // repositories alike. No working directory is guessed.
+            let repo = open_repo(&common_dir_param)?;
+            let repo_common_dir = repo.common_dir().to_path_buf();
             let mut out = Vec::new();
             for checkout in repo.worktrees_including_main().map_err(native_err)? {
                 let checkout = checkout.map_err(native_err)?;
-                let path = checkout
-                    .workdir()
-                    .map(Path::to_path_buf)
-                    .ok_or_else(|| native_err("worktree has no working tree"))?;
-                let is_main = checkout.git_dir() == common_dir;
+                // The main registration of a bare common repository has no
+                // working tree: it is repository administration, not a
+                // usable checkout, so it is skipped instead of failing the
+                // enumeration for bare-backed linked checkouts.
+                let Some(path) = checkout.workdir() else {
+                    continue;
+                };
+                let path = path.to_path_buf();
+                let is_main = checkout.git_dir() == repo_common_dir;
                 let branch = repo_branch_of(&checkout);
                 out.push(RegisteredWorktree {
                     path: std::fs::canonicalize(&path).unwrap_or(path),
@@ -417,15 +534,15 @@ impl RepositoryOps for GixRepoOps {
 
     async fn add_worktree(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         path: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<()> {
-        let repo_root = repo_root.to_path_buf();
+        let common_dir = common_dir.to_path_buf();
         let path = path.to_path_buf();
         let full = full_branch_name(branch);
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             let head = gix::worktree::add::Head::Attached(full);
             let interrupt = std::sync::atomic::AtomicBool::new(false);
             repo.add_worktree(&path, head, gix::progress::Discard, &interrupt)
@@ -436,11 +553,11 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn remove_worktree(&self, repo_root: &Path, path: &Path) -> WorktreeResult<()> {
-        let repo_root = repo_root.to_path_buf();
+    async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
+        let common_dir = common_dir.to_path_buf();
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             repo.remove_worktree(
                 &path,
                 gix::worktree::remove::Force::Never,
@@ -453,10 +570,10 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
-    async fn prune_worktrees(&self, repo_root: &Path) -> WorktreeResult<()> {
-        let repo_root = repo_root.to_path_buf();
+    async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
+        let common_dir = common_dir.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             let common_dir = repo.common_dir().to_path_buf();
             for proxy in repo.worktrees().map_err(native_err)? {
                 if proxy.base().map_err(native_err)?.exists() {
@@ -482,7 +599,7 @@ impl RepositoryOps for GixRepoOps {
     async fn checkout_status(&self, checkout: &Path) -> WorktreeResult<CheckoutStatus> {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&checkout)?;
+            let repo = open_repo_for_status(&checkout)?;
             let mut status = CheckoutStatus::default();
 
             // Index-vs-worktree changes plus untracked/ignored discovery.
@@ -591,24 +708,24 @@ impl RepositoryOps for GixRepoOps {
 
     async fn commits_between_count(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         base: &str,
         tip: &str,
     ) -> WorktreeResult<usize> {
-        Ok(self.commits_between(repo_root, base, tip).await?.len())
+        Ok(self.commits_between(common_dir, base, tip).await?.len())
     }
 
     async fn commits_between(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         base: &str,
         tip: &str,
     ) -> WorktreeResult<Vec<String>> {
-        let repo_root = repo_root.to_path_buf();
+        let common_dir = common_dir.to_path_buf();
         let base = base.to_string();
         let tip = tip.to_string();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             let base = repo
                 .rev_parse_single(base.as_bytes())
                 .map_err(native_err)?
@@ -639,15 +756,15 @@ impl RepositoryOps for GixRepoOps {
 
     async fn is_ancestor(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         ancestor: &str,
         descendant: &str,
     ) -> WorktreeResult<bool> {
-        let repo_root = repo_root.to_path_buf();
+        let common_dir = common_dir.to_path_buf();
         let ancestor = ancestor.to_string();
         let descendant = descendant.to_string();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&repo_root)?;
+            let repo = open_repo(&common_dir)?;
             let ancestor = repo
                 .rev_parse_single(ancestor.as_bytes())
                 .map_err(native_err)?
@@ -677,10 +794,40 @@ impl RepositoryOps for GixRepoOps {
         .map_err(native_err)?
     }
 
+    async fn changed_paths_between(
+        &self,
+        common_dir: &Path,
+        base: &str,
+        tip: &str,
+    ) -> WorktreeResult<Vec<ChangedPath>> {
+        let common_dir = common_dir.to_path_buf();
+        let base = base.to_string();
+        let tip = tip.to_string();
+        tokio::task::spawn_blocking(move || {
+            let repo = open_repo(&common_dir)?;
+            let base = repo
+                .rev_parse_single(base.as_bytes())
+                .map_err(native_err)?
+                .detach();
+            let tip = repo
+                .rev_parse_single(tip.as_bytes())
+                .map_err(native_err)?
+                .detach();
+            let base_tree = peel_to_tree(&repo, base)?;
+            let tip_tree = peel_to_tree(&repo, tip)?;
+            changed_paths_between_trees(&repo, base_tree, tip_tree)
+        })
+        .await
+        .map_err(native_err)?
+    }
+
     async fn capture_working_state(&self, checkout: &Path) -> WorktreeResult<CapturedWorkingState> {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&checkout)?;
+            // The status pass below must see untracked files even when the
+            // repository config disables them (`status.showUntrackedFiles`),
+            // otherwise the baseline would silently miss content.
+            let repo = open_repo_for_status(&checkout)?;
             let head = repo.head_id().map_err(|err| {
                 if is_not_found(&err) {
                     WorktreeError::InvalidOperation(
@@ -701,8 +848,19 @@ impl RepositoryOps for GixRepoOps {
                 gix::index::State::from_tree(&head_tree, &repo.objects, Default::default())
                     .map_err(native_err)?;
 
+            // Reject active submodules before touching the working tree: a
+            // gitlink checkout is a directory and cannot be read as blob
+            // content.
+            reject_gitlinks(&repo, head_tree)?;
+
             let (ignored_files, kept) =
                 classify_and_reconcile(&repo, &mut private_index, source_head, head_tree)?;
+
+            // Reject candidate paths whose effective attributes select an
+            // external filter (Git LFS or any custom clean/smudge process);
+            // resolution covers nested `.gitattributes`, Git-directory
+            // attributes, and macros.
+            reject_external_filter_paths(&repo, &private_index, &kept)?;
 
             let tree = write_tree_from_index(&repo, &private_index, &kept)?;
 
@@ -897,6 +1055,63 @@ fn flatten_tree(
     Ok(())
 }
 
+/// Peel a resolved revision to its tree, accepting commits and trees.
+fn peel_to_tree(
+    repo: &gix::Repository,
+    id: gix::hash::ObjectId,
+) -> WorktreeResult<gix::hash::ObjectId> {
+    Ok(repo
+        .find_object(id)
+        .map_err(native_err)?
+        .peel_to_kind(gix::object::Kind::Tree)
+        .map_err(native_err)?
+        .id()
+        .detach())
+}
+
+/// Diff two immutable trees into sorted path/kind pairs by flattening both
+/// trees and comparing path → (mode, object) maps. A path present only in
+/// `tip_tree` is added, only in `base_tree` is deleted, and otherwise
+/// modified when either its object id or its mode differs. Runs on the
+/// calling thread only.
+fn changed_paths_between_trees(
+    repo: &gix::Repository,
+    base_tree: gix::hash::ObjectId,
+    tip_tree: gix::hash::ObjectId,
+) -> WorktreeResult<Vec<ChangedPath>> {
+    let mut base = std::collections::HashMap::new();
+    flatten_tree(repo, base_tree, &mut base, String::new())?;
+    let mut tip = std::collections::HashMap::new();
+    flatten_tree(repo, tip_tree, &mut tip, String::new())?;
+    let mut changes: Vec<ChangedPath> = Vec::with_capacity(base.len().max(tip.len()));
+    for (path, (tip_mode, tip_oid)) in &tip {
+        match base.get(path) {
+            None => changes.push(ChangedPath {
+                path: path.to_string(),
+                kind: ChangeKind::Added,
+            }),
+            Some((base_mode, base_oid)) => {
+                if base_oid != tip_oid || base_mode != tip_mode {
+                    changes.push(ChangedPath {
+                        path: path.to_string(),
+                        kind: ChangeKind::Modified,
+                    });
+                }
+            }
+        }
+    }
+    for path in base.keys() {
+        if !tip.contains_key(path) {
+            changes.push(ChangedPath {
+                path: path.to_string(),
+                kind: ChangeKind::Deleted,
+            });
+        }
+    }
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(changes)
+}
+
 /// Classify the working tree and reconcile the private index with actual
 /// working contents.
 ///
@@ -1010,16 +1225,16 @@ fn classify_and_reconcile(
         for (entry, path) in entries.iter_mut().zip(&tracked_paths) {
             let abs = worktree.join(gix_pathbuf(path.as_bstr()));
             match std::fs::symlink_metadata(&abs) {
-                Ok(md) => {
+                Ok(md) if !md.is_dir() => {
                     let kind = file_kind_from_metadata(&md);
                     entry.id = write_blob_from_disk(repo, &abs, &md)?;
                     entry.mode = index_mode_for(kind);
                     kept.insert(path.clone());
                 }
-                Err(_) => {
-                    // Deleted from the working tree: excluded from the
-                    // baseline.
-                }
+                // Deleted from the working tree: excluded from the
+                // baseline. Directories (e.g. an uncaught gitlink
+                // checkout) are never read as blob content.
+                _ => {}
             }
         }
     }
@@ -1052,6 +1267,122 @@ fn classify_and_reconcile(
 fn gix_pathbuf(path: &gix::bstr::BStr) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
     PathBuf::from(std::ffi::OsStr::from_bytes(path))
+}
+
+/// Index mode spelling of a submodule gitlink (`160000`).
+const GITLINK_MODE: &str = "160000";
+
+/// Find the first submodule gitlink in `tree_id`, by tree entry kind —
+/// active submodules are rejected whether or not `.gitmodules` exists.
+fn find_gitlink_in_tree(
+    repo: &gix::Repository,
+    tree_id: gix::hash::ObjectId,
+    prefix: &str,
+) -> WorktreeResult<Option<String>> {
+    let tree = repo.find_tree(tree_id).map_err(native_err)?;
+    for entry in tree.iter() {
+        let entry = entry.map_err(native_err)?;
+        let path = if prefix.is_empty() {
+            entry.filename().to_string()
+        } else {
+            format!("{prefix}/{}", entry.filename())
+        };
+        if entry.mode().kind() == gix::objs::tree::EntryKind::Commit {
+            return Ok(Some(path));
+        }
+        if entry.mode().kind() == gix::objs::tree::EntryKind::Tree {
+            if let Some(found) = find_gitlink_in_tree(repo, entry.oid().into(), &path)? {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Reject active submodules: a gitlink in the HEAD tree or in the real
+/// index (regardless of a `.gitmodules` file) cannot be materialized into a
+/// private baseline in this version.
+fn reject_gitlinks(repo: &gix::Repository, head_tree: gix::hash::ObjectId) -> WorktreeResult<()> {
+    let submodule_error = |path: String| {
+        WorktreeError::InvalidOperation(format!(
+            "cannot capture baseline: submodules are unsupported in this version (gitlink at `{path}`)"
+        ))
+    };
+    if let Some(path) = find_gitlink_in_tree(repo, head_tree, "")? {
+        return Err(submodule_error(path));
+    }
+    if repo.index_path().exists() {
+        let index = repo.open_index().map_err(native_err)?;
+        for entry in index.entries() {
+            if entry.stage() != gix::index::entry::Stage::Unconflicted {
+                continue;
+            }
+            if format!("{:o}", entry.mode) == GITLINK_MODE {
+                return Err(submodule_error(
+                    entry.path(&index).to_str_lossy().into_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject candidate paths whose effective attributes select an external
+/// filter process, e.g. Git LFS (`filter=lfs`) or a custom clean/smudge
+/// filter. Resolution uses gix's attribute stack — in-tree `.gitattributes`
+/// files at any depth, `$GIT_DIR/info/attributes`, global attribute files,
+/// and `[attr]` macros — never a root-file text scan, so support decisions
+/// match Git's own attribute semantics.
+fn reject_external_filter_paths(
+    repo: &gix::Repository,
+    private_index: &gix::index::State,
+    kept: &std::collections::HashSet<gix::bstr::BString>,
+) -> WorktreeResult<()> {
+    if kept.is_empty() {
+        return Ok(());
+    }
+    let mut stack = repo
+        .attributes_only(
+            private_index,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+        )
+        .map_err(native_err)?;
+    let collection = stack.attributes_collection();
+    let mut outcome = gix::attrs::search::Outcome::default();
+    outcome.initialize_with_selection(collection, ["filter"]);
+    for path in kept {
+        let platform = stack
+            .at_path(gix_pathbuf(path.as_bstr()), None)
+            .map_err(native_err)?;
+        if !platform.matching_attributes(&mut outcome) {
+            continue;
+        }
+        for matched in outcome.iter_selected() {
+            let assignment = &matched.assignment;
+            if assignment.name.as_str() != "filter" {
+                continue;
+            }
+            match &assignment.state {
+                gix::attrs::StateRef::Value(value) if value.as_bstr() == b"lfs".as_bstr() => {
+                    return Err(WorktreeError::InvalidOperation(format!(
+                        "cannot capture baseline: Git LFS content is unsupported in this version \
+                         (path `{}` resolves to filter=lfs)",
+                        path.to_str_lossy()
+                    )));
+                }
+                gix::attrs::StateRef::Value(value) => {
+                    return Err(WorktreeError::InvalidOperation(format!(
+                        "cannot capture baseline: external filter processes are unsupported in \
+                         this version (path `{}` resolves to filter={})",
+                        path.to_str_lossy(),
+                        value.as_bstr().to_str_lossy()
+                    )));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_executable(md: &std::fs::Metadata) -> bool {
@@ -1251,6 +1582,7 @@ pub enum FailurePoint {
     BranchTip,
     CreateBranch,
     DeleteBranch,
+    DeleteBranchIfUnchanged,
     SetRef,
     CreateRefIfAbsent,
     ListWorktrees,
@@ -1262,6 +1594,7 @@ pub enum FailurePoint {
     CurrentBranch,
     CommitsBetween,
     IsAncestor,
+    ChangedPaths,
     CaptureWorkingState,
     IndexManifest,
     HasUnmergedEntries,
@@ -1304,53 +1637,71 @@ impl FaultInjectingRepoOps {
 
 #[async_trait]
 impl RepositoryOps for FaultInjectingRepoOps {
-    async fn resolve_commit(&self, repo_root: &Path, expr: &str) -> WorktreeResult<Option<String>> {
+    async fn resolve_commit(
+        &self,
+        common_dir: &Path,
+        expr: &str,
+    ) -> WorktreeResult<Option<String>> {
         if let Some(err) = self.take_failure(FailurePoint::ResolveCommit) {
             return Err(err);
         }
-        self.inner().resolve_commit(repo_root, expr).await
+        self.inner().resolve_commit(common_dir, expr).await
     }
 
     async fn branch_tip(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<Option<String>> {
         if let Some(err) = self.take_failure(FailurePoint::BranchTip) {
             return Err(err);
         }
-        self.inner().branch_tip(repo_root, branch).await
+        self.inner().branch_tip(common_dir, branch).await
     }
 
     async fn create_branch(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
         target: &str,
     ) -> WorktreeResult<()> {
         if let Some(err) = self.take_failure(FailurePoint::CreateBranch) {
             return Err(err);
         }
-        self.inner().create_branch(repo_root, branch, target).await
+        self.inner().create_branch(common_dir, branch, target).await
     }
 
-    async fn delete_branch(&self, repo_root: &Path, branch: &ManagedBranch) -> WorktreeResult<()> {
+    async fn delete_branch(&self, common_dir: &Path, branch: &ManagedBranch) -> WorktreeResult<()> {
         if let Some(err) = self.take_failure(FailurePoint::DeleteBranch) {
             return Err(err);
         }
-        self.inner().delete_branch(repo_root, branch).await
+        self.inner().delete_branch(common_dir, branch).await
     }
 
-    async fn set_ref(&self, repo_root: &Path, ref_name: &str, commit: &str) -> WorktreeResult<()> {
+    async fn delete_branch_if_unchanged(
+        &self,
+        common_dir: &Path,
+        branch: &ManagedBranch,
+        expected_target: &str,
+    ) -> WorktreeResult<bool> {
+        if let Some(err) = self.take_failure(FailurePoint::DeleteBranchIfUnchanged) {
+            return Err(err);
+        }
+        self.inner()
+            .delete_branch_if_unchanged(common_dir, branch, expected_target)
+            .await
+    }
+
+    async fn set_ref(&self, common_dir: &Path, ref_name: &str, commit: &str) -> WorktreeResult<()> {
         if let Some(err) = self.take_failure(FailurePoint::SetRef) {
             return Err(err);
         }
-        self.inner().set_ref(repo_root, ref_name, commit).await
+        self.inner().set_ref(common_dir, ref_name, commit).await
     }
 
     async fn create_ref_if_absent(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         ref_name: &str,
         commit: &str,
     ) -> WorktreeResult<()> {
@@ -1358,41 +1709,41 @@ impl RepositoryOps for FaultInjectingRepoOps {
             return Err(err);
         }
         self.inner()
-            .create_ref_if_absent(repo_root, ref_name, commit)
+            .create_ref_if_absent(common_dir, ref_name, commit)
             .await
     }
 
-    async fn list_worktrees(&self, repo_root: &Path) -> WorktreeResult<Vec<RegisteredWorktree>> {
+    async fn list_worktrees(&self, common_dir: &Path) -> WorktreeResult<Vec<RegisteredWorktree>> {
         if let Some(err) = self.take_failure(FailurePoint::ListWorktrees) {
             return Err(err);
         }
-        self.inner().list_worktrees(repo_root).await
+        self.inner().list_worktrees(common_dir).await
     }
 
     async fn add_worktree(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         path: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<()> {
         if let Some(err) = self.take_failure(FailurePoint::AddWorktree) {
             return Err(err);
         }
-        self.inner().add_worktree(repo_root, path, branch).await
+        self.inner().add_worktree(common_dir, path, branch).await
     }
 
-    async fn remove_worktree(&self, repo_root: &Path, path: &Path) -> WorktreeResult<()> {
+    async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
         if let Some(err) = self.take_failure(FailurePoint::RemoveWorktree) {
             return Err(err);
         }
-        self.inner().remove_worktree(repo_root, path).await
+        self.inner().remove_worktree(common_dir, path).await
     }
 
-    async fn prune_worktrees(&self, repo_root: &Path) -> WorktreeResult<()> {
+    async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
         if let Some(err) = self.take_failure(FailurePoint::PruneWorktrees) {
             return Err(err);
         }
-        self.inner().prune_worktrees(repo_root).await
+        self.inner().prune_worktrees(common_dir).await
     }
 
     async fn checkout_status(&self, checkout: &Path) -> WorktreeResult<CheckoutStatus> {
@@ -1418,7 +1769,7 @@ impl RepositoryOps for FaultInjectingRepoOps {
 
     async fn commits_between_count(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         base: &str,
         tip: &str,
     ) -> WorktreeResult<usize> {
@@ -1426,25 +1777,25 @@ impl RepositoryOps for FaultInjectingRepoOps {
             return Err(err);
         }
         self.inner()
-            .commits_between_count(repo_root, base, tip)
+            .commits_between_count(common_dir, base, tip)
             .await
     }
 
     async fn commits_between(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         base: &str,
         tip: &str,
     ) -> WorktreeResult<Vec<String>> {
         if let Some(err) = self.take_failure(FailurePoint::CommitsBetween) {
             return Err(err);
         }
-        self.inner().commits_between(repo_root, base, tip).await
+        self.inner().commits_between(common_dir, base, tip).await
     }
 
     async fn is_ancestor(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         ancestor: &str,
         descendant: &str,
     ) -> WorktreeResult<bool> {
@@ -1452,8 +1803,20 @@ impl RepositoryOps for FaultInjectingRepoOps {
             return Err(err);
         }
         self.inner()
-            .is_ancestor(repo_root, ancestor, descendant)
+            .is_ancestor(common_dir, ancestor, descendant)
             .await
+    }
+
+    async fn changed_paths_between(
+        &self,
+        common_dir: &Path,
+        base: &str,
+        tip: &str,
+    ) -> WorktreeResult<Vec<ChangedPath>> {
+        if let Some(err) = self.take_failure(FailurePoint::ChangedPaths) {
+            return Err(err);
+        }
+        self.inner().changed_paths_between(common_dir, base, tip).await
     }
 
     async fn capture_working_state(&self, checkout: &Path) -> WorktreeResult<CapturedWorkingState> {

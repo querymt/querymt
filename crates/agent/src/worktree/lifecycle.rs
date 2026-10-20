@@ -84,6 +84,11 @@ pub struct RemovalReport {
     /// The managed branch, when it was deleted (only branches with no
     /// commits beyond the baseline are deleted).
     pub removed_branch: Option<ManagedBranch>,
+    /// The managed branch, when an external writer moved it between the
+    /// preservation check and deletion: the branch (with its new history)
+    /// was retained instead of deleted, and the race is disclosed here and
+    /// in `retained_refs`.
+    pub branch_moved_during_removal: Option<ManagedBranch>,
     /// Refs intentionally retained for recovery (managed branch and/or
     /// recorded result refs).
     pub retained_refs: Vec<String>,
@@ -97,6 +102,12 @@ impl fmt::Display for RemovalReport {
         }
         if let Some(branch) = &self.removed_branch {
             write!(f, "; deleted branch {branch}")?;
+        }
+        if let Some(branch) = &self.branch_moved_during_removal {
+            write!(
+                f,
+                "; branch {branch} was moved externally during removal and was retained, not deleted"
+            )?;
         }
         if !self.retained_refs.is_empty() {
             write!(f, "; retained refs: {}", self.retained_refs.join(", "))?;
@@ -338,7 +349,9 @@ impl WorkspaceManager {
     /// Removal steps, run under the repository administration lock with the
     /// freshly loaded record.
     async fn remove_locked(&self, record: &WorkspaceRecord) -> WorktreeResult<RemovalReport> {
-        let repo_root = main_repo_root(&record.repository.common_dir)?;
+        // Administration handle: the canonical common directory from the
+        // durable record — never a working directory guessed from it.
+        let common_dir = &record.repository.common_dir;
         let checkout = record.checkout_path.clone();
         let checkout_exists = checkout.is_dir();
 
@@ -352,7 +365,8 @@ impl WorkspaceManager {
                     checkout.display()
                 )));
             }
-            if !worktree_registered(self.git.as_ref(), repo_root, &checkout, &record.branch).await?
+            if !worktree_registered(self.git.as_ref(), common_dir, &checkout, &record.branch)
+                .await?
             {
                 return Err(WorktreeError::InvalidOperation(format!(
                     "preserving {}: it is not a registered checkout of managed branch {}",
@@ -389,7 +403,7 @@ impl WorkspaceManager {
             .filter(|r| validate_ref_name(r).is_ok())
             .collect();
         let baseline_commit = record.baseline.as_ref().map(|b| b.baseline_commit.clone());
-        let branch_tip = self.branch_tip(repo_root, &record.branch).await?;
+        let branch_tip = self.branch_tip(common_dir, &record.branch).await?;
 
         let mut commits_preserved = false;
         let mut retained_refs = result_refs.clone();
@@ -403,10 +417,10 @@ impl WorkspaceManager {
                 // Baseline-only checkout: the branch adds nothing.
             }
             (Some(base), Some(tip)) => {
-                let commits = self.commits_between(repo_root, base, tip).await?;
+                let commits = self.commits_between(common_dir, base, tip).await?;
                 let mut preserved = false;
                 for r in &result_refs {
-                    if self.is_ancestor(repo_root, tip, r).await? {
+                    if self.is_ancestor(common_dir, tip, r).await? {
                         preserved = true;
                         break;
                     }
@@ -450,17 +464,32 @@ impl WorkspaceManager {
         //    metadata of a checkout that already vanished.
         let mut checkout_removed = false;
         if checkout_exists {
-            self.git.remove_worktree(repo_root, &checkout).await?;
+            self.git.remove_worktree(common_dir, &checkout).await?;
             checkout_removed = true;
         }
-        self.git.prune_worktrees(repo_root).await?;
+        self.git.prune_worktrees(common_dir).await?;
 
-        // 5. Branch disposition: delete an empty managed branch; retain one
-        //    whose commits are preserved elsewhere.
+        // 5. Branch disposition: delete an empty managed branch — but only
+        //    while it still points at the tip observed during the
+        //    preservation checks. Ordinary Git processes do not honor
+        //    QueryMT's administration lock, so an external writer may move
+        //    the branch between check and deletion; a moved branch is
+        //    retained together with its new history and the race is
+        //    disclosed, never deleted unconditionally.
         let mut removed_branch = None;
-        if branch_tip.is_some() && !commits_preserved {
-            self.git.delete_branch(repo_root, &record.branch).await?;
-            removed_branch = Some(record.branch.clone());
+        let mut branch_moved_during_removal = None;
+        if let (Some(observed_tip), false) = (branch_tip.as_deref(), commits_preserved) {
+            match self
+                .git
+                .delete_branch_if_unchanged(common_dir, &record.branch, observed_tip)
+                .await?
+            {
+                true => removed_branch = Some(record.branch.clone()),
+                false => {
+                    branch_moved_during_removal = Some(record.branch.clone());
+                    retained_refs.push(record.branch.as_str().to_string());
+                }
+            }
         }
 
         // 6. Completing an interrupted removal is idempotent under the admin lock.
@@ -483,6 +512,7 @@ impl WorkspaceManager {
             workspace_id: record.id.clone(),
             checkout_removed,
             removed_branch,
+            branch_moved_during_removal,
             retained_refs,
         })
     }
@@ -522,12 +552,11 @@ impl WorkspaceManager {
             return Ok(status);
         }
 
-        let repo_root = main_repo_root(&record.repository.common_dir)?;
+        let common_dir = &record.repository.common_dir;
 
         // Registration of the checkout at the managed branch.
         status.registered =
-            worktree_registered(self.git.as_ref(), repo_root, checkout, &record.branch).await?;
-
+            worktree_registered(self.git.as_ref(), common_dir, checkout, &record.branch).await?;
         // Live working-tree state across the whole checkout.
         let live = self.git.checkout_status(checkout).await?;
         status.uncommitted = live.uncommitted;
@@ -540,12 +569,12 @@ impl WorkspaceManager {
 
         // Commits on the managed branch beyond the recorded baseline.
         if let Some(baseline) = &record.baseline
-            && let Some(tip) = self.branch_tip(repo_root, &record.branch).await?
+            && let Some(tip) = self.branch_tip(common_dir, &record.branch).await?
             && tip != baseline.baseline_commit
         {
             status.unique_commit_count = u64::try_from(
                 self.git
-                    .commits_between_count(repo_root, &baseline.baseline_commit, &tip)
+                    .commits_between_count(common_dir, &baseline.baseline_commit, &tip)
                     .await?,
             )
             .unwrap_or(0);
@@ -557,30 +586,30 @@ impl WorkspaceManager {
     /// Full object id at the branch tip, or `None` when the branch is absent.
     async fn branch_tip(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<Option<String>> {
-        self.git.branch_tip(repo_root, branch).await
+        self.git.branch_tip(common_dir, branch).await
     }
 
     /// Commits reachable from `tip` but not `base` (newest first).
     async fn commits_between(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         base: &str,
         tip: &str,
     ) -> WorktreeResult<Vec<String>> {
-        self.git.commits_between(repo_root, base, tip).await
+        self.git.commits_between(common_dir, base, tip).await
     }
 
     /// Whether `ancestor` is contained in `descendant`.
     async fn is_ancestor(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         ancestor: &str,
         descendant: &str,
     ) -> WorktreeResult<bool> {
-        self.git.is_ancestor(repo_root, ancestor, descendant).await
+        self.git.is_ancestor(common_dir, ancestor, descendant).await
     }
 
     /// Access the registry (used by tests to cross-check durable state).
@@ -588,17 +617,6 @@ impl WorkspaceManager {
     pub(crate) fn registry(&self) -> &Arc<dyn WorkspaceRepository> {
         &self.registry
     }
-}
-
-/// Main working-tree root for a canonical common directory
-/// (`<project>/.git` -> `<project>`).
-fn main_repo_root(common_dir: &Path) -> WorktreeResult<&Path> {
-    common_dir.parent().ok_or_else(|| {
-        WorktreeError::InvalidOperation(format!(
-            "cannot determine main repository root from common dir {}",
-            common_dir.display()
-        ))
-    })
 }
 
 /// Bounded commit list for removal-refusal diagnostics.
@@ -618,6 +636,7 @@ fn preview_commits(commits: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::session::schema;
+    use crate::worktree::FaultInjectingRepoOps;
     use crate::worktree::GitRunner as _;
     use crate::worktree::GixRepoOps;
     use crate::worktree::allocate::WorkspaceAllocator;
@@ -690,9 +709,9 @@ mod tests {
             .unwrap();
     }
 
-    async fn branch_exists(repo_root: &Path, branch: &ManagedBranch) -> bool {
+    async fn branch_exists(common_dir: &Path, branch: &ManagedBranch) -> bool {
         CliGit::new()
-            .run(repo_root, &["rev-parse", "--verify", branch.as_str()])
+            .run(common_dir, &["rev-parse", "--verify", branch.as_str()])
             .await
             .unwrap()
             .success
@@ -1186,6 +1205,563 @@ mod tests {
         assert!(record.checkout_path.is_dir());
     }
 
+    /// Test double that performs an external ref update on the managed
+    /// branch exactly when the conditional branch deletion runs —
+    /// deterministically placing an external ref update between QueryMT's
+    /// preservation check and the deletion (F3). The checkout is already
+    /// gone at that boundary, so the update is a pure ref move to a
+    /// pre-created commit.
+    struct ExternalMoveOnDelete {
+        inner: Arc<GixRepoOps>,
+        move_to: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryOps for ExternalMoveOnDelete {
+        async fn resolve_commit(
+            &self,
+            common_dir: &Path,
+            expr: &str,
+        ) -> WorktreeResult<Option<String>> {
+            self.inner.resolve_commit(common_dir, expr).await
+        }
+
+        async fn branch_tip(
+            &self,
+            common_dir: &Path,
+            branch: &ManagedBranch,
+        ) -> WorktreeResult<Option<String>> {
+            self.inner.branch_tip(common_dir, branch).await
+        }
+
+        async fn create_branch(
+            &self,
+            common_dir: &Path,
+            branch: &ManagedBranch,
+            target: &str,
+        ) -> WorktreeResult<()> {
+            self.inner.create_branch(common_dir, branch, target).await
+        }
+
+        async fn delete_branch(
+            &self,
+            common_dir: &Path,
+            branch: &ManagedBranch,
+        ) -> WorktreeResult<()> {
+            self.inner.delete_branch(common_dir, branch).await
+        }
+
+        async fn delete_branch_if_unchanged(
+            &self,
+            common_dir: &Path,
+            branch: &ManagedBranch,
+            expected_target: &str,
+        ) -> WorktreeResult<bool> {
+            let pending = self.move_to.lock().expect("injector mutex").take();
+            if let Some(target) = pending {
+                // The external writer moves the branch between check and
+                // deletion (an ordinary ref update; external writers do not
+                // honor QueryMT's administration lock).
+                self.inner
+                    .set_ref(
+                        common_dir,
+                        format!("refs/heads/{}", branch.as_str()).as_str(),
+                        &target,
+                    )
+                    .await?;
+            }
+            self.inner
+                .delete_branch_if_unchanged(common_dir, branch, expected_target)
+                .await
+        }
+
+        async fn set_ref(
+            &self,
+            common_dir: &Path,
+            ref_name: &str,
+            commit: &str,
+        ) -> WorktreeResult<()> {
+            self.inner.set_ref(common_dir, ref_name, commit).await
+        }
+
+        async fn create_ref_if_absent(
+            &self,
+            common_dir: &Path,
+            ref_name: &str,
+            commit: &str,
+        ) -> WorktreeResult<()> {
+            self.inner
+                .create_ref_if_absent(common_dir, ref_name, commit)
+                .await
+        }
+
+        async fn list_worktrees(
+            &self,
+            common_dir: &Path,
+        ) -> WorktreeResult<Vec<crate::worktree::repo_ops::RegisteredWorktree>> {
+            self.inner.list_worktrees(common_dir).await
+        }
+
+        async fn add_worktree(
+            &self,
+            common_dir: &Path,
+            path: &Path,
+            branch: &ManagedBranch,
+        ) -> WorktreeResult<()> {
+            self.inner.add_worktree(common_dir, path, branch).await
+        }
+
+        async fn remove_worktree(&self, common_dir: &Path, path: &Path) -> WorktreeResult<()> {
+            self.inner.remove_worktree(common_dir, path).await
+        }
+
+        async fn prune_worktrees(&self, common_dir: &Path) -> WorktreeResult<()> {
+            self.inner.prune_worktrees(common_dir).await
+        }
+
+        async fn checkout_status(
+            &self,
+            checkout: &Path,
+        ) -> WorktreeResult<crate::worktree::repo_ops::CheckoutStatus> {
+            self.inner.checkout_status(checkout).await
+        }
+
+        async fn head_commit(&self, checkout: &Path) -> WorktreeResult<Option<String>> {
+            self.inner.head_commit(checkout).await
+        }
+
+        async fn current_branch(&self, checkout: &Path) -> WorktreeResult<Option<String>> {
+            self.inner.current_branch(checkout).await
+        }
+
+        async fn commits_between_count(
+            &self,
+            common_dir: &Path,
+            base: &str,
+            tip: &str,
+        ) -> WorktreeResult<usize> {
+            self.inner
+                .commits_between_count(common_dir, base, tip)
+                .await
+        }
+
+        async fn commits_between(
+            &self,
+            common_dir: &Path,
+            base: &str,
+            tip: &str,
+        ) -> WorktreeResult<Vec<String>> {
+            self.inner.commits_between(common_dir, base, tip).await
+        }
+
+        async fn is_ancestor(
+            &self,
+            common_dir: &Path,
+            ancestor: &str,
+            descendant: &str,
+        ) -> WorktreeResult<bool> {
+            self.inner
+                .is_ancestor(common_dir, ancestor, descendant)
+                .await
+        }
+
+        async fn capture_working_state(
+            &self,
+            checkout: &Path,
+        ) -> WorktreeResult<crate::worktree::repo_ops::CapturedWorkingState> {
+            self.inner.capture_working_state(checkout).await
+        }
+
+        async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>> {
+            self.inner.index_manifest(checkout).await
+        }
+
+        async fn has_unmerged_entries(&self, checkout: &Path) -> WorktreeResult<bool> {
+            self.inner.has_unmerged_entries(checkout).await
+        }
+
+        async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool> {
+            self.inner.sparse_checkout_enabled(checkout).await
+        }
+    }
+
+    /// Removal is race-safe: an external writer that moves the managed
+    /// branch between the preservation check and deletion wins, and the
+    /// branch (with its new history) is retained and disclosed — never
+    /// deleted unconditionally (12.1).
+    #[tokio::test]
+    async fn external_branch_move_between_check_and_delete_is_retained() {
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &[("file.txt", "one")]);
+        materialize(repo.path(), &[("file.txt", "one")]);
+        let storage = TempDir::new().unwrap();
+        let (_conn, store) = shared_db();
+        let store = Arc::new(store);
+        let injector = Arc::new(ExternalMoveOnDelete {
+            inner: Arc::new(GixRepoOps::new()),
+            move_to: std::sync::Mutex::new(None),
+        });
+        let ops: Arc<dyn RepositoryOps> = injector.clone();
+        let alloc = WorkspaceAllocator::new(ops.clone(), store.clone(), storage.path());
+        let resolved = resolve_repository(repo.path()).unwrap();
+        let record = alloc
+            .allocate(&resolved, Path::new(""), None)
+            .await
+            .unwrap();
+        let manager = WorkspaceManager::new(ops, store, storage.path());
+
+        // The externally created commit the branch will be moved to.
+        commit_files(
+            repo.path(),
+            "external",
+            &[("file.txt", "one"), ("external.txt", "moved")],
+        );
+        let external_tip = CliGit::new()
+            .run(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+
+        // Arm the injection for the deletion inside remove_locked.
+        *injector.move_to.lock().unwrap() = Some(external_tip.clone());
+        let report = manager.remove(&record).await.unwrap();
+
+        assert!(report.checkout_removed);
+        assert_eq!(
+            report.removed_branch, None,
+            "the moved branch must not be reported as deleted"
+        );
+        assert_eq!(
+            report
+                .branch_moved_during_removal
+                .as_ref()
+                .map(|b| b.as_str()),
+            Some(record.branch.as_str()),
+            "the race is disclosed on the report"
+        );
+        assert!(
+            report
+                .retained_refs
+                .contains(&record.branch.as_str().to_string()),
+            "retained refs disclose the branch: {:?}",
+            report.retained_refs
+        );
+        assert_eq!(
+            manager
+                .registry()
+                .get_workspace(&record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            WorkspaceLifecycle::Removed
+        );
+
+        // The branch and its new history survive.
+        assert!(branch_exists(repo.path(), &record.branch).await);
+        let tip = CliGit::new()
+            .run(repo.path(), &["rev-parse", record.branch.as_str()])
+            .await
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+        assert_eq!(
+            tip, external_tip,
+            "the branch keeps the externally moved target"
+        );
+        let base = record.baseline.as_ref().unwrap().baseline_commit.clone();
+        let count = CliGit::new()
+            .run(
+                repo.path(),
+                &["rev-list", "--count", &format!("{base}..{tip}").to_string()],
+            )
+            .await
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+        assert_eq!(
+            count, "1",
+            "the externally added commit survives on the retained branch"
+        );
+        let display = report.to_string();
+        assert!(
+            display.contains("moved externally during removal"),
+            "display discloses the race: {display}"
+        );
+    }
+
+    /// Interrupted-removal recovery rechecks safety freshly: a branch an
+    /// external writer moved beyond the baseline while removal was
+    /// interrupted is refused (unpreserved commits) and retained; once the
+    /// commits are preserved by a retained result ref, recovery completes
+    /// and still keeps the branch (12.2).
+    #[tokio::test]
+    async fn recovery_after_interrupted_removal_rechecks_branch_safety() {
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &[("file.txt", "one")]);
+        materialize(repo.path(), &[("file.txt", "one")]);
+        let storage = TempDir::new().unwrap();
+        let (_conn, store) = shared_db();
+        let store = Arc::new(store);
+        let faulted = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let alloc = WorkspaceAllocator::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            store.clone(),
+            storage.path(),
+        );
+        let resolved = resolve_repository(repo.path()).unwrap();
+        let record = alloc
+            .allocate(&resolved, Path::new(""), None)
+            .await
+            .unwrap();
+        let manager = WorkspaceManager::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            store,
+            storage.path(),
+        );
+
+        // Interrupt exactly at the branch-deletion boundary (the checkout is
+        // already gone; the branch is untouched).
+        faulted.fail_next(
+            crate::worktree::repo_ops::FailurePoint::DeleteBranchIfUnchanged,
+            1,
+            "injected deletion failure",
+        );
+        let err = manager.remove(&record).await.unwrap_err();
+        assert!(err.to_string().contains("injected deletion failure"));
+        let interrupted = manager
+            .registry()
+            .get_workspace(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupted.lifecycle, WorkspaceLifecycle::Removing);
+        assert!(
+            !record.checkout_path.exists(),
+            "checkout removal happened first"
+        );
+        assert!(branch_exists(repo.path(), &record.branch).await);
+
+        // An external writer moves the branch beyond the baseline.
+        commit_files(
+            repo.path(),
+            "external",
+            &[("file.txt", "one"), ("external.txt", "moved")],
+        );
+        let moved_tip = CliGit::new()
+            .run(repo.path(), &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .stdout_str()
+            .trim()
+            .to_string();
+        CliGit::new()
+            .run(
+                repo.path(),
+                &[
+                    "update-ref",
+                    format!("refs/heads/{}", record.branch.as_str()).as_str(),
+                    moved_tip.as_str(),
+                ],
+            )
+            .await
+            .unwrap()
+            .into_checked(&["update-ref"])
+            .unwrap();
+
+        // Recovery rechecks safety and refuses: the moved commits are not
+        // preserved anywhere, so nothing is deleted unconditionally.
+        let err = manager.remove(&interrupted).await.unwrap_err();
+        assert!(
+            err.to_string().contains("beyond its baseline"),
+            "recovery must refuse moved commits: {err}"
+        );
+        assert!(branch_exists(repo.path(), &record.branch).await);
+
+        // Once the new history is preserved by a retained result ref,
+        // recovery completes; the moved branch is retained, not deleted.
+        CliGit::new()
+            .run(
+                repo.path(),
+                &["update-ref", "refs/qmt/results/test", moved_tip.as_str()],
+            )
+            .await
+            .unwrap()
+            .into_checked(&["update-ref"])
+            .unwrap();
+        manager
+            .registry()
+            .record_result(
+                &record.id,
+                &ResultProvenance {
+                    baseline_commit: record.baseline.as_ref().unwrap().baseline_commit.clone(),
+                    result_commit: Some(moved_tip.clone()),
+                    result_ref: Some("refs/qmt/results/test".into()),
+                    verification: Some(ResultVerificationStatus::Passed),
+                    captured_at: time::OffsetDateTime::now_utc(),
+                },
+            )
+            .await
+            .unwrap();
+        let report = manager.remove(&interrupted).await.unwrap();
+        assert!(!report.checkout_removed, "checkout already absent");
+        assert_eq!(
+            report.removed_branch, None,
+            "moved commits stay preserved on the branch"
+        );
+        assert!(
+            report
+                .retained_refs
+                .contains(&record.branch.as_str().to_string()),
+            "retained refs disclose the branch: {:?}",
+            report.retained_refs
+        );
+        assert_eq!(
+            manager
+                .registry()
+                .get_workspace(&record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            WorkspaceLifecycle::Removed
+        );
+        assert!(branch_exists(repo.path(), &record.branch).await);
+    }
+
+    /// Interrupted-removal recovery is idempotent when the branch was
+    /// already deleted externally and the checkout is gone: no unconditional
+    /// branch deletion is attempted and the record completes (12.2).
+    #[tokio::test]
+    async fn recovery_is_idempotent_when_branch_and_checkout_already_gone() {
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &[("file.txt", "one")]);
+        materialize(repo.path(), &[("file.txt", "one")]);
+        let storage = TempDir::new().unwrap();
+        let (_conn, store) = shared_db();
+        let store = Arc::new(store);
+        let faulted = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let alloc = WorkspaceAllocator::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            store.clone(),
+            storage.path(),
+        );
+        let resolved = resolve_repository(repo.path()).unwrap();
+        let record = alloc
+            .allocate(&resolved, Path::new(""), None)
+            .await
+            .unwrap();
+        let manager = WorkspaceManager::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            store,
+            storage.path(),
+        );
+
+        faulted.fail_next(
+            crate::worktree::repo_ops::FailurePoint::DeleteBranchIfUnchanged,
+            1,
+            "injected deletion failure",
+        );
+        assert!(manager.remove(&record).await.is_err());
+        assert!(!record.checkout_path.exists());
+
+        // An external writer deletes the branch outright.
+        CliGit::new()
+            .run(repo.path(), &["branch", "-D", record.branch.as_str()])
+            .await
+            .unwrap()
+            .into_checked(&["branch", "-D"])
+            .unwrap();
+
+        // Recovery observes the absence and completes without error.
+        let report = manager.remove(&record).await.unwrap();
+        assert!(!report.checkout_removed);
+        assert_eq!(report.removed_branch, None);
+        assert_eq!(
+            manager
+                .registry()
+                .get_workspace(&record.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .lifecycle,
+            WorkspaceLifecycle::Removed
+        );
+    }
+
+    /// Removal safety is independent of `status.showUntrackedFiles`
+    /// configuration: untracked and ignored content still refuses removal
+    /// and no recoverable files or refs are lost (12.3).
+    #[tokio::test]
+    async fn removal_refuses_content_independent_of_show_untracked_files_config() {
+        let (_repo, _storage, record, manager) = provision(&[("file.txt", "one")]).await;
+        CliGit::new()
+            .run(_repo.path(), &["config", "status.showUntrackedFiles", "no"])
+            .await
+            .unwrap()
+            .into_checked(&["config"])
+            .unwrap();
+
+        // Untracked content blocks removal even with the config set to hide
+        // untracked files.
+        fs::write(record.checkout_path.join("untracked.txt"), "precious\n").unwrap();
+        let status = manager.observe(&record).await.unwrap();
+        assert!(
+            status.untracked.iter().any(|p| p.contains("untracked.txt")),
+            "untracked detection ignores showUntrackedFiles: {status:?}"
+        );
+        let err = manager.remove(&record).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unpreserved working state"),
+            "removal refuses: {err}"
+        );
+        assert!(record.checkout_path.join("untracked.txt").is_file());
+        assert!(branch_exists(_repo.path(), &record.branch).await);
+        assert!(
+            CliGit::new()
+                .run(
+                    _repo.path(),
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        baseline_ref_for(&record.id).as_str(),
+                    ],
+                )
+                .await
+                .unwrap()
+                .stdout_str()
+                .trim()
+                .len()
+                == 40,
+            "baseline ref remains reachable"
+        );
+
+        // Ignored content blocks removal as well.
+        commit_in_checkout(
+            &record.checkout_path,
+            "gitignore",
+            &[("file.txt", "one"), (".gitignore", "ignored.txt")],
+        )
+        .await;
+        fs::write(record.checkout_path.join("ignored.txt"), "secret\n").unwrap();
+        let status = manager.observe(&record).await.unwrap();
+        assert!(
+            status.ignored.iter().any(|p| p.contains("ignored.txt")),
+            "ignored detection is unaffected: {status:?}"
+        );
+        let err = manager.remove(&record).await.unwrap_err();
+        assert!(
+            err.to_string().contains("unpreserved working state"),
+            "removal refuses ignored content: {err}"
+        );
+        assert!(record.checkout_path.join("ignored.txt").is_file());
+        assert!(record.checkout_path.is_dir());
+    }
+
     // -- Documented recovery runbook ------------------------------------------
     //
     // Verifies the runbook in docs/docs/agent/index.md ("Worktree Workspaces
@@ -1236,6 +1812,10 @@ mod tests {
             lifecycle: WorkspaceLifecycle::Provisioning,
             ownership: WorkspaceOwnership::default(),
             last_error: None,
+            requested_baseline_mode: BaselineMode::Commit,
+            requested_base_ref: None,
+            operation_id: format!("op-{interrupted_id}"),
+            provisioning_phase: Some(crate::worktree::ProvisioningPhase::BaselineBound),
             created_at: time::OffsetDateTime::now_utc(),
             updated_at: time::OffsetDateTime::now_utc(),
         };
@@ -1252,7 +1832,7 @@ mod tests {
 
         // Recovery replays the idempotent provisioning steps to `ready`.
         let recovered = alloc
-            .recover_pending(repo.path(), &resolved.identity.common_dir)
+            .recover_pending(&resolved.identity.common_dir)
             .await
             .unwrap();
         assert_eq!(recovered.len(), 1);

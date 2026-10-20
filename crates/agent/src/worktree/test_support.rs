@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+use crate::worktree::repo_workspace::WorkspaceRepository;
+
 /// Initialize a non-bare repository with a commit identity in its config
 /// (mirroring the snapshot backend's config handling).
 pub(crate) fn init_repo() -> tempfile::TempDir {
@@ -120,4 +122,185 @@ pub(crate) fn init_repo_with_subdir() -> (tempfile::TempDir, gix::ObjectId, gix:
     );
     materialize(tmp.path(), &[("file.txt", "one"), ("sub/file.txt", "sub")]);
     (tmp, first, second)
+}
+
+/// Registry persistence boundaries that provisioning depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RegistryFaultPoint {
+    /// Persisting the initial provisioning intent.
+    InsertWorkspace,
+    /// Binding the captured baseline identity.
+    BindBaseline,
+    /// The final provisioning → ready lifecycle transition.
+    TransitionLifecycle,
+}
+
+/// Wraps a [`WorkspaceRepository`], injecting failures at named persistence
+/// boundaries so tests can interrupt provisioning exactly between durable
+/// writes without fabricating SQLite errors or parsing Git commands.
+pub(crate) struct FaultInjectingWorkspaceRepository {
+    inner: std::sync::Arc<dyn WorkspaceRepository>,
+    failures: std::sync::Mutex<std::collections::HashMap<RegistryFaultPoint, (usize, String)>>,
+}
+
+impl FaultInjectingWorkspaceRepository {
+    pub(crate) fn new(inner: std::sync::Arc<dyn WorkspaceRepository>) -> Self {
+        Self {
+            inner,
+            failures: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Fail the next `times` calls at `point` with `message`.
+    pub(crate) fn fail_next(&self, point: RegistryFaultPoint, times: usize, message: &str) {
+        self.failures
+            .lock()
+            .unwrap()
+            .insert(point, (times, message.to_string()));
+    }
+
+    fn take_failure(
+        &self,
+        point: RegistryFaultPoint,
+    ) -> Option<crate::session::error::SessionError> {
+        let mut failures = self.failures.lock().unwrap();
+        let entry = failures.get_mut(&point)?;
+        let (times, message) = entry;
+        if *times == 0 {
+            return None;
+        }
+        *times -= 1;
+        Some(crate::session::error::SessionError::Other(format!(
+            "injected {point:?} failure: {message}"
+        )))
+    }
+
+    fn inner(&self) -> &std::sync::Arc<dyn WorkspaceRepository> {
+        &self.inner
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkspaceRepository for FaultInjectingWorkspaceRepository {
+    async fn insert_workspace(
+        &self,
+        record: crate::worktree::domain::WorkspaceRecord,
+    ) -> crate::session::error::SessionResult<crate::worktree::domain::WorkspaceRecord> {
+        if let Some(err) = self.take_failure(RegistryFaultPoint::InsertWorkspace) {
+            return Err(err);
+        }
+        self.inner().insert_workspace(record).await
+    }
+
+    async fn get_workspace(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+    ) -> crate::session::error::SessionResult<Option<crate::worktree::domain::WorkspaceRecord>>
+    {
+        self.inner().get_workspace(id).await
+    }
+
+    async fn get_workspace_by_checkout(
+        &self,
+        checkout_path: &std::path::Path,
+    ) -> crate::session::error::SessionResult<Option<crate::worktree::domain::WorkspaceRecord>>
+    {
+        self.inner().get_workspace_by_checkout(checkout_path).await
+    }
+
+    async fn get_workspace_by_session(
+        &self,
+        session_id: &str,
+    ) -> crate::session::error::SessionResult<Option<crate::worktree::domain::WorkspaceRecord>>
+    {
+        self.inner().get_workspace_by_session(session_id).await
+    }
+
+    async fn list_workspaces(
+        &self,
+    ) -> crate::session::error::SessionResult<Vec<crate::worktree::domain::WorkspaceRecord>> {
+        self.inner().list_workspaces().await
+    }
+
+    async fn list_workspaces_by_repository(
+        &self,
+        common_dir: &std::path::Path,
+    ) -> crate::session::error::SessionResult<Vec<crate::worktree::domain::WorkspaceRecord>> {
+        self.inner().list_workspaces_by_repository(common_dir).await
+    }
+
+    async fn list_workspaces_by_batch(
+        &self,
+        batch_id: &str,
+    ) -> crate::session::error::SessionResult<Vec<crate::worktree::domain::WorkspaceRecord>> {
+        self.inner().list_workspaces_by_batch(batch_id).await
+    }
+
+    async fn update_workspace(
+        &self,
+        record: crate::worktree::domain::WorkspaceRecord,
+    ) -> crate::session::error::SessionResult<()> {
+        self.inner().update_workspace(record).await
+    }
+
+    async fn transition_lifecycle(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+        from: crate::worktree::domain::WorkspaceLifecycle,
+        to: crate::worktree::domain::WorkspaceLifecycle,
+    ) -> crate::session::error::SessionResult<bool> {
+        if let Some(err) = self.take_failure(RegistryFaultPoint::TransitionLifecycle) {
+            return Err(err);
+        }
+        self.inner().transition_lifecycle(id, from, to).await
+    }
+
+    async fn attach_owner(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+        owner_session_id: &str,
+    ) -> crate::session::error::SessionResult<crate::worktree::domain::WorkspaceRecord> {
+        self.inner().attach_owner(id, owner_session_id).await
+    }
+
+    async fn detach_owner(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+    ) -> crate::session::error::SessionResult<crate::worktree::domain::WorkspaceRecord> {
+        self.inner().detach_owner(id).await
+    }
+
+    async fn bind_baseline(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+        baseline: &crate::worktree::domain::Baseline,
+    ) -> crate::session::error::SessionResult<()> {
+        if let Some(err) = self.take_failure(RegistryFaultPoint::BindBaseline) {
+            return Err(err);
+        }
+        self.inner().bind_baseline(id, baseline).await
+    }
+
+    async fn record_provisioning_phase(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+        phase: crate::worktree::domain::ProvisioningPhase,
+    ) -> crate::session::error::SessionResult<bool> {
+        self.inner().record_provisioning_phase(id, phase).await
+    }
+
+    async fn record_result(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+        provenance: &crate::worktree::domain::ResultProvenance,
+    ) -> crate::session::error::SessionResult<()> {
+        self.inner().record_result(id, provenance).await
+    }
+
+    async fn list_results(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+    ) -> crate::session::error::SessionResult<Vec<crate::worktree::domain::ResultProvenance>> {
+        self.inner().list_results(id).await
+    }
 }

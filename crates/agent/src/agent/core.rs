@@ -203,6 +203,10 @@ pub struct SessionRuntime {
     /// files so a concurrent capture never observes partial restoration.
     /// Set for Git sessions when the workspace service is configured.
     pub mutation_gate: Arc<OnceCell<Arc<crate::worktree::gate::CheckoutMutationGate>>>,
+    /// Session-scoped slash-command registry resolved from the session's
+    /// bound workspace checkout at materialization. Unset for legacy local
+    /// sessions, which keep the agent-level registry.
+    pub slash_registry: OnceCell<Arc<crate::slash_commands::SlashCommandRegistry>>,
     /// Managed checkout context is independent of cooperative locking.
     pub managed_checkout: OnceCell<bool>,
     pub(crate) workspace_activity: OnceCell<crate::worktree::gate::CheckoutActivityLease>,
@@ -231,6 +235,7 @@ impl SessionRuntime {
             turn_diffs: ParkingMutex::new(Default::default()),
             execution_permit: Arc::new(tokio::sync::Semaphore::new(1)),
             mutation_gate: Arc::new(OnceCell::new()),
+            slash_registry: OnceCell::new(),
             managed_checkout: OnceCell::new(),
             workspace_activity: OnceCell::new(),
         })

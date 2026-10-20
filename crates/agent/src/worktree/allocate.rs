@@ -18,8 +18,8 @@
 //!   baseline fails explicitly and never attaches to the checkout root.
 
 use crate::worktree::domain::{
-    Baseline, BaselineMode, ExecutionMode, ManagedBranch, WorkspaceId, WorkspaceLifecycle,
-    WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
+    Baseline, BaselineMode, ExecutionMode, ManagedBranch, ProvisioningPhase, WorkspaceId,
+    WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
 };
 use crate::worktree::error::{WorktreeError, WorktreeResult};
 use crate::worktree::gate::CheckoutMutationGate;
@@ -28,6 +28,34 @@ use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
 use crate::worktree::repo_workspace::WorkspaceRepository;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Where the baseline of a recovered workspace came from.
+///
+/// Recovery must disclose whether the baseline was durably bound before the
+/// interruption (preserved exactly) or captured fresh at recovery time
+/// (reflects recovery-time source contents, not the pre-interruption
+/// working state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaselineSource {
+    /// The workspace already had a bound baseline before the interruption;
+    /// recovery preserved that exact identity.
+    BoundBeforeInterruption,
+    /// The workspace had no bound baseline; recovery captured a new one
+    /// from the recorded source and policy at recovery time.
+    CapturedDuringRecovery,
+}
+
+/// The result of an explicit provisioning recovery.
+#[derive(Debug, Clone)]
+pub struct RecoveredWorkspace {
+    /// The refreshed registry record (lifecycle `Ready` on success).
+    pub record: WorkspaceRecord,
+    /// The baseline the recovered workspace now branches from.
+    pub baseline: Baseline,
+    /// Whether that baseline predates the interruption or was captured
+    /// during recovery.
+    pub baseline_source: BaselineSource,
+}
 
 /// Parameters for provisioning one managed workspace.
 ///
@@ -176,7 +204,10 @@ impl WorkspaceAllocator {
         let branch = ManagedBranch::for_workspace(&id);
         let checkout_path = checkout_path_for(&self.storage_root, &source.identity.common_dir, &id);
 
-        // 1. Persist the provisioning intent before any Git mutation.
+        // 1. Persist the replayable provisioning intent before any Git
+        //    mutation: source identity, requested ref/policy, relative cwd,
+        //    intended resources, operation id, and the initial phase. The
+        //    baseline is deliberately absent — capture has not run yet.
         let record = WorkspaceRecord {
             id: id.clone(),
             repository: source.identity.clone(),
@@ -194,6 +225,10 @@ impl WorkspaceAllocator {
                 ..Default::default()
             },
             last_error: None,
+            requested_baseline_mode: baseline_mode,
+            requested_base_ref: base_ref.map(str::to_string),
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            provisioning_phase: Some(ProvisioningPhase::IntentPersisted),
             created_at: time::OffsetDateTime::now_utc(),
             updated_at: time::OffsetDateTime::now_utc(),
         };
@@ -270,7 +305,12 @@ impl WorkspaceAllocator {
         checkout_path: &Path,
         mutation_gate: Option<&CheckoutMutationGate>,
     ) -> WorktreeResult<()> {
-        let repo_root = &source.checkout.root;
+        // Administration happens through the canonical common directory —
+        // never through a working directory reconstructed from a checkout —
+        // so separate Git directories and bare-backed linked sources
+        // administer the correct shared repository. The checkout handle is
+        // used only for the per-checkout capture below.
+        let common_dir = &source.identity.common_dir;
 
         // 1. Resolve + record the baseline on the intent so recovery knows
         //    the expected branch tip. A preset batch baseline is reused
@@ -278,14 +318,15 @@ impl WorkspaceAllocator {
         //    from the resolved commit; current-working-tree mode captures
         //    the checkout's actual working state first (under the session's
         //    mutation gate when provided) and branches from that private
-        //    baseline.
+        //    baseline. Binding is immutable: a durably bound baseline is
+        //    never replaced (see `recover`).
         validate_ref_name(branch.as_str())?;
         let baseline = match preset_baseline {
             Some(preset) => preset.clone(),
             None => match baseline_mode {
                 BaselineMode::Commit => {
                     let base_commit =
-                        resolve_base_commit(self.git.as_ref(), repo_root, base_ref).await?;
+                        resolve_base_commit(self.git.as_ref(), common_dir, base_ref).await?;
                     Baseline {
                         mode: BaselineMode::Commit,
                         source_head: base_commit.clone(),
@@ -314,21 +355,28 @@ impl WorkspaceAllocator {
             },
         };
         self.registry.bind_baseline(id, &baseline).await?;
+        self.record_phase(id, ProvisioningPhase::BaselineBound)
+            .await;
 
         // 2. Keep the baseline reachable across restarts/GC through a
-        //    managed ref (retained and reported on removal, never deleted).
-        let ref_name = baseline_ref_for(id);
-        self.git
-            .set_ref(repo_root, ref_name.as_str(), &baseline.baseline_commit)
-            .await?;
+        //    managed ref. Publication is create-only and verified against
+        //    the bound baseline: an existing conflicting ref is diagnosed,
+        //    never overwritten (see `ensure_baseline_ref`).
+        self.ensure_baseline_ref(common_dir, id, &baseline).await?;
+        self.record_phase(id, ProvisioningPhase::BaselineRefPublished)
+            .await;
 
         // 3. Allocate the managed branch at the baseline commit.
-        self.ensure_branch(repo_root, branch, &baseline.baseline_commit)
+        self.ensure_branch(common_dir, branch, &baseline.baseline_commit)
             .await?;
+        self.record_phase(id, ProvisioningPhase::BranchCreated)
+            .await;
 
         // 4. Create the linked worktree checking out the managed branch.
-        self.ensure_checkout(repo_root, checkout_path, branch)
+        self.ensure_checkout(common_dir, checkout_path, branch)
             .await?;
+        self.record_phase(id, ProvisioningPhase::CheckoutCreated)
+            .await;
 
         // 5. The checkout root must exist and contain the session cwd.
         if !checkout_path.is_dir() {
@@ -340,15 +388,53 @@ impl WorkspaceAllocator {
         ensure_relative_cwd_exists(checkout_path, relative_cwd)
     }
 
+    /// Idempotently ensure the retained baseline ref exists at the bound
+    /// baseline's target. Create-only: an existing ref pointing elsewhere is
+    /// refused with an explicit conflict instead of being overwritten, and
+    /// an identical target is accepted so recovery can replay this step.
+    async fn ensure_baseline_ref(
+        &self,
+        common_dir: &Path,
+        id: &WorkspaceId,
+        baseline: &Baseline,
+    ) -> WorktreeResult<()> {
+        let ref_name = baseline_ref_for(id);
+        match self
+            .git
+            .resolve_commit(common_dir, ref_name.as_str())
+            .await?
+        {
+            Some(target) if target == baseline.baseline_commit => Ok(()),
+            Some(target) => Err(WorktreeError::InvalidOperation(format!(
+                "baseline ref {ref_name} already exists at {target}; refusing to \
+                 republish the bound baseline {} — resolve the conflict explicitly",
+                baseline.baseline_commit
+            ))),
+            None => {
+                self.git
+                    .create_ref_if_absent(common_dir, ref_name.as_str(), &baseline.baseline_commit)
+                    .await
+            }
+        }
+    }
+
+    /// Persist a forward-only provisioning phase. Best-effort: a failed
+    /// phase write never aborts allocation (the phase is advisory recovery
+    /// state; resource idempotence and the lifecycle CAS remain the
+    /// authoritative boundaries).
+    async fn record_phase(&self, id: &WorkspaceId, phase: ProvisioningPhase) {
+        let _ = self.registry.record_provisioning_phase(id, phase).await;
+    }
+
     /// Create the managed branch at `expected_base` unless it already
     /// exists there. A branch pointing elsewhere is a hard conflict.
     async fn ensure_branch(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         branch: &ManagedBranch,
         expected_base: &str,
     ) -> WorktreeResult<()> {
-        if let Some(tip) = self.git.branch_tip(repo_root, branch).await? {
+        if let Some(tip) = self.git.branch_tip(common_dir, branch).await? {
             if tip == expected_base {
                 return Ok(());
             }
@@ -358,7 +444,7 @@ impl WorkspaceAllocator {
             )));
         }
         self.git
-            .create_branch(repo_root, branch, expected_base)
+            .create_branch(common_dir, branch, expected_base)
             .await
     }
 
@@ -368,12 +454,12 @@ impl WorkspaceAllocator {
     /// operation fails loudly.
     async fn ensure_checkout(
         &self,
-        repo_root: &Path,
+        common_dir: &Path,
         checkout_path: &Path,
         branch: &ManagedBranch,
     ) -> WorktreeResult<()> {
         if checkout_path.exists() {
-            if worktree_registered(self.git.as_ref(), repo_root, checkout_path, branch).await? {
+            if worktree_registered(self.git.as_ref(), common_dir, checkout_path, branch).await? {
                 return Ok(());
             }
             return Err(WorktreeError::InvalidOperation(format!(
@@ -384,7 +470,7 @@ impl WorkspaceAllocator {
         }
 
         self.git
-            .add_worktree(repo_root, checkout_path, branch)
+            .add_worktree(common_dir, checkout_path, branch)
             .await
     }
 
@@ -393,54 +479,29 @@ impl WorkspaceAllocator {
     /// Replays the boundary steps ([`Self::provision`]) for a record still
     /// in `Provisioning`; safe to run after a crash at any boundary. Never
     /// touches pre-existing unknown directories at the checkout path.
-    pub async fn recover(
-        &self,
-        record: &WorkspaceRecord,
-        repo_root: &Path,
-    ) -> WorktreeResult<WorkspaceRecord> {
+    ///
+    /// Recovery is self-contained: administration runs against the record's
+    /// canonical common directory and recovery-time capture uses the
+    /// recorded source checkout — no working directory is guessed or passed
+    /// in by callers.
+    pub async fn recover(&self, record: &WorkspaceRecord) -> WorktreeResult<RecoveredWorkspace> {
         if record.lifecycle != WorkspaceLifecycle::Provisioning {
             return Err(WorktreeError::InvalidOperation(format!(
                 "workspace {} is {:?}, only provisioning workspaces can be recovered",
                 record.id, record.lifecycle
             )));
         }
-        let base_commit = record
-            .baseline
-            .as_ref()
-            .map(|b| b.baseline_commit.clone())
-            .ok_or_else(|| {
-                WorktreeError::InvalidOperation(format!(
-                    "provisioning intent for {} has no recorded base commit",
-                    record.id
-                ))
-            })?;
 
+        // Whether the baseline was bound before recovery determines the
+        // disclosure: a bound baseline is preserved exactly; an absent one
+        // is (re)captured at recovery time and disclosed as such.
+        let had_bound_baseline = record.baseline.is_some();
         let common_dir = record.repository.common_dir.clone();
-        let finish = async {
-            self.ensure_branch(repo_root, &record.branch, &base_commit)
-                .await?;
-            self.ensure_checkout(repo_root, &record.checkout_path, &record.branch)
-                .await?;
-            ensure_relative_cwd_exists(&record.checkout_path, &record.relative_cwd)?;
-            let moved = self
-                .registry
-                .transition_lifecycle(
-                    &record.id,
-                    WorkspaceLifecycle::Provisioning,
-                    WorkspaceLifecycle::Ready,
-                )
-                .await?;
-            if !moved {
-                return Err(WorktreeError::InvalidOperation(format!(
-                    "workspace {} left provisioning state during recovery",
-                    record.id
-                )));
-            }
-            Ok(())
-        };
-        crate::worktree::lock::with_admin_lock(&self.storage_root, &common_dir, finish).await?;
+        let recovery = self.recover_inner(record);
+        crate::worktree::lock::with_admin_lock(&self.storage_root, &common_dir, recovery).await?;
 
-        self.registry
+        let updated = self
+            .registry
             .get_workspace(&record.id)
             .await?
             .ok_or_else(|| {
@@ -448,17 +509,155 @@ impl WorkspaceAllocator {
                     "workspace {} disappeared during recovery",
                     record.id
                 ))
-            })
+            })?;
+        let baseline = updated.baseline.clone().ok_or_else(|| {
+            WorktreeError::InvalidOperation(format!(
+                "workspace {} has no baseline after recovery",
+                record.id
+            ))
+        })?;
+        let baseline_source = if had_bound_baseline {
+            BaselineSource::BoundBeforeInterruption
+        } else {
+            BaselineSource::CapturedDuringRecovery
+        };
+        Ok(RecoveredWorkspace {
+            record: updated,
+            baseline,
+            baseline_source,
+        })
+    }
+
+    async fn recover_inner(&self, record: &WorkspaceRecord) -> WorktreeResult<()> {
+        // 1. Reconcile the baseline. A durably bound baseline is preserved
+        //    exactly — never recaptured or changed. A baseline-absent intent
+        //    is retried with a freshly validated capture from the recorded
+        //    source and policy; on failure the workspace keeps its
+        //    actionable non-runnable state for an explicit later retry.
+        if record.baseline.is_some() {
+            return self.finish_recovery(record).await;
+        }
+        let baseline = match self.capture_recovery_baseline(record).await {
+            Ok(baseline) => baseline,
+            Err(err) => {
+                self.record_recovery_error(&record.id, &err).await;
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.registry.bind_baseline(&record.id, &baseline).await {
+            let err = WorktreeError::from(err);
+            self.record_recovery_error(&record.id, &err).await;
+            return Err(err);
+        }
+        self.record_phase(&record.id, ProvisioningPhase::BaselineBound)
+            .await;
+        self.finish_recovery_with(record, &baseline).await
+    }
+
+    /// Replay the resource boundaries after the baseline is reconciled:
+    /// retained ref, branch, checkout, relative cwd, then the final Ready
+    /// transition.
+    async fn finish_recovery(&self, record: &WorkspaceRecord) -> WorktreeResult<()> {
+        let baseline = record.baseline.clone().ok_or_else(|| {
+            WorktreeError::InvalidOperation(format!(
+                "provisioning intent for {} has no recorded base commit",
+                record.id
+            ))
+        })?;
+        self.finish_recovery_with(record, &baseline).await
+    }
+
+    async fn finish_recovery_with(
+        &self,
+        record: &WorkspaceRecord,
+        baseline: &Baseline,
+    ) -> WorktreeResult<()> {
+        let common_dir = &record.repository.common_dir;
+        self.ensure_baseline_ref(common_dir, &record.id, baseline)
+            .await?;
+        self.record_phase(&record.id, ProvisioningPhase::BaselineRefPublished)
+            .await;
+        self.ensure_branch(common_dir, &record.branch, &baseline.baseline_commit)
+            .await?;
+        self.record_phase(&record.id, ProvisioningPhase::BranchCreated)
+            .await;
+        self.ensure_checkout(common_dir, &record.checkout_path, &record.branch)
+            .await?;
+        self.record_phase(&record.id, ProvisioningPhase::CheckoutCreated)
+            .await;
+        ensure_relative_cwd_exists(&record.checkout_path, &record.relative_cwd)?;
+        let moved = self
+            .registry
+            .transition_lifecycle(
+                &record.id,
+                WorkspaceLifecycle::Provisioning,
+                WorkspaceLifecycle::Ready,
+            )
+            .await?;
+        if !moved {
+            return Err(WorktreeError::InvalidOperation(format!(
+                "workspace {} left provisioning state during recovery",
+                record.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Build the recovery-time baseline from the recorded intent policy.
+    /// Commit mode re-resolves the recorded ref (or HEAD) in the recorded
+    /// common repository; current-working-tree mode re-runs the validated
+    /// capture against the recorded source checkout. The result is
+    /// disclosed as captured during recovery, never presented as the
+    /// pre-interruption capture.
+    async fn capture_recovery_baseline(
+        &self,
+        record: &WorkspaceRecord,
+    ) -> WorktreeResult<Baseline> {
+        match record.requested_baseline_mode {
+            BaselineMode::Commit => {
+                let base_commit = resolve_base_commit(
+                    self.git.as_ref(),
+                    &record.repository.common_dir,
+                    record.requested_base_ref.as_deref(),
+                )
+                .await?;
+                Ok(Baseline {
+                    mode: BaselineMode::Commit,
+                    source_head: base_commit.clone(),
+                    baseline_commit: base_commit,
+                })
+            }
+            BaselineMode::CurrentWorkingTree => {
+                let captured = crate::worktree::capture::capture_working_state_validated(
+                    self.git.as_ref(),
+                    &record.repository.origin_path,
+                    Default::default(),
+                )
+                .await?;
+                Ok(Baseline {
+                    mode: BaselineMode::CurrentWorkingTree,
+                    source_head: captured.source_head,
+                    baseline_commit: captured.commit,
+                })
+            }
+        }
+    }
+
+    /// Keep a failed recovery actionable: the workspace stays non-runnable
+    /// (`provisioning`, so an explicit retry remains possible) and the
+    /// diagnostic is retained on the record.
+    async fn record_recovery_error(&self, id: &WorkspaceId, error: &WorktreeError) {
+        if let Ok(Some(mut rec)) = self.registry.get_workspace(id).await {
+            rec.last_error = Some(error.to_string());
+            rec.updated_at = time::OffsetDateTime::now_utc();
+            let _ = self.registry.update_workspace(rec).await;
+        }
     }
 
     /// Recover every `Provisioning` workspace of a repository. Per-record
     /// failures are skipped (they stay `Provisioning`/`Failed` for the
     /// management surface); successes are returned.
-    pub async fn recover_pending(
-        &self,
-        repo_root: &Path,
-        common_dir: &Path,
-    ) -> WorktreeResult<Vec<WorkspaceRecord>> {
+    pub async fn recover_pending(&self, common_dir: &Path) -> WorktreeResult<Vec<WorkspaceRecord>> {
         let pending: Vec<WorkspaceRecord> = self
             .registry
             .list_workspaces_by_repository(common_dir)
@@ -469,8 +668,8 @@ impl WorkspaceAllocator {
 
         let mut recovered = Vec::new();
         for record in pending {
-            if let Ok(done) = self.recover(&record, repo_root).await {
-                recovered.push(done);
+            if let Ok(done) = self.recover(&record).await {
+                recovered.push(done.record);
             }
         }
         Ok(recovered)
@@ -503,12 +702,12 @@ impl WorkspaceAllocator {
 /// registered on `branch`.
 pub(crate) async fn worktree_registered(
     ops: &dyn RepositoryOps,
-    repo_root: &Path,
+    common_dir: &Path,
     checkout_path: &Path,
     branch: &ManagedBranch,
 ) -> WorktreeResult<bool> {
     let checkout_canonical = std::fs::canonicalize(checkout_path).ok();
-    for registered in ops.list_worktrees(repo_root).await? {
+    for registered in ops.list_worktrees(common_dir).await? {
         if registered.is_main || registered.branch.as_deref() != Some(branch.as_str()) {
             continue;
         }
@@ -548,16 +747,17 @@ pub(crate) fn repo_slug(common_dir: &Path) -> String {
     format!("{hash:016x}")
 }
 
-/// Resolve `base_ref` (or HEAD) to a full commit object id.
+/// Resolve `base_ref` (or HEAD) to a full commit object id in the
+/// canonical common repository.
 async fn resolve_base_commit(
     ops: &dyn RepositoryOps,
-    repo_root: &Path,
+    common_dir: &Path,
     base_ref: Option<&str>,
 ) -> WorktreeResult<String> {
     let expr = base_ref.unwrap_or("HEAD");
     validate_rev_expression(expr)?;
     let rev = format!("{expr}^{{commit}}");
-    match ops.resolve_commit(repo_root, &rev).await? {
+    match ops.resolve_commit(common_dir, &rev).await? {
         Some(commit) => Ok(commit),
         None => Err(WorktreeError::GitCommand {
             argv: rev,
@@ -602,8 +802,11 @@ mod tests {
     use crate::worktree::GitRunner as _;
     use crate::worktree::GixRepoOps;
     use crate::worktree::git::CliGit;
+    use crate::worktree::repo_ops::{FailurePoint, FaultInjectingRepoOps};
     use crate::worktree::repo_workspace::SqliteWorkspaceRepository;
-    use crate::worktree::test_support::{init_repo_with_subdir, materialize};
+    use crate::worktree::test_support::{
+        FaultInjectingWorkspaceRepository, RegistryFaultPoint, init_repo_with_subdir, materialize,
+    };
     use rusqlite::Connection;
     use std::sync::Mutex;
     use std::time::SystemTime;
@@ -620,8 +823,8 @@ mod tests {
         )
     }
 
-    fn resolve(repo_root: &Path) -> ResolvedRepository {
-        crate::worktree::identity::resolve_repository(repo_root).unwrap()
+    fn resolve(repo_path: &Path) -> ResolvedRepository {
+        crate::worktree::identity::resolve_repository(repo_path).unwrap()
     }
 
     /// Byte snapshot of a file, if present.
@@ -863,26 +1066,50 @@ mod tests {
         id: &str,
         base: &str,
     ) -> WorkspaceRecord {
+        let mut record =
+            insert_intent_only(alloc, storage, resolved, id, BaselineMode::Commit, None).await;
+        record.baseline = Some(Baseline {
+            mode: BaselineMode::Commit,
+            source_head: base.to_string(),
+            baseline_commit: base.to_string(),
+        });
+        record.provisioning_phase = Some(crate::worktree::ProvisioningPhase::BaselineBound);
+        alloc
+            .registry
+            .bind_baseline(&record.id, record.baseline.as_ref().unwrap())
+            .await
+            .unwrap();
+        record
+    }
+
+    /// Persist only the provisioning intent — the true first durable state:
+    /// source identity, requested policy, placement, and phase, with no
+    /// baseline. This is the shape a crash directly after intent persistence
+    /// leaves behind.
+    async fn insert_intent_only(
+        alloc: &WorkspaceAllocator,
+        storage: &Path,
+        resolved: &ResolvedRepository,
+        id: &str,
+        baseline_mode: BaselineMode,
+        base_ref: Option<&str>,
+    ) -> WorkspaceRecord {
         let wid = WorkspaceId::from_raw(id);
         let record = WorkspaceRecord {
-            id: wid,
+            id: wid.clone(),
             repository: resolved.identity.clone(),
-            checkout_path: checkout_path_for(
-                storage,
-                &resolved.identity.common_dir,
-                &WorkspaceId::from_raw(id),
-            ),
-            branch: ManagedBranch::for_workspace(&WorkspaceId::from_raw(id)),
+            checkout_path: checkout_path_for(storage, &resolved.identity.common_dir, &wid),
+            branch: ManagedBranch::for_workspace(&wid),
             relative_cwd: PathBuf::new(),
             execution: ExecutionMode::Worktree,
-            baseline: Some(Baseline {
-                mode: BaselineMode::Commit,
-                source_head: base.to_string(),
-                baseline_commit: base.to_string(),
-            }),
+            baseline: None,
             lifecycle: WorkspaceLifecycle::Provisioning,
             ownership: WorkspaceOwnership::default(),
             last_error: None,
+            requested_baseline_mode: baseline_mode,
+            requested_base_ref: base_ref.map(str::to_string),
+            operation_id: format!("op-{id}"),
+            provisioning_phase: Some(crate::worktree::ProvisioningPhase::IntentPersisted),
             created_at: time::OffsetDateTime::now_utc(),
             updated_at: time::OffsetDateTime::now_utc(),
         };
@@ -926,11 +1153,11 @@ mod tests {
         )
         .await;
 
-        let done = alloc.recover(&record, repo.path()).await.unwrap();
-        assert_eq!(done.lifecycle, WorkspaceLifecycle::Ready);
-        assert!(done.checkout_path.join("file.txt").exists());
+        let done = alloc.recover(&record).await.unwrap();
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert!(done.record.checkout_path.join("file.txt").exists());
         assert_eq!(
-            branch_tip(&alloc, repo.path(), &done.branch).await,
+            branch_tip(&alloc, repo.path(), &done.record.branch).await,
             head.to_string()
         );
     }
@@ -961,14 +1188,14 @@ mod tests {
             .into_checked(&["branch", record.branch.as_str()])
             .unwrap();
 
-        let done = alloc.recover(&record, repo.path()).await.unwrap();
-        assert_eq!(done.lifecycle, WorkspaceLifecycle::Ready);
+        let done = alloc.recover(&record).await.unwrap();
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
         // The pre-existing branch was reused, not recreated or moved.
         assert_eq!(
-            branch_tip(&alloc, repo.path(), &done.branch).await,
+            branch_tip(&alloc, repo.path(), &done.record.branch).await,
             head.to_string()
         );
-        assert!(done.checkout_path.join("file.txt").exists());
+        assert!(done.record.checkout_path.join("file.txt").exists());
     }
 
     #[tokio::test]
@@ -1007,9 +1234,9 @@ mod tests {
             .into_checked(&["worktree", "add"])
             .unwrap();
 
-        let done = alloc.recover(&record, repo.path()).await.unwrap();
-        assert_eq!(done.lifecycle, WorkspaceLifecycle::Ready);
-        assert!(done.checkout_path.join("file.txt").exists());
+        let done = alloc.recover(&record).await.unwrap();
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert!(done.record.checkout_path.join("file.txt").exists());
     }
 
     #[tokio::test]
@@ -1033,7 +1260,7 @@ mod tests {
         std::fs::create_dir_all(&record.checkout_path).unwrap();
         std::fs::write(record.checkout_path.join("keep.txt"), b"precious").unwrap();
 
-        let err = alloc.recover(&record, repo.path()).await.unwrap_err();
+        let err = alloc.recover(&record).await.unwrap_err();
         assert!(
             matches!(err, WorktreeError::InvalidOperation(ref m) if m.contains("preserving")),
             "unexpected error: {err:?}"
@@ -1082,7 +1309,7 @@ mod tests {
             .into_checked(&["branch", record.branch.as_str()])
             .unwrap();
 
-        let err = alloc.recover(&record, repo.path()).await.unwrap_err();
+        let err = alloc.recover(&record).await.unwrap_err();
         assert!(matches!(err, WorktreeError::InvalidOperation(_)), "{err:?}");
         assert_eq!(
             branch_tip(&alloc, repo.path(), &record.branch).await,
@@ -1112,7 +1339,7 @@ mod tests {
             .unwrap();
 
         let recovered = alloc
-            .recover_pending(repo.path(), &resolved.identity.common_dir)
+            .recover_pending(&resolved.identity.common_dir)
             .await
             .unwrap();
         assert_eq!(recovered.len(), 1);
@@ -1127,6 +1354,671 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(still, ready);
+    }
+
+    // -- Replayable provisioning and retained baseline refs (section 15) ----
+
+    /// In-memory registry store, for fault-injected allocators.
+    fn in_memory_registry() -> Arc<SqliteWorkspaceRepository> {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        schema::init_schema(&mut conn).unwrap();
+        Arc::new(SqliteWorkspaceRepository::new(Arc::new(Mutex::new(conn))))
+    }
+
+    /// Allocator whose registry can be faulted at persistence boundaries.
+    fn faulted_registry(
+        storage: &Path,
+    ) -> (WorkspaceAllocator, Arc<FaultInjectingWorkspaceRepository>) {
+        let inner = in_memory_registry();
+        let faulted = Arc::new(FaultInjectingWorkspaceRepository::new(inner));
+        let alloc = WorkspaceAllocator::new(
+            Arc::new(GixRepoOps::new()),
+            faulted.clone() as Arc<dyn WorkspaceRepository>,
+            storage.to_path_buf(),
+        );
+        (alloc, faulted)
+    }
+
+    /// Allocator over a file-backed registry, for restart simulations.
+    fn file_allocator(
+        storage: &Path,
+        db_path: &Path,
+    ) -> (WorkspaceAllocator, Arc<Mutex<Connection>>) {
+        let mut conn = Connection::open(db_path).unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        schema::init_schema(&mut conn).unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+        let alloc = WorkspaceAllocator::new(
+            Arc::new(GixRepoOps::new()),
+            Arc::new(SqliteWorkspaceRepository::new(conn.clone())),
+            storage.to_path_buf(),
+        );
+        (alloc, conn)
+    }
+
+    /// Insert the session rows required by the owner foreign key.
+    async fn insert_session_row(conn: &Arc<Mutex<Connection>>, public_id: &str) {
+        let conn = conn.clone();
+        let public_id = public_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            conn.lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO sessions (public_id, name, created_at, updated_at) \
+                     VALUES (?1, 'test', '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",
+                    [&public_id],
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Current target of a ref, or `None` when it does not exist.
+    async fn ref_target(alloc: &WorkspaceAllocator, repo: &Path, name: &str) -> Option<String> {
+        alloc.git().resolve_commit(repo, name).await.unwrap()
+    }
+
+    /// The true first persisted intent round-trips without a fabricated
+    /// baseline and with no Git resources allocated yet.
+    #[tokio::test]
+    async fn first_persisted_intent_round_trips_without_a_fabricated_baseline() {
+        let (repo, _, _) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let alloc = allocator(storage.path());
+        let resolved = resolve(repo.path());
+
+        let intent = insert_intent_only(
+            &alloc,
+            storage.path(),
+            &resolved,
+            "ws-first",
+            BaselineMode::CurrentWorkingTree,
+            None,
+        )
+        .await;
+
+        let stored = alloc
+            .registry
+            .get_workspace(&intent.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored.baseline.is_none(),
+            "the first intent must not fabricate a baseline"
+        );
+        assert_eq!(
+            stored.requested_baseline_mode,
+            BaselineMode::CurrentWorkingTree
+        );
+        assert_eq!(stored.requested_base_ref, None);
+        assert!(!stored.operation_id.is_empty(), "operation id persisted");
+        assert_eq!(
+            stored.provisioning_phase,
+            Some(crate::worktree::ProvisioningPhase::IntentPersisted)
+        );
+
+        // Nothing was allocated for the intent: no checkout, no branch, no
+        // retained baseline ref.
+        assert!(!intent.checkout_path.exists());
+        assert_eq!(
+            ref_target(
+                &alloc,
+                repo.path(),
+                &format!("refs/heads/{}", intent.branch.as_str())
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            ref_target(&alloc, repo.path(), &baseline_ref_for(&intent.id)).await,
+            None
+        );
+    }
+
+    /// Baseline-absent recovery works from the durable intent alone, across
+    /// a restart, and discloses the recovery-time capture instead of
+    /// presenting it as the pre-interruption state.
+    #[tokio::test]
+    async fn recover_baseline_absent_intent_captures_at_recovery_time_and_discloses() {
+        let (repo, _, _) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+
+        // Persist the intent through a first "process"; recover through a
+        // reopened registry to prove the durable intent alone suffices.
+        let record = {
+            let (alloc, conn) = file_allocator(storage.path(), &db.path().join("state.db"));
+            let resolved = resolve(repo.path());
+            let record = insert_intent_only(
+                &alloc,
+                storage.path(),
+                &resolved,
+                "ws-recover",
+                BaselineMode::CurrentWorkingTree,
+                None,
+            )
+            .await;
+            (record, conn)
+        };
+        let (record, conn) = record;
+
+        // The source changed after the interruption.
+        std::fs::write(repo.path().join("file.txt"), "recovered").unwrap();
+
+        let store = Arc::new(SqliteWorkspaceRepository::new(conn.clone()));
+        let persisted = store
+            .get_workspace(&record.id)
+            .await
+            .unwrap()
+            .expect("intent survives the restart");
+        assert!(persisted.baseline.is_none());
+
+        let alloc =
+            WorkspaceAllocator::new(Arc::new(GixRepoOps::new()), store.clone(), storage.path());
+        let done = alloc.recover(&persisted).await.unwrap();
+        assert_eq!(
+            done.baseline_source,
+            BaselineSource::CapturedDuringRecovery,
+            "the recovery-time capture is disclosed"
+        );
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert_eq!(done.baseline.mode, BaselineMode::CurrentWorkingTree);
+        assert_eq!(
+            fs::read_to_string(done.record.checkout_path.join("file.txt")).unwrap(),
+            "recovered",
+            "worktree reflects recovery-time source contents"
+        );
+        assert_eq!(
+            branch_tip(&alloc, repo.path(), &done.record.branch).await,
+            done.baseline.baseline_commit
+        );
+        assert_eq!(
+            ref_target(&alloc, repo.path(), &baseline_ref_for(&done.record.id))
+                .await
+                .as_deref(),
+            Some(done.baseline.baseline_commit.as_str()),
+            "the retained ref exists at the recovery-time baseline"
+        );
+        // No duplicate resources: exactly one workspace row exists.
+        assert_eq!(alloc.registry.list_workspaces().await.unwrap().len(), 1);
+        // The source checkout was not disturbed by recovery.
+        assert_eq!(
+            fs::read_to_string(repo.path().join("file.txt")).unwrap(),
+            "recovered"
+        );
+    }
+
+    /// Commit-mode baseline-absent recovery re-resolves the recorded
+    /// requested ref instead of fabricating a baseline.
+    #[tokio::test]
+    async fn recover_baseline_absent_commit_intent_re_resolves_the_requested_ref() {
+        let (repo, first, _second) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let alloc = allocator(storage.path());
+        let resolved = resolve(repo.path());
+
+        let record = insert_intent_only(
+            &alloc,
+            storage.path(),
+            &resolved,
+            "ws-commit",
+            BaselineMode::Commit,
+            Some(&first.to_string()),
+        )
+        .await;
+
+        let done = alloc.recover(&record).await.unwrap();
+        assert_eq!(done.baseline_source, BaselineSource::CapturedDuringRecovery);
+        assert_eq!(done.baseline.mode, BaselineMode::Commit);
+        assert_eq!(done.baseline.baseline_commit, first.to_string());
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert_eq!(
+            branch_tip(&alloc, repo.path(), &done.record.branch).await,
+            first.to_string()
+        );
+    }
+
+    /// An unavailable source leaves an actionable non-runnable record; a
+    /// later explicit retry succeeds without duplicate resources.
+    #[tokio::test]
+    async fn recover_baseline_absent_with_unavailable_source_stays_actionable_and_retryable() {
+        let (repo, first, _) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let alloc = allocator(storage.path());
+        let resolved = resolve(repo.path());
+
+        let record = insert_intent_only(
+            &alloc,
+            storage.path(),
+            &resolved,
+            "ws-gone",
+            BaselineMode::Commit,
+            Some("refs/heads/vanished"),
+        )
+        .await;
+
+        // The recorded ref no longer resolves: recovery fails with an
+        // actionable diagnostic and keeps the workspace non-runnable.
+        let err = alloc.recover(&record).await.unwrap_err();
+        assert!(err.to_string().contains("refs/heads/vanished"), "{err}");
+        let stored = alloc
+            .registry
+            .get_workspace(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.lifecycle, WorkspaceLifecycle::Provisioning);
+        assert!(
+            stored
+                .last_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("refs/heads/vanished"),
+            "diagnostic is actionable: {:?}",
+            stored.last_error
+        );
+        assert!(!stored.checkout_path.exists());
+
+        // Once the source is available again, the same intent recovers.
+        CliGit::new()
+            .run(repo.path(), &["branch", "vanished", &first.to_string()])
+            .await
+            .unwrap()
+            .into_checked(&["branch"])
+            .unwrap();
+        let done = alloc.recover(&stored).await.unwrap();
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert_eq!(done.baseline.baseline_commit, first.to_string());
+        assert_eq!(alloc.registry.list_workspaces().await.unwrap().len(), 1);
+    }
+
+    /// A crash between baseline binding and ref publication is repaired:
+    /// recovery restores that exact baseline into the retained ref.
+    #[tokio::test]
+    async fn crash_after_baseline_binding_restores_the_exact_baseline_ref() {
+        let (repo, _, head) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let alloc = allocator(storage.path());
+        let resolved = resolve(repo.path());
+
+        // insert_intent binds the baseline durably but publishes no ref and
+        // allocates nothing: the crash boundary between binding and
+        // publication.
+        let record = insert_intent(
+            &alloc,
+            storage.path(),
+            &resolved,
+            "ws-ref",
+            &head.to_string(),
+        )
+        .await;
+        let bound = record.baseline.clone().unwrap();
+        assert_eq!(
+            ref_target(&alloc, repo.path(), &baseline_ref_for(&record.id)).await,
+            None,
+            "precondition: the ref was never published"
+        );
+
+        let done = alloc.recover(&record).await.unwrap();
+        assert_eq!(
+            done.baseline_source,
+            BaselineSource::BoundBeforeInterruption
+        );
+        assert_eq!(
+            done.baseline, bound,
+            "the bound baseline identity is preserved exactly"
+        );
+        assert_eq!(
+            ref_target(&alloc, repo.path(), &baseline_ref_for(&record.id))
+                .await
+                .as_deref(),
+            Some(bound.baseline_commit.as_str()),
+            "the exact bound baseline was restored into the retained ref"
+        );
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+    }
+
+    /// A conflicting existing baseline ref is diagnosed rather than
+    /// overwritten, and the workspace stays recoverable.
+    #[tokio::test]
+    async fn conflicting_existing_baseline_ref_is_refused_not_overwritten() {
+        let (repo, first, second) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let alloc = allocator(storage.path());
+        let resolved = resolve(repo.path());
+
+        let record = insert_intent(
+            &alloc,
+            storage.path(),
+            &resolved,
+            "ws-conflict",
+            &first.to_string(),
+        )
+        .await;
+        let ref_name = baseline_ref_for(&record.id);
+        // An external writer created the retained ref at a different commit.
+        CliGit::new()
+            .run(
+                repo.path(),
+                &["update-ref", ref_name.as_str(), &second.to_string()],
+            )
+            .await
+            .unwrap()
+            .into_checked(&["update-ref"])
+            .unwrap();
+
+        let err = alloc.recover(&record).await.unwrap_err();
+        assert!(
+            matches!(err, WorktreeError::InvalidOperation(ref m) if m.contains("refusing")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            ref_target(&alloc, repo.path(), &ref_name).await.as_deref(),
+            Some(second.to_string().as_str()),
+            "the conflicting ref is not overwritten"
+        );
+        let stored = alloc
+            .registry
+            .get_workspace(&record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.lifecycle,
+            WorkspaceLifecycle::Provisioning,
+            "the workspace stays recoverable after the conflict is resolved"
+        );
+        assert!(
+            !stored.checkout_path.exists(),
+            "no checkout is created while the ref conflicts"
+        );
+    }
+
+    /// Git-operation fault injection at the capture, baseline-ref
+    /// publication, branch, and checkout boundaries: failed allocations
+    /// mark the record failed, keep resources consistent, and recovery
+    /// completes without duplicates.
+    #[tokio::test]
+    async fn git_boundary_faults_fail_allocations_without_orphaning_resources() {
+        let (repo, _, _) = init_repo_with_subdir();
+        let resolved = resolve(repo.path());
+
+        // (a) capture boundary: nothing bound, no branch, no checkout.
+        let storage = TempDir::new().unwrap();
+        let faulted = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let alloc = WorkspaceAllocator::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            in_memory_registry(),
+            storage.path(),
+        );
+        faulted.fail_next(FailurePoint::CaptureWorkingState, 1, "capture boom");
+        let record = alloc
+            .allocate_with(AllocationRequest {
+                source: &resolved,
+                relative_cwd: Path::new(""),
+                base_ref: None,
+                baseline_mode: BaselineMode::CurrentWorkingTree,
+                delegation_batch_id: None,
+                parent_workspace_id: None,
+                parent_session_id: None,
+                delegation_id: None,
+                preset_baseline: None,
+                mutation_gate: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(record.to_string().contains("capture boom"));
+        let stored = in_memory_registry_failed_row(&alloc).await;
+        assert!(!stored.checkout_path.exists());
+
+        // (b) baseline-ref publication boundary: baseline bound, but no
+        //     branch/checkout allocated.
+        let storage = TempDir::new().unwrap();
+        let faulted = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let alloc = WorkspaceAllocator::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            in_memory_registry(),
+            storage.path(),
+        );
+        faulted.fail_next(FailurePoint::CreateRefIfAbsent, 1, "ref boom");
+        let err = alloc
+            .allocate(&resolved, Path::new(""), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ref boom"));
+        let stored = in_memory_registry_failed_row(&alloc).await;
+        assert!(!stored.checkout_path.exists());
+        assert_eq!(
+            ref_target(
+                &alloc,
+                repo.path(),
+                &format!("refs/heads/{}", stored.branch.as_str())
+            )
+            .await,
+            None,
+            "no branch is allocated when ref publication fails"
+        );
+
+        // (c) branch creation boundary.
+        let storage = TempDir::new().unwrap();
+        let faulted = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let alloc = WorkspaceAllocator::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            in_memory_registry(),
+            storage.path(),
+        );
+        faulted.fail_next(FailurePoint::CreateBranch, 1, "branch boom");
+        let err = alloc
+            .allocate(&resolved, Path::new(""), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("branch boom"));
+        let stored = in_memory_registry_failed_row(&alloc).await;
+        assert!(!stored.checkout_path.exists());
+
+        // (d) checkout creation boundary: the branch already exists, and
+        //     explicit recovery completes it without duplicate resources.
+        let storage = TempDir::new().unwrap();
+        let faulted = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let alloc = WorkspaceAllocator::new(
+            faulted.clone() as Arc<dyn RepositoryOps>,
+            in_memory_registry(),
+            storage.path(),
+        );
+        faulted.fail_next(FailurePoint::AddWorktree, 1, "checkout boom");
+        let err = alloc
+            .allocate(&resolved, Path::new(""), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("checkout boom"));
+        let stored = alloc
+            .registry
+            .list_workspaces()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(stored.lifecycle, WorkspaceLifecycle::Failed);
+        assert!(!stored.checkout_path.exists());
+        let baseline = stored.baseline.clone().unwrap();
+        assert_eq!(
+            ref_target(
+                &alloc,
+                repo.path(),
+                &format!("refs/heads/{}", stored.branch.as_str())
+            )
+            .await
+            .as_deref(),
+            Some(baseline.baseline_commit.as_str()),
+            "the branch exists at the baseline from before the failure"
+        );
+
+        // Simulate the durable retry path: back to provisioning, recover.
+        alloc
+            .registry
+            .transition_lifecycle(
+                &stored.id,
+                WorkspaceLifecycle::Failed,
+                WorkspaceLifecycle::Provisioning,
+            )
+            .await
+            .unwrap();
+        let retryable = alloc
+            .registry
+            .get_workspace(&stored.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let done = alloc.recover(&retryable).await.unwrap();
+        assert_eq!(done.baseline, baseline, "bound baseline preserved");
+        assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+        assert_eq!(
+            ref_target(
+                &alloc,
+                repo.path(),
+                &format!("refs/heads/{}", stored.branch.as_str())
+            )
+            .await
+            .as_deref(),
+            Some(baseline.baseline_commit.as_str()),
+            "recovery reuses the existing branch without moving it"
+        );
+        assert_eq!(alloc.registry.list_workspaces().await.unwrap().len(), 1);
+    }
+
+    /// Fetch the single workspace row and assert it is Failed with a
+    /// retained diagnostic.
+    async fn in_memory_registry_failed_row(alloc: &WorkspaceAllocator) -> WorkspaceRecord {
+        let rows = alloc.registry.list_workspaces().await.unwrap();
+        assert_eq!(rows.len(), 1, "exactly the failed intent is stored");
+        assert_eq!(rows[0].lifecycle, WorkspaceLifecycle::Failed);
+        assert!(rows[0].last_error.is_some(), "diagnostic retained");
+        rows[0].clone()
+    }
+
+    /// Registry persistence faults at the intent, baseline-bind, and final
+    /// Ready boundaries: nothing is silently lost and provisioning stays
+    /// replayable.
+    #[tokio::test]
+    async fn registry_boundary_faults_keep_provisioning_replayable() {
+        let (repo, _, head) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let resolved = resolve(repo.path());
+
+        // (a) intent persistence failure: no row, no Git resources.
+        {
+            let (alloc, faults) = faulted_registry(storage.path());
+            faults.fail_next(RegistryFaultPoint::InsertWorkspace, 1, "intent boom");
+            let err = alloc
+                .allocate(&resolved, Path::new(""), None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("intent boom"));
+            assert_eq!(
+                alloc.registry.list_workspaces().await.unwrap().len(),
+                0,
+                "no intent row was persisted"
+            );
+            assert_eq!(
+                ref_target(&alloc, repo.path(), "HEAD").await.as_deref(),
+                Some(head.to_string().as_str()),
+                "source HEAD untouched"
+            );
+        }
+
+        // (b) baseline binding failure: the record fails closed with no
+        //     Git resources allocated.
+        {
+            let (alloc, faults) = faulted_registry(storage.path());
+            faults.fail_next(RegistryFaultPoint::BindBaseline, 1, "bind boom");
+            let err = alloc
+                .allocate(&resolved, Path::new(""), None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("bind boom"));
+            let rows = alloc.registry.list_workspaces().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].lifecycle, WorkspaceLifecycle::Failed);
+            assert!(rows[0].baseline.is_none());
+            assert!(!rows[0].checkout_path.exists());
+        }
+
+        // (c) final Ready-transition failure: Git resources exist, the
+        //     workspace stays provisioning, and recovery completes without
+        //     duplicates or a second owner.
+        {
+            let (alloc, faults) = faulted_registry(storage.path());
+            faults.fail_next(RegistryFaultPoint::TransitionLifecycle, 1, "ready boom");
+            let err = alloc
+                .allocate(&resolved, Path::new(""), None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("ready boom"));
+            let rows = alloc.registry.list_workspaces().await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].lifecycle, WorkspaceLifecycle::Provisioning);
+            assert!(
+                rows[0].checkout_path.is_dir(),
+                "allocated resources are recoverable"
+            );
+            let done = alloc.recover(&rows[0]).await.unwrap();
+            assert_eq!(done.record.lifecycle, WorkspaceLifecycle::Ready);
+            assert_eq!(alloc.registry.list_workspaces().await.unwrap().len(), 1);
+        }
+    }
+
+    /// Recovery preserves single ownership across a restart: exactly one
+    /// workspace row, one writable owner, and a second attach is refused.
+    #[tokio::test]
+    async fn recovery_preserves_single_ownership_across_restart() {
+        let (repo, _, _) = init_repo_with_subdir();
+        let storage = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+
+        let record = {
+            let (alloc, conn) = file_allocator(storage.path(), &db.path().join("state.db"));
+            let resolved = resolve(repo.path());
+            let record = insert_intent_only(
+                &alloc,
+                storage.path(),
+                &resolved,
+                "ws-owner",
+                BaselineMode::CurrentWorkingTree,
+                None,
+            )
+            .await;
+            (record, conn)
+        };
+        let (record, conn) = record;
+        insert_session_row(&conn, "sess-a").await;
+        insert_session_row(&conn, "sess-b").await;
+
+        let store = Arc::new(SqliteWorkspaceRepository::new(conn.clone()));
+        let persisted = store
+            .get_workspace(&record.id)
+            .await
+            .unwrap()
+            .expect("intent survives the restart");
+        let alloc =
+            WorkspaceAllocator::new(Arc::new(GixRepoOps::new()), store.clone(), storage.path());
+        let done = alloc.recover(&persisted).await.unwrap();
+
+        store.attach_owner(&done.record.id, "sess-a").await.unwrap();
+        let err = store
+            .attach_owner(&done.record.id, "sess-b")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::session::error::SessionError::WorkspaceAlreadyOwned { .. }
+            ),
+            "second writable owner refused: {err:?}"
+        );
+        assert_eq!(store.list_workspaces().await.unwrap().len(), 1);
     }
 
     // -- Baseline modes and immutable baseline refs (section 3.3) -----------

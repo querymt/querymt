@@ -84,6 +84,17 @@ struct WorktreeIdRequest {
     workspace_id: String,
 }
 
+/// Recovery targets: a workspace with an interrupted provisioning/removal
+/// intent, or (forks only) a session whose pending isolation startup barrier
+/// still blocks load/resume.
+#[derive(Debug, Deserialize)]
+struct WorktreeRecoverRequest {
+    #[serde(default, alias = "workspaceId")]
+    workspace_id: Option<String>,
+    #[serde(default, alias = "sessionId")]
+    session_id: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct WorktreeStatusResponse {
     #[serde(flatten)]
@@ -122,8 +133,10 @@ struct WorktreeRemoveResponse {
     workspace_id: String,
     checkout_removed: bool,
     removed_branch: Option<String>,
-    /// Refs intentionally retained for recovery; removal never implies
-    /// integration.
+    /// Set when an external writer moved the branch between the safety
+    /// checks and deletion: the branch (with its new history) was retained,
+    /// never deleted unconditionally.
+    branch_moved_during_removal: Option<String>,
     retained_refs: Vec<String>,
 }
 
@@ -481,6 +494,9 @@ impl LocalAgentHandle {
             workspace_id: report.workspace_id.to_string(),
             checkout_removed: report.checkout_removed,
             removed_branch: report.removed_branch.map(|b| b.as_str().to_string()),
+            branch_moved_during_removal: report
+                .branch_moved_during_removal
+                .map(|b| b.as_str().to_string()),
             retained_refs: report.retained_refs,
         })
     }
@@ -503,41 +519,101 @@ impl LocalAgentHandle {
         ext_json_response(&summarize_record(&archived))
     }
 
-    /// Explicitly recover persisted allocation/removal intent; never starts an actor.
+    /// Explicitly recover persisted allocation/removal intent, or release a
+    /// pending fork-isolation startup barrier by session id; never starts an
+    /// actor.
     pub(super) async fn handle_ext_worktree_recover(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
-        let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        let record = self
-            .lookup_workspace(&service, &parsed.workspace_id)
-            .await?;
-        match record.lifecycle {
-            crate::worktree::WorkspaceLifecycle::Provisioning => {
-                let root = record.repository.origin_path.clone();
-                let recovered = service
-                    .allocator()
-                    .recover(&record, &root)
-                    .await
-                    .map_err(|err| Error::invalid_request().data(err.to_string()))?;
-                ext_json_response(&summarize_record(&recovered))
+        let parsed: WorktreeRecoverRequest = parse_workspace_op_request(req)?;
+        match (parsed.workspace_id.as_deref(), parsed.session_id.as_deref()) {
+            (Some(_), Some(_)) => {
+                Err(Error::invalid_params()
+                    .data("provide either workspace_id or session_id, not both"))
             }
-            crate::worktree::WorkspaceLifecycle::Removing => {
-                let report = service
-                    .manager()
-                    .remove(&record)
-                    .await
-                    .map_err(|err| Error::invalid_request().data(err.to_string()))?;
-                ext_json_response(&WorktreeRemoveResponse {
-                    workspace_id: report.workspace_id.to_string(),
-                    checkout_removed: report.checkout_removed,
-                    removed_branch: report.removed_branch.map(|b| b.as_str().to_string()),
-                    retained_refs: report.retained_refs,
-                })
+            (None, None) => Err(Error::invalid_params().data("provide workspace_id or session_id")),
+            (None, Some(session_id)) => {
+                // Session-scoped recovery: complete a pending isolated
+                // fork's provisioning (reusing its bound workspace when a
+                // previous attempt already attached it) and release the
+                // durable startup barrier.
+                let response = self
+                    .session_materializer
+                    .recover_pending_fork(session_id)
+                    .await?;
+                let workspace = response
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.get("querymt"))
+                    .and_then(|querymt| querymt.get(crate::worktree::SESSION_WORKSPACE_META_KEY))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                ext_json_response(&serde_json::json!({
+                    "session_id": session_id,
+                    "sessionWorkspace": workspace,
+                }))
             }
-            _ => Err(Error::invalid_request()
-                .data("workspace has no interrupted provisioning or removal to recover")),
+            (Some(workspace_id), None) => {
+                let service = self.workspace_service()?;
+                let id = crate::worktree::WorkspaceId::from_raw(workspace_id);
+                let record = service
+                    .registry()
+                    .get_workspace(&id)
+                    .await
+                    .map_err(|err| {
+                        Error::internal_error()
+                            .data(format!("failed to load workspace {workspace_id}: {err}"))
+                    })?
+                    .ok_or_else(|| {
+                        Error::invalid_request().data(format!("unknown workspace: {workspace_id}"))
+                    })?;
+                match record.lifecycle {
+                    crate::worktree::WorkspaceLifecycle::Provisioning => {
+                        // Recovery is self-contained: administration and
+                        // recovery-time capture use the record's canonical
+                        // common directory and recorded source checkout.
+                        let recovered = service
+                            .allocator()
+                            .recover(&record)
+                            .await
+                            .map_err(|err| Error::invalid_request().data(err.to_string()))?;
+                        // Disclose whether the baseline was durably bound
+                        // before the interruption or captured at recovery
+                        // time from the recorded source.
+                        let baseline_source = match recovered.baseline_source {
+                            crate::worktree::BaselineSource::BoundBeforeInterruption => {
+                                "bound-before-interruption"
+                            }
+                            crate::worktree::BaselineSource::CapturedDuringRecovery => {
+                                "captured-during-recovery"
+                            }
+                        };
+                        ext_json_response(&serde_json::json!({
+                            "summary": summarize_record(&recovered.record),
+                            "baselineSource": baseline_source,
+                        }))
+                    }
+                    crate::worktree::WorkspaceLifecycle::Removing => {
+                        let report = service
+                            .manager()
+                            .remove(&record)
+                            .await
+                            .map_err(|err| Error::invalid_request().data(err.to_string()))?;
+                        ext_json_response(&WorktreeRemoveResponse {
+                            workspace_id: report.workspace_id.to_string(),
+                            checkout_removed: report.checkout_removed,
+                            removed_branch: report.removed_branch.map(|b| b.as_str().to_string()),
+                            branch_moved_during_removal: report
+                                .branch_moved_during_removal
+                                .map(|b| b.as_str().to_string()),
+                            retained_refs: report.retained_refs,
+                        })
+                    }
+                    _ => Err(Error::invalid_request()
+                        .data("workspace has no interrupted provisioning or removal to recover")),
+                }
+            }
         }
     }
 

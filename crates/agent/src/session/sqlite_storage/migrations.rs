@@ -129,15 +129,32 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0026_pending_fork_isolation",
         apply: migration_0026_pending_fork_isolation,
     },
+    Migration {
+        version: "0027_workspace_provisioning_intent",
+        apply: migration_0027_workspace_provisioning_intent,
+    },
 ];
 
 fn migration_0026_pending_fork_isolation(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
-        "CREATE TABLE session_fork_isolation_intents (
-            session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-            intent_json TEXT NOT NULL
-        );",
+        "CREATE TABLE session_fork_isolation_intents (\n            session_id INTEGER PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,\n            intent_json TEXT NOT NULL\n        );",
     )
+}
+
+/// Replayable provisioning-intent columns for existing workspaces.
+///
+/// Adds `requested_base_ref`, `operation_id`, and `provisioning_phase` to the
+/// `workspaces` table so interrupted allocation can be recovered from the
+/// recorded source/policy alone instead of requiring a pre-populated
+/// baseline. Existing rows keep NULLs: an absent phase is reconciled from
+/// the presence of a bound baseline, and an absent requested ref only
+/// matters for rows still in `provisioning`. Guarded column adds keep the
+/// migration idempotent for fresh installs where `init_schema` already
+/// created the columns.
+fn migration_0027_workspace_provisioning_intent(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_provisioning_columns(conn)
 }
 
 fn migration_0025_workspace_archival(conn: &mut Connection) -> Result<(), rusqlite::Error> {

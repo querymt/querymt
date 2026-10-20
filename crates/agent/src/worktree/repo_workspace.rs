@@ -9,8 +9,9 @@
 
 use crate::session::error::{SessionError, SessionResult};
 use crate::worktree::domain::{
-    Baseline, BaselineMode, ExecutionMode, ManagedBranch, RepositoryIdentity, ResultProvenance,
-    ResultVerificationStatus, WorkspaceId, WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord,
+    Baseline, BaselineMode, ExecutionMode, ManagedBranch, ProvisioningPhase, RepositoryIdentity,
+    ResultProvenance, ResultVerificationStatus, WorkspaceId, WorkspaceLifecycle,
+    WorkspaceOwnership, WorkspaceRecord,
 };
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -85,6 +86,17 @@ pub trait WorkspaceRepository: Send + Sync {
     /// Persist the captured immutable baseline for a workspace.
     async fn bind_baseline(&self, id: &WorkspaceId, baseline: &Baseline) -> SessionResult<()>;
 
+    /// Advance the durable provisioning phase of a `provisioning` workspace.
+    ///
+    /// Forward-only: an attempt to move to an equal or earlier phase is a
+    /// no-op (`Ok(false)`), so idempotent replay can safely re-record steps.
+    /// Unknown workspace ids also yield `Ok(false)`.
+    async fn record_provisioning_phase(
+        &self,
+        id: &WorkspaceId,
+        phase: ProvisioningPhase,
+    ) -> SessionResult<bool>;
+
     /// Persist retained result provenance for a workspace.
     async fn record_result(
         &self,
@@ -154,7 +166,8 @@ fn path_text(path: &Path) -> String {
 const SELECT_COLS: &str = "public_id, common_dir, origin_path, project_name, checkout_path, \
      branch, relative_cwd, execution, baseline_mode, source_head, baseline_commit, lifecycle, \
      owner_session_id, parent_workspace_id, parent_session_id, delegation_id, \
-     delegation_batch_id, last_error, created_at, updated_at";
+     delegation_batch_id, last_error, created_at, updated_at, \
+     requested_base_ref, operation_id, provisioning_phase";
 
 fn select_by_id_sql() -> String {
     format!("SELECT {SELECT_COLS} FROM workspaces WHERE public_id = ?1")
@@ -185,6 +198,9 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<WorkspaceRecord, rusqlite
     let last_error: Option<String> = row.get("last_error")?;
     let created_at: String = row.get("created_at")?;
     let updated_at: String = row.get("updated_at")?;
+    let requested_base_ref: Option<String> = row.get("requested_base_ref")?;
+    let operation_id: Option<String> = row.get("operation_id")?;
+    let provisioning_phase: Option<String> = row.get("provisioning_phase")?;
 
     let mode = BaselineMode::from_str(&baseline_mode).map_err(|_| rusqlite::Error::InvalidQuery)?;
     let baseline = match (source_head, baseline_commit) {
@@ -220,6 +236,13 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<WorkspaceRecord, rusqlite
             delegation_batch_id,
         },
         last_error,
+        requested_baseline_mode: mode,
+        requested_base_ref,
+        operation_id: operation_id.unwrap_or_default(),
+        provisioning_phase: provisioning_phase
+            .map(|p| ProvisioningPhase::from_str(&p))
+            .transpose()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
         created_at: parse_dt(&created_at)?,
         updated_at: parse_dt(&updated_at)?,
     })
@@ -235,8 +258,9 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     branch, relative_cwd, execution, baseline_mode, source_head,
                     baseline_commit, lifecycle, owner_session_id, parent_workspace_id,
                     parent_session_id, delegation_id, delegation_batch_id, last_error,
-                    created_at, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                    created_at, updated_at, requested_base_ref, operation_id,
+                    provisioning_phase
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                 params![
                     record.id.as_str(),
                     path_text(&record.repository.common_dir),
@@ -249,8 +273,9 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     record
                         .baseline
                         .as_ref()
-                        .map(|b| b.mode.to_string())
-                        .unwrap_or_else(|| BaselineMode::Commit.to_string()),
+                        .map(|b| b.mode)
+                        .unwrap_or(record.requested_baseline_mode)
+                        .to_string(),
                     record.baseline.as_ref().map(|b| b.source_head.clone()),
                     record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
                     record.lifecycle.to_string(),
@@ -266,6 +291,9 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     record.last_error,
                     format_dt(&record.created_at),
                     format_dt(&record.updated_at),
+                    record.requested_base_ref,
+                    record.operation_id,
+                    record.provisioning_phase.map(|p| p.to_string()),
                 ],
             )?;
             Ok(record)
@@ -384,7 +412,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     baseline_commit = ?11, lifecycle = ?12, owner_session_id = ?13,
                     parent_workspace_id = ?14, parent_session_id = ?15,
                     delegation_id = ?16, delegation_batch_id = ?17, last_error = ?18,
-                    created_at = ?19, updated_at = ?20
+                    created_at = ?19, updated_at = ?20, requested_base_ref = ?21,
+                    operation_id = ?22, provisioning_phase = ?23
                  WHERE public_id = ?1",
                     params![
                         record.id.as_str(),
@@ -398,8 +427,9 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                         record
                             .baseline
                             .as_ref()
-                            .map(|b| b.mode.to_string())
-                            .unwrap_or_else(|| BaselineMode::Commit.to_string()),
+                            .map(|b| b.mode)
+                            .unwrap_or(record.requested_baseline_mode)
+                            .to_string(),
                         record.baseline.as_ref().map(|b| b.source_head.clone()),
                         record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
                         record.lifecycle.to_string(),
@@ -415,6 +445,9 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                         record.last_error,
                         format_dt(&record.created_at),
                         format_dt(&record.updated_at),
+                        record.requested_base_ref,
+                        record.operation_id,
+                        record.provisioning_phase.map(|p| p.to_string()),
                     ],
                 )?;
                 Ok(changed)
@@ -436,8 +469,13 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         let from = from.to_string();
         let to = to.to_string();
         self.run_blocking(move |conn| {
+            // Clear the provisioning phase when provisioning completes so
+            // `Some(phase)` always means "provisioning still in progress".
             let changed = conn.execute(
-                "UPDATE workspaces SET lifecycle = ?3, updated_at = ?4 \
+                "UPDATE workspaces SET lifecycle = ?3, updated_at = ?4, \
+                 provisioning_phase = CASE \
+                   WHEN ?2 = 'provisioning' AND ?3 = 'ready' THEN NULL \
+                   ELSE provisioning_phase END \
                  WHERE public_id = ?1 AND lifecycle = ?2 \
                  AND (?3 != 'removing' OR owner_session_id IS NULL OR lifecycle = 'archived')",
                 params![id, from, to, format_dt(&OffsetDateTime::now_utc())],
@@ -523,14 +561,21 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
     async fn bind_baseline(&self, id: &WorkspaceId, baseline: &Baseline) -> SessionResult<()> {
         let id = id.as_str().to_string();
         let id_for_err = id.clone();
+        let conflict_id = id.clone();
         let mode = baseline.mode.to_string();
         let source_head = baseline.source_head.clone();
         let baseline_commit = baseline.baseline_commit.clone();
         let changed = self
             .run_blocking(move |conn| {
+                // Bind once, immutably: an unbound row takes the capture, a
+                // row already bound to the same commit is an idempotent
+                // no-op, and a row bound to a different commit is refused
+                // rather than overwritten.
                 let changed = conn.execute(
                     "UPDATE workspaces SET baseline_mode = ?2, source_head = ?3, \
-                     baseline_commit = ?4, updated_at = ?5 WHERE public_id = ?1",
+                     baseline_commit = ?4, updated_at = ?5 \
+                     WHERE public_id = ?1 \
+                       AND (baseline_commit IS NULL OR baseline_commit = ?4)",
                     params![
                         id,
                         mode,
@@ -543,9 +588,52 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
             })
             .await?;
         if changed == 0 {
-            return Err(SessionError::WorkspaceNotFound(id_for_err));
+            let existing = self
+                .get_workspace(&WorkspaceId::from_raw(conflict_id.clone()))
+                .await?;
+            if existing.is_none() {
+                return Err(SessionError::WorkspaceNotFound(id_for_err));
+            }
+            return Err(SessionError::InvalidOperation(format!(
+                "workspace {conflict_id} already has a bound baseline; \
+                 refusing to replace it"
+            )));
         }
         Ok(())
+    }
+
+    async fn record_provisioning_phase(
+        &self,
+        id: &WorkspaceId,
+        phase: ProvisioningPhase,
+    ) -> SessionResult<bool> {
+        let id = id.as_str().to_string();
+        let phase_text = phase.to_string();
+        self.run_blocking(move |conn| {
+            // Forward-only CAS: only advance from an earlier (or legacy
+            // NULL) phase while the workspace is still provisioning.
+            let changed = conn.execute(
+                "UPDATE workspaces SET provisioning_phase = ?2, updated_at = ?3 \
+                 WHERE public_id = ?1 AND lifecycle = 'provisioning' \
+                 AND (CASE IFNULL(provisioning_phase, 'intent_persisted') \
+                      WHEN 'intent_persisted' THEN 0 \
+                      WHEN 'baseline_bound' THEN 1 \
+                      WHEN 'baseline_ref_published' THEN 2 \
+                      WHEN 'branch_created' THEN 3 \
+                      WHEN 'checkout_created' THEN 4 \
+                      ELSE 99 END) \
+                   < (CASE ?2 \
+                      WHEN 'intent_persisted' THEN 0 \
+                      WHEN 'baseline_bound' THEN 1 \
+                      WHEN 'baseline_ref_published' THEN 2 \
+                      WHEN 'branch_created' THEN 3 \
+                      WHEN 'checkout_created' THEN 4 \
+                      ELSE -1 END)",
+                params![id, phase_text, format_dt(&OffsetDateTime::now_utc())],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
     }
 
     async fn record_result(
@@ -663,6 +751,10 @@ mod tests {
             lifecycle: WorkspaceLifecycle::Provisioning,
             ownership: WorkspaceOwnership::default(),
             last_error: None,
+            requested_baseline_mode: BaselineMode::Commit,
+            requested_base_ref: None,
+            operation_id: format!("op-{id}"),
+            provisioning_phase: Some(ProvisioningPhase::IntentPersisted),
             created_at: datetime!(2026-01-15 12:00:00 UTC),
             updated_at: datetime!(2026-01-15 12:00:00 UTC),
         }
@@ -918,6 +1010,9 @@ mod tests {
             source_head: "aaa111".into(),
             baseline_commit: "bbb222".into(),
         });
+        // A bound baseline carries its mode: keep the requested policy in
+        // sync the way the allocator does.
+        record.requested_baseline_mode = BaselineMode::CurrentWorkingTree;
         record.ownership.delegation_batch_id = Some("batch-9".into());
         repo.update_workspace(record.clone()).await.unwrap();
 
@@ -965,6 +1060,150 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    /// A bound baseline is immutable: rebinding the same commit is an
+    /// idempotent no-op; binding a different commit is refused with an
+    /// explicit conflict instead of being overwritten.
+    #[tokio::test]
+    async fn bind_baseline_is_immutable_and_conflicts_are_refused() {
+        let repo = repo();
+        repo.insert_workspace(make_record("ws-1", "/store/wt/ws-1"))
+            .await
+            .unwrap();
+        let id = WorkspaceId::from_raw("ws-1");
+        let bound = Baseline {
+            mode: BaselineMode::Commit,
+            source_head: "aaa111".into(),
+            baseline_commit: "bbb222".into(),
+        };
+        repo.bind_baseline(&id, &bound).await.unwrap();
+
+        // Same commit: idempotent.
+        repo.bind_baseline(&id, &bound).await.unwrap();
+        assert_eq!(
+            repo.get_workspace(&id).await.unwrap().unwrap().baseline,
+            Some(bound.clone())
+        );
+
+        // Different commit: refused, original retained.
+        let conflicting = Baseline {
+            mode: BaselineMode::Commit,
+            source_head: "changed".into(),
+            baseline_commit: "ccc333".into(),
+        };
+        let err = repo.bind_baseline(&id, &conflicting).await.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to replace"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            repo.get_workspace(&id).await.unwrap().unwrap().baseline,
+            Some(bound)
+        );
+    }
+
+    /// Provisioning phases only ever move forward while provisioning:
+    /// idempotent replay re-recording an earlier step is a no-op.
+    #[tokio::test]
+    async fn provisioning_phase_advances_forward_only() {
+        let repo = repo();
+        repo.insert_workspace(make_record("ws-1", "/store/wt/ws-1"))
+            .await
+            .unwrap();
+        let id = WorkspaceId::from_raw("ws-1");
+
+        assert!(
+            repo.record_provisioning_phase(&id, ProvisioningPhase::BaselineBound)
+                .await
+                .unwrap()
+        );
+        // Equal or earlier phases are no-ops.
+        assert!(
+            !repo
+                .record_provisioning_phase(&id, ProvisioningPhase::BaselineBound)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !repo
+                .record_provisioning_phase(&id, ProvisioningPhase::IntentPersisted)
+                .await
+                .unwrap()
+        );
+        assert!(
+            repo.record_provisioning_phase(&id, ProvisioningPhase::CheckoutCreated)
+                .await
+                .unwrap()
+        );
+        let loaded = repo.get_workspace(&id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.provisioning_phase,
+            Some(ProvisioningPhase::CheckoutCreated)
+        );
+
+        // Unknown workspace ids report "not advanced" instead of erroring.
+        assert!(
+            !repo
+                .record_provisioning_phase(
+                    &WorkspaceId::from_raw("ghost"),
+                    ProvisioningPhase::BranchCreated
+                )
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The true first persisted intent (no baseline yet) round-trips the
+    /// requested policy, operation id, and phase without fabricating a
+    /// capture, and survives a full database reopen.
+    #[tokio::test]
+    async fn first_persisted_intent_round_trips_without_a_baseline() {
+        let db = tempfile::TempDir::new().unwrap();
+        let db_path = db.path().join("sessions.db");
+        let record = {
+            let mut conn = Connection::open(&db_path).unwrap();
+            conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+            schema::init_schema(&mut conn).unwrap();
+            let store = SqliteWorkspaceRepository::new(Arc::new(Mutex::new(conn)));
+            let mut record = make_record("ws-intent", "/store/wt/ws-intent");
+            record.requested_baseline_mode = BaselineMode::CurrentWorkingTree;
+            record.requested_base_ref = None;
+            record.operation_id = "op-first-intent".into();
+            record.provisioning_phase = Some(ProvisioningPhase::IntentPersisted);
+            store.insert_workspace(record.clone()).await.unwrap();
+
+            let loaded = store
+                .get_workspace(&record.id)
+                .await
+                .unwrap()
+                .expect("intent row");
+            assert!(loaded.baseline.is_none(), "no fabricated baseline");
+            assert_eq!(
+                loaded.requested_baseline_mode,
+                BaselineMode::CurrentWorkingTree
+            );
+            assert_eq!(loaded.requested_base_ref, None);
+            assert_eq!(loaded.operation_id, "op-first-intent");
+            assert_eq!(
+                loaded.provisioning_phase,
+                Some(ProvisioningPhase::IntentPersisted)
+            );
+            record
+        };
+        // Reopen from disk: the intent survives without a baseline.
+        let reopened_conn = Connection::open(&db_path).unwrap();
+        let reopened = SqliteWorkspaceRepository::new(Arc::new(Mutex::new(reopened_conn)));
+        let loaded = reopened
+            .get_workspace(&record.id)
+            .await
+            .unwrap()
+            .expect("intent row after reopen");
+        assert!(loaded.baseline.is_none());
+        assert_eq!(
+            loaded.provisioning_phase,
+            Some(ProvisioningPhase::IntentPersisted)
         );
     }
 

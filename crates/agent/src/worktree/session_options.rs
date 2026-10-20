@@ -106,6 +106,16 @@ impl SessionCreationOptions {
             base_ref: self.base_ref.clone(),
         }
     }
+
+    /// Reconstruct from durable workspace creation options, e.g. a persisted
+    /// fork-isolation intent replayed by explicit recovery.
+    pub fn from_workspace_options(options: &WorkspaceCreationOptions) -> Self {
+        Self {
+            execution: options.execution,
+            baseline: options.baseline,
+            base_ref: options.base_ref.clone(),
+        }
+    }
 }
 
 /// `_meta.querymt.sessionWorkspace` key carrying typed creation options on

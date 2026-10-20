@@ -698,6 +698,13 @@ pub struct SessionListItem {
     /// Whether this session has child sessions
     pub has_children: bool,
     pub fork_count: usize,
+    /// A persisted fork-isolation intent is still outstanding: the fork is
+    /// not runnable (load/resume fail closed) until explicit recovery
+    /// completes provisioning. Set for pending and failed isolated fork
+    /// creation alike; the workspace view, when present, carries the
+    /// workspace-level lifecycle (e.g. `failed`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_isolation: bool,
 }
 
 impl SessionListItem {
@@ -954,6 +961,7 @@ mod tests {
             session_kind: None,
             has_children: false,
             fork_count: 0,
+            pending_isolation: false,
         };
         assert_eq!(item.session_id, "sess-x");
         assert!(!item.has_children);
