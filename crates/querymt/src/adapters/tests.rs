@@ -335,6 +335,42 @@ impl ChatStreamParser for StreamTestParser {
 }
 
 impl HTTPChatProvider for StreamTestProvider {
+    fn prepare_chat_request(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        stream: bool,
+    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
+        let request = self.chat_stream_request(messages, tools)?;
+        Ok(crate::chat::http::PreparedChatRequest {
+            request,
+            context: serde_json::json!({"private": "decoder-state", "stream": stream}),
+        })
+    }
+
+    fn parse_chat_with_context(
+        &self,
+        _response: Response<Vec<u8>>,
+        context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
+        assert_eq!(
+            context,
+            serde_json::json!({"private": "decoder-state", "stream": false})
+        );
+        Ok(ChatOutput::default())
+    }
+
+    fn chat_stream_parser_with_context(
+        &self,
+        context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        assert_eq!(
+            context,
+            serde_json::json!({"private": "decoder-state", "stream": true})
+        );
+        self.chat_stream_parser()
+    }
+
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> crate::error::LLMError {
         // Prove the adapter calls the provider classifier (not only status-only).
         let body = String::from_utf8_lossy(response.body());
@@ -518,6 +554,19 @@ async fn stream_parser_chunk_failure_preserves_classification() {
         other => panic!("expected ProviderResponseError, got {other}"),
     }
     assert!(err.is_retryable());
+}
+
+#[tokio::test]
+async fn http_adapter_returns_private_context_to_non_streaming_decoder() {
+    let uri = serve_once("HTTP/1.1 200 OK", &[], b"{}").await;
+    let adapter = LLMProviderFromHTTP::new(Box::new(StreamTestProvider {
+        uri,
+        parser: StreamTestParserMode::Unused,
+    }));
+    adapter
+        .chat_with_tools(&[], None)
+        .await
+        .expect("context-aware decode");
 }
 
 #[tokio::test]

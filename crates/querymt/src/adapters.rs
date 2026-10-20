@@ -42,14 +42,14 @@ impl LLMProviderFromHTTP {
     ) -> Result<ChatOutput, LLMError> {
         self.ensure_credential_fresh().await?;
 
-        let req = self.inner.chat_request(messages, tools)?;
+        let prepared = self.inner.prepare_chat_request(messages, tools, false)?;
 
-        let resp = call_outbound_raw(req).await?;
+        let resp = call_outbound_raw(prepared.request).await?;
         if !resp.status().is_success() {
             return Err(self.inner.classify_chat_error_async(&resp).await);
         }
 
-        self.inner.parse_chat(resp)
+        self.inner.parse_chat_with_context(resp, prepared.context)
     }
 }
 
@@ -89,16 +89,18 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         self.ensure_credential_fresh().await?;
 
-        let req = self.inner.chat_stream_request(messages, tools)?;
+        let prepared = self.inner.prepare_chat_request(messages, tools, true)?;
 
-        let stream = match call_outbound_stream_raw(req).await? {
+        let stream = match call_outbound_stream_raw(prepared.request).await? {
             OutboundStreamResult::Failure { response } => {
                 return Err(self.inner.classify_chat_error_async(&response).await);
             }
             OutboundStreamResult::Success { stream } => stream,
         };
 
-        let mut parser = self.inner.chat_stream_parser()?;
+        let mut parser = self
+            .inner
+            .chat_stream_parser_with_context(prepared.context)?;
         let s = stream
             .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
             .chain(futures::stream::iter([

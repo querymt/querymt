@@ -252,13 +252,6 @@ fn manual_code_entry() -> Result<String> {
     io::stdin().read_line(&mut response)?;
     let response = response.trim();
 
-    // Try to extract code from query string if present
-    // This handles cases where user pastes the full callback URL
-    if response.contains('?') || response.contains('&') {
-        if let Some(code) = querymt_utils::oauth::extract_code_from_query(response) {
-            return Ok(code);
-        }
-    }
-
+    // Each provider parses its own response; Anthropic must retain returned state.
     Ok(response.to_string())
 }

@@ -158,6 +158,11 @@ impl OAuthProvider for AnthropicProvider {
         "Anthropic"
     }
 
+    fn callback_port(&self) -> Option<u16> {
+        // This client uses the hosted code callback, not a loopback redirect.
+        None
+    }
+
     async fn start_flow(&self) -> Result<OAuthFlowData> {
         let client = AnthropicOAuthClient::new(OAuthConfig::default())?;
         let flow = client.start_flow(self.mode)?;
@@ -176,7 +181,25 @@ impl OAuthProvider for AnthropicProvider {
 
     async fn refresh_token(&self, refresh_token: &str) -> Result<TokenSet> {
         let client = AnthropicOAuthClient::new(OAuthConfig::default())?;
-        Ok(client.refresh_token(refresh_token).await?)
+        for attempt in 0..=2 {
+            match client.refresh_token(refresh_token).await {
+                Ok(tokens) => return Ok(tokens),
+                Err(error) => {
+                    let retryable = match &error {
+                        anthropic_auth::AnthropicAuthError::Http { status, .. } => *status >= 500,
+                        anthropic_auth::AnthropicAuthError::Network(error) => {
+                            error.is_connect() || error.is_timeout()
+                        }
+                        _ => false,
+                    };
+                    if !retryable || attempt == 2 {
+                        return Err(error.into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                }
+            }
+        }
+        unreachable!("bounded refresh loop always returns")
     }
 
     async fn create_api_key(&self, access_token: &str) -> Result<Option<String>> {
@@ -259,8 +282,9 @@ impl OAuthProvider for CodexProvider {
     }
 
     async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
+        let code = extract_code_from_query(code).unwrap_or_else(|| code.to_string());
         // Codex backend uses the OAuth access token directly.
-        let tokens = self.client.exchange_code(code, verifier).await?;
+        let tokens = self.client.exchange_code(&code, verifier).await?;
 
         Ok(convert_openai_tokens(tokens))
     }
@@ -510,6 +534,7 @@ impl OAuthProvider for XaiProvider {
     }
 
     async fn exchange_code(&self, code: &str, _state: &str, verifier: &str) -> Result<TokenSet> {
+        let code = extract_code_from_query(code).unwrap_or_else(|| code.to_string());
         let snapshot: XaiFlowSnapshot = serde_json::from_str(verifier)
             .map_err(|e| anyhow!("Invalid xAI OAuth flow data: {}", e))?;
         let http_client = Self::oauth_http_client()?;
@@ -771,6 +796,31 @@ pub async fn authenticate(
     Ok(())
 }
 
+/// Upper bound for one provider token refresh, including provider-side retries
+/// and api-key creation.
+///
+/// The underlying OAuth HTTP clients do not configure a request timeout, so a
+/// stalled connection would otherwise hold the per-provider refresh lock in
+/// [`get_or_refresh_token`] indefinitely and block all subsequent token reads
+/// for that provider.
+const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs `future` under [`TOKEN_REFRESH_TIMEOUT`].
+async fn bound_refresh<F>(provider: &str, future: F) -> Result<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout(TOKEN_REFRESH_TIMEOUT, future)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "{} OAuth token refresh timed out after {}s",
+                provider,
+                TOKEN_REFRESH_TIMEOUT.as_secs()
+            )
+        })
+}
+
 /// Refresh OAuth tokens for a provider
 ///
 /// # Arguments
@@ -789,16 +839,23 @@ pub async fn refresh_tokens(
         .get_oauth_tokens(provider.name())
         .ok_or_else(|| anyhow!("No OAuth tokens found for {}", provider.display_name()))?;
 
-    let new_tokens = provider.refresh_token(&tokens.refresh_token).await?;
+    // Bound the refresh so a stalled transport releases the per-provider
+    // refresh lock promptly instead of blocking every later token read.
+    let new_tokens = bound_refresh(provider.display_name(), async {
+        let new_tokens = provider.refresh_token(&tokens.refresh_token).await?;
 
-    // Store the new tokens
-    store.set_oauth_tokens(provider.name(), &new_tokens)?;
+        // Store the new tokens
+        store.set_oauth_tokens(provider.name(), &new_tokens)?;
 
-    if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await
-        && let Some(key_name) = provider.api_key_name()
-    {
-        let _ = store.set(key_name, &api_key);
-    }
+        if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await
+            && let Some(key_name) = provider.api_key_name()
+        {
+            let _ = store.set(key_name, &api_key);
+        }
+
+        Ok::<TokenSet, anyhow::Error>(new_tokens)
+    })
+    .await??;
 
     Ok(new_tokens)
 }
@@ -1079,12 +1136,24 @@ pub fn extract_code_from_query(input: &str) -> Option<String> {
 /// # }
 /// ```
 pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
+    let lock = oauth_refresh_lock(provider).await;
+    let _guard = lock.lock().await;
+    // Load credentials only after acquiring the guard: another request may have rotated them.
     log::debug!("Checking OAuth tokens for provider: {}", provider);
 
     let mut store = SecretStore::new().map_err(|e| anyhow!("Keyring access failed: {}", e))?;
 
     let oauth_provider = get_oauth_provider(provider, None)?;
     get_valid_token(oauth_provider.as_ref(), &mut store).await
+}
+
+async fn oauth_refresh_lock(provider: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+    type RefreshLocks = tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<RefreshLocks> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(RefreshLocks::default).lock().await;
+    locks.entry(provider.to_string()).or_default().clone()
 }
 
 #[cfg(test)]
@@ -1095,7 +1164,7 @@ mod tests {
     fn provider_flow_kinds() {
         let anthropic = AnthropicProvider::new(OAuthMode::Max);
         assert_eq!(anthropic.flow_kind(), OAuthFlowKind::RedirectCode);
-        assert_eq!(anthropic.callback_port(), Some(1455));
+        assert_eq!(anthropic.callback_port(), None);
         assert_eq!(anthropic.name(), "anthropic");
 
         let codex = CodexProvider::new();
@@ -1284,5 +1353,16 @@ mod tests {
     #[test]
     fn get_oauth_provider_rejects_unknown() {
         assert!(get_oauth_provider("unknown-provider", None).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn token_refresh_deadline_bounds_hanging_refresh() {
+        // A refresh future that never completes must surface a timeout error
+        // instead of holding the per-provider refresh lock forever.
+        let result = bound_refresh("test-provider", std::future::pending::<()>()).await;
+        let err = result.expect_err("hanging refresh should time out");
+        let message = err.to_string();
+        assert!(message.contains("test-provider"), "message: {message}");
+        assert!(message.contains("timed out"), "message: {message}");
     }
 }

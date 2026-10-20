@@ -1,11 +1,13 @@
 mod interface;
 pub use interface::{
     BinaryCodec, ExtismChatChunk, ExtismChatChunkParseRequest, ExtismChatParseRequest,
-    ExtismChatRequest, ExtismChatResponse, ExtismCompleteParseRequest, ExtismCompleteRequest,
-    ExtismEmbedParseRequest, ExtismEmbedRequest, ExtismListModelsParseRequest,
-    ExtismListModelsRequest, ExtismLogRecord, ExtismSttRequest, ExtismSttResponse,
-    ExtismTtsRequest, ExtismTtsResponse, ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION,
-    PluginError, StreamOpenResult, messages_require_item_aware_contract,
+    ExtismChatPrepareRequest, ExtismChatRequest, ExtismChatResponse, ExtismChatStreamParserRequest,
+    ExtismCompleteParseRequest, ExtismCompleteRequest, ExtismEmbedParseRequest, ExtismEmbedRequest,
+    ExtismListModelsParseRequest, ExtismListModelsRequest, ExtismLogRecord,
+    ExtismPreparedChatRequest, ExtismSttRequest, ExtismSttResponse, ExtismTtsRequest,
+    ExtismTtsResponse, ExtismVoiceConfig, ITEM_AWARE_CHAT_CONTRACT_VERSION,
+    PREPARED_CHAT_CONTRACT_VERSION, PluginError, StreamOpenResult,
+    messages_require_item_aware_contract,
 };
 
 #[cfg(feature = "extism_host")]
