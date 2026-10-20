@@ -22,7 +22,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.70">
+      <meta name="generator" content="zensical-0.0.71">
     
     
       
@@ -1463,6 +1463,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#native-git-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Native Git operations
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Native Git operations">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#supported-repository-layouts" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Supported repository layouts
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#native-commands-and-typed-operations" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1479,6 +1507,28 @@
     <span class="md-ellipsis">
       <span class="md-typeset">
         Opt-in workflow
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#removal-external-writers-and-retained-refs" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Removal, external writers, and retained refs
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#provisioning-phases-and-recovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Provisioning phases and recovery
       </span>
     </span>
   </a>
@@ -1502,6 +1552,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#workspace-scoped-slash-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Workspace-scoped slash commands
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#forking" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1509,6 +1570,23 @@
       </span>
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Forking">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#pending-and-failed-fork-creation" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Pending and failed fork creation
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1524,10 +1602,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#reviewing-and-integrating-delegate-results" class="md-nav__link">
+  <a href="#reviewing-and-integrating-results" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
-        Reviewing and integrating delegate results
+        Reviewing and integrating results
       </span>
     </span>
   </a>
@@ -1848,11 +1926,11 @@ builder; without it every session executes locally exactly as before:</p>
 <span class="normal"><a href="#__codelineno-0-11">11</a></span>
 <span class="normal"><a href="#__codelineno-0-12">12</a></span>
 <span class="normal"><a href="#__codelineno-0-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">Arc</span><span class="p">;</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">worktree</span><span class="p">::{</span><span class="n">CliGit</span><span class="p">,</span><span class="w"> </span><span class="n">WorkspaceService</span><span class="p">};</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">worktree</span><span class="p">::{</span><span class="n">GixRepoOps</span><span class="p">,</span><span class="w"> </span><span class="n">WorkspaceService</span><span class="p">};</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3"></a>
 <a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">storage_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">dirs</span><span class="p">::</span><span class="n">data_dir</span><span class="p">().</span><span class="n">unwrap</span><span class="p">().</span><span class="n">join</span><span class="p">(</span><span class="s">"qmt/worktrees"</span><span class="p">);</span>
 <a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">service</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">WorkspaceService</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">CliGit</span><span class="p">::</span><span class="n">new</span><span class="p">()),</span>
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">GixRepoOps</span><span class="p">::</span><span class="n">new</span><span class="p">()),</span>
 <a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="w">    </span><span class="n">storage</span><span class="p">.</span><span class="n">workspace_repository</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">"backend exposes a workspace repository"</span><span class="p">),</span>
 <a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="w">    </span><span class="n">storage_root</span><span class="p">,</span><span class="w"> </span><span class="c1">// durable worktree storage, e.g. ~/.local/share/qmt/worktrees</span>
 <a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="p">));</span>
@@ -1933,27 +2011,111 @@ extension (additive; upstream protocol types are unchanged):</p>
   storage, or local filesystem placement is unavailable, creation fails with
   an actionable error instead of silently running shared.</li>
 </ul>
+<p><code>current_working_tree</code> capture details:</p>
+<ul>
+<li><strong>Tracked membership comes from HEAD plus the real index.</strong> A file
+  force-added to the index is captured with its working contents — even when
+  ignore rules would exclude it — and later working edits to it are captured
+  too. Genuinely untracked ignored files stay excluded and disclosed. The
+  parent's staging partition is not imported: a partially staged file uses
+  its working content, and the real index stays byte-for-byte unchanged.</li>
+<li><strong>Capture is repository-wide.</strong> A session started in a subdirectory still
+  captures from the resolved checkout root; the relative cwd only applies to
+  child execution. Root-level <code>core.sparseCheckout</code> therefore cannot be
+  bypassed from a subdirectory.</li>
+<li><strong>Unsupported content is rejected with path diagnostics before any child
+  launches.</strong> Active submodules are detected from gitlink entries in HEAD or
+  the index (no <code>.gitmodules</code> required); sparse checkouts and unborn HEAD or
+  unresolved conflicts fail as before.</li>
+<li><strong>External filter processes are unsupported and rejected via effective
+  attributes.</strong> Attribute resolution follows Git semantics — nested
+  <code>.gitattributes</code> files, <code>$GIT_DIR/info/attributes</code>, global attribute
+  files, and <code>[attr]</code> macros — and any path resolving to <code>filter=lfs</code> (or
+  any other external clean/smudge filter) fails capture with a diagnostic
+  naming the path. A filter configuration with no matching paths is not a
+  blocker: rejection is path-based, never a root-file text scan. Working
+  contents are captured as raw bytes; text/eol normalization and external
+  filters are not applied.</li>
+<li><strong>Externally changing sources are retried, then rejected.</strong> The source
+  HEAD, index (including newly staged files), and captured tree are
+  validated before and after capture; a mismatch retriggers a bounded retry
+  and fails explicitly rather than launching from a known-inconsistent
+  baseline. This is not a transactional snapshot against arbitrary hostile
+  writers — a write landing after the post-validation is undetectable.</li>
+</ul>
+<h2 id="native-git-operations">Native Git operations</h2>
+<p>All built-in workspace operations — baseline capture, branch and ref
+administration, linked-worktree creation/inventory/removal, status, and
+ancestry checks — are implemented natively in Rust on top of <code>gix</code> (0.89).
+No Git executable is required, installed, or invoked for these built-in
+operations; QueryMT needs a supported toolchain (Rust ≥ 1.88) but nothing
+else. Building the <code>WorkspaceService</code> takes a <code>GixRepoOps</code> value (see the
+example above); there is no Git-CLI configuration knob.</p>
+<p>Repository-opening policy: administration operations (branches, refs,
+worktree registration/inventory/removal, ancestry) open the canonical Git
+<strong>common directory</strong> resolved from the source at creation time and stored on
+every workspace record — never a working directory guessed from a checkout.
+Per-checkout operations (status, HEAD, capture, index reads) open the explicit
+checkout path. Both use an isolated open that ignores inherited <code>GIT_DIR</code>,
+<code>GIT_WORK_TREE</code>, and <code>GIT_INDEX_FILE</code> overrides, so an ambient environment
+cannot redirect operations to a different repository, worktree, or index.
+Repository-local configuration is still honored.</p>
+<h3 id="supported-repository-layouts">Supported repository layouts</h3>
+<p>Workspace creation, status, capture, result review, recovery, and removal
+work for all of these source layouts:</p>
+<ul>
+<li><strong>Ordinary checkout</strong> — <code>.git</code> directory directly below the working tree.</li>
+<li><strong>Separate Git directory</strong> — the checkout carries a <code>.git</code> <em>file</em> pointing
+  at a Git directory stored elsewhere (the <code>git init --separate-git-dir</code>
+  layout, with <code>core.worktree</code> pointing back). Administration targets the
+  external Git directory; the checkout is never assumed to contain one.</li>
+<li><strong>Existing linked source</strong> — the session starts in a linked worktree of an
+  ordinary repository. Its managed checkout becomes a sibling linked worktree
+  of the same shared repository.</li>
+<li><strong>Linked checkout backed by a bare common repository</strong> — the source is a
+  linked worktree whose common repository is bare (e.g. <code>project.git</code>). The
+  bare registration itself has no working tree and is never misread as a
+  usable checkout; the linked checkout is the only one listed and managed.</li>
+</ul>
+<p>A bare source without a working checkout is rejected explicitly with
+<code>BareRepositoryUnsupported</code> before any workspace resources are allocated.
+Other layout diagnostics: <code>NotGitRepository</code> (no repository at or above the
+path), <code>RelativeCwdOutsideCheckout</code>, and <code>RelativeCwdAbsent</code> (a subdirectory
+session whose directory the selected baseline lacks).</p>
+<p>All paths are canonicalized at resolution time, so path aliases (symlinks)
+resolve to identical repository and checkout identities: a durable workspace
+has exactly one owner and one administration lock no matter which alias a
+caller uses, and project grouping keys on the canonical common directory.
+Grouped sessions share the project identity but keep distinct execution
+paths and per-checkout indexes — grouping never merges execution state.</p>
+<p>This native layer is distinct from the Git activity a session may perform
+through its own tools: arbitrary shell commands the model runs, and any
+configured external filters or hooks, execute Git however they choose and
+are neither intercepted nor restricted by this service. Built-in typed
+operations never shell out and never parse Git command output.</p>
 <h2 id="native-commands-and-typed-operations">Native commands and typed operations</h2>
 <p>Submit these as ordinary ACP <code>session/prompt</code> text, not queued or steering
 input. They are intercepted before prompt expansion and never ask the model
 to run Git commands:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1">1</a></span>
-<span class="normal"><a href="#__codelineno-2-2">2</a></span>
-<span class="normal"><a href="#__codelineno-2-3">3</a></span>
-<span class="normal"><a href="#__codelineno-2-4">4</a></span>
-<span class="normal"><a href="#__codelineno-2-5">5</a></span>
-<span class="normal"><a href="#__codelineno-2-6">6</a></span>
-<span class="normal"><a href="#__codelineno-2-7">7</a></span>
-<span class="normal"><a href="#__codelineno-2-8">8</a></span>
-<span class="normal"><a href="#__codelineno-2-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a>/worktree create
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-2-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-2-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-2-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-2-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-2-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-2-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-2-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-2-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-2-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a>/worktree create
 <a id="__codelineno-2-2" name="__codelineno-2-2"></a>/worktree create HEAD review
 <a id="__codelineno-2-3" name="__codelineno-2-3"></a>/worktree create --include-local-changes review
 <a id="__codelineno-2-4" name="__codelineno-2-4"></a>/worktree list
 <a id="__codelineno-2-5" name="__codelineno-2-5"></a>/worktree status &lt;workspace-id&gt;
 <a id="__codelineno-2-6" name="__codelineno-2-6"></a>/worktree result &lt;workspace-id&gt;
-<a id="__codelineno-2-7" name="__codelineno-2-7"></a>/worktree archive &lt;workspace-id&gt;
-<a id="__codelineno-2-8" name="__codelineno-2-8"></a>/worktree remove &lt;workspace-id&gt;
-<a id="__codelineno-2-9" name="__codelineno-2-9"></a>/worktree recover &lt;workspace-id&gt;
+<a id="__codelineno-2-7" name="__codelineno-2-7"></a>/worktree publish [workspace-id]
+<a id="__codelineno-2-8" name="__codelineno-2-8"></a>/worktree archive &lt;workspace-id&gt;
+<a id="__codelineno-2-9" name="__codelineno-2-9"></a>/worktree remove &lt;workspace-id&gt;
+<a id="__codelineno-2-10" name="__codelineno-2-10"></a>/worktree recover &lt;workspace-id&gt;
 </code></pre></div></td></tr></table></div>
 <p><code>create</code> returns a <strong>new session ID</strong>, workspace ID, checkout path, branch,
 and baseline. Attach to that new session to work there: the conversation
@@ -1961,9 +2123,9 @@ issuing the command does not switch roots. The optional name labels the new
 session, not its managed branch. Names and refs are single whitespace-separated
 tokens. With <code>--include-local-changes</code>, an optional name is accepted but a base
 ref is not. Without that flag local edits are excluded. Ignored untracked
-files are always excluded. <code>status</code> and <code>result</code> default to the current
-session's workspace when no ID is supplied; local sessions must supply an ID.
-Results are also returned in prompt response <code>_meta["querymt.worktree"]</code>.</p>
+files are always excluded. <code>status</code>, <code>result</code>, and <code>publish</code> default to the
+current session's workspace when no ID is supplied; local sessions must supply
+an ID. Results are also returned in prompt response <code>_meta["querymt.worktree"]</code>.</p>
 <p>The same service backs additive ACP extension methods:</p>
 <table>
 <thead>
@@ -1990,6 +2152,10 @@ Results are also returned in prompt response <code>_meta["querymt.worktree"]</co
 <td><code>{"workspace_id":"&lt;id&gt;"}</code></td>
 </tr>
 <tr>
+<td><code>querymt/worktree/publish</code></td>
+<td><code>{"workspace_id":"&lt;id&gt;"}</code> or <code>{"session_id":"&lt;id&gt;"}</code></td>
+</tr>
+<tr>
 <td><code>querymt/worktree/archive</code></td>
 <td><code>{"workspace_id":"&lt;id&gt;"}</code></td>
 </tr>
@@ -1999,17 +2165,26 @@ Results are also returned in prompt response <code>_meta["querymt.worktree"]</co
 </tr>
 <tr>
 <td><code>querymt/worktree/recover</code></td>
-<td><code>{"workspace_id":"&lt;id&gt;"}</code></td>
+<td><code>{"workspace_id":"&lt;id&gt;"}</code> or <code>{"session_id":"&lt;id&gt;"}</code> (pending isolated forks)</td>
 </tr>
 </tbody>
 </table>
 <p>Commit-based creation also accepts <code>base_ref</code> (or <code>baseRef</code>). Result responses
-contain immutable baseline/result OIDs, retained result refs, and verification
-status; an empty result list does not imply integration. Session views include
-workspace provenance and distinct execution cwd values. Managed sessions group
-under <code>repository:&lt;canonical-common-dir&gt;</code>; local sessions retain cwd grouping.
-A durable <code>session_workspace_bound</code> event exposes the same binding without
+carry the immutable baseline/result OIDs and retained result refs, the
+baseline-relative changed paths with change kinds, the verification state, and
+the <strong>captured HEAD</strong>; live HEAD and dirty status are reported separately. An
+empty result list does not imply integration. Session views include workspace
+provenance and distinct execution cwd values. Managed sessions group under
+<code>repository:&lt;canonical-common-dir&gt;</code>; local sessions retain cwd grouping. A
+durable <code>session_workspace_bound</code> event exposes the same binding without
 changing existing ACP session updates.</p>
+<p><code>publish</code> is the explicit top-level publication entry point. It captures the
+workspace's current uncommitted working state as an immutable result through
+the same private-index capture used for delegates, so the real index, working
+files, and every other checkout remain unchanged. Publication performs no
+verification, which is reported as <code>skipped</code>. A failed capture reports an
+explicit error and keeps the checkout untouched; it never records a partial
+result. Inspection (<code>result</code>) is read-only and never republishes live state.</p>
 <h3 id="opt-in-workflow">Opt-in workflow</h3>
 <ol>
 <li>Configure the durable workspace service and create a session with
@@ -2017,7 +2192,8 @@ changing existing ACP session updates.</p>
 <li>Attach to its returned session ID. Its delegates inherit isolation; a local
    parent can explicitly request <code>"isolation":"isolated"</code> on the delegate tool.</li>
 <li>Inspect the retained child ID/path and <code>/worktree result &lt;id&gt;</code>. Review only
-   baseline-to-result changes using the exact OIDs/refs in the response.</li>
+   baseline-to-result changes using the exact OIDs/refs in the response. A
+   top-level workspace publishes its own delta with <code>/worktree publish</code>.</li>
 <li>Integrate that delta manually after review. No completion, cancellation,
    disconnection, or command merges it for you.</li>
 <li>Close the owning session and any explicitly shared delegates. From another
@@ -2030,15 +2206,91 @@ changing existing ACP session updates.</p>
    Dirty, untracked, ignored, externally owned, or unpreserved-result checkouts
    remain protected. There is no <code>--force</code>; successful removal reports retained refs.</li>
 </ol>
+<p>Removal safety does not depend on Git status configuration: untracked and
+ignored files are detected even when <code>status.showUntrackedFiles=no</code> is set,
+and any such content refuses removal with nothing deleted.</p>
+<h3 id="removal-external-writers-and-retained-refs">Removal, external writers, and retained refs</h3>
+<p>The repository-administration lock coordinates QueryMT processes only; plain
+Git commands and editors never honor it. Removal therefore assumes external
+writers and is race-safe by construction:</p>
+<ul>
+<li>The managed branch is observed during the preservation checks and deleted
+  with an <strong>expected-target transaction</strong> (delete only while it still points
+  at the observed commit). If an external writer moves the branch between
+  check and deletion, the branch — together with its new history — is
+  <strong>retained, never deleted</strong>, and the removal response discloses the race in
+  <code>branch_moved_during_removal</code> plus the branch in <code>retained_refs</code>.</li>
+<li>Removal responses always report exactly what remains:
+  <code>checkout_removed</code>, <code>removed_branch</code>, <code>branch_moved_during_removal</code>, and
+  <code>retained_refs</code>. A response never claims complete deletion when anything
+  was retained or refused; baseline refs of removed workspaces are always
+  retained and listed.</li>
+<li>Interrupted <code>removing</code> state recovers through the same safety checks, run
+  freshly: a branch moved while removal was interrupted is refused as
+  unpreserved until its commits are contained in a retained result ref, and
+  an already-deleted branch or vanished checkout is completed idempotently
+  without unconditional deletion.</li>
+</ul>
 <p>For an interrupted <code>provisioning</code> or <code>removing</code> operation, use
 <code>/worktree recover &lt;id&gt;</code> (or its typed extension). Recovery completes the
-persisted intent conservatively and never starts an actor or changes its owner.</p>
+persisted intent conservatively and never starts an actor or changes its owner.
+Pending isolated forks recover by session id through the typed extension:
+<code>querymt/worktree/recover</code> with <code>{"session_id":"&lt;id&gt;"}</code>.</p>
+<h3 id="provisioning-phases-and-recovery">Provisioning phases and recovery</h3>
+<p>Provisioning records its progress durably after every step, so a crash at any
+boundary can be replayed from the recorded state instead of guessing:</p>
+<ol>
+<li><strong>Intent persisted</strong> — the workspace row exists with its source identity
+   (source checkout and repository), requested baseline policy and ref,
+   relative cwd, intended branch and checkout path, and a unique operation id.
+   Nothing has been captured or allocated yet.</li>
+<li><strong>Baseline bound</strong> — the immutable baseline identity is durably bound.</li>
+<li><strong>Baseline ref published</strong> — <code>refs/qmt/baselines/&lt;workspace-id&gt;</code> exists at
+   the bound baseline.</li>
+<li><strong>Branch created</strong> — the managed branch exists at the baseline commit.</li>
+<li><strong>Checkout created</strong> — the linked worktree exists; only the final
+   <code>ready</code> transition remains.</li>
+</ol>
+<p>Recovery behavior depends on how far the interrupted allocation got:</p>
+<ul>
+<li><strong>Intent-only (no baseline bound).</strong> The recorded source and policy are
+  sufficient to finish: recovery re-resolves the recorded ref (or source
+  HEAD) or re-runs the validated current-working-tree capture against the
+  recorded source checkout. The source must still exist and be a usable
+  repository — recovery never fabricates a baseline. If the source is
+  unavailable or the recorded ref no longer resolves, the workspace stays
+  non-runnable (<code>provisioning</code>) with an actionable diagnostic in
+  <code>last_error</code>, and a later explicit retry succeeds once the source is back.</li>
+<li><strong>Recovery-time captures are disclosed.</strong> A baseline captured during
+  recovery reflects the source contents at recovery time — not the state
+  before the interruption — and is reported as
+  <code>baselineSource: "captured-during-recovery"</code>; a baseline that was already
+  bound before the crash is reported as <code>"bound-before-interruption"</code> and is
+  preserved exactly. Recovery never recaptures or replaces a bound baseline.</li>
+<li><strong>Retained baseline refs are repaired, never rewritten.</strong> If the process
+  crashed after binding the baseline but before publishing its ref, recovery
+  recreates <code>refs/qmt/baselines/&lt;workspace-id&gt;</code> at that exact baseline. If a
+  ref with that name already exists at a different commit, recovery refuses
+  with an explicit conflict instead of overwriting it; resolve the conflict
+  manually, then retry.</li>
+<li><strong>No duplicates, no silent startup.</strong> Recovery reuses the recorded branch,
+  checkout path, and operation id — including branches or checkouts that
+  were already created before the crash — and never registers a second
+  workspace row or a second writable owner for the same checkout.
+  Pre-existing directories at the checkout path that QueryMT does not own
+  are preserved untouched. Recovery never launches an actor; only a fully
+  provisioned and durably bound workspace becomes runnable, and a pending
+  isolated fork still cannot load or resume as local execution.</li>
+</ul>
 <h2 id="resuming-and-loading">Resuming and loading</h2>
 <p>A session's workspace binding is persisted independently of conversation
 contents. Resume/load always resolve that binding first:</p>
 <ul>
 <li>The session runs in its <strong>persisted checkout</strong> — the same path across
-  restarts — regardless of where the client reattaches from.</li>
+  restarts — regardless of where the client reattaches from. The binding,
+  not any caller-supplied path, is the single authority for the effective
+  working directory; tool context, indexes, hooks, and delegation all
+  resolve it the same way.</li>
 <li>A <strong>conflicting <code>cwd</code> request fails</strong> with a workspace-specific diagnostic;
   it is never silently re-bound to a different directory.</li>
 <li>A <strong>missing checkout fails closed</strong>. Deleted worktrees are recorded
@@ -2048,6 +2300,40 @@ contents. Resume/load always resolve that binding first:</p>
 <p>One workspace has exactly <strong>one writable owner session</strong>. A second session
 cannot attach to an owned checkout; it creates its own through an explicit
 creation request.</p>
+<h2 id="workspace-scoped-slash-commands">Workspace-scoped slash commands</h2>
+<p>Slash commands follow the effective workspace. A managed session discovers
+its commands from its <strong>bound checkout</strong>, not from the directory the agent
+process was started in:</p>
+<ul>
+<li><strong>Project commands</strong> (<code>.qmt/commands/*.md</code>) are re-resolved from the
+  checkout for both the advertised catalog and the actual <code>/command</code>
+  expansion, so the two always agree. Two checkouts of the same project can
+  define the same command differently, and each session expands its own
+  version.</li>
+<li>A command that exists <strong>only in an isolated checkout</strong> can be invoked in
+  that session; the original checkout does not consult the isolated one.</li>
+<li><strong>Global and configured sources</strong> (for example <code>~/.qmt/commands</code> and
+  explicitly configured paths) follow the same discovery configuration as
+  agent startup, and the scripts policy (enabled/disabled) is unchanged.</li>
+</ul>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
+<span class="normal"><a href="#__codelineno-3-2">2</a></span>
+<span class="normal"><a href="#__codelineno-3-3">3</a></span>
+<span class="normal"><a href="#__codelineno-3-4">4</a></span>
+<span class="normal"><a href="#__codelineno-3-5">5</a></span>
+<span class="normal"><a href="#__codelineno-3-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="gp"># </span>In<span class="w"> </span>the<span class="w"> </span>original<span class="w"> </span>checkout,<span class="w"> </span>/deploy<span class="w"> </span>may<span class="w"> </span>read:
+<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="gp">#   </span><span class="s2">"Deploy to staging"</span><span class="w">  </span><span class="o">(</span>project<span class="w"> </span><span class="nb">command</span><span class="w"> </span>committed<span class="w"> </span>on<span class="w"> </span>main<span class="o">)</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="go">/worktree create feature-x</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="gp"># </span>In<span class="w"> </span>the<span class="w"> </span>isolated<span class="w"> </span>session,<span class="w"> </span>the<span class="w"> </span>same<span class="w"> </span>.qmt/commands/deploy.md<span class="w"> </span>now<span class="w"> </span>reads:
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="gp">#   </span><span class="s2">"Deploy the service"</span><span class="w">  </span><span class="o">(</span>as<span class="w"> </span>defined<span class="w"> </span><span class="k">in</span><span class="w"> </span>that<span class="w"> </span>checkout<span class="o">)</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="go">/deploy api</span>
+</code></pre></div></td></tr></table></div>
+<p>Absolute paths inside command prompts are <strong>not rewritten</strong> — a prompt that
+hard-codes <code>/Users/me/project/src</code> keeps referring there, so prefer
+repository-relative paths in shared command files. The native <code>/worktree</code>
+command family keeps its built-in interception and is never expanded as a
+prompt command, and legacy local sessions continue to use the registry
+built at agent startup.</p>
 <h2 id="forking">Forking</h2>
 <p>Forking a session copies its conversation up to a message fork point, as
 before. An isolated source automatically gives the fork its own fresh
@@ -2058,11 +2344,43 @@ workspace, even without metadata. A local source can request isolation explicitl
   response discloses this via
   <code>_meta.querymt.sessionWorkspace.disclosure = "fresh-working-state"</code> and
   includes the fork's <code>workspaceId</code> and <code>sessionCwd</code>.</li>
+<li>The fork's persisted session cwd <strong>is</strong> its bound checkout: the row, the
+  workspace binding, listing, load, and resume all agree with no external
+  rewrite. Historical absolute paths in copied messages are context only —
+  they are not rewritten, and there is <strong>no live workspace switching</strong>.</li>
 <li>The message fork point and the workspace association are recorded
   <strong>separately</strong>: selecting an older message does not rewind files.</li>
 <li>Forks never share a checkout with the source, a sibling, or the parent.</li>
 <li>Forks of local sources without workspace options remain pure message copies.</li>
 <li>An explicit local fork of an isolated source is rejected rather than sharing its checkout.</li>
+</ul>
+<h3 id="pending-and-failed-fork-creation">Pending and failed fork creation</h3>
+<p>Creation is fail-closed at every boundary. An invalid request creates no
+fork row and copies no history. Once the conversation copy commits, a
+durable <strong>startup barrier</strong> (a pending isolation intent) travels with the
+fork until its workspace is allocated, bound as the single writable owner,
+and the execution cwd is published atomically in SQLite:</p>
+<ul>
+<li>A pending or failed fork is <strong>not runnable</strong>: load and resume reject it
+  with <code>fork isolation is pending; refusing local fallback</code> instead of
+  running it in the source checkout — including after a restart or when no
+  workspace service is configured.</li>
+<li>Failures compensate only newly allocated, unused resources: a workspace
+  whose owner binding failed is marked <code>failed</code> (diagnostic retained, Git
+  resources preserved for explicit recovery/removal); the copied history is
+  always preserved.</li>
+<li>Session <strong>listing flags these forks</strong> (<code>pending_isolation</code>), and the
+  workspace view carries the failed lifecycle when one exists, so a pending
+  fork is never mistaken for a legacy local session.</li>
+<li><strong>Recovery is explicit</strong> and creates no duplicate owners:
+  <code>querymt/worktree/recover</code> with <code>{"session_id": ...}</code> completes a pending
+  fork — reusing its bound workspace when a previous attempt already
+  attached it, otherwise allocating one (with a baseline captured at
+  recovery time, disclosed in the response) — persists the execution cwd,
+  and releases the barrier in one validated SQLite transaction. Workspace
+  records with interrupted provisioning/removal intents recover by id via
+  <code>/worktree recover &lt;workspace-id&gt;</code> as before. A recovered fork runs in its
+  own checkout; retries are refused once nothing is pending.</li>
 </ul>
 <h2 id="undo-snapshots-and-workspace-references">Undo, snapshots, and workspace references</h2>
 <p>Undo and redo reuse the <strong>existing snapshot backend</strong>, unchanged. The
@@ -2091,44 +2409,59 @@ delegation, and the worktree command surface keep working without a
 snapshot backend, and undo reports its usual unavailable-backend behavior
 rather than substituting workspace Git refs as undo history. Enabling
 isolation never silently enables snapshots when they were disabled.</p>
-<h2 id="reviewing-and-integrating-delegate-results">Reviewing and integrating delegate results</h2>
-<p>Nothing is ever merged back automatically. When an isolated delegate
-finishes, its workspace — checkout path, managed branch, baseline, and (for
-uncommitted output) a captured result — is retained exactly as it was, and
-the completion, failure, cancellation, and summary output identify what was
-retained.</p>
-<p>A retained result is <strong>baseline-relative</strong>. The delegate started from a
-private baseline commit (which included the parent's working state at
-dispatch); the captured result contains that baseline plus the delegate's
-own work. To see only what the delegate did, diff the two refs:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
-<span class="normal"><a href="#__codelineno-3-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-only<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="w">                      </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
+<h2 id="reviewing-and-integrating-results">Reviewing and integrating results</h2>
+<p>Nothing is ever merged back automatically. Delegates publish their uncommitted
+output automatically on completion; top-level workspaces publish explicitly
+with <code>/worktree publish</code> or <code>querymt/worktree/publish</code>. Either way the
+workspace — checkout path, managed branch, baseline, and a captured immutable
+result — is retained exactly as it was, and the completion, failure,
+cancellation, and summary output identify what was retained.</p>
+<p>A retained result is <strong>baseline-relative</strong>. The workspace started from a
+private baseline commit (which included the parent's working state at dispatch
+for delegates); the captured result contains that baseline plus the
+workspace's own work. Review reports the baseline-to-result changes without
+consulting the live checkout:</p>
+<ul>
+<li><code>baseline_commit</code> / <code>result_commit</code> and the retained <code>result_ref</code>
+  (<code>refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;</code>),</li>
+<li><code>changed_paths</code> with change kinds (<code>added</code>, <code>modified</code>, <code>deleted</code>),</li>
+<li><code>captured_head</code> — the checkout HEAD when the result was captured — and the
+  <code>verification</code> state (<code>passed</code>, <code>failed</code>, <code>pending</code>, or <code>skipped</code>),</li>
+<li>live <code>live_head</code>/<code>dirty</code> state separately; later edits or commits never
+  rewrite an existing result, and each new publication gets its own
+  create-only ref.</li>
+</ul>
+<p>You can also reproduce the delta with Git directly:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
+<span class="normal"><a href="#__codelineno-4-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
 </code></pre></div></td></tr></table></div>
 <p>Example: a parent with uncommitted edits to <code>config.rs</code> dispatches an
 isolated delegate that changes <code>auth.rs</code> and leaves <code>notes.md</code> untracked.
 The baseline already contains the <code>config.rs</code> edit, so the baseline→result
-diff lists exactly <code>auth.rs</code> and <code>notes.md</code> — the delegate's delta — and
-never reports the inherited <code>config.rs</code> change as delegate work.</p>
+review lists exactly <code>auth.rs</code> and <code>notes.md</code> — the delegate's delta — and
+never reports the inherited <code>config.rs</code> change as delegate work. The same
+applies to an explicit top-level publication, which reports only that
+workspace's changes since its baseline.</p>
 <div class="admonition warning">
 <p class="admonition-title">Do not raw-merge a private branch from a dirty parent</p>
-<p>The delegate's managed branch points at (or beyond) its baseline, and
-the baseline embeds the parent's uncommitted edits at dispatch time.
-<code>git merge &lt;managed-branch&gt;</code> (or cherry-picking its tip wholesale) can
-therefore bring the parent's baseline edits along with the delegate's
-work. Integrate the delta deliberately instead:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
-<span class="normal"><a href="#__codelineno-4-2">2</a></span>
-<span class="normal"><a href="#__codelineno-4-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="c1"># Apply only the delegate's delta onto your current branch:</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
+<p>When the baseline captured uncommitted parent edits, result responses set
+<code>baseline_includes_uncommitted_edits</code> and include an
+<code>integration_warning</code>. The managed branch points at (or beyond) that
+baseline, so <code>git merge &lt;managed-branch&gt;</code> (or cherry-picking its tip
+wholesale) can bring the parent's baseline edits along with the
+workspace's work. Integrate the delta deliberately instead:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
+<span class="normal"><a href="#__codelineno-5-2">2</a></span>
+<span class="normal"><a href="#__codelineno-5-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
 </code></pre></div></td></tr></table></div>
-<p>or, if the delegate produced real commits and the parent was clean,
-cherry-pick the delegate's commit range. If the parent was dirty, either
-commit the parent's state coherently first, or apply the baseline-relative
-patch as above. A clean worktree or a completed status never implies the
-result has been applied or accepted — review the delta and integrate it
-yourself.</p>
+<p>or, if the workspace produced real commits and the parent was clean,
+cherry-pick the commit range. If the parent was dirty, either commit the
+parent's state coherently first, or apply the baseline-relative patch as
+above. A clean worktree or a completed status never implies the result has
+been applied or accepted — review the delta and integrate it yourself.</p>
 </div>
 <h2 id="what-isolation-does-not-do">What isolation does not do</h2>
 <ul>
@@ -2162,6 +2495,7 @@ yourself.</p>
 </ul>
 <h2 id="see-also">See also</h2>
 <ul>
+<li><a href="../slash-commands/">Slash Commands</a> — command discovery and format</li>
 <li><a href="../delegation/">Delegation</a> — multi-agent delegation</li>
 <li><a href="../api_reference/">API Reference</a> — session creation and fork requests</li>
 </ul>
