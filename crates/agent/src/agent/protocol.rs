@@ -149,7 +149,9 @@ fn stdio_command(stdio: &McpServerStdio, cwd: Option<&std::path::Path>) -> tokio
         .stderr(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .stdin(std::process::Stdio::piped());
-    if let Some(dir) = cwd {
+    // Only an existing directory: a stale stored cwd must not turn into a
+    // spawn failure for a server that never depended on it.
+    if let Some(dir) = cwd.filter(|dir| dir.is_dir()) {
         cmd.current_dir(dir);
     }
     cmd
@@ -266,6 +268,12 @@ mod tests {
 
         // Local sessions keep the agent process working directory.
         let cmd = stdio_command(&server, None);
+        assert_eq!(cmd.as_std().get_current_dir(), None);
+
+        // A stale (missing) workspace directory is ignored rather than
+        // failing the spawn.
+        let missing = dir.path().join("does-not-exist");
+        let cmd = stdio_command(&server, Some(&missing));
         assert_eq!(cmd.as_std().get_current_dir(), None);
     }
 }

@@ -325,8 +325,13 @@ impl WorkspaceAllocator {
             Some(preset) => preset.clone(),
             None => match baseline_mode {
                 BaselineMode::Commit => {
-                    let base_commit =
-                        resolve_base_commit(self.git.as_ref(), common_dir, base_ref).await?;
+                    let base_commit = resolve_base_commit(
+                        self.git.as_ref(),
+                        common_dir,
+                        &source.checkout.root,
+                        base_ref,
+                    )
+                    .await?;
                     Baseline {
                         mode: BaselineMode::Commit,
                         source_head: base_commit.clone(),
@@ -618,6 +623,7 @@ impl WorkspaceAllocator {
                 let base_commit = resolve_base_commit(
                     self.git.as_ref(),
                     &record.repository.common_dir,
+                    &record.repository.origin_path,
                     record.requested_base_ref.as_deref(),
                 )
                 .await?;
@@ -752,10 +758,28 @@ pub(crate) fn repo_slug(common_dir: &Path) -> String {
 async fn resolve_base_commit(
     ops: &dyn RepositoryOps,
     common_dir: &Path,
+    source_checkout: &Path,
     base_ref: Option<&str>,
 ) -> WorktreeResult<String> {
     let expr = base_ref.unwrap_or("HEAD");
     validate_rev_expression(expr)?;
+    // `HEAD` is per-worktree: opened through the common directory it is the
+    // main checkout's HEAD, not the (possibly linked) source checkout's.
+    // HEAD-relative expressions (`HEAD`, `HEAD~2`, `HEAD^`) are therefore
+    // anchored to the source checkout's HEAD commit; named refs and all ref
+    // writes keep using the common directory.
+    let expr = match head_relative_suffix(expr) {
+        Some(suffix) => {
+            let head = ops.head_commit(source_checkout).await?.ok_or_else(|| {
+                WorktreeError::InvalidOperation(
+                    "source checkout has no commits (unborn HEAD); cannot resolve a base commit"
+                        .to_string(),
+                )
+            })?;
+            format!("{head}{suffix}")
+        }
+        None => expr.to_string(),
+    };
     let rev = format!("{expr}^{{commit}}");
     match ops.resolve_commit(common_dir, &rev).await? {
         Some(commit) => Ok(commit),
@@ -764,6 +788,19 @@ async fn resolve_base_commit(
             status: "rev-parse failed".to_string(),
             stderr: format!("{expr} does not resolve to a commit"),
         }),
+    }
+}
+
+/// If `expr` is `HEAD` (or `@`) optionally followed by `~`/`^` ancestry
+/// operators, return that operator suffix. Branch names that merely start
+/// with `HEAD` and reflog forms (`HEAD@{1}`) are not HEAD-relative here.
+fn head_relative_suffix(expr: &str) -> Option<&str> {
+    let rest = expr
+        .strip_prefix("HEAD")
+        .or_else(|| expr.strip_prefix('@'))?;
+    match rest.chars().next() {
+        None | Some('~') | Some('^') => Some(rest),
+        _ => None,
     }
 }
 

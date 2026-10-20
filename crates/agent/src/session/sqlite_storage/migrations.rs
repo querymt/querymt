@@ -192,16 +192,43 @@ fn migration_0025_workspace_archival(conn: &mut Connection) -> Result<(), rusqli
     conn.pragma_update(None, "foreign_keys", false)?;
     let result = (|| {
         let tx = conn.transaction()?;
-        let ddl = schema::WORKSPACE_TABLES_DDL
-            .split("-- A managed workspace")
-            .next()
-            .ok_or(rusqlite::Error::InvalidQuery)?
-            .replace(
-                "CREATE TABLE IF NOT EXISTS workspaces",
-                "CREATE TABLE workspaces_new",
-            );
+        let ddl = schema::workspaces_create_table_statement().replace(
+            "CREATE TABLE IF NOT EXISTS workspaces",
+            "CREATE TABLE workspaces_new",
+        );
         tx.execute_batch(&ddl)?;
-        tx.execute_batch("INSERT INTO workspaces_new SELECT * FROM workspaces; DROP TABLE workspaces; ALTER TABLE workspaces_new RENAME TO workspaces;")?;
+
+        // Copy by explicit column name, never `SELECT *`: positional copies
+        // silently misalign data if the old and new column orders differ.
+        // Columns the old table has but the new statement lacks (additive
+        // columns added by later `ALTER TABLE` helpers) are recreated on the
+        // new table first so their data survives the rebuild.
+        let table_columns = |tx: &rusqlite::Transaction<'_>,
+                             table: &str|
+         -> Result<Vec<(String, String)>, rusqlite::Error> {
+            let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+            stmt.query_map([], |row| Ok((row.get(1)?, row.get(2)?)))?
+                .collect()
+        };
+        let old_columns = table_columns(&tx, "workspaces")?;
+        let new_columns = table_columns(&tx, "workspaces_new")?;
+        for (name, declared_type) in &old_columns {
+            if !new_columns.iter().any(|(existing, _)| existing == name) {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE workspaces_new ADD COLUMN \"{name}\" {declared_type}"
+                ))?;
+            }
+        }
+        let copied = old_columns
+            .iter()
+            .map(|(name, _)| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute_batch(&format!(
+            "INSERT INTO workspaces_new ({copied}) SELECT {copied} FROM workspaces; \
+             DROP TABLE workspaces; \
+             ALTER TABLE workspaces_new RENAME TO workspaces;"
+        ))?;
         tx.execute_batch(schema::WORKSPACE_TABLES_DDL)?;
         let violations: i64 =
             tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {

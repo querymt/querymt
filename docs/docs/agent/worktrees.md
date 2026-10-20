@@ -65,7 +65,7 @@ Semantics that matter:
 - **Omitted options keep local behavior.** No managed worktree is created.
 - **The actual working directory is disclosed.** The session materializes
   with `cwd` set to the bound checkout — e.g.
-  `~/.local/share/qmt/worktrees/project/ws_01ABCdef…` — and that path, not
+  `~/.local/share/qmt/worktrees/<repo-slug>/ws_01ABCdef…` — and that path, not
   the source directory, is what file tools, the shell, indexes, prompts, and
   hooks use. Ignored (gitignored) untracked files are never copied; the
   response discloses that exclusion for current-working-tree baselines.

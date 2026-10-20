@@ -436,9 +436,17 @@ impl SessionMaterializer {
                         .await
                         .map_err(|err| Error::internal_error().data(err.to_string()))?;
                     if let Some(record) = record {
-                        if parent_session_id.is_none()
-                            || record.ownership.owner_session_id.as_deref() != parent_session_id
-                        {
+                        // A shared child may attach when its parent is the
+                        // owner or itself a shared descendant of the owner
+                        // (nested shared delegation P -> C -> D).
+                        let permitted = match parent_session_id {
+                            Some(parent) => {
+                                self.session_shares_managed_checkout(&record, parent)
+                                    .await?
+                            }
+                            None => false,
+                        };
+                        if !permitted {
                             return Err(invalid_workspace_request(
                                 "managed checkout cannot be attached to another writable session; create a fresh worktree",
                             ));
@@ -503,40 +511,58 @@ impl SessionMaterializer {
             }
         }
 
-        // Resolve MCP inputs (config + request + runtime attachments)
-        let resolved = self
-            .resolve_mcp_inputs(
-                &session_id,
-                &cwd,
-                SessionMaterializationKind::New,
-                &req.mcp_servers,
+        // Everything from here to a running actor can fail (MCP root
+        // validation, MCP startup, actor spawn). A freshly bound workspace
+        // that never reaches a running session must not stay Ready and
+        // owned by a dead session: release it as failed (resources retained
+        // for explicit recovery/removal).
+        let started = async {
+            // Resolve MCP inputs (config + request + runtime attachments)
+            let resolved = self
+                .resolve_mcp_inputs(
+                    &session_id,
+                    &cwd,
+                    SessionMaterializationKind::New,
+                    &req.mcp_servers,
+                )
+                .await?;
+
+            // Materialize session actor (heavy: MCP startup, actor spawn)
+            let materialization = self
+                .materialize_session_actor(
+                    session_id.clone(),
+                    cwd.clone(),
+                    &resolved.server_configs,
+                    parent_session_id.is_some(),
+                    &SessionMaterializationOptions {
+                        attach_mesh_handle: true,
+                        register_in_dht: true,
+                    },
+                    workspace
+                        .as_ref()
+                        .map(|binding| binding.mutation_gate.clone())
+                        .or(shared_gate),
+                )
+                .await?;
+
+            // Merge connected MCP peers (from runtime attachments)
+            crate::agent::protocol::merge_connected_mcp_peers(
+                materialization.runtime.mcp_tool_state.clone(),
+                &resolved.connected_peers,
             )
             .await?;
-
-        // Materialize session actor (heavy: MCP startup, actor spawn)
-        let materialization = self
-            .materialize_session_actor(
-                session_id.clone(),
-                cwd.clone(),
-                &resolved.server_configs,
-                parent_session_id.is_some(),
-                &SessionMaterializationOptions {
-                    attach_mesh_handle: true,
-                    register_in_dht: true,
-                },
-                workspace
-                    .as_ref()
-                    .map(|binding| binding.mutation_gate.clone())
-                    .or(shared_gate),
-            )
-            .await?;
-
-        // Merge connected MCP peers (from runtime attachments)
-        crate::agent::protocol::merge_connected_mcp_peers(
-            materialization.runtime.mcp_tool_state.clone(),
-            &resolved.connected_peers,
-        )
-        .await?;
+            Ok::<_, Error>((resolved, materialization))
+        }
+        .await;
+        let (resolved, materialization) = match started {
+            Ok(started) => started,
+            Err(err) => {
+                if let Some(binding) = &workspace {
+                    self.release_unstarted_workspace(binding, &err).await;
+                }
+                return Err(err);
+            }
+        };
 
         Ok(PreparedSession {
             session_id,
@@ -547,6 +573,69 @@ impl SessionMaterializer {
             register_in_dht: true,
             _single_flight_guard: None,
         })
+    }
+
+    /// Whether `start_session_id` may run in the managed checkout of
+    /// `record`: it is the workspace owner, or a (possibly nested) shared
+    /// descendant of the owner whose ancestors all execute inside that
+    /// checkout. Walks the parent chain (bounded) and fails closed on any
+    /// missing link or an ancestor outside the checkout.
+    async fn session_shares_managed_checkout(
+        &self,
+        record: &crate::worktree::WorkspaceRecord,
+        start_session_id: &str,
+    ) -> Result<bool, Error> {
+        let store = self.config.provider.history_store();
+        let mut candidate = start_session_id.to_string();
+        for _ in 0..32 {
+            if record.ownership.owner_session_id.as_deref() == Some(candidate.as_str()) {
+                return Ok(true);
+            }
+            let Some(session) = store
+                .get_session(&candidate)
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?
+            else {
+                return Ok(false);
+            };
+            let Some(parent) = session.parent_session_id else {
+                return Ok(false);
+            };
+            let Some((public_id, parent_cwd)) = store
+                .get_session_ref_by_internal_id(parent)
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?
+            else {
+                return Ok(false);
+            };
+            if parent_cwd
+                .as_deref()
+                .is_none_or(|cwd| !cwd.starts_with(&record.checkout_path))
+            {
+                return Ok(false);
+            }
+            candidate = public_id;
+        }
+        Ok(false)
+    }
+
+    /// Compensate a workspace whose session failed to start after the owner
+    /// was bound: detach the dead owner and mark the workspace `Failed` with
+    /// a diagnostic. Checkout and branch are retained; nothing is deleted.
+    async fn release_unstarted_workspace(&self, binding: &WorkspaceBinding, cause: &Error) {
+        let Some(service) = self.workspace_service() else {
+            return;
+        };
+        let _ = service.registry().detach_owner(&binding.record.id).await;
+        let _ = service
+            .mark_owner_binding_failed(
+                &binding.record.id,
+                &format!(
+                    "session startup failed after workspace binding; workspace retained unused: {}",
+                    cause.message
+                ),
+            )
+            .await;
     }
 
     /// Prepare to load an existing session: validate, initialize MCP, spawn actor.
@@ -1304,44 +1393,9 @@ impl SessionMaterializer {
                     "managed workspace is no longer ready; refusing actor startup",
                 ));
             }
-            let mut candidate = session_id.clone();
-            let mut permitted = false;
-            for _ in 0..32 {
-                if record.ownership.owner_session_id.as_deref() == Some(candidate.as_str()) {
-                    permitted = true;
-                    break;
-                }
-                let Some(session) = self
-                    .config
-                    .provider
-                    .history_store()
-                    .get_session(&candidate)
-                    .await
-                    .map_err(|err| Error::internal_error().data(err.to_string()))?
-                else {
-                    break;
-                };
-                let Some(parent) = session.parent_session_id else {
-                    break;
-                };
-                let Some((public_id, parent_cwd)) = self
-                    .config
-                    .provider
-                    .history_store()
-                    .get_session_ref_by_internal_id(parent)
-                    .await
-                    .map_err(|err| Error::internal_error().data(err.to_string()))?
-                else {
-                    break;
-                };
-                if parent_cwd
-                    .as_deref()
-                    .is_none_or(|cwd| !cwd.starts_with(&record.checkout_path))
-                {
-                    break;
-                }
-                candidate = public_id;
-            }
+            let permitted = self
+                .session_shares_managed_checkout(&record, &session_id)
+                .await?;
             if !permitted {
                 return Err(invalid_workspace_request(
                     "managed checkout is owned by another session; create a fresh worktree",
@@ -1369,7 +1423,7 @@ impl SessionMaterializer {
                 slash_registry = Some(Arc::new(
                     crate::slash_commands::SlashCommandRegistry::registry_for_workspace(
                         slash_config,
-                        cwd,
+                        &repo.checkout.root,
                     ),
                 ));
             }
@@ -1388,7 +1442,14 @@ impl SessionMaterializer {
             session_id.clone(),
             &crate::agent::mcp::agent_implementation(),
             tool_state.clone(),
-            cwd.as_deref(),
+            // Only managed-checkout sessions run MCP servers inside the
+            // bound workspace; legacy local sessions keep the agent
+            // process working directory exactly as before.
+            if activity.is_some() {
+                cwd.as_deref()
+            } else {
+                None
+            },
         )
         .await?;
 
@@ -2278,6 +2339,116 @@ mod worktree_binding_tests {
                 .prepare_new_session(NewSessionRequest::new(cwd.join("sub")))
                 .await
                 .is_err()
+        );
+    }
+
+    /// Shared (non-isolated) delegation nests: P -> C -> D all run in P's
+    /// managed checkout. D's direct parent C is not the workspace owner, but
+    /// C is a shared descendant of the owner, so D may attach. A session
+    /// with no parent chain to the owner is still rejected.
+    #[tokio::test]
+    async fn nested_shared_delegation_attaches_through_the_owner_chain() {
+        let fx = worktree_fixture(true).await;
+        let owner = fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(isolation_meta()),
+            )
+            .await
+            .unwrap();
+        let cwd = owner.cwd.clone().unwrap();
+        let parent_meta = |parent: &str| {
+            let mut meta = serde_json::Map::new();
+            meta.insert("parent_session_id".into(), parent.to_string().into());
+            meta
+        };
+
+        let child = fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(cwd.clone()).meta(parent_meta(&owner.session_id)),
+            )
+            .await
+            .expect("direct shared child attaches");
+        let grandchild = fx
+            .materializer
+            .prepare_new_session(
+                NewSessionRequest::new(cwd.clone()).meta(parent_meta(&child.session_id)),
+            )
+            .await
+            .expect("nested shared grandchild attaches through its parent chain");
+        assert_eq!(grandchild.cwd.as_deref(), Some(cwd.as_path()));
+
+        // A parent that is unrelated to the owner chain stays rejected.
+        let stranger = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .unwrap();
+        assert!(
+            fx.materializer
+                .prepare_new_session(
+                    NewSessionRequest::new(cwd).meta(parent_meta(&stranger.session_id)),
+                )
+                .await
+                .is_err(),
+            "a non-descendant parent cannot attach to the managed checkout"
+        );
+    }
+
+    /// An isolated session whose MCP server is pinned to the *original*
+    /// checkout would silently operate on the wrong files, so startup is
+    /// rejected. The workspace was already allocated and bound, so it must
+    /// not stay Ready and owned by a session that never started: it is
+    /// released as Failed (resources retained) with a diagnostic.
+    #[tokio::test]
+    async fn mcp_root_mismatch_rejects_startup_and_releases_the_workspace() {
+        let fx = worktree_fixture(true).await;
+        let pinned = McpServer::Stdio(
+            crate::acp::protocol::McpServerStdio::new("pinned", "/bin/false")
+                .args(vec![fx.repo.path().display().to_string()]),
+        );
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf())
+            .meta(isolation_meta())
+            .mcp_servers(vec![pinned]);
+        let err = match fx.materializer.prepare_new_session(req).await {
+            Err(err) => err,
+            Ok(_) => panic!("a root pinned to another checkout must be rejected"),
+        };
+        assert!(
+            format!("{err:?}").contains("different checkout"),
+            "expected a root-mismatch diagnostic, got: {err:?}"
+        );
+
+        let records = fx
+            .storage
+            .workspace_repository()
+            .unwrap()
+            .list_workspaces()
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 1, "the allocated workspace is retained");
+        let record = &records[0];
+        assert_eq!(
+            record.lifecycle,
+            crate::worktree::WorkspaceLifecycle::Failed,
+            "an unstarted workspace must not stay Ready"
+        );
+        assert!(
+            record.ownership.owner_session_id.is_none(),
+            "no dead session may keep owning the workspace"
+        );
+        assert!(
+            record
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("session startup failed")),
+            "diagnostic: {:?}",
+            record.last_error
+        );
+        assert!(
+            record.checkout_path.is_dir(),
+            "the checkout is retained for explicit recovery or removal"
         );
     }
 

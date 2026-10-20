@@ -2458,6 +2458,57 @@ fn workspace_archival_migration_preserves_bindings_and_results() {
     );
 }
 
+/// The archival rebuild copies by column name, so an old table carrying an
+/// additive column (added later by an `ALTER TABLE` helper, hence last in
+/// the old table but absent from the rebuild statement) keeps that column's
+/// data instead of misaligning or dropping it.
+#[test]
+fn workspace_archival_migration_preserves_additive_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    let old = crate::session::schema::WORKSPACE_TABLES_DDL
+        .replace("'missing', 'archived',", "'missing',");
+    conn.execute_batch(&old).unwrap();
+    crate::session::schema::ensure_workspace_provisioning_columns(&mut conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, execution, baseline_mode, lifecycle, requested_base_ref, operation_id, provisioning_phase, created_at, updated_at)
+         VALUES('w', '/repo/.git', '/repo', 'repo', '/wt/w', 'qmt/w', 'worktree', 'commit', 'ready', 'v1.2', 'op-1', 'intent_persisted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0025_workspace_archival")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+
+    let row: (String, String, String, String) = conn
+        .query_row(
+            "SELECT branch, requested_base_ref, operation_id, provisioning_phase FROM workspaces WHERE public_id = 'w'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "qmt/w".into(),
+            "v1.2".into(),
+            "op-1".into(),
+            "intent_persisted".into()
+        )
+    );
+    // The rebuilt table now accepts the new lifecycle value.
+    conn.execute(
+        "UPDATE workspaces SET lifecycle = 'archived' WHERE public_id = 'w'",
+        [],
+    )
+    .unwrap();
+}
+
 #[test]
 fn worktree_workspace_migration_upgrades_existing_database() {
     let mut conn = Connection::open_in_memory().unwrap();

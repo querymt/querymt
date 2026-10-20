@@ -1208,7 +1208,27 @@ async fn execute_delegation(
     {
         Ok(result) => result,
         Err(e) => {
-            let error_message = format!("Failed to create session via kameo: {}", e);
+            // The child workspace was allocated before session creation. No
+            // session owns it, so mark it failed (resources retained for
+            // explicit recovery/removal) instead of leaving an orphaned
+            // Ready workspace, and disclose it in the failure.
+            if let (Some(binding), Some(service)) =
+                (child_workspace.as_ref(), ctx.workspace_service.as_ref())
+            {
+                let _ = service
+                    .mark_owner_binding_failed(
+                        &binding.record.id,
+                        &format!(
+                            "delegate session creation failed; workspace retained unused: {e}"
+                        ),
+                    )
+                    .await;
+            }
+            let error_message = format!(
+                "Failed to create session via kameo: {}{}",
+                e,
+                workspace_retention_note(child_workspace.as_ref())
+            );
             fail_delegation(
                 DelegationFailureContext {
                     event_sink: &ctx.event_sink,
@@ -1221,11 +1241,12 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session: None,
-                    execution_cwd: None,
+                    execution_cwd: child_workspace.as_ref().map(|b| b.effective_cwd.clone()),
                 },
                 &error_message,
             )
             .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
             return;
         }
     };

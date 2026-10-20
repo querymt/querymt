@@ -46,7 +46,15 @@ pub struct ResolvedRepository {
 /// directories and bare repositories (explicitly unsupported in this
 /// version). All returned paths are canonicalized.
 pub fn resolve_repository(cwd: &Path) -> WorktreeResult<ResolvedRepository> {
-    let repo = gix::discover(cwd).map_err(|err| {
+    // Isolated like every other native operation: ambient GIT_DIR /
+    // GIT_WORK_TREE / GIT_INDEX_FILE must not redirect which repository a
+    // path resolves to (repository-local config is still honored).
+    let repo = gix::discover_opts(
+        cwd,
+        gix::discover::upwards::Options::default(),
+        gix::open::Options::isolated(),
+    )
+    .map_err(|err| {
         if is_no_repository(&err) {
             WorktreeError::NotGitRepository {
                 path: cwd.to_path_buf(),

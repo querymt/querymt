@@ -903,12 +903,20 @@ async fn test_fork_undo_treats_inherited_foreign_snapshots_as_context_only() -> 
         .map(|m| m.id.clone())
         .expect("fork copied the parent's patch message");
 
-    let result = fixture.undo(&child_id, &inherited_target).await?;
+    let err = fixture
+        .undo(&child_id, &inherited_target)
+        .await
+        .expect_err("a directly selected foreign snapshot must be rejected");
     assert!(
-        result.reverted_files.is_empty(),
-        "inherited foreign-workspace snapshots must not restore"
+        err.to_string().contains("workspace") || format!("{err:?}").contains("WorkspaceMismatch"),
+        "expected an explicit provenance error, got: {err:?}"
     );
     assert_eq!(fixture.read_file("a.txt")?, "a-turn-one");
+    assert_eq!(
+        fixture.read_file_in(fork_workspace.path(), "a.txt").ok(),
+        None,
+        "nothing was restored into the fork workspace"
+    );
 
     // A new turn made inside the fork remains fully undoable.
     fixture.write_file_in(fork_workspace.path(), "b.txt", "b-original")?;
@@ -991,9 +999,11 @@ async fn test_fork_undo_from_subdirectory_cwd_is_context_only() -> Result<()> {
         .expect("fork copied the parent's patch message");
 
     // The subdirectory cwd differs from the fork workspace root, so the
-    // inherited snapshots stay context-only here too.
-    let result = fixture.undo(&child_id, &inherited_target).await?;
-    assert!(result.reverted_files.is_empty());
+    // inherited snapshot is foreign here too and is rejected, unrestored.
+    fixture
+        .undo(&child_id, &inherited_target)
+        .await
+        .expect_err("a directly selected foreign snapshot must be rejected");
     assert_eq!(fixture.read_file_in(&sub, "nested.txt")?, "edited");
 
     Ok(())

@@ -513,6 +513,9 @@ let delegation = Delegation {
     task_id: None,
     planning_summary: None,
     verification_spec: None,
+    // `Inherit` (default): isolated parents isolate delegates, local parents
+    // share. Use `Shared` or `Isolated` to force a mode.
+    isolation: DelegationIsolation::Inherit,
 };
 
 // Request delegation

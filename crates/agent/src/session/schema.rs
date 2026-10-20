@@ -603,8 +603,8 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
         -- DELETE trigger for knowledge_consolidations
         CREATE TRIGGER IF NOT EXISTS knowledge_consolidations_ad AFTER DELETE ON knowledge_consolidations BEGIN
-            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, insight)
-            VALUES ('delete', old.id, old.insight);
+            INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
+            VALUES ('delete', old.id, old.summary, old.insight);
         END;
 
         "#,
@@ -673,6 +673,22 @@ pub fn ensure_workspace_result_columns(conn: &mut Connection) -> Result<(), rusq
 /// Shared between `init_schema` (fresh installs) and the additive
 /// `0022_worktree_workspaces` migration (existing databases) so the two can
 /// never drift. All statements are `IF NOT EXISTS` and safe to re-run.
+/// The `CREATE TABLE IF NOT EXISTS workspaces (...)` statement from
+/// [`WORKSPACE_TABLES_DDL`], located by the statement itself rather than by
+/// a neighbouring comment so reflowing comments cannot break the
+/// table-rebuild migrations that reuse it.
+pub fn workspaces_create_table_statement() -> &'static str {
+    const START: &str = "CREATE TABLE IF NOT EXISTS workspaces (";
+    let start = WORKSPACE_TABLES_DDL
+        .find(START)
+        .expect("WORKSPACE_TABLES_DDL defines the workspaces table");
+    let rest = &WORKSPACE_TABLES_DDL[start..];
+    let end = rest
+        .find(");")
+        .expect("the workspaces CREATE TABLE statement is terminated");
+    &rest[..end + 2]
+}
+
 pub const WORKSPACE_TABLES_DDL: &str = r#"
     -- ========================================================================
     -- TIER 1: WORKTREE WORKSPACES (with public_id) — isolated Git workspaces
@@ -744,3 +760,51 @@ pub const WORKSPACE_TABLES_DDL: &str = r#"
     CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_results_result_ref
         ON workspace_results(result_ref) WHERE result_ref IS NOT NULL;
 "#;
+
+#[cfg(test)]
+mod fts_trigger_tests {
+    use super::*;
+
+    /// Deleting a consolidation must remove *both* indexed columns from the
+    /// external-content FTS index. The delete trigger has to replay the
+    /// original `summary` and `insight` values; omitting `summary` leaves
+    /// stale postings and corrupts the index.
+    #[test]
+    fn consolidation_delete_removes_summary_and_insight_postings() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO knowledge_consolidations \
+             (public_id, scope, source_entry_public_ids_json, summary, insight, created_at) \
+             VALUES ('c1', 'scope', '[]', 'zebrafish summary', 'quokka insight', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let hits = |conn: &Connection, term: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM knowledge_consolidations_fts WHERE knowledge_consolidations_fts MATCH ?1",
+                [term],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(hits(&conn, "zebrafish"), 1);
+        assert_eq!(hits(&conn, "quokka"), 1);
+
+        conn.execute(
+            "DELETE FROM knowledge_consolidations WHERE public_id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(hits(&conn, "zebrafish"), 0, "summary postings removed");
+        assert_eq!(hits(&conn, "quokka"), 0, "insight postings removed");
+
+        // The index must remain structurally consistent after the delete.
+        conn.execute(
+            "INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts) VALUES('integrity-check')",
+            [],
+        )
+        .expect("FTS index integrity check passes after delete");
+    }
+}

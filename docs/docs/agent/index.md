@@ -181,15 +181,16 @@ Key model invariants:
   state are keyed by checkout identity, never shared by project identity.
 - **Snapshot storage is separate**: The undo/redo snapshot cache remains a
   disposable, path-keyed store. Managed worktrees never live inside it —
-  isolated worktree storage is durable, defaulting to
-  `~/.qmt/worktrees/<repo-id>/<workspace-id>` (configurable via agent
-  configuration), never inside your project.
+  isolated worktree storage is durable and lives under the storage root you
+  pass to `WorkspaceService::new` (there is no built-in default), laid out as
+  `<storage-root>/<repo-slug>/<workspace-id>`, never inside your project.
 - **Single writable owner**: A managed workspace is bound to at most one
   writable session; additional connections to that same session are fine, a
   second writable session attachment is rejected. Forks and delegates receive
   their own workspaces.
 - **Explicit lifecycle**: Workspaces track durable states
-  (`provisioning → ready`, with `failed`, `missing`, `removing`, `removed`)
+  (`provisioning → ready`, with `failed`, `missing`, `archived`, `removing`,
+  `removed`)
   so crashes and externally deleted checkouts are detected and recoverable.
   Removal never reuses a checkout path.
 - **Delegation defaults**: Delegates of isolated sessions run isolated by
@@ -201,7 +202,7 @@ Key model invariants:
 #### Lifecycle operations and recovery
 
 The durable lifecycle (`provisioning`, `ready`, `failed`, `missing`,
-`removing`, `removed`) is inspected and advanced through three workspace
+`archived`, `removing`, `removed`) is inspected and advanced through three workspace
 operations. None of them has a force flag:
 
 - **status** — live observation only: whether the checkout exists, whether

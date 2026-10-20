@@ -354,7 +354,7 @@ impl LocalAgentHandle {
                 None => serde_json::json!({"session_id": session_id}),
             },
             "remove" | "recover" | "archive" if args.len() == 1 && !args[0].starts_with('-') => serde_json::json!({"workspace_id": args[0]}),
-            _ => return Err(Error::invalid_params().data("usage: /worktree create [ref] [name] [--include-local-changes], list, status [id], result [id], publish [id], remove <id>, recover <id>, archive <id>; no force removal")),
+            _ => return Err(Error::invalid_params().data("usage: /worktree create [ref] [name] | create --include-local-changes [name], list, status [id], result [id], publish [id], remove <id>, recover <id>, archive <id>; no force removal")),
         };
         let raw = serde_json::value::RawValue::from_string(params.to_string())
             .map_err(|e| Error::internal_error().data(e.to_string()))?;

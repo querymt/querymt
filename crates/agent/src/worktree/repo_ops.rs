@@ -260,11 +260,27 @@ fn open_repo(path: &Path) -> Result<gix::Repository, WorktreeError> {
 /// stays available; the explicit builder in [`RepositoryOps::checkout_status`]
 /// then selects per-file emission.
 fn open_repo_for_status(path: &Path) -> Result<gix::Repository, WorktreeError> {
-    gix::open_opts(
+    open_checkout_with(
         path,
         gix::open::Options::isolated().config_overrides(["status.showUntrackedFiles=all"]),
     )
-    .map_err(native_err)
+}
+
+/// Open the repository that contains `path`, which may be the checkout root
+/// or any directory below it (sessions routinely run in a subdirectory of
+/// their checkout). Unlike [`open_repo`], which takes an exact Git
+/// directory, this searches upwards. Environment overrides are ignored for
+/// the same reason as in [`open_repo`].
+fn open_checkout(path: &Path) -> Result<gix::Repository, WorktreeError> {
+    open_checkout_with(path, gix::open::Options::isolated())
+}
+
+fn open_checkout_with(
+    path: &Path,
+    options: gix::open::Options,
+) -> Result<gix::Repository, WorktreeError> {
+    gix::discover_opts(path, gix::discover::upwards::Options::default(), options)
+        .map_err(native_err)
 }
 
 fn full_branch_name(branch: &ManagedBranch) -> gix::refs::FullName {
@@ -576,7 +592,9 @@ impl RepositoryOps for GixRepoOps {
             let repo = open_repo(&common_dir)?;
             let common_dir = repo.common_dir().to_path_buf();
             for proxy in repo.worktrees().map_err(native_err)? {
-                if proxy.base().map_err(native_err)?.exists() {
+                // Locked registrations (e.g. worktrees on removable media)
+                // are kept, matching `git worktree prune`.
+                if proxy.is_locked() || proxy.base().map_err(native_err)?.exists() {
                     continue;
                 }
                 // Registration metadata of a vanished checkout: remove the
@@ -680,7 +698,7 @@ impl RepositoryOps for GixRepoOps {
     async fn head_commit(&self, checkout: &Path) -> WorktreeResult<Option<String>> {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&checkout)?;
+            let repo = open_checkout(&checkout)?;
             match repo.head_id() {
                 Ok(id) => Ok(Some(id.detach().to_string())),
                 Err(err) if is_not_found(&err) => Ok(None),
@@ -694,7 +712,7 @@ impl RepositoryOps for GixRepoOps {
     async fn current_branch(&self, checkout: &Path) -> WorktreeResult<Option<String>> {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&checkout)?;
+            let repo = open_checkout(&checkout)?;
             let branch = repo.head_name().map_err(native_err)?.and_then(|full| {
                 String::from_utf8(full.as_bstr().to_vec())
                     .ok()
@@ -734,17 +752,19 @@ impl RepositoryOps for GixRepoOps {
                 .rev_parse_single(tip.as_bytes())
                 .map_err(native_err)?
                 .detach();
-            let mut seen = std::collections::HashSet::new();
-            let mut stack = vec![tip];
+            // `tip ^base`: everything reachable from the tip but not from
+            // the base, including across merges.
+            let walk = repo
+                .rev_walk([tip])
+                .with_hidden([base])
+                .all()
+                .map_err(native_err)?;
             let mut commits: Vec<(gix::date::Time, String)> = Vec::new();
-            while let Some(id) = stack.pop() {
-                if id == base || !seen.insert(id) {
-                    continue;
-                }
-                let commit = repo.find_commit(id).map_err(native_err)?;
+            for info in walk {
+                let info = info.map_err(native_err)?;
+                let commit = info.object().map_err(native_err)?;
                 let time = commit.time().map_err(native_err)?;
-                stack.extend(commit.parent_ids().map(|p| p.detach()));
-                commits.push((time, id.to_string()));
+                commits.push((time, info.id.to_string()));
             }
             // Newest first.
             commits.sort_by(|a, b| b.0.seconds.cmp(&a.0.seconds).then_with(|| b.1.cmp(&a.1)));
@@ -896,7 +916,7 @@ impl RepositoryOps for GixRepoOps {
     async fn index_manifest(&self, checkout: &Path) -> WorktreeResult<Vec<u8>> {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&checkout)?;
+            let repo = open_checkout(&checkout)?;
             if !repo.index_path().exists() {
                 return Ok(Vec::new());
             }
@@ -921,7 +941,7 @@ impl RepositoryOps for GixRepoOps {
     async fn has_unmerged_entries(&self, checkout: &Path) -> WorktreeResult<bool> {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&checkout)?;
+            let repo = open_checkout(&checkout)?;
             if !repo.index_path().exists() {
                 return Ok(false);
             }
@@ -938,11 +958,13 @@ impl RepositoryOps for GixRepoOps {
     async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool> {
         let checkout = checkout.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let repo = open_repo(&checkout)?;
-            let value = repo.config_snapshot().string("core.sparseCheckout");
-            Ok(value.is_some_and(|v| {
-                v.as_bstr() == b"true".as_bstr() || v.as_bstr() == b"True".as_bstr()
-            }))
+            let repo = open_checkout(&checkout)?;
+            // Typed accessor: accepts every Git boolean spelling
+            // (`true`/`yes`/`on`/`1`, any case).
+            Ok(repo
+                .config_snapshot()
+                .boolean("core.sparseCheckout")
+                .unwrap_or(false))
         })
         .await
         .map_err(native_err)?
@@ -1046,7 +1068,7 @@ fn flatten_tree(
                 gix::objs::tree::EntryKind::BlobExecutable => {
                     gix::index::entry::Mode::FILE_EXECUTABLE
                 }
-                gix::objs::tree::EntryKind::Commit => gix::index::entry::Mode::DIR,
+                gix::objs::tree::EntryKind::Commit => gix::index::entry::Mode::COMMIT,
                 _ => gix::index::entry::Mode::FILE,
             };
             out.insert(path, (mode, entry.oid().into()));
@@ -1265,8 +1287,14 @@ fn classify_and_reconcile(
 }
 
 fn gix_pathbuf(path: &gix::bstr::BStr) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(std::ffi::OsStr::from_bytes(path))
+    // Platform-aware conversion (raw bytes on Unix, UTF-8 + separator
+    // normalization elsewhere); compiles on every target.
+    match gix::path::from_bstr(path) {
+        Ok(path) => path.into_owned(),
+        // Only reachable on non-Unix targets for ill-formed UTF-8; the
+        // lossy spelling then simply fails the later filesystem access.
+        Err(_) => PathBuf::from(path.to_string()),
+    }
 }
 
 /// Index mode spelling of a submodule gitlink (`160000`).
@@ -1385,9 +1413,16 @@ fn reject_external_filter_paths(
     Ok(())
 }
 
+#[cfg(unix)]
 fn is_executable(md: &std::fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     md.permissions().mode() & 0o111 != 0
+}
+
+/// Platforms without an executable permission bit never record one.
+#[cfg(not(unix))]
+fn is_executable(_md: &std::fs::Metadata) -> bool {
+    false
 }
 
 fn write_blob_from_disk(
@@ -1397,9 +1432,11 @@ fn write_blob_from_disk(
 ) -> WorktreeResult<gix::hash::ObjectId> {
     if md.file_type().is_symlink() {
         let target = std::fs::read_link(abs).map_err(native_err)?;
-        use std::os::unix::ffi::OsStrExt;
+        // Symlink targets are stored as raw path bytes (Git's convention).
+        let target = gix::path::into_bstr(target.as_path()).map_err(native_err)?;
+        let bytes: &[u8] = &target;
         return repo
-            .write_blob(target.as_os_str().as_bytes())
+            .write_blob(bytes)
             .map_err(native_err)
             .map(|id| id.detach());
     }
@@ -1484,6 +1521,8 @@ fn write_tree_from_index(
                 TreeItem::File { oid, mode } => {
                     let kind = if *mode == gix::index::entry::Mode::DIR {
                         EntryKind::Tree
+                    } else if *mode == gix::index::entry::Mode::COMMIT {
+                        EntryKind::Commit
                     } else if *mode == gix::index::entry::Mode::SYMLINK {
                         EntryKind::Link
                     } else if *mode == gix::index::entry::Mode::FILE_EXECUTABLE {
@@ -1855,45 +1894,156 @@ mod tests {
     use super::*;
     use crate::worktree::test_support::{commit_files, init_repo};
 
+    /// `commits_between(base, tip)` is `tip ^base`: with a merge tip whose
+    /// parents are `base` and a sibling, only the merge and the sibling
+    /// count. Commits reachable from `base` (here the shared root) must be
+    /// excluded even though they are also reachable through the other
+    /// parent.
+    #[tokio::test]
+    async fn commits_between_excludes_everything_reachable_from_base_across_merges() {
+        let repo = init_repo();
+        let root = commit_files(repo.path(), "root", &[("a.txt", "1")]);
+        let g = gix::open(repo.path()).unwrap();
+        let tree = g.find_commit(root).unwrap().tree_id().unwrap().detach();
+        let mk = |parents: Vec<gix::ObjectId>, msg: &str| -> gix::ObjectId {
+            g.write_object(&gix::objs::Commit {
+                tree,
+                parents: parents.into(),
+                author: internal_signature(),
+                committer: internal_signature(),
+                encoding: None,
+                message: msg.as_bytes().into(),
+                extra_headers: Default::default(),
+            })
+            .unwrap()
+            .detach()
+        };
+        let p1 = mk(vec![root], "p1");
+        let p2 = mk(vec![root], "p2");
+        let merge = mk(vec![p1, p2], "merge");
+
+        let ops = GixRepoOps::new();
+        let common = repo.path().join(".git");
+        let mut got = ops
+            .commits_between(&common, &p1.to_string(), &merge.to_string())
+            .await
+            .unwrap();
+        got.sort();
+        let mut want = vec![merge.to_string(), p2.to_string()];
+        want.sort();
+        assert_eq!(got, want, "root and base must not be listed");
+        assert_eq!(
+            ops.commits_between_count(&common, &p1.to_string(), &merge.to_string())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    /// Locked worktree registrations survive prune (as `git worktree
+    /// prune` does) even when their checkout is missing; unlocked ones are
+    /// removed.
+    #[tokio::test]
+    async fn prune_keeps_locked_registrations_of_missing_checkouts() {
+        use crate::worktree::domain::ManagedBranch;
+
+        let repo = init_repo();
+        let head = commit_files(repo.path(), "root", &[("a.txt", "1")]);
+        let ops = GixRepoOps::new();
+        let common = repo.path().join(".git");
+        let wt_parent = tempfile::TempDir::new().unwrap();
+        let checkout = wt_parent.path().join("wt");
+
+        ops.create_branch(
+            &common,
+            &ManagedBranch::from_raw("locked-wt"),
+            &head.to_string(),
+        )
+        .await
+        .unwrap();
+        gix::open(&common)
+            .unwrap()
+            .add_worktree(
+                &checkout,
+                gix::worktree::add::Head::Attached(
+                    gix::refs::FullName::try_from("refs/heads/locked-wt").unwrap(),
+                ),
+                gix::progress::Discard,
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
+
+        let admin_root = common.join("worktrees");
+        let admin = std::fs::read_dir(&admin_root)
+            .unwrap()
+            .next()
+            .expect("one registration")
+            .unwrap()
+            .path();
+        std::fs::write(admin.join("locked"), "on removable media").unwrap();
+        std::fs::remove_dir_all(&checkout).unwrap();
+
+        ops.prune_worktrees(&common).await.unwrap();
+        assert!(admin.is_dir(), "a locked registration must be kept");
+
+        std::fs::remove_file(admin.join("locked")).unwrap();
+        ops.prune_worktrees(&common).await.unwrap();
+        assert!(!admin.exists(), "an unlocked stale registration is pruned");
+    }
+
     /// Inherited Git environment overrides must not redirect native
     /// operations: every op opens the explicit checkout path and derives
     /// the index from that repository rather than from GIT_DIR,
     /// GIT_WORK_TREE, or GIT_INDEX_FILE.
+    ///
+    /// The bogus variables are set only on a child process (a re-exec of
+    /// this test binary running [`env_probe_child`]), so the parent test
+    /// process environment is never mutated while other tests run in
+    /// parallel threads.
+    #[test]
+    fn inherited_git_env_overrides_do_not_redirect_native_ops() {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "worktree::repo_ops::tests::env_probe_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("QMT_ENV_PROBE_CHILD", "1")
+            .env("GIT_DIR", "/nonexistent/qmt-git-dir")
+            .env("GIT_WORK_TREE", "/nonexistent/qmt-worktree")
+            .env("GIT_INDEX_FILE", "/nonexistent/qmt-index")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "native ops must ignore inherited GIT_* overrides:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the child probe must actually run: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// Child half of [`inherited_git_env_overrides_do_not_redirect_native_ops`];
+    /// a no-op unless launched by it with the bogus overrides in its own
+    /// environment.
     #[tokio::test]
-    async fn inherited_git_env_overrides_do_not_redirect_native_ops() {
+    async fn env_probe_child() {
+        if std::env::var_os("QMT_ENV_PROBE_CHILD").is_none() {
+            return;
+        }
         let repo = init_repo();
         commit_files(repo.path(), "initial", &[("README.md", "hello\n")]);
         std::fs::write(repo.path().join("untracked.txt"), "x").unwrap();
 
-        let saved: Vec<(&str, Option<String>)> = ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"]
-            .map(|name| {
-                // SAFETY: test process; no other thread reads these keys.
-                (name, std::env::var(name).ok())
-            })
-            .into();
-        // SAFETY: single-threaded mutation for this test's duration; native
-        // operations ignore these variables (that is what is under test).
-        unsafe {
-            std::env::set_var("GIT_DIR", "/nonexistent/qmt-git-dir");
-            std::env::set_var("GIT_WORK_TREE", "/nonexistent/qmt-worktree");
-            std::env::set_var("GIT_INDEX_FILE", "/nonexistent/qmt-index");
-        }
-
         let ops = GixRepoOps::new();
         let head = ops.head_commit(repo.path()).await.unwrap();
         let status = ops.checkout_status(repo.path()).await.unwrap();
-
-        // SAFETY: restoring the process environment right after the probe so
-        // concurrent tests never observe the bogus overrides, even if the
-        // assertions below fail.
-        unsafe {
-            for (name, value) in &saved {
-                match value {
-                    Some(v) => std::env::set_var(name, v),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
 
         assert!(head.is_some(), "HEAD resolves despite bogus GIT_DIR");
         assert!(

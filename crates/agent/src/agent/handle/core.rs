@@ -168,14 +168,40 @@ impl LocalAgentHandle {
         if !slash_config.enabled {
             return None;
         }
-        let binding = service
+        // Same rule the session actor uses to expand prompts: any session
+        // executing inside a managed checkout (the owner, or a shared child
+        // such as a non-isolated delegate) resolves sources from that
+        // checkout's root, so the advertised catalog and execution agree.
+        let root = match service
             .resolve_existing_session(session_id, None)
             .await
-            .ok()??;
+            .ok()?
+        {
+            Some(binding) => crate::worktree::resolve_repository(&binding.effective_cwd)
+                .map(|repo| repo.checkout.root)
+                .unwrap_or(binding.effective_cwd),
+            None => {
+                let cwd = self
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session(session_id)
+                    .await
+                    .ok()??
+                    .cwd?;
+                let repo = crate::worktree::resolve_repository(&cwd).ok()?;
+                service
+                    .registry()
+                    .get_workspace_by_checkout(&repo.checkout.root)
+                    .await
+                    .ok()??;
+                repo.checkout.root
+            }
+        };
         Some(
             crate::slash_commands::SlashCommandRegistry::registry_for_workspace(
                 slash_config,
-                &binding.effective_cwd,
+                &root,
             ),
         )
     }

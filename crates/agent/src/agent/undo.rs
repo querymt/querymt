@@ -296,6 +296,14 @@ pub(crate) async fn undo_impl(
         // scan above; legacy same-workspace forks and non-forked sessions
         // are unaffected.
         if target_idx < inherited_count {
+            // Nothing local can be undone here. Directly selecting a
+            // snapshot recorded in another workspace is a provenance error
+            // (spec: "Workspace binding mismatch"): fail before any
+            // restoration and before a redo frame is pushed, rather than
+            // reporting a success that restored no files.
+            for part in &history[target_idx].parts {
+                validate_snapshot_workspace(part, worktree)?;
+            }
             debug!("Undo: target message is inherited fork context; skipping snapshot restore");
         } else {
             for part in &history[target_idx].parts {

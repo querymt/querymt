@@ -142,6 +142,10 @@ impl WorkspaceService {
         let resolved = resolve_repository(source_cwd)?;
         let relative =
             crate::worktree::identity::relative_cwd(&resolved.checkout.root, source_cwd)?;
+        // Serialize working-tree capture against cooperating writers of the
+        // source checkout (local sessions install this same gate at actor
+        // startup), exactly as delegation does.
+        let source_gate = CheckoutMutationGate::new(&self.storage_root, &resolved.checkout.root)?;
         let record = self
             .allocator
             .allocate_with_baseline(
@@ -149,7 +153,7 @@ impl WorkspaceService {
                 &relative,
                 options.base_ref.as_deref(),
                 options.baseline,
-                None,
+                Some(&source_gate),
             )
             .await?;
         Ok(Some(WorkspaceBinding::new(record, &self.storage_root)?))
@@ -305,6 +309,18 @@ impl WorkspaceService {
         let resolved = resolve_repository(source_cwd)?;
         let relative =
             crate::worktree::identity::relative_cwd(&resolved.checkout.root, source_cwd)?;
+        // A managed source supplies its own gate; a local (unmanaged) source
+        // falls back to a gate on its resolved checkout so capture is still
+        // serialized against cooperating writers.
+        let fallback_gate;
+        let source_gate = match source_gate {
+            Some(gate) => gate,
+            None => {
+                fallback_gate =
+                    CheckoutMutationGate::new(&self.storage_root, &resolved.checkout.root)?;
+                &fallback_gate
+            }
+        };
         let record = self
             .allocator
             .allocate_with_baseline(
@@ -312,7 +328,7 @@ impl WorkspaceService {
                 &relative,
                 options.base_ref.as_deref(),
                 options.baseline,
-                source_gate,
+                Some(source_gate),
             )
             .await?;
         WorkspaceBinding::new(record, &self.storage_root)
@@ -679,7 +695,9 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn real_git_cross_feature_acceptance_retains_independent_work_and_resume() {
+        let _git_path = git_path_lock();
         use crate::session::backend::StorageBackend;
         use crate::snapshot::{GitSnapshotBackend, SnapshotBackend};
         use crate::verification::service::{VerificationContext, VerificationService};
@@ -1217,6 +1235,12 @@ mod tests {
     /// about whether a real Git executable is reachable.
     static PATH_ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
+    /// Held by tests that spawn the real `git` executable so they never run
+    /// while [`PathEnvGuard`] has emptied `PATH` in another test thread.
+    fn git_path_lock() -> std::sync::MutexGuard<'static, ()> {
+        PATH_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Hides every executable from spawned processes for the guard's
     /// lifetime (`PATH` points at an empty directory) and restores the
     /// previous value on drop.
@@ -1448,6 +1472,98 @@ mod tests {
         }
     }
 
+    /// A parent session whose cwd is a *subdirectory* of its checkout (the
+    /// common case for monorepo sessions) must be able to delegate: the
+    /// baseline capture, repository resolution and relative-cwd mapping all
+    /// run from the subdirectory, not the checkout root.
+    #[tokio::test]
+    async fn delegation_from_a_subdirectory_session_works() {
+        let (repo, _storage, svc) = service().await;
+        commit_files(
+            repo.path(),
+            "add sub",
+            &[("file.txt", "one"), ("sub/file.txt", "sub")],
+        );
+        materialize(repo.path(), &[("file.txt", "one"), ("sub/file.txt", "sub")]);
+
+        let parent = provision_owned(&svc, repo.path(), "sess-owner").await;
+        let parent_sub = parent.checkout_path.join("sub");
+        assert!(parent_sub.is_dir(), "fixture: parent checkout has sub/");
+        fs::write(parent_sub.join("file.txt"), "parent sub edit").unwrap();
+        fs::write(parent_sub.join("new.txt"), "untracked in sub").unwrap();
+        fs::write(parent.checkout_path.join("root.txt"), "untracked at root").unwrap();
+
+        let child = svc
+            .allocate_for_delegation(
+                "sess-owner",
+                Some(&parent),
+                &parent_sub,
+                None,
+                "delegation-sub",
+                None,
+            )
+            .await
+            .expect("delegation from a subdirectory cwd must succeed");
+
+        // The delegate runs in the same relative subdirectory of its own
+        // checkout, never inside the parent's.
+        assert_ne!(child.record.checkout_path, parent.checkout_path);
+        assert_eq!(
+            child.effective_cwd,
+            child.record.checkout_path.join("sub"),
+            "delegate cwd preserves the parent's relative subdirectory"
+        );
+        assert!(child.effective_cwd.is_dir());
+
+        // The baseline reflects the whole parent working state, not just
+        // the subdirectory.
+        assert_eq!(
+            fs::read_to_string(child.effective_cwd.join("file.txt")).unwrap(),
+            "parent sub edit"
+        );
+        assert_eq!(
+            fs::read_to_string(child.effective_cwd.join("new.txt")).unwrap(),
+            "untracked in sub"
+        );
+        assert_eq!(
+            fs::read_to_string(child.record.checkout_path.join("root.txt")).unwrap(),
+            "untracked at root"
+        );
+        assert_eq!(
+            child.record.ownership.parent_workspace_id.as_ref(),
+            Some(&parent.id)
+        );
+
+        // Batch baseline capture from the subdirectory resolves the same
+        // repository state as from the root.
+        let from_sub = svc
+            .capture_batch_baseline(&parent_sub, BaselineMode::CurrentWorkingTree, None)
+            .await
+            .expect("baseline capture from a subdirectory");
+        let from_root = svc
+            .capture_batch_baseline(
+                &parent.checkout_path,
+                BaselineMode::CurrentWorkingTree,
+                None,
+            )
+            .await
+            .expect("baseline capture from the root");
+        // Captured commits embed a timestamp, so two captures taken in
+        // different seconds have different commit ids. The captured
+        // *content* (tree) and the source HEAD are what must agree.
+        let tree_of = |commit: &str| {
+            let repo = gix::open(&parent.repository.common_dir).unwrap();
+            let id = gix::ObjectId::from_hex(commit.as_bytes()).unwrap();
+            repo.find_commit(id).unwrap().tree_id().unwrap().detach()
+        };
+        assert_eq!(
+            tree_of(&from_sub.baseline_commit),
+            tree_of(&from_root.baseline_commit),
+            "a subdirectory cwd captures the same repository-wide content as the root"
+        );
+        assert_eq!(from_sub.source_head, from_root.source_head);
+    }
+
     /// Nested delegation: a delegate that delegates further gets a workspace
     /// whose parent link points at its own (delegate) workspace.
     #[tokio::test]
@@ -1508,7 +1624,9 @@ mod tests {
     /// result publication leaves the child's staging state and the parent
     /// checkout unchanged, and the provenance is durably retained.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn delegate_result_capture_is_baseline_relative_and_non_invasive() {
+        let _git_path = git_path_lock();
         use crate::worktree::GitRunner as _;
         use crate::worktree::{CliGit, ResultVerificationStatus};
 

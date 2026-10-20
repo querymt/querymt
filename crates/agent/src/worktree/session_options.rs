@@ -243,11 +243,22 @@ pub fn fork_creation_options_from_meta(
     let Some(options) = session_creation_options_from_meta(meta)? else {
         return Ok(None);
     };
+    // A baseline is pinned by a non-null `baseline` or by an explicit
+    // boolean `includeLocalChanges` (including `false`, which requests a
+    // commit baseline and must not be upgraded to a working-tree capture).
     let baseline_pinned = meta
         .and_then(|meta| meta.get(crate::acp::shared::QUERYMT_META_NAMESPACE))
         .and_then(|querymt| querymt.get(SESSION_WORKSPACE_META_KEY))
-        .and_then(|workspace| workspace.get("baseline"))
-        .is_some();
+        .is_some_and(|workspace| {
+            workspace.get("baseline").is_some_and(|v| !v.is_null())
+                || ["includeLocalChanges", "include_local_changes"]
+                    .iter()
+                    .any(|key| {
+                        workspace
+                            .get(*key)
+                            .is_some_and(serde_json::Value::is_boolean)
+                    })
+        });
     let mut options = options;
     if options.requests_isolation() && !baseline_pinned && options.base_ref.is_none() {
         options.baseline = BaselineMode::CurrentWorkingTree;
@@ -457,6 +468,48 @@ mod tests {
             .expect("isolation requested");
         assert_eq!(opts.baseline, BaselineMode::Commit);
         assert_eq!(opts.base_ref.as_deref(), Some("v1.2"));
+    }
+
+    /// An explicit boolean `includeLocalChanges` pins the baseline, including
+    /// `false` (commit baseline); a null `baseline` does not pin.
+    #[test]
+    fn fork_explicit_include_local_changes_pins_the_baseline() {
+        for key in ["includeLocalChanges", "include_local_changes"] {
+            let off = meta_with_workspace(serde_json::json!({
+                "execution": "worktree",
+                key: false,
+            }));
+            let opts = fork_creation_options_from_meta(Some(&off))
+                .expect("valid options")
+                .expect("isolation requested");
+            assert_eq!(
+                opts.baseline,
+                BaselineMode::Commit,
+                "{key}: false must not be upgraded to a working-tree capture"
+            );
+
+            let on = meta_with_workspace(serde_json::json!({
+                "execution": "worktree",
+                key: true,
+            }));
+            let opts = fork_creation_options_from_meta(Some(&on))
+                .expect("valid options")
+                .expect("isolation requested");
+            assert_eq!(opts.baseline, BaselineMode::CurrentWorkingTree);
+        }
+
+        let null_baseline = meta_with_workspace(serde_json::json!({
+            "execution": "worktree",
+            "baseline": null,
+        }));
+        let opts = fork_creation_options_from_meta(Some(&null_baseline))
+            .expect("valid options")
+            .expect("isolation requested");
+        assert_eq!(
+            opts.baseline,
+            BaselineMode::CurrentWorkingTree,
+            "a null baseline is not an explicit pin"
+        );
     }
 
     #[test]

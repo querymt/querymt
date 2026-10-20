@@ -336,6 +336,84 @@ async fn managed_sessions_expand_and_advertise_their_own_checkout_commands() {
     f.handle.shutdown().await;
 }
 
+/// A shared (non-isolated) child runs inside its parent's managed checkout.
+/// It does not own the workspace, but its catalog and its prompt expansion
+/// must still come from that checkout, not from the agent-level registry.
+#[tokio::test]
+async fn shared_child_in_a_managed_checkout_uses_the_checkout_commands() {
+    let f = slash_worktree_fixture(agent_level_registry()).await;
+    let command = "---\ndescription: Deploy the service\n---\nROOT-DEPLOY: $ARGUMENTS\n";
+    crate::worktree::test_support::commit_files(
+        f.repo.path(),
+        "initial",
+        &[
+            ("README.md", "hello\n"),
+            (".qmt/commands/deploy.md", command),
+        ],
+    );
+    crate::worktree::test_support::materialize(
+        f.repo.path(),
+        &[
+            ("README.md", "hello\n"),
+            (".qmt/commands/deploy.md", command),
+        ],
+    );
+
+    let source = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    let source_id = source.session_id.to_string();
+    let created = native_command(
+        &f.handle,
+        &source_id,
+        "/worktree create --include-local-changes w1",
+    )
+    .await
+    .unwrap();
+    let owner_id = created["session_id"].as_str().unwrap().to_owned();
+    let checkout = std::path::PathBuf::from(created["checkout_path"].as_str().unwrap());
+
+    // The checkout's definition diverges from the original's.
+    std::fs::write(
+        checkout.join(".qmt/commands/deploy.md"),
+        "---\ndescription: Deploy the service\n---\nW1-DEPLOY: $ARGUMENTS\n",
+    )
+    .unwrap();
+
+    let mut meta = serde_json::Map::new();
+    meta.insert("parent_session_id".into(), owner_id.clone().into());
+    let shared = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(checkout.clone()).meta(meta))
+        .await
+        .expect("a shared child attaches to its owner's managed checkout");
+    let shared_id = shared.session_id.to_string();
+
+    let catalog = f.handle.slash_command_catalog(&shared_id).await.unwrap();
+    let names = advertised_names(&catalog);
+    assert!(names.contains(&"/deploy".to_string()), "names: {names:?}");
+    assert!(
+        !names.contains(&"/agent-only".to_string()),
+        "agent-level commands are not advertised inside a managed checkout: {names:?}"
+    );
+
+    prompt(&f.handle, &shared_id, "/deploy from-shared")
+        .await
+        .unwrap();
+    assert!(
+        stored_user_text(&f, &shared_id)
+            .await
+            .contains("W1-DEPLOY: from-shared"),
+        "the shared child expands against the checkout it executes in"
+    );
+
+    f.handle.shutdown().await;
+}
+
 /// Native `/worktree` interception, global command policy, and
 /// scripts-disabled behavior are preserved: a checkout command named
 /// `worktree` never competes with native dispatch, and script-required

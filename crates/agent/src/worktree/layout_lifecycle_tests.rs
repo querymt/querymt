@@ -351,6 +351,85 @@ async fn existing_linked_source_runs_the_full_lifecycle() {
     assert_full_lifecycle(&source, &svc, storage.path()).await;
 }
 
+/// `HEAD` is per-worktree. A commit-mode baseline requested from a linked
+/// source that is ahead of the main checkout must start at the *linked*
+/// source's tip, not the main checkout's HEAD (allocation and recovery).
+#[tokio::test]
+async fn commit_baseline_from_a_linked_source_starts_at_the_linked_tip() {
+    let (repo_tmp, _wt_tmp, linked) = linked_source_of_standard_repo().await;
+    let (_storage, svc) = layout_service();
+
+    let main_head = gix::open(repo_tmp.path())
+        .unwrap()
+        .head_id()
+        .unwrap()
+        .detach()
+        .to_string();
+    // Advance only the linked source's branch by one commit.
+    let ahead = commit_files(
+        &linked,
+        "linked ahead",
+        &[
+            ("file.txt", "one"),
+            ("sub/file.txt", "sub"),
+            ("ahead.txt", "linked only"),
+        ],
+    )
+    .to_string();
+    assert_ne!(ahead, main_head, "fixture: linked source is ahead");
+    assert_eq!(
+        gix::open(repo_tmp.path())
+            .unwrap()
+            .head_id()
+            .unwrap()
+            .detach()
+            .to_string(),
+        main_head,
+        "fixture: the main checkout did not move"
+    );
+
+    // Implicit base (HEAD) and an explicit HEAD-relative base.
+    let implicit = svc
+        .allocate_for_new_session(
+            &linked,
+            &SessionCreationOptions::isolated_worktree(BaselineMode::Commit),
+        )
+        .await
+        .unwrap()
+        .expect("isolation allocates");
+    let baseline = implicit.record.baseline.as_ref().expect("bound baseline");
+    assert_eq!(
+        baseline.baseline_commit, ahead,
+        "implicit HEAD resolves in the linked source, not the main checkout"
+    );
+    assert!(
+        implicit.record.checkout_path.join("ahead.txt").is_file(),
+        "the managed checkout contains the linked-only commit"
+    );
+    let branch_tip = svc
+        .ops()
+        .branch_tip(
+            &resolve_repository(&linked).unwrap().identity.common_dir,
+            &implicit.record.branch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(branch_tip.as_deref(), Some(ahead.as_str()));
+
+    let mut parent_opts = SessionCreationOptions::isolated_worktree(BaselineMode::Commit);
+    parent_opts.base_ref = Some("HEAD~1".to_string());
+    let parent = svc
+        .allocate_for_new_session(&linked, &parent_opts)
+        .await
+        .unwrap()
+        .expect("isolation allocates");
+    assert_eq!(
+        parent.record.baseline.as_ref().unwrap().baseline_commit,
+        main_head,
+        "HEAD~1 of the linked source is the shared ancestor"
+    );
+}
+
 /// Linked source backed by a bare common repository: the bare registration
 /// (no working tree) is not misinterpreted as the main checkout; creation,
 /// status, capture, recovery, and removal all use the bare repository as
