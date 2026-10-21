@@ -523,47 +523,99 @@ pub async fn resolve_elicitation_from_connection(
     response: ElicitationResponse,
 ) -> Result<ElicitationResolution, agent_client_protocol::Error> {
     for map in all_pending_maps(agent).await {
-        let delivery = {
-            let entries = map.lock().await;
-            let Some(entry) = entries.get(elicitation_id) else {
-                continue;
-            };
-            if session_id.is_some_and(|session_id| entry.session_id != session_id) {
-                continue;
-            }
-            if entry.delivery_generation == 0 {
-                if entry.owner_authority.is_some() {
-                    return Ok(ElicitationResolution::StaleDelivery);
-                }
-                (entry.session_id.clone(), 0)
-            } else if entry.delivery_connection.as_deref() == Some(connection_id) {
-                (entry.session_id.clone(), entry.delivery_generation)
-            } else {
+        // Check, validate and remove under a single hold of the map lock so a
+        // concurrent claim/cancel cannot change the delivery state in between.
+        let mut entries = map.lock().await;
+        let Some(entry) = entries.get(elicitation_id) else {
+            continue;
+        };
+        if session_id.is_some_and(|session_id| entry.session_id != session_id) {
+            continue;
+        }
+        let allowed = if entry.delivery_generation == 0 {
+            if entry.owner_authority.is_some() {
                 return Ok(ElicitationResolution::StaleDelivery);
             }
+            true
+        } else {
+            entry.delivery_connection.as_deref() == Some(connection_id)
         };
-        if delivery.1 == 0 {
-            let mut entries = map.lock().await;
-            let Some(entry) = entries.get(elicitation_id) else {
-                return Ok(ElicitationResolution::NotFound);
-            };
-            validate_elicitation_response(entry, &response)?;
-            let entry = entries.remove(elicitation_id).expect("entry checked above");
-            drop(entries);
-            let _ = entry.sender.send(response);
-            return Ok(ElicitationResolution::Resolved);
+        if !allowed {
+            return Ok(ElicitationResolution::StaleDelivery);
         }
-        return resolve_claimed_elicitation(
-            agent,
-            &delivery.0,
-            elicitation_id,
-            connection_id,
-            delivery.1,
-            response,
-        )
-        .await;
+        validate_elicitation_response(entry, &response)?;
+        let entry = entries
+            .remove(elicitation_id)
+            .expect("pending entry exists while registry lock is held");
+        drop(entries);
+        let _ = entry.sender.send(response);
+        return Ok(ElicitationResolution::Resolved);
     }
     Ok(ElicitationResolution::NotFound)
+}
+
+/// Serialize a form's requested schema, carrying request-level `_meta` (if any)
+/// under the `"_meta"` key so `form_allows_custom` can see it. Forms without
+/// metadata serialize exactly as before.
+fn form_schema_with_meta<S: Serialize, M: Serialize>(
+    requested_schema: &S,
+    meta: Option<&M>,
+) -> serde_json::Value {
+    let mut schema = serde_json::to_value(requested_schema).unwrap_or(serde_json::Value::Null);
+    if let Some(meta) = meta
+        && let Ok(meta_value) = serde_json::to_value(meta)
+        && !meta_value.is_null()
+        && meta_value.as_object().is_none_or(|obj| !obj.is_empty())
+        && let Some(obj) = schema.as_object_mut()
+    {
+        obj.insert("_meta".to_string(), meta_value);
+    }
+    schema
+}
+
+/// Whether the form advertises free-form ("custom") answers in addition to its
+/// listed options. Mirrors the client-side rule used to render the custom field.
+fn form_allows_custom(form: &PendingElicitationForm) -> bool {
+    if form.source == "builtin:question" {
+        return true;
+    }
+    let Some(meta) = form
+        .requested_schema
+        .get("_meta")
+        .and_then(|m| m.get("querymt"))
+    else {
+        return false;
+    };
+    meta.get("allow_custom").and_then(|v| v.as_bool()) == Some(true)
+        || meta.get("allowCustom").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Copy of `schema` with per-property option constraints (`oneOf`, `anyOf`,
+/// `enum`, `const`, and the same on array `items`) removed. Types, `required`
+/// and object structure are preserved so malformed payloads are still rejected.
+fn relax_schema_for_custom(schema: &serde_json::Value) -> serde_json::Value {
+    fn strip_options(property: &mut serde_json::Value) {
+        let Some(obj) = property.as_object_mut() else {
+            return;
+        };
+        for key in ["oneOf", "anyOf", "enum", "const"] {
+            obj.remove(key);
+        }
+        if let Some(items) = obj.get_mut("items") {
+            strip_options(items);
+        }
+    }
+
+    let mut relaxed = schema.clone();
+    if let Some(properties) = relaxed
+        .get_mut("properties")
+        .and_then(|p| p.as_object_mut())
+    {
+        for property in properties.values_mut() {
+            strip_options(property);
+        }
+    }
+    relaxed
 }
 
 fn validate_elicitation_response(
@@ -577,7 +629,14 @@ fn validate_elicitation_response(
         agent_client_protocol::Error::invalid_params()
             .data("Accepted elicitation response requires content")
     })?;
-    let validator = jsonschema::validator_for(&entry.form.requested_schema).map_err(|err| {
+    let relaxed;
+    let schema = if form_allows_custom(&entry.form) {
+        relaxed = relax_schema_for_custom(&entry.form.requested_schema);
+        &relaxed
+    } else {
+        &entry.form.requested_schema
+    };
+    let validator = jsonschema::validator_for(schema).map_err(|err| {
         agent_client_protocol::Error::invalid_params()
             .data(format!("Invalid elicitation schema: {err}"))
     })?;
@@ -617,6 +676,46 @@ pub async fn resolve_claimed_elicitation(
         return Ok(ElicitationResolution::Resolved);
     }
     Ok(ElicitationResolution::NotFound)
+}
+
+/// Cancel a claimed delivery that can no longer make progress (for example when
+/// validation retries are exhausted).
+///
+/// The generation/connection check and the removal happen under a single hold
+/// of the map lock, so a delivery re-claimed by another connection in the
+/// meantime is never cancelled. The waiter is notified after the lock is
+/// released.
+pub async fn cancel_claimed_elicitation(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+    elicitation_id: &str,
+    connection_id: &str,
+    delivery_generation: u64,
+) -> ElicitationResolution {
+    for map in all_pending_maps(agent).await {
+        let mut entries = map.lock().await;
+        let Some(entry) = entries.get(elicitation_id) else {
+            continue;
+        };
+        if entry.session_id != session_id {
+            continue;
+        }
+        if entry.delivery_generation != delivery_generation
+            || entry.delivery_connection.as_deref() != Some(connection_id)
+        {
+            return ElicitationResolution::StaleDelivery;
+        }
+        let entry = entries
+            .remove(elicitation_id)
+            .expect("pending entry exists while registry lock is held");
+        drop(entries);
+        let _ = entry.sender.send(ElicitationResponse {
+            action: ElicitationAction::Cancel,
+            content: None,
+        });
+        return ElicitationResolution::Resolved;
+    }
+    ElicitationResolution::NotFound
 }
 
 pub async fn has_pending_elicitation_for_session(
@@ -740,12 +839,12 @@ impl ClientHandler for McpClientHandler {
             // Extract message and schema from the enum variant.
             let (message, schema_json) = match &request {
                 CreateElicitationRequestParams::FormElicitationParams {
+                    meta,
                     message,
                     requested_schema,
-                    ..
                 } => (
                     message.clone(),
-                    serde_json::to_value(requested_schema).unwrap_or(serde_json::Value::Null),
+                    form_schema_with_meta(requested_schema, meta.as_ref()),
                 ),
                 CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
                     (message.clone(), serde_json::json!({ "url": url }))
@@ -1389,6 +1488,331 @@ mod tests {
         assert_eq!(
             response.content,
             Some(serde_json::json!({"selection": "allow_once"}))
+        );
+    }
+
+    fn question_entry(schema: serde_json::Value, source: &str) -> PendingElicitation {
+        let (tx, _rx) = oneshot::channel();
+        let mut entry = PendingElicitation::for_test("s", tx);
+        entry.form = PendingElicitationForm {
+            message: "q".to_string(),
+            requested_schema: schema,
+            source: source.to_string(),
+        };
+        entry
+    }
+
+    fn accept(content: serde_json::Value) -> ElicitationResponse {
+        ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(content),
+        }
+    }
+
+    fn single_choice_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"selection": {
+                "type": "string",
+                "oneOf": [{"const": "A", "title": "A"}, {"const": "B", "title": "B"}]
+            }},
+            "required": ["selection"]
+        })
+    }
+
+    fn multi_choice_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"selection": {
+                "type": "array",
+                "items": {"anyOf": [{"const": "A", "title": "A"}, {"const": "B", "title": "B"}]}
+            }},
+            "required": ["selection"]
+        })
+    }
+
+    #[test]
+    fn builtin_question_accepts_custom_single_answer() {
+        let entry = question_entry(single_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": "A"})))
+                .is_ok()
+        );
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "something else entirely"}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn builtin_question_accepts_custom_multi_answer() {
+        let entry = question_entry(multi_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": ["custom"]}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn custom_forms_still_reject_missing_required_and_wrong_types() {
+        let entry = question_entry(single_choice_schema(), "builtin:question");
+        assert!(validate_elicitation_response(&entry, &accept(serde_json::json!({}))).is_err());
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": 42})))
+                .is_err()
+        );
+        let multi = question_entry(multi_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(&multi, &accept(serde_json::json!({"selection": "A"})))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn non_custom_forms_keep_strict_option_validation() {
+        let entry = question_entry(single_choice_schema(), "mcp:server");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "free"}))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": "A"})))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_question_answer_resolves_the_waiting_tool() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let map = fixture.handle.pending_elicitations();
+        let (tx, rx) = oneshot::channel();
+        register_pending_elicitation(
+            &map,
+            "question-custom".to_string(),
+            PendingElicitationRegistration {
+                session_id: "s1".to_string(),
+                form: PendingElicitationForm {
+                    message: "Pick".to_string(),
+                    requested_schema: single_choice_schema(),
+                    source: "builtin:question".to_string(),
+                },
+                owner_authority: None,
+                run_id: None,
+                tool_call_id: None,
+            },
+            tx,
+        )
+        .await;
+        let claim = claim_live_elicitation_delivery(
+            fixture.handle.as_ref(),
+            "s1",
+            "question-custom",
+            "conn",
+        )
+        .await
+        .expect("claim");
+
+        let resolution = resolve_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "question-custom",
+            "conn",
+            claim.delivery_generation,
+            accept(serde_json::json!({"selection": "my own words"})),
+        )
+        .await
+        .expect("custom answer must not be rejected");
+        assert_eq!(resolution, ElicitationResolution::Resolved);
+        assert_eq!(
+            rx.await.expect("tool is released").content,
+            Some(serde_json::json!({"selection": "my own words"}))
+        );
+        assert!(map.lock().await.is_empty());
+    }
+
+    #[test]
+    fn form_meta_is_merged_into_schema_and_enables_custom() {
+        let meta = serde_json::json!({"querymt": {"allow_custom": true}});
+        let schema = form_schema_with_meta(&single_choice_schema(), Some(&meta));
+        assert_eq!(schema["_meta"], meta);
+        assert!(form_allows_custom(&PendingElicitationForm {
+            message: String::new(),
+            requested_schema: schema,
+            source: "mcp:server".to_string(),
+        }));
+    }
+
+    #[test]
+    fn form_without_meta_is_unchanged() {
+        let base = single_choice_schema();
+        assert_eq!(
+            form_schema_with_meta(&base, None::<&serde_json::Value>),
+            base
+        );
+        let empty = serde_json::json!({});
+        assert_eq!(form_schema_with_meta(&base, Some(&empty)), base);
+        assert!(!form_allows_custom(&PendingElicitationForm {
+            message: String::new(),
+            requested_schema: base,
+            source: "mcp:server".to_string(),
+        }));
+    }
+
+    async fn register_claimed(
+        fixture: &crate::test_utils::TestAgent,
+        id: &str,
+        connection: &str,
+    ) -> (
+        ClaimedElicitationDelivery,
+        oneshot::Receiver<ElicitationResponse>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        register_pending_elicitation(
+            &fixture.handle.pending_elicitations(),
+            id.to_string(),
+            PendingElicitationRegistration {
+                session_id: "s1".to_string(),
+                form: PendingElicitationForm {
+                    message: "Pick".to_string(),
+                    requested_schema: single_choice_schema(),
+                    source: "mcp:server".to_string(),
+                },
+                owner_authority: None,
+                run_id: None,
+                tool_call_id: None,
+            },
+            tx,
+        )
+        .await;
+        let claim = claim_live_elicitation_delivery(fixture.handle.as_ref(), "s1", id, connection)
+            .await
+            .expect("claim");
+        (claim, rx)
+    }
+
+    #[tokio::test]
+    async fn cancel_claimed_elicitation_releases_waiter_and_removes_entry() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (claim, rx) = register_claimed(&fixture, "q-cancel", "conn").await;
+
+        let resolution = cancel_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "q-cancel",
+            "conn",
+            claim.delivery_generation,
+        )
+        .await;
+        assert_eq!(resolution, ElicitationResolution::Resolved);
+        assert_eq!(rx.await.unwrap().action, ElicitationAction::Cancel);
+        assert!(
+            fixture
+                .handle
+                .pending_elicitations()
+                .lock()
+                .await
+                .is_empty()
+        );
+
+        let again = cancel_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "q-cancel",
+            "conn",
+            claim.delivery_generation,
+        )
+        .await;
+        assert_eq!(again, ElicitationResolution::NotFound);
+    }
+
+    #[tokio::test]
+    async fn cancel_claimed_elicitation_ignores_stale_or_reclaimed_delivery() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (claim, mut rx) = register_claimed(&fixture, "q-stale", "conn-a").await;
+        // Another connection re-claims the question.
+        let newer =
+            claim_live_elicitation_delivery(fixture.handle.as_ref(), "s1", "q-stale", "conn-b")
+                .await
+                .expect("reclaim");
+        assert!(newer.delivery_generation > claim.delivery_generation);
+
+        let resolution = cancel_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "q-stale",
+            "conn-a",
+            claim.delivery_generation,
+        )
+        .await;
+        assert_eq!(resolution, ElicitationResolution::StaleDelivery);
+        assert!(rx.try_recv().is_err());
+        assert!(
+            has_pending_elicitation_for_session(&fixture.handle.pending_elicitations(), "s1").await
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_cancel_and_resolve_settle_exactly_once() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (claim, rx) = register_claimed(&fixture, "q-race", "conn").await;
+        let handle = fixture.handle.clone();
+        let generation = claim.delivery_generation;
+
+        let cancel = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                cancel_claimed_elicitation(handle.as_ref(), "s1", "q-race", "conn", generation)
+                    .await
+            })
+        };
+        let resolve = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                resolve_claimed_elicitation(
+                    handle.as_ref(),
+                    "s1",
+                    "q-race",
+                    "conn",
+                    generation,
+                    accept(serde_json::json!({"selection": "A"})),
+                )
+                .await
+                .expect("valid answer")
+            })
+        };
+        let (cancel, resolve) = (cancel.await.unwrap(), resolve.await.unwrap());
+        let resolved = [cancel, resolve]
+            .iter()
+            .filter(|r| **r == ElicitationResolution::Resolved)
+            .count();
+        assert_eq!(
+            resolved, 1,
+            "exactly one side may win: {cancel:?} {resolve:?}"
+        );
+        assert!(rx.await.is_ok());
+        assert!(handle.pending_elicitations().lock().await.is_empty());
+    }
+
+    #[test]
+    fn explicit_allow_custom_meta_relaxes_validation() {
+        let mut schema = single_choice_schema();
+        schema["_meta"] = serde_json::json!({"querymt": {"allow_custom": true}});
+        let entry = question_entry(schema, "mcp:server");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "free"}))
+            )
+            .is_ok()
         );
     }
 }

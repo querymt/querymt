@@ -1237,25 +1237,16 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
             .contains_key("stable-question")
     );
 
-    let retry_claim = crate::elicitation::claim_live_elicitation_delivery(
-        fixture.handle.as_ref(),
-        "off-screen-session",
-        "stable-question",
-        "new",
-    )
-    .await
-    .unwrap();
-    deliver_claimed_websocket_elicitation(
-        fixture.handle.clone(),
-        recovery,
-        retry_claim,
-        connection_state_for_test("new", new_tx, new_pending.clone(), counter),
-    )
-    .await
-    .unwrap();
+    // The agent re-delivers the still-pending question automatically with a
+    // fresh JSON-RPC id and the same stable elicitation id.
     let retry_request: serde_json::Value =
         serde_json::from_str(&new_rx.recv().await.unwrap()).unwrap();
+    assert_eq!(retry_request["method"], "elicitation/create");
     assert_ne!(retry_request["id"], new_request["id"]);
+    assert_eq!(
+        retry_request["params"]["_meta"]["querymt"]["elicitation_id"],
+        "stable-question"
+    );
     assert!(
         route_websocket_response(
             &new_pending,
@@ -1283,6 +1274,118 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
             None,
         )
         .await
+    );
+}
+
+#[tokio::test]
+async fn exhausted_validation_redeliveries_cancel_the_pending_elicitation() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let recovery = crate::control::elicitation_recovery::ElicitationRecoveryRegistry::default();
+    let (waiter_tx, waiter_rx) = oneshot::channel();
+    register_pending_elicitation(
+        &fixture.handle.pending_elicitations(),
+        "never-valid".to_string(),
+        PendingElicitationRegistration {
+            session_id: "session".to_string(),
+            form: PendingElicitationForm {
+                message: "Choose".to_string(),
+                requested_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"choice": {"type": "string"}},
+                    "required": ["choice"]
+                }),
+                source: "mcp:server".to_string(),
+            },
+            owner_authority: None,
+            run_id: Some("run".to_string()),
+            tool_call_id: Some("tool".to_string()),
+        },
+        waiter_tx,
+    )
+    .await;
+    let claim = crate::elicitation::claim_live_elicitation_delivery(
+        fixture.handle.as_ref(),
+        "session",
+        "never-valid",
+        "conn",
+    )
+    .await
+    .unwrap();
+    let pending: PendingWsRequestMap = Arc::new(Mutex::new(HashMap::new()));
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(32);
+    deliver_claimed_websocket_elicitation(
+        fixture.handle.clone(),
+        recovery,
+        claim,
+        connection_state_for_test(
+            "conn",
+            wire_tx,
+            pending.clone(),
+            Arc::new(AtomicU64::new(1)),
+        ),
+    )
+    .await
+    .unwrap();
+
+    // Initial delivery plus every permitted redelivery gets an invalid answer.
+    for attempt in 0..=super::websocket::MAX_VALIDATION_REDELIVERIES {
+        let request: serde_json::Value = serde_json::from_str(
+            &timeout(Duration::from_secs(2), wire_rx.recv())
+                .await
+                .expect("request should be (re)delivered")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request["method"], "elicitation/create", "attempt {attempt}");
+        assert!(
+            route_websocket_response(
+                &pending,
+                request["id"].clone(),
+                Some(serde_json::json!({"action": "accept", "content": {"choice": 42}})),
+                None,
+            )
+            .await
+        );
+        let validation: serde_json::Value = serde_json::from_str(
+            &timeout(Duration::from_secs(2), wire_rx.recv())
+                .await
+                .expect("validation failure should be reported")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            validation["method"],
+            crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION
+        );
+    }
+
+    let terminal: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("terminal notification should be sent")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        terminal["method"],
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION
+    );
+    assert_eq!(terminal["params"]["outcome"], "cancel");
+    assert_eq!(
+        timeout(Duration::from_secs(2), waiter_rx)
+            .await
+            .expect("waiting tool must be released")
+            .unwrap()
+            .action,
+        crate::elicitation::ElicitationAction::Cancel
+    );
+    assert!(
+        !fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("never-valid")
     );
 }
 
