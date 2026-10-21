@@ -434,7 +434,38 @@ async fn send_websocket_ext_notification(
 /// Maximum number of times a question is re-delivered on the same connection
 /// after the client's answer failed schema validation. Bounds the loop for a
 /// client that keeps submitting invalid content.
-const MAX_VALIDATION_REDELIVERIES: u32 = 5;
+pub(crate) const MAX_VALIDATION_REDELIVERIES: u32 = 5;
+
+/// Terminate a pending elicitation that cannot be re-delivered any further.
+///
+/// Removal is generation-checked and atomic under the pending-map lock (see
+/// `cancel_claimed_elicitation`), so a delivery re-claimed by another
+/// connection is never cancelled. Returns the terminal outcome to report.
+async fn cancel_unredeliverable_elicitation(
+    agent: &crate::agent::LocalAgentHandle,
+    recovery: &crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
+    session_id: &str,
+    elicitation_id: &str,
+    connection_id: &str,
+    delivery_generation: u64,
+) -> &'static str {
+    match crate::elicitation::cancel_claimed_elicitation(
+        agent,
+        session_id,
+        elicitation_id,
+        connection_id,
+        delivery_generation,
+    )
+    .await
+    {
+        crate::elicitation::ElicitationResolution::Resolved => {
+            recovery.retire_session_if_idle(session_id, agent).await;
+            "cancel"
+        }
+        crate::elicitation::ElicitationResolution::StaleDelivery => "superseded",
+        crate::elicitation::ElicitationResolution::NotFound => "completed_elsewhere",
+    }
+}
 
 pub(crate) async fn deliver_claimed_websocket_elicitation(
     agent: Arc<crate::agent::LocalAgentHandle>,
@@ -548,53 +579,85 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
                     // elicitation id) so the user can correct the answer
                     // instead of leaving the tool waiting forever.
                     if redeliveries_left == 0 {
-                        return;
-                    }
-                    redeliveries_left -= 1;
-                    let Some(next_claim) = recovery
-                        .claim_live_delivery(
-                            &connection_id,
+                        // Retry budget exhausted: terminate the pending
+                        // question so the waiting tool is not left hanging.
+                        cancel_unredeliverable_elicitation(
+                            agent.as_ref(),
+                            &recovery,
                             &claim.session_id,
                             &claim.elicitation_id,
-                            agent.as_ref(),
+                            &connection_id,
+                            claim.delivery_generation,
                         )
                         .await
-                    else {
-                        return;
-                    };
-                    let request = match create_elicitation_request(
-                        next_claim.elicitation_id.clone(),
-                        next_claim.session_id.clone(),
-                        next_claim.form.message.clone(),
-                        next_claim.form.requested_schema.clone(),
-                        next_claim.form.source.clone(),
-                    ) {
-                        Ok(request) => request,
-                        Err(_) => return,
-                    };
-                    match send_websocket_request(
-                        &tx,
-                        &pending_requests,
-                        &request_counter,
-                        &connection_id,
-                        "elicitation/create",
-                        &request,
-                    )
-                    .await
-                    {
-                        Ok(next_pending) => {
-                            claim = next_claim;
-                            pending = next_pending;
-                            continue;
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "Failed to re-deliver elicitation after validation failure: session_id={} elicitation_id={} error={}",
-                                next_claim.session_id,
-                                next_claim.elicitation_id,
-                                error
-                            );
+                    } else {
+                        redeliveries_left -= 1;
+                        let Some(next_claim) = recovery
+                            .claim_live_delivery(
+                                &connection_id,
+                                &claim.session_id,
+                                &claim.elicitation_id,
+                                agent.as_ref(),
+                            )
+                            .await
+                        else {
                             return;
+                        };
+                        match create_elicitation_request(
+                            next_claim.elicitation_id.clone(),
+                            next_claim.session_id.clone(),
+                            next_claim.form.message.clone(),
+                            next_claim.form.requested_schema.clone(),
+                            next_claim.form.source.clone(),
+                        ) {
+                            Err(error) => {
+                                log::warn!(
+                                    "Cannot rebuild elicitation request for re-delivery: session_id={} elicitation_id={} error={}",
+                                    next_claim.session_id,
+                                    next_claim.elicitation_id,
+                                    error
+                                );
+                                let outcome = cancel_unredeliverable_elicitation(
+                                    agent.as_ref(),
+                                    &recovery,
+                                    &next_claim.session_id,
+                                    &next_claim.elicitation_id,
+                                    &connection_id,
+                                    next_claim.delivery_generation,
+                                )
+                                .await;
+                                claim = next_claim;
+                                outcome
+                            }
+                            Ok(request) => {
+                                match send_websocket_request(
+                                    &tx,
+                                    &pending_requests,
+                                    &request_counter,
+                                    &connection_id,
+                                    "elicitation/create",
+                                    &request,
+                                )
+                                .await
+                                {
+                                    Ok(next_pending) => {
+                                        claim = next_claim;
+                                        pending = next_pending;
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        // Connection is gone; the question stays
+                                        // pending for recovery on another one.
+                                        log::warn!(
+                                            "Failed to re-deliver elicitation after validation failure: session_id={} elicitation_id={} error={}",
+                                            next_claim.session_id,
+                                            next_claim.elicitation_id,
+                                            error
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
