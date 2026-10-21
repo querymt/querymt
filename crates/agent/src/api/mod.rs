@@ -79,9 +79,11 @@ pub use quorum::QuorumBuilder;
 pub use session::AgentSession;
 pub(crate) use sessions::AcpSessionListError;
 pub use sessions::{
-    AgentLoadedSession, AgentSessions, ListSessionsOptions, RemoteSessionConnectionState,
-    RemoteSessionMode, SessionChildrenPage, SessionGroup, SessionListMode, SessionListPage,
-    SessionMeta, SessionSummary,
+    AgentLoadedSession, AgentSessions, ArchiveFilter, ListSessionsOptions,
+    RemoteSessionConnectionState, RemoteSessionMode, ResolutionFilter, SessionChildrenPage,
+    SessionChildrenPageWithLifecycle, SessionGroup, SessionGroupWithLifecycle, SessionLifecycle,
+    SessionLifecycleFilter, SessionLifecyclePatch, SessionListMode, SessionListPage,
+    SessionListPageWithLifecycle, SessionMeta, SessionSummary, SessionSummaryWithLifecycle,
 };
 
 #[cfg(test)]

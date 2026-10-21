@@ -5,17 +5,57 @@ use crate::acp::protocol::{
 };
 use crate::agent::LocalAgentHandle;
 use crate::agent::messages::SessionRuntimeStatus;
+pub use crate::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycle, SessionLifecycleFilter,
+    SessionLifecyclePatch,
+};
 use crate::session::load_snapshot::{SessionLoadSnapshot, load_session_snapshot};
 use crate::session::projection::{SessionListItem, SessionScope, ViewStore};
 use crate::session::store::SessionStore;
 use anyhow::{Result, anyhow};
+#[cfg(feature = "remote")]
+use futures_util::StreamExt;
 use querymt::chat::FinishReason;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "remote")]
+use std::collections::{BTreeMap, HashSet};
+#[cfg(feature = "remote")]
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "remote")]
+use std::time::Duration;
 use time::format_description::well_known::Rfc3339;
 use typeshare::typeshare;
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AcpSessionLifecycleFilters {
+    resolution: ResolutionFilter,
+    archive: ArchiveFilter,
+}
+
+fn acp_session_lifecycle_filter(
+    meta: Option<&Meta>,
+) -> std::result::Result<SessionLifecycleFilter, AcpSessionListError> {
+    let Some(querymt) = meta.and_then(|meta| meta.get("querymt")) else {
+        return Ok(SessionLifecycleFilter::default());
+    };
+    let Some(filters) = querymt
+        .as_object()
+        .ok_or_else(|| anyhow!("_meta.querymt must be an object"))?
+        .get("sessionFilters")
+    else {
+        return Ok(SessionLifecycleFilter::default());
+    };
+    let filters: AcpSessionLifecycleFilters = serde_json::from_value(filters.clone())
+        .map_err(|error| anyhow!("invalid _meta.querymt.sessionFilters: {error}"))?;
+    Ok(SessionLifecycleFilter {
+        resolution: filters.resolution,
+        archive: filters.archive,
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +249,41 @@ pub struct SessionChildrenPage {
     pub total_count: u64,
 }
 
+/// A session summary paired with authoritative lifecycle metadata when available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummaryWithLifecycle {
+    #[serde(flatten)]
+    pub summary: SessionSummary,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<SessionLifecycle>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionGroupWithLifecycle {
+    pub cwd: Option<String>,
+    pub sessions: Vec<SessionSummaryWithLifecycle>,
+    pub latest_activity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListPageWithLifecycle {
+    pub groups: Vec<SessionGroupWithLifecycle>,
+    pub next_cursor: Option<String>,
+    pub total_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionChildrenPageWithLifecycle {
+    pub parent_session_id: String,
+    pub sessions: Vec<SessionSummaryWithLifecycle>,
+    pub next_cursor: Option<String>,
+    pub total_count: u64,
+}
+
 pub struct AgentLoadedSession {
     pub session: AgentSession,
     pub snapshot: SessionLoadSnapshot,
@@ -219,6 +294,82 @@ pub struct AgentSessions {
     view_store: Arc<dyn ViewStore>,
     session_store: Arc<dyn SessionStore>,
     default_cwd: Option<PathBuf>,
+}
+
+#[cfg(feature = "remote")]
+const REMOTE_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "remote")]
+const REMOTE_LIFECYCLE_CONCURRENCY: usize = 8;
+
+#[cfg(feature = "remote")]
+async fn load_remote_lifecycles_for_summaries<M, Find, FindFuture, Fetch, FetchFuture>(
+    summaries: &[SessionSummary],
+    find_manager: Find,
+    fetch_lifecycle: Fetch,
+) -> HashMap<String, Option<SessionLifecycle>>
+where
+    M: Clone + Send + Sync + 'static,
+    Find: Fn(String) -> FindFuture + Send + Sync + 'static,
+    FindFuture: Future<Output = Option<M>> + Send + 'static,
+    Fetch: Fn(M, String) -> FetchFuture + Send + Sync + 'static,
+    FetchFuture: Future<Output = Option<SessionLifecycle>> + Send + 'static,
+{
+    let mut node_sessions = BTreeMap::<String, Vec<String>>::new();
+    let mut seen_session_ids = HashSet::new();
+    for summary in summaries {
+        if let Some(node_id) = &summary.node_id
+            && seen_session_ids.insert(summary.session_id.clone())
+        {
+            node_sessions
+                .entry(node_id.clone())
+                .or_default()
+                .push(summary.session_id.clone());
+        }
+    }
+
+    let mut lifecycles_by_id = node_sessions
+        .values()
+        .flatten()
+        .cloned()
+        .map(|session_id| (session_id, None))
+        .collect::<HashMap<_, _>>();
+    let find_manager = Arc::new(find_manager);
+    let fetch_lifecycle = Arc::new(fetch_lifecycle);
+    let mut node_requests =
+        futures_util::stream::iter(node_sessions.into_iter().map(|(node_id, session_ids)| {
+            let find_manager = Arc::clone(&find_manager);
+            let fetch_lifecycle = Arc::clone(&fetch_lifecycle);
+            async move {
+                let deadline = tokio::time::Instant::now() + REMOTE_LIFECYCLE_TIMEOUT;
+                let manager = match tokio::time::timeout_at(deadline, find_manager(node_id)).await {
+                    Ok(Some(manager)) => manager,
+                    Ok(None) | Err(_) => return HashMap::new(),
+                };
+
+                let mut session_requests =
+                    futures_util::stream::iter(session_ids.into_iter().map(|session_id| {
+                        let fetch_lifecycle = Arc::clone(&fetch_lifecycle);
+                        let manager = manager.clone();
+                        async move {
+                            let lifecycle = fetch_lifecycle(manager, session_id.clone()).await;
+                            (session_id, lifecycle)
+                        }
+                    }))
+                    .buffer_unordered(REMOTE_LIFECYCLE_CONCURRENCY);
+                let mut node_lifecycles = HashMap::new();
+                while let Ok(Some((session_id, lifecycle))) =
+                    tokio::time::timeout_at(deadline, session_requests.next()).await
+                {
+                    node_lifecycles.insert(session_id, lifecycle);
+                }
+                node_lifecycles
+            }
+        }))
+        .buffer_unordered(REMOTE_LIFECYCLE_CONCURRENCY);
+    while let Some(node_lifecycles) = node_requests.next().await {
+        lifecycles_by_id.extend(node_lifecycles);
+    }
+    lifecycles_by_id
 }
 
 impl AgentSessions {
@@ -302,6 +453,302 @@ impl AgentSessions {
         Ok(page)
     }
 
+    /// List sessions with lifecycle filtering and per-row authoritative metadata.
+    pub async fn list_with_lifecycle(
+        &self,
+        options: ListSessionsOptions,
+        lifecycle: SessionLifecycleFilter,
+    ) -> Result<SessionListPageWithLifecycle> {
+        let page = if lifecycle.is_filtered() {
+            if options.remote != RemoteSessionMode::None {
+                return Err(anyhow!(
+                    "Lifecycle-filtered API listing requires a complete local owner query; remote bookmark/live merge is unsupported"
+                ));
+            }
+            let view_store = self.view_store()?;
+            if !view_store.supports_session_lifecycle()
+                || !view_store.supports_session_lifecycle_filtering()
+            {
+                return Err(anyhow!(
+                    "Session lifecycle filtering is unsupported by this view store"
+                ));
+            }
+            let page_limit = options.limit.unwrap_or(20).clamp(1, 200) as usize;
+            let scope = options.session_scope.unwrap_or_default();
+            match options.mode {
+                SessionListMode::Group => {
+                    let cwd = match options.cwd.as_deref() {
+                        Some("__none__") => None,
+                        _ => options.cwd.map(normalize_group_cwd),
+                    };
+                    let (group, total) = view_store
+                        .list_group_sessions_with_lifecycle(
+                            cwd,
+                            options.cursor,
+                            page_limit,
+                            scope,
+                            lifecycle,
+                        )
+                        .await?;
+                    SessionListPage {
+                        next_cursor: group.next_cursor.clone(),
+                        total_count: total as u64,
+                        groups: vec![group.into()],
+                    }
+                }
+                SessionListMode::Search => {
+                    let (groups, next_cursor, total) = view_store
+                        .search_sessions_with_lifecycle(
+                            options.query.unwrap_or_default(),
+                            options.cursor,
+                            page_limit,
+                            scope,
+                            lifecycle,
+                        )
+                        .await?;
+                    SessionListPage {
+                        groups: groups.into_iter().map(Into::into).collect(),
+                        next_cursor,
+                        total_count: total as u64,
+                    }
+                }
+                SessionListMode::Browse => {
+                    let (groups, next_cursor, total) = view_store
+                        .browse_session_groups_with_lifecycle(
+                            options.cursor,
+                            page_limit,
+                            10,
+                            scope,
+                            lifecycle,
+                        )
+                        .await?;
+                    SessionListPage {
+                        groups: groups.into_iter().map(Into::into).collect(),
+                        next_cursor,
+                        total_count: total as u64,
+                    }
+                }
+            }
+        } else {
+            self.list(options).await?
+        };
+        self.enrich_session_page_with_lifecycle(page).await
+    }
+
+    pub async fn browse_with_lifecycle(
+        &self,
+        mut options: ListSessionsOptions,
+        lifecycle: SessionLifecycleFilter,
+    ) -> Result<SessionListPageWithLifecycle> {
+        options.mode = SessionListMode::Browse;
+        self.list_with_lifecycle(options, lifecycle).await
+    }
+
+    pub async fn search_with_lifecycle(
+        &self,
+        query: impl Into<String>,
+        mut options: ListSessionsOptions,
+        lifecycle: SessionLifecycleFilter,
+    ) -> Result<SessionListPageWithLifecycle> {
+        options.mode = SessionListMode::Search;
+        options.query = Some(query.into());
+        self.list_with_lifecycle(options, lifecycle).await
+    }
+
+    pub async fn list_group_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        mut options: ListSessionsOptions,
+        lifecycle: SessionLifecycleFilter,
+    ) -> Result<SessionListPageWithLifecycle> {
+        options.mode = SessionListMode::Group;
+        options.cwd = cwd;
+        self.list_with_lifecycle(options, lifecycle).await
+    }
+
+    pub async fn children_with_lifecycle(
+        &self,
+        parent_session_id: impl Into<String>,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        lifecycle: SessionLifecycleFilter,
+    ) -> Result<SessionChildrenPageWithLifecycle> {
+        let parent_session_id = parent_session_id.into();
+        let page_limit = limit.unwrap_or(20).clamp(1, 200) as usize;
+        let view_store = self.view_store()?;
+        let (group, total) = if lifecycle.is_filtered() {
+            if !view_store.supports_session_lifecycle()
+                || !view_store.supports_session_lifecycle_filtering()
+            {
+                return Err(anyhow!(
+                    "Session lifecycle filtering is unsupported by this view store"
+                ));
+            }
+            view_store
+                .list_session_children_with_lifecycle(
+                    parent_session_id.clone(),
+                    cursor,
+                    page_limit,
+                    lifecycle,
+                )
+                .await?
+        } else {
+            view_store
+                .list_session_children(parent_session_id.clone(), cursor, page_limit)
+                .await?
+        };
+        let summaries: Vec<SessionSummary> = group.sessions.into_iter().map(Into::into).collect();
+        let lifecycle_by_id = self
+            .enrich_summaries_with_lifecycle(summaries.clone())
+            .await?;
+        let sessions = summaries
+            .into_iter()
+            .map(|summary| SessionSummaryWithLifecycle {
+                lifecycle: lifecycle_by_id
+                    .get(&summary.session_id)
+                    .and_then(Clone::clone),
+                summary,
+            })
+            .collect();
+        Ok(SessionChildrenPageWithLifecycle {
+            parent_session_id,
+            sessions,
+            next_cursor: group.next_cursor,
+            total_count: total as u64,
+        })
+    }
+
+    pub async fn get_session_lifecycle(
+        &self,
+        session_id: impl AsRef<str>,
+    ) -> Result<SessionLifecycle> {
+        self.agent
+            .get_session_lifecycle_unloaded(session_id.as_ref())
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub async fn set_session_lifecycle(
+        &self,
+        session_id: impl AsRef<str>,
+        patch: crate::session::lifecycle::SessionLifecyclePatch,
+    ) -> Result<SessionLifecycle> {
+        self.agent
+            .patch_session_lifecycle_unloaded(session_id.as_ref(), &patch)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    async fn enrich_session_page_with_lifecycle(
+        &self,
+        page: SessionListPage,
+    ) -> Result<SessionListPageWithLifecycle> {
+        let summaries: Vec<_> = page
+            .groups
+            .iter()
+            .flat_map(|group| group.sessions.iter().cloned())
+            .collect();
+        let lifecycle_by_id = self
+            .enrich_summaries_with_lifecycle(summaries.clone())
+            .await?;
+        let groups = page
+            .groups
+            .into_iter()
+            .map(|group| SessionGroupWithLifecycle {
+                cwd: group.cwd,
+                sessions: group
+                    .sessions
+                    .into_iter()
+                    .map(|summary| SessionSummaryWithLifecycle {
+                        lifecycle: lifecycle_by_id
+                            .get(&summary.session_id)
+                            .and_then(|state| state.clone()),
+                        summary,
+                    })
+                    .collect(),
+                latest_activity: group.latest_activity,
+                total_count: group.total_count,
+                next_cursor: group.next_cursor,
+            })
+            .collect();
+        Ok(SessionListPageWithLifecycle {
+            groups,
+            next_cursor: page.next_cursor,
+            total_count: page.total_count,
+        })
+    }
+
+    async fn enrich_summaries_with_lifecycle(
+        &self,
+        summaries: Vec<SessionSummary>,
+    ) -> Result<HashMap<String, Option<SessionLifecycle>>> {
+        let mut lifecycle_by_id = HashMap::new();
+        let session_store = self.agent.config.provider.history_store();
+        let local_candidate_ids = summaries
+            .iter()
+            .filter(|summary| summary.node_id.is_none())
+            .map(|summary| summary.session_id.clone())
+            .collect::<Vec<_>>();
+        let locations = session_store
+            .resolve_session_locations(&local_candidate_ids)
+            .await?;
+        let mut local_ids = Vec::new();
+        for session_id in &local_candidate_ids {
+            let Some(location) = locations.get(session_id) else {
+                continue;
+            };
+            match location {
+                crate::session::location::SessionLocation::Local => {
+                    local_ids.push(session_id.clone());
+                }
+                crate::session::location::SessionLocation::Conflict { .. } => {
+                    return Err(anyhow!(
+                        "Session location conflict: {session_id} exists locally and as a remote bookmark"
+                    ));
+                }
+                crate::session::location::SessionLocation::Remote { .. }
+                | crate::session::location::SessionLocation::NotFound => {}
+            }
+        }
+
+        let view_store = self.view_store()?;
+        if view_store.supports_session_lifecycle() && !local_ids.is_empty() {
+            lifecycle_by_id.extend(
+                view_store
+                    .get_session_list_lifecycles(&local_ids)
+                    .await?
+                    .into_iter()
+                    .map(|(id, state)| (id, Some(state))),
+            );
+        }
+        #[cfg(feature = "remote")]
+        {
+            let find_agent = self.agent.clone();
+            let fetch_agent = self.agent.clone();
+            let remote_states = load_remote_lifecycles_for_summaries(
+                &summaries,
+                move |node_id| {
+                    let agent = find_agent.clone();
+                    async move { agent.find_node_manager(&node_id).await.ok() }
+                },
+                move |manager, session_id| {
+                    let agent = fetch_agent.clone();
+                    async move {
+                        agent
+                            .get_remote_session_lifecycle(&manager, session_id)
+                            .await
+                            .ok()
+                    }
+                },
+            )
+            .await;
+            lifecycle_by_id.extend(remote_states);
+        }
+        #[cfg(not(feature = "remote"))]
+        let _ = summaries;
+        Ok(lifecycle_by_id)
+    }
+
     pub async fn list_acp(
         &self,
         request: AcpListSessionsRequest,
@@ -324,6 +771,7 @@ impl AgentSessions {
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
+        let lifecycle = acp_session_lifecycle_filter(request.meta.as_ref())?;
         #[cfg(feature = "remote")]
         let remote_nodes = acp_remote_node_ids(request.meta.as_ref());
         #[cfg(feature = "remote")]
@@ -351,12 +799,22 @@ impl AgentSessions {
                 &remote_nodes,
                 remote_cwd.as_deref(),
                 remote_scope,
+                lifecycle,
                 cursor,
             )
             .await;
         }
 
-        let mut page = Self::list_for_acp_from_view_store(view_store.clone(), request).await?;
+        let mut page = if lifecycle.is_filtered() {
+            Self::list_for_acp_from_view_store_with_lifecycle(
+                view_store.clone(),
+                request,
+                lifecycle,
+            )
+            .await?
+        } else {
+            Self::list_for_acp_from_view_store(view_store.clone(), request).await?
+        };
         Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
         #[cfg(feature = "remote")]
         if !remote_nodes.is_empty() && page.next_cursor.is_none() {
@@ -365,6 +823,7 @@ impl AgentSessions {
                 &remote_nodes,
                 remote_cwd.as_deref(),
                 remote_scope,
+                lifecycle,
                 AcpRemoteCursor::default(),
             )
             .await?;
@@ -383,6 +842,7 @@ impl AgentSessions {
         nodes: &[String],
         cwd: Option<&str>,
         scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
         cursor: AcpRemoteCursor,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let node_id = nodes
@@ -407,19 +867,68 @@ impl AgentSessions {
             .map(|session| session.public_id)
             .collect();
 
-        // Bound lookup plus listing together; a small ACP request must not
-        // enumerate every peer or repeatedly traverse an owner's history.
-        let live_page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // Explicit lifecycle predicates run at the owner; otherwise retain raw-page
+        // traversal for workspace and relationship filtering.
+        let (owner_cwd, owner_scope) = if lifecycle.is_filtered() {
+            (cwd.map(str::to_owned), scope)
+        } else {
+            (None, SessionScope::All)
+        };
+        let owner_page = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let manager = agent.find_node_manager(node_id).await?;
-            agent
-                .list_remote_sessions(&manager, Some(offset), Some(limit))
+            match agent
+                .list_remote_sessions_with_lifecycle(
+                    &manager,
+                    Some(offset),
+                    Some(limit),
+                    owner_cwd.clone(),
+                    owner_scope,
+                    lifecycle,
+                )
                 .await
+            {
+                Ok(response) => {
+                    let lifecycle_by_id: HashMap<String, SessionLifecycle> = response
+                        .sessions
+                        .iter()
+                        .map(|row| (row.session.session_id.clone(), row.lifecycle.clone()))
+                        .collect();
+                    let entries = response
+                        .sessions
+                        .into_iter()
+                        .map(|row| row.session)
+                        .collect();
+                    Ok((entries, response.next_offset, Some(lifecycle_by_id)))
+                }
+                Err(error) if lifecycle.is_filtered() => Err(error),
+                Err(_) => agent
+                    .list_remote_sessions(&manager, Some(offset), Some(limit))
+                    .await
+                    .map(|response| (response.sessions, response.next_offset, None)),
+            }
         })
         .await;
-        let (entries, next_offset, live) = match live_page {
-            Ok(Ok(response)) => {
+        let (entries, next_offset, live, remote_lifecycles) = match owner_page {
+            Ok(Ok((entries, next_offset, remote_lifecycles))) => {
+                let response = crate::agent::remote::ListRemoteSessionsResponse {
+                    sessions: entries.clone(),
+                    next_offset,
+                    total_count: 0,
+                };
                 validate_acp_remote_page(&response, offset, limit)?;
-                (response.sessions, response.next_offset, true)
+                (entries, next_offset, true, remote_lifecycles)
+            }
+            Ok(Err(error)) if lifecycle.is_filtered() => {
+                return Err(anyhow!(
+                    "Remote session owner cannot provide lifecycle-filtered results: {error}"
+                )
+                .into());
+            }
+            Err(error) if lifecycle.is_filtered() => {
+                return Err(anyhow!(
+                    "Remote session owner is unavailable for lifecycle-filtered results: {error}"
+                )
+                .into());
             }
             error => {
                 log::debug!("Unable to list sessions from peer {}: {:?}", node_id, error);
@@ -453,7 +962,7 @@ impl AgentSessions {
                 } else {
                     None
                 };
-                (entries, next, false)
+                (entries, next, false, None)
             }
         };
         let source = if live { "live" } else { "bookmarks" };
@@ -489,6 +998,10 @@ impl AgentSessions {
             {
                 continue;
             }
+            let lifecycle_metadata = remote_lifecycles
+                .as_ref()
+                .and_then(|lifecycles| lifecycles.get(&entry.session_id))
+                .cloned();
             let mut info = SessionInfo::new(
                 SessionId::from(entry.session_id),
                 entry.cwd.map(PathBuf::from).unwrap_or_default(),
@@ -518,6 +1031,9 @@ impl AgentSessions {
             if let Some(origin) = entry.fork_origin {
                 meta.insert("forkOrigin".into(), serde_json::json!(origin));
             }
+            if let Some(lifecycle) = lifecycle_metadata.as_ref() {
+                insert_acp_lifecycle_meta(&mut meta, lifecycle);
+            }
             info.meta = Some(meta);
             sessions.push(info);
         }
@@ -534,6 +1050,19 @@ impl AgentSessions {
         view_store: Arc<dyn ViewStore>,
         request: AcpListSessionsRequest,
     ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
+        Self::list_for_acp_from_view_store_with_lifecycle(
+            view_store,
+            request,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn list_for_acp_from_view_store_with_lifecycle(
+        view_store: Arc<dyn ViewStore>,
+        request: AcpListSessionsRequest,
+        lifecycle: SessionLifecycleFilter,
+    ) -> std::result::Result<AcpSessionListPage, AcpSessionListError> {
         let cursor = AcpSessionCursor::parse(request.cursor.as_deref())?;
         let requested_cwd = request
             .cwd
@@ -543,11 +1072,12 @@ impl AgentSessions {
         let limit = if requested_cwd.is_some() { 10 } else { 100 };
 
         let (sessions, next_cursor, total_count) = view_store
-            .list_session_items(
+            .list_session_items_with_lifecycle(
                 requested_cwd,
                 cursor.map(AcpSessionCursor::into_string),
                 limit,
                 session_scope,
+                lifecycle,
             )
             .await
             .map_err(anyhow::Error::from)?;
@@ -575,7 +1105,38 @@ impl AgentSessions {
             return Ok(());
         }
 
+        let session_store = agent.config.provider.history_store();
+        let locations = session_store
+            .resolve_session_locations(&session_ids)
+            .await?;
+        let mut local_session_ids = Vec::with_capacity(session_ids.len());
+        for session_id in &session_ids {
+            let Some(location) = locations.get(session_id) else {
+                continue;
+            };
+            match location {
+                crate::session::location::SessionLocation::Local => {
+                    local_session_ids.push(session_id.clone());
+                }
+                crate::session::location::SessionLocation::Conflict { .. } => {
+                    return Err(anyhow!(
+                        "Session location conflict: {session_id} exists locally and as a remote bookmark"
+                    ));
+                }
+                crate::session::location::SessionLocation::Remote { .. }
+                | crate::session::location::SessionLocation::NotFound => {}
+            }
+        }
+
         let persisted_stats = view_store.get_session_list_meta_stats(&session_ids).await?;
+        let lifecycles = if view_store.supports_session_lifecycle() && !local_session_ids.is_empty()
+        {
+            view_store
+                .get_session_list_lifecycles(&local_session_ids)
+                .await?
+        } else {
+            HashMap::new()
+        };
         let actor_refs = {
             let registry = agent.registry.lock().await;
             registry.get_many(session_ids.iter().map(String::as_str))
@@ -612,6 +1173,9 @@ impl AgentSessions {
             };
             let mut acp_meta = info.meta.take().unwrap_or_default();
             acp_meta.extend(meta.to_acp_meta());
+            if let Some(lifecycle) = lifecycles.get(&session_id) {
+                insert_acp_lifecycle_meta(&mut acp_meta, lifecycle);
+            }
             info.meta = Some(acp_meta);
         }
 
@@ -1042,6 +1606,21 @@ fn parse_acp_remote_cursor(
     }
 }
 
+fn insert_acp_lifecycle_meta(meta: &mut Meta, lifecycle: &SessionLifecycle) {
+    let namespace = meta
+        .entry("querymt")
+        .or_insert_with(|| serde_json::json!({}));
+    if !namespace.is_object() {
+        *namespace = serde_json::json!({});
+    }
+    if let Some(namespace) = namespace.as_object_mut() {
+        namespace.insert(
+            "lifecycle".into(),
+            serde_json::to_value(lifecycle).expect("serialize lifecycle metadata"),
+        );
+    }
+}
+
 fn acp_session_scope_from_meta(meta: Option<&Meta>) -> SessionScope {
     let Some(meta) = meta else {
         return SessionScope::All;
@@ -1218,5 +1797,282 @@ mod remote_page_tests {
         ] {
             assert!(validate_acp_remote_page(&response(count, next), offset, 10).is_err());
         }
+    }
+
+    fn summary(session_id: &str, node_id: &str) -> SessionSummary {
+        SessionSummary {
+            session_id: session_id.to_string(),
+            name: None,
+            cwd: None,
+            title: None,
+            created_at: None,
+            updated_at: None,
+            parent_session_id: None,
+            fork_origin: None,
+            session_kind: None,
+            has_children: false,
+            fork_count: 0,
+            node: None,
+            node_id: Some(node_id.to_string()),
+            attached: None,
+            connection_state: None,
+            runtime_state: None,
+        }
+    }
+
+    fn lifecycle(session_id: &str, resolved: bool) -> SessionLifecycle {
+        SessionLifecycle {
+            session_id: session_id.to_string(),
+            resolved,
+            archived: false,
+            resolved_at: resolved.then(|| "2026-01-01T00:00:00Z".to_string()),
+            archived_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_enrichment_discovers_each_node_once_and_fetches_session_states() {
+        use std::sync::{Arc, Mutex};
+
+        let find_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let fetch_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let summaries = vec![
+            summary("a-open", "node-a"),
+            summary("a-resolved", "node-a"),
+            summary("b-open", "node-b"),
+        ];
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            {
+                let calls = Arc::clone(&find_calls);
+                move |node_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        *calls.lock().unwrap().entry(node_id.clone()).or_default() += 1;
+                        Some(node_id)
+                    }
+                }
+            },
+            {
+                let calls = Arc::clone(&fetch_calls);
+                move |_manager: String, session_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        *calls.lock().unwrap().entry(session_id.clone()).or_default() += 1;
+                        Some(lifecycle(&session_id, session_id == "a-resolved"))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            find_calls.lock().unwrap().clone(),
+            HashMap::from([("node-a".to_string(), 1), ("node-b".to_string(), 1)])
+        );
+        assert_eq!(
+            fetch_calls.lock().unwrap().clone(),
+            HashMap::from([
+                ("a-open".to_string(), 1),
+                ("a-resolved".to_string(), 1),
+                ("b-open".to_string(), 1),
+            ])
+        );
+        assert_eq!(
+            lifecycles.get("a-open"),
+            Some(&Some(lifecycle("a-open", false)))
+        );
+        assert_eq!(
+            lifecycles.get("a-resolved"),
+            Some(&Some(lifecycle("a-resolved", true)))
+        );
+        assert_eq!(
+            lifecycles.get("b-open"),
+            Some(&Some(lifecycle("b-open", false)))
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_enrichment_processes_rows_beyond_node_and_session_windows() {
+        use std::sync::{Arc, Mutex};
+
+        let find_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let fetch_calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let mut summaries = (0..8)
+            .map(|node| summary(&format!("node-session-{node}"), &format!("node-{node:02}")))
+            .collect::<Vec<_>>();
+        summaries
+            .extend((0..101).map(|session| summary(&format!("session-{session:03}"), "node-08")));
+
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            {
+                let calls = Arc::clone(&find_calls);
+                move |node_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        *calls.lock().unwrap().entry(node_id).or_default() += 1;
+                        Some("healthy-owner".to_string())
+                    }
+                }
+            },
+            {
+                let calls = Arc::clone(&fetch_calls);
+                move |manager: String, session_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        assert_eq!(manager, "healthy-owner");
+                        *calls.lock().unwrap().entry(session_id.clone()).or_default() += 1;
+                        Some(lifecycle(&session_id, session_id == "session-100"))
+                    }
+                }
+            },
+        )
+        .await;
+
+        let find_calls = find_calls.lock().unwrap();
+        assert_eq!(find_calls.len(), 9);
+        assert!(find_calls.values().all(|count| *count == 1));
+        let fetch_calls = fetch_calls.lock().unwrap();
+        assert_eq!(fetch_calls.len(), 109);
+        assert!(fetch_calls.values().all(|count| *count == 1));
+        for summary in &summaries {
+            let resolved = summary.session_id == "session-100";
+            assert_eq!(
+                lifecycles.get(&summary.session_id),
+                Some(&Some(lifecycle(&summary.session_id, resolved)))
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_enrichment_fetches_100_healthy_sessions_within_shared_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let find_calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let summaries = (0..100)
+            .map(|index| summary(&format!("session-{index:03}"), "healthy-owner"))
+            .collect::<Vec<_>>();
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            {
+                let find_calls = Arc::clone(&find_calls);
+                move |_node_id: String| {
+                    let find_calls = Arc::clone(&find_calls);
+                    async move {
+                        find_calls.fetch_add(1, Ordering::SeqCst);
+                        Some("healthy-owner".to_string())
+                    }
+                }
+            },
+            {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                move |manager: String, session_id: String| {
+                    let fetch_calls = Arc::clone(&fetch_calls);
+                    let in_flight = Arc::clone(&in_flight);
+                    let max_in_flight = Arc::clone(&max_in_flight);
+                    async move {
+                        assert_eq!(manager, "healthy-owner");
+                        fetch_calls.fetch_add(1, Ordering::SeqCst);
+                        let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_in_flight.fetch_max(active, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                        let index = session_id
+                            .strip_prefix("session-")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        Some(lifecycle(&session_id, index % 2 == 0))
+                    }
+                }
+            },
+        )
+        .await;
+
+        let completed_count = lifecycles.values().filter(|state| state.is_some()).count();
+        assert_eq!(
+            completed_count,
+            summaries.len(),
+            "all healthy lifecycle lookups should fit within the shared node deadline"
+        );
+        for (index, summary) in summaries.iter().enumerate() {
+            assert_eq!(
+                lifecycles.get(&summary.session_id),
+                Some(&Some(lifecycle(&summary.session_id, index % 2 == 0)))
+            );
+        }
+        assert_eq!(find_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), summaries.len());
+        assert!(max_in_flight.load(Ordering::SeqCst) > 1);
+        assert!(max_in_flight.load(Ordering::SeqCst) <= REMOTE_LIFECYCLE_CONCURRENCY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_enrichment_keeps_completed_states_and_bounds_offline_or_slow_nodes() {
+        use std::sync::{Arc, Mutex};
+
+        let fetch_calls = Arc::new(Mutex::new(Vec::new()));
+        let summaries = vec![
+            summary("offline-a", "node-offline"),
+            summary("offline-b", "node-offline"),
+            summary("known", "node-slow"),
+            summary("slow", "node-slow"),
+            summary("after-timeout", "node-slow"),
+        ];
+        let lifecycles = load_remote_lifecycles_for_summaries(
+            &summaries,
+            |node_id: String| async move {
+                if node_id == "node-offline" {
+                    None
+                } else {
+                    Some(node_id)
+                }
+            },
+            {
+                let calls = Arc::clone(&fetch_calls);
+                move |_manager: String, session_id: String| {
+                    let calls = Arc::clone(&calls);
+                    async move {
+                        calls.lock().unwrap().push(session_id.clone());
+                        if session_id == "slow" {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                        }
+                        Some(lifecycle(&session_id, true))
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(lifecycles.get("offline-a"), Some(&None));
+        assert_eq!(lifecycles.get("offline-b"), Some(&None));
+        assert_eq!(
+            lifecycles.get("known"),
+            Some(&Some(lifecycle("known", true)))
+        );
+        assert_eq!(lifecycles.get("slow"), Some(&None));
+        assert_eq!(
+            lifecycles.get("after-timeout"),
+            Some(&Some(lifecycle("after-timeout", true)))
+        );
+        let fetch_calls = fetch_calls.lock().unwrap();
+        assert_eq!(fetch_calls.len(), 3);
+        assert_eq!(
+            fetch_calls
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([
+                "known".to_string(),
+                "slow".to_string(),
+                "after-timeout".to_string(),
+            ])
+        );
     }
 }

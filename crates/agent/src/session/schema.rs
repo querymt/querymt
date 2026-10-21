@@ -44,6 +44,13 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS idx_sessions_cwd_updated ON sessions(cwd, updated_at DESC);
         CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 
+        CREATE TABLE IF NOT EXISTS session_lifecycle (
+            session_id INTEGER PRIMARY KEY,
+            resolved_at TEXT,
+            archived_at TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
         -- Full-text session search index (all sessions, not just loaded pages).
         -- The 'title' column is populated from intent_snapshots.summary so that
         -- session titles are searchable even though the title is derived data.

@@ -10,6 +10,9 @@ use crate::agent::session_control::{SessionControlState, SessionModelBinding};
 use crate::events::{AgentEventKind, EventOrigin};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::ForkOrigin;
+use crate::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
+};
 use crate::session::projection::{
     EventJournal, NewDurableEvent, RecentModelEntry, SessionScope, ViewStore,
 };
@@ -2142,6 +2145,125 @@ fn migrations_are_idempotent() {
 }
 
 #[tokio::test]
+async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let mut conn = Connection::open(db.path()).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE schema_migrations (
+             version TEXT PRIMARY KEY,
+             applied_at INTEGER NOT NULL
+         );",
+    )
+    .unwrap();
+
+    // Model the previous schema by applying and recording every migration except lifecycle.
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version != "0022_session_lifecycle")
+    {
+        (migration.apply)(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 0)",
+            [migration.version],
+        )
+        .unwrap();
+    }
+
+    let lifecycle_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        lifecycle_table_exists,
+        "migration 0001 initializes the current schema"
+    );
+    conn.execute_batch("DROP TABLE session_lifecycle;").unwrap();
+    let lifecycle_table_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !lifecycle_table_exists,
+        "fixture must predate lifecycle support"
+    );
+
+    conn.execute(
+        "INSERT INTO sessions (public_id, name, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            "pre-lifecycle-session",
+            "Legacy session",
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z"
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let storage = SqliteStorage::connect(db.path().to_path_buf())
+        .await
+        .unwrap();
+    {
+        let conn = storage.conn_for_test();
+        let conn = conn.lock().unwrap();
+        let lifecycle_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_lifecycle')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(lifecycle_table_exists, "connection applies migration 0022");
+        let lifecycle_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_lifecycle", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lifecycle_rows, 0, "legacy sessions are not backfilled");
+        let legacy_row: (String, String, String, String) = conn
+            .query_row(
+                "SELECT public_id, name, created_at, updated_at FROM sessions WHERE public_id = ?1",
+                ["pre-lifecycle-session"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            legacy_row,
+            (
+                "pre-lifecycle-session".into(),
+                "Legacy session".into(),
+                "2026-01-01T00:00:00Z".into(),
+                "2026-01-02T00:00:00Z".into(),
+            )
+        );
+    }
+
+    let session = storage
+        .get_session("pre-lifecycle-session")
+        .await
+        .unwrap()
+        .expect("pre-existing session survives the lifecycle migration");
+    assert_eq!(session.public_id, "pre-lifecycle-session");
+    assert_eq!(session.name.as_deref(), Some("Legacy session"));
+
+    let lifecycle = storage
+        .get_session_lifecycle(&session.public_id)
+        .await
+        .unwrap();
+    assert!(!lifecycle.resolved);
+    assert!(!lifecycle.archived);
+    assert_eq!(lifecycle.resolved_at, None);
+    assert_eq!(lifecycle.archived_at, None);
+}
+
+#[tokio::test]
 async fn task_lifecycle_is_atomic_revisioned_and_explicit() {
     use crate::session::domain::{TaskKind, TaskStatus};
     use crate::session::store::TaskPatch;
@@ -3457,6 +3579,484 @@ async fn search_sessions_filters_by_scope() {
 // ══════════════════════════════════════════════════════════════════════
 // ViewStore — get_recent_models_view tests
 // ══════════════════════════════════════════════════════════════════════
+
+fn set_session_updated_at(storage: &SqliteStorage, session_id: &str, updated_at: &str) {
+    let conn = storage.conn_for_test();
+    conn.lock()
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE public_id = ?2",
+            rusqlite::params![updated_at, session_id],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn session_lifecycle_storage_defaults_patches_and_cascades() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let session = storage
+        .create_session(Some("lifecycle".into()), None, None, None)
+        .await
+        .unwrap();
+    let sibling = storage
+        .create_session(Some("sibling".into()), None, None, None)
+        .await
+        .unwrap();
+    let store: &dyn SessionStore = &storage;
+    assert!(store.supports_session_lifecycle());
+
+    let before_activity = store
+        .get_session(&session.public_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .updated_at;
+    let lifecycle_rows: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM session_lifecycle", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(lifecycle_rows, 0, "new sessions are not backfilled");
+
+    let initial = store
+        .get_session_lifecycle(&session.public_id)
+        .await
+        .unwrap();
+    assert!(!initial.resolved);
+    assert!(!initial.archived);
+    assert_eq!(initial.resolved_at, None);
+    assert_eq!(initial.archived_at, None);
+
+    let empty_patch = SessionLifecyclePatch::default();
+    assert!(
+        store
+            .patch_session_lifecycle(&session.public_id, &empty_patch)
+            .await
+            .is_err()
+    );
+    let resolved_patch = SessionLifecyclePatch {
+        resolved: Some(true),
+        archived: None,
+    };
+    let resolved = store
+        .patch_session_lifecycle(&session.public_id, &resolved_patch)
+        .await
+        .unwrap();
+    let repeated = store
+        .patch_session_lifecycle(&session.public_id, &resolved_patch)
+        .await
+        .unwrap();
+    assert!(resolved.resolved);
+    assert_eq!(resolved.resolved_at, repeated.resolved_at);
+
+    let archived = store
+        .patch_session_lifecycle(
+            &session.public_id,
+            &SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    let reopened = store
+        .patch_session_lifecycle(
+            &session.public_id,
+            &SessionLifecyclePatch {
+                resolved: Some(false),
+                archived: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!reopened.resolved);
+    assert_eq!(reopened.resolved_at, None);
+    assert!(reopened.archived);
+    assert_eq!(reopened.archived_at, archived.archived_at);
+    assert_eq!(
+        store
+            .get_session(&session.public_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        before_activity
+    );
+
+    let ids = vec![session.public_id.clone(), sibling.public_id.clone()];
+    let batch = store.get_session_lifecycles(&ids).await.unwrap();
+    assert!(batch[&session.public_id].archived);
+    assert!(!batch[&sibling.public_id].resolved);
+    assert_eq!(batch[&sibling.public_id].resolved_at, None);
+
+    let views: &dyn ViewStore = &storage;
+    assert!(views.supports_session_lifecycle());
+    let listed = views.get_session_list_lifecycles(&ids).await.unwrap();
+    assert_eq!(listed, batch);
+    assert!(matches!(
+        store.get_session_lifecycle("missing-session").await,
+        Err(crate::session::error::SessionError::SessionNotFound(_))
+    ));
+    assert!(
+        store
+            .patch_session_lifecycle("missing-session", &resolved_patch)
+            .await
+            .is_err()
+    );
+
+    let internal_id: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM sessions WHERE public_id = ?1",
+            rusqlite::params![session.public_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    store.delete_session(&session.public_id).await.unwrap();
+    let remaining_lifecycle_rows: i64 = storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_lifecycle WHERE session_id = ?1",
+            rusqlite::params![internal_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_lifecycle_rows, 0, "session deletion cascades");
+}
+
+#[tokio::test]
+async fn session_lifecycle_state_survives_reopening_storage() {
+    let db = tempfile::NamedTempFile::new().unwrap();
+    let db_path = db.path().to_path_buf();
+    let session_id;
+    let expected;
+    {
+        let storage = SqliteStorage::connect(db_path.clone()).await.unwrap();
+        let session = storage
+            .create_session(Some("persist lifecycle".into()), None, None, None)
+            .await
+            .unwrap();
+        session_id = session.public_id;
+        expected = storage
+            .patch_session_lifecycle(
+                &session_id,
+                &SessionLifecyclePatch {
+                    resolved: Some(true),
+                    archived: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    let reopened = SqliteStorage::connect(db_path).await.unwrap();
+    let actual = reopened.get_session_lifecycle(&session_id).await.unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn lifecycle_filters_apply_before_pages_counts_and_activity() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let newest_open = storage
+        .create_session(
+            Some("lifecycleprobe newest open".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let newest_archived = storage
+        .create_session(
+            Some("lifecycleprobe newest archived".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let resolved = storage
+        .create_session(
+            Some("lifecycleprobe resolved".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let older_open = storage
+        .create_session(
+            Some("lifecycleprobe older open".into()),
+            Some("/lifecycle".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let parent = storage
+        .create_session(
+            Some("lifecycleprobe parent".into()),
+            Some("/children".into()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let open_child = storage
+        .create_session(
+            Some("lifecycleprobe open child".into()),
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(ForkOrigin::User),
+        )
+        .await
+        .unwrap();
+    let archived_child = storage
+        .create_session(
+            Some("lifecycleprobe archived child".into()),
+            Some("/children".into()),
+            Some(parent.public_id.clone()),
+            Some(ForkOrigin::User),
+        )
+        .await
+        .unwrap();
+
+    set_session_updated_at(&storage, &newest_archived.public_id, "2025-04-01T00:00:00Z");
+    set_session_updated_at(&storage, &resolved.public_id, "2025-03-01T00:00:00Z");
+    set_session_updated_at(&storage, &newest_open.public_id, "2025-02-01T00:00:00Z");
+    set_session_updated_at(&storage, &older_open.public_id, "2025-01-01T00:00:00Z");
+    set_session_updated_at(&storage, &parent.public_id, "2024-12-01T00:00:00Z");
+    set_session_updated_at(&storage, &open_child.public_id, "2024-11-01T00:00:00Z");
+    set_session_updated_at(&storage, &archived_child.public_id, "2024-10-01T00:00:00Z");
+
+    let store: &dyn SessionStore = &storage;
+    store
+        .patch_session_lifecycle(
+            &newest_archived.public_id,
+            &SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .patch_session_lifecycle(
+            &resolved.public_id,
+            &SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .patch_session_lifecycle(
+            &archived_child.public_id,
+            &SessionLifecyclePatch {
+                resolved: None,
+                archived: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .patch_session_lifecycle(
+            &parent.public_id,
+            &SessionLifecyclePatch {
+                resolved: Some(true),
+                archived: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let filter = SessionLifecycleFilter {
+        resolution: ResolutionFilter::Open,
+        archive: ArchiveFilter::Excluded,
+    };
+    let views: &dyn ViewStore = &storage;
+
+    let (items, next_cursor, total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            1,
+            SessionScope::All,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(items[0].session_id, newest_open.public_id);
+    assert_eq!(next_cursor.as_deref(), Some("1"));
+    let (items, next_cursor, total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            next_cursor,
+            1,
+            SessionScope::All,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(items[0].session_id, older_open.public_id);
+    assert!(next_cursor.is_none());
+
+    let (archived_items, _, archived_total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            10,
+            SessionScope::All,
+            SessionLifecycleFilter {
+                resolution: ResolutionFilter::Any,
+                archive: ArchiveFilter::Only,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(archived_total, 1);
+    assert_eq!(archived_items[0].session_id, newest_archived.public_id);
+
+    let (resolved_items, _, resolved_total) = views
+        .list_session_items_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            10,
+            SessionScope::All,
+            SessionLifecycleFilter {
+                resolution: ResolutionFilter::Resolved,
+                archive: ArchiveFilter::Any,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved_total, 1);
+    assert_eq!(resolved_items[0].session_id, resolved.public_id);
+
+    let (group, total) = views
+        .list_group_sessions_with_lifecycle(
+            Some("/lifecycle".into()),
+            None,
+            1,
+            SessionScope::All,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(group.total_count, Some(2));
+    assert_eq!(group.sessions[0].session_id, newest_open.public_id);
+    assert_eq!(
+        group.latest_activity.unwrap(),
+        time::OffsetDateTime::parse(
+            "2025-02-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    );
+
+    let (groups, _, total) = views
+        .browse_session_groups_with_lifecycle(None, 10, 1, SessionScope::Root, filter)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    let workspace_group = groups
+        .iter()
+        .find(|group| group.cwd.as_deref() == Some("/lifecycle"))
+        .unwrap();
+    assert_eq!(workspace_group.total_count, Some(2));
+    assert_eq!(
+        workspace_group.sessions[0].session_id,
+        newest_open.public_id
+    );
+
+    let (groups, _, total) = views
+        .search_sessions_with_lifecycle(
+            "lifecycleprobe".into(),
+            None,
+            1,
+            SessionScope::Root,
+            filter,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    let first_page_ids = session_ids(&groups);
+    assert_eq!(first_page_ids.len(), 1);
+    assert!(!first_page_ids.contains(&newest_archived.public_id));
+    assert!(!first_page_ids.contains(&resolved.public_id));
+
+    let (groups, _, _) = views
+        .search_sessions_with_lifecycle(
+            "lifecycleprobe".into(),
+            None,
+            10,
+            SessionScope::Root,
+            filter,
+        )
+        .await
+        .unwrap();
+    let search_workspace = groups
+        .iter()
+        .find(|group| group.cwd.as_deref() == Some("/lifecycle"))
+        .unwrap();
+    assert_eq!(search_workspace.total_count, Some(2));
+    assert_eq!(
+        search_workspace.latest_activity.unwrap(),
+        time::OffsetDateTime::parse(
+            "2025-02-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+    );
+
+    let (group, total) = views
+        .list_session_children_with_lifecycle(parent.public_id.clone(), None, 10, filter)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(group.sessions[0].session_id, open_child.public_id);
+
+    let list_view = views
+        .get_session_list_view_with_lifecycle(None, filter)
+        .await
+        .unwrap();
+    assert_eq!(list_view.total_count, 3);
+    assert_eq!(
+        list_view
+            .groups
+            .iter()
+            .map(|group| group.sessions.len())
+            .sum::<usize>(),
+        3
+    );
+    let listed_child = list_view
+        .groups
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .find(|session| session.session_id == open_child.public_id)
+        .expect("open child remains listed when its parent is filtered out");
+    assert_eq!(
+        listed_child.parent_session_id.as_deref(),
+        Some(parent.public_id.as_str())
+    );
+
+    let (_, _, unfiltered_total) = views
+        .search_sessions("lifecycleprobe".into(), None, 20, SessionScope::Root)
+        .await
+        .unwrap();
+    assert_eq!(unfiltered_total, 5);
+}
 
 #[tokio::test]
 async fn recent_models_view_reads_from_event_journal() {

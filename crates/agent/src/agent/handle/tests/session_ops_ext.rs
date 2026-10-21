@@ -140,3 +140,87 @@ async fn querymt_session_redo_unknown_session_returns_failure_payload() {
     );
     assert_eq!(result["undo_stack"].as_array().map(Vec::len), Some(0));
 }
+
+#[tokio::test]
+async fn querymt_session_lifecycle_ext_reads_and_patches_without_loading() {
+    let f = HandleFixture::new().await;
+    let store = f.handle.config.provider.history_store();
+    let session = store
+        .create_session(None, None, None, None)
+        .await
+        .expect("create stored session");
+    let session_id = session.public_id;
+
+    let initial = ext_method_json(
+        &f.handle,
+        "querymt/session/getLifecycle",
+        serde_json::json!({ "session_id": session_id }),
+    )
+    .await;
+    assert_eq!(initial["resolved"], false);
+    assert_eq!(initial["archived"], false);
+    assert!(initial["resolved_at"].is_null());
+    assert!(f.handle.registry.lock().await.get(&session_id).is_none());
+
+    let updated = ext_method_json(
+        &f.handle,
+        "querymt/session/setLifecycle",
+        serde_json::json!({
+            "session_id": session_id,
+            "resolved": true,
+            "archived": true
+        }),
+    )
+    .await;
+    assert_eq!(updated["resolved"], true);
+    assert_eq!(updated["archived"], true);
+    assert!(updated["resolved_at"].is_string());
+    assert!(updated["archived_at"].is_string());
+
+    let restored = ext_method_json(
+        &f.handle,
+        "querymt/session/setLifecycle",
+        serde_json::json!({ "session_id": session_id, "archived": false }),
+    )
+    .await;
+    assert_eq!(restored["resolved"], true);
+    assert_eq!(restored["archived"], false);
+    assert!(restored["archived_at"].is_null());
+    assert!(f.handle.registry.lock().await.get(&session_id).is_none());
+}
+
+#[tokio::test]
+async fn querymt_session_lifecycle_ext_rejects_empty_and_null_patches() {
+    let f = HandleFixture::new().await;
+    let missing = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/session/setLifecycle",
+            raw_params(&serde_json::json!({ "session_id": "missing" }).to_string()),
+        ))
+        .await
+        .expect_err("empty patch is invalid");
+    assert_eq!(
+        missing.code,
+        agent_client_protocol::ErrorCode::InvalidParams
+    );
+
+    let null_value = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/session/setLifecycle",
+            raw_params(
+                &serde_json::json!({
+                    "session_id": "missing",
+                    "resolved": null
+                })
+                .to_string(),
+            ),
+        ))
+        .await
+        .expect_err("null desired state is invalid");
+    assert_eq!(
+        null_value.code,
+        agent_client_protocol::ErrorCode::InvalidParams
+    );
+}

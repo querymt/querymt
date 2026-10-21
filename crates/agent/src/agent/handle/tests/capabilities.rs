@@ -34,7 +34,30 @@ fn legacy_capabilities_fixture_has_no_recovery_contract() {
     let capabilities: crate::control::capabilities::CapabilitiesInfo =
         serde_json::from_value(legacy).expect("deserialize legacy capabilities");
 
+    assert!(!capabilities.features.session_lifecycle);
     assert!(capabilities.elicitation_recovery.is_none());
+}
+
+#[test]
+fn session_lifecycle_feature_deserializes_explicit_values() {
+    for expected in [false, true] {
+        let features: crate::control::capabilities::ControlFeatureInfo =
+            serde_json::from_value(serde_json::json!({
+                "mesh": false,
+                "mesh_invites": false,
+                "remote_sessions": false,
+                "session_lifecycle": expected,
+                "schedules": false,
+                "remote_schedules": false,
+                "profiles": false,
+                "auth": false,
+                "models": false,
+                "steering": false
+            }))
+            .expect("deserialize explicit session lifecycle capability");
+
+        assert_eq!(features.session_lifecycle, expected);
+    }
 }
 
 #[tokio::test]
@@ -73,6 +96,8 @@ async fn test_querymt_capabilities_lists_control_surface() {
         "querymt/session/undo",
         "querymt/session/redo",
         "querymt/session/undoStack",
+        "querymt/session/getLifecycle",
+        "querymt/session/setLifecycle",
         "querymt/auth/status",
         "querymt/auth/start",
         "querymt/auth/complete",
@@ -91,6 +116,7 @@ async fn test_querymt_capabilities_lists_control_surface() {
         );
     }
     assert_eq!(result["features"]["auth"], true);
+    assert_eq!(result["features"]["session_lifecycle"], true);
     assert_eq!(result["elicitation_recovery"]["version"], 1);
     for method in [
         "querymt/elicitation/listPendingSessions",
@@ -143,6 +169,57 @@ async fn test_querymt_capabilities_lists_control_surface() {
             .iter()
             .any(|method| method == "querymt/session/delegateModelsChanged")
     );
+}
+
+struct NoViewStoreBackend {
+    storage: Arc<crate::session::sqlite_storage::SqliteStorage>,
+}
+
+impl crate::session::backend::StorageBackend for NoViewStoreBackend {
+    fn session_store(&self) -> Arc<dyn crate::session::store::SessionStore> {
+        self.storage.clone()
+    }
+
+    fn event_journal(&self) -> Arc<dyn crate::session::projection::EventJournal> {
+        self.storage.clone()
+    }
+
+    fn view_store(&self) -> Option<Arc<dyn crate::session::projection::ViewStore>> {
+        None
+    }
+}
+
+#[tokio::test]
+async fn capabilities_report_lifecycle_unsupported_without_a_view_store() {
+    let (plugin_registry, _temp_dir) = empty_plugin_registry().expect("plugin registry");
+    let storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("test storage"),
+    );
+    let backend = Arc::new(NoViewStoreBackend { storage });
+    let config = Arc::new(
+        AgentConfigBuilder::new(
+            Arc::new(plugin_registry),
+            backend,
+            querymt::LLMParams::new()
+                .provider("mock")
+                .model("mock-model"),
+        )
+        .with_tool_policy(ToolPolicy::ProviderOnly)
+        .build(),
+    );
+    let handle = LocalAgentHandle::from_config(config);
+    let result = ext_method_json(&handle, "querymt/capabilities", serde_json::json!({})).await;
+
+    assert_eq!(result["features"]["session_lifecycle"], false);
+    let methods = result["methods"].as_array().expect("methods array");
+    for unavailable in [
+        "querymt/session/getLifecycle",
+        "querymt/session/setLifecycle",
+    ] {
+        assert!(!methods.iter().any(|method| method == unavailable));
+    }
 }
 
 #[tokio::test]

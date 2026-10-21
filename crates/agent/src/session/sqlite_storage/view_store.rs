@@ -4,6 +4,9 @@ use time::OffsetDateTime;
 use crate::events::AgentEvent;
 use crate::session::domain::TaskStatus;
 use crate::session::error::SessionResult;
+use crate::session::lifecycle::{
+    ArchiveFilter, ResolutionFilter, SessionLifecycle, SessionLifecycleFilter,
+};
 use crate::session::projection::{
     AuditView, DefaultRedactor, EventJournal, FilterExpr, PredicateOp, RecentModelEntry,
     RecentModelsView, RedactedArtifact, RedactedProgress, RedactedTask, RedactedView,
@@ -21,7 +24,7 @@ use crate::session::repository::{
     ArtifactRepository, DecisionRepository, DelegationRepository, IntentRepository,
     ProgressRepository, SessionRepository, TaskRepository,
 };
-use crate::session::store::Session;
+use crate::session::store::{Session, SessionStore};
 use querymt::chat::FinishReason;
 use rusqlite::{OptionalExtension, params, params_from_iter};
 use std::collections::HashMap;
@@ -83,6 +86,28 @@ fn session_scope_where(scope: SessionScope, alias: &str) -> String {
             alias, alias
         ),
     }
+}
+
+fn lifecycle_filter_where(filter: SessionLifecycleFilter, alias: &str) -> String {
+    let resolution = match filter.resolution {
+        ResolutionFilter::Any => "1 = 1".to_string(),
+        ResolutionFilter::Open => format!(
+            "NOT EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.resolved_at IS NOT NULL)"
+        ),
+        ResolutionFilter::Resolved => format!(
+            "EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.resolved_at IS NOT NULL)"
+        ),
+    };
+    let archive = match filter.archive {
+        ArchiveFilter::Any => "1 = 1".to_string(),
+        ArchiveFilter::Excluded => format!(
+            "NOT EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.archived_at IS NOT NULL)"
+        ),
+        ArchiveFilter::Only => format!(
+            "EXISTS (SELECT 1 FROM session_lifecycle l WHERE l.session_id = {alias}.id AND l.archived_at IS NOT NULL)"
+        ),
+    };
+    format!("({resolution}) AND ({archive})")
 }
 
 #[async_trait]
@@ -269,6 +294,14 @@ impl ViewStore for SqliteStorage {
         })
     }
 
+    async fn get_session_list_view(
+        &self,
+        filter: Option<SessionListFilter>,
+    ) -> SessionResult<SessionListView> {
+        self.get_session_list_view_with_lifecycle(filter, SessionLifecycleFilter::default())
+            .await
+    }
+
     #[tracing::instrument(
         name = "session.get_session_list_view",
         skip(self, filter),
@@ -286,11 +319,12 @@ impl ViewStore for SqliteStorage {
             group_build_ms = tracing::field::Empty
         )
     )]
-    async fn get_session_list_view(
+    async fn get_session_list_view_with_lifecycle(
         &self,
         filter: Option<SessionListFilter>,
+        lifecycle: SessionLifecycleFilter,
     ) -> SessionResult<SessionListView> {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
         use std::time::Instant;
 
         let started = Instant::now();
@@ -309,6 +343,7 @@ impl ViewStore for SqliteStorage {
             created_at: Option<String>,
             updated_at: Option<String>,
             parent_session_id_internal: Option<i64>,
+            parent_session_public_id: Option<String>,
             fork_origin: Option<String>,
             session_kind: Option<String>,
             initial_intent: Option<String>,
@@ -326,12 +361,13 @@ impl ViewStore for SqliteStorage {
                 None
             }
         });
+        let lifecycle_where = lifecycle_filter_where(lifecycle, "s");
 
         let raw_rows: Vec<RawRow> = self
             .run_blocking(move |conn| {
                 // Build query with optional LIMIT pushed into SQL when there is
                 // no predicate filter (predicates still require in-memory eval).
-                let sql = if let Some(limit) = sql_limit {
+                let sql = if let Some(_limit) = sql_limit {
                     format!(
                         r#"
                         SELECT
@@ -342,6 +378,7 @@ impl ViewStore for SqliteStorage {
                             s.created_at,
                             s.updated_at,
                             s.parent_session_id,
+                            parent.public_id,
                             s.fork_origin,
                             s.session_kind,
                             i.summary                                    AS initial_intent,
@@ -358,12 +395,15 @@ impl ViewStore for SqliteStorage {
                                 SELECT MIN(id) FROM intent_snapshots
                                 WHERE session_id = s.id
                             )
+                        LEFT JOIN sessions parent ON parent.id = s.parent_session_id
+                        WHERE {lifecycle_where}
                         ORDER BY s.updated_at DESC
-                        LIMIT {limit}
+                        LIMIT ?1
                         "#
                     )
                 } else {
-                    r#"
+                    format!(
+                        r#"
                     SELECT
                         s.id,
                         s.public_id,
@@ -372,6 +412,7 @@ impl ViewStore for SqliteStorage {
                         s.created_at,
                         s.updated_at,
                         s.parent_session_id,
+                        parent.public_id,
                         s.fork_origin,
                         s.session_kind,
                         i.summary                                    AS initial_intent,
@@ -388,40 +429,41 @@ impl ViewStore for SqliteStorage {
                             SELECT MIN(id) FROM intent_snapshots
                             WHERE session_id = s.id
                         )
+                    LEFT JOIN sessions parent ON parent.id = s.parent_session_id
+                    WHERE {lifecycle_where}
                     ORDER BY s.updated_at DESC
+                    LIMIT ?1
                     "#
-                    .to_string()
+                    )
                 };
 
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map([], |row| {
-                    Ok(RawRow {
-                        id: row.get(0)?,
-                        public_id: row.get(1)?,
-                        name: row.get(2)?,
-                        cwd: row.get(3)?,
-                        created_at: row.get(4)?,
-                        updated_at: row.get(5)?,
-                        parent_session_id_internal: row.get(6)?,
-                        fork_origin: row.get(7)?,
-                        session_kind: row.get(8)?,
-                        initial_intent: row.get(9)?,
-                        is_recurring: row.get::<_, i64>(10)? != 0,
-                        fork_count: row.get::<_, i64>(11)? as usize,
-                    })
-                })?;
+                let rows = stmt.query_map(
+                    params![sql_limit.map(|limit| limit as i64).unwrap_or(-1)],
+                    |row| {
+                        Ok(RawRow {
+                            id: row.get(0)?,
+                            public_id: row.get(1)?,
+                            name: row.get(2)?,
+                            cwd: row.get(3)?,
+                            created_at: row.get(4)?,
+                            updated_at: row.get(5)?,
+                            parent_session_id_internal: row.get(6)?,
+                            parent_session_public_id: row.get(7)?,
+                            fork_origin: row.get(8)?,
+                            session_kind: row.get(9)?,
+                            initial_intent: row.get(10)?,
+                            is_recurring: row.get::<_, i64>(11)? != 0,
+                            fork_count: row.get::<_, i64>(12)? as usize,
+                        })
+                    },
+                )?;
                 rows.collect::<Result<Vec<_>, _>>()
             })
             .await?;
 
         let list_sessions_ms = list_sessions_started.elapsed().as_millis() as u64;
         let session_count_before_filter = raw_rows.len();
-
-        // Build id→public_id map for parent resolution before filtering.
-        let id_to_public_id: HashMap<i64, String> = raw_rows
-            .iter()
-            .map(|r| (r.id, r.public_id.clone()))
-            .collect();
 
         let filter_started = Instant::now();
 
@@ -487,9 +529,7 @@ impl ViewStore for SqliteStorage {
         for row in raw_rows {
             let title = row.initial_intent.map(truncate_title);
 
-            let parent_session_id = row
-                .parent_session_id_internal
-                .and_then(|pid| id_to_public_id.get(&pid).cloned());
+            let parent_session_id = row.parent_session_public_id;
 
             let session_kind = if row.is_recurring {
                 Some("recurring".to_string())
@@ -523,9 +563,15 @@ impl ViewStore for SqliteStorage {
         let hierarchy_started = Instant::now();
         let mut parent_children_map: HashMap<String, Vec<SessionListItem>> = HashMap::new();
         let mut root_sessions: Vec<SessionListItem> = Vec::new();
+        let included_session_ids: HashSet<String> =
+            items.iter().map(|item| item.session_id.clone()).collect();
 
         for item in items {
-            if let Some(ref parent_id) = item.parent_session_id {
+            if let Some(parent_id) = item
+                .parent_session_id
+                .as_ref()
+                .filter(|parent_id| included_session_ids.contains(*parent_id))
+            {
                 parent_children_map
                     .entry(parent_id.clone())
                     .or_default()
@@ -637,6 +683,24 @@ impl ViewStore for SqliteStorage {
         session_limit_per_group: usize,
         session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        self.browse_session_groups_with_lifecycle(
+            cursor,
+            group_limit,
+            session_limit_per_group,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn browse_session_groups_with_lifecycle(
+        &self,
+        cursor: Option<String>,
+        group_limit: usize,
+        session_limit_per_group: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
         let group_offset = cursor
             .as_deref()
             .and_then(|c| c.parse::<usize>().ok())
@@ -645,7 +709,11 @@ impl ViewStore for SqliteStorage {
         let preview_limit = session_limit_per_group.clamp(1, 100);
 
         self.run_blocking(move |conn| {
-            let scope_where = session_scope_where(session_scope, "s");
+            let scope_where = format!(
+                "{} AND {}",
+                session_scope_where(session_scope, "s"),
+                lifecycle_filter_where(lifecycle, "s")
+            );
             let total_sessions: usize = conn.query_row(
                 &format!("SELECT COUNT(*) FROM sessions s WHERE {}", scope_where),
                 [],
@@ -783,6 +851,24 @@ impl ViewStore for SqliteStorage {
         limit: usize,
         session_scope: SessionScope,
     ) -> SessionResult<(SessionGroup, usize)> {
+        self.list_group_sessions_with_lifecycle(
+            cwd,
+            cursor,
+            limit,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn list_group_sessions_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
         let offset = cursor
             .as_deref()
             .and_then(|c| c.parse::<usize>().ok())
@@ -790,7 +876,11 @@ impl ViewStore for SqliteStorage {
         let limit = limit.clamp(1, 200);
 
         self.run_blocking(move |conn| {
-            let scope_where = session_scope_where(session_scope, "s");
+            let scope_where = format!(
+                "{} AND {}",
+                session_scope_where(session_scope, "s"),
+                lifecycle_filter_where(lifecycle, "s")
+            );
             let total_count: usize = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
                     &format!(
@@ -919,11 +1009,28 @@ impl ViewStore for SqliteStorage {
         cursor: Option<String>,
         limit: usize,
     ) -> SessionResult<(SessionGroup, usize)> {
+        self.list_session_children_with_lifecycle(
+            parent_session_id,
+            cursor,
+            limit,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn list_session_children_with_lifecycle(
+        &self,
+        parent_session_id: String,
+        cursor: Option<String>,
+        limit: usize,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(SessionGroup, usize)> {
         let offset = cursor
             .as_deref()
             .and_then(|c| c.parse::<usize>().ok())
             .unwrap_or(0);
         let limit = limit.clamp(1, 200);
+        let lifecycle_where = lifecycle_filter_where(lifecycle, "s");
 
         self.run_blocking(move |conn| {
             let parent_db_id: Option<i64> = conn
@@ -947,20 +1054,20 @@ impl ViewStore for SqliteStorage {
             };
 
             let total_count: usize = conn.query_row(
-                "SELECT COUNT(*) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user'",
+                &format!("SELECT COUNT(*) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user' AND {lifecycle_where}"),
                 params![parent_db_id],
                 |row| row.get::<_, i64>(0).map(|v| v as usize),
             )?;
 
             let latest_raw: Option<String> = conn.query_row(
-                "SELECT MAX(s.updated_at) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user'",
+                &format!("SELECT MAX(s.updated_at) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user' AND {lifecycle_where}"),
                 params![parent_db_id],
                 |row| row.get(0),
             )?;
 
             let latest_activity = parse_rfc3339_option(latest_raw);
 
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 r#"
                 SELECT
                     s.public_id,
@@ -977,11 +1084,11 @@ impl ViewStore for SqliteStorage {
                 LEFT JOIN sessions p ON p.id = s.parent_session_id
                 LEFT JOIN intent_snapshots i
                     ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user'
+                WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user' AND {lifecycle_where}
                 ORDER BY s.updated_at DESC
                 LIMIT ?2 OFFSET ?3
-                "#,
-            )?;
+                "#
+            ))?;
 
             let sessions = stmt
                 .query_map(params![parent_db_id, limit as i64, offset as i64], map_session_list_item_row)?
@@ -1014,13 +1121,35 @@ impl ViewStore for SqliteStorage {
         limit: usize,
         session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        self.list_session_items_with_lifecycle(
+            cwd,
+            cursor,
+            limit,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn list_session_items_with_lifecycle(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
         let offset = cursor
             .as_deref()
             .and_then(|cursor| cursor.parse::<i64>().ok())
             .filter(|offset| *offset >= 0)
             .unwrap_or(0);
         let limit = limit.clamp(1, 200);
-        let scope_where = session_scope_where(session_scope, "s");
+        let scope_where = format!(
+            "{} AND {}",
+            session_scope_where(session_scope, "s"),
+            lifecycle_filter_where(lifecycle, "s")
+        );
 
         self.run_blocking(move |conn| {
             let total_count: usize = if let Some(ref cwd_value) = cwd {
@@ -1193,6 +1322,24 @@ impl ViewStore for SqliteStorage {
         limit: usize,
         session_scope: SessionScope,
     ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
+        self.search_sessions_with_lifecycle(
+            query,
+            cursor,
+            limit,
+            session_scope,
+            SessionLifecycleFilter::default(),
+        )
+        .await
+    }
+
+    async fn search_sessions_with_lifecycle(
+        &self,
+        query: String,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+    ) -> SessionResult<(Vec<SessionGroup>, Option<String>, usize)> {
         let offset = cursor
             .as_deref()
             .and_then(|c| c.parse::<usize>().ok())
@@ -1204,7 +1351,11 @@ impl ViewStore for SqliteStorage {
         }
 
         self.run_blocking(move |conn| {
-            let scope_where = session_scope_where(session_scope, "s");
+            let scope_where = format!(
+                "{} AND {}",
+                session_scope_where(session_scope, "s"),
+                lifecycle_filter_where(lifecycle, "s")
+            );
             let total_count: usize = match conn.query_row(
                 &format!(
                     "SELECT COUNT(*) FROM sessions_fts f JOIN sessions s ON s.id = f.rowid WHERE sessions_fts MATCH ?1 AND {}",
@@ -1221,7 +1372,7 @@ impl ViewStore for SqliteStorage {
 
             let mut group_counts_stmt = conn.prepare(&format!(
                 r#"
-                SELECT s.cwd, COUNT(*)
+                SELECT s.cwd, COUNT(*), MAX(s.updated_at)
                 FROM sessions_fts f
                 JOIN sessions s ON s.id = f.rowid
                 WHERE sessions_fts MATCH ?1 AND {}
@@ -1234,11 +1385,17 @@ impl ViewStore for SqliteStorage {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, i64>(1)? as usize,
+                        row.get::<_, Option<String>>(2)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            let group_counts_map: std::collections::HashMap<Option<String>, usize> =
-                group_counts.into_iter().collect();
+            let group_counts_map: std::collections::HashMap<
+                Option<String>,
+                (usize, Option<String>),
+            > = group_counts
+                .into_iter()
+                .map(|(cwd, count, latest)| (cwd, (count, latest)))
+                .collect();
 
             let mut stmt = conn.prepare(&format!(
                 r#"
@@ -1278,9 +1435,15 @@ impl ViewStore for SqliteStorage {
             let mut groups: Vec<SessionGroup> = by_cwd
                 .into_iter()
                 .map(|(cwd, sessions)| {
-                    let latest_activity = sessions.iter().filter_map(|s| s.updated_at).max();
+                    let group_count = group_counts_map.get(&cwd);
+                    let total_count = group_count
+                        .map(|(count, _)| *count)
+                        .unwrap_or(sessions.len());
+                    let latest_activity = parse_rfc3339_option(
+                        group_count.and_then(|(_, latest)| latest.clone()),
+                    );
                     SessionGroup {
-                        total_count: Some(*group_counts_map.get(&cwd).unwrap_or(&sessions.len())),
+                        total_count: Some(total_count),
                         next_cursor: None,
                         cwd,
                         sessions,
@@ -1406,6 +1569,21 @@ impl ViewStore for SqliteStorage {
             by_workspace,
             generated_at: OffsetDateTime::now_utc(),
         })
+    }
+
+    fn supports_session_lifecycle(&self) -> bool {
+        SessionStore::supports_session_lifecycle(self)
+    }
+
+    fn supports_session_lifecycle_filtering(&self) -> bool {
+        SessionStore::supports_session_lifecycle(self)
+    }
+
+    async fn get_session_list_lifecycles(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        SessionStore::get_session_lifecycles(self, session_ids).await
     }
 }
 

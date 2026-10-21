@@ -27,6 +27,8 @@ pub struct ControlFeatureInfo {
     pub mesh: bool,
     pub mesh_invites: bool,
     pub remote_sessions: bool,
+    #[serde(default)]
+    pub session_lifecycle: bool,
     pub schedules: bool,
     pub remote_schedules: bool,
     pub profiles: bool,
@@ -107,6 +109,13 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD.to_string(),
     ];
 
+    if agent.supports_session_lifecycle_contract() {
+        methods.extend([
+            "querymt/session/getLifecycle".to_string(),
+            "querymt/session/setLifecycle".to_string(),
+        ]);
+    }
+
     if agent.profiles().is_some() {
         methods.extend([
             "querymt/profiles".to_string(),
@@ -176,6 +185,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             mesh: cfg!(feature = "remote") && mesh_enabled,
             mesh_invites,
             remote_sessions: cfg!(feature = "remote"),
+            session_lifecycle: agent.supports_session_lifecycle_contract(),
             schedules: true,
             remote_schedules: cfg!(feature = "remote") && mesh_enabled,
             profiles: agent.profiles().is_some(),

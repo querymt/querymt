@@ -52,6 +52,15 @@ impl AgentHandle for LocalAgentHandle {
         Ok((session_id, session_ref))
     }
 
+    async fn set_session_lifecycle(
+        &self,
+        session_id: &str,
+        patch: crate::session::lifecycle::SessionLifecyclePatch,
+    ) -> crate::session::error::SessionResult<crate::session::lifecycle::SessionLifecycle> {
+        self.patch_session_lifecycle_unloaded(session_id, &patch)
+            .await
+    }
+
     fn subscribe_events(&self) -> broadcast::Receiver<EventEnvelope> {
         self.config.event_sink.fanout().subscribe()
     }

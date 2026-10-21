@@ -4021,6 +4021,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_extensions_do_not_load_or_attach_sessions() {
+        let fixture = DelegateTestFixture::new()
+            .await
+            .expect("create agent fixture");
+        let store = fixture.planner.config.provider.history_store();
+        let session = store
+            .create_session(None, None, None, None)
+            .await
+            .expect("create stored session");
+        let session_id = session.public_id;
+        let session_owners = SessionOwnerMap::default();
+        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
+
+        for (method, params) in [
+            (
+                "querymt/session/getLifecycle",
+                serde_json::json!({ "session_id": session_id }),
+            ),
+            (
+                "querymt/session/setLifecycle",
+                serde_json::json!({ "session_id": session_id, "resolved": true }),
+            ),
+        ] {
+            let output = handle_rpc_message(
+                fixture.planner.as_ref(),
+                &session_owners,
+                &pending_permissions,
+                &pending_elicitations,
+                "conn-lifecycle",
+                RpcMessage {
+                    jsonrpc: "2.0".to_string(),
+                    method: method.to_string(),
+                    params,
+                    id: Some(serde_json::json!(1)),
+                },
+            )
+            .await;
+            assert!(
+                output.response.expect("extension response").error.is_none(),
+                "{method} should succeed without attaching"
+            );
+        }
+
+        assert!(!session_owners.lock().await.contains_key(&session_id));
+        assert!(
+            fixture
+                .planner
+                .registry
+                .lock()
+                .await
+                .get(&session_id)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_input_extension_rolls_back_only_new_session_ownership() {
         let session_owners = SessionOwnerMap::default();
         session_owners.lock().await.insert(

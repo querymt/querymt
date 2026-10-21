@@ -236,6 +236,71 @@ impl LocalAgentHandle {
         .map_err(Self::map_remote_node_manager_error)
     }
 
+    /// List a filtered owner page and its authoritative lifecycle metadata.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn list_remote_sessions_with_lifecycle(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        offset: Option<u32>,
+        limit: Option<u32>,
+        cwd: Option<String>,
+        scope: crate::session::projection::SessionScope,
+        lifecycle: crate::session::lifecycle::SessionLifecycleFilter,
+    ) -> Result<
+        crate::agent::remote::node_manager::ListRemoteSessionsWithLifecycleResponse,
+        agent_client_protocol::Error,
+    > {
+        let timeout = Self::remote_request_timeout();
+        querymt_remote::ask_remote_with_timeout(
+            node_manager_ref,
+            &crate::agent::remote::ListRemoteSessionsWithLifecycle {
+                offset,
+                limit,
+                cwd,
+                scope,
+                lifecycle,
+            },
+            timeout,
+        )
+        .await
+        .map_err(Self::map_remote_node_manager_error)
+    }
+
+    /// Read lifecycle state from the authoritative owner without attaching an actor.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn get_remote_session_lifecycle(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        session_id: String,
+    ) -> Result<crate::session::lifecycle::SessionLifecycle, agent_client_protocol::Error> {
+        let timeout = Self::remote_request_timeout();
+        querymt_remote::ask_remote_with_timeout(
+            node_manager_ref,
+            &crate::agent::remote::GetRemoteSessionLifecycle { session_id },
+            timeout,
+        )
+        .await
+        .map_err(Self::map_remote_node_manager_error)
+    }
+
+    /// Patch lifecycle state on the authoritative owner without attaching an actor.
+    #[cfg(feature = "remote")]
+    pub(crate) async fn patch_remote_session_lifecycle(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        session_id: String,
+        patch: crate::session::lifecycle::SessionLifecyclePatch,
+    ) -> Result<crate::session::lifecycle::SessionLifecycle, agent_client_protocol::Error> {
+        let timeout = Self::remote_request_timeout();
+        querymt_remote::ask_remote_with_timeout(
+            node_manager_ref,
+            &crate::agent::remote::SetRemoteSessionLifecycle { session_id, patch },
+            timeout,
+        )
+        .await
+        .map_err(Self::map_remote_node_manager_error)
+    }
+
     /// Read display-only profile identity from the session's owning node.
     #[cfg(feature = "remote")]
     pub(crate) async fn remote_session_profile(

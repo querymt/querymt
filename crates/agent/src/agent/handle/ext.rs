@@ -2,7 +2,8 @@ use super::*;
 
 impl LocalAgentHandle {
     pub(super) async fn handle_ext_capabilities(&self) -> Result<ExtResponse, Error> {
-        super::utils::ext_json_response(&crate::control::capabilities::get_capabilities(self))
+        let capabilities = crate::control::capabilities::get_capabilities(self);
+        super::utils::ext_json_response(&capabilities)
     }
 
     pub(super) async fn handle_ext_method(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
@@ -48,6 +49,8 @@ impl LocalAgentHandle {
             "querymt/session/undo" => self.handle_ext_session_undo(req).await,
             "querymt/session/redo" => self.handle_ext_session_redo(req).await,
             "querymt/session/undoStack" => self.handle_ext_session_undo_stack(req).await,
+            "querymt/session/getLifecycle" => self.handle_ext_session_get_lifecycle(req).await,
+            "querymt/session/setLifecycle" => self.handle_ext_session_set_lifecycle(req).await,
             "querymt/capabilities" => self.handle_ext_capabilities().await,
             "querymt/mesh/status" => self.handle_ext_mesh_status().await,
             "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,

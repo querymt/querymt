@@ -28,6 +28,7 @@ mod send_agent_impl;
 mod send_agent_lifecycle;
 mod session_config;
 mod session_control;
+pub(crate) mod session_lifecycle;
 #[cfg(feature = "remote")]
 pub(crate) mod session_operation;
 mod utils;
@@ -109,6 +110,18 @@ pub trait AgentHandle: Send + Sync {
         cwd: Option<String>,
         parent_session_id: String,
     ) -> std::result::Result<(String, SessionActorRef), Error>;
+
+    /// Set persisted lifecycle state without loading the session actor.
+    async fn set_session_lifecycle(
+        &self,
+        session_id: &str,
+        patch: crate::session::lifecycle::SessionLifecyclePatch,
+    ) -> crate::session::error::SessionResult<crate::session::lifecycle::SessionLifecycle> {
+        let _ = (session_id, patch);
+        Err(crate::session::error::SessionError::InvalidOperation(
+            "Session lifecycle updates are unsupported by this agent handle".into(),
+        ))
+    }
 
     // --- Event system ---
 

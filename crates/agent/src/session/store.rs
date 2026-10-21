@@ -9,10 +9,12 @@ use crate::session::domain::{
     ProgressKind, Task, TaskKind, TaskStatus,
 };
 use crate::session::error::{SessionError, SessionResult};
+use crate::session::lifecycle::{SessionLifecycle, SessionLifecyclePatch};
 use async_trait::async_trait;
 use querymt::LLMParams;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use time::OffsetDateTime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,6 +292,57 @@ pub trait SessionStore: Send + Sync {
 
     /// Retrieves session metadata by its unique ID.
     async fn get_session(&self, session_id: &str) -> SessionResult<Option<Session>>;
+
+    /// Resolve durable local/remote ownership for a set of session IDs.
+    /// Custom stores retain point-lookup semantics unless they provide a batch implementation.
+    async fn resolve_session_locations(
+        &self,
+        session_ids: &[String],
+    ) -> SessionResult<HashMap<String, crate::session::location::SessionLocation>> {
+        let mut locations = HashMap::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            let bookmark = self.get_remote_session_bookmark(session_id).await?;
+            let local_exists = self.get_session(session_id).await?.is_some();
+            locations.insert(
+                session_id.clone(),
+                crate::session::location::classify_session_location(local_exists, bookmark),
+            );
+        }
+        Ok(locations)
+    }
+
+    /// Whether this store provides authoritative persisted session lifecycle state.
+    fn supports_session_lifecycle(&self) -> bool {
+        false
+    }
+
+    /// Read lifecycle state for one existing session.
+    async fn get_session_lifecycle(&self, _session_id: &str) -> SessionResult<SessionLifecycle> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this store".into(),
+        ))
+    }
+
+    /// Atomically patch lifecycle state for one existing session.
+    async fn patch_session_lifecycle(
+        &self,
+        _session_id: &str,
+        _patch: &SessionLifecyclePatch,
+    ) -> SessionResult<SessionLifecycle> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this store".into(),
+        ))
+    }
+
+    /// Read lifecycle state for a batch of existing sessions.
+    async fn get_session_lifecycles(
+        &self,
+        _session_ids: &[String],
+    ) -> SessionResult<HashMap<String, SessionLifecycle>> {
+        Err(SessionError::InvalidOperation(
+            "Session lifecycle is unsupported by this store".into(),
+        ))
+    }
 
     /// Persist a session title and return the stored RFC 3339 last-activity
     /// timestamp. `None` explicitly clears the title. Default stores reject
