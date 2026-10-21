@@ -29,6 +29,8 @@ pub struct ControlFeatureInfo {
     pub remote_sessions: bool,
     #[serde(default)]
     pub session_lifecycle: bool,
+    #[serde(default)]
+    pub session_pins: bool,
     pub schedules: bool,
     pub remote_schedules: bool,
     pub profiles: bool,
@@ -115,6 +117,14 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             "querymt/session/setLifecycle".to_string(),
         ]);
     }
+    let session_pins = agent
+        .config
+        .provider
+        .history_store()
+        .supports_session_pins();
+    if session_pins {
+        methods.push("querymt/session/setPinned".to_string());
+    }
 
     if agent.profiles().is_some() {
         methods.extend([
@@ -161,6 +171,9 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         notifications
             .push(crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED.to_string());
     }
+    if session_pins {
+        notifications.push(crate::acp::shared::QMT_NOTIFICATION_SESSION_PINS_CHANGED.to_string());
+    }
 
     CapabilitiesInfo {
         querymt_control_version: 1,
@@ -186,6 +199,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
             mesh_invites,
             remote_sessions: cfg!(feature = "remote"),
             session_lifecycle: agent.supports_session_lifecycle_contract(),
+            session_pins,
             schedules: true,
             remote_schedules: cfg!(feature = "remote") && mesh_enabled,
             profiles: agent.profiles().is_some(),

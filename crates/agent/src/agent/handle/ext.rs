@@ -51,6 +51,7 @@ impl LocalAgentHandle {
             "querymt/session/undoStack" => self.handle_ext_session_undo_stack(req).await,
             "querymt/session/getLifecycle" => self.handle_ext_session_get_lifecycle(req).await,
             "querymt/session/setLifecycle" => self.handle_ext_session_set_lifecycle(req).await,
+            "querymt/session/setPinned" => self.handle_ext_session_set_pinned(req).await,
             "querymt/capabilities" => self.handle_ext_capabilities().await,
             "querymt/mesh/status" => self.handle_ext_mesh_status().await,
             "querymt/mesh/join" => self.handle_ext_mesh_join(req).await,

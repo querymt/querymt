@@ -101,6 +101,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0022_session_lifecycle",
         apply: migration_0022_session_lifecycle,
     },
+    Migration {
+        version: "0023_session_pins",
+        apply: migration_0023_session_pins,
+    },
 ];
 
 fn migration_0021_normalize_session_cwd_slashes(
@@ -134,6 +138,16 @@ fn migration_0022_session_lifecycle(conn: &mut Connection) -> Result<(), rusqlit
             session_id INTEGER PRIMARY KEY,
             resolved_at TEXT,
             archived_at TEXT,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );",
+    )
+}
+
+fn migration_0023_session_pins(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_pins (
+            session_id INTEGER PRIMARY KEY,
+            pinned_at TEXT NOT NULL,
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );",
     )

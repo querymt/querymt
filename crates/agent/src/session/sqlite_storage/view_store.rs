@@ -110,6 +110,14 @@ fn lifecycle_filter_where(filter: SessionLifecycleFilter, alias: &str) -> String
     format!("({resolution}) AND ({archive})")
 }
 
+fn session_pin_filter_where(pinned: Option<bool>, alias: &str) -> String {
+    match pinned {
+        Some(true) => format!("{alias}.session_id IS NOT NULL"),
+        Some(false) => format!("{alias}.session_id IS NULL"),
+        None => "1 = 1".to_owned(),
+    }
+}
+
 #[async_trait]
 impl ViewStore for SqliteStorage {
     async fn get_audit_view(
@@ -1139,6 +1147,19 @@ impl ViewStore for SqliteStorage {
         session_scope: SessionScope,
         lifecycle: SessionLifecycleFilter,
     ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
+        self.list_session_items_with_pins(cwd, cursor, limit, session_scope, lifecycle, None)
+            .await
+    }
+
+    async fn list_session_items_with_pins(
+        &self,
+        cwd: Option<String>,
+        cursor: Option<String>,
+        limit: usize,
+        session_scope: SessionScope,
+        lifecycle: SessionLifecycleFilter,
+        pinned: Option<bool>,
+    ) -> SessionResult<(Vec<SessionListItem>, Option<String>, usize)> {
         let offset = cursor
             .as_deref()
             .and_then(|cursor| cursor.parse::<i64>().ok())
@@ -1146,21 +1167,27 @@ impl ViewStore for SqliteStorage {
             .unwrap_or(0);
         let limit = limit.clamp(1, 200);
         let scope_where = format!(
-            "{} AND {}",
+            "{} AND {} AND {}",
             session_scope_where(session_scope, "s"),
-            lifecycle_filter_where(lifecycle, "s")
+            lifecycle_filter_where(lifecycle, "s"),
+            session_pin_filter_where(pinned, "sp")
         );
+        let order_by = if pinned == Some(true) {
+            "sp.pinned_at DESC, s.id DESC"
+        } else {
+            "s.updated_at DESC, s.id DESC"
+        };
 
         self.run_blocking(move |conn| {
             let total_count: usize = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
-                    &format!("SELECT COUNT(*) FROM sessions s WHERE s.cwd = ?1 AND {}", scope_where),
+                    &format!("SELECT COUNT(*) FROM sessions s LEFT JOIN session_pins sp ON sp.session_id = s.id WHERE s.cwd = ?1 AND {}", scope_where),
                     params![cwd_value],
                     |row| row.get::<_, i64>(0).map(|v| v as usize),
                 )?
             } else {
                 conn.query_row(
-                    &format!("SELECT COUNT(*) FROM sessions s WHERE {}", scope_where),
+&format!("SELECT COUNT(*) FROM sessions s LEFT JOIN session_pins sp ON sp.session_id = s.id WHERE {}", scope_where),
                     [],
                     |row| row.get::<_, i64>(0).map(|v| v as usize),
                 )?
@@ -1184,14 +1211,16 @@ impl ViewStore for SqliteStorage {
                         (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                         i.summary
                     FROM sessions s
+                    LEFT JOIN session_pins sp ON sp.session_id = s.id
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
                     WHERE s.cwd = ?1 AND {}
-                    ORDER BY s.updated_at DESC, s.id DESC
+                    ORDER BY {}
                     LIMIT ?2 OFFSET ?3
                     "#,
-                    scope_where
+                    scope_where,
+                    order_by
                 ))?
             } else {
                 conn.prepare(&format!(
@@ -1211,14 +1240,16 @@ impl ViewStore for SqliteStorage {
                         (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
                         i.summary
                     FROM sessions s
+                    LEFT JOIN session_pins sp ON sp.session_id = s.id
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
                     WHERE {}
-                    ORDER BY s.updated_at DESC, s.id DESC
+                    ORDER BY {}
                     LIMIT ?1 OFFSET ?2
                     "#,
-                    scope_where
+                    scope_where,
+                    order_by
                 ))?
             };
 

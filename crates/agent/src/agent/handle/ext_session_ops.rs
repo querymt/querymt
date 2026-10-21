@@ -30,6 +30,12 @@ struct SetSessionLifecycleRequest {
     archived: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetSessionPinnedRequest {
+    session_id: String,
+    pinned: bool,
+}
+
 fn deserialize_patch_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -114,6 +120,34 @@ impl LocalAgentHandle {
             .await
             .map_err(|error| Error::internal_error().data(error.to_string()))?;
         ext_json_response(&lifecycle)
+    }
+
+    pub(super) async fn handle_ext_session_set_pinned(
+        &self,
+        req: ExtRequest,
+    ) -> Result<ExtResponse, Error> {
+        let parsed: SetSessionPinnedRequest = parse_session_op_request(req)?;
+        let store = self.config.provider.history_store();
+        if !store.supports_session_pins() {
+            return Err(Error::method_not_found());
+        }
+        let (pin, changed) = store
+            .set_session_pinned(&parsed.session_id, parsed.pinned)
+            .await
+            .map_err(|error| match error {
+                crate::session::error::SessionError::SessionNotFound(_) => {
+                    Error::invalid_params().data(error.to_string())
+                }
+                other => Error::internal_error().data(other.to_string()),
+            })?;
+        if changed {
+            crate::control::notifications::emit_session_pins_changed_notification(
+                self,
+                &parsed.session_id,
+            )
+            .await;
+        }
+        ext_json_response(&pin)
     }
 
     pub(super) async fn handle_ext_session_submit_input(
