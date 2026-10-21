@@ -86,7 +86,7 @@ pub enum InteractionKind {
     #[default]
     Elicitation,
     Permission {
-        request: crate::acp::protocol::RequestPermissionRequest,
+        request: Box<crate::acp::protocol::RequestPermissionRequest>,
     },
 }
 
@@ -365,7 +365,9 @@ pub async fn register_pending_permission(
         PendingElicitation {
             session_id,
             form: PendingElicitationForm::default(),
-            kind: InteractionKind::Permission { request },
+            kind: InteractionKind::Permission {
+                request: Box::new(request),
+            },
             owner_authority: None,
             run_id,
             tool_call_id,

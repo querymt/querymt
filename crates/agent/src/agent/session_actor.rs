@@ -1913,12 +1913,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     }
                 });
                 if self.active_run.is_none() {
-                    self.launch_prompt(
-                        req,
-                        reply,
-                        ctx.actor_ref().clone(),
-                        Some(input_id.clone()),
-                    );
+                    self.launch_prompt(req, reply, ctx.actor_ref().clone(), Some(input_id.clone()));
                     let run_id = self
                         .active_run
                         .as_ref()

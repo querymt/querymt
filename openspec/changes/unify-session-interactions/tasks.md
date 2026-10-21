@@ -21,16 +21,16 @@
 
 - [x] 3.1 Remove `bridge` from `Prompt`, `QueuedPrompt` and `SessionActor`, delete `SetBridge`/`GetBridge`/`ClearBridge`, `prompt_with_bridge`/`prompt_agent_with_bridge` and the session-registry `set_bridge` call, and make `session/prompt` call plain `prompt`; verify `cargo build --all-features` and that no session code produces `RequestPermission`, `Elicit` or `WorkspaceQuery` bridge messages.
 - [x] 3.2 Replace test E.11 in `agent/remote/session_actor_ref_remote_tests.rs` with "remote prompt over WebSocket dispatch succeeds and streams updates", and add a test that update notifications for a prompt are sent before its prompt response on local sessions; the remote ordering test is committed `#[ignore]` and owned by `ordered-session-events` (design §4); verify `remote_prompt_over_dispatch_succeeds_and_streams_updates` and `local_prompt_updates_are_sent_before_prompt_response` pass.
-- [ ] 3.3 Reduce `ClientBridgeSender`/`ClientBridgeMessage` to transport-owned outbound messages plus agent-wide `notify_ext`, and update the module docs in `acp/client_bridge.rs` to describe the new role; verify bridge unit tests and schedule/control notification tests pass.
+- [x] 3.3 Reduce `ClientBridgeSender`/`ClientBridgeMessage` to transport-owned outbound messages plus agent-wide `notify_ext`, and update the module docs in `acp/client_bridge.rs` to describe the new role; verify bridge unit tests and schedule/control notification tests pass.
 
 ## 4. Workspace query availability
 
-- [ ] 4.1 Populate the workspace-query capability only for locally hosted sessions with a supporting connection and extend the `language_query` unavailable message to name remote sessions; verify a unit test that a remote-hosted execution context returns the unavailable result and the run continues.
+- [x] 4.1 Populate the workspace-query capability only for locally hosted sessions with a supporting connection and extend the `language_query` unavailable message to name remote sessions; verify a unit test that a remote-hosted execution context returns the unavailable result and the run continues.
 
 ## 5. Documentation and verification
 
-- [ ] 5.1 Document the interaction lifecycle, the wait-on-unanswered-permission behavior for unattended runs, and the all-nodes-upgrade requirement in the agent docs/changelog; verify the docs render and mention the `RemoteNodeUpgradeRequired` error.
-- [ ] 5.2 Run the full agent suite (`cargo test --all-features`, clippy, fmt) and verify it is green with the two-node integration tests included.
+- [x] 5.1 Document the interaction lifecycle, the wait-on-unanswered-permission behavior for unattended runs, and the all-nodes-upgrade requirement in the agent docs/changelog; verify the docs render and mention the `RemoteNodeUpgradeRequired` error.
+- [x] 5.2 Run the full agent suite (`cargo test --all-features`, clippy, fmt) and verify it is green with the two-node integration tests included.
 
 ## Workflow follow-up
 

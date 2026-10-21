@@ -1535,8 +1535,7 @@ mod genai_trace_tests {
                 "skill",
                 &serde_json::json!({"name":requested}).to_string(),
             );
-            let (result, spans) =
-                capture_info(execute_tool_call(&config, &call, &exec)).await;
+            let (result, spans) = capture_info(execute_tool_call(&config, &call, &exec)).await;
             let verified = matches!(mode, "success" | "rewrite");
             let result = result.unwrap();
             assert_eq!(
@@ -1700,8 +1699,7 @@ mod genai_trace_tests {
                 args["args"] = serde_json::json!(["-c", "sleep 0.2; kill -TERM $$"]);
             }
             let call = mock_tool_call(mode, "shell", &args.to_string());
-            let (result, spans) =
-                capture_info(execute_tool_call(&config, &call, &exec)).await;
+            let (result, spans) = capture_info(execute_tool_call(&config, &call, &exec)).await;
             let result = result.unwrap();
             let ran = matches!(mode, "direct" | "symlink" | "script" | "wrapper" | "signal");
             assert_eq!(

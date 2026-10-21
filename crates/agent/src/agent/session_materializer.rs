@@ -567,10 +567,7 @@ impl SessionMaterializer {
     ///
     /// This is called AFTER the session has been inserted into the registry.
     /// It does NOT hold the registry lock.
-    pub async fn finalize_session(
-        &self,
-        prepared: &PreparedSession,
-    ) -> Result<(), Error> {
+    pub async fn finalize_session(&self, prepared: &PreparedSession) -> Result<(), Error> {
         // Register in DHT if requested (for remote sessions)
         #[cfg(feature = "remote")]
         if prepared.register_in_dht

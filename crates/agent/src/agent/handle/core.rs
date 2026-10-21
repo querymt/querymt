@@ -544,7 +544,9 @@ impl LocalAgentHandle {
         };
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        self.session_materializer.finalize_session(&prepared).await?;
+        self.session_materializer
+            .finalize_session(&prepared)
+            .await?;
 
         // Get current per-session settings for the response.
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;

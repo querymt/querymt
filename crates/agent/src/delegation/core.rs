@@ -1034,9 +1034,7 @@ async fn execute_delegation(
         child_bridge_connection_id = bridge.connection_id().map(Arc::from);
         bridges.insert(
             child_session_id.clone(),
-            crate::agent::agent_config::SessionBridgeRoute {
-                bridge,
-            },
+            crate::agent::agent_config::SessionBridgeRoute { bridge },
         );
     }
 

@@ -1061,6 +1061,29 @@ stateDiagram-v2
 
 **Mixed-version compatibility.** New protocol fields (direct relay capability, source cursor, connection state, structured error codes) are additive with serde defaults, so older peers ignore them. New clients fall back to the generation-specific DHT relay name when talking to hosts that predate capability handoff, and hosts that predate cursor backfill are reported as potentially stale history rather than connection failure. Legacy `LoadSession`/`AttachRemoteSession` remain supported wrappers over the unified open operation, and legacy `prompt` RPCs are fulfilled with acknowledged submissions.
 
+### Session Interactions
+
+Tool permission requests and form questions (elicitation) follow the same lifecycle whether a session runs on the local agent or on a remote mesh node. A client never needs location-specific handling.
+
+1. **Request.** The session registers a pending interaction on its host node and emits a durable event (`PermissionRequested` or `ElicitationRequested`). The event is relayed to every attached client through the normal event path.
+2. **Delivery.** The transport the client is connected to (WebSocket or stdio) claims the delivery through the session and sends a standard ACP request: `session/request_permission` or `elicitation/create`. Claims, re-delivery and recovery go through the session actor, so a question from a remote session is discoverable and answerable through the local agent the client is connected to.
+3. **Resolution.** The client's answer is submitted to the owning session. Only the first valid answer for an interaction is accepted; later answers get a not-pending or stale result. An invalid form answer is rejected, the tool keeps waiting and the question is re-delivered for correction.
+4. **Retirement.** Cancelling the run, or the tool exiting, retires the interaction. A late answer is rejected as not pending and a reconnect cannot revive it.
+
+Sessions and prompts carry no per-connection client bridge. `session/prompt` works the same for remote sessions as for local ones.
+
+**Unanswered permission waits.** A permission-required tool call that is not decided by a cached "always" choice, tool policy or hook waits for an explicit user answer. It is not granted because no client is attached, delivery failed, the client disconnected, the response timed out or the answer was malformed. The request stays pending and is delivered again to the next authorized client that attaches.
+
+> **Unattended runs.** Scheduled or headless runs that previously relied on implicit auto-grant now stay paused at the first unanswered permission until a user answers or the run is cancelled. Restrict the enabled `tools` list, set `mutating_tools` / `assume_mutating` so only intended tools need permission, or add `permission_request` hooks that allow or deny explicitly for those runs. See [Hooks](hooks.md).
+
+**"Always" choices.** Answering "Always allow" or "Always reject" applies to later calls of the same tool in that session, for local and remote sessions alike.
+
+**Editor workspace queries.** The `language_query` tool needs a locally hosted session with an attached editor connection. For a session on a remote node it returns an "unavailable" result that names remote sessions, and the run continues.
+
+**All nodes must be upgraded together.** This contract adds new session messages to the mesh wire protocol. Mixed-version meshes are not supported, and there is no fallback to bridge-based or auto-granted behavior. If the local agent attaches to or prompts a session on a node that lacks the interaction messages, the operation fails with `RemoteNodeUpgradeRequired`. Clients receive it as an ACP error (code `-32603`) with `data.category = "remote_upgrade_required"` and `data.node` set to the outdated node. Upgrade that node, and every other node in the mesh, to the same agent version. Rolling back means reverting the agent on all nodes together.
+
+**Prompt response ordering.** The response to `session/prompt` is not guaranteed to follow every `session/update` for that prompt. For remote sessions in particular, relayed updates can arrive after the response. Clients that need all updates should keep reading after the response. Strict ordering is tracked in the `ordered-session-events` change.
+
 ### Session Persistence
 
 Remote sessions are persisted on the host node:

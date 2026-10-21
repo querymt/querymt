@@ -25,9 +25,7 @@ impl SendAgent for LocalAgentHandle {
             .execute_session_operation(
                 &session_id,
                 session_operation::SessionOperation::LegacyPrompt,
-                |session_ref| {
-                    Box::pin(session_ref.prompt_agent(req.clone()))
-                },
+                |session_ref| Box::pin(session_ref.prompt_agent(req.clone())),
             )
             .await
             .map_err(session_operation::SessionOperationError::into_acp_error);

@@ -83,8 +83,8 @@ mod session_actor_ref_remote_tests {
         // A host-side session actor carries the mesh: SubscribeEvents resolves
         // the event relay through it (mirrors production hosts).
         let host_config = config.clone();
-        let actor = SessionActor::new(config, session_id.clone(), runtime)
-            .with_mesh(Some(mesh.clone()));
+        let actor =
+            SessionActor::new(config, session_id.clone(), runtime).with_mesh(Some(mesh.clone()));
         let local_ref = SessionActor::spawn(actor);
 
         let dht_name = crate::agent::remote::scope::scoped_session(
@@ -308,7 +308,10 @@ mod session_actor_ref_remote_tests {
         .await
         .expect("remote prompt completes")
         .expect("remote prompt succeeds without a client bridge");
-        assert_eq!(response.stop_reason, crate::acp::protocol::StopReason::EndTurn);
+        assert_eq!(
+            response.stop_reason,
+            crate::acp::protocol::StopReason::EndTurn
+        );
 
         let mut saw_assistant_text = false;
         while let Ok(Ok(event)) =

@@ -1,7 +1,31 @@
-//! Client bridge for Send/!Send boundary crossing.
+//! Transport-owned outbound queue for one ACP connection.
 //!
-//! This module provides types that allow a `Send + Sync` agent (like `AgentHandle`)
-//! to communicate with the active ACP client connection.
+//! A `ClientBridgeSender` is the send side of a per-connection mpsc queue that
+//! lets `Send + Sync` code hand messages to the task that owns the (possibly
+//! `!Send`) ACP connection. It belongs to the transport, not to sessions.
+//!
+//! ## Role
+//!
+//! Sessions hold **no** bridge. Prompts carry no bridge, session actors store
+//! none, and remote sessions are reached through `SessionActorRef` only. User
+//! interactions (tool permission, form elicitation) are session-owned pending
+//! interactions announced by durable events and answered through
+//! `SessionActorRef` messages; see `crate::elicitation`. Session code never
+//! produces `RequestPermission`, `Elicit` or `WorkspaceQuery` messages.
+//!
+//! What flows through the queue:
+//!
+//! - `Notification` / `Flush`: ordered `session/update` delivery written by
+//!   the connection's event forwarders and replay.
+//! - `ExtNotification`: agent-wide extension notifications (schedules,
+//!   control, input state) via [`ClientBridgeSender::notify_ext`].
+//! - `RequestPermission` / `Elicit`: outbound ACP requests created by the
+//!   transport's own interaction forwarder when it delivers a pending
+//!   interaction to this connection. The answer is resolved through the
+//!   owning session, never by the caller of these methods.
+//! - `WorkspaceQuery`: editor language queries, available only to locally
+//!   hosted sessions whose attached connection supports them. Sessions on a
+//!   remote node have no route and report the capability as unavailable.
 //!
 //! ## Architecture
 //!
@@ -13,25 +37,9 @@
 //! └───────────────────┘      └──────────────▲───────────────┘
 //!                                           │ ClientBridgeMessage
 //!                         ┌─────────────────┴──────────────────┐
-//!                         │  QueryMTAgent (Send + Sync)        │
+//!                         │  Transport (forwarders, replay)    │
 //!                         │  - Holds ClientBridgeSender        │
 //!                         └────────────────────────────────────┘
-//! ```
-//!
-//! ## Usage
-//!
-//! The bridge is set up automatically by the ACP stdio server (`serve_stdio`).
-//! The agent uses `ClientBridgeSender` to communicate with the client:
-//!
-//! ```rust,ignore
-//! // In QueryMTAgent methods
-//! if let Some(bridge) = self.bridge() {
-//!     // Send a notification (fire-and-forget)
-//!     bridge.notify(notification).await?;
-//!     
-//!     // Request permission (wait for response)
-//!     let response = bridge.request_permission(request).await?;
-//! }
 //! ```
 
 use crate::acp::protocol::{
@@ -42,10 +50,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-/// Messages sent from agent tasks to the active ACP bridge task.
+/// Messages sent from transport tasks to the active ACP bridge task.
 ///
-/// The mpsc channel keeps agent execution decoupled from the ACP connection's
-/// request and notification lifecycle.
+/// The mpsc channel keeps the transport's producers decoupled from the ACP
+/// connection's request and notification lifecycle. Session code does not
+/// produce `RequestPermission`, `Elicit` or `WorkspaceQuery`.
 #[derive(Debug)]
 pub enum ClientBridgeMessage {
     /// Fire-and-forget session notification.
@@ -62,7 +71,8 @@ pub enum ClientBridgeMessage {
     /// Fire-and-forget ACP extension notification payload.
     ExtNotification(ExtNotification),
 
-    /// Request-response permission request.
+    /// Request-response permission request emitted by a transport's
+    /// interaction forwarder to deliver a pending permission interaction.
     ///
     /// The bridge task will call `connection.request_permission(...)` and
     /// send the response back through the oneshot channel.
@@ -71,7 +81,8 @@ pub enum ClientBridgeMessage {
         response_tx: oneshot::Sender<Result<RequestPermissionResponse, Error>>,
     },
 
-    /// Request-response elicitation request.
+    /// Request-response elicitation request emitted by a transport's
+    /// interaction forwarder to deliver a pending elicitation.
     ///
     /// The bridge task will handle elicitation and return the response.
     Elicit {
@@ -83,7 +94,8 @@ pub enum ClientBridgeMessage {
         response_tx: oneshot::Sender<Result<crate::elicitation::ElicitationResponse, Error>>,
     },
 
-    /// Workspace query request (agent → client → VS Code LSP).
+    /// Workspace query request (agent → client → VS Code LSP) for a locally
+    /// hosted session. Remote-hosted sessions never reach this message.
     ///
     /// The bridge task sends this as an ACP SDK `AgentRequest::ExtMethodRequest`
     /// using the wire-form method `"_workspace/query"`.
@@ -117,25 +129,7 @@ impl NotificationForwardingState {
     }
 }
 
-/// Send-side handle for the client bridge.
-///
-/// This type is `Send + Sync` and can be cloned and used from multi-threaded contexts.
-/// It allows agent tasks to communicate with the ACP client by sending messages
-/// through an mpsc channel to the connection's bridge task.
-///
-/// ## Examples
-///
-/// ```rust,ignore
-/// // Create bridge channel
-/// let (tx, rx) = mpsc::channel::<ClientBridgeMessage>(100);
-/// let sender = ClientBridgeSender::new(tx);
-///
-/// // Set on agent
-/// agent.set_bridge(sender);
-///
-/// // In agent methods:
-/// agent.bridge().unwrap().notify(notification).await?;
-/// ```
+/// Per-connection state shared by every clone of a connection's sender.
 pub(crate) struct ClientBridgeConnectionState {
     active: AtomicBool,
     attachment_lock: Mutex<()>,
@@ -155,6 +149,17 @@ impl ClientBridgeConnectionState {
     }
 }
 
+/// Send-side handle for a connection's outbound queue.
+///
+/// This type is `Send + Sync` and cheap to clone. It is owned by the transport
+/// and by agent-wide notifiers (`set_bridge` on the handle, used for
+/// `notify_ext`); sessions never hold one.
+///
+/// ```rust,ignore
+/// let (tx, rx) = mpsc::channel::<ClientBridgeMessage>(100);
+/// let sender = ClientBridgeSender::new(tx);
+/// sender.notify(notification).await?;
+/// ```
 #[derive(Clone)]
 pub struct ClientBridgeSender {
     tx: mpsc::Sender<ClientBridgeMessage>,
