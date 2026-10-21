@@ -51,7 +51,7 @@ runs:
 
     - name: Restore CUDA kernel cache
       if: inputs.os == 'linux' && contains(inputs.features, 'cuda')
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ${{ runner.temp }}/mistralrs-cuda-objects
