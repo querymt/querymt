@@ -563,30 +563,14 @@ impl SessionMaterializer {
         Ok(ForkSessionResponse::new(new_session_id))
     }
 
-    /// Finalize session after registration: emit events, set bridge, register in DHT, initialize workspace index.
+    /// Finalize session after registration: emit events, register in DHT, initialize workspace index.
     ///
     /// This is called AFTER the session has been inserted into the registry.
     /// It does NOT hold the registry lock.
     pub async fn finalize_session(
         &self,
         prepared: &PreparedSession,
-        bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
     ) -> Result<(), Error> {
-        // Set bridge on the session actor if available.
-        // This is done here instead of in register_prepared_session to avoid
-        // holding the registry lock during the async actor call.
-        if let Some(ref bridge_sender) = bridge {
-            let session_ref =
-                crate::agent::remote::SessionActorRef::from(prepared.actor_ref.clone());
-            if let Err(e) = session_ref.set_bridge(bridge_sender.clone()).await {
-                log::warn!(
-                    "Session {}: failed to set bridge on session actor: {}",
-                    prepared.session_id,
-                    e
-                );
-            }
-        }
-
         // Register in DHT if requested (for remote sessions)
         #[cfg(feature = "remote")]
         if prepared.register_in_dht

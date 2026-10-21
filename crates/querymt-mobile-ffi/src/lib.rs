@@ -50,7 +50,6 @@ pub type AcpMessageHandlerFn = unsafe extern "C" fn(
 struct AcpConnection {
     agent_handle: u64,
     conn_id: String,
-    pending_permissions: querymt_agent::acp::shared::PermissionMap,
     pending_elicitations: querymt_agent::acp::shared::PendingElicitationMap,
     session_owners: querymt_agent::acp::shared::SessionOwnerMap,
     outbox: Arc<Mutex<VecDeque<String>>>,
@@ -512,7 +511,6 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
 
     let connection_handle = NEXT_ACP_CONNECTION_HANDLE.fetch_add(1, Ordering::Relaxed);
     let conn_id = format!("ffi-{connection_handle}");
-    let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
     let pending_elicitations = inner.pending_elicitations();
     let session_owners = querymt_agent::acp::shared::SessionOwnerMap::default();
     let outbox = Arc::new(Mutex::new(VecDeque::new()));
@@ -553,7 +551,6 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
             AcpConnection {
                 agent_handle,
                 conn_id,
-                pending_permissions,
                 pending_elicitations,
                 session_owners,
                 outbox,
@@ -605,7 +602,6 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
             agent_handle,
             conn_id,
             session_owners,
-            pending_permissions,
             pending_elicitations,
             outbox,
             view_store,
@@ -624,7 +620,6 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
                 conn.agent_handle,
                 conn.conn_id.clone(),
                 conn.session_owners.clone(),
-                conn.pending_permissions.clone(),
                 conn.pending_elicitations.clone(),
                 conn.outbox.clone(),
                 view_store,
@@ -764,7 +759,6 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
             let output = querymt_agent::acp::shared::handle_rpc_message_with_context(
                 agent.as_ref(),
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 &conn_id,
                 req,
@@ -1157,8 +1151,6 @@ mod tests {
     ) -> (u64, Arc<Mutex<VecDeque<String>>>) {
         let connection_handle = NEXT_ACP_CONNECTION_HANDLE.fetch_add(1, Ordering::Relaxed);
         let outbox = Arc::new(Mutex::new(VecDeque::new()));
-        let pending_permissions: querymt_agent::acp::shared::PermissionMap =
-            Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: querymt_agent::acp::shared::PendingElicitationMap =
             Arc::new(Mutex::new(HashMap::new()));
         let session_owners = querymt_agent::acp::shared::SessionOwnerMap::default();
@@ -1169,7 +1161,6 @@ mod tests {
                 AcpConnection {
                     agent_handle: 1,
                     conn_id: format!("test-{connection_handle}"),
-                    pending_permissions,
                     pending_elicitations,
                     session_owners,
                     outbox: outbox.clone(),

@@ -407,6 +407,71 @@ async fn run_bridge_task(
     log::info!("Client bridge task ended (channel closed)");
 }
 
+/// Deliver one pending permission interaction to the stdio client as a
+/// standard `session/request_permission` request.
+///
+/// Only an explicitly selected option resolves the interaction. A transport
+/// error, a client-side `cancelled` outcome or a malformed answer leaves it
+/// pending so it can be delivered again (never a grant, never a rejection).
+async fn deliver_stdio_permission(
+    agent: Arc<crate::agent::LocalAgentHandle>,
+    bridge: ClientBridgeSender,
+    session_id: String,
+    permission_id: String,
+    request: crate::acp::protocol::RequestPermissionRequest,
+) {
+    const CONNECTION_ID: &str = "stdio";
+    let Some(claim) = crate::elicitation::claim_live_elicitation_delivery(
+        agent.as_ref(),
+        &session_id,
+        &permission_id,
+        CONNECTION_ID,
+    )
+    .await
+    else {
+        return;
+    };
+    let response = match bridge.request_permission(request).await {
+        Ok(response) => response,
+        Err(err) => {
+            log::warn!(
+                "Native ACP permission {permission_id} ended without an answer, staying pending: {err}"
+            );
+            return;
+        }
+    };
+    let answer = match response.outcome {
+        crate::acp::protocol::RequestPermissionOutcome::Selected(selected) => {
+            crate::elicitation::ElicitationResponse::permission_selected(
+                selected.option_id.0.as_ref(),
+            )
+        }
+        _ => {
+            log::debug!("Native ACP permission {permission_id} dismissed, staying pending");
+            return;
+        }
+    };
+    match crate::elicitation::resolve_claimed_elicitation(
+        agent.as_ref(),
+        &session_id,
+        &permission_id,
+        CONNECTION_ID,
+        claim.delivery_generation,
+        answer,
+    )
+    .await
+    {
+        Ok(crate::elicitation::ElicitationResolution::Resolved) => {}
+        Ok(resolution) => log::warn!(
+            "Permission answer not applied ({resolution:?}): session_id={session_id} permission_id={permission_id}"
+        ),
+        Err(error) => log::warn!(
+            "Permission answer rejected, request stays pending: session_id={session_id} permission_id={permission_id} error={}",
+            error.message
+        ),
+    }
+}
+
 /// Forwards events from EventFanout to the client bridge.
 ///
 /// This task subscribes to the EventFanout and forwards all events to the ACP client
@@ -511,6 +576,37 @@ fn spawn_event_bridge_forwarder(
                                         );
                                     }
                                 }
+                            });
+                        }
+                        continue;
+                    }
+
+                    if let crate::events::AgentEventKind::PermissionRequested {
+                        permission_id,
+                        request: Some(request),
+                        ..
+                    } = event.kind()
+                    {
+                        let session_id = event.session_id().to_string();
+                        let key = (session_id.clone(), permission_id.clone());
+                        let should_forward = forwarded_elicitations
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .insert(key);
+                        if should_forward {
+                            let agent = agent.clone();
+                            let bridge = bridge.clone();
+                            let permission_id = permission_id.clone();
+                            let request = request.clone();
+                            tokio::spawn(async move {
+                                deliver_stdio_permission(
+                                    agent,
+                                    bridge,
+                                    session_id,
+                                    permission_id,
+                                    request,
+                                )
+                                .await;
                             });
                         }
                         continue;

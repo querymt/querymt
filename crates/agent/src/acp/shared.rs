@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 
 /// Session subscriptions keyed by session id.
 ///
@@ -82,9 +82,6 @@ async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &s
         owners.remove(session_id);
     }
 }
-
-/// Type alias for pending permission requests (tool_call_id -> response sender)
-pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>;
 
 /// Type alias for pending elicitation requests (elicitation_id -> response sender)
 pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
@@ -145,6 +142,30 @@ pub(crate) fn convert_elicitation_response(
     Ok(crate::elicitation::ElicitationResponse { action, content })
 }
 
+/// Convert a client's `session/request_permission` response into the answer
+/// carried by a pending permission interaction.
+///
+/// Only an explicitly selected option is an answer. A client-side `cancelled`
+/// outcome is not a decision (`Ok(None)`: the delivery ends, the request stays
+/// pending) and anything unparseable is an error handled as undelivered.
+pub(crate) fn convert_permission_response_value(
+    value: serde_json::Value,
+) -> Result<Option<crate::elicitation::ElicitationResponse>, Error> {
+    let response: crate::acp::protocol::RequestPermissionResponse = serde_json::from_value(value)
+        .map_err(|err| {
+        Error::invalid_params().data(format!("Invalid permission response: {err}"))
+    })?;
+    match response.outcome {
+        RequestPermissionOutcome::Selected(selected) => Ok(Some(
+            crate::elicitation::ElicitationResponse::permission_selected(
+                selected.option_id.0.as_ref(),
+            ),
+        )),
+        RequestPermissionOutcome::Cancelled => Ok(None),
+        _ => Err(Error::invalid_params().data("Unsupported permission outcome")),
+    }
+}
+
 pub(crate) fn convert_elicitation_response_value(
     value: serde_json::Value,
 ) -> Result<crate::elicitation::ElicitationResponse, Error> {
@@ -203,7 +224,6 @@ impl RpcDispatchOutput {
 pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
     agent: Arc<S>,
     session_owners: SessionOwnerMap,
-    pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     conn_id: String,
     request: RpcMessage,
@@ -213,7 +233,6 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
         RpcDispatchState {
             agent,
             session_owners,
-            pending_permissions,
             pending_elicitations,
             conn_id,
             tx,
@@ -228,7 +247,6 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
 pub(crate) struct RpcDispatchState<S> {
     pub agent: Arc<S>,
     pub session_owners: SessionOwnerMap,
-    pub pending_permissions: PermissionMap,
     pub pending_elicitations: PendingElicitationMap,
     pub conn_id: String,
     pub tx: mpsc::Sender<String>,
@@ -242,7 +260,6 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let RpcDispatchState {
         agent,
         session_owners,
-        pending_permissions,
         pending_elicitations,
         conn_id,
         tx,
@@ -250,7 +267,6 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let output = handle_rpc_message_with_context(
         agent.as_ref(),
         &session_owners,
-        &pending_permissions,
         &pending_elicitations,
         &conn_id,
         request,
@@ -2001,7 +2017,6 @@ use crate::agent::session_registry::config_options as session_config_options;
 pub async fn handle_rpc_message<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
-    pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcMessage,
@@ -2009,7 +2024,6 @@ pub async fn handle_rpc_message<S: SendAgent>(
     handle_rpc_message_with_context(
         agent,
         session_owners,
-        pending_permissions,
         pending_elicitations,
         conn_id,
         req,
@@ -2021,7 +2035,6 @@ pub async fn handle_rpc_message<S: SendAgent>(
 pub async fn handle_rpc_message_with_context<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
-    pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcMessage,
@@ -2138,7 +2151,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             )
                             .await?;
                             agent
-                                .prompt_with_bridge(params, context.session_bridge.clone())
+                                .prompt(params)
                                 .await
                                 .map(|r| serde_json::to_value(r).unwrap())
                         }
@@ -2371,28 +2384,6 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             .set_session_model(params)
                             .await
                             .map(|r| serde_json::to_value(r).unwrap()),
-                        Err(e) => Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()}))),
-                    }
-                }
-
-                "permission_result" => {
-                    #[derive(Deserialize)]
-                    struct PermissionResultParams {
-                        tool_call_id: String,
-                        outcome: RequestPermissionOutcome,
-                    }
-                    match serde_json::from_value::<PermissionResultParams>(req.params) {
-                        Ok(params) => {
-                            let mut pending = pending_permissions.lock().await;
-                            if let Some(tx) = pending.remove(&params.tool_call_id) {
-                                let _ = tx.send(params.outcome);
-                                Ok(serde_json::Value::Null)
-                            } else {
-                                Err(Error::internal_error()
-                                    .data("No pending permission for this tool_call_id"))
-                            }
-                        }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -3940,14 +3931,12 @@ mod tests {
             ext_method_control: None,
         });
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(2);
 
         let prompt_task = tokio::spawn(dispatch_rpc_message(
             agent.clone(),
             session_owners.clone(),
-            pending_permissions.clone(),
             pending_elicitations.clone(),
             "conn-1".to_string(),
             RpcMessage {
@@ -3969,7 +3958,6 @@ mod tests {
         let cancel_task = tokio::spawn(dispatch_rpc_message(
             agent,
             session_owners,
-            pending_permissions,
             pending_elicitations,
             "conn-1".to_string(),
             rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
@@ -4003,14 +3991,12 @@ mod tests {
     #[tokio::test]
     async fn session_cancel_notification_dispatches_without_response() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (agent, cancelled_session) = cancel_test_agent();
 
         let output = handle_rpc_message(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
@@ -4033,7 +4019,6 @@ mod tests {
             .expect("create stored session");
         let session_id = session.public_id;
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         for (method, params) in [
@@ -4049,7 +4034,6 @@ mod tests {
             let output = handle_rpc_message(
                 fixture.planner.as_ref(),
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-lifecycle",
                 RpcMessage {
@@ -4085,7 +4069,6 @@ mod tests {
             "s-existing".to_string(),
             HashSet::from(["conn-ext".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let agent = CancelTestAgent {
             cancelled_session: Arc::new(Mutex::new(None)),
@@ -4106,7 +4089,6 @@ mod tests {
             let output = handle_rpc_message(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-ext",
                 RpcMessage {
@@ -4162,19 +4144,16 @@ mod tests {
             ext_method_control: Some(control.clone()),
         });
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         let spawn_request = |id| {
             let agent = agent.clone();
             let session_owners = session_owners.clone();
-            let pending_permissions = pending_permissions.clone();
             let pending_elicitations = pending_elicitations.clone();
             tokio::spawn(async move {
                 handle_rpc_message(
                     agent.as_ref(),
                     &session_owners,
-                    &pending_permissions,
                     &pending_elicitations,
                     "conn-ext",
                     RpcMessage {
@@ -4247,7 +4226,6 @@ mod tests {
             "s-load-existing".to_string(),
             HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let context = RpcDispatchContext {
             session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
@@ -4264,7 +4242,6 @@ mod tests {
             let output = handle_rpc_message_with_context(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-hook",
                 RpcMessage {
@@ -4317,7 +4294,6 @@ mod tests {
             "s-remote-existing".to_string(),
             HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let context = RpcDispatchContext {
             session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
@@ -4347,7 +4323,6 @@ mod tests {
             let output = handle_rpc_message_with_context(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-hook",
                 RpcMessage {
@@ -4395,12 +4370,10 @@ mod tests {
             ext_method_control: None,
         };
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-lifecycle",
             RpcMessage {
@@ -4451,12 +4424,10 @@ mod tests {
             ext_method_control: None,
         };
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-prompt",
             RpcMessage {
@@ -4498,7 +4469,6 @@ mod tests {
     #[tokio::test]
     async fn session_new_rpc_dispatches_to_agent_new_session() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -4597,7 +4567,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4661,12 +4630,10 @@ mod tests {
         params: serde_json::Value,
     ) -> RpcDispatchOutput {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
             agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4709,12 +4676,10 @@ mod tests {
         let translator = Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new()));
         translator.lock().unwrap().set_capabilities(capabilities);
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
             agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4912,14 +4877,12 @@ mod tests {
         registry.register(docs_slash_command());
         let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(8);
 
         dispatch_rpc_message(
             fixture.handle.clone(),
             session_owners,
-            pending_permissions,
             pending_elicitations,
             "conn-1".to_string(),
             RpcMessage {
@@ -4977,7 +4940,6 @@ mod tests {
             .expect("persist replay event");
 
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -4985,7 +4947,6 @@ mod tests {
             RpcDispatchState {
                 agent: fixture.handle.clone(),
                 session_owners,
-                pending_permissions,
                 pending_elicitations,
                 conn_id: "conn-order".to_string(),
                 tx,
@@ -5032,7 +4993,6 @@ mod tests {
     #[tokio::test]
     async fn remote_attach_extension_records_session_owner_with_snake_case_payload() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5136,7 +5096,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-9",
             RpcMessage {
@@ -5160,7 +5119,6 @@ mod tests {
     #[tokio::test]
     async fn remote_create_session_records_session_owner_from_snake_case_response() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5263,7 +5221,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-9",
             RpcMessage {
@@ -5287,7 +5244,6 @@ mod tests {
     #[tokio::test]
     async fn session_load_records_session_owner_for_live_updates() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5386,7 +5342,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-load",
             RpcMessage {
@@ -5414,7 +5369,6 @@ mod tests {
     #[tokio::test]
     async fn session_close_rpc_forwards_to_send_agent() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5513,7 +5467,6 @@ mod tests {
         let output = handle_rpc_message(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5540,7 +5493,6 @@ mod tests {
     #[tokio::test]
     async fn set_config_option_rpc_forwards_to_send_agent() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Minimal SendAgent that returns method_not_found for set_session_config_option
@@ -5641,7 +5593,6 @@ mod tests {
         let output = handle_rpc_message(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5677,13 +5628,11 @@ mod tests {
         );
 
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = fixture.planner.pending_elicitations();
 
         let output = handle_rpc_message(
             fixture.planner.as_ref(),
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {

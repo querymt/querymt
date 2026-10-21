@@ -828,7 +828,6 @@ impl TestHarness {
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
             &mut self.exec_ctx,
-            None,
             crate::agent::core::AgentMode::Build,
         )
         .await
@@ -1234,12 +1233,6 @@ async fn delegate_session_inherits_parent_connection_bridge() {
     };
     #[cfg(not(feature = "remote"))]
     let crate::agent::remote::SessionActorRef::Local(child) = child;
-    let inherited = child
-        .ask(crate::agent::messages::GetBridge)
-        .await
-        .expect("query child bridge")
-        .expect("child bridge");
-    assert_eq!(inherited.connection_id(), Some("conn"));
     let routed_child = target
         .config
         .session_bridges

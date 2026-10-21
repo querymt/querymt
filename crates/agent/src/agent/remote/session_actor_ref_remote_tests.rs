@@ -43,16 +43,31 @@ mod session_actor_ref_remote_tests {
         std::sync::Arc<crate::agent::agent_config::AgentConfig>,
         String,
     ) {
-        let mesh = get_test_mesh().await;
         let f = AgentConfigFixture::new().await;
-        let store = f.config.provider.history_store();
+        remote_session_ref_for_config(label, f.config.clone(), "mock").await
+    }
+
+    /// Host a session on `config` (model `model` of provider `mock`) and
+    /// return a remote ref to it.
+    async fn remote_session_ref_for_config(
+        label: &str,
+        config: std::sync::Arc<crate::agent::agent_config::AgentConfig>,
+        model: &str,
+    ) -> (
+        SessionActorRef,
+        kameo::actor::ActorRef<SessionActor>,
+        std::sync::Arc<crate::agent::agent_config::AgentConfig>,
+        String,
+    ) {
+        let mesh = get_test_mesh().await;
+        let store = config.provider.history_store();
         let session = store
             .create_session(Some(format!("remote-e-{label}")), None, None, None)
             .await
             .expect("create test session");
         let session_id = session.public_id;
         let llm_config = store
-            .create_or_get_llm_config(&LLMParams::new().provider("mock").model("mock"))
+            .create_or_get_llm_config(&LLMParams::new().provider("mock").model(model))
             .await
             .expect("create test LLM config");
         store
@@ -67,8 +82,8 @@ mod session_actor_ref_remote_tests {
         );
         // A host-side session actor carries the mesh: SubscribeEvents resolves
         // the event relay through it (mirrors production hosts).
-        let host_config = f.config.clone();
-        let actor = SessionActor::new(f.config.clone(), session_id.clone(), runtime)
+        let host_config = config.clone();
+        let actor = SessionActor::new(config, session_id.clone(), runtime)
             .with_mesh(Some(mesh.clone()));
         let local_ref = SessionActor::spawn(actor);
 
@@ -263,54 +278,99 @@ mod session_actor_ref_remote_tests {
         assert!(result.is_ok(), "shutdown on remote ref should return Ok");
     }
 
-    // ── E.10 ─────────────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_remote_ref_set_bridge_returns_ok() {
-        let (session_ref, _local) = remote_session_ref("e10").await;
-        // set_bridge on Remote variant is a no-op that returns Ok regardless of sender.
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let bridge = crate::acp::client_bridge::ClientBridgeSender::new(tx);
-        let result = session_ref.set_bridge(bridge).await;
-        assert!(
-            result.is_ok(),
-            "set_bridge on remote ref should return Ok (no-op)"
-        );
-    }
-
     // ── E.11 ─────────────────────────────────────────────────────────────────
 
+    /// Prompting a remote-hosted session needs no client bridge: the prompt
+    /// runs on the host, streams its events through the host fanout, and the
+    /// response reports the stop reason.
     #[tokio::test]
-    async fn test_remote_ref_rejects_prompt_with_client_bridge() {
-        let (session_ref, _local) = remote_session_ref("e11").await;
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let bridge = crate::acp::client_bridge::ClientBridgeSender::new(tx);
+    async fn remote_prompt_over_dispatch_succeeds_and_streams_updates() {
+        use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+
+        let mut mock = MockLlmProvider::new();
+        mock.expect_chat_with_tools()
+            .returning(|_, _| Ok(MockChatResponse::text_only("remote hello").into()));
+        mock.expect_chat()
+            .returning(|_| Ok(MockChatResponse::text_only("remote hello").into()));
+        let host = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+        let (session_ref, _local, host_config, session_id) =
+            remote_session_ref_for_config("e11", host.config.clone(), "mock-model").await;
+        let mut events = host_config.event_sink.fanout().subscribe();
+
         let req = crate::acp::protocol::PromptRequest::new(
-            "remote-e-e11",
+            session_id.clone(),
             vec![crate::acp::protocol::ContentBlock::from("hello")],
         );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session_ref.prompt_agent(req),
+        )
+        .await
+        .expect("remote prompt completes")
+        .expect("remote prompt succeeds without a client bridge");
+        assert_eq!(response.stop_reason, crate::acp::protocol::StopReason::EndTurn);
 
-        let error = session_ref
-            .prompt_agent_with_bridge(req, Some(bridge))
+        let mut saw_assistant_text = false;
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), events.recv()).await
+        {
+            if event.session_id() == session_id
+                && matches!(
+                    event.kind(),
+                    crate::events::AgentEventKind::AssistantMessageStored { .. }
+                )
+            {
+                saw_assistant_text = true;
+                break;
+            }
+        }
+        assert!(saw_assistant_text, "prompt updates stream from the host");
+    }
+
+    /// The same prompt-ordering guarantee holds for a remote-hosted session:
+    /// updates relayed from the host reach the attached client before the
+    /// prompt response, with no client bridge involved.
+    #[tokio::test]
+    #[ignore = "known gap: relayed host updates trail the prompt response; \
+                owned by openspec change ordered-session-events (task 5.3)"]
+    async fn remote_prompt_updates_are_sent_before_prompt_response() {
+        use crate::session::backend::StorageBackend as _;
+        use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+
+        let mut mock = MockLlmProvider::new();
+        mock.expect_chat_with_tools()
+            .returning(|_, _| Ok(MockChatResponse::text_only("ordered reply").into()));
+        mock.expect_chat()
+            .returning(|_| Ok(MockChatResponse::text_only("ordered reply").into()));
+        let host = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+        let (_session_ref, _local, _host_config, session_id) =
+            remote_session_ref_for_config("e11b", host.config.clone(), "mock-model").await;
+
+        // Alpha (the node the client is attached to) knows the session only
+        // through a durable remote bookmark; the prompt path attaches to the
+        // host (session ref + event relay) exactly as in production.
+        let mesh = get_test_mesh().await;
+        let alpha = TestAgent::new().await;
+        alpha.handle.set_mesh(mesh.clone());
+        alpha
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: session_id.clone(),
+                node_id: mesh.peer_id().to_string(),
+                peer_label: "e11b".to_string(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+            })
             .await
-            .expect_err("remote prompt with a client bridge must be rejected");
+            .expect("save remote bookmark");
 
-        assert!(
-            matches!(
-                error,
-                crate::error::AgentError::Internal(ref message)
-                    if message == "client bridges are not supported for remote session prompts"
-            ),
-            "unexpected error: {error}"
-        );
-        assert!(
-            session_ref
-                .get_history()
-                .await
-                .expect("get history after rejected prompt")
-                .is_empty(),
-            "rejected prompt must not execute remotely"
-        );
+        crate::acp::websocket_tests::assert_prompt_updates_precede_response(
+            alpha.handle.clone(),
+            &session_id,
+        )
+        .await;
     }
 
     // ── E.13 ─────────────────────────────────────────────────────────────────
@@ -636,6 +696,111 @@ mod session_actor_ref_remote_tests {
             .expect("waiter resumed")
             .expect("answer");
         assert_eq!(answer.content, Some(serde_json::json!({"choice": "back"})));
+    }
+
+    // ── E.15: two-node permission delivery ───────────────────────────────────
+
+    /// Beta hosts the session and the permission-required tool call (the
+    /// waiter below is the tool); alpha only holds the remote ref and serves
+    /// the WebSocket client.
+    #[tokio::test]
+    async fn remote_permission_prompts_attached_client_and_option_decides_call() {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use crate::acp::websocket::{
+            deliver_claimed_websocket_permission, route_websocket_response,
+        };
+
+        let (session_ref, _local, host_config, session_id) =
+            remote_session_ref_with_host("e15").await;
+        let alpha = crate::test_utils::TestAgent::new().await;
+        alpha
+            .handle
+            .registry
+            .lock()
+            .await
+            .insert(session_id.clone(), session_ref);
+
+        let request = RequestPermissionRequest::new(
+            session_id.clone(),
+            ToolCallUpdate::new(
+                ToolCallId::from("remote-call".to_string()),
+                ToolCallUpdateFields::new().title("Run shell"),
+            ),
+            vec![
+                PermissionOption::new(
+                    PermissionOptionId::from("allow_once"),
+                    "Allow once",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                PermissionOption::new(
+                    PermissionOptionId::from("reject_once"),
+                    "Reject once",
+                    PermissionOptionKind::RejectOnce,
+                ),
+            ],
+        );
+        let (tx, mut waiter) = tokio::sync::oneshot::channel();
+        crate::elicitation::register_pending_permission(
+            &host_config.pending_elicitations,
+            "remote-call".to_string(),
+            session_id.clone(),
+            request,
+            Some("run".to_string()),
+            Some("remote-call".to_string()),
+            tx,
+        )
+        .await;
+
+        // Alpha discovers the host's pending permission through the remote ref.
+        assert_eq!(
+            crate::elicitation::undelivered_permission_ids_for_session(
+                alpha.handle.as_ref(),
+                &session_id,
+                "c1",
+            )
+            .await,
+            vec!["remote-call".to_string()]
+        );
+        let claim = crate::elicitation::claim_live_elicitation_delivery(
+            alpha.handle.as_ref(),
+            &session_id,
+            "remote-call",
+            "c1",
+        )
+        .await
+        .expect("claim reaches the remote session");
+
+        let (conn, pending, mut wire) = ws_connection("c1");
+        deliver_claimed_websocket_permission(alpha.handle.clone(), claim, conn)
+            .await
+            .expect("deliver");
+        let prompt = next_wire(&mut wire).await;
+        assert_eq!(prompt["method"], "session/request_permission");
+        assert_eq!(prompt["params"]["toolCall"]["toolCallId"], "remote-call");
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        // The selected option decides the remote call, exactly once.
+        assert!(
+            route_websocket_response(
+                &pending,
+                prompt["id"].clone(),
+                Some(serde_json::json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}})),
+                None,
+            )
+            .await
+        );
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("remote tool resumed")
+            .expect("answer");
+        assert_eq!(answer.selected_permission_option(), Some("allow_once"));
+        assert!(host_config.pending_elicitations.lock().await.is_empty());
     }
 
     // ── E.12 ─────────────────────────────────────────────────────────────────

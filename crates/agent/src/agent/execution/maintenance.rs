@@ -749,7 +749,6 @@ mod tests {
             super::super::execute_cycle_state_machine(
                 &config,
                 &mut exec_ctx,
-                None,
                 crate::agent::core::AgentMode::Build,
             ),
         )

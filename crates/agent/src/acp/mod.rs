@@ -14,7 +14,7 @@ pub(crate) mod trace_context;
 #[cfg(test)]
 mod session_load_snapshot_tests;
 #[cfg(test)]
-mod websocket_tests;
+pub(crate) mod websocket_tests;
 
 // Public re-exports
 pub use transport::AcpTransport;
@@ -24,20 +24,18 @@ pub use stdio::{AcpSessionLoadOutcome, load_session_with_replay, serve_stdio};
 
 // Existing manual JSON-RPC implementation (for dashboard compatibility)
 use crate::acp::shared::{
-    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcMessage, SessionOwnerMap,
+    AcpLiveEventTranslator, PendingElicitationMap, RpcMessage, SessionOwnerMap,
     collect_event_sources, dispatch_rpc_message, is_event_owned,
 };
 use crate::event_fanout::EventFanout;
 
 use axum::Router;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 pub struct AcpServer {
     agent: Arc<crate::agent::LocalAgentHandle>,
-    pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventFanout>>,
     session_owners: SessionOwnerMap,
@@ -46,7 +44,6 @@ pub struct AcpServer {
 #[derive(Clone)]
 struct ServerState {
     agent: Arc<crate::agent::LocalAgentHandle>,
-    pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     event_sources: Vec<Arc<EventFanout>>,
     session_owners: SessionOwnerMap,
@@ -83,13 +80,11 @@ fn spawn_event_forwarders(state: ServerState, conn_id: String, tx: mpsc::Sender<
 impl AcpServer {
     pub fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
         let event_sources = collect_event_sources(&agent);
-        let pending_permissions = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = agent.pending_elicitations();
         let session_owners = SessionOwnerMap::default();
 
         Self {
             agent,
-            pending_permissions,
             pending_elicitations,
             event_sources,
             session_owners,
@@ -103,7 +98,6 @@ impl AcpServer {
     pub async fn run_stdio(self) -> anyhow::Result<()> {
         let state = ServerState {
             agent: self.agent,
-            pending_permissions: self.pending_permissions,
             pending_elicitations: self.pending_elicitations,
             event_sources: self.event_sources,
             session_owners: self.session_owners,
@@ -139,7 +133,6 @@ impl AcpServer {
                     tokio::spawn(dispatch_rpc_message(
                         state.agent.clone(),
                         state.session_owners.clone(),
-                        state.pending_permissions.clone(),
                         state.pending_elicitations.clone(),
                         conn_id.clone(),
                         request,

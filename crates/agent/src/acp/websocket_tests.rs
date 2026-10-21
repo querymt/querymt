@@ -1645,7 +1645,6 @@ async fn authorized_recovery_rpc_discovers_and_attaches_pending_session() {
             crate::acp::shared::RpcDispatchState {
                 agent: fixture.handle.clone(),
                 session_owners: state.session_owners.clone(),
-                pending_permissions: state.pending_permissions.clone(),
                 pending_elicitations: state.pending_elicitations.clone(),
                 conn_id: "replacement".to_string(),
                 tx: wire_tx.clone(),
@@ -1787,7 +1786,6 @@ async fn disconnected_websocket_cannot_be_reattached_by_in_flight_dispatch() {
         crate::acp::shared::RpcDispatchState {
             agent: fixture.handle.clone(),
             session_owners: state.session_owners.clone(),
-            pending_permissions: state.pending_permissions.clone(),
             pending_elicitations: state.pending_elicitations.clone(),
             conn_id: conn_id.to_string(),
             tx: wire_tx,
@@ -1933,4 +1931,412 @@ async fn websocket_event_forwarder_deduplicates_elicitation_requests() {
             .is_err()
     );
     cancel.cancel();
+}
+
+// ── Permission interactions over WebSocket ───────────────────────────────────
+
+fn permission_request_for_test(session_id: &str, tool_call_id: &str) -> RequestPermissionRequest {
+    RequestPermissionRequest::new(
+        session_id.to_string(),
+        ToolCallUpdate::new(
+            ToolCallId::from(tool_call_id.to_string()),
+            ToolCallUpdateFields::new().title("Run shell"),
+        ),
+        vec![
+            PermissionOption::new(
+                PermissionOptionId::from("allow_once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            ),
+            PermissionOption::new(
+                PermissionOptionId::from("reject_once"),
+                "Reject once",
+                PermissionOptionKind::RejectOnce,
+            ),
+        ],
+    )
+}
+
+async fn register_permission_for_test(
+    fixture: &crate::test_utils::TestAgent,
+    session_id: &str,
+    permission_id: &str,
+) -> oneshot::Receiver<crate::elicitation::ElicitationResponse> {
+    let (tx, rx) = oneshot::channel();
+    crate::elicitation::register_pending_permission(
+        &fixture.handle.pending_elicitations(),
+        permission_id.to_string(),
+        session_id.to_string(),
+        permission_request_for_test(session_id, permission_id),
+        Some("run".to_string()),
+        Some(permission_id.to_string()),
+        tx,
+    )
+    .await;
+    rx
+}
+
+async fn deliver_permission_for_test(
+    fixture: &crate::test_utils::TestAgent,
+    conn_id: &str,
+    session_id: &str,
+    permission_id: &str,
+) -> (
+    PendingWsRequestMap,
+    mpsc::Receiver<String>,
+    CancellationToken,
+) {
+    let claim = crate::elicitation::claim_live_elicitation_delivery(
+        fixture.handle.as_ref(),
+        session_id,
+        permission_id,
+        conn_id,
+    )
+    .await
+    .expect("permission interaction is claimable");
+    let pending: PendingWsRequestMap = Arc::new(Mutex::new(HashMap::new()));
+    let (wire_tx, wire_rx) = mpsc::channel::<String>(16);
+    let connection = connection_state_for_test(
+        conn_id,
+        wire_tx,
+        pending.clone(),
+        Arc::new(AtomicU64::new(1)),
+    );
+    let cancel = connection.connection_cancel.clone();
+    super::websocket::deliver_claimed_websocket_permission(
+        fixture.handle.clone(),
+        claim,
+        connection,
+    )
+    .await
+    .expect("permission request is written to the wire");
+    (pending, wire_rx, cancel)
+}
+
+fn selected(option_id: &str) -> serde_json::Value {
+    serde_json::json!({"outcome": {"outcome": "selected", "optionId": option_id}})
+}
+
+#[tokio::test]
+async fn permission_is_delivered_as_request_permission_and_selected_option_resolves() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let waiter = register_permission_for_test(&fixture, "session", "call-1").await;
+    let (pending, mut wire, _cancel) =
+        deliver_permission_for_test(&fixture, "conn", "session", "call-1").await;
+
+    let request: serde_json::Value = serde_json::from_str(&wire.recv().await.unwrap()).unwrap();
+    assert_eq!(request["method"], "session/request_permission");
+    assert_eq!(request["params"]["toolCall"]["toolCallId"], "call-1");
+
+    assert!(
+        route_websocket_response(
+            &pending,
+            request["id"].clone(),
+            Some(selected("allow_once")),
+            None
+        )
+        .await
+    );
+    let answer = timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("answer reaches the waiting tool")
+        .unwrap();
+    assert_eq!(answer.selected_permission_option(), Some("allow_once"));
+    assert!(
+        !fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("call-1")
+    );
+}
+
+#[tokio::test]
+async fn permission_disconnect_keeps_request_pending_and_next_client_decides() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let mut waiter = register_permission_for_test(&fixture, "session", "call-d").await;
+    let (_pending, mut wire, cancel) =
+        deliver_permission_for_test(&fixture, "old", "session", "call-d").await;
+    let _ = wire.recv().await.unwrap();
+
+    // The first connection closes without answering: not a decision.
+    cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        waiter.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(
+        fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("call-d")
+    );
+
+    // A later client attaching is offered the same request again.
+    assert_eq!(
+        crate::elicitation::undelivered_permission_ids_for_session(
+            fixture.handle.as_ref(),
+            "session",
+            "new"
+        )
+        .await,
+        vec!["call-d".to_string()]
+    );
+    let (pending, mut new_wire, _cancel) =
+        deliver_permission_for_test(&fixture, "new", "session", "call-d").await;
+    let request: serde_json::Value = serde_json::from_str(&new_wire.recv().await.unwrap()).unwrap();
+    assert_eq!(request["method"], "session/request_permission");
+    assert!(
+        route_websocket_response(
+            &pending,
+            request["id"].clone(),
+            Some(selected("reject_once")),
+            None
+        )
+        .await
+    );
+    let answer = timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.selected_permission_option(), Some("reject_once"));
+}
+
+#[tokio::test]
+async fn permission_malformed_answer_stays_pending_and_is_redelivered() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let mut waiter = register_permission_for_test(&fixture, "session", "call-m").await;
+    let (pending, mut wire, _cancel) =
+        deliver_permission_for_test(&fixture, "conn", "session", "call-m").await;
+    let first: serde_json::Value = serde_json::from_str(&wire.recv().await.unwrap()).unwrap();
+
+    // Unknown option, then an unparseable payload: neither grants nor rejects.
+    assert!(
+        route_websocket_response(
+            &pending,
+            first["id"].clone(),
+            Some(selected("not-an-option")),
+            None
+        )
+        .await
+    );
+    let second: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire.recv())
+            .await
+            .expect("request is re-delivered")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second["method"], "session/request_permission");
+    assert_ne!(second["id"], first["id"]);
+    assert!(
+        route_websocket_response(
+            &pending,
+            second["id"].clone(),
+            Some(serde_json::json!({"nonsense": true})),
+            None
+        )
+        .await
+    );
+    let third: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire.recv())
+            .await
+            .expect("request is re-delivered again")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        waiter.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(
+        fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("call-m")
+    );
+
+    // A dismissed (cancelled) outcome is not a decision either.
+    assert!(
+        route_websocket_response(
+            &pending,
+            third["id"].clone(),
+            Some(serde_json::json!({"outcome": {"outcome": "cancelled"}})),
+            None
+        )
+        .await
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(matches!(
+        waiter.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert!(
+        fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("call-m")
+    );
+}
+
+#[tokio::test]
+async fn permission_two_connections_first_valid_answer_wins_second_is_stale() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let waiter = register_permission_for_test(&fixture, "session", "call-w").await;
+    let (pending_a, mut wire_a, _cancel_a) =
+        deliver_permission_for_test(&fixture, "a", "session", "call-w").await;
+    let (pending_b, mut wire_b, _cancel_b) =
+        deliver_permission_for_test(&fixture, "b", "session", "call-w").await;
+    let request_a: serde_json::Value = serde_json::from_str(&wire_a.recv().await.unwrap()).unwrap();
+    let request_b: serde_json::Value = serde_json::from_str(&wire_b.recv().await.unwrap()).unwrap();
+
+    // `b` claimed last, so `a`'s delivery is superseded and cannot decide.
+    assert!(
+        route_websocket_response(
+            &pending_a,
+            request_a["id"].clone(),
+            Some(selected("allow_once")),
+            None
+        )
+        .await
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .contains_key("call-w"),
+        "a superseded delivery must not decide the call"
+    );
+
+    assert!(
+        route_websocket_response(
+            &pending_b,
+            request_b["id"].clone(),
+            Some(selected("reject_once")),
+            None
+        )
+        .await
+    );
+    let answer = timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.selected_permission_option(), Some("reject_once"));
+
+    // Resolved once: any later answer is rejected as not pending.
+    let late = crate::elicitation::resolve_claimed_elicitation(
+        fixture.handle.as_ref(),
+        "session",
+        "call-w",
+        "b",
+        2,
+        crate::elicitation::ElicitationResponse::permission_selected("allow_once"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(late, crate::elicitation::ElicitationResolution::NotFound);
+}
+
+/// Prompt `session/update` notifications reach the wire before the prompt
+/// response. Sessions hold no client bridge, so this ordering comes from the
+/// event forwarder alone.
+#[tokio::test]
+async fn local_prompt_updates_are_sent_before_prompt_response() {
+    use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+
+    let mut mock = MockLlmProvider::new();
+    mock.expect_chat_with_tools()
+        .returning(|_, _| Ok(MockChatResponse::text_only("ordered reply").into()));
+    mock.expect_chat()
+        .returning(|_| Ok(MockChatResponse::text_only("ordered reply").into()));
+    let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+    let session_id = crate::send_agent::SendAgent::new_session(
+        fixture.handle.as_ref(),
+        crate::acp::protocol::NewSessionRequest::new(std::env::temp_dir()),
+    )
+    .await
+    .expect("new session")
+    .session_id
+    .to_string();
+
+    assert_prompt_updates_precede_response(fixture.handle.clone(), &session_id).await;
+}
+
+/// Drive `session/prompt` through the real dispatcher with the connection's
+/// event forwarders attached, and assert every assistant update precedes the
+/// response on the wire.
+pub(crate) async fn assert_prompt_updates_precede_response(
+    agent: Arc<crate::agent::LocalAgentHandle>,
+    session_id: &str,
+) {
+    let state = WsServerState::new(agent.clone());
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(256);
+    let cancel = CancellationToken::new();
+    spawn_event_forwarders(
+        state.clone(),
+        ConnectionEventState {
+            conn_id: "conn".to_string(),
+            tx: wire_tx.clone(),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+        },
+        test_translator(),
+    );
+
+    super::shared::dispatch_rpc_message(
+        agent,
+        state.session_owners.clone(),
+        state.pending_elicitations.clone(),
+        "conn".to_string(),
+        super::shared::RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            method: "session/prompt".to_string(),
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "hello"}]
+            }),
+            id: Some(serde_json::json!(42)),
+        },
+        wire_tx,
+    )
+    .await;
+
+    let mut saw_update = false;
+    loop {
+        let raw = timeout(Duration::from_secs(5), wire_rx.recv())
+            .await
+            .expect("prompt response arrives")
+            .expect("wire open");
+        let message: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if message["id"] == serde_json::json!(42) {
+            assert!(
+                message.get("error").is_none() || message["error"].is_null(),
+                "prompt failed: {message}"
+            );
+            break;
+        }
+        if message["method"] == "session/update"
+            && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+        {
+            saw_update = true;
+        }
+    }
+    cancel.cancel();
+    assert!(
+        saw_update,
+        "assistant update must be on the wire before the prompt response"
+    );
 }

@@ -739,6 +739,45 @@ pub async fn has_pending_elicitation_for_agent_session(
     false
 }
 
+/// IDs of the pending permission interactions of `session_id` that
+/// `connection_id` does not already hold, wherever the session runs. Used to
+/// re-deliver permission requests to a client that attaches after the request
+/// was raised.
+pub async fn undelivered_permission_ids_for_session(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+    connection_id: &str,
+) -> Vec<String> {
+    let pending = if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        session_ref
+            .list_pending_interactions(None)
+            .await
+            .unwrap_or_else(|error| {
+                warn_interaction_call("pending_permissions", session_id, &error);
+                Vec::new()
+            })
+    } else {
+        let mut snapshots = Vec::new();
+        for map in all_pending_maps(agent).await {
+            snapshots.extend(snapshot_pending_elicitations(&map).await);
+        }
+        snapshots
+            .into_iter()
+            .filter(|entry| entry.session_id == session_id)
+            .collect()
+    };
+    let mut ids = pending
+        .into_iter()
+        .filter(|entry| {
+            matches!(entry.kind, InteractionKind::Permission { .. })
+                && entry.delivery_connection.as_deref() != Some(connection_id)
+        })
+        .map(|entry| entry.elicitation_id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
 pub async fn claim_pending_elicitation_deliveries(
     agent: &crate::agent::LocalAgentHandle,
     session_id: &str,

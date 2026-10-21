@@ -825,7 +825,7 @@ mod remote_impl {
 
                 // ── Phase 3: Finalize (NO lock held) ────────────────────────────
                 self.session_materializer
-                    .finalize_session(prepared, None)
+                    .finalize_session(prepared)
                     .await
                     .map_err(|e| AgentError::Internal(e.to_string()))?;
             }

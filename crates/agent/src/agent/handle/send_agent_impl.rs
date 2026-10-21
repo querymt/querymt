@@ -19,14 +19,6 @@ impl SendAgent for LocalAgentHandle {
     }
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
-        self.prompt_with_bridge(req, None).await
-    }
-
-    async fn prompt_with_bridge(
-        &self,
-        req: PromptRequest,
-        bridge: Option<ClientBridgeSender>,
-    ) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
         #[cfg(feature = "remote")]
         return self
@@ -34,7 +26,7 @@ impl SendAgent for LocalAgentHandle {
                 &session_id,
                 session_operation::SessionOperation::LegacyPrompt,
                 |session_ref| {
-                    Box::pin(session_ref.prompt_agent_with_bridge(req.clone(), bridge.clone()))
+                    Box::pin(session_ref.prompt_agent(req.clone()))
                 },
             )
             .await
@@ -42,7 +34,7 @@ impl SendAgent for LocalAgentHandle {
         #[cfg(not(feature = "remote"))]
         self.session_ref_for_agent_session(&session_id)
             .await?
-            .prompt_with_bridge(req, bridge)
+            .prompt(req)
             .await
     }
 

@@ -7,7 +7,6 @@
 //! - ProcessingToolCalls → BeforeLlmCall or WaitingForEvent (parallel tool execution)
 
 use super::wave_plan::{CallInfo, plan_waves, serialized_call_count};
-use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
 use crate::agent::session_actor::ensure_pre_turn_snapshot_ready;
@@ -1613,7 +1612,7 @@ pub(super) async fn transition_after_llm(
 /// history invariant is always maintained.
 #[instrument(
     name = "agent.transition.processing_tool_calls",
-    skip(config, remaining_calls, results, context, exec_ctx, bridge),
+    skip(config, remaining_calls, results, context, exec_ctx),
     fields(
         session_id = %exec_ctx.session_id,
         remaining_calls = remaining_calls.len(),
@@ -1629,7 +1628,6 @@ pub(super) async fn transition_processing_tool_calls(
     results: &Arc<[ToolResult]>,
     context: &Arc<crate::middleware::ConversationContext>,
     exec_ctx: &mut ExecutionContext,
-    bridge: Option<&ClientBridgeSender>,
 ) -> Result<ExecutionState, anyhow::Error> {
     debug!(
         "ProcessingToolCalls: session={}, remaining={}, completed={}",
@@ -1722,12 +1720,7 @@ pub(super) async fn transition_processing_tool_calls(
             let exec_ctx_ref: &ExecutionContext = exec_ctx;
             let futures = wave.iter().map(|&index| {
                 let call = &remaining_calls[index];
-                async move {
-                    (
-                        index,
-                        run_tool_call(config, call, exec_ctx_ref, bridge).await,
-                    )
-                }
+                async move { (index, run_tool_call(config, call, exec_ctx_ref).await) }
             });
             for (index, result) in join_all(futures).await {
                 slots[index] = Some(result);
@@ -1735,7 +1728,7 @@ pub(super) async fn transition_processing_tool_calls(
         } else {
             let call = &remaining_calls[first];
             stateful_executed |= class == crate::tools::ToolExecutionClass::SerialStateful;
-            let result = run_tool_call(config, call, exec_ctx, bridge).await;
+            let result = run_tool_call(config, call, exec_ctx).await;
             if class == crate::tools::ToolExecutionClass::ClarificationBoundary && !result.is_error
             {
                 clarification_applied = apply_clarification_answer(exec_ctx, call, &result).await;
@@ -1839,11 +1832,10 @@ async fn run_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
     exec_ctx: &ExecutionContext,
-    bridge: Option<&ClientBridgeSender>,
 ) -> ToolResult {
     let cancel = exec_ctx.cancellation_token.clone();
     tokio::select! {
-        result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge) => {
+        result = super::tool_calls::execute_tool_call(config, call, exec_ctx) => {
             match result {
                 Ok(tool_result) => tool_result,
                 Err(error) => {

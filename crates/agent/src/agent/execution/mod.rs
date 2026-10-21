@@ -246,7 +246,6 @@ pub(crate) async fn apply_pending_steering(
 //  State machine implementation
 // ══════════════════════════════════════════════════════════════════════════
 
-use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 
 /// Execute the cycle state machine using an `AgentConfig`.
@@ -258,7 +257,7 @@ use crate::agent::agent_config::AgentConfig;
 /// It is injected into every `ConversationContext` so middleware can read it.
 #[instrument(
     name = "agent.execution.turn",
-    skip(config, exec_ctx, bridge),
+    skip(config, exec_ctx),
     fields(
         session_id = %exec_ctx.session_id,
         mode = %session_mode,
@@ -270,7 +269,6 @@ use crate::agent::agent_config::AgentConfig;
 pub(crate) async fn execute_cycle_state_machine(
     config: &AgentConfig,
     exec_ctx: &mut ExecutionContext,
-    bridge: Option<ClientBridgeSender>,
     session_mode: crate::agent::core::AgentMode,
 ) -> Result<CycleOutcome, anyhow::Error> {
     debug!(
@@ -544,7 +542,6 @@ pub(crate) async fn execute_cycle_state_machine(
                         &Arc::from(skipped.into_boxed_slice()),
                         &steered_context,
                         exec_ctx,
-                        bridge.as_ref(),
                     )
                     .await?;
                     state = next;
@@ -596,7 +593,6 @@ pub(crate) async fn execute_cycle_state_machine(
                             results,
                             context,
                             exec_ctx,
-                            bridge.as_ref(),
                         )
                         .await?
                     }

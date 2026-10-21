@@ -16,7 +16,6 @@ use crate::acp::protocol::AuthMethod;
 use crate::agent::core::{
     AgentMode, DelegationContextConfig, SnapshotPolicy, ToolConfig, ToolPolicy,
 };
-use crate::agent::remote::SessionActorRef;
 use crate::agent::session_mcp::SessionMcpAttachmentSource;
 use crate::config::{DelegationWaitPolicy, McpServerConfig, RuntimeExecutionPolicy};
 use crate::delegation::AgentRegistry;
@@ -34,7 +33,23 @@ use crate::tools::ToolRegistry;
 #[derive(Clone)]
 pub(crate) struct SessionBridgeRoute {
     pub bridge: ClientBridgeSender,
-    pub session_ref: SessionActorRef,
+}
+
+impl AgentConfig {
+    /// Workspace-query capability for a locally hosted session.
+    ///
+    /// Returns the transport connection currently attached to the session on
+    /// this node, if any. Sessions hosted on remote nodes never have an entry
+    /// in the local route table, so they report no capability.
+    pub(crate) fn workspace_query_bridge_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<ClientBridgeSender> {
+        self.session_bridges
+            .lock()
+            .ok()
+            .and_then(|bridges| bridges.get(session_id).map(|route| route.bridge.clone()))
+    }
 }
 
 /// Shared agent configuration and infrastructure.

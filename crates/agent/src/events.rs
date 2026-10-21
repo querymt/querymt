@@ -587,10 +587,22 @@ pub enum AgentEventKind {
         options: Vec<String>,
     },
     PermissionRequested {
+        /// Interaction ID of the pending permission request.
         permission_id: String,
         task_id: Option<String>,
         tool_name: String,
         reason: String,
+        /// Tool call awaiting the decision. Empty for events journaled before
+        /// permission became a pending interaction.
+        #[serde(default)]
+        tool_call_id: String,
+        /// Full ACP `session/request_permission` payload (tool-call update and
+        /// options) so any attached client can render and answer it, local or
+        /// remote. Absent for events journaled before permission became a
+        /// pending interaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "any")]
+        request: Option<crate::acp::protocol::RequestPermissionRequest>,
     },
     PermissionGranted {
         permission_id: String,
@@ -1503,6 +1515,95 @@ mod tests {
             source: "test".into(),
         };
         assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    fn sample_permission_request() -> crate::acp::protocol::RequestPermissionRequest {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        RequestPermissionRequest::new(
+            "s1".to_string(),
+            ToolCallUpdate::new(ToolCallId::from("call-1".to_string()), {
+                ToolCallUpdateFields::new().title("Run shell")
+            }),
+            vec![PermissionOption::new(
+                PermissionOptionId::from("allow_once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        )
+    }
+
+    #[test]
+    fn classify_permission_requested_is_durable() {
+        let kind = AgentEventKind::PermissionRequested {
+            permission_id: "call-1".into(),
+            task_id: None,
+            tool_name: "shell".into(),
+            reason: "needs permission".into(),
+            tool_call_id: "call-1".into(),
+            request: Some(sample_permission_request()),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn permission_requested_round_trips_full_request_payload() {
+        let kind = AgentEventKind::PermissionRequested {
+            permission_id: "call-1".into(),
+            task_id: Some("t1".into()),
+            tool_name: "shell".into(),
+            reason: "needs permission".into(),
+            tool_call_id: "call-1".into(),
+            request: Some(sample_permission_request()),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "permission_requested");
+        assert_eq!(json["data"]["tool_call_id"], "call-1");
+        assert_eq!(json["data"]["request"]["toolCall"]["toolCallId"], "call-1");
+        assert_eq!(
+            json["data"]["request"]["options"][0]["optionId"],
+            "allow_once"
+        );
+
+        let restored: AgentEventKind = serde_json::from_value(json).unwrap();
+        let AgentEventKind::PermissionRequested {
+            tool_call_id,
+            request,
+            ..
+        } = restored
+        else {
+            panic!("expected PermissionRequested");
+        };
+        assert_eq!(tool_call_id, "call-1");
+        let request = request.expect("request payload survives round trip");
+        assert_eq!(request.options.len(), 1);
+        assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-1");
+    }
+
+    #[test]
+    fn permission_requested_loads_legacy_journal_entries() {
+        let legacy = serde_json::json!({
+            "type": "permission_requested",
+            "data": {
+                "permission_id": "p1",
+                "task_id": null,
+                "tool_name": "shell",
+                "reason": "Tool shell requires explicit permission"
+            }
+        });
+        let restored: AgentEventKind = serde_json::from_value(legacy).unwrap();
+        let AgentEventKind::PermissionRequested {
+            tool_call_id,
+            request,
+            ..
+        } = restored
+        else {
+            panic!("expected PermissionRequested");
+        };
+        assert!(tool_call_id.is_empty());
+        assert!(request.is_none());
     }
 
     // ── DurableEvent construction ──────────────────────────────────────────

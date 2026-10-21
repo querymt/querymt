@@ -7,10 +7,9 @@
 //!
 //! Public messages that may be sent across the kameo mesh (when the `remote`
 //! feature is enabled) derive `Serialize + Deserialize`. Internal-only messages
-//! (`PromptFinished`, `SetBridge`, `Shutdown`) do NOT — they are local-only and
+//! (`PromptFinished`, `Shutdown`) do NOT — they are local-only and
 //! contain non-serializable types.
 
-use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{ExtNotification as AcpExtNotification, ExtRequest, PromptRequest};
 use crate::agent::core::AgentMode;
 use crate::agent::session_control::{
@@ -20,7 +19,6 @@ pub use crate::agent::turn_control::{InputDelivery, SubmitInput, SubmitInputResu
 use querymt::LLMParams;
 use querymt::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use typeshare::typeshare;
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -34,8 +32,6 @@ use typeshare::typeshare;
 #[derive(Serialize, Deserialize)]
 pub struct Prompt {
     pub req: PromptRequest,
-    #[serde(skip)]
-    pub bridge: Option<ClientBridgeSender>,
 }
 
 /// Submit explicitly steered or queued input.
@@ -312,21 +308,6 @@ pub struct ExtNotification {
 //  Lifecycle (local-only, NOT serializable)
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Set the client bridge for SessionUpdate notifications.
-///
-/// NOT serializable — contains `ClientBridgeSender` (mpsc channel).
-pub struct SetBridge {
-    pub bridge: ClientBridgeSender,
-}
-
-#[cfg(test)]
-pub struct GetBridge;
-
-/// Clear a connection-local bridge only if it still belongs to that connection.
-pub struct ClearBridge {
-    pub connection_id: Arc<str>,
-}
-
 /// Stop this session actor gracefully.
 ///
 /// NOT serializable — local lifecycle only.
@@ -530,7 +511,7 @@ mod tests {
         // and the content field is called "prompt" in the protocol schema.
         let json = r#"{"req":{"sessionId":"sess-1","prompt":[]}}"#;
         let rt: Prompt = serde_json::from_str(json).unwrap();
-        assert!(rt.bridge.is_none());
+        assert_eq!(rt.req.session_id.to_string(), "sess-1");
         let back = serde_json::to_string(&rt).unwrap();
         assert!(back.contains("sess-1"));
     }

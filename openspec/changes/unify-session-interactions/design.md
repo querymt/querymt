@@ -51,7 +51,9 @@ The WebSocket and stdio forwarders already special-case `ElicitationRequested`. 
 `ClientBridgeSender` becomes the transport's own outbound queue, owned by the connection, plus the agent-wide `notify_ext` used by schedules and control notifications. `ClientBridgeMessage::RequestPermission`, `Elicit` and `WorkspaceQuery` stop being produced by session code.
 
 ### 4. Sessions no longer hold bridges
-Remove `Prompt.bridge`, `QueuedPrompt.bridge`, `SessionActor.bridge`, `SetBridge`/`GetBridge`/`ClearBridge`, `prompt_with_bridge`/`prompt_agent_with_bridge` and the session-registry `set_bridge` call. `session/prompt` dispatch calls plain `prompt`. The remote-ref rejection disappears along with its parameter. `Flush` is only exercised by bridge unit tests (no production caller), so prompt-response ordering relies on the existing event forwarder in both cases; this is verified by a test rather than assumed.
+Remove `Prompt.bridge`, `QueuedPrompt.bridge`, `SessionActor.bridge`, `SetBridge`/`GetBridge`/`ClearBridge`, `prompt_with_bridge`/`prompt_agent_with_bridge` and the session-registry `set_bridge` call. `session/prompt` dispatch calls plain `prompt`. The remote-ref rejection disappears along with its parameter. `Flush` is only exercised by bridge unit tests (no production caller).
+
+**Prompt-response ordering is not guaranteed by this change.** Nothing links the prompt response to the session events before it. Locally, updates usually win the race because the run does more work after its last update. For remote sessions, relayed updates reliably arrive after the response (relay path: host write → host fanout → mesh `tell` → attached-node write → fanout → connection forwarder). The `event_emit` benchmark also showed local durable events are published out of order under bursts. This is split into the follow-up change `ordered-session-events` (per-session sequence, prompt watermark, lossless consumers). Here, the local ordering test is kept and the remote ordering test is committed as `#[ignore]` pointing at that change.
 
 ### 5. Workspace query is a capability of the local session only
 `ExecutionContext.workspace_query_bridge` is populated only for locally hosted sessions with a VS Code connection. A remote-hosted run never has it, so `language_query` returns its existing "not available" result, with the message extended to name remote sessions.
@@ -67,6 +69,8 @@ The new remote message IDs are absent on old nodes, so kameo remote asks fail wi
 - [Duplicate delivery from relay plus backfill] → Forwarders already dedupe by `(session_id, interaction_id)`; the claim generation makes stale answers no-ops.
 - [Permission payload in durable events] → It contains tool arguments, which are already persisted in `ToolCallStart`; answers stay out of history, as with elicitation.
 - [Large change] → Phased tasks; each phase keeps local behavior green before the next.
+- [Remote prompt response precedes its relayed updates] → Known gap, owned by `ordered-session-events`. Clients that need the updates first must wait for them after the response until that change lands.
+- [WebSocket session-event forwarder stops after one broadcast lag (`acp/websocket.rs` `spawn_event_forwarders`, `Err(_) => break`)] → Pre-existing bug, not fixed here; must be fixed in `ordered-session-events` (task 4.1).
 
 ## Migration Plan
 

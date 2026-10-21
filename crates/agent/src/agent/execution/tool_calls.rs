@@ -3,7 +3,6 @@
 //! This module handles the complete lifecycle of tool calls: execution, permission
 //! checking, snapshotting, and storing results back into conversation history.
 
-use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::SnapshotPolicy;
 use crate::agent::execution_context::ExecutionContext;
@@ -39,7 +38,7 @@ use uuid::Uuid;
 /// 8. Returns the tool result
 #[instrument(
     name = "agent.tool.execute",
-    skip(config, call, exec_ctx, bridge),
+    skip(config, call, exec_ctx),
     fields(
         otel.name = %format!("execute_tool {}", call.function.name),
         otel.kind = "internal",
@@ -60,11 +59,10 @@ pub(super) async fn execute_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
     exec_ctx: &ExecutionContext,
-    bridge: Option<&ClientBridgeSender>,
 ) -> Result<ToolResult, anyhow::Error> {
     genai::agent_id(&Span::current(), config.provider.agent_id.as_deref());
     Span::current().set_attribute("querymt.tool.execution", "not_started");
-    execute_tool_call_inner(config, call, exec_ctx, bridge)
+    execute_tool_call_inner(config, call, exec_ctx)
         .await
         .inspect_err(|_| {
             if !exec_ctx.cancellation_token.is_cancelled() {
@@ -77,7 +75,6 @@ async fn execute_tool_call_inner(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
     exec_ctx: &ExecutionContext,
-    bridge: Option<&ClientBridgeSender>,
 ) -> Result<ToolResult, anyhow::Error> {
     debug!(
         "Executing tool: session={}, tool={}",
@@ -392,7 +389,6 @@ async fn execute_tool_call_inner(
             &call.id,
             &call.function.name,
             &args,
-            bridge,
             PermissionContext {
                 turn_id: exec_ctx.turn_id().unwrap_or_default(),
                 bypass_interactive_prompt: hook_allows_interactive,
@@ -731,7 +727,7 @@ pub(super) struct PermissionContext<'a> {
 /// Returns `true` if permission is granted (or not required), `false` if denied.
 #[instrument(
     name = "agent.tool.permission",
-    skip(config, exec_ctx, args, bridge, permission),
+    skip(config, exec_ctx, args, permission),
     fields(
         session_id = %exec_ctx.session_id,
         tool_name = %tool_name,
@@ -747,12 +743,11 @@ pub(super) async fn ensure_tool_permission(
     tool_call_id: &str,
     tool_name: &str,
     args: &serde_json::Value,
-    bridge: Option<&ClientBridgeSender>,
     permission: PermissionContext<'_>,
 ) -> Result<bool, agent_client_protocol::Error> {
     use crate::acp::protocol::{
-        PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
-        RequestPermissionRequest, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+        ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     };
     use crate::agent::utils::{extract_locations, tool_kind_for_tool};
 
@@ -830,35 +825,6 @@ pub(super) async fn ensure_tool_permission(
         None => {}
     }
 
-    let permission_id = Uuid::new_v4().to_string();
-    config.emit_event(
-        &exec_ctx.session_id,
-        AgentEventKind::PermissionRequested {
-            permission_id: permission_id.clone(),
-            task_id: exec_ctx
-                .state
-                .active_task
-                .as_ref()
-                .map(|task| task.public_id.clone()),
-            tool_name: tool_name.to_string(),
-            reason: format!("Tool {} requires explicit permission", tool_name),
-        },
-    );
-
-    // In the actor model, only the bridge is available (no client)
-    let Some(bridge) = bridge else {
-        // No bridge available — auto-grant permission
-        config.emit_event(
-            &exec_ctx.session_id,
-            AgentEventKind::PermissionGranted {
-                permission_id,
-                granted: true,
-            },
-        );
-        Span::current().record("granted", true);
-        return Ok(true);
-    };
-
     let locations = extract_locations(args);
     let tool_update_fields = ToolCallUpdateFields::new()
         .title(format!("Run {}", tool_name))
@@ -901,22 +867,74 @@ pub(super) async fn ensure_tool_permission(
         ],
     );
 
-    let response = bridge.request_permission(request).await?;
-    let granted = match response.outcome {
-        RequestPermissionOutcome::Selected(selected) => {
-            let option_id = selected.option_id.0.as_ref();
+    // The interaction ID is the tool-call ID (stable across deliveries, as in ACP).
+    let permission_id = tool_call_id.to_string();
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    crate::elicitation::register_pending_permission(
+        &config.pending_elicitations,
+        permission_id.clone(),
+        exec_ctx.session_id.clone(),
+        request.clone(),
+        Some(permission.turn_id.to_string()),
+        Some(tool_call_id.to_string()),
+        response_tx,
+    )
+    .await;
+    // Retire the pending entry on every exit path (answer, cancel, drop).
+    let _cleanup = PendingPermissionGuard {
+        pending_map: config.pending_elicitations.clone(),
+        interaction_id: permission_id.clone(),
+    };
+
+    // Durable so any attached client (local or remote) or a later attach
+    // can discover and answer the request.
+    if let Err(err) = config
+        .event_sink
+        .emit_durable(
+            &exec_ctx.session_id,
+            AgentEventKind::PermissionRequested {
+                permission_id: permission_id.clone(),
+                task_id: exec_ctx
+                    .state
+                    .active_task
+                    .as_ref()
+                    .map(|task| task.public_id.clone()),
+                tool_name: tool_name.to_string(),
+                reason: format!("Tool {} requires explicit permission", tool_name),
+                tool_call_id: tool_call_id.to_string(),
+                request: Some(request),
+            },
+        )
+        .await
+    {
+        // The pending entry stays discoverable through ListPendingInteractions.
+        log::warn!("failed to emit PermissionRequested: {}", err);
+    }
+
+    // Wait for an explicit answer or run cancellation. No client attached,
+    // delivery failure and disconnect all keep the request pending; only an
+    // explicit selected option grants.
+    let response = tokio::select! {
+        response = response_rx => response.ok(),
+        _ = exec_ctx.cancellation_token.cancelled() => None,
+    };
+
+    let granted = match response
+        .as_ref()
+        .and_then(|r| r.selected_permission_option())
+    {
+        Some(option_id) => {
             let allow = option_id == "allow_once" || option_id == "allow_always";
-            {
-                let mut cache = exec_ctx.runtime.permission_cache.lock();
-                if option_id == "allow_always" {
-                    cache.insert(tool_name.to_string(), true);
-                } else if option_id == "reject_always" {
-                    cache.insert(tool_name.to_string(), false);
-                }
+            let mut cache = exec_ctx.runtime.permission_cache.lock();
+            if option_id == "allow_always" {
+                cache.insert(tool_name.to_string(), true);
+            } else if option_id == "reject_always" {
+                cache.insert(tool_name.to_string(), false);
             }
             allow
         }
-        _ => false,
+        // Decline, cancel, run cancellation or a dropped waiter never grant.
+        None => false,
     };
 
     config.emit_event(
@@ -930,6 +948,24 @@ pub(super) async fn ensure_tool_permission(
     Span::current().record("granted", granted);
 
     Ok(granted)
+}
+
+/// Removes a pending permission interaction when the waiting tool call exits.
+struct PendingPermissionGuard {
+    pending_map: crate::elicitation::PendingElicitationMap,
+    interaction_id: String,
+}
+
+impl Drop for PendingPermissionGuard {
+    fn drop(&mut self) {
+        let pending_map = self.pending_map.clone();
+        let interaction_id = std::mem::take(&mut self.interaction_id);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                pending_map.lock().await.remove(&interaction_id);
+            });
+        }
+    }
 }
 
 /// Record side effects of a tool execution (artifacts, delegations).
@@ -1500,7 +1536,7 @@ mod genai_trace_tests {
                 &serde_json::json!({"name":requested}).to_string(),
             );
             let (result, spans) =
-                capture_info(execute_tool_call(&config, &call, &exec, None)).await;
+                capture_info(execute_tool_call(&config, &call, &exec)).await;
             let verified = matches!(mode, "success" | "rewrite");
             let result = result.unwrap();
             assert_eq!(
@@ -1665,7 +1701,7 @@ mod genai_trace_tests {
             }
             let call = mock_tool_call(mode, "shell", &args.to_string());
             let (result, spans) =
-                capture_info(execute_tool_call(&config, &call, &exec, None)).await;
+                capture_info(execute_tool_call(&config, &call, &exec)).await;
             let result = result.unwrap();
             let ran = matches!(mode, "direct" | "symlink" | "script" | "wrapper" | "signal");
             assert_eq!(
@@ -1756,7 +1792,7 @@ mod genai_trace_tests {
                 r#"{"secret":"SECRET_ARGUMENT"}"#,
             );
             let (result, spans) = capture(async {
-                execute_tool_call(&config, &call, &exec, None)
+                execute_tool_call(&config, &call, &exec)
                     .instrument(info_span!("test-parent"))
                     .await
             })
@@ -1834,7 +1870,7 @@ mod genai_trace_tests {
             "telemetry_tool",
             r#"{"secret":"SECRET_ARGUMENT"}"#,
         );
-        let (result, spans) = capture(execute_tool_call(&config, &call, &exec, None)).await;
+        let (result, spans) = capture(execute_tool_call(&config, &call, &exec)).await;
         assert!(result.is_err());
         let tool = spans
             .iter()
@@ -1887,7 +1923,7 @@ mod genai_trace_tests {
                 "telemetry_tool",
                 r#"{"secret":"SECRET_ARGUMENT"}"#,
             );
-            let (result, spans) = capture(execute_tool_call(&config, &call, &exec, None)).await;
+            let (result, spans) = capture(execute_tool_call(&config, &call, &exec)).await;
             assert!(result.unwrap().is_error);
             let tool = spans
                 .iter()
@@ -1913,6 +1949,242 @@ mod genai_trace_tests {
                 attr(tool, "gen_ai.conversation.id")
             );
             assert_private(&spans);
+        }
+    }
+}
+
+#[cfg(test)]
+mod permission_interaction_tests {
+    use super::*;
+    use crate::agent::agent_config_builder::AgentConfigBuilder;
+    use crate::elicitation::{ElicitationResponse, InteractionKind};
+    use crate::hooks::{Hooks, HooksConfig};
+    use crate::session::backend::StorageBackend;
+    use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+    use std::time::Duration;
+
+    async fn fixture() -> (TestAgent, ExecutionContext) {
+        let fixture =
+            TestAgent::with_mock_provider(SharedLlmProvider::new(MockLlmProvider::new(), vec![]))
+                .await;
+        let exec = fixture.execution_context().await;
+        (fixture, exec)
+    }
+
+    fn permission_ctx() -> PermissionContext<'static> {
+        PermissionContext {
+            turn_id: "turn-1",
+            bypass_interactive_prompt: false,
+        }
+    }
+
+    /// Wait until `id` is registered as a pending permission interaction.
+    async fn wait_pending(config: &AgentConfig, id: &str) {
+        for _ in 0..200 {
+            if let Some(entry) = config.pending_elicitations.lock().await.get(id) {
+                assert!(matches!(entry.kind, InteractionKind::Permission { .. }));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("permission interaction {id} never became pending");
+    }
+
+    async fn answer(config: &AgentConfig, session_id: &str, id: &str, option: &str) {
+        let resolution = crate::elicitation::resolve_in_map(
+            &config.pending_elicitations,
+            Some(session_id),
+            id,
+            "conn-1",
+            None,
+            ElicitationResponse::permission_selected(option),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolution,
+            crate::elicitation::ElicitationResolution::Resolved
+        );
+    }
+
+    async fn pending_is_empty(config: &AgentConfig) -> bool {
+        for _ in 0..200 {
+            if config.pending_elicitations.lock().await.is_empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn waits_without_client_then_answer_decides() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let args = serde_json::json!({"command": "ls"});
+
+        let ensure =
+            ensure_tool_permission(config, &exec, "call-1", "shell", &args, permission_ctx());
+        let driver = async {
+            wait_pending(config, "call-1").await;
+            // No client answers yet: the call must still be waiting, not granted.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                config
+                    .pending_elicitations
+                    .lock()
+                    .await
+                    .contains_key("call-1")
+            );
+            answer(config, &exec.session_id, "call-1", "allow_once").await;
+        };
+        let (granted, ()) = tokio::join!(ensure, driver);
+        assert!(granted.unwrap());
+        assert!(pending_is_empty(config).await);
+    }
+
+    #[tokio::test]
+    async fn reject_option_denies_call() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let args = serde_json::json!({});
+
+        let ensure =
+            ensure_tool_permission(config, &exec, "call-r", "shell", &args, permission_ctx());
+        let driver = async {
+            wait_pending(config, "call-r").await;
+            answer(config, &exec.session_id, "call-r", "reject_once").await;
+        };
+        let (granted, ()) = tokio::join!(ensure, driver);
+        assert!(!granted.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unknown_option_stays_pending() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let args = serde_json::json!({});
+
+        let ensure =
+            ensure_tool_permission(config, &exec, "call-m", "shell", &args, permission_ctx());
+        let driver = async {
+            wait_pending(config, "call-m").await;
+            let err = crate::elicitation::resolve_in_map(
+                &config.pending_elicitations,
+                Some(&exec.session_id),
+                "call-m",
+                "conn-1",
+                None,
+                ElicitationResponse::permission_selected("not-an-option"),
+            )
+            .await;
+            assert!(err.is_err(), "malformed answer must be rejected");
+            assert!(
+                config
+                    .pending_elicitations
+                    .lock()
+                    .await
+                    .contains_key("call-m")
+            );
+            answer(config, &exec.session_id, "call-m", "allow_once").await;
+        };
+        let (granted, ()) = tokio::join!(ensure, driver);
+        assert!(granted.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancel_while_waiting_does_not_grant() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let args = serde_json::json!({});
+
+        let ensure =
+            ensure_tool_permission(config, &exec, "call-c", "shell", &args, permission_ctx());
+        let driver = async {
+            wait_pending(config, "call-c").await;
+            exec.cancellation_token.cancel();
+        };
+        let (granted, ()) = tokio::join!(ensure, driver);
+        assert!(!granted.unwrap());
+        assert!(pending_is_empty(config).await);
+        // A late answer is rejected as not pending.
+        let late = crate::elicitation::resolve_in_map(
+            &config.pending_elicitations,
+            Some(&exec.session_id),
+            "call-c",
+            "conn-1",
+            None,
+            ElicitationResponse::permission_selected("allow_once"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(late, crate::elicitation::ElicitationResolution::NotFound);
+    }
+
+    #[tokio::test]
+    async fn always_allow_is_cached_and_not_prompted_again() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let args = serde_json::json!({});
+
+        let first =
+            ensure_tool_permission(config, &exec, "call-a", "shell", &args, permission_ctx());
+        let driver = async {
+            wait_pending(config, "call-a").await;
+            answer(config, &exec.session_id, "call-a", "allow_always").await;
+        };
+        let (granted, ()) = tokio::join!(first, driver);
+        assert!(granted.unwrap());
+
+        let second =
+            ensure_tool_permission(config, &exec, "call-b", "shell", &args, permission_ctx())
+                .await
+                .unwrap();
+        assert!(second);
+        assert!(config.pending_elicitations.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hook_decision_skips_prompt() {
+        let (fixture, exec) = fixture().await;
+        for (behavior, expected) in [("allow", true), ("deny", false)] {
+            let output = serde_json::json!({
+                "continue": true,
+                "hook_specific_output": {
+                    "hook_event_name": "permission_request",
+                    "decision": {"behavior": behavior, "message": "policy"}
+                }
+            })
+            .to_string();
+            let hooks = Hooks::new(
+                serde_json::from_value::<HooksConfig>(serde_json::json!({
+                    "enabled": true,
+                    "permission_request": [{"matcher": "^shell$", "hooks": [{
+                        "type": "command",
+                        "command": format!("printf '%s' '{output}'"),
+                        "timeout_sec": 5
+                    }]}]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let config = AgentConfigBuilder::from_provider(
+                fixture.storage.clone(),
+                fixture.config.provider.clone(),
+                fixture.storage.event_journal(),
+            )
+            .with_hooks(hooks)
+            .build();
+            let args = serde_json::json!({});
+            let granted = tokio::time::timeout(
+                Duration::from_secs(10),
+                ensure_tool_permission(&config, &exec, "call-h", "shell", &args, permission_ctx()),
+            )
+            .await
+            .expect("hook decision must not wait for a user")
+            .unwrap();
+            assert_eq!(granted, expected, "behavior={behavior}");
+            assert!(config.pending_elicitations.lock().await.is_empty());
         }
     }
 }

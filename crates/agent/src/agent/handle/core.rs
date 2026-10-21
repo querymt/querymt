@@ -246,12 +246,12 @@ impl LocalAgentHandle {
         self.config.workspace_manager_actor()
     }
 
-    /// Sets the process-wide client bridge used by the single-client stdio transport.
+    /// Sets the process-wide outbound channel used for agent-wide extension
+    /// notifications (schedules, control) by the single-client stdio transport.
     pub async fn set_bridge(&self, bridge: ClientBridgeSender) {
         if let Ok(mut handle) = self.bridge.lock() {
-            *handle = Some(bridge.clone());
+            *handle = Some(bridge);
         }
-        self.registry.lock().await.set_bridge(bridge);
     }
 
     pub fn subscribe_ext_notifications(&self) -> broadcast::Receiver<ExtNotification> {
@@ -262,23 +262,23 @@ impl LocalAgentHandle {
         let _ = self.ext_notifications.send(notification);
     }
 
-    /// Assigns the active ACP bridge to one materialized session.
+    /// Records the active ACP connection for one materialized session.
+    ///
+    /// The route is transport-owned state used only for the editor workspace
+    /// query capability of locally hosted sessions; the session actor itself
+    /// holds no bridge.
     pub async fn set_session_bridge(
         &self,
         session_id: &str,
         bridge: ClientBridgeSender,
     ) -> Result<(), Error> {
-        let session_ref = self.session_ref_for_agent_session(session_id).await?;
-        session_ref
-            .set_bridge(bridge.clone())
-            .await
-            .map_err(Error::from)?;
+        // Fail fast for unknown sessions; the route itself holds no session ref.
+        self.session_ref_for_agent_session(session_id).await?;
         if let Ok(mut bridges) = self.config.session_bridges.lock() {
             bridges.insert(
                 session_id.to_string(),
                 crate::agent::agent_config::SessionBridgeRoute {
                     bridge: bridge.clone(),
-                    session_ref: session_ref.clone(),
                 },
             );
         }
@@ -288,125 +288,60 @@ impl LocalAgentHandle {
         {
             bridges.insert(
                 session_id.to_string(),
-                crate::agent::agent_config::SessionBridgeRoute {
-                    bridge,
-                    session_ref,
-                },
+                crate::agent::agent_config::SessionBridgeRoute { bridge },
             );
         }
         Ok(())
     }
 
     pub async fn clear_session_bridge(&self, session_id: &str, connection_id: Arc<str>) -> bool {
-        let session_ref = match self.session_ref_for_agent_session(session_id).await {
-            Ok(session_ref) => Some(session_ref),
-            Err(_) => self
-                .find_session_bridge_route(session_id)
-                .await
-                .map(|route| route.session_ref),
-        };
-        let Some(session_ref) = session_ref else {
-            return false;
-        };
-        match session_ref.clear_bridge(connection_id.clone()).await {
-            Ok(true) => {
-                self.remove_session_bridge_routes(session_id, &connection_id)
-                    .await;
-                true
-            }
-            Ok(false) => false,
-            Err(err) => {
-                log::debug!("Failed to clear ACP bridge for session {session_id}: {err}");
-                self.remove_session_bridge_routes(session_id, &connection_id)
-                    .await;
-                true
-            }
-        }
+        self.remove_session_bridge_routes(session_id, &connection_id)
+            .await
     }
 
-    async fn find_session_bridge_route(
+    /// Removes every route for `session_id` that belongs to `connection_id`.
+    /// Returns whether any route was removed.
+    async fn remove_session_bridge_routes(
         &self,
         session_id: &str,
-    ) -> Option<crate::agent::agent_config::SessionBridgeRoute> {
-        if let Some(route) = Self::find_session_bridge_route_in_handle(self, session_id) {
-            return Some(route);
-        }
+        connection_id: &Arc<str>,
+    ) -> bool {
+        let mut removed =
+            Self::remove_session_bridge_routes_from_handle(self, session_id, connection_id);
         if let Some(profiles) = self.profiles() {
             for runtime in profiles.materialized_runtimes().await {
-                if let Some(route) =
-                    Self::find_session_bridge_route_in_handle(&runtime.agent().handle(), session_id)
-                {
-                    return Some(route);
-                }
-            }
-        }
-        None
-    }
-
-    fn find_session_bridge_route_in_handle(
-        handle: &LocalAgentHandle,
-        session_id: &str,
-    ) -> Option<crate::agent::agent_config::SessionBridgeRoute> {
-        if let Some(route) = handle
-            .config
-            .session_bridges
-            .lock()
-            .ok()
-            .and_then(|bridges| bridges.get(session_id).cloned())
-        {
-            return Some(route);
-        }
-        handle
-            .config
-            .agent_registry
-            .list_agents()
-            .into_iter()
-            .filter_map(|target| handle.config.agent_registry.get_handle(&target.id))
-            .filter_map(|handle| {
-                handle
-                    .as_any()
-                    .downcast_ref::<LocalAgentHandle>()
-                    .and_then(|local_handle| {
-                        local_handle
-                            .config
-                            .session_bridges
-                            .lock()
-                            .ok()
-                            .and_then(|bridges| bridges.get(session_id).cloned())
-                    })
-            })
-            .next()
-    }
-
-    async fn remove_session_bridge_routes(&self, session_id: &str, connection_id: &Arc<str>) {
-        Self::remove_session_bridge_routes_from_handle(self, session_id, connection_id);
-        if let Some(profiles) = self.profiles() {
-            for runtime in profiles.materialized_runtimes().await {
-                Self::remove_session_bridge_routes_from_handle(
+                removed |= Self::remove_session_bridge_routes_from_handle(
                     &runtime.agent().handle(),
                     session_id,
                     connection_id,
                 );
             }
         }
+        removed
     }
 
     fn remove_session_bridge_routes_from_handle(
         handle: &LocalAgentHandle,
         session_id: &str,
         connection_id: &Arc<str>,
-    ) {
-        Self::remove_session_bridge(&handle.config, session_id, connection_id);
+    ) -> bool {
+        let mut removed = Self::remove_session_bridge(&handle.config, session_id, connection_id);
         for target in handle.config.agent_registry.list_agents() {
             if let Some(agent_handle) = handle.config.agent_registry.get_handle(&target.id)
                 && let Some(local_handle) = agent_handle.as_any().downcast_ref::<LocalAgentHandle>()
             {
-                Self::remove_session_bridge(&local_handle.config, session_id, connection_id);
+                removed |=
+                    Self::remove_session_bridge(&local_handle.config, session_id, connection_id);
             }
         }
+        removed
     }
 
-    fn remove_session_bridge(config: &AgentConfig, session_id: &str, connection_id: &Arc<str>) {
+    fn remove_session_bridge(
+        config: &AgentConfig,
+        session_id: &str,
+        connection_id: &Arc<str>,
+    ) -> bool {
         if let Ok(mut bridges) = config.session_bridges.lock()
             && bridges
                 .get(session_id)
@@ -414,7 +349,9 @@ impl LocalAgentHandle {
                 == Some(connection_id.as_ref())
         {
             bridges.remove(session_id);
+            return true;
         }
+        false
     }
 
     /// Emits an event for external observers.
@@ -551,14 +488,9 @@ impl LocalAgentHandle {
                 let mut registry = profile_handle.registry_lock().await;
                 registry.register_prepared_session(&prepared).await
             };
-            let bridge = profile_handle
-                .bridge
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone());
             profile_handle
                 .session_materializer
-                .finalize_session(&prepared, bridge)
+                .finalize_session(&prepared)
                 .await?;
             profiles
                 .bind_session_to_runtime(session_id.clone(), &runtime)
@@ -612,11 +544,7 @@ impl LocalAgentHandle {
         };
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        // Pass the bridge for setup outside the lock
-        let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
-        self.session_materializer
-            .finalize_session(&prepared, bridge)
-            .await?;
+        self.session_materializer.finalize_session(&prepared).await?;
 
         // Get current per-session settings for the response.
         let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
@@ -770,14 +698,9 @@ impl LocalAgentHandle {
                             let mut registry = profile_handle.registry_lock().await;
                             registry.register_prepared_session(&prepared).await
                         };
-                        let bridge = profile_handle
-                            .bridge
-                            .lock()
-                            .ok()
-                            .and_then(|guard| guard.clone());
                         profile_handle
                             .session_materializer
-                            .finalize_session(&prepared, bridge)
+                            .finalize_session(&prepared)
                             .await?;
                         session_ref
                     }
@@ -857,12 +780,8 @@ impl LocalAgentHandle {
         };
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        // Pass the bridge for setup outside the lock
         if let Some(prepared) = prepared.as_ref() {
-            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
-            self.session_materializer
-                .finalize_session(prepared, bridge)
-                .await?;
+            self.session_materializer.finalize_session(prepared).await?;
         }
 
         // Get current per-session settings for the response.
