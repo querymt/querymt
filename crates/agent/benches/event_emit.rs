@@ -9,9 +9,9 @@
 //!
 //! Variants
 //! - `baseline`    : `AgentConfig::emit_event` as it exists today
-//!                   (one spawned task per durable event, ephemeral inline).
+//!   (one spawned task per durable event, ephemeral inline).
 //! - `per_session` : one ordered writer task per session; durable and
-//!                   ephemeral events share the queue; supports `drain`.
+//!   ephemeral events share the queue; supports `drain`.
 //! - `global`      : a single ordered writer task for all sessions.
 //!
 //! Workload per session: for every durable event, `DELTAS_PER_DURABLE`
@@ -166,6 +166,9 @@ fn parse_event(envelope: &EventEnvelope) -> Option<(usize, usize, bool)> {
 
 // ── Candidate ordered writers (benchmark-local) ─────────────────────────────
 
+/// `AgentEventKind` is large, but boxing it here would add an allocation to
+/// the exact caller-side emit cost this benchmark measures.
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     Event(String, AgentEventKind),
     Drain(String, oneshot::Sender<i64>),
