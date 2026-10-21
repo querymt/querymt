@@ -236,6 +236,22 @@ remote_msg_impl!(
     REG_GET_REASONING_EFFORT
 );
 
+remote_msg_impl!(
+    messages::ListPendingInteractions,
+    "querymt::ListPendingInteractions",
+    REG_LIST_PENDING_INTERACTIONS
+);
+remote_msg_impl!(
+    messages::ClaimInteractionDelivery,
+    "querymt::ClaimInteractionDelivery",
+    REG_CLAIM_INTERACTION_DELIVERY
+);
+remote_msg_impl!(
+    messages::ResolveInteraction,
+    "querymt::ResolveInteraction",
+    REG_RESOLVE_INTERACTION
+);
+
 // ── EventRelayActor RemoteActor ──────────────────────────────────────────
 
 impl kameo::remote::RemoteActor for EventRelayActor {

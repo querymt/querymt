@@ -1371,6 +1371,76 @@ impl Message<ClearBridge> for SessionActor {
     }
 }
 
+impl Message<ListPendingInteractions> for SessionActor {
+    type Reply = Result<Vec<crate::elicitation::PendingElicitationSnapshot>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: ListPendingInteractions,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let map = &self.config.pending_elicitations;
+        if let Some(authority) = msg.assign_authority.as_deref() {
+            crate::elicitation::assign_authority_in_map(map, &self.session_id, authority).await;
+        }
+        Ok(crate::elicitation::snapshot_pending_elicitations(map)
+            .await
+            .into_iter()
+            .filter(|snapshot| snapshot.session_id == self.session_id)
+            .collect())
+    }
+}
+
+impl Message<ClaimInteractionDelivery> for SessionActor {
+    type Reply = Result<Vec<crate::elicitation::ClaimedElicitationDelivery>, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: ClaimInteractionDelivery,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if msg.authority.is_none() && msg.interaction_id.is_none() {
+            return Err(AgentError::InvalidInteractionResponse {
+                detail: "claim requires an interaction id or an authority".to_string(),
+            });
+        }
+        Ok(crate::elicitation::claim_deliveries_in_map(
+            &self.config.pending_elicitations,
+            &self.session_id,
+            msg.interaction_id.as_deref(),
+            msg.authority.as_deref(),
+            &msg.connection_id,
+        )
+        .await)
+    }
+}
+
+impl Message<ResolveInteraction> for SessionActor {
+    type Reply = Result<crate::elicitation::ElicitationResolution, AgentError>;
+
+    async fn handle(
+        &mut self,
+        msg: ResolveInteraction,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        crate::elicitation::resolve_in_map(
+            &self.config.pending_elicitations,
+            Some(&self.session_id),
+            &msg.interaction_id,
+            &msg.connection_id,
+            msg.delivery_generation,
+            msg.response,
+        )
+        .await
+        .map_err(|error| AgentError::InvalidInteractionResponse {
+            detail: match error.data {
+                Some(serde_json::Value::String(data)) => data,
+                _ => error.message,
+            },
+        })
+    }
+}
+
 impl Message<Shutdown> for SessionActor {
     type Reply = ();
 
@@ -4170,6 +4240,121 @@ mod tests {
             })
             .await
             .expect("remote session should accept reasoning effort update");
+    }
+
+    async fn register_test_interaction(
+        f: &ActorFixture,
+        id: &str,
+        session_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<crate::elicitation::ElicitationResponse> {
+        let (tx, rx) = oneshot::channel();
+        crate::elicitation::register_pending_elicitation(
+            &f.config.pending_elicitations,
+            id.to_string(),
+            crate::elicitation::PendingElicitationRegistration {
+                session_id: session_id.to_string(),
+                form: crate::elicitation::PendingElicitationForm {
+                    message: "pick".to_string(),
+                    requested_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"choice": {"type": "string"}},
+                        "required": ["choice"]
+                    }),
+                    source: "test".to_string(),
+                },
+                owner_authority: None,
+                run_id: None,
+                tool_call_id: None,
+            },
+            tx,
+        )
+        .await;
+        rx
+    }
+
+    fn accept(content: serde_json::Value) -> crate::elicitation::ElicitationResponse {
+        crate::elicitation::ElicitationResponse {
+            action: crate::elicitation::ElicitationAction::Accept,
+            content: Some(content),
+        }
+    }
+
+    #[tokio::test]
+    async fn interaction_messages_claim_generation_and_single_winner_resolve() {
+        use crate::elicitation::ElicitationResolution;
+        let f = ActorFixture::new().await;
+        let rx = register_test_interaction(&f, "q1", "test-session").await;
+        // Entries of other sessions are never listed or claimed by this actor.
+        let _other = register_test_interaction(&f, "q-other", "other-session").await;
+
+        let listed = f
+            .actor_ref
+            .ask(ListPendingInteractions {
+                assign_authority: Some("auth".to_string()),
+            })
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].elicitation_id, "q1");
+        assert_eq!(listed[0].owner_authority.as_deref(), Some("auth"));
+
+        let claim = |connection: &str| ClaimInteractionDelivery {
+            interaction_id: Some("q1".to_string()),
+            connection_id: connection.to_string(),
+            authority: Some("auth".to_string()),
+        };
+        let first = f.actor_ref.ask(claim("conn-a")).await.expect("claim a");
+        assert_eq!(first[0].delivery_generation, 1);
+        let second = f.actor_ref.ask(claim("conn-b")).await.expect("claim b");
+        assert_eq!(second[0].delivery_generation, 2);
+
+        let resolve =
+            |connection: &str, generation: u64, content: serde_json::Value| ResolveInteraction {
+                interaction_id: "q1".to_string(),
+                connection_id: connection.to_string(),
+                delivery_generation: Some(generation),
+                response: accept(content),
+            };
+        let ok = serde_json::json!({"choice": "x"});
+        // Stale generation and wrong connection do not resolve.
+        for stale in [
+            resolve("conn-a", 1, ok.clone()),
+            resolve("conn-a", 2, ok.clone()),
+            resolve("conn-b", 1, ok.clone()),
+        ] {
+            assert_eq!(
+                f.actor_ref.ask(stale).await.expect("stale"),
+                ElicitationResolution::StaleDelivery
+            );
+        }
+        // Invalid form content is rejected and the question stays pending.
+        let invalid = f
+            .actor_ref
+            .ask(resolve("conn-b", 2, serde_json::json!({})))
+            .await;
+        assert!(matches!(
+            invalid,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::InvalidInteractionResponse { .. }
+            ))
+        ));
+
+        assert_eq!(
+            f.actor_ref
+                .ask(resolve("conn-b", 2, ok.clone()))
+                .await
+                .expect("resolve"),
+            ElicitationResolution::Resolved
+        );
+        assert_eq!(rx.await.expect("waiter resumed").content, Some(ok.clone()));
+        // A second answer is not pending any more.
+        assert_eq!(
+            f.actor_ref
+                .ask(resolve("conn-b", 2, ok))
+                .await
+                .expect("late"),
+            ElicitationResolution::NotFound
+        );
     }
 
     #[tokio::test]

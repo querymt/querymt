@@ -441,6 +441,53 @@ pub struct SetPlanningContext {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+//  Session-owned interactions (elicitation / permission)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Snapshot the pending interactions owned by this session.
+///
+/// Reply: `Result<Vec<PendingElicitationSnapshot>, AgentError>`
+///
+/// When `assign_authority` is set, entries without an owner authority adopt it
+/// before the snapshot is taken (recovery authority issue).
+#[derive(Serialize, Deserialize)]
+pub struct ListPendingInteractions {
+    #[serde(default)]
+    pub assign_authority: Option<String>,
+}
+
+/// Claim delivery of pending interactions for a connection, bumping the
+/// delivery generation.
+///
+/// Reply: `Result<Vec<ClaimedElicitationDelivery>, AgentError>`
+///
+/// With `authority` the entry's owner authority must match; without it
+/// `interaction_id` is required (live claim by the connection that is
+/// receiving the request event).
+#[derive(Serialize, Deserialize)]
+pub struct ClaimInteractionDelivery {
+    pub interaction_id: Option<String>,
+    pub connection_id: String,
+    pub authority: Option<String>,
+}
+
+/// Resolve a pending interaction with a user answer.
+///
+/// Reply: `Result<ElicitationResolution, AgentError>`
+///
+/// `delivery_generation: Some(_)` requires the exact claimed delivery;
+/// `None` is the unclaimed path for connections without recovery authority.
+/// Invalid answers return `AgentError::InvalidInteractionResponse` and leave
+/// the interaction pending.
+#[derive(Serialize, Deserialize)]
+pub struct ResolveInteraction {
+    pub interaction_id: String,
+    pub connection_id: String,
+    pub delivery_generation: Option<u64>,
+    pub response: crate::elicitation::ElicitationResponse,
+}
+
+// ══════════════════════════════════════════════════════════════════════════
 //  File Proxy (remote file index / file reads)
 // ══════════════════════════════════════════════════════════════════════════
 

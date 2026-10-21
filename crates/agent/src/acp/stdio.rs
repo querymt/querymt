@@ -478,33 +478,36 @@ fn spawn_event_bridge_forwarder(
                                     }
                                 };
 
-                                match crate::elicitation::take_pending_elicitation_sender_for_session(
+                                match crate::elicitation::resolve_elicitation_from_connection(
                                     &agent,
-                                    &session_id,
+                                    Some(&session_id),
                                     &elicitation_id,
+                                    "stdio",
+                                    response,
                                 )
                                 .await
                                 {
-                                    Some(sender) => {
-                                        if sender.send(response).is_err() {
-                                            log::warn!(
-                                                "Elicitation response receiver dropped: session_id={} elicitation_id={}",
-                                                session_id,
-                                                elicitation_id
-                                            );
-                                        } else {
-                                            log::debug!(
-                                                "Elicitation response delivered: session_id={} elicitation_id={}",
-                                                session_id,
-                                                elicitation_id
-                                            );
-                                        }
-                                    }
-                                    None => {
-                                        log::warn!(
-                                            "No pending elicitation found: session_id={} elicitation_id={}",
+                                    Ok(crate::elicitation::ElicitationResolution::Resolved) => {
+                                        log::debug!(
+                                            "Elicitation response delivered: session_id={} elicitation_id={}",
                                             session_id,
                                             elicitation_id
+                                        );
+                                    }
+                                    Ok(resolution) => {
+                                        log::warn!(
+                                            "Elicitation response not applied ({:?}): session_id={} elicitation_id={}",
+                                            resolution,
+                                            session_id,
+                                            elicitation_id
+                                        );
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Elicitation response rejected: session_id={} elicitation_id={} error={}",
+                                            session_id,
+                                            elicitation_id,
+                                            error.message
                                         );
                                     }
                                 }
