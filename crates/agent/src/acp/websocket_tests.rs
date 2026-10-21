@@ -1237,25 +1237,16 @@ async fn recovered_delivery_uses_fresh_id_and_rejects_old_invalid_and_duplicate_
             .contains_key("stable-question")
     );
 
-    let retry_claim = crate::elicitation::claim_live_elicitation_delivery(
-        fixture.handle.as_ref(),
-        "off-screen-session",
-        "stable-question",
-        "new",
-    )
-    .await
-    .unwrap();
-    deliver_claimed_websocket_elicitation(
-        fixture.handle.clone(),
-        recovery,
-        retry_claim,
-        connection_state_for_test("new", new_tx, new_pending.clone(), counter),
-    )
-    .await
-    .unwrap();
+    // The agent re-delivers the still-pending question automatically with a
+    // fresh JSON-RPC id and the same stable elicitation id.
     let retry_request: serde_json::Value =
         serde_json::from_str(&new_rx.recv().await.unwrap()).unwrap();
+    assert_eq!(retry_request["method"], "elicitation/create");
     assert_ne!(retry_request["id"], new_request["id"]);
+    assert_eq!(
+        retry_request["params"]["_meta"]["querymt"]["elicitation_id"],
+        "stable-question"
+    );
     assert!(
         route_websocket_response(
             &new_pending,

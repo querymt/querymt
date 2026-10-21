@@ -566,6 +566,51 @@ pub async fn resolve_elicitation_from_connection(
     Ok(ElicitationResolution::NotFound)
 }
 
+/// Whether the form advertises free-form ("custom") answers in addition to its
+/// listed options. Mirrors the client-side rule used to render the custom field.
+fn form_allows_custom(form: &PendingElicitationForm) -> bool {
+    if form.source == "builtin:question" {
+        return true;
+    }
+    let Some(meta) = form
+        .requested_schema
+        .get("_meta")
+        .and_then(|m| m.get("querymt"))
+    else {
+        return false;
+    };
+    meta.get("allow_custom").and_then(|v| v.as_bool()) == Some(true)
+        || meta.get("allowCustom").and_then(|v| v.as_bool()) == Some(true)
+}
+
+/// Copy of `schema` with per-property option constraints (`oneOf`, `anyOf`,
+/// `enum`, `const`, and the same on array `items`) removed. Types, `required`
+/// and object structure are preserved so malformed payloads are still rejected.
+fn relax_schema_for_custom(schema: &serde_json::Value) -> serde_json::Value {
+    fn strip_options(property: &mut serde_json::Value) {
+        let Some(obj) = property.as_object_mut() else {
+            return;
+        };
+        for key in ["oneOf", "anyOf", "enum", "const"] {
+            obj.remove(key);
+        }
+        if let Some(items) = obj.get_mut("items") {
+            strip_options(items);
+        }
+    }
+
+    let mut relaxed = schema.clone();
+    if let Some(properties) = relaxed
+        .get_mut("properties")
+        .and_then(|p| p.as_object_mut())
+    {
+        for property in properties.values_mut() {
+            strip_options(property);
+        }
+    }
+    relaxed
+}
+
 fn validate_elicitation_response(
     entry: &PendingElicitation,
     response: &ElicitationResponse,
@@ -577,7 +622,14 @@ fn validate_elicitation_response(
         agent_client_protocol::Error::invalid_params()
             .data("Accepted elicitation response requires content")
     })?;
-    let validator = jsonschema::validator_for(&entry.form.requested_schema).map_err(|err| {
+    let relaxed;
+    let schema = if form_allows_custom(&entry.form) {
+        relaxed = relax_schema_for_custom(&entry.form.requested_schema);
+        &relaxed
+    } else {
+        &entry.form.requested_schema
+    };
+    let validator = jsonschema::validator_for(schema).map_err(|err| {
         agent_client_protocol::Error::invalid_params()
             .data(format!("Invalid elicitation schema: {err}"))
     })?;
@@ -1389,6 +1441,168 @@ mod tests {
         assert_eq!(
             response.content,
             Some(serde_json::json!({"selection": "allow_once"}))
+        );
+    }
+
+    fn question_entry(schema: serde_json::Value, source: &str) -> PendingElicitation {
+        let (tx, _rx) = oneshot::channel();
+        let mut entry = PendingElicitation::for_test("s", tx);
+        entry.form = PendingElicitationForm {
+            message: "q".to_string(),
+            requested_schema: schema,
+            source: source.to_string(),
+        };
+        entry
+    }
+
+    fn accept(content: serde_json::Value) -> ElicitationResponse {
+        ElicitationResponse {
+            action: ElicitationAction::Accept,
+            content: Some(content),
+        }
+    }
+
+    fn single_choice_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"selection": {
+                "type": "string",
+                "oneOf": [{"const": "A", "title": "A"}, {"const": "B", "title": "B"}]
+            }},
+            "required": ["selection"]
+        })
+    }
+
+    fn multi_choice_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"selection": {
+                "type": "array",
+                "items": {"anyOf": [{"const": "A", "title": "A"}, {"const": "B", "title": "B"}]}
+            }},
+            "required": ["selection"]
+        })
+    }
+
+    #[test]
+    fn builtin_question_accepts_custom_single_answer() {
+        let entry = question_entry(single_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": "A"})))
+                .is_ok()
+        );
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "something else entirely"}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn builtin_question_accepts_custom_multi_answer() {
+        let entry = question_entry(multi_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": ["custom"]}))
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn custom_forms_still_reject_missing_required_and_wrong_types() {
+        let entry = question_entry(single_choice_schema(), "builtin:question");
+        assert!(validate_elicitation_response(&entry, &accept(serde_json::json!({}))).is_err());
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": 42})))
+                .is_err()
+        );
+        let multi = question_entry(multi_choice_schema(), "builtin:question");
+        assert!(
+            validate_elicitation_response(&multi, &accept(serde_json::json!({"selection": "A"})))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn non_custom_forms_keep_strict_option_validation() {
+        let entry = question_entry(single_choice_schema(), "mcp:server");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "free"}))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_elicitation_response(&entry, &accept(serde_json::json!({"selection": "A"})))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_question_answer_resolves_the_waiting_tool() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let map = fixture.handle.pending_elicitations();
+        let (tx, rx) = oneshot::channel();
+        register_pending_elicitation(
+            &map,
+            "question-custom".to_string(),
+            PendingElicitationRegistration {
+                session_id: "s1".to_string(),
+                form: PendingElicitationForm {
+                    message: "Pick".to_string(),
+                    requested_schema: single_choice_schema(),
+                    source: "builtin:question".to_string(),
+                },
+                owner_authority: None,
+                run_id: None,
+                tool_call_id: None,
+            },
+            tx,
+        )
+        .await;
+        let claim = claim_live_elicitation_delivery(
+            fixture.handle.as_ref(),
+            "s1",
+            "question-custom",
+            "conn",
+        )
+        .await
+        .expect("claim");
+
+        let resolution = resolve_claimed_elicitation(
+            fixture.handle.as_ref(),
+            "s1",
+            "question-custom",
+            "conn",
+            claim.delivery_generation,
+            accept(serde_json::json!({"selection": "my own words"})),
+        )
+        .await
+        .expect("custom answer must not be rejected");
+        assert_eq!(resolution, ElicitationResolution::Resolved);
+        assert_eq!(
+            rx.await.expect("tool is released").content,
+            Some(serde_json::json!({"selection": "my own words"}))
+        );
+        assert!(map.lock().await.is_empty());
+    }
+
+    #[test]
+    fn explicit_allow_custom_meta_relaxes_validation() {
+        let mut schema = single_choice_schema();
+        schema["_meta"] = serde_json::json!({"querymt": {"allow_custom": true}});
+        let entry = question_entry(schema, "mcp:server");
+        assert!(
+            validate_elicitation_response(
+                &entry,
+                &accept(serde_json::json!({"selection": "free"}))
+            )
+            .is_ok()
         );
     }
 }

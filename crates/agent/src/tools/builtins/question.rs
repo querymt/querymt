@@ -55,7 +55,7 @@ impl Tool for QuestionTool {
             tool_type: "function".to_string(),
             function: FunctionTool {
                 name: self.name().to_string(),
-                description: "Ask the user one or more structured questions and wait for answers. This tool blocks until the user responds. Use this when you need to gather user preferences, requirements, or decisions during execution."
+                description: "Ask the user one or more structured questions and wait for answers. This tool blocks until the user responds. Use this when you need to gather user preferences, requirements, or decisions during execution. The user is not limited to the listed options: they may reply with free-form text instead of picking a choice."
                     .to_string(),
                 parameters: json!({
                     "type": "object",

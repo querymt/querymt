@@ -431,6 +431,11 @@ async fn send_websocket_ext_notification(
     tx.send(json).await.map_err(|_| ())
 }
 
+/// Maximum number of times a question is re-delivered on the same connection
+/// after the client's answer failed schema validation. Bounds the loop for a
+/// client that keeps submitting invalid content.
+const MAX_VALIDATION_REDELIVERIES: u32 = 5;
+
 pub(crate) async fn deliver_claimed_websocket_elicitation(
     agent: Arc<crate::agent::LocalAgentHandle>,
     recovery: crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
@@ -474,88 +479,137 @@ pub(crate) async fn deliver_claimed_websocket_elicitation(
     .await?;
 
     tokio::spawn(async move {
-        let response =
-            wait_for_websocket_elicitation_response(pending, pending_requests, connection_cancel)
-                .await
-                .and_then(convert_elicitation_response_value);
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                log::warn!(
-                    "WebSocket elicitation delivery ended without a user response: session_id={} elicitation_id={} error={}",
-                    claim.session_id,
-                    claim.elicitation_id,
-                    error
-                );
-                return;
-            }
-        };
-        let outcome = match response.action {
-            crate::elicitation::ElicitationAction::Accept => "accept",
-            crate::elicitation::ElicitationAction::Decline => "decline",
-            crate::elicitation::ElicitationAction::Cancel => "cancel",
-        };
-        match crate::elicitation::resolve_claimed_elicitation(
-            agent.as_ref(),
-            &claim.session_id,
-            &claim.elicitation_id,
-            &connection_id,
-            claim.delivery_generation,
-            response,
-        )
-        .await
-        {
-            Ok(crate::elicitation::ElicitationResolution::Resolved) => {
-                recovery
-                    .retire_session_if_idle(&claim.session_id, agent.as_ref())
+        let mut claim = claim;
+        let mut pending = pending;
+        let mut redeliveries_left = MAX_VALIDATION_REDELIVERIES;
+        loop {
+            let response = wait_for_websocket_elicitation_response(
+                pending,
+                pending_requests.clone(),
+                connection_cancel.clone(),
+            )
+            .await
+            .and_then(convert_elicitation_response_value);
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    log::warn!(
+                        "WebSocket elicitation delivery ended without a user response: session_id={} elicitation_id={} error={}",
+                        claim.session_id,
+                        claim.elicitation_id,
+                        error
+                    );
+                    return;
+                }
+            };
+            let outcome = match response.action {
+                crate::elicitation::ElicitationAction::Accept => "accept",
+                crate::elicitation::ElicitationAction::Decline => "decline",
+                crate::elicitation::ElicitationAction::Cancel => "cancel",
+            };
+            let terminal_outcome = match crate::elicitation::resolve_claimed_elicitation(
+                agent.as_ref(),
+                &claim.session_id,
+                &claim.elicitation_id,
+                &connection_id,
+                claim.delivery_generation,
+                response,
+            )
+            .await
+            {
+                Ok(crate::elicitation::ElicitationResolution::Resolved) => {
+                    recovery
+                        .retire_session_if_idle(&claim.session_id, agent.as_ref())
+                        .await;
+                    outcome
+                }
+                Ok(crate::elicitation::ElicitationResolution::StaleDelivery) => "superseded",
+                Ok(crate::elicitation::ElicitationResolution::NotFound) => "completed_elsewhere",
+                Err(error) => {
+                    log::warn!(
+                        "WebSocket elicitation response failed validation: session_id={} elicitation_id={} error={}",
+                        claim.session_id,
+                        claim.elicitation_id,
+                        error.message
+                    );
+                    let _ = send_websocket_notification(
+                        &tx,
+                        crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION,
+                        &serde_json::json!({
+                            "session_id": claim.session_id,
+                            "elicitation_id": claim.elicitation_id,
+                            "message": error.message,
+                        }),
+                    )
                     .await;
-                let _ = send_websocket_notification(
-                    &tx,
-                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
-                    &serde_json::json!({
-                        "session_id": claim.session_id,
-                        "elicitation_id": claim.elicitation_id,
-                        "outcome": outcome,
-                    }),
-                )
-                .await;
-            }
-            Ok(crate::elicitation::ElicitationResolution::StaleDelivery) => {
-                let _ = send_websocket_notification(
-                    &tx,
-                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
-                    &serde_json::json!({
-                        "session_id": claim.session_id,
-                        "elicitation_id": claim.elicitation_id,
-                        "outcome": "superseded",
-                    }),
-                )
-                .await;
-            }
-            Ok(crate::elicitation::ElicitationResolution::NotFound) => {
-                let _ = send_websocket_notification(
-                    &tx,
-                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
-                    &serde_json::json!({
-                        "session_id": claim.session_id,
-                        "elicitation_id": claim.elicitation_id,
-                        "outcome": "completed_elsewhere",
-                    }),
-                )
-                .await;
-            }
-            Err(error) => {
-                let _ = send_websocket_notification(
-                    &tx,
-                    crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION,
-                    &serde_json::json!({
-                        "session_id": claim.session_id,
-                        "elicitation_id": claim.elicitation_id,
-                        "message": error.message,
-                    }),
-                )
-                .await;
-            }
+
+                    // The question is still pending agent-side. Re-deliver it
+                    // (fresh JSON-RPC id, bumped generation, same stable
+                    // elicitation id) so the user can correct the answer
+                    // instead of leaving the tool waiting forever.
+                    if redeliveries_left == 0 {
+                        return;
+                    }
+                    redeliveries_left -= 1;
+                    let Some(next_claim) = recovery
+                        .claim_live_delivery(
+                            &connection_id,
+                            &claim.session_id,
+                            &claim.elicitation_id,
+                            agent.as_ref(),
+                        )
+                        .await
+                    else {
+                        return;
+                    };
+                    let request = match create_elicitation_request(
+                        next_claim.elicitation_id.clone(),
+                        next_claim.session_id.clone(),
+                        next_claim.form.message.clone(),
+                        next_claim.form.requested_schema.clone(),
+                        next_claim.form.source.clone(),
+                    ) {
+                        Ok(request) => request,
+                        Err(_) => return,
+                    };
+                    match send_websocket_request(
+                        &tx,
+                        &pending_requests,
+                        &request_counter,
+                        &connection_id,
+                        "elicitation/create",
+                        &request,
+                    )
+                    .await
+                    {
+                        Ok(next_pending) => {
+                            claim = next_claim;
+                            pending = next_pending;
+                            continue;
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "Failed to re-deliver elicitation after validation failure: session_id={} elicitation_id={} error={}",
+                                next_claim.session_id,
+                                next_claim.elicitation_id,
+                                error
+                            );
+                            return;
+                        }
+                    }
+                }
+            };
+            let _ = send_websocket_notification(
+                &tx,
+                crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION,
+                &serde_json::json!({
+                    "session_id": claim.session_id,
+                    "elicitation_id": claim.elicitation_id,
+                    "outcome": terminal_outcome,
+                }),
+            )
+            .await;
+            return;
         }
     });
     Ok(())
