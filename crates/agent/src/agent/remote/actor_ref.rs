@@ -48,7 +48,6 @@ pub enum SessionActorRef {
 
 // ── Constructors ─────────────────────────────────────────────────────────
 
-#[cfg(any(feature = "remote", test))]
 /// Map a remote send failure of an interaction message.
 ///
 /// kameo answers `UnknownMessage` when the remote actor has no handler
@@ -106,6 +105,7 @@ mod interaction_error_tests {
     }
 }
 
+#[cfg(any(feature = "remote", test))]
 async fn collect_event_stream_pages<F, Fut>(
     mut fetch: F,
 ) -> Result<Vec<crate::events::AgentEvent>, AgentError>

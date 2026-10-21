@@ -700,8 +700,16 @@ pub async fn pending_sessions_for_authority(
                 .map(|entry| entry.session_id.clone()),
         );
     }
-    for (session_id, session_ref) in remote_session_refs(agent).await {
-        match session_ref.list_pending_interactions(None).await {
+    let remote_results =
+        futures_util::future::join_all(remote_session_refs(agent).await.into_iter().map(
+            |(session_id, session_ref)| async move {
+                let result = session_ref.list_pending_interactions(None).await;
+                (session_id, result)
+            },
+        ))
+        .await;
+    for (session_id, result) in remote_results {
+        match result {
             Ok(pending) => {
                 if pending
                     .iter()
@@ -944,7 +952,8 @@ async fn resolve_interaction_routed(
         }
     }
     if session_id.is_none() {
-        for (_, session_ref) in remote_session_refs(agent).await {
+        let mut last_error = None;
+        for (remote_session_id, session_ref) in remote_session_refs(agent).await {
             match session_ref
                 .resolve_interaction(
                     elicitation_id.to_string(),
@@ -956,8 +965,23 @@ async fn resolve_interaction_routed(
             {
                 Ok(ElicitationResolution::NotFound) => continue,
                 Ok(resolved) => return Ok(resolved),
+                Err(error)
+                    if error.transport_failure().is_some()
+                        || matches!(
+                            error,
+                            crate::error::AgentError::RemoteNodeUpgradeRequired { .. }
+                        ) =>
+                {
+                    // One unreachable or outdated node must not hide the
+                    // interaction when another node owns it.
+                    warn_interaction_call("resolve", &remote_session_id, &error);
+                    last_error = Some(error);
+                }
                 Err(error) => return Err(error.into()),
             }
+        }
+        if let Some(error) = last_error {
+            return Err(error.into());
         }
     }
     Ok(ElicitationResolution::NotFound)

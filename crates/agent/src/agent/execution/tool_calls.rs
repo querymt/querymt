@@ -867,8 +867,8 @@ pub(super) async fn ensure_tool_permission(
         ],
     );
 
-    // The interaction ID is the tool-call ID (stable across deliveries, as in ACP).
-    let permission_id = tool_call_id.to_string();
+    // Unique interaction ID; the tool-call ID is carried separately in the request.
+    let permission_id = uuid::Uuid::now_v7().to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     crate::elicitation::register_pending_permission(
         &config.pending_elicitations,
@@ -1976,16 +1976,24 @@ mod permission_interaction_tests {
         }
     }
 
-    /// Wait until `id` is registered as a pending permission interaction.
-    async fn wait_pending(config: &AgentConfig, id: &str) {
+    /// Wait until a permission interaction for `tool_call_id` is pending and
+    /// return its (unique) interaction ID.
+    async fn wait_pending(config: &AgentConfig, tool_call_id: &str) -> String {
         for _ in 0..200 {
-            if let Some(entry) = config.pending_elicitations.lock().await.get(id) {
+            if let Some((id, entry)) = config
+                .pending_elicitations
+                .lock()
+                .await
+                .iter()
+                .find(|(_, entry)| entry.tool_call_id.as_deref() == Some(tool_call_id))
+            {
                 assert!(matches!(entry.kind, InteractionKind::Permission { .. }));
-                return;
+                assert_ne!(id, tool_call_id, "interaction id must be unique");
+                return id.clone();
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("permission interaction {id} never became pending");
+        panic!("permission interaction for tool call {tool_call_id} never became pending");
     }
 
     async fn answer(config: &AgentConfig, session_id: &str, id: &str, option: &str) {
@@ -2024,17 +2032,11 @@ mod permission_interaction_tests {
         let ensure =
             ensure_tool_permission(config, &exec, "call-1", "shell", &args, permission_ctx());
         let driver = async {
-            wait_pending(config, "call-1").await;
+            let id = wait_pending(config, "call-1").await;
             // No client answers yet: the call must still be waiting, not granted.
             tokio::time::sleep(Duration::from_millis(100)).await;
-            assert!(
-                config
-                    .pending_elicitations
-                    .lock()
-                    .await
-                    .contains_key("call-1")
-            );
-            answer(config, &exec.session_id, "call-1", "allow_once").await;
+            assert!(config.pending_elicitations.lock().await.contains_key(&id));
+            answer(config, &exec.session_id, &id, "allow_once").await;
         };
         let (granted, ()) = tokio::join!(ensure, driver);
         assert!(granted.unwrap());
@@ -2050,8 +2052,8 @@ mod permission_interaction_tests {
         let ensure =
             ensure_tool_permission(config, &exec, "call-r", "shell", &args, permission_ctx());
         let driver = async {
-            wait_pending(config, "call-r").await;
-            answer(config, &exec.session_id, "call-r", "reject_once").await;
+            let id = wait_pending(config, "call-r").await;
+            answer(config, &exec.session_id, &id, "reject_once").await;
         };
         let (granted, ()) = tokio::join!(ensure, driver);
         assert!(!granted.unwrap());
@@ -2066,25 +2068,19 @@ mod permission_interaction_tests {
         let ensure =
             ensure_tool_permission(config, &exec, "call-m", "shell", &args, permission_ctx());
         let driver = async {
-            wait_pending(config, "call-m").await;
+            let id = wait_pending(config, "call-m").await;
             let err = crate::elicitation::resolve_in_map(
                 &config.pending_elicitations,
                 Some(&exec.session_id),
-                "call-m",
+                &id,
                 "conn-1",
                 None,
                 ElicitationResponse::permission_selected("not-an-option"),
             )
             .await;
             assert!(err.is_err(), "malformed answer must be rejected");
-            assert!(
-                config
-                    .pending_elicitations
-                    .lock()
-                    .await
-                    .contains_key("call-m")
-            );
-            answer(config, &exec.session_id, "call-m", "allow_once").await;
+            assert!(config.pending_elicitations.lock().await.contains_key(&id));
+            answer(config, &exec.session_id, &id, "allow_once").await;
         };
         let (granted, ()) = tokio::join!(ensure, driver);
         assert!(granted.unwrap());
@@ -2099,17 +2095,18 @@ mod permission_interaction_tests {
         let ensure =
             ensure_tool_permission(config, &exec, "call-c", "shell", &args, permission_ctx());
         let driver = async {
-            wait_pending(config, "call-c").await;
+            let id = wait_pending(config, "call-c").await;
             exec.cancellation_token.cancel();
+            id
         };
-        let (granted, ()) = tokio::join!(ensure, driver);
+        let (granted, id) = tokio::join!(ensure, driver);
         assert!(!granted.unwrap());
         assert!(pending_is_empty(config).await);
         // A late answer is rejected as not pending.
         let late = crate::elicitation::resolve_in_map(
             &config.pending_elicitations,
             Some(&exec.session_id),
-            "call-c",
+            &id,
             "conn-1",
             None,
             ElicitationResponse::permission_selected("allow_once"),
@@ -2128,8 +2125,8 @@ mod permission_interaction_tests {
         let first =
             ensure_tool_permission(config, &exec, "call-a", "shell", &args, permission_ctx());
         let driver = async {
-            wait_pending(config, "call-a").await;
-            answer(config, &exec.session_id, "call-a", "allow_always").await;
+            let id = wait_pending(config, "call-a").await;
+            answer(config, &exec.session_id, &id, "allow_always").await;
         };
         let (granted, ()) = tokio::join!(first, driver);
         assert!(granted.unwrap());

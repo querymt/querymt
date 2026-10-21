@@ -61,19 +61,27 @@ QueryMT SHALL NOT withhold a prompt response indefinitely. If the requesting con
 - **WHEN** the event relay of a remote-hosted session disconnects while a prompt response is waiting for its updates
 - **THEN** the response is sent without waiting further and the disconnect is reported to the client
 
-### Requirement: Streaming latency is not tied to persistence
-QueryMT SHALL publish ephemeral streaming events without waiting for durable events to be persisted, while still keeping production order.
+### Requirement: Streaming latency is bounded by earlier durable events only
+QueryMT SHALL publish an ephemeral streaming event without waiting for durable events produced after it. It MAY wait for durable events produced before it to be persisted, so that production order is kept.
 
-#### Scenario: Slow storage during streaming
-- **WHEN** durable event persistence is slow while a session streams message deltas
-- **THEN** the deltas reach attached connections without waiting for pending durable writes
+#### Scenario: Slow storage for a later durable event
+- **WHEN** a durable event is being persisted slowly and the session produces message deltas after it
+- **THEN** the deltas reach attached connections once that earlier durable event is published, in production order
+
+#### Scenario: Deltas do not wait for later durable events
+- **WHEN** a session produces a message delta and then a durable event whose persistence is slow
+- **THEN** the delta reaches attached connections without waiting for the later durable write
 
 ### Requirement: Lag and gap recovery
-A connection that falls behind a session's event stream or detects a missing session sequence SHALL recover the missed durable events from the journal and SHALL continue receiving live events afterwards. A lagging connection SHALL NOT stop receiving session updates for the rest of its lifetime.
+A connection that falls behind a session's event stream or detects a missing session sequence SHALL recover the missed durable events from the journal and SHALL continue receiving live events afterwards. A lagging connection SHALL NOT stop receiving session updates for the rest of its lifetime. Ephemeral events missed while lagging are not recovered; the recovered durable events supersede them, and the delta-ordering guarantees of this capability apply to connections that did not lag.
 
 #### Scenario: WebSocket connection lags
 - **WHEN** a WebSocket connection falls behind the live event buffer during a burst
 - **THEN** it receives the missed durable updates in order and keeps receiving later updates
+
+#### Scenario: Lag during a streamed message
+- **WHEN** a connection lags while a session streams deltas of a message and the message is then stored
+- **THEN** the connection receives the stored message after recovery, without the deltas it missed, and keeps receiving later updates
 
 #### Scenario: Gap in relayed sequence
 - **WHEN** an attached node receives a relayed event whose session sequence skips a number
