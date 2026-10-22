@@ -36,16 +36,17 @@ pub(crate) fn handle_mdns_discovered<B: libp2p::swarm::NetworkBehaviour>(
     }
 
     for (peer_id, new_addrs) in addrs_by_peer {
-        let (is_new, has_new_addr) = {
-            let peers = known_peers.read();
-            match peers.get(&peer_id) {
-                None => (true, false),
-                Some(known_addrs) => {
-                    let any_new = new_addrs.iter().any(|a| !known_addrs.contains(a));
-                    (false, any_new)
-                }
-            }
-        };
+        let is_new = !known_peers.read().contains_key(&peer_id);
+        // A live connection retains its LAN addresses even after mDNS expiry
+        // removes the known-peer entry. Check novelty before updating that route.
+        let previous_lan_route = routes.routes_for_peer(&peer_id).into_iter().find(|route| {
+            route.transport == MeshTransportKind::Lan && route.scope == MeshScopeId::lan_default()
+        });
+        let has_new_addr = new_addrs.iter().any(|addr| {
+            previous_lan_route
+                .as_ref()
+                .is_none_or(|route| !route.addrs.contains(addr))
+        });
 
         {
             let mut peers = known_peers.write();
@@ -563,6 +564,54 @@ mod tests {
             notifications, 1,
             "new addresses must trigger one inventory retry, not one per announcement"
         );
+    }
+
+    #[tokio::test]
+    async fn mdns_rediscovery_after_expiry_notifies_only_for_new_route_addresses() {
+        let mut swarm = test_swarm();
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let address: Multiaddr = format!("/ip4/127.0.0.1/tcp/1/p2p/{peer}").parse().unwrap();
+        let new_address: Multiaddr = format!("/ip4/127.0.0.1/tcp/2/p2p/{peer}").parse().unwrap();
+        let known = RwLock::new(HashMap::from([(peer, HashSet::from([address.clone()]))]));
+        let routes = RouteTable::new(Duration::from_secs(90));
+        routes.connection_established(
+            peer,
+            MeshTransportKind::Lan,
+            MeshScopeId::lan_default(),
+            address.clone(),
+            100,
+        );
+        let (tx, mut rx) = broadcast::channel(16);
+        for (advertised, expected) in [(address.clone(), 0), (new_address, 1)] {
+            handle_mdns_expired(
+                &mut swarm,
+                vec![(peer, address.clone())],
+                &known,
+                &routes,
+                &tx,
+            );
+            assert!(!known.read().contains_key(&peer));
+            assert!(routes.is_peer_alive(&peer));
+            while rx.try_recv().is_ok() {}
+            for _ in 0..3 {
+                handle_mdns_discovered(
+                    &mut swarm,
+                    vec![(peer, advertised.clone())],
+                    &known,
+                    &routes,
+                    &tx,
+                );
+            }
+            let notifications = std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|event| matches!(event, MeshEvent::Discovered(id) if *id == peer))
+                .count();
+            assert_eq!(
+                notifications, expected,
+                "rediscovered address: {advertised}"
+            );
+        }
     }
 
     #[tokio::test]

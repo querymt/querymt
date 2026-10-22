@@ -269,6 +269,7 @@ type RemoteRefreshKey = (
     Duration,
     Duration,
     usize,
+    u64,
 );
 
 #[cfg(feature = "remote")]
@@ -614,6 +615,10 @@ impl ModelInventory {
 
     /// Mark remote data stale and refresh without hiding last-known-good catalogs.
     pub async fn invalidate_remote(&self) {
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh() {
+            mesh.invalidate_catalog_refreshes();
+        }
         {
             let mut state = self.inner.refresh_state.lock().await;
             state.remote_updated_at = None;
@@ -628,6 +633,10 @@ impl ModelInventory {
 
     /// Invalidate all caches and trigger refresh
     pub async fn invalidate_all(&self) {
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh() {
+            mesh.invalidate_catalog_refreshes();
+        }
         self.inner.local_snapshot.store(Arc::new(Vec::new()));
         self.inner.remote_snapshot.store(Arc::new(Vec::new()));
         {
@@ -856,13 +865,7 @@ impl ModelInventory {
             });
         };
         let scopes = mesh.active_scopes();
-        let key = (
-            *mesh.peer_id(),
-            scopes.clone(),
-            self.inner.inv_config.remote_node_timeout,
-            self.inner.inv_config.remote_refresh_timeout,
-            self.inner.inv_config.remote_concurrency,
-        );
+        let key = self.remote_refresh_key(&mesh, scopes.clone());
         // All local agents share one in-flight network pass and its short-lived result.
         let result = shared_remote_refreshes()
             .get_with(key, async {
@@ -898,6 +901,22 @@ impl ModelInventory {
             incomplete: result.incomplete || retained,
             epoch,
         })
+    }
+
+    #[cfg(feature = "remote")]
+    fn remote_refresh_key(
+        &self,
+        mesh: &MeshRuntimeHandle,
+        scopes: Vec<querymt_remote::MeshScopeId>,
+    ) -> RemoteRefreshKey {
+        (
+            *mesh.peer_id(),
+            scopes,
+            self.inner.inv_config.remote_node_timeout,
+            self.inner.inv_config.remote_refresh_timeout,
+            self.inner.inv_config.remote_concurrency,
+            mesh.catalog_refresh_generation(),
+        )
     }
 
     #[cfg(feature = "remote")]
@@ -1256,6 +1275,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(30),
             10,
+            0,
         );
         let count = std::sync::atomic::AtomicUsize::new(0);
         let jobs = (0..20).map(|_| {
@@ -1267,6 +1287,61 @@ mod tests {
         });
         join_all(jobs).await;
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn invalidation_bypasses_completed_and_in_flight_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let config = make_test_config().await;
+        let first = ModelInventory::new(config.clone());
+        let second = ModelInventory::new(config);
+        first.set_mesh(mesh.clone());
+        second.set_mesh(mesh.clone());
+        let first_mesh = first.mesh().unwrap();
+        let second_mesh = second.mesh().unwrap();
+        // Exercise the real invalidation entry points without launching network I/O.
+        first.inner.refresh_state.lock().await.remote_refreshing = true;
+        let count = AtomicUsize::new(0);
+        for invalidate_while_running in [false, true] {
+            // Isolate each case from previous results and other process-wide mesh tests.
+            let scopes = vec![querymt_remote::MeshScopeId::Iroh {
+                mesh_id: uuid::Uuid::now_v7().to_string(),
+            }];
+            let old_key = first.remote_refresh_key(&first_mesh, scopes.clone());
+            let old = shared_remote_refreshes()
+                .get_with(old_key, async {
+                    if invalidate_while_running {
+                        first.invalidate_all().await;
+                    }
+                    Arc::new(RemoteRefreshResult::default())
+                })
+                .await;
+            if !invalidate_while_running {
+                first.invalidate_remote().await;
+            }
+            let second_key = second.remote_refresh_key(&second_mesh, scopes.clone());
+            let results = join_all((0..20).map(|_| {
+                shared_remote_refreshes().get_with(second_key.clone(), async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Arc::new(RemoteRefreshResult::default())
+                })
+            }))
+            .await;
+            assert!(
+                results.iter().all(|result| !Arc::ptr_eq(result, &old)),
+                "invalidation must not reuse the completed pre-event result"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|result| Arc::ptr_eq(result, &results[0]))
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
