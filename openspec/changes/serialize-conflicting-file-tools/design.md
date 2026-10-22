@@ -50,18 +50,18 @@ Declared access per tool:
 |---|---|
 | `edit`, `multiedit` | writes `filePath` |
 | `write_file`, `delete_file` | writes `path` |
-| `replace_symbol` | writes each `requests[].path` (resolved against its `root` argument the same way the tool does) |
+| `replace_symbol` | writes each `replacements[].path`, resolved exactly like the tool (`ToolContext::resolve_path`; a relative path is joined with the cwd, so `root` only has to resolve and never changes which file is named) |
 | `shell` | `Unknown` |
 | everything else | `None` (default) |
 
-Read-only tools stay `None` in this change. Declaring reads only matters for "read after write" ordering. That is nice to have, but not needed for the bug. It can be added per tool later without changing the scheduler. The spec's read/write ordering requirement applies to tools that declare reads. The first implementation declares reads for `read_tool`, so the scenario holds for the main read tool.
+Read-only file tools declare their reads, so a read is ordered against a write of the same file (or of a file beneath a directory they read). `read_tool`, `get_function`, `get_symbol`, `index`, `mdq` and `find_references` read the files they name; `search_text`, `ls` and `glob` read the directory they walk (`path`, default cwd). Path overlap is containment (equal, or one is an ancestor of the other), so `search_text` over `src/` waits for an `edit` of `src/a.rs`. Tools that declare nothing stay `None`.
 
 ### D2. Normalise paths in one shared helper
 
 `normalize_tool_path(raw, cwd) -> PathBuf`:
 1. Resolve against cwd, the same way as `ToolContext::resolve_path`.
 2. Lexically clean `.` and `..`.
-3. `canonicalize` if the path exists. Otherwise canonicalize the deepest existing ancestor and append the rest.
+3. Canonicalize the longest existing prefix of the *uncleaned* path (so `link/../x` follows the symlink target as the OS does) and append the remaining components, resolving `.`/`..` lexically. Canonicalization uses `dunce` so Windows paths never carry the `\\\\?\\` verbatim prefix.
 
 The scheduler and the middleware both use it. That keeps `./a.md`, `a.md`, the absolute path and symlinked paths as the same key. The helper does not try to handle case-insensitive file systems; see Risks.
 
@@ -107,7 +107,10 @@ On cancellation, every call that hasn't run yet gets the existing synthetic "Can
   - The new `ProcessingToolCalls` contains the reduced `remaining_calls`.
   - This depends on the order fix in D5.
 - **Default on.** In `api/agent.rs`, next to the existing ContextMiddleware auto-add: if no driver is named `ParallelEditGuard` *and* the config has no `parallel_edit_guard` entry (including a disabled one), push a warn-mode instance. Apply the same in `api/quorum.rs` where middleware entries are built.
-- **Event.** The guard emits an agent event so UIs can show the warning. It reuses an existing generic middleware/warning event kind if there is one; otherwise this is a small follow-up (see Open Questions).
+- **Event.** The guard publishes a `HookNotice` event (`event_name = "parallel_edit_guard"`) so UIs can show the warning. It gets the event sink and the live tool registry through `MiddlewareDriver::bind_agent`, called when the `AgentConfig` is assembled, so it always agrees with the scheduler about which tools exist.
+- **Stale notes.** A pending note is dropped at turn start and when the turn ends (`Complete`/`Stopped`/`Cancelled`); the wording is neutral about whether the calls succeeded.
+- **Every batch is inspected.** Calls gated earlier for invalid arguments pre-fill `results`; this does not disable detection. Deny mode appends its rejections to existing results.
+- **Middleware order.** The auto-added guard is pushed last in both `api/agent.rs` and `api/quorum.rs`, so its note is the final message of the request.
 
 - *Alternative: a context fragment.* Rejected in discussion (less visible to the model).
 - *Alternative: a new post-execution hook that annotates results.* Rejected (needs a new hook; option (a) was chosen).

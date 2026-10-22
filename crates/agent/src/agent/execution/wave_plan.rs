@@ -13,7 +13,7 @@
 //!   a barrier;
 //! - unrelated calls are placed as early as possible to keep parallelism.
 
-use crate::tools::{FileAccess, ToolExecutionClass};
+use crate::tools::{FileAccess, ToolExecutionClass, paths_overlap};
 
 /// What the planner needs to know about a single tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +27,9 @@ pub(super) type Wave = Vec<usize>;
 
 /// Whether two calls must not run concurrently because of their file access.
 ///
-/// - `Paths` vs `Paths`: write/write or read/write overlap on any path.
+/// - `Paths` vs `Paths`: write/write or read/write overlap on any path. Paths
+///   overlap when they are equal or one contains the other, so a call reading a
+///   directory (`ls`, `glob`, `search_text`) waits for writers of files beneath it.
 /// - `Unknown` vs a call that declares at least one write.
 /// - Everything else (`None`, read/read, `Unknown` vs `Unknown`, `Unknown` vs
 ///   readers) is compatible.
@@ -52,8 +54,9 @@ fn conflicts(a: &FileAccess, b: &FileAccess) -> bool {
     }
 }
 
-fn overlaps<T: PartialEq>(left: &[T], right: &[T]) -> bool {
-    left.iter().any(|item| right.contains(item))
+fn overlaps(left: &[std::path::PathBuf], right: &[std::path::PathBuf]) -> bool {
+    left.iter()
+        .any(|l| right.iter().any(|r| paths_overlap(l, r)))
 }
 
 /// Group `calls` into ordered waves. See the module docs for the guarantees.
@@ -131,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn serialized_call_count_is_zero_without_conflicts() {
+    fn serialized_call_count_counts_only_conflicting_calls() {
         let calls = [write("a.md"), write("b.md"), read("a.md")];
         let waves = plan_waves(&calls);
         assert_eq!(serialized_call_count(&calls, &waves), 1);
@@ -211,6 +214,24 @@ mod tests {
     #[test]
     fn read_of_other_file_does_not_wait_for_write() {
         let waves = plan_waves(&[write("x.rs"), read("y.rs")]);
+        assert_eq!(waves, vec![vec![0, 1]]);
+    }
+
+    #[test]
+    fn directory_read_waits_for_write_beneath_it() {
+        let waves = plan_waves(&[write("src/a.rs"), read("src")]);
+        assert_eq!(waves, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn write_beneath_directory_read_waits_for_the_read() {
+        let waves = plan_waves(&[read("src"), write("src/a.rs")]);
+        assert_eq!(waves, vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn directory_read_ignores_sibling_with_common_name_prefix() {
+        let waves = plan_waves(&[write("src2/a.rs"), read("src")]);
         assert_eq!(waves, vec![vec![0, 1]]);
     }
 

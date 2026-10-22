@@ -11,7 +11,7 @@ mod delegation;
 pub mod delegation_guard;
 mod limits;
 mod modes;
-pub mod parallel_edit_guard;
+mod parallel_edit_guard;
 mod presets;
 mod specialized;
 mod tasks;

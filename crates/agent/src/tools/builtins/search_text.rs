@@ -13,7 +13,10 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError,
+    path_or_cwd_read_access,
+};
 
 /// Maximum bytes for a single matched line's text.
 /// Lines longer than this are truncated to prevent binary blobs or extremely
@@ -453,6 +456,11 @@ impl ToolTrait for SearchTextTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        // Reads the tree under `path` (default: the working directory).
+        path_or_cwd_read_access(args, "path", cwd)
+    }
+
     fn truncation_hint(&self) -> Option<&'static str> {
         Some(
             "TIP: Many matches found and truncated. Refine your search pattern, \
@@ -572,6 +580,30 @@ impl ToolTrait for SearchTextTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_path_or_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = SearchTextTool::new();
+        assert_eq!(
+            tool.file_access(&serde_json::json!({"pattern": "x"}), Some(&root)),
+            Access::reads([root.clone()])
+        );
+        assert_eq!(
+            tool.file_access(
+                &serde_json::json!({"pattern": "x", "path": "src"}),
+                Some(&root)
+            ),
+            Access::reads([root.join("src")])
+        );
+        assert_eq!(
+            tool.file_access(&serde_json::json!({"pattern": "x"}), None),
+            Access::None
+        );
+    }
+
     use super::*;
 
     fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {

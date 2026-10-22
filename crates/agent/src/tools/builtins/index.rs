@@ -10,7 +10,10 @@ use serde_json::{Value, json};
 
 use crate::index::outline_index::common::get_language_for_extension;
 use crate::index::outline_index::{IndexOptions, OutlineError, format_outline, index_file};
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError, resolve_arg_path,
+    root_arg_resolves,
+};
 
 pub struct IndexTool;
 
@@ -76,6 +79,16 @@ impl ToolTrait for IndexTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        if !root_arg_resolves(args, cwd) {
+            return FileAccess::None;
+        }
+        args.get("path")
+            .and_then(Value::as_str)
+            .and_then(|raw| resolve_arg_path(raw, cwd))
+            .map_or(FileAccess::None, |path| FileAccess::reads([path]))
     }
 
     async fn call(
@@ -412,6 +425,24 @@ pub fn run() {}
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_the_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let access = IndexTool::new().file_access(&json!({"path": "./src/lib.rs"}), Some(&root));
+        assert_eq!(access, Access::reads([root.join("src/lib.rs")]));
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let cwd = std::env::temp_dir();
+        let tool = IndexTool::new();
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), Access::None);
+        assert_eq!(tool.file_access(&json!({"path": "a.rs"}), None), Access::None);
+    }
+
     #[test]
     fn test_it() {}
 }

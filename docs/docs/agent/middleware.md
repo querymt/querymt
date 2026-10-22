@@ -182,6 +182,14 @@ enabled = false
 Only calls that declare file writes count (`edit`, `multiedit`, `write_file`,
 `delete_file`, `replace_symbol`). `shell` and read-only calls are not counted.
 
+When a batch is flagged, a `HookNotice` event (`parallel_edit_guard`) is also
+published so UIs can show the warning. A guidance message that was not delivered
+(for example because the turn was cancelled) is discarded at the next turn start.
+
+Read-only file tools (`read_tool`, `get_function`, `get_symbol`, `index`, `mdq`,
+`find_references`, `search_text`, `ls`, `glob`) are ordered after earlier writes to
+the files (or directories) they read, so they never observe a half-written file.
+
 ### ContextFactory Middleware
 
 Legacy context management middleware.

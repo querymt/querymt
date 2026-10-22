@@ -5,7 +5,9 @@ use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, path_or_cwd_read_access,
+};
 
 /// Fast file pattern matching tool
 pub struct GlobTool;
@@ -123,6 +125,10 @@ impl Tool for GlobTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        path_or_cwd_read_access(args, "path", cwd)
+    }
+
     fn truncation_hint(&self) -> Option<&'static str> {
         Some(
             "TIP: Many matches found and truncated. Refine your glob pattern \
@@ -187,6 +193,19 @@ impl Tool for GlobTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_path_or_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = GlobTool::new();
+        assert_eq!(
+            tool.file_access(&serde_json::json!({"pattern": "*.rs"}), Some(&root)),
+            Access::reads([root.clone()])
+        );
+    }
+
     use super::*;
 
     fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {

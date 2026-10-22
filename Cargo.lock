@@ -11611,6 +11611,7 @@ dependencies = [
  "clap",
  "criterion",
  "dirs 7.0.0",
+ "dunce",
  "env_logger",
  "fast_html2md",
  "flate2",

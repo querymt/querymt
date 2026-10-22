@@ -197,6 +197,9 @@ impl AgentConfigBuilder {
             self.event_journal.clone(),
             self.event_fanout.clone(),
         ));
+        for driver in &self.middleware_drivers {
+            driver.bind_agent(&self.tool_registry, &event_sink);
+        }
         AgentConfig {
             provider: self.provider,
             storage: self.storage,

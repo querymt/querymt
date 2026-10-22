@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn file_access_writes_normalised_path() {
         let temp_dir = TempDir::new().unwrap();
-        let root = temp_dir.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(temp_dir.path()).unwrap();
         fs::write(root.join("a.md"), "x").unwrap();
         let tool = DeleteFileTool::new();
 

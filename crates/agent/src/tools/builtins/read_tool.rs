@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn file_access_reads_normalised_path() {
         let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         let tool = ReadTool::new();
 
         let access = tool.file_access(&json!({"path": "./src/../a.rs"}), Some(&root));

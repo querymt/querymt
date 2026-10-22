@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{
     CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, resolve_arg_path,
+    root_arg_resolves,
 };
 
 use super::helpers::{resolve_root, resolve_target};
@@ -122,15 +123,10 @@ impl Tool for ReplaceSymbolTool {
     }
 
     fn file_access(&self, args: &Value, cwd: Option<&Path>) -> FileAccess {
-        // Mirror `call`: the `root` argument (or cwd) must resolve, and every
-        // target goes through `ToolContext::resolve_path` (relative paths are
-        // joined with cwd), so a target is only resolvable when `cwd` exists or
-        // the path is absolute.
-        let root_ok = match args.get("root").and_then(Value::as_str) {
-            Some(root) => resolve_arg_path(root, cwd).is_some(),
-            None => cwd.is_some(),
-        };
-        if !root_ok {
+        // Mirror `call`: `resolve_root` must succeed, and every target goes
+        // through `ToolContext::resolve_path` (relative paths are joined with
+        // the cwd, so `root` never changes which file a relative path names).
+        if !root_arg_resolves(args, cwd) {
             return FileAccess::None;
         }
         let Some(entries) = args.get("replacements").and_then(Value::as_array) else {
@@ -669,7 +665,7 @@ mod tests {
     #[test]
     fn file_access_writes_every_replacement_path_with_custom_root() {
         let dir = TempDir::new().unwrap();
-        let cwd = dir.path().canonicalize().unwrap();
+        let cwd = dunce::canonicalize(dir.path()).unwrap();
         std::fs::create_dir_all(cwd.join("sub")).unwrap();
         let tool = ReplaceSymbolTool::new();
 

@@ -225,6 +225,7 @@ mod tests {
     }
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn file_access_is_unknown() {
@@ -237,7 +238,6 @@ mod tests {
         // Unknown access never counts as a declared write.
         assert!(!FileAccess::Unknown.has_writes());
     }
-    use tokio_util::sync::CancellationToken;
 
     #[cfg(unix)]
     async fn wait_for_pid(path: &std::path::Path) -> i32 {

@@ -4,7 +4,6 @@
 //! tool calls refer to the same file, regardless of how the model spelled the
 //! path (`a.md`, `./a.md`, an absolute path, or through a symlinked directory).
 
-use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
 use super::context::FileAccess;
@@ -13,12 +12,18 @@ use super::context::FileAccess;
 ///
 /// 1. Resolve against `cwd` when the path is relative (mirrors
 ///    `ToolContext::resolve_path`). Without a `cwd` a relative path stays
-///    relative.
-/// 2. Lexically clean `.` and `..` components.
-/// 3. Canonicalize the path if it exists; otherwise canonicalize the deepest
-///    existing ancestor and append the remaining components.
+///    relative and is only lexically cleaned.
+/// 2. Canonicalize the longest existing prefix of the path. This is done on the
+///    *un-cleaned* path so the operating system resolves `..` the way it will
+///    when the tool opens the file (`link/../x` is relative to the symlink
+///    target, not to the directory containing the link).
+/// 3. Append the remaining (non-existent) components, resolving `.` and `..`
+///    lexically.
 ///
-/// This never fails. When canonicalization is impossible the cleaned absolute
+/// Canonicalization uses [`dunce`], so on Windows the result never carries the
+/// `\\?\` verbatim prefix and `C:\a` and `\\?\C:\a` map to the same key.
+///
+/// This never fails. When nothing can be canonicalized the lexically cleaned
 /// path is returned, so the worst case is two spellings being treated as
 /// different files (the pre-existing behaviour).
 pub fn normalize_tool_path(raw: impl AsRef<Path>, cwd: Option<&Path>) -> PathBuf {
@@ -27,11 +32,10 @@ pub fn normalize_tool_path(raw: impl AsRef<Path>, cwd: Option<&Path>) -> PathBuf
         Some(cwd) if !raw.is_absolute() => cwd.join(raw),
         _ => raw.to_path_buf(),
     };
-    let cleaned = lexical_clean(&joined);
-    if !cleaned.is_absolute() {
-        return cleaned;
+    if !joined.is_absolute() {
+        return lexical_clean(&joined);
     }
-    canonicalize_deepest_ancestor(cleaned)
+    canonicalize_existing_prefix(&joined)
 }
 
 /// Build a normalised path from a string argument, mirroring
@@ -42,6 +46,17 @@ pub fn resolve_arg_path(raw: &str, cwd: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     Some(normalize_tool_path(raw, cwd))
+}
+
+/// Whether the optional `root` argument (or, when absent, the `cwd`) resolves.
+///
+/// Mirrors `helpers::resolve_root`: when this is `false` the tool fails before
+/// touching any file, so it must declare no file access.
+pub fn root_arg_resolves(args: &serde_json::Value, cwd: Option<&Path>) -> bool {
+    match args.get("root").and_then(serde_json::Value::as_str) {
+        Some(root) => resolve_arg_path(root, cwd).is_some(),
+        None => cwd.is_some(),
+    }
 }
 
 /// `FileAccess` for tools that write the single path in `args[key]`.
@@ -59,6 +74,90 @@ pub fn single_path_write_access(
         .map_or(FileAccess::None, |path| FileAccess::writes([path]))
 }
 
+/// `FileAccess` for tools that read the single path in `args[key]`.
+///
+/// The path may be a file or a directory; readers of a directory conflict with
+/// writers of anything beneath it.
+pub fn single_path_read_access(
+    args: &serde_json::Value,
+    key: &str,
+    cwd: Option<&Path>,
+) -> FileAccess {
+    args.get(key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|raw| resolve_arg_path(raw, cwd))
+        .map_or(FileAccess::None, |path| FileAccess::reads([path]))
+}
+
+/// `FileAccess` for tools that read the optional path in `args[key]`, falling
+/// back to the working directory when the argument is absent (e.g. a search
+/// rooted at the workspace).
+pub fn path_or_cwd_read_access(
+    args: &serde_json::Value,
+    key: &str,
+    cwd: Option<&Path>,
+) -> FileAccess {
+    match args.get(key).and_then(serde_json::Value::as_str) {
+        Some(raw) => {
+            resolve_arg_path(raw, cwd).map_or(FileAccess::None, |p| FileAccess::reads([p]))
+        }
+        None => cwd.map_or(FileAccess::None, |cwd| {
+            FileAccess::reads([normalize_tool_path(cwd, None)])
+        }),
+    }
+}
+
+/// `FileAccess` for tools that read every string in the array `args[key]`.
+///
+/// Requires [`root_arg_resolves`], mirroring tools that call `resolve_root`
+/// before resolving their targets. Non-string entries are ignored, like the
+/// tools' own argument parsing does.
+pub fn path_list_read_access(
+    args: &serde_json::Value,
+    key: &str,
+    cwd: Option<&Path>,
+) -> FileAccess {
+    if !root_arg_resolves(args, cwd) {
+        return FileAccess::None;
+    }
+    let Some(entries) = args.get(key).and_then(serde_json::Value::as_array) else {
+        return FileAccess::None;
+    };
+    collect_read_paths(
+        entries
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(|raw| resolve_arg_path(raw, cwd)),
+    )
+}
+
+/// Build a read-only access from resolved paths.
+///
+/// If any entry failed to resolve the call will fail validation, so no access
+/// is declared. Duplicates collapse; an empty list declares nothing.
+pub fn collect_read_paths(paths: impl IntoIterator<Item = Option<PathBuf>>) -> FileAccess {
+    let mut reads: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        let Some(path) = path else {
+            return FileAccess::None;
+        };
+        if !reads.contains(&path) {
+            reads.push(path);
+        }
+    }
+    if reads.is_empty() {
+        FileAccess::None
+    } else {
+        FileAccess::reads(reads)
+    }
+}
+
+/// Whether two normalised paths overlap: they are equal, or one contains the
+/// other (so a directory conflicts with anything beneath it).
+pub fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
 /// Remove `.` components and resolve `..` against preceding normal components.
 fn lexical_clean(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
@@ -66,41 +165,61 @@ fn lexical_clean(path: &Path) -> PathBuf {
         match component {
             Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
             Component::CurDir => {}
-            Component::ParentDir => match out.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    out.pop();
-                }
-                // `..` at the root stays at the root.
-                Some(Component::RootDir | Component::Prefix(_)) => {}
-                Some(Component::ParentDir) | None => out.push(component.as_os_str()),
-                Some(Component::CurDir) => {}
-            },
+            Component::ParentDir => pop_parent(&mut out, true),
             Component::Normal(part) => out.push(part),
         }
     }
     out
 }
 
-/// Canonicalize the longest existing prefix of `path` and re-append the rest.
-fn canonicalize_deepest_ancestor(path: PathBuf) -> PathBuf {
-    let mut tail: Vec<OsString> = Vec::new();
-    let mut current = path.clone();
-    loop {
-        match current.canonicalize() {
-            Ok(mut resolved) => {
-                resolved.extend(tail.iter().rev());
-                return resolved;
+/// Apply a `..` to `out`. `keep_relative` keeps leading `..` of relative paths.
+fn pop_parent(out: &mut PathBuf, keep_relative: bool) {
+    match out.components().next_back() {
+        Some(Component::Normal(_)) => {
+            out.pop();
+        }
+        // `..` at the root stays at the root.
+        Some(Component::RootDir | Component::Prefix(_)) => {}
+        Some(Component::ParentDir) | None => {
+            if keep_relative {
+                out.push("..");
             }
-            Err(_) => match (current.file_name(), current.parent()) {
-                (Some(name), Some(parent)) => {
-                    tail.push(name.to_os_string());
-                    current = parent.to_path_buf();
+        }
+        Some(Component::CurDir) => {}
+    }
+}
+
+/// Canonicalize the longest existing prefix of an absolute `path` and apply the
+/// remaining components lexically.
+fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
+    let components: Vec<Component<'_>> = path
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    // Never try to canonicalize a bare drive prefix such as `C:` (that means
+    // "the current directory of drive C").
+    let min_prefix = match components.as_slice() {
+        [Component::Prefix(_), Component::RootDir, ..] => 2,
+        _ => 1,
+    };
+
+    for split in (min_prefix..=components.len()).rev() {
+        let prefix: PathBuf = components[..split]
+            .iter()
+            .map(|component| component.as_os_str())
+            .collect();
+        if let Ok(mut resolved) = dunce::canonicalize(&prefix) {
+            for component in &components[split..] {
+                match component {
+                    Component::Normal(part) => resolved.push(part),
+                    Component::ParentDir => pop_parent(&mut resolved, false),
+                    _ => {}
                 }
-                // Nothing along the path can be canonicalized.
-                _ => return path,
-            },
+            }
+            return resolved;
         }
     }
+    lexical_clean(path)
 }
 
 #[cfg(test)]
@@ -109,7 +228,7 @@ mod tests {
 
     fn canonical_tmp() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().canonicalize().expect("canonical tempdir");
+        let root = dunce::canonicalize(dir.path()).expect("canonical tempdir");
         (dir, root)
     }
 
@@ -135,6 +254,14 @@ mod tests {
 
         let via_parent = normalize_tool_path("docs/sub/../a.md", Some(&root));
         assert_eq!(via_parent, root.join("docs/a.md"));
+    }
+
+    #[test]
+    fn parent_segments_after_missing_dirs_are_cleaned() {
+        let (_guard, root) = canonical_tmp();
+
+        let result = normalize_tool_path("missing/../a.md", Some(&root));
+        assert_eq!(result, root.join("a.md"));
     }
 
     #[test]
@@ -167,6 +294,96 @@ mod tests {
         assert_eq!(result, PathBuf::from("b.md"));
     }
 
+    #[test]
+    fn resolve_arg_path_requires_cwd_for_relative_paths() {
+        let (_guard, root) = canonical_tmp();
+        assert_eq!(resolve_arg_path("a.md", None), None);
+        assert_eq!(
+            resolve_arg_path("a.md", Some(&root)),
+            Some(root.join("a.md"))
+        );
+    }
+
+    #[test]
+    fn root_arg_resolves_mirrors_resolve_root() {
+        let (_guard, root) = canonical_tmp();
+        let none = serde_json::json!({});
+        let abs = serde_json::json!({"root": root.to_str().unwrap()});
+        let rel = serde_json::json!({"root": "sub"});
+
+        assert!(root_arg_resolves(&none, Some(&root)));
+        assert!(!root_arg_resolves(&none, None));
+        assert!(root_arg_resolves(&abs, None));
+        assert!(root_arg_resolves(&rel, Some(&root)));
+        assert!(!root_arg_resolves(&rel, None));
+    }
+
+    #[test]
+    fn read_helpers_return_none_for_invalid_arguments() {
+        let (_guard, root) = canonical_tmp();
+        let bad = serde_json::json!({"path": 1, "paths": "x"});
+
+        assert_eq!(
+            single_path_read_access(&bad, "path", Some(&root)),
+            FileAccess::None
+        );
+        assert_eq!(
+            path_list_read_access(&bad, "paths", Some(&root)),
+            FileAccess::None
+        );
+        assert_eq!(
+            path_list_read_access(&serde_json::json!({"paths": []}), "paths", Some(&root)),
+            FileAccess::None
+        );
+        // An unresolvable entry means the whole call fails validation.
+        assert_eq!(
+            path_list_read_access(&serde_json::json!({"paths": ["a.rs"]}), "paths", None),
+            FileAccess::None
+        );
+    }
+
+    #[test]
+    fn path_list_read_access_collapses_duplicates() {
+        let (_guard, root) = canonical_tmp();
+        let args = serde_json::json!({"paths": ["a.rs", "./a.rs", "b.rs"]});
+
+        assert_eq!(
+            path_list_read_access(&args, "paths", Some(&root)),
+            FileAccess::reads([root.join("a.rs"), root.join("b.rs")])
+        );
+    }
+
+    #[test]
+    fn path_or_cwd_read_access_defaults_to_cwd() {
+        let (_guard, root) = canonical_tmp();
+
+        assert_eq!(
+            path_or_cwd_read_access(&serde_json::json!({}), "path", Some(&root)),
+            FileAccess::reads([root.clone()])
+        );
+        assert_eq!(
+            path_or_cwd_read_access(&serde_json::json!({"path": "src"}), "path", Some(&root)),
+            FileAccess::reads([root.join("src")])
+        );
+        assert_eq!(
+            path_or_cwd_read_access(&serde_json::json!({}), "path", None),
+            FileAccess::None
+        );
+    }
+
+    #[test]
+    fn paths_overlap_is_containment_not_prefix_of_name() {
+        let dir = Path::new("/ws/src");
+        assert!(paths_overlap(dir, Path::new("/ws/src")));
+        assert!(paths_overlap(dir, Path::new("/ws/src/a.rs")));
+        assert!(paths_overlap(Path::new("/ws/src/a.rs"), dir));
+        assert!(!paths_overlap(dir, Path::new("/ws/src2/a.rs")));
+        assert!(!paths_overlap(
+            Path::new("/ws/src/a.rs"),
+            Path::new("/ws/src/b.rs")
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlinked_dir_resolves_to_same_key() {
@@ -183,5 +400,18 @@ mod tests {
         let new_direct = normalize_tool_path("real/new.md", Some(&root));
         let new_link = normalize_tool_path("link/new.md", Some(&root));
         assert_eq!(new_direct, new_link);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parent_segment_after_symlink_follows_the_link_target() {
+        let (_guard, root) = canonical_tmp();
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/sub"), root.join("link")).unwrap();
+
+        // The OS resolves `link/..` to `real`, not to `root`.
+        let through_link = normalize_tool_path("link/../x.md", Some(&root));
+        assert_eq!(through_link, root.join("real/x.md"));
+        assert_eq!(through_link, normalize_tool_path("real/x.md", Some(&root)));
     }
 }

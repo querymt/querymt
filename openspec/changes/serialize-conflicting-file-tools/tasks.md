@@ -30,6 +30,15 @@
 - [x] 4.1 End-to-end test with a mock provider emitting one response with two `edit` calls on the same file: both edits persist, and the next request contains the warn guidance after the tool results; verify with `cargo nextest run -p querymt-agent`
 - [x] 4.2 Run full `cargo nextest run -p querymt-agent` and `cargo clippy --workspace -- -D warnings`; verify both pass
 
+## 5. Review follow-ups
+
+- [x] 5.1 Guard inspects every batch (pre-filled `results` no longer disable it); deny mode appends rejections to existing results; verify with guard unit tests
+- [x] 5.2 Guard and scheduler share the live tool registry (`MiddlewareDriver::bind_agent`, `ToolRegistry::file_access[_batch]`, evaluated on the blocking pool); verify `bind_agent_replaces_the_registry`
+- [x] 5.3 Auto-added guard is last in both `api/agent.rs` and `api/quorum.rs`; stale notes dropped at turn start/end; neutral wording; writer count in the deny message; `HookNotice` event; guard module no longer `pub`
+- [x] 5.4 Path identity: `dunce` canonicalization, `..` resolved by the OS before the symlink is lost; verify `parent_segment_after_symlink_follows_the_link_target`
+- [x] 5.5 Reads declared for `get_function`, `get_symbol`, `index`, `mdq`, `find_references`, `search_text`, `ls`, `glob`; planner treats a directory as overlapping files beneath it; verify planner and per-tool tests
+- [x] 5.6 `replace_symbol` documented as resolving like the tool (root does not rebase relative paths); nits (test rename, shell test placement)
+
 ## Workflow follow-up
 
 - Archive the change after review and merge.

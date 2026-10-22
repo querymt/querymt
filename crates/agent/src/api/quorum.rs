@@ -1375,6 +1375,16 @@ fn apply_middleware_from_config(
         }
     }
 
+    let has_context_middleware = entries.iter().any(|e| e.middleware_type == "context");
+    if auto_compact && !has_context_middleware {
+        log::info!("Auto-enabling ContextMiddleware for compaction");
+        builder.push_middleware(Arc::new(crate::middleware::ContextMiddleware::new(
+            crate::middleware::ContextConfig::default().auto_compact(true),
+        )));
+    }
+
+    // The guard goes last (same order as `AgentBuilder::build`) so its note is
+    // the final message of the request, after any compaction.
     // Auto-add ParallelEditGuard (warn mode) unless a driver or any
     // `parallel_edit_guard` entry (including a disabled one) is present.
     let has_guard_entry = entries
@@ -1384,14 +1394,6 @@ fn apply_middleware_from_config(
         builder.push_middleware(Arc::new(crate::middleware::ParallelEditGuard::new(
             builder.tool_registry_snapshot(),
             crate::middleware::ParallelEditMode::Warn,
-        )));
-    }
-
-    let has_context_middleware = entries.iter().any(|e| e.middleware_type == "context");
-    if auto_compact && !has_context_middleware {
-        log::info!("Auto-enabling ContextMiddleware for compaction");
-        builder.push_middleware(Arc::new(crate::middleware::ContextMiddleware::new(
-            crate::middleware::ContextConfig::default().auto_compact(true),
         )));
     }
 }

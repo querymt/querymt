@@ -12,6 +12,11 @@
 //! - `deny`: only the first writing call per file runs; later writers get an
 //!   error result telling the model to combine them into one `multiedit`.
 //!
+//! File access is read from the agent's *live* tool registry (bound through
+//! [`MiddlewareDriver::bind_agent`] when the config is assembled), so
+//! the guard and the scheduler always agree on which tools exist and which
+//! paths they write.
+//!
 //! # Example (TOML config)
 //!
 //! ```toml
@@ -24,13 +29,16 @@
 use crate::agent::core::SessionRuntime;
 use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result, ToolCall, ToolResult};
-use crate::tools::{ToolRegistry, normalize_tool_path};
+use crate::tools::{FileAccess, ToolRegistry};
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+
+use crate::event_sink::EventSink;
+use crate::events::AgentEventKind;
 
 /// How the guard reacts to a flagged batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -62,7 +70,10 @@ struct FlaggedFile {
 
 /// Middleware that detects and reacts to multiple same-file writes per response.
 pub struct ParallelEditGuard {
-    registry: ToolRegistry,
+    /// The agent's tool registry; replaced by the live one in `bind_agent`.
+    registry: RwLock<ToolRegistry>,
+    /// Where warnings are published for UIs; set by `bind_agent`.
+    events: RwLock<Option<Arc<EventSink>>>,
     mode: ParallelEditMode,
     /// Guidance waiting to be injected, keyed by session id.
     pending: Mutex<HashMap<String, String>>,
@@ -71,7 +82,8 @@ pub struct ParallelEditGuard {
 impl ParallelEditGuard {
     pub fn new(registry: ToolRegistry, mode: ParallelEditMode) -> Self {
         Self {
-            registry,
+            registry: RwLock::new(registry),
+            events: RwLock::new(None),
             mode,
             pending: Mutex::new(HashMap::new()),
         }
@@ -81,30 +93,67 @@ impl ParallelEditGuard {
         self.mode
     }
 
-    /// Normalised written paths of one call (deduplicated, in declaration order).
-    fn call_writes(&self, call: &ToolCall, cwd: Option<&Path>) -> Vec<PathBuf> {
-        let Some(tool) = self.registry.find(&call.function.name) else {
-            return Vec::new();
-        };
-        let args: Value = serde_json::from_str(&call.function.arguments)
-            .unwrap_or_else(|_| serde_json::json!({}));
-        let access = tool.file_access(&args, cwd);
+    fn registry_snapshot(&self) -> ToolRegistry {
+        self.registry
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Tell UIs about a flagged batch (`HookNotice`, like other middleware warnings).
+    async fn notify(&self, session_id: &str, message: String) {
+        let sink = self
+            .events
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(sink) = sink else { return };
+        if let Err(error) = sink
+            .emit_durable(
+                session_id,
+                AgentEventKind::HookNotice {
+                    event_name: "parallel_edit_guard".to_string(),
+                    message,
+                    is_error: false,
+                },
+            )
+            .await
+        {
+            log::warn!("parallel_edit_guard: failed to emit notice: {error}");
+        }
+    }
+
+    /// Declared file access of every call (already path-normalised by the
+    /// tools), evaluated once off the async executor.
+    async fn accesses(&self, calls: &[ToolCall], cwd: Option<&Path>) -> Vec<FileAccess> {
+        self.registry_snapshot()
+            .file_access_batch(
+                calls
+                    .iter()
+                    .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
+                    .collect(),
+                cwd.map(Path::to_path_buf),
+            )
+            .await
+    }
+
+    /// Distinct written paths of one call, in declaration order.
+    fn call_writes(access: &FileAccess) -> Vec<&PathBuf> {
         let mut seen = HashSet::new();
         access
             .written_paths()
             .iter()
-            .map(|p| normalize_tool_path(p, cwd))
-            .filter(|p| seen.insert(p.clone()))
+            .filter(|path| seen.insert(*path))
             .collect()
     }
 
     /// Files written by two or more calls, in first-seen order.
-    fn detect(&self, calls: &[ToolCall], cwd: Option<&Path>) -> Vec<FlaggedFile> {
-        let mut order: Vec<PathBuf> = Vec::new();
-        let mut counts: HashMap<PathBuf, usize> = HashMap::new();
-        for call in calls {
-            for path in self.call_writes(call, cwd) {
-                let count = counts.entry(path.clone()).or_insert(0);
+    fn detect(accesses: &[FileAccess]) -> Vec<FlaggedFile> {
+        let mut order: Vec<&PathBuf> = Vec::new();
+        let mut counts: HashMap<&PathBuf, usize> = HashMap::new();
+        for access in accesses {
+            for path in Self::call_writes(access) {
+                let count = counts.entry(path).or_insert(0);
                 if *count == 0 {
                     order.push(path);
                 }
@@ -114,8 +163,11 @@ impl ParallelEditGuard {
         order
             .into_iter()
             .filter_map(|path| {
-                let writers = counts[&path];
-                (writers >= 2).then_some(FlaggedFile { path, writers })
+                let writers = counts[path];
+                (writers >= 2).then(|| FlaggedFile {
+                    path: path.clone(),
+                    writers,
+                })
             })
             .collect()
     }
@@ -125,7 +177,7 @@ impl ParallelEditGuard {
             if let Ok(rel) = path.strip_prefix(cwd) {
                 return rel.display().to_string();
             }
-            if let Ok(canonical) = cwd.canonicalize()
+            if let Ok(canonical) = dunce::canonicalize(cwd)
                 && let Ok(rel) = path.strip_prefix(canonical)
             {
                 return rel.display().to_string();
@@ -147,17 +199,19 @@ impl ParallelEditGuard {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "System note: your previous response modified the same file with several \
-             separate tool calls: {files}. They were applied one after another in order. \
-             Next time, combine all edits to one file into a single `multiedit` call."
+            "System note: your previous response contained several separate tool calls \
+             that modify the same file: {files}. Calls on one file are executed one after \
+             another in order, but it is more reliable and cheaper to combine all edits to \
+             one file into a single `multiedit` call."
         )
     }
 
-    fn deny_message(path: &Path, cwd: Option<&Path>) -> String {
+    fn deny_message(flagged: &FlaggedFile, cwd: Option<&Path>) -> String {
         format!(
-            "Rejected: multiple writes to `{}` in one response. This call was not executed. \
+            "Rejected: {} writes to `{}` in one response. This call was not executed. \
              Combine all edits to this file into a single `multiedit` call.",
-            Self::display_path(path, cwd)
+            flagged.writers,
+            Self::display_path(&flagged.path, cwd)
         )
     }
 
@@ -177,10 +231,45 @@ impl ParallelEditGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// Drop a note that was never delivered (cancelled or ended turn).
+    fn discard_pending(&self, state: &ExecutionState) {
+        if let Some(context) = state.context() {
+            self.lock_pending().remove(&*context.session_id);
+        }
+    }
 }
 
 #[async_trait]
 impl MiddlewareDriver for ParallelEditGuard {
+    async fn on_turn_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        // A note left over from a cancelled turn must not leak into this one.
+        self.discard_pending(&state);
+        Ok(state)
+    }
+
+    async fn on_turn_end(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        // Other middleware may turn `Complete` back into `BeforeLlmCall`; only
+        // drop the note when the turn really ends.
+        if matches!(
+            state,
+            ExecutionState::Complete { .. }
+                | ExecutionState::Stopped { .. }
+                | ExecutionState::Cancelled
+        ) {
+            self.discard_pending(&state);
+        }
+        Ok(state)
+    }
+
     async fn on_step_start(
         &self,
         state: ExecutionState,
@@ -214,17 +303,13 @@ impl MiddlewareDriver for ParallelEditGuard {
             return Ok(state);
         };
 
-        // Only inspect fresh batches; later invocations see partial progress.
-        if !results.is_empty() {
-            return Ok(ExecutionState::ProcessingToolCalls {
-                remaining_calls,
-                results,
-                context,
-            });
-        }
-
+        // `results` may already hold outcomes for calls that never reach the
+        // scheduler (e.g. calls gated for invalid arguments). They do not change
+        // which of the remaining calls write the same file, so every batch is
+        // inspected.
         let cwd = runtime.and_then(|r| r.cwd.as_deref());
-        let flagged = self.detect(&remaining_calls, cwd);
+        let accesses = self.accesses(&remaining_calls, cwd).await;
+        let flagged = Self::detect(&accesses);
         if flagged.is_empty() {
             return Ok(ExecutionState::ProcessingToolCalls {
                 remaining_calls,
@@ -236,6 +321,7 @@ impl MiddlewareDriver for ParallelEditGuard {
         match self.mode {
             ParallelEditMode::Warn => {
                 let note = Self::warn_note(&flagged, cwd);
+                self.notify(&context.session_id, note.clone()).await;
                 self.lock_pending()
                     .insert(context.session_id.to_string(), note);
                 Ok(ExecutionState::ProcessingToolCalls {
@@ -245,32 +331,63 @@ impl MiddlewareDriver for ParallelEditGuard {
                 })
             }
             ParallelEditMode::Deny => {
-                let flagged_paths: HashSet<&PathBuf> = flagged.iter().map(|f| &f.path).collect();
-                let mut claimed: HashSet<PathBuf> = HashSet::new();
+                let flagged_by_path: HashMap<&PathBuf, &FlaggedFile> =
+                    flagged.iter().map(|f| (&f.path, f)).collect();
+                let mut claimed: HashSet<&PathBuf> = HashSet::new();
                 let mut kept: Vec<ToolCall> = Vec::with_capacity(remaining_calls.len());
-                let mut rejected: Vec<ToolResult> = Vec::new();
+                let mut all_results: Vec<ToolResult> = results.to_vec();
 
-                for call in remaining_calls.iter() {
-                    let writes: Vec<PathBuf> = self
-                        .call_writes(call, cwd)
+                for (call, access) in remaining_calls.iter().zip(&accesses) {
+                    let writes: Vec<&PathBuf> = Self::call_writes(access)
                         .into_iter()
-                        .filter(|p| flagged_paths.contains(p))
+                        .filter(|path| flagged_by_path.contains_key(path))
                         .collect();
-                    if let Some(conflict) = writes.iter().find(|p| claimed.contains(*p)) {
-                        rejected.push(Self::deny_result(call, Self::deny_message(conflict, cwd)));
+                    if let Some(conflict) = writes.iter().find(|path| claimed.contains(**path)) {
+                        all_results.push(Self::deny_result(
+                            call,
+                            Self::deny_message(flagged_by_path[*conflict], cwd),
+                        ));
                     } else {
                         claimed.extend(writes);
                         kept.push(call.clone());
                     }
                 }
 
+                let summary = flagged
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "`{}` ({} writes)",
+                            Self::display_path(&f.path, cwd),
+                            f.writers
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.notify(
+                    &context.session_id,
+                    format!("Rejected redundant same-file writes in one response: {summary}"),
+                )
+                .await;
+
                 Ok(ExecutionState::ProcessingToolCalls {
                     remaining_calls: Arc::from(kept.into_boxed_slice()),
-                    results: Arc::from(rejected.into_boxed_slice()),
+                    results: Arc::from(all_results.into_boxed_slice()),
                     context,
                 })
             }
         }
+    }
+
+    fn bind_agent(&self, registry: &ToolRegistry, events: &Arc<EventSink>) {
+        *self
+            .registry
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = registry.clone();
+        *self
+            .events
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(events.clone());
     }
 
     fn reset(&self) {
@@ -388,12 +505,17 @@ mod tests {
 
     fn temp_root() -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
-        let root = dir.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         (dir, root)
     }
 
-    #[test]
-    fn detects_two_edits_to_same_file() {
+    async fn detect_in(guard: &ParallelEditGuard, calls: &[ToolCall]) -> Vec<FlaggedFile> {
+        let accesses = guard.accesses(calls, None).await;
+        ParallelEditGuard::detect(&accesses)
+    }
+
+    #[tokio::test]
+    async fn detects_two_edits_to_same_file() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
         let calls = vec![
@@ -401,24 +523,24 @@ mod tests {
             edit("2", &root.join("./design.md")),
         ];
 
-        let flagged = guard.detect(&calls, None);
+        let flagged = detect_in(&guard, &calls).await;
 
         assert_eq!(flagged.len(), 1);
         assert_eq!(flagged[0].path, root.join("design.md"));
         assert_eq!(flagged[0].writers, 2);
     }
 
-    #[test]
-    fn does_not_flag_different_files() {
+    #[tokio::test]
+    async fn does_not_flag_different_files() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
         let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("b.md"))];
 
-        assert!(guard.detect(&calls, None).is_empty());
+        assert!(detect_in(&guard, &calls).await.is_empty());
     }
 
-    #[test]
-    fn shell_and_reads_are_not_counted() {
+    #[tokio::test]
+    async fn shell_and_reads_are_not_counted() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
         let calls = vec![
@@ -431,7 +553,7 @@ mod tests {
             ),
         ];
 
-        assert!(guard.detect(&calls, None).is_empty());
+        assert!(detect_in(&guard, &calls).await.is_empty());
     }
 
     #[tokio::test]
@@ -511,22 +633,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_batches_are_not_inspected() {
+    async fn batches_with_prefilled_results_are_still_inspected_in_warn_mode() {
+        // e.g. one call was gated for invalid arguments before the batch got here.
         let (_dir, root) = temp_root();
-        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Deny);
-        let prior = ToolResult::new("0".into(), vec![], false, None, None);
+        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
+        let gated = ToolResult::new("0".into(), vec![], true, None, None);
         let state = ExecutionState::ProcessingToolCalls {
             remaining_calls: Arc::from(vec![
                 edit("1", &root.join("a.md")),
                 edit("2", &root.join("a.md")),
             ]),
-            results: Arc::from(vec![prior]),
+            results: Arc::from(vec![gated]),
             context: context(),
         };
 
         let (calls, results) = unpack(guard.on_processing_tool_calls(state, None).await.unwrap());
         assert_eq!(calls.len(), 2);
         assert_eq!(results.len(), 1);
+
+        let before = ExecutionState::BeforeLlmCall { context: context() };
+        let ExecutionState::BeforeLlmCall { context } =
+            guard.on_step_start(before, None).await.unwrap()
+        else {
+            panic!("expected BeforeLlmCall");
+        };
+        assert_eq!(context.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deny_mode_keeps_prefilled_results_and_appends_rejections() {
+        let (_dir, root) = temp_root();
+        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Deny);
+        let gated = ToolResult::new("0".into(), vec![], true, None, None);
+        let state = ExecutionState::ProcessingToolCalls {
+            remaining_calls: Arc::from(vec![
+                edit("1", &root.join("a.md")),
+                edit("2", &root.join("a.md")),
+            ]),
+            results: Arc::from(vec![gated]),
+            context: context(),
+        };
+
+        let (calls, results) = unpack(guard.on_processing_tool_calls(state, None).await.unwrap());
+        assert_eq!(
+            calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["1"]
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["0", "2"]
+        );
+        assert!(results[1].text_content().contains("2 writes"));
+    }
+
+    async fn flag_same_file(guard: &ParallelEditGuard, root: &Path) {
+        let state = batch(vec![
+            edit("1", &root.join("a.md")),
+            edit("2", &root.join("a.md")),
+        ]);
+        guard.on_processing_tool_calls(state, None).await.unwrap();
+    }
+
+    async fn injected_messages(guard: &ParallelEditGuard) -> usize {
+        let before = ExecutionState::BeforeLlmCall { context: context() };
+        let ExecutionState::BeforeLlmCall { context } =
+            guard.on_step_start(before, None).await.unwrap()
+        else {
+            panic!("expected BeforeLlmCall");
+        };
+        context.messages.len()
+    }
+
+    #[tokio::test]
+    async fn pending_note_is_dropped_at_turn_start_and_turn_end() {
+        let (_dir, root) = temp_root();
+        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
+
+        // Turn start drops a note left by a cancelled turn.
+        flag_same_file(&guard, &root).await;
+        let start = ExecutionState::BeforeLlmCall { context: context() };
+        guard.on_turn_start(start, None).await.unwrap();
+        assert_eq!(injected_messages(&guard).await, 0);
+
+        // Turn end (Complete) drops an undelivered note.
+        flag_same_file(&guard, &root).await;
+        let end = ExecutionState::Complete { context: context() };
+        guard.on_turn_end(end, None).await.unwrap();
+        assert_eq!(injected_messages(&guard).await, 0);
+
+        // A BeforeLlmCall at turn end (another middleware asked to continue) keeps it.
+        flag_same_file(&guard, &root).await;
+        let cont = ExecutionState::BeforeLlmCall { context: context() };
+        guard.on_turn_end(cont, None).await.unwrap();
+        assert_eq!(injected_messages(&guard).await, 1);
+    }
+
+    #[tokio::test]
+    async fn bind_agent_replaces_the_registry() {
+        let (_dir, root) = temp_root();
+        // Starts with no tools: nothing is detected.
+        let guard = ParallelEditGuard::new(ToolRegistry::new(), ParallelEditMode::Warn);
+        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
+        assert!(detect_in(&guard, &calls).await.is_empty());
+
+        let agent = crate::test_utils::TestAgent::new().await;
+        guard.bind_agent(&registry(), &agent.config.event_sink);
+        assert_eq!(detect_in(&guard, &calls).await.len(), 1);
     }
 
     #[tokio::test]

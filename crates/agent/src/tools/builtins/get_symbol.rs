@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, parse_kind_filter};
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, collect_read_paths,
+    resolve_arg_path, root_arg_resolves,
+};
 
 use super::helpers::{resolve_root, resolve_target};
 
@@ -93,6 +96,26 @@ impl Tool for GetSymbolTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        if !root_arg_resolves(args, cwd) {
+            return FileAccess::None;
+        }
+        // Mirrors `parse_requests`: a single object is accepted as well as an array.
+        let entries: Vec<&Value> = match args.get("requests") {
+            Some(Value::Array(items)) => items.iter().collect(),
+            Some(single @ Value::Object(_)) => vec![single],
+            _ => return FileAccess::None,
+        };
+        let mut paths = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Some(raw) = entry.get("path").and_then(Value::as_str) else {
+                return FileAccess::None;
+            };
+            paths.push(resolve_arg_path(raw, cwd));
+        }
+        collect_read_paths(paths)
     }
 
     async fn call(
@@ -451,6 +474,45 @@ fn all_symbols(symbols: &[SymbolEntry]) -> Vec<&SymbolEntry> {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_request_paths_for_array_and_single_object() {
+        let dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = GetSymbolTool::new();
+
+        let many = tool.file_access(
+            &json!({"requests": [{"path": "a.rs", "symbol": "x"}, {"path": "b.rs", "symbol": "y"}]}),
+            Some(&root),
+        );
+        assert_eq!(many, Access::reads([root.join("a.rs"), root.join("b.rs")]));
+
+        let single = tool.file_access(
+            &json!({"requests": {"path": "a.rs", "symbol": "x"}}),
+            Some(&root),
+        );
+        assert_eq!(single, Access::reads([root.join("a.rs")]));
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let cwd = std::env::temp_dir();
+        let tool = GetSymbolTool::new();
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), Access::None);
+        assert_eq!(
+            tool.file_access(&json!({"requests": [{"symbol": "x"}]}), Some(&cwd)),
+            Access::None
+        );
+        assert_eq!(
+            tool.file_access(
+                &json!({"requests": [{"path": "a.rs", "symbol": "x"}]}),
+                None
+            ),
+            Access::None
+        );
+    }
+
     use super::*;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;

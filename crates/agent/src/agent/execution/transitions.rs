@@ -1662,9 +1662,27 @@ pub(super) async fn transition_processing_tool_calls(
     // Plan the batch into ordered waves. Calls inside a wave never conflict on a
     // file and run concurrently; waves (and execution barriers) run in order.
     let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
+    let accesses = config
+        .tool_registry
+        .file_access_batch(
+            remaining_calls
+                .iter()
+                .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
+                .collect(),
+            cwd,
+        )
+        .await;
     let call_infos: Vec<CallInfo> = remaining_calls
         .iter()
-        .map(|call| plan_call_info(config, call, cwd.as_deref()))
+        .zip(accesses)
+        .map(|(call, access)| CallInfo {
+            class: config
+                .tool_registry
+                .find(&call.function.name)
+                .map(|tool| tool.execution_class())
+                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe),
+            access,
+        })
         .collect();
     let waves = plan_waves(&call_infos);
     let span = tracing::Span::current();
@@ -1797,30 +1815,6 @@ pub(super) async fn transition_processing_tool_calls(
     }
 
     Ok(next_state)
-}
-
-/// Execution class and declared file access of a call, as seen by the planner.
-///
-/// Unknown tools default to `ParallelSafe` with no file access, which is the
-/// pre-existing behaviour.
-fn plan_call_info(
-    config: &AgentConfig,
-    call: &MiddlewareToolCall,
-    cwd: Option<&std::path::Path>,
-) -> CallInfo {
-    let Some(tool) = config.tool_registry.find(&call.function.name) else {
-        return CallInfo {
-            class: crate::tools::ToolExecutionClass::ParallelSafe,
-            access: crate::tools::FileAccess::None,
-        };
-    };
-    // Plan with the arguments exactly as `execute_tool_call` will first see them.
-    let args: serde_json::Value =
-        serde_json::from_str(&call.function.arguments).unwrap_or_else(|_| serde_json::json!({}));
-    CallInfo {
-        class: tool.execution_class(),
-        access: tool.file_access(&args, cwd),
-    }
 }
 
 /// Build a synthetic error result for a call that did not produce one.

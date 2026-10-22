@@ -113,6 +113,9 @@ impl AgentConfig {
     /// Used by `AgentBuilder::build()` to swap in the final middleware chain
     /// without manually cloning every field.
     pub(crate) fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+        for driver in &drivers {
+            driver.bind_agent(&self.tool_registry, &self.event_sink);
+        }
         self.middleware_drivers = drivers;
         self
     }

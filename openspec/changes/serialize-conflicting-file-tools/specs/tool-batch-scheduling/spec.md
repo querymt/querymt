@@ -50,6 +50,14 @@ A call that reads a file and a call that writes that same file in one response S
 - **WHEN** a response contains an `edit` on `x.rs` followed by a read of `x.rs`
 - **THEN** the read runs after the edit completes and observes the edited content
 
+#### Scenario: Symbol and outline readers
+- **WHEN** a response contains an `edit` on `x.rs` followed by `get_function`, `get_symbol` or `index` on `x.rs`
+- **THEN** the reader runs after the edit completes
+
+#### Scenario: Directory search waits for writes beneath it
+- **WHEN** a response contains an `edit` on `src/a.rs` followed by `search_text`, `ls` or `glob` over `src`
+- **THEN** the search runs after the edit completes, while a search over an unrelated directory runs concurrently
+
 ### Requirement: Shell commands do not overlap with file-writing tools
 A tool call whose file access cannot be determined (such as a shell command) SHALL NOT run concurrently with any call that writes a file in the same response. It MAY run concurrently with read-only or non-file calls, and with other undetermined-access calls.
 
