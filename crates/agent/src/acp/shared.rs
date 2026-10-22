@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Weak};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc};
 
 /// Session subscriptions keyed by session id.
 ///
@@ -82,9 +82,6 @@ async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &s
         owners.remove(session_id);
     }
 }
-
-/// Type alias for pending permission requests (tool_call_id -> response sender)
-pub type PermissionMap = Arc<Mutex<HashMap<String, oneshot::Sender<RequestPermissionOutcome>>>>;
 
 /// Type alias for pending elicitation requests (elicitation_id -> response sender)
 pub type PendingElicitationMap = crate::elicitation::PendingElicitationMap;
@@ -145,6 +142,30 @@ pub(crate) fn convert_elicitation_response(
     Ok(crate::elicitation::ElicitationResponse { action, content })
 }
 
+/// Convert a client's `session/request_permission` response into the answer
+/// carried by a pending permission interaction.
+///
+/// Only an explicitly selected option is an answer. A client-side `cancelled`
+/// outcome is not a decision (`Ok(None)`: the delivery ends, the request stays
+/// pending) and anything unparseable is an error handled as undelivered.
+pub(crate) fn convert_permission_response_value(
+    value: serde_json::Value,
+) -> Result<Option<crate::elicitation::ElicitationResponse>, Error> {
+    let response: crate::acp::protocol::RequestPermissionResponse = serde_json::from_value(value)
+        .map_err(|err| {
+        Error::invalid_params().data(format!("Invalid permission response: {err}"))
+    })?;
+    match response.outcome {
+        RequestPermissionOutcome::Selected(selected) => Ok(Some(
+            crate::elicitation::ElicitationResponse::permission_selected(
+                selected.option_id.0.as_ref(),
+            ),
+        )),
+        RequestPermissionOutcome::Cancelled => Ok(None),
+        _ => Err(Error::invalid_params().data("Unsupported permission outcome")),
+    }
+}
+
 pub(crate) fn convert_elicitation_response_value(
     value: serde_json::Value,
 ) -> Result<crate::elicitation::ElicitationResponse, Error> {
@@ -203,7 +224,6 @@ impl RpcDispatchOutput {
 pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
     agent: Arc<S>,
     session_owners: SessionOwnerMap,
-    pending_permissions: PermissionMap,
     pending_elicitations: PendingElicitationMap,
     conn_id: String,
     request: RpcMessage,
@@ -213,7 +233,6 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
         RpcDispatchState {
             agent,
             session_owners,
-            pending_permissions,
             pending_elicitations,
             conn_id,
             tx,
@@ -228,7 +247,6 @@ pub(crate) async fn dispatch_rpc_message<S: SendAgent>(
 pub(crate) struct RpcDispatchState<S> {
     pub agent: Arc<S>,
     pub session_owners: SessionOwnerMap,
-    pub pending_permissions: PermissionMap,
     pub pending_elicitations: PendingElicitationMap,
     pub conn_id: String,
     pub tx: mpsc::Sender<String>,
@@ -242,7 +260,6 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let RpcDispatchState {
         agent,
         session_owners,
-        pending_permissions,
         pending_elicitations,
         conn_id,
         tx,
@@ -250,7 +267,6 @@ pub(crate) async fn dispatch_rpc_message_with_context<S: SendAgent>(
     let output = handle_rpc_message_with_context(
         agent.as_ref(),
         &session_owners,
-        &pending_permissions,
         &pending_elicitations,
         &conn_id,
         request,
@@ -318,6 +334,9 @@ pub struct RpcDispatchContext {
     /// the negotiated client capabilities are parsed into it so the
     /// snapshot-vs-replay choice stays scoped to this connection.
     pub session_load: Option<Arc<std::sync::Mutex<AcpSessionLoadPreferences>>>,
+    /// The connection's delivery position. `session/prompt` waits on it so the
+    /// response follows the session updates the prompt produced.
+    pub(crate) delivery: Option<Arc<crate::acp::delivery::ConnectionDelivery>>,
 }
 
 impl RpcDispatchContext {
@@ -2001,7 +2020,6 @@ use crate::agent::session_registry::config_options as session_config_options;
 pub async fn handle_rpc_message<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
-    pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcMessage,
@@ -2009,7 +2027,6 @@ pub async fn handle_rpc_message<S: SendAgent>(
     handle_rpc_message_with_context(
         agent,
         session_owners,
-        pending_permissions,
         pending_elicitations,
         conn_id,
         req,
@@ -2021,7 +2038,6 @@ pub async fn handle_rpc_message<S: SendAgent>(
 pub async fn handle_rpc_message_with_context<S: SendAgent>(
     agent: &S,
     session_owners: &SessionOwnerMap,
-    pending_permissions: &PermissionMap,
     pending_elicitations: &PendingElicitationMap,
     conn_id: &str,
     req: RpcMessage,
@@ -2137,10 +2153,18 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 true,
                             )
                             .await?;
-                            agent
-                                .prompt_with_bridge(params, context.session_bridge.clone())
-                                .await
-                                .map(|r| serde_json::to_value(r).unwrap())
+                            let mut response = agent.prompt(params).await?;
+                            // The reply carries the last `session_seq` the run
+                            // produced. Hold the response until this connection
+                            // delivered every update up to it (bounded; a lost
+                            // delivery is logged and the response proceeds). A
+                            // missing tip means "no watermark".
+                            if let Some(tip) = crate::acp::delivery::take_event_tip(&mut response)
+                                && let Some(delivery) = context.delivery.as_ref()
+                            {
+                                delivery.hold_response_for_updates(&session_id, tip).await;
+                            }
+                            Ok(serde_json::to_value(response).unwrap())
                         }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
@@ -2371,28 +2395,6 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             .set_session_model(params)
                             .await
                             .map(|r| serde_json::to_value(r).unwrap()),
-                        Err(e) => Err(Error::invalid_params()
-                            .data(serde_json::json!({"error": e.to_string()}))),
-                    }
-                }
-
-                "permission_result" => {
-                    #[derive(Deserialize)]
-                    struct PermissionResultParams {
-                        tool_call_id: String,
-                        outcome: RequestPermissionOutcome,
-                    }
-                    match serde_json::from_value::<PermissionResultParams>(req.params) {
-                        Ok(params) => {
-                            let mut pending = pending_permissions.lock().await;
-                            if let Some(tx) = pending.remove(&params.tool_call_id) {
-                                let _ = tx.send(params.outcome);
-                                Ok(serde_json::Value::Null)
-                            } else {
-                                Err(Error::internal_error()
-                                    .data("No pending permission for this tool_call_id"))
-                            }
-                        }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
                     }
@@ -2811,6 +2813,7 @@ mod tests {
         subscribe_connection(&subscriptions, "session".to_string(), "conn-b").await;
 
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "event".into(),
             stream_seq: 1,
             session_id: "session".into(),
@@ -2964,6 +2967,7 @@ mod tests {
 
         for (index, (kind, expected)) in cases.into_iter().enumerate() {
             let event = EventEnvelope::Durable(DurableEvent {
+                session_seq: 0,
                 event_id: format!("input-event-{index}"),
                 stream_seq: index as i64 + 1,
                 session_id: "s-1".into(),
@@ -3024,6 +3028,7 @@ mod tests {
 
     fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-1".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3040,6 +3045,7 @@ mod tests {
 
     fn tool_end_event(tool_name: &str) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-2".into(),
             stream_seq: 2,
             timestamp: 0,
@@ -3058,6 +3064,7 @@ mod tests {
     #[test]
     fn prompt_received_preserves_message_id() {
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-prompt".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3096,6 +3103,7 @@ mod tests {
             .map(|(index, block)| {
                 translator
                     .translate_update(&EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+                        session_seq: 0,
                         session_id: "s-1".to_string(),
                         timestamp: index as i64,
                         origin: EventOrigin::Local,
@@ -3139,6 +3147,7 @@ mod tests {
         ));
 
         let summary = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-prompt".into(),
             stream_seq: 4,
             timestamp: 4,
@@ -3245,6 +3254,7 @@ mod tests {
     #[test]
     fn assistant_updates_preserve_message_id() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3259,6 +3269,7 @@ mod tests {
             },
         });
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3293,6 +3304,7 @@ mod tests {
     #[test]
     fn live_translator_suppresses_stored_message_after_streaming_delta() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3303,6 +3315,7 @@ mod tests {
             },
         });
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3328,6 +3341,7 @@ mod tests {
     #[test]
     fn live_translator_forwards_non_streaming_stored_message() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3360,6 +3374,7 @@ mod tests {
     #[test]
     fn replay_translation_skips_streaming_deltas() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3392,6 +3407,7 @@ mod tests {
     #[test]
     fn live_translator_forwards_thinking_delta_as_agent_thought_chunk() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3430,6 +3446,7 @@ mod tests {
     #[test]
     fn replay_projects_each_summary_part_as_its_own_thought_chunk() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3477,6 +3494,7 @@ mod tests {
     #[test]
     fn live_translator_skips_empty_thinking_delta() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3501,6 +3519,7 @@ mod tests {
             "s-1",
             vec![
                 AgentEvent {
+                    session_seq: 0,
                     seq: 1,
                     timestamp: 1,
                     session_id: "s-1".to_string(),
@@ -3512,6 +3531,7 @@ mod tests {
                     },
                 },
                 AgentEvent {
+                    session_seq: 0,
                     seq: 2,
                     timestamp: 2,
                     session_id: "s-1".to_string(),
@@ -3525,6 +3545,7 @@ mod tests {
                     },
                 },
                 AgentEvent {
+                    session_seq: 0,
                     seq: 3,
                     timestamp: 3,
                     session_id: "s-1".to_string(),
@@ -3552,6 +3573,7 @@ mod tests {
     #[test]
     fn replay_uses_persisted_structured_prompt_blocks_when_available() {
         let event = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 1,
             session_id: "s-1".to_string(),
@@ -3638,6 +3660,7 @@ mod tests {
     #[test]
     fn malformed_todowrite_arguments_do_not_emit_update() {
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-3".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3940,14 +3963,12 @@ mod tests {
             ext_method_control: None,
         });
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(2);
 
         let prompt_task = tokio::spawn(dispatch_rpc_message(
             agent.clone(),
             session_owners.clone(),
-            pending_permissions.clone(),
             pending_elicitations.clone(),
             "conn-1".to_string(),
             RpcMessage {
@@ -3969,7 +3990,6 @@ mod tests {
         let cancel_task = tokio::spawn(dispatch_rpc_message(
             agent,
             session_owners,
-            pending_permissions,
             pending_elicitations,
             "conn-1".to_string(),
             rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
@@ -4003,14 +4023,12 @@ mod tests {
     #[tokio::test]
     async fn session_cancel_notification_dispatches_without_response() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (agent, cancelled_session) = cancel_test_agent();
 
         let output = handle_rpc_message(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             rpc_cancel_message(None, serde_json::json!({"sessionId": "s-cancel"})),
@@ -4033,7 +4051,6 @@ mod tests {
             .expect("create stored session");
         let session_id = session.public_id;
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         for (method, params) in [
@@ -4049,7 +4066,6 @@ mod tests {
             let output = handle_rpc_message(
                 fixture.planner.as_ref(),
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-lifecycle",
                 RpcMessage {
@@ -4085,7 +4101,6 @@ mod tests {
             "s-existing".to_string(),
             HashSet::from(["conn-ext".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let agent = CancelTestAgent {
             cancelled_session: Arc::new(Mutex::new(None)),
@@ -4106,7 +4121,6 @@ mod tests {
             let output = handle_rpc_message(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-ext",
                 RpcMessage {
@@ -4162,19 +4176,16 @@ mod tests {
             ext_method_control: Some(control.clone()),
         });
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         let spawn_request = |id| {
             let agent = agent.clone();
             let session_owners = session_owners.clone();
-            let pending_permissions = pending_permissions.clone();
             let pending_elicitations = pending_elicitations.clone();
             tokio::spawn(async move {
                 handle_rpc_message(
                     agent.as_ref(),
                     &session_owners,
-                    &pending_permissions,
                     &pending_elicitations,
                     "conn-ext",
                     RpcMessage {
@@ -4247,7 +4258,6 @@ mod tests {
             "s-load-existing".to_string(),
             HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let context = RpcDispatchContext {
             session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
@@ -4258,13 +4268,13 @@ mod tests {
             elicitation_recovery: None,
             translator: None,
             session_load: None,
+            delivery: None,
         };
 
         for session_id in ["s-load-new", "s-load-existing"] {
             let output = handle_rpc_message_with_context(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-hook",
                 RpcMessage {
@@ -4317,7 +4327,6 @@ mod tests {
             "s-remote-existing".to_string(),
             HashSet::from(["conn-hook".to_string(), "conn-other".to_string()]),
         );
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let context = RpcDispatchContext {
             session_hooks: Some(Arc::new(RejectPostAttachmentHooks {
@@ -4328,6 +4337,7 @@ mod tests {
             elicitation_recovery: None,
             translator: None,
             session_load: None,
+            delivery: None,
         };
 
         for (method, params) in [
@@ -4347,7 +4357,6 @@ mod tests {
             let output = handle_rpc_message_with_context(
                 &agent,
                 &session_owners,
-                &pending_permissions,
                 &pending_elicitations,
                 "conn-hook",
                 RpcMessage {
@@ -4395,12 +4404,10 @@ mod tests {
             ext_method_control: None,
         };
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-lifecycle",
             RpcMessage {
@@ -4420,6 +4427,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4451,12 +4459,10 @@ mod tests {
             ext_method_control: None,
         };
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let output = handle_rpc_message_with_context(
             &agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-prompt",
             RpcMessage {
@@ -4479,6 +4485,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4498,7 +4505,6 @@ mod tests {
     #[tokio::test]
     async fn session_new_rpc_dispatches_to_agent_new_session() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -4597,7 +4603,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4612,6 +4617,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4661,12 +4667,10 @@ mod tests {
         params: serde_json::Value,
     ) -> RpcDispatchOutput {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
             agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4681,6 +4685,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await
@@ -4709,12 +4714,10 @@ mod tests {
         let translator = Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new()));
         translator.lock().unwrap().set_capabilities(capabilities);
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         handle_rpc_message_with_context(
             agent,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -4733,6 +4736,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: Some(translator),
                 session_load: Some(Arc::new(std::sync::Mutex::new(preferences))),
+                delivery: None,
             },
         )
         .await
@@ -4778,6 +4782,7 @@ mod tests {
         ] {
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -4912,14 +4917,12 @@ mod tests {
         registry.register(docs_slash_command());
         let fixture = crate::test_utils::TestAgent::with_slash_command_registry(registry).await;
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(8);
 
         dispatch_rpc_message(
             fixture.handle.clone(),
             session_owners,
-            pending_permissions,
             pending_elicitations,
             "conn-1".to_string(),
             RpcMessage {
@@ -4955,6 +4958,7 @@ mod tests {
         let journal = fixture.storage.event_journal();
         journal
             .append_durable(&NewDurableEvent {
+                session_seq: None,
                 session_id: session_id.clone(),
                 origin: EventOrigin::Local,
                 source_node: None,
@@ -4977,7 +4981,6 @@ mod tests {
             .expect("persist replay event");
 
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = mpsc::channel(64);
 
@@ -4985,7 +4988,6 @@ mod tests {
             RpcDispatchState {
                 agent: fixture.handle.clone(),
                 session_owners,
-                pending_permissions,
                 pending_elicitations,
                 conn_id: "conn-order".to_string(),
                 tx,
@@ -5032,7 +5034,6 @@ mod tests {
     #[tokio::test]
     async fn remote_attach_extension_records_session_owner_with_snake_case_payload() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5136,7 +5137,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-9",
             RpcMessage {
@@ -5160,7 +5160,6 @@ mod tests {
     #[tokio::test]
     async fn remote_create_session_records_session_owner_from_snake_case_response() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5263,7 +5262,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-9",
             RpcMessage {
@@ -5287,7 +5285,6 @@ mod tests {
     #[tokio::test]
     async fn session_load_records_session_owner_for_live_updates() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5386,7 +5383,6 @@ mod tests {
         let output = handle_rpc_message_with_context(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-load",
             RpcMessage {
@@ -5414,7 +5410,6 @@ mod tests {
     #[tokio::test]
     async fn session_close_rpc_forwards_to_send_agent() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         struct Dummy;
@@ -5513,7 +5508,6 @@ mod tests {
         let output = handle_rpc_message(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5540,7 +5534,6 @@ mod tests {
     #[tokio::test]
     async fn set_config_option_rpc_forwards_to_send_agent() {
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations: PendingElicitationMap = Arc::new(Mutex::new(HashMap::new()));
 
         // Minimal SendAgent that returns method_not_found for set_session_config_option
@@ -5641,7 +5634,6 @@ mod tests {
         let output = handle_rpc_message(
             &Dummy,
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5677,13 +5669,11 @@ mod tests {
         );
 
         let session_owners = SessionOwnerMap::default();
-        let pending_permissions: PermissionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_elicitations = fixture.planner.pending_elicitations();
 
         let output = handle_rpc_message(
             fixture.planner.as_ref(),
             &session_owners,
-            &pending_permissions,
             &pending_elicitations,
             "conn-1",
             RpcMessage {
@@ -5983,6 +5973,7 @@ mod tests {
             for _ in 0..10_001 {
                 journal
                     .append_durable(&NewDurableEvent {
+                        session_seq: None,
                         session_id: session_id.clone(),
                         origin: EventOrigin::Local,
                         source_node: None,
@@ -5995,6 +5986,7 @@ mod tests {
             }
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -6017,6 +6009,7 @@ mod tests {
                 .expect("persist replay event");
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -6153,6 +6146,7 @@ mod session_update_tests {
 
     fn envelope(seq: i64, kind: AgentEventKind) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: format!("evt-{seq}"),
             stream_seq: seq,
             timestamp: 0,
@@ -6165,6 +6159,7 @@ mod session_update_tests {
 
     fn agent_event(seq: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
+            session_seq: 0,
             seq,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -6700,6 +6695,7 @@ mod session_update_tests {
         for kind in kinds {
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,

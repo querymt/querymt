@@ -851,7 +851,12 @@ impl SessionStore for SqliteStorage {
             // delegation telemetry) are intentionally excluded because replaying them in a fork can
             // create contradictory state and duplicate execution traces. The downside is inherited
             // UI telemetry before the fork point is intentionally partial.
-            for (_event_id, timestamp, origin, source_node, kind, payload_json) in conversational_events_to_copy {
+            for (index, (_event_id, timestamp, origin, source_node, kind, payload_json)) in
+                conversational_events_to_copy.into_iter().enumerate()
+            {
+                // Copied events are numbered 1..n so the fork's own sequencer
+                // continues after them.
+                let session_seq = index as i64 + 1;
                 let new_event_id = Uuid::now_v7().to_string();
                 let stream_seq: i64 = tx.query_row(
                     "UPDATE event_journal_seq SET next_seq = next_seq + 1 WHERE id = 1 RETURNING next_seq - 1",
@@ -860,7 +865,7 @@ impl SessionStore for SqliteStorage {
                 )?;
 
                 tx.execute(
-                    "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, kind, payload_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO event_journal (event_id, stream_seq, session_id, timestamp, origin, source_node, kind, payload_json, session_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     params![
                         new_event_id,
                         stream_seq,
@@ -870,6 +875,7 @@ impl SessionStore for SqliteStorage {
                         source_node,
                         kind,
                         payload_json,
+                        session_seq,
                     ],
                 )?;
             }

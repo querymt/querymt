@@ -107,7 +107,7 @@ pub use actor_ref::SessionActorRef;
 pub use cached_transport::{CachedDynMeshTransport, CachedMeshTransport};
 pub use event_forwarder::EventForwarder;
 #[cfg(feature = "remote")]
-pub use event_relay::{EventRelayActor, RelayedEvent};
+pub use event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 #[cfg(feature = "remote")]
 pub use mesh::join_mesh_via_invite;
 #[cfg(feature = "remote")]

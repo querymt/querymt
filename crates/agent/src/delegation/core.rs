@@ -1021,34 +1021,21 @@ async fn execute_delegation(
                         .map(|route| route.bridge.clone())
                 })
         });
+    // Locally hosted children inherit the parent's connection route so the
+    // workspace-query capability follows the delegation. Remote children never
+    // get a route (workspace queries are unavailable for remote sessions).
     if let Some(bridge) = parent_bridge
         && !session_ref.is_remote()
+        && let Some(target) = target
+            .as_any()
+            .downcast_ref::<crate::agent::LocalAgentHandle>()
+        && let Ok(mut bridges) = target.config.session_bridges.lock()
     {
-        match session_ref.set_bridge(bridge.clone()).await {
-            Ok(()) => {
-                child_bridge_connection_id = bridge.connection_id().map(Arc::from);
-                if let Some(target) = target
-                    .as_any()
-                    .downcast_ref::<crate::agent::LocalAgentHandle>()
-                    && let Ok(mut bridges) = target.config.session_bridges.lock()
-                {
-                    bridges.insert(
-                        child_session_id.clone(),
-                        crate::agent::agent_config::SessionBridgeRoute {
-                            bridge,
-                            session_ref: session_ref.clone(),
-                        },
-                    );
-                }
-            }
-            Err(_) => {
-                tracing::warn!(
-                    delegation_id = %delegation.public_id,
-                    child_session_id = %child_session_id,
-                    "Failed to inherit the parent session client bridge"
-                );
-            }
-        }
+        child_bridge_connection_id = bridge.connection_id().map(Arc::from);
+        bridges.insert(
+            child_session_id.clone(),
+            crate::agent::agent_config::SessionBridgeRoute { bridge },
+        );
     }
 
     if let Some(profile_id) = ctx.profile_id.as_deref()
@@ -2492,6 +2479,7 @@ mod tests {
         let requested = storage
             .event_journal()
             .append_durable(&crate::session::projection::NewDurableEvent {
+                session_seq: None,
                 session_id: session.public_id.clone(),
                 origin: crate::events::EventOrigin::Local,
                 source_node: None,

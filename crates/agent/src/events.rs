@@ -201,8 +201,15 @@ impl<'de> Deserialize<'de> for EventOrigin {
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
+    /// Journal `stream_seq` of the producing node (0 for ephemeral events).
+    /// For relayed events this is the host cursor used for dedup and backfill.
     #[typeshare(serialized_as = "number")]
     pub seq: i64,
+    /// Producer-assigned per-session sequence (see [`DurableEvent::session_seq`]).
+    /// `0` when unknown (payloads from older nodes).
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub session_seq: i64,
     #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
     pub session_id: String,
@@ -587,10 +594,22 @@ pub enum AgentEventKind {
         options: Vec<String>,
     },
     PermissionRequested {
+        /// Interaction ID of the pending permission request.
         permission_id: String,
         task_id: Option<String>,
         tool_name: String,
         reason: String,
+        /// Tool call awaiting the decision. Empty for events journaled before
+        /// permission became a pending interaction.
+        #[serde(default)]
+        tool_call_id: String,
+        /// Full ACP `session/request_permission` payload (tool-call update and
+        /// options) so any attached client can render and answer it, local or
+        /// remote. Absent for events journaled before permission became a
+        /// pending interaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "any")]
+        request: Option<crate::acp::protocol::RequestPermissionRequest>,
     },
     PermissionGranted {
         permission_id: String,
@@ -836,6 +855,13 @@ pub struct DurableEvent {
     pub event_id: String,
     #[typeshare(serialized_as = "number")]
     pub stream_seq: i64,
+    /// Per-session sequence assigned at production time. Strictly increasing
+    /// in production order within a session and shared with ephemeral events;
+    /// relayed events keep the host's value. `0` means unsequenced (legacy
+    /// payloads and events produced outside a session sequencer).
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub session_seq: i64,
     pub session_id: String,
     #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
@@ -850,6 +876,7 @@ impl From<DurableEvent> for AgentEvent {
     fn from(de: DurableEvent) -> Self {
         AgentEvent {
             seq: de.stream_seq,
+            session_seq: de.session_seq,
             timestamp: de.timestamp,
             session_id: de.session_id,
             origin: de.origin,
@@ -859,12 +886,17 @@ impl From<DurableEvent> for AgentEvent {
     }
 }
 
-/// An ephemeral event — live delivery only, no persistence, no sequence.
+/// An ephemeral event — live delivery only, no persistence.
 /// Typeshare-annotated: generated for TypeScript and Swift.
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EphemeralEvent {
     pub session_id: String,
+    /// Per-session sequence shared with durable events (see
+    /// [`DurableEvent::session_seq`]); `0` when unsequenced.
+    #[serde(default)]
+    #[typeshare(serialized_as = "number")]
+    pub session_seq: i64,
     #[typeshare(serialized_as = "number")]
     pub timestamp: i64,
     #[typeshare(serialized_as = "string")]
@@ -878,6 +910,7 @@ impl From<EphemeralEvent> for AgentEvent {
     fn from(ee: EphemeralEvent) -> Self {
         AgentEvent {
             seq: 0,
+            session_seq: ee.session_seq,
             timestamp: ee.timestamp,
             session_id: ee.session_id,
             origin: ee.origin,
@@ -892,6 +925,7 @@ impl From<AgentEvent> for EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
             event_id: format!("legacy-{}", event.seq),
             stream_seq: event.seq,
+            session_seq: event.session_seq,
             session_id: event.session_id,
             timestamp: event.timestamp,
             origin: event.origin,
@@ -946,6 +980,14 @@ impl EventEnvelope {
         match self {
             EventEnvelope::Durable(e) => e.stream_seq,
             EventEnvelope::Ephemeral(_) => 0,
+        }
+    }
+
+    /// Per-session production sequence (`0` when unsequenced).
+    pub fn session_seq(&self) -> i64 {
+        match self {
+            EventEnvelope::Durable(e) => e.session_seq,
+            EventEnvelope::Ephemeral(e) => e.session_seq,
         }
     }
 
@@ -1275,8 +1317,52 @@ mod tests {
     // ── AgentEvent clone + debug ───────────────────────────────────────────
 
     #[test]
+    fn payloads_without_session_seq_still_parse() {
+        let durable: DurableEvent = serde_json::from_str(
+            r#"{"event_id":"e1","stream_seq":4,"session_id":"s","timestamp":1,
+                "origin":"local","kind":{"type":"session_created"}}"#,
+        )
+        .expect("legacy durable payload");
+        assert_eq!(durable.session_seq, 0);
+        assert_eq!(durable.stream_seq, 4);
+
+        let ephemeral: EphemeralEvent = serde_json::from_str(
+            r#"{"session_id":"s","timestamp":1,"origin":"local",
+                "kind":{"type":"cancelled"}}"#,
+        )
+        .expect("legacy ephemeral payload");
+        assert_eq!(ephemeral.session_seq, 0);
+
+        let agent_event: AgentEvent = serde_json::from_str(
+            r#"{"seq":9,"timestamp":1,"session_id":"s","kind":{"type":"cancelled"}}"#,
+        )
+        .expect("legacy relayed payload");
+        assert_eq!((agent_event.seq, agent_event.session_seq), (9, 0));
+    }
+
+    #[test]
+    fn session_seq_round_trips_through_serialization() {
+        let event = DurableEvent {
+            event_id: "e".into(),
+            stream_seq: 2,
+            session_seq: 7,
+            session_id: "s".into(),
+            timestamp: 1,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::SessionCreated,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let back: DurableEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.session_seq, 7);
+        let relayed: AgentEvent = event.into();
+        assert_eq!((relayed.seq, relayed.session_seq), (2, 7));
+    }
+
+    #[test]
     fn agent_event_implements_clone() {
         let original = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 1234567890,
             session_id: "sess-1".to_string(),
@@ -1292,6 +1378,7 @@ mod tests {
     #[test]
     fn agent_event_implements_debug() {
         let event = AgentEvent {
+            session_seq: 0,
             seq: 42,
             timestamp: 1234567890,
             session_id: "sess-debug".to_string(),
@@ -1505,11 +1592,101 @@ mod tests {
         assert_eq!(classify_durability(&kind), Durability::Durable);
     }
 
+    fn sample_permission_request() -> crate::acp::protocol::RequestPermissionRequest {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        RequestPermissionRequest::new(
+            "s1".to_string(),
+            ToolCallUpdate::new(ToolCallId::from("call-1".to_string()), {
+                ToolCallUpdateFields::new().title("Run shell")
+            }),
+            vec![PermissionOption::new(
+                PermissionOptionId::from("allow_once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        )
+    }
+
+    #[test]
+    fn classify_permission_requested_is_durable() {
+        let kind = AgentEventKind::PermissionRequested {
+            permission_id: "call-1".into(),
+            task_id: None,
+            tool_name: "shell".into(),
+            reason: "needs permission".into(),
+            tool_call_id: "call-1".into(),
+            request: Some(sample_permission_request()),
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
+    }
+
+    #[test]
+    fn permission_requested_round_trips_full_request_payload() {
+        let kind = AgentEventKind::PermissionRequested {
+            permission_id: "call-1".into(),
+            task_id: Some("t1".into()),
+            tool_name: "shell".into(),
+            reason: "needs permission".into(),
+            tool_call_id: "call-1".into(),
+            request: Some(sample_permission_request()),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "permission_requested");
+        assert_eq!(json["data"]["tool_call_id"], "call-1");
+        assert_eq!(json["data"]["request"]["toolCall"]["toolCallId"], "call-1");
+        assert_eq!(
+            json["data"]["request"]["options"][0]["optionId"],
+            "allow_once"
+        );
+
+        let restored: AgentEventKind = serde_json::from_value(json).unwrap();
+        let AgentEventKind::PermissionRequested {
+            tool_call_id,
+            request,
+            ..
+        } = restored
+        else {
+            panic!("expected PermissionRequested");
+        };
+        assert_eq!(tool_call_id, "call-1");
+        let request = request.expect("request payload survives round trip");
+        assert_eq!(request.options.len(), 1);
+        assert_eq!(request.tool_call.tool_call_id.0.as_ref(), "call-1");
+    }
+
+    #[test]
+    fn permission_requested_loads_legacy_journal_entries() {
+        let legacy = serde_json::json!({
+            "type": "permission_requested",
+            "data": {
+                "permission_id": "p1",
+                "task_id": null,
+                "tool_name": "shell",
+                "reason": "Tool shell requires explicit permission"
+            }
+        });
+        let restored: AgentEventKind = serde_json::from_value(legacy).unwrap();
+        let AgentEventKind::PermissionRequested {
+            tool_call_id,
+            request,
+            ..
+        } = restored
+        else {
+            panic!("expected PermissionRequested");
+        };
+        assert!(tool_call_id.is_empty());
+        assert!(request.is_none());
+    }
+
     // ── DurableEvent construction ──────────────────────────────────────────
 
     #[test]
     fn durable_event_construction_and_fields() {
         let event = DurableEvent {
+            session_seq: 0,
             event_id: "evt-1".into(),
             stream_seq: 42,
             session_id: "sess-1".into(),
@@ -1526,6 +1703,7 @@ mod tests {
     #[test]
     fn durable_event_serde_round_trip() {
         let event = DurableEvent {
+            session_seq: 0,
             event_id: "evt-2".into(),
             stream_seq: 7,
             session_id: "sess-2".into(),
@@ -1547,6 +1725,7 @@ mod tests {
     #[test]
     fn ephemeral_event_construction() {
         let event = EphemeralEvent {
+            session_seq: 0,
             session_id: "sess-e".into(),
             timestamp: 123,
             origin: EventOrigin::Local,
@@ -1564,6 +1743,7 @@ mod tests {
     #[test]
     fn envelope_durable_accessors() {
         let env = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "e1".into(),
             stream_seq: 1,
             session_id: "s1".into(),
@@ -1582,6 +1762,7 @@ mod tests {
     #[test]
     fn envelope_ephemeral_accessors() {
         let env = EventEnvelope::Ephemeral(EphemeralEvent {
+            session_seq: 0,
             session_id: "s2".into(),
             timestamp: 200,
             origin: EventOrigin::Local,
@@ -1631,6 +1812,7 @@ mod tests {
     #[test]
     fn session_metadata_updated_title_clear_survives_persisted_round_trip() {
         let event = DurableEvent {
+            session_seq: 0,
             event_id: "evt-title".into(),
             stream_seq: 7,
             session_id: "sess-title".into(),

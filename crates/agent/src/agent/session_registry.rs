@@ -228,10 +228,6 @@ pub struct SessionRegistry {
     mesh: Option<crate::agent::remote::MeshHandle>,
     #[cfg(feature = "remote")]
     remote_disconnect_tx: Option<mpsc::UnboundedSender<RemoteSessionDisconnect>>,
-    /// Client bridge for workspace queries and notifications. Set once the ACP
-    /// connection is established. Propagated to new session actors via `SetBridge`
-    /// so that tools like `language_query` can access the client's language server.
-    bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
 }
 
 impl SessionRegistry {
@@ -246,17 +242,7 @@ impl SessionRegistry {
             mesh: None,
             #[cfg(feature = "remote")]
             remote_disconnect_tx: None,
-            bridge: None,
         }
-    }
-
-    /// Set the client bridge for ACP communication.
-    ///
-    /// When set, newly created sessions will receive the bridge via `SetBridge`
-    /// so that session actors can send notifications and tools like
-    /// `language_query` can access the client's language server.
-    pub fn set_bridge(&mut self, bridge: crate::acp::client_bridge::ClientBridgeSender) {
-        self.bridge = Some(bridge);
     }
 
     #[cfg(feature = "remote")]
@@ -445,16 +431,6 @@ impl SessionRegistry {
         let actor = { SessionActor::new(self.config.clone(), session_id.clone(), runtime.clone()) };
         let actor_ref = SessionActor::spawn(actor);
         let session_ref = SessionActorRef::from(actor_ref.clone());
-
-        if let Some(ref bridge) = self.bridge
-            && let Err(e) = session_ref.set_bridge(bridge.clone()).await
-        {
-            log::warn!(
-                "Session {}: failed to set bridge on session actor: {}",
-                session_id,
-                e
-            );
-        }
 
         self.sessions
             .insert(session_id.clone(), session_ref.clone());
@@ -897,13 +873,16 @@ pub(crate) async fn prepare_remote_attachment(
         peer_label: peer_label.clone(),
         remote_node_id: remote_node_id.clone(),
     };
-    let relay_ref = EventRelayActor::spawn(EventRelayActor::new(
-        context.event_sink,
-        session_id.clone(),
-        peer_label,
-        remote_node_id,
-        context.disconnect_tx,
-    ));
+    let relay_ref = EventRelayActor::spawn(
+        EventRelayActor::new(
+            context.event_sink,
+            session_id.clone(),
+            peer_label,
+            remote_node_id,
+            context.disconnect_tx,
+        )
+        .with_gap_source(session_ref.clone()),
+    );
     let relay_actor_id = relay_ref.id().sequence_id();
     let mut candidate = PreparedRemoteAttachment {
         armed: true,

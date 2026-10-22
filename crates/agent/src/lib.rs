@@ -47,6 +47,7 @@ pub mod send_agent;
 #[cfg(feature = "api")]
 pub mod server;
 pub mod session;
+pub mod session_event_stream;
 pub mod skills;
 pub mod slash_commands;
 pub mod snapshot;

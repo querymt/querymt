@@ -34,6 +34,47 @@ impl EventJournal for SqliteStorage {
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
     }
 
+    async fn append_durable_batch(
+        &self,
+        events: &[NewDurableEvent],
+    ) -> Vec<SessionResult<DurableEvent>> {
+        if events.is_empty() {
+            return Vec::new();
+        }
+        let batch = events.to_vec();
+        let count = batch.len();
+        let conn_arc = self.conn.clone();
+
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut conn = conn_arc.lock().unwrap();
+            insert_batch(&mut conn, &batch)
+        })
+        .await;
+        match joined {
+            Ok(results) => results,
+            Err(e) => (0..count)
+                .map(|_| Err(SessionError::Other(format!("Task execution failed: {}", e))))
+                .collect(),
+        }
+    }
+
+    fn max_session_seq_blocking(&self, session_id: &str) -> i64 {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            // Local numbering only: relayed rows carry the host's numbers.
+            // The `session_seq IS NOT NULL` term lets SQLite answer MAX from
+            // the partial unique index instead of scanning the session's rows.
+            "SELECT COALESCE(MAX(session_seq), 0) FROM event_journal \
+             WHERE session_id = ?1 AND source_node_id IS NULL AND session_seq IS NOT NULL",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|err| {
+            log::warn!("failed to read max session_seq for {session_id}: {err}");
+            0
+        })
+    }
+
     async fn load_session_stream(
         &self,
         session_id: &str,
@@ -50,18 +91,79 @@ impl EventJournal for SqliteStorage {
             let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
 
             let mut stmt = conn.prepare(
-                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq \
                  FROM event_journal \
                  WHERE session_id = ? AND stream_seq > ? \
                  ORDER BY stream_seq ASC \
                  LIMIT ?",
             )?;
 
-            let events = stmt
+            // Read in index order (no temp sort), then restore production
+            // order only if the journal holds out-of-order sequenced rows.
+            let mut events = stmt
                 .query_map(params![session_id, after, lim], parse_journal_row)?
                 .collect::<Result<Vec<_>, _>>()?;
+            restore_production_order(&mut events);
 
             Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn load_session_page(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let after = after_seq.unwrap_or(0);
+            let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq \
+                 FROM event_journal \
+                 WHERE session_id = ? AND stream_seq > ? \
+                 ORDER BY stream_seq ASC \
+                 LIMIT ?",
+            )?;
+            stmt.query_map(params![session_id, after, lim], parse_journal_row)?
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn load_session_range(
+        &self,
+        session_id: &str,
+        after_session_seq: i64,
+        up_to_session_seq: Option<i64>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            let upper = up_to_session_seq.unwrap_or(i64::MAX);
+            // Served by idx_event_journal_session_order, already in order.
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq \
+                 FROM event_journal \
+                 WHERE session_id = ? AND session_seq > ? AND session_seq <= ? \
+                 ORDER BY session_seq ASC",
+            )?;
+            stmt.query_map(
+                params![session_id, after_session_seq, upper],
+                parse_journal_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
@@ -82,7 +184,7 @@ impl EventJournal for SqliteStorage {
             let lim = limit.map_or(-1, |limit| i64::try_from(limit).unwrap_or(i64::MAX));
 
             let mut stmt = conn.prepare(
-                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json \
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq \
                  FROM event_journal \
                  WHERE stream_seq > ? \
                  ORDER BY stream_seq ASC \
@@ -252,7 +354,7 @@ impl EventJournal for SqliteStorage {
             // Legacy rows remain intact. Once an authoritative snapshot is
             // complete, prefer it over cursorless copies of the same history.
             let mut stmt = conn.prepare(
-                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq
                  FROM event_journal WHERE session_id = ?1 AND (
                      source_node_id = ?2 OR (source_node_id IS NULL AND NOT EXISTS (
                          SELECT 1 FROM remote_session_sync
@@ -295,6 +397,9 @@ fn insert_journal_event(
     source_node_id: Option<&str>,
     source_seq: Option<i64>,
 ) -> Result<Option<DurableEvent>, rusqlite::Error> {
+    // Unset producer sequence is stored as NULL, never 0, so the unique
+    // (session_id, session_seq) index only constrains real sequence numbers.
+    let session_seq = event.session_seq.filter(|seq| *seq > 0);
     let kind_tag = serde_json::to_value(&event.kind)
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
@@ -323,8 +428,8 @@ fn insert_journal_event(
 
     let inserted = conn.execute(
         "INSERT INTO event_journal \
-         (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json, session_seq) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (session_id, source_node_id, source_seq) \
          WHERE source_node_id IS NOT NULL AND source_seq IS NOT NULL DO NOTHING",
         params![
@@ -338,6 +443,7 @@ fn insert_journal_event(
             source_seq,
             kind_tag,
             payload_json,
+            session_seq,
         ],
     )?;
     if inserted == 0 {
@@ -347,12 +453,92 @@ fn insert_journal_event(
     Ok(Some(DurableEvent {
         event_id,
         stream_seq,
+        session_seq: session_seq.unwrap_or(0),
         session_id: event.session_id.clone(),
         timestamp,
         origin: event.origin.clone(),
         source_node: event.source_node.clone(),
         kind: event.kind.clone(),
     }))
+}
+
+/// Reorder events read in `stream_seq` (insert) order into producer
+/// `session_seq` order.
+///
+/// Rows with `session_seq == 0` (legacy or unsequenced annotations) keep their
+/// insert-order slot; the sequenced rows are sorted among the slots they
+/// occupy. Already ordered input (the common case) is left untouched without
+/// allocating.
+fn restore_production_order(events: &mut [DurableEvent]) {
+    let is_ordered = events
+        .iter()
+        .filter(|event| event.session_seq > 0)
+        .map(|event| event.session_seq)
+        .is_sorted();
+    if is_ordered {
+        return;
+    }
+    let slots: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| (event.session_seq > 0).then_some(index))
+        .collect();
+    let mut sequenced: Vec<DurableEvent> = slots.iter().map(|&i| events[i].clone()).collect();
+    sequenced.sort_by_key(|event| (event.session_seq, event.stream_seq));
+    for (slot, event) in slots.into_iter().zip(sequenced) {
+        events[slot] = event;
+    }
+}
+
+/// Persist a batch in one transaction. If any row fails, the transaction is
+/// rolled back and each event is retried on its own so one bad event cannot
+/// fail its neighbours.
+fn insert_batch(
+    conn: &mut rusqlite::Connection,
+    events: &[NewDurableEvent],
+) -> Vec<SessionResult<DurableEvent>> {
+    let batched = (|| -> Result<Vec<DurableEvent>, rusqlite::Error> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut persisted = Vec::with_capacity(events.len());
+        for event in events {
+            let inserted = insert_journal_event(
+                &tx,
+                event,
+                event.source_node_id.as_deref(),
+                event.source_seq,
+            )?;
+            persisted.push(inserted.ok_or(rusqlite::Error::StatementChangedRows(0))?);
+        }
+        tx.commit()?;
+        Ok(persisted)
+    })();
+    match batched {
+        Ok(persisted) => persisted.into_iter().map(Ok).collect(),
+        Err(batch_error) if events.len() == 1 => vec![Err(SessionError::from(batch_error))],
+        Err(batch_error) => {
+            log::debug!("journal batch failed, retrying events individually: {batch_error}");
+            events
+                .iter()
+                .map(|event| {
+                    insert_journal_event(
+                        conn,
+                        event,
+                        event.source_node_id.as_deref(),
+                        event.source_seq,
+                    )
+                    .map_err(SessionError::from)
+                    .and_then(|inserted| {
+                        inserted.ok_or_else(|| {
+                            SessionError::DatabaseError(
+                                "duplicate source-identity event rejected by the journal unique index"
+                                    .to_string(),
+                            )
+                        })
+                    })
+                })
+                .collect()
+        }
+    }
 }
 
 fn parse_journal_row(row: &rusqlite::Row) -> Result<DurableEvent, rusqlite::Error> {
@@ -363,6 +549,7 @@ fn parse_journal_row(row: &rusqlite::Row) -> Result<DurableEvent, rusqlite::Erro
     let origin_str: String = row.get(4)?;
     let source_node: Option<String> = row.get(5)?;
     let payload_json: String = row.get(6)?;
+    let session_seq: Option<i64> = row.get(7)?;
 
     let origin = match origin_str.as_str() {
         "local" => EventOrigin::Local,
@@ -376,6 +563,7 @@ fn parse_journal_row(row: &rusqlite::Row) -> Result<DurableEvent, rusqlite::Erro
     Ok(DurableEvent {
         event_id,
         stream_seq,
+        session_seq: session_seq.unwrap_or(0),
         session_id,
         timestamp,
         origin,

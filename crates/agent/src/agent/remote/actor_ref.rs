@@ -23,7 +23,6 @@ use querymt::chat::ReasoningEffort;
 use querymt_remote::{
     classify_infallible_remote_send_error, classify_remote_send_error_with_timeout_message,
 };
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Location-transparent reference to a `SessionActor`.
@@ -48,6 +47,63 @@ pub enum SessionActorRef {
 }
 
 // ── Constructors ─────────────────────────────────────────────────────────
+
+/// Map a remote send failure of an interaction message.
+///
+/// kameo answers `UnknownMessage` when the remote actor has no handler
+/// registered for the message ID, i.e. the node runs an agent without the
+/// session-interaction contract. Surface that as an explicit upgrade-required
+/// error instead of any fallback.
+#[cfg(feature = "remote")]
+fn map_interaction_send_error(
+    node: &str,
+    error: kameo::error::RemoteSendError<AgentError>,
+    timeout_message: &str,
+) -> AgentError {
+    if matches!(error, kameo::error::RemoteSendError::UnknownMessage { .. }) {
+        return AgentError::RemoteNodeUpgradeRequired {
+            node: node.to_string(),
+        };
+    }
+    SessionActorRef::map_agent_timeout_remote_send_error(error, timeout_message)
+}
+
+#[cfg(all(test, feature = "remote"))]
+mod interaction_error_tests {
+    use super::*;
+    use kameo::error::RemoteSendError;
+    use std::borrow::Cow;
+
+    #[test]
+    fn unregistered_interaction_message_requires_node_upgrade() {
+        let error = map_interaction_send_error(
+            "old-node",
+            RemoteSendError::UnknownMessage {
+                actor_remote_id: Cow::Borrowed("querymt::SessionActor"),
+                message_remote_id: Cow::Borrowed("querymt::ResolveInteraction"),
+            },
+            "timeout",
+        );
+        assert!(
+            matches!(&error, AgentError::RemoteNodeUpgradeRequired { node } if node == "old-node"),
+            "unexpected error: {error:?}"
+        );
+        let acp: AcpError = error.into();
+        assert!(acp.message.contains("must be upgraded"));
+    }
+
+    #[test]
+    fn other_send_failures_stay_transport_or_handler_errors() {
+        let handler = map_interaction_send_error(
+            "n",
+            RemoteSendError::HandlerError(AgentError::Internal("boom".into())),
+            "timeout",
+        );
+        assert!(matches!(handler, AgentError::Internal(_)));
+        let timeout = map_interaction_send_error("n", RemoteSendError::ReplyTimeout, "timed out");
+        assert!(timeout.transport_failure().is_some());
+    }
+}
 
 #[cfg(any(feature = "remote", test))]
 async fn collect_event_stream_pages<F, Fut>(
@@ -217,30 +273,16 @@ impl SessionActorRef {
         )
     )]
     pub async fn prompt_agent(&self, req: PromptRequest) -> Result<PromptResponse, AgentError> {
-        self.prompt_agent_with_bridge(req, None).await
-    }
-
-    pub async fn prompt_agent_with_bridge(
-        &self,
-        req: PromptRequest,
-        bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
-    ) -> Result<PromptResponse, AgentError> {
         match self {
             Self::Local(actor_ref) => actor_ref
-                .ask(messages::Prompt { req, bridge })
+                .ask(messages::Prompt { req })
                 .await
                 .map_err(Self::map_local_agent_send_error),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => {
-                if bridge.is_some() {
-                    return Err(AgentError::Internal(
-                        "client bridges are not supported for remote session prompts".to_string(),
-                    ));
-                }
-
                 actor_ref
-                    .ask(&messages::Prompt { bridge: None, req })
+                    .ask(&messages::Prompt { req })
                     .mailbox_timeout(Self::REMOTE_PROMPT_MAILBOX_TIMEOUT)
                     .reply_timeout(Self::REMOTE_PROMPT_REPLY_TIMEOUT)
                     .send()
@@ -272,16 +314,6 @@ impl SessionActorRef {
         self.prompt_agent(req).await.map_err(AcpError::from)
     }
 
-    pub async fn prompt_with_bridge(
-        &self,
-        req: PromptRequest,
-        bridge: Option<crate::acp::client_bridge::ClientBridgeSender>,
-    ) -> Result<PromptResponse, AcpError> {
-        self.prompt_agent_with_bridge(req, bridge)
-            .await
-            .map_err(AcpError::from)
-    }
-
     pub async fn submit_input(
         &self,
         input: messages::SubmitInput,
@@ -303,6 +335,115 @@ impl SessionActorRef {
                     Self::map_agent_timeout_remote_send_error(
                         error,
                         "SubmitInput timed out on remote session",
+                    )
+                }),
+        }
+    }
+
+    /// Map a remote send failure for the interaction messages. A node that
+    /// does not register these messages answers `UnknownMessage`; that means
+    /// the node runs an older agent and must be upgraded.
+    #[cfg(feature = "remote")]
+    fn map_interaction_remote_error(
+        &self,
+        error: kameo::error::RemoteSendError<AgentError>,
+        timeout_message: &str,
+    ) -> AgentError {
+        map_interaction_send_error(self.node_label(), error, timeout_message)
+    }
+
+    /// Snapshot this session's pending interactions (see
+    /// [`messages::ListPendingInteractions`]).
+    pub async fn list_pending_interactions(
+        &self,
+        assign_authority: Option<String>,
+    ) -> Result<Vec<crate::elicitation::PendingElicitationSnapshot>, AgentError> {
+        let message = messages::ListPendingInteractions { assign_authority };
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(message)
+                .await
+                .map_err(Self::map_local_agent_send_error),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&message)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| {
+                    self.map_interaction_remote_error(
+                        error,
+                        "ListPendingInteractions timed out on remote session",
+                    )
+                }),
+        }
+    }
+
+    /// Claim delivery of pending interactions for a connection (see
+    /// [`messages::ClaimInteractionDelivery`]).
+    pub async fn claim_interaction_delivery(
+        &self,
+        interaction_id: Option<String>,
+        connection_id: String,
+        authority: Option<String>,
+    ) -> Result<Vec<crate::elicitation::ClaimedElicitationDelivery>, AgentError> {
+        let message = messages::ClaimInteractionDelivery {
+            interaction_id,
+            connection_id,
+            authority,
+        };
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(message)
+                .await
+                .map_err(Self::map_local_agent_send_error),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&message)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| {
+                    self.map_interaction_remote_error(
+                        error,
+                        "ClaimInteractionDelivery timed out on remote session",
+                    )
+                }),
+        }
+    }
+
+    /// Resolve a pending interaction (see [`messages::ResolveInteraction`]).
+    pub async fn resolve_interaction(
+        &self,
+        interaction_id: String,
+        connection_id: String,
+        delivery_generation: Option<u64>,
+        response: crate::elicitation::ElicitationResponse,
+    ) -> Result<crate::elicitation::ElicitationResolution, AgentError> {
+        let message = messages::ResolveInteraction {
+            interaction_id,
+            connection_id,
+            delivery_generation,
+            response,
+        };
+        match self {
+            Self::Local(actor_ref) => actor_ref
+                .ask(message)
+                .await
+                .map_err(Self::map_local_agent_send_error),
+            #[cfg(feature = "remote")]
+            Self::Remote { actor_ref, .. } => actor_ref
+                .ask(&message)
+                .mailbox_timeout(Self::REMOTE_CONTROL_MAILBOX_TIMEOUT)
+                .reply_timeout(Self::REMOTE_CONTROL_REPLY_TIMEOUT)
+                .send()
+                .await
+                .map_err(|error| {
+                    self.map_interaction_remote_error(
+                        error,
+                        "ResolveInteraction timed out on remote session",
                     )
                 }),
         }
@@ -848,42 +989,6 @@ impl SessionActorRef {
         }
     }
 
-    /// Set the client bridge for SessionUpdate notifications (local only).
-    ///
-    /// This is a no-op for remote sessions — the bridge is a local channel
-    /// that cannot be serialized across the network. Remote sessions use
-    /// the EventRelay mechanism instead.
-    pub async fn set_bridge(
-        &self,
-        bridge: crate::acp::client_bridge::ClientBridgeSender,
-    ) -> Result<(), AgentError> {
-        match self {
-            Self::Local(actor_ref) => actor_ref
-                .tell(messages::SetBridge { bridge })
-                .await
-                .map_err(|e| AgentError::RemoteActor(e.to_string())),
-
-            #[cfg(feature = "remote")]
-            Self::Remote { .. } => {
-                // Remote sessions use EventRelay, not direct bridge
-                log::debug!("set_bridge called on remote SessionActorRef — ignored");
-                Ok(())
-            }
-        }
-    }
-
-    pub async fn clear_bridge(&self, connection_id: Arc<str>) -> Result<bool, AgentError> {
-        match self {
-            Self::Local(actor_ref) => actor_ref
-                .ask(messages::ClearBridge { connection_id })
-                .await
-                .map_err(|error| AgentError::RemoteActor(error.to_string())),
-
-            #[cfg(feature = "remote")]
-            Self::Remote { .. } => Ok(false),
-        }
-    }
-
     /// Shutdown this session actor gracefully (local only for now).
     pub async fn shutdown(&self) -> Result<(), AgentError> {
         match self {
@@ -1206,6 +1311,7 @@ mod history_paging_tests {
             events: seqs
                 .into_iter()
                 .map(|seq| crate::events::AgentEvent {
+                    session_seq: 0,
                     seq,
                     timestamp: 0,
                     session_id: "s1".into(),

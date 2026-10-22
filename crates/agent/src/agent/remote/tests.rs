@@ -663,6 +663,79 @@ mod event_relay_extended {
         Arc::new(EventSink::new(journal, fanout))
     }
 
+    /// Gap recovery must stop before the received event's `session_seq`, so a
+    /// repair never publishes host events that come after the event being
+    /// delivered.
+    #[tokio::test]
+    async fn test_gap_recovery_stops_before_received_session_seq() {
+        let (host_config, _td) = test_agent_config().await;
+        let (host_ref, session_id) =
+            spawn_test_session_with_id(host_config.clone(), "gap-bound").await;
+        for _ in 0..6 {
+            host_config
+                .event_sink
+                .emit_durable(&session_id, AgentEventKind::Cancelled)
+                .await
+                .unwrap();
+        }
+        let host_events = host_config
+            .event_sink
+            .journal()
+            .load_session_stream(&session_id, None, None)
+            .await
+            .unwrap();
+        assert!(host_events.len() >= 6);
+
+        let local_sink = make_sink().await;
+        let relay = EventRelayActor::new(
+            local_sink.clone(),
+            session_id.clone(),
+            "host".to_string(),
+            Some("node-a".to_string()),
+            None,
+        )
+        .with_gap_source(host_ref);
+        let relay_ref = <EventRelayActor as Spawn>::spawn(relay);
+
+        // Deliver the first host event live, then skip ahead to an ephemeral
+        // event numbered after host_events[3].
+        relay_ref
+            .ask(RelayedEvent {
+                event: AgentEvent::from(host_events[0].clone()),
+            })
+            .await
+            .unwrap();
+        let received_seq = host_events[3].session_seq;
+        relay_ref
+            .ask(RelayedEvent {
+                event: AgentEvent {
+                    session_seq: received_seq,
+                    seq: 0,
+                    timestamp: 1,
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    kind: AgentEventKind::AssistantContentDelta {
+                        content: "t".into(),
+                        message_id: "m".into(),
+                    },
+                },
+            })
+            .await
+            .unwrap();
+
+        let local: Vec<i64> = local_sink
+            .journal()
+            .load_session_stream(&session_id, None, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|event| event.session_seq)
+            .collect();
+        let expected: Vec<i64> = host_events[..3].iter().map(|e| e.session_seq).collect();
+        assert_eq!(local, expected, "recovery must not reach the received seq");
+    }
+
     #[tokio::test]
     async fn test_relay_multiple_events() {
         let sink = make_sink().await;
@@ -679,6 +752,7 @@ mod event_relay_extended {
 
         let events = vec![
             AgentEvent {
+                session_seq: 0,
                 seq: 1,
                 timestamp: 100,
                 session_id: "s1".to_string(),
@@ -687,6 +761,7 @@ mod event_relay_extended {
                 kind: AgentEventKind::SessionCreated,
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 2,
                 timestamp: 200,
                 session_id: "s1".to_string(),
@@ -698,6 +773,7 @@ mod event_relay_extended {
                 },
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 3,
                 timestamp: 300,
                 session_id: "s1".to_string(),
@@ -761,6 +837,7 @@ mod event_relay_extended {
         let mut rx = sink.fanout().subscribe();
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 99,
             timestamp: 555,
             session_id: "unique-session-id-xyz".to_string(),
@@ -799,6 +876,7 @@ mod event_relay_extended {
         let mut rx = sink.fanout().subscribe();
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 7,
             timestamp: 777,
             session_id: "s1".to_string(),
@@ -844,6 +922,7 @@ mod event_relay_extended {
         let mut rx = sink.fanout().subscribe();
 
         let event_a = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 100,
             session_id: "session-a".to_string(),
@@ -852,6 +931,7 @@ mod event_relay_extended {
             kind: AgentEventKind::SessionCreated,
         };
         let event_b = AgentEvent {
+            session_seq: 0,
             seq: 2,
             timestamp: 200,
             session_id: "session-b".to_string(),

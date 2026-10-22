@@ -230,7 +230,6 @@ impl TestHarness {
         crate::agent::execution::execute_cycle_state_machine(
             &self.config,
             &mut self.exec_ctx,
-            None,
             crate::agent::core::AgentMode::Build,
         )
         .await
@@ -1292,7 +1291,6 @@ async fn test_llm_error_returns_err() {
     let result = crate::agent::execution::execute_cycle_state_machine(
         &harness.config,
         &mut harness.exec_ctx,
-        None,
         crate::agent::core::AgentMode::Build,
     )
     .await;

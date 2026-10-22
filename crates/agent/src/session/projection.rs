@@ -123,17 +123,46 @@ pub struct NewDurableEvent {
     /// `None` for locally produced events and for relayed events that carry
     /// no usable source cursor.
     pub source_seq: Option<i64>,
+    /// Producer-assigned per-session sequence (see `DurableEvent::session_seq`).
+    /// For relayed events this is the host's value. `None` leaves the column
+    /// unset (annotation events and callers outside a session sequencer).
+    pub session_seq: Option<i64>,
     pub kind: AgentEventKind,
 }
 
-/// Durable event journal — single source of truth for event ordering.
+/// Durable event journal — persistence and replay of a session's events.
 ///
-/// Sequence assignment is the authority of the journal implementation.
-/// Producers never set `stream_seq`; it is assigned atomically on append.
+/// Ordering authority is split in two:
+/// - Producers set `session_seq` (the per-session production order) before
+///   appending; session replay orders by it.
+/// - The journal still assigns `stream_seq` atomically on append; it is the
+///   insert-order cursor for global-stream consumers and the host cursor for
+///   remote dedup and backfill.
 #[async_trait]
 pub trait EventJournal: Send + Sync {
     /// Persist a durable event and return it with assigned `event_id` and `stream_seq`.
     async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent>;
+
+    /// Persist consecutive durable events in order, returning one result per
+    /// input. Implementations should write the batch in a single transaction;
+    /// the default appends one by one.
+    async fn append_durable_batch(
+        &self,
+        events: &[NewDurableEvent],
+    ) -> Vec<SessionResult<DurableEvent>> {
+        let mut results = Vec::with_capacity(events.len());
+        for event in events {
+            results.push(self.append_durable(event).await);
+        }
+        results
+    }
+
+    /// Highest producer `session_seq` persisted for a session (0 when none).
+    /// Synchronous because a session's sequence counter is created at emit
+    /// time, which is not async; it runs once per session per process.
+    fn max_session_seq_blocking(&self, _session_id: &str) -> i64 {
+        0
+    }
 
     /// Load the durable event stream for a session, optionally starting after a cursor.
     /// `None` loads all matching events; `Some(limit)` returns at most that many.
@@ -143,6 +172,49 @@ pub trait EventJournal: Send + Sync {
         after_seq: Option<i64>,
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>>;
+
+    /// Load one page of a session's durable events strictly in `stream_seq`
+    /// order, with no production-order restoration.
+    ///
+    /// Pages served to other nodes (backfill, gap recovery) must have a
+    /// strictly increasing `stream_seq`, because the receiver uses it as its
+    /// cursor and rejects pages that go backwards. The default falls back to
+    /// [`Self::load_session_stream`] and re-sorts.
+    async fn load_session_page(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let mut events = self
+            .load_session_stream(session_id, after_seq, limit)
+            .await?;
+        events.sort_by_key(|event| event.stream_seq);
+        Ok(events)
+    }
+
+    /// Load a session's durable events with `session_seq` in
+    /// `(after_session_seq, up_to_session_seq]` (`None` = no upper bound), in
+    /// production order. Used by live consumers to recover events they missed
+    /// (broadcast lag or a sequence gap). Unsequenced rows (`session_seq` 0)
+    /// are never returned.
+    ///
+    /// The default filters the full stream; storage backends should override
+    /// it with an indexed range read.
+    async fn load_session_range(
+        &self,
+        session_id: &str,
+        after_session_seq: i64,
+        up_to_session_seq: Option<i64>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        let mut events = self.load_session_stream(session_id, None, None).await?;
+        events.retain(|event| {
+            event.session_seq > after_session_seq
+                && up_to_session_seq.is_none_or(|upper| event.session_seq <= upper)
+        });
+        events.sort_by_key(|event| event.session_seq);
+        Ok(events)
+    }
 
     /// Load events across all sessions (global stream), after a given sequence.
     /// `None` loads all matching events; `Some(limit)` returns at most that many.

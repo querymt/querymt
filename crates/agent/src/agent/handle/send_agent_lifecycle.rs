@@ -167,12 +167,8 @@ impl LocalAgentHandle {
         };
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
-        // Pass the bridge for setup outside the lock
         if let Some(prepared) = prepared.as_ref() {
-            let bridge = self.bridge.lock().ok().and_then(|guard| guard.clone());
-            self.session_materializer
-                .finalize_session(prepared, bridge)
-                .await?;
+            self.session_materializer.finalize_session(prepared).await?;
         }
 
         // Get current per-session settings for the response.

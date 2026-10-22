@@ -2144,6 +2144,39 @@ fn migrations_are_idempotent() {
     assert_eq!(count_after_first, count_after_second);
 }
 
+/// `apply_migrations` keys on the full version string and records it with
+/// `INSERT OR IGNORE`. Two entries sharing a string would both run on a fresh
+/// database, but the second would be silently skipped on any database that
+/// already applied the first. Numeric prefixes may repeat across branches
+/// (different full names are fine); full strings must not.
+#[test]
+fn migration_versions_are_unique_and_well_formed() {
+    let mut seen = std::collections::HashSet::new();
+    for migration in MIGRATIONS {
+        let version = migration.version;
+        assert!(
+            seen.insert(version),
+            "duplicate migration version `{version}`: a duplicate is silently skipped on \
+             databases that already applied it"
+        );
+
+        let (number, name) = version
+            .split_once('_')
+            .unwrap_or_else(|| panic!("migration version `{version}` must be `NNNN_name`"));
+        assert!(
+            number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit()),
+            "migration version `{version}` must start with a four-digit number"
+        );
+        assert!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "migration version `{version}` name must be non-empty lowercase snake_case"
+        );
+    }
+}
+
 #[tokio::test]
 async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill() {
     let db = tempfile::NamedTempFile::new().unwrap();
@@ -2686,6 +2719,7 @@ async fn custom_model_crud_round_trip() {
 
 fn new_durable(session_id: &str, kind: AgentEventKind) -> NewDurableEvent {
     NewDurableEvent {
+        session_seq: None,
         session_id: session_id.to_string(),
         origin: EventOrigin::Local,
         source_node: None,
@@ -2960,6 +2994,7 @@ async fn journal_append_durable_returns_correct_fields() {
 
     let evt = journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: "sess-x".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("node-a".to_string()),
@@ -3189,6 +3224,281 @@ async fn journal_ordering_is_monotonic_per_stream() {
             "stream_seq must be strictly increasing"
         );
     }
+}
+
+#[tokio::test]
+async fn journal_replay_orders_by_producer_session_seq() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    // Persisted in the opposite order from production (as racing writers did).
+    for (seq, kind) in [
+        (2, AgentEventKind::Cancelled),
+        (1, AgentEventKind::SessionCreated),
+    ] {
+        let mut event = new_durable("s1", kind);
+        event.session_seq = Some(seq);
+        journal.append_durable(&event).await.unwrap();
+    }
+
+    let events = journal.load_session_stream("s1", None, None).await.unwrap();
+    let seqs: Vec<i64> = events.iter().map(|e| e.session_seq).collect();
+    assert_eq!(seqs, vec![1, 2], "replay follows production order");
+    assert!(matches!(events[0].kind, AgentEventKind::SessionCreated));
+    assert_eq!(journal.max_session_seq_blocking("s1"), 2);
+    assert_eq!(journal.max_session_seq_blocking("other"), 0);
+}
+
+#[tokio::test]
+async fn journal_rejects_duplicate_session_seq_but_allows_unsequenced_rows() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut sequenced = new_durable("s1", AgentEventKind::SessionCreated);
+    sequenced.session_seq = Some(1);
+    journal.append_durable(&sequenced).await.unwrap();
+    assert!(
+        journal.append_durable(&sequenced).await.is_err(),
+        "(session_id, session_seq) is unique"
+    );
+
+    // Unsequenced rows (annotations) store NULL and never collide.
+    for _ in 0..2 {
+        let stored = journal
+            .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+            .await
+            .unwrap();
+        assert_eq!(stored.session_seq, 0);
+    }
+}
+
+#[tokio::test]
+async fn journal_batch_append_keeps_order_and_isolates_failures() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let batch: Vec<NewDurableEvent> = (1..=3)
+        .map(|seq| {
+            let mut event = new_durable("s1", AgentEventKind::Cancelled);
+            event.session_seq = Some(seq);
+            event
+        })
+        .collect();
+    let results = journal.append_durable_batch(&batch).await;
+    let stored: Vec<i64> = results
+        .iter()
+        .map(|r| r.as_ref().unwrap().session_seq)
+        .collect();
+    assert_eq!(stored, vec![1, 2, 3]);
+
+    // One colliding event fails alone; its neighbours still persist.
+    let mut next = batch.clone();
+    next[1].session_seq = Some(2); // duplicate of the stored row
+    next[0].session_seq = Some(4);
+    next[2].session_seq = Some(5);
+    let results = journal.append_durable_batch(&next).await;
+    assert!(results[0].is_ok() && results[1].is_err() && results[2].is_ok());
+    assert_eq!(journal.max_session_seq_blocking("s1"), 5);
+}
+
+#[tokio::test]
+async fn journal_relayed_events_keep_host_session_seq_and_dedup() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut event = new_durable("s1", AgentEventKind::SessionCreated);
+    event.origin = EventOrigin::Remote;
+    event.source_node_id = Some("node-a".to_string());
+    event.source_seq = Some(40);
+    event.session_seq = Some(7);
+
+    let stored = journal
+        .append_durable_from_source(&event)
+        .await
+        .unwrap()
+        .expect("first relay persists");
+    assert_eq!(stored.session_seq, 7, "host sequence is kept as-is");
+    assert!(
+        journal
+            .append_durable_from_source(&event)
+            .await
+            .unwrap()
+            .is_none(),
+        "replayed relay is a no-op"
+    );
+
+    let replay = journal.load_session_stream("s1", None, None).await.unwrap();
+    assert_eq!(replay.len(), 1);
+    assert_eq!(replay[0].session_seq, 7);
+}
+
+/// The host's numbering is a separate sequence: a relayed row may carry the
+/// same `session_seq` as a local row without being rejected, and the local
+/// counter ignores relayed numbers.
+#[tokio::test]
+async fn journal_relayed_session_seq_does_not_collide_with_local_numbering() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut local = new_durable("s1", AgentEventKind::SessionCreated);
+    local.session_seq = Some(1);
+    journal.append_durable(&local).await.unwrap();
+
+    let mut relayed = new_durable("s1", AgentEventKind::Cancelled);
+    relayed.origin = EventOrigin::Remote;
+    relayed.source_node_id = Some("node-a".to_string());
+    relayed.source_seq = Some(90);
+    relayed.session_seq = Some(1);
+    assert!(
+        journal
+            .append_durable_from_source(&relayed)
+            .await
+            .unwrap()
+            .is_some(),
+        "relayed row with the same number as a local row is stored"
+    );
+
+    let mut high = relayed.clone();
+    high.source_seq = Some(91);
+    high.session_seq = Some(500);
+    journal.append_durable_from_source(&high).await.unwrap();
+    assert_eq!(
+        journal.max_session_seq_blocking("s1"),
+        1,
+        "local counter ignores relayed numbers"
+    );
+
+    // Local numbers stay unique.
+    assert!(journal.append_durable(&local).await.is_err());
+}
+
+/// Pages served to other nodes are strictly increasing in `stream_seq` even
+/// when the rows were stored out of production order.
+#[tokio::test]
+async fn journal_page_is_raw_stream_seq_order_while_replay_restores_production_order() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    for seq in [3, 1, 2] {
+        let mut event = new_durable("s1", AgentEventKind::Cancelled);
+        event.session_seq = Some(seq);
+        journal.append_durable(&event).await.unwrap();
+    }
+
+    let page = journal.load_session_page("s1", None, None).await.unwrap();
+    let stream: Vec<i64> = page.iter().map(|e| e.stream_seq).collect();
+    assert!(stream.windows(2).all(|w| w[0] < w[1]), "{stream:?}");
+    let session: Vec<i64> = page.iter().map(|e| e.session_seq).collect();
+    assert_eq!(session, vec![3, 1, 2], "raw insert order");
+
+    let replay = journal.load_session_stream("s1", None, None).await.unwrap();
+    let session: Vec<i64> = replay.iter().map(|e| e.session_seq).collect();
+    assert_eq!(session, vec![1, 2, 3], "replay follows production order");
+
+    let tail = journal
+        .load_session_page("s1", Some(page[0].stream_seq), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].stream_seq, page[1].stream_seq);
+}
+
+/// Unsequenced rows keep their insert slot instead of jumping to the front.
+#[tokio::test]
+async fn journal_replay_keeps_unsequenced_rows_in_their_slot() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let journal: &dyn EventJournal = &storage;
+
+    let mut a = new_durable("s1", AgentEventKind::SessionCreated);
+    a.session_seq = Some(2);
+    journal.append_durable(&a).await.unwrap();
+    journal
+        .append_durable(&new_durable("s1", AgentEventKind::Cancelled))
+        .await
+        .unwrap();
+    let mut b = new_durable("s1", AgentEventKind::SessionCreated);
+    b.session_seq = Some(1);
+    journal.append_durable(&b).await.unwrap();
+
+    let replay = journal.load_session_stream("s1", None, None).await.unwrap();
+    let session: Vec<i64> = replay.iter().map(|e| e.session_seq).collect();
+    assert_eq!(session, vec![1, 0, 2]);
+}
+
+#[test]
+fn migration_0024_backfills_local_rows_from_stream_order_and_leaves_relayed_null() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|m| m.version != "0024_event_journal_session_seq")
+    {
+        (migration.apply)(&mut conn).unwrap();
+    }
+
+    let insert = |id: &str, stream_seq: i64, session: &str, origin: &str, node_id: Option<&str>| {
+        conn.execute(
+            "INSERT INTO event_journal \
+             (event_id, stream_seq, session_id, timestamp, origin, source_node, source_node_id, source_seq, kind, payload_json) \
+             VALUES (?1, ?2, ?3, 1, ?4, NULL, ?5, ?6, 'cancelled', '{\"type\":\"cancelled\"}')",
+            rusqlite::params![id, stream_seq, session, origin, node_id, node_id.map(|_| stream_seq)],
+        )
+        .unwrap();
+    };
+    insert("a1", 1, "s1", "local", None);
+    insert("b1", 2, "s2", "local", None);
+    insert("a2", 3, "s1", "local", None);
+    insert("r1", 4, "s1", "remote", Some("node-a"));
+    insert("a3", 5, "s1", "local", None);
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0024_event_journal_session_seq")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent.
+    (migration.apply)(&mut conn).unwrap();
+
+    let seq_of = |id: &str| -> Option<i64> {
+        conn.query_row(
+            "SELECT session_seq FROM event_journal WHERE event_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(seq_of("a1"), Some(1));
+    assert_eq!(seq_of("a2"), Some(2));
+    assert_eq!(seq_of("a3"), Some(3));
+    assert_eq!(seq_of("b1"), Some(1), "numbering is per session");
+    assert_eq!(seq_of("r1"), None, "relayed legacy rows stay unnumbered");
+
+    let index_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_event_journal_session_order'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(index_exists, 1);
+}
+
+#[tokio::test]
+async fn file_databases_use_wal_with_normal_synchronous() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = SqliteStorage::connect(dir.path().join("journal.db"))
+        .await
+        .unwrap();
+    let conn = storage.conn_for_test();
+    let conn = conn.lock().unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+        .unwrap();
+    let synchronous: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
+    assert_eq!(synchronous, 1, "NORMAL");
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -4160,6 +4470,7 @@ async fn recent_models_view_reads_from_event_journal() {
     let journal: &dyn EventJournal = &storage;
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: session_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,
@@ -4228,6 +4539,7 @@ async fn recent_models_view_respects_limit_per_workspace() {
     ] {
         journal
             .append_durable(&NewDurableEvent {
+                session_seq: None,
                 session_id: session_id.clone(),
                 origin: EventOrigin::Local,
                 source_node: None,
@@ -4265,6 +4577,7 @@ async fn journal_preserves_remote_origin_and_source_node() {
 
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: "s1".to_string(),
             origin: EventOrigin::Remote,
             source_node: Some("peer-42".to_string()),

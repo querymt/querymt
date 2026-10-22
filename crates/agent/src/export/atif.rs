@@ -539,6 +539,7 @@ mod tests {
     fn atif_from_events_with_tool_calls_produces_correct_steps() {
         let events = vec![
             AgentEvent {
+                session_seq: 0,
                 seq: 1,
                 timestamp: 1234567890,
                 session_id: "sess-1".to_string(),
@@ -550,6 +551,7 @@ mod tests {
                 },
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 2,
                 timestamp: 1234567891,
                 session_id: "sess-1".to_string(),
@@ -558,6 +560,7 @@ mod tests {
                 kind: AgentEventKind::LlmRequestStart { message_count: 1 },
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 3,
                 timestamp: 1234567892,
                 session_id: "sess-1".to_string(),
@@ -570,6 +573,7 @@ mod tests {
                 },
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 4,
                 timestamp: 1234567893,
                 session_id: "sess-1".to_string(),
@@ -752,6 +756,7 @@ mod tests {
     fn atif_metrics_accumulation() {
         let events = vec![
             AgentEvent {
+                session_seq: 0,
                 seq: 1,
                 timestamp: 1234567890,
                 session_id: "sess-1".to_string(),
@@ -760,6 +765,7 @@ mod tests {
                 kind: AgentEventKind::LlmRequestStart { message_count: 1 },
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 2,
                 timestamp: 1234567891,
                 session_id: "sess-1".to_string(),

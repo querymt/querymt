@@ -26,9 +26,9 @@
 use crate::acp::client_bridge::{ClientBridgeMessage, ClientBridgeSender};
 use crate::acp::protocol::{Error, ExtNotification, RequestPermissionResponse};
 use crate::acp::shared::{
-    AcpLiveEventTranslator, PendingElicitationMap, PermissionMap, RpcDispatchContext,
-    RpcDispatchState, RpcMessage, SessionOwnerMap, collect_event_sources,
-    convert_elicitation_response_value, create_elicitation_request,
+    AcpLiveEventTranslator, PendingElicitationMap, RpcDispatchContext, RpcDispatchState,
+    RpcMessage, SessionOwnerMap, collect_event_sources, convert_elicitation_response_value,
+    convert_permission_response_value, create_elicitation_request,
     dispatch_rpc_message_with_context, is_event_owned,
 };
 use crate::acp::shutdown;
@@ -57,7 +57,6 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub(crate) struct WsServerState {
     pub(crate) agent: Arc<crate::agent::LocalAgentHandle>,
-    pub(crate) pending_permissions: PermissionMap,
     pub(crate) pending_elicitations: PendingElicitationMap,
     pub(crate) event_sources: Vec<Arc<EventFanout>>,
     pub(crate) session_owners: SessionOwnerMap,
@@ -71,7 +70,6 @@ impl WsServerState {
     pub(crate) fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
         Self {
             event_sources: collect_event_sources(&agent),
-            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
             pending_elicitations: agent.pending_elicitations(),
             session_owners: SessionOwnerMap::default(),
             connection_bridges: Arc::new(Mutex::new(HashMap::new())),
@@ -467,6 +465,210 @@ async fn cancel_unredeliverable_elicitation(
     }
 }
 
+/// Deliver a claimed permission interaction as a standard ACP
+/// `session/request_permission` request and resolve the selected option through
+/// the owning session.
+///
+/// Transport failure, disconnect, a client-side `cancelled` outcome and
+/// malformed answers are *undelivered*: the interaction stays pending and is
+/// re-delivered to the next eligible client. Only an explicitly selected option
+/// resolves it.
+pub(crate) async fn deliver_claimed_websocket_permission(
+    agent: Arc<crate::agent::LocalAgentHandle>,
+    claim: crate::elicitation::ClaimedElicitationDelivery,
+    connection: ConnectionEventState,
+) -> Result<(), Error> {
+    let ConnectionEventState {
+        conn_id: connection_id,
+        tx,
+        pending_requests,
+        request_counter,
+        connection_cancel,
+        ..
+    } = connection;
+    let crate::elicitation::InteractionKind::Permission { request } = &claim.kind else {
+        return Ok(());
+    };
+    let pending = send_websocket_request(
+        &tx,
+        &pending_requests,
+        &request_counter,
+        &connection_id,
+        "session/request_permission",
+        request,
+    )
+    .await?;
+
+    tokio::spawn(async move {
+        let mut claim = claim;
+        let mut pending = pending;
+        let mut redeliveries_left = MAX_VALIDATION_REDELIVERIES;
+        loop {
+            let value = match wait_for_websocket_elicitation_response(
+                pending,
+                pending_requests.clone(),
+                connection_cancel.clone(),
+            )
+            .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    log::warn!(
+                        "WebSocket permission delivery ended without an answer: session_id={} permission_id={} error={}",
+                        claim.session_id,
+                        claim.elicitation_id,
+                        error
+                    );
+                    return;
+                }
+            };
+            let failure = match convert_permission_response_value(value) {
+                Ok(None) => {
+                    log::debug!(
+                        "WebSocket permission request dismissed by client, staying pending: session_id={} permission_id={}",
+                        claim.session_id,
+                        claim.elicitation_id
+                    );
+                    return;
+                }
+                Ok(Some(response)) => {
+                    match crate::elicitation::resolve_claimed_elicitation(
+                        agent.as_ref(),
+                        &claim.session_id,
+                        &claim.elicitation_id,
+                        &connection_id,
+                        claim.delivery_generation,
+                        response,
+                    )
+                    .await
+                    {
+                        // Resolved, superseded by another connection, or already
+                        // decided elsewhere: this delivery is finished.
+                        Ok(_) => return,
+                        Err(error) => error,
+                    }
+                }
+                Err(error) => error,
+            };
+            log::warn!(
+                "WebSocket permission answer rejected, request stays pending: session_id={} permission_id={} error={}",
+                claim.session_id,
+                claim.elicitation_id,
+                failure.message
+            );
+            if redeliveries_left == 0 {
+                return;
+            }
+            redeliveries_left -= 1;
+            let Some(next_claim) = crate::elicitation::claim_live_elicitation_delivery(
+                agent.as_ref(),
+                &claim.session_id,
+                &claim.elicitation_id,
+                &connection_id,
+            )
+            .await
+            else {
+                return;
+            };
+            let crate::elicitation::InteractionKind::Permission { request } = &next_claim.kind
+            else {
+                return;
+            };
+            match send_websocket_request(
+                &tx,
+                &pending_requests,
+                &request_counter,
+                &connection_id,
+                "session/request_permission",
+                request,
+            )
+            .await
+            {
+                Ok(next_pending) => {
+                    pending = next_pending;
+                    claim = next_claim;
+                }
+                Err(_) => return,
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Claim and deliver every pending permission interaction of `session_id` that
+/// `conn_id` does not already hold. Called when a connection attaches to a
+/// session so a request raised while no client was attached is not lost.
+pub(crate) async fn redeliver_pending_permissions(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    session_id: &str,
+    connection: &ConnectionEventState,
+) {
+    for permission_id in crate::elicitation::undelivered_permission_ids_for_session(
+        agent.as_ref(),
+        session_id,
+        &connection.conn_id,
+    )
+    .await
+    {
+        let Some(claim) = crate::elicitation::claim_live_elicitation_delivery(
+            agent.as_ref(),
+            session_id,
+            &permission_id,
+            &connection.conn_id,
+        )
+        .await
+        else {
+            continue;
+        };
+        if let Err(error) =
+            deliver_claimed_websocket_permission(agent.clone(), claim, connection.clone()).await
+        {
+            log::warn!("Failed to re-deliver pending permission {permission_id}: {error}");
+            break;
+        }
+    }
+}
+
+/// Deliver every pending interaction the recovery attach just claimed for
+/// `connection`, each through the sender that matches its kind.
+///
+/// A recovery attach claims permissions and form questions together. A
+/// permission has no form to render, so it MUST go out as a standard
+/// `session/request_permission`; sending it through the question sender would
+/// fail to build a form and silently drop it, leaving the tool waiting.
+pub(crate) async fn deliver_attached_interactions(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    recovery: &crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
+    session_id: &str,
+    connection: &ConnectionEventState,
+) {
+    for claim in crate::elicitation::claimed_elicitation_deliveries(
+        agent.as_ref(),
+        session_id,
+        &connection.conn_id,
+    )
+    .await
+    {
+        let result = match claim.kind {
+            crate::elicitation::InteractionKind::Permission { .. } => {
+                deliver_claimed_websocket_permission(agent.clone(), claim, connection.clone()).await
+            }
+            _ => {
+                deliver_claimed_websocket_elicitation(
+                    agent.clone(),
+                    recovery.clone(),
+                    claim,
+                    connection.clone(),
+                )
+                .await
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("Failed to re-deliver attached interaction: {error}");
+        }
+    }
+}
+
 pub(crate) async fn deliver_claimed_websocket_elicitation(
     agent: Arc<crate::agent::LocalAgentHandle>,
     recovery: crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
@@ -839,6 +1041,10 @@ async fn handle_websocket_connection(
         forwarded_elicitations,
         request_counter: request_counter.clone(),
         connection_cancel: connection_cancel.clone(),
+        delivery: crate::acp::delivery::ConnectionDelivery::new(
+            Some(state.agent.config.event_sink.journal().clone()),
+            connection_cancel.clone(),
+        ),
     };
     // One projection context per connection: the RPC dispatcher parses the
     // negotiated Preview capabilities into it at initialize, and the event
@@ -887,6 +1093,19 @@ async fn handle_websocket_connection(
                                 .map(|request| request.session_id)
                             })
                             .flatten();
+                        let permission_attach_session = (request.method
+                            == crate::acp::protocol::AGENT_METHOD_NAMES.session_load
+                            || request.method
+                                == crate::acp::protocol::AGENT_METHOD_NAMES.session_resume)
+                            .then(|| {
+                                request
+                                    .params
+                                    .get("sessionId")
+                                    .and_then(|value| value.as_str())
+                                    .map(str::to_string)
+                            })
+                            .flatten()
+                            .or_else(|| attach_session.clone());
                         let state_dispatch = state_receive.clone();
                         let conn_id_dispatch = conn_id_receive.clone();
                         let connection_dispatch = connection_receive.clone();
@@ -898,7 +1117,6 @@ async fn handle_websocket_connection(
                                 RpcDispatchState {
                                     agent: state_dispatch.agent.clone(),
                                     session_owners: state_dispatch.session_owners.clone(),
-                                    pending_permissions: state_dispatch.pending_permissions.clone(),
                                     pending_elicitations: state_dispatch
                                         .pending_elicitations
                                         .clone(),
@@ -914,9 +1132,25 @@ async fn handle_websocket_connection(
                                     ),
                                     translator: Some(translator_dispatch.clone()),
                                     session_load: Some(session_load_dispatch.clone()),
+                                    delivery: Some(connection_dispatch.delivery.clone()),
                                 },
                             )
                             .await;
+                            if let Some(session_id) = permission_attach_session
+                                && state_dispatch
+                                    .session_owners
+                                    .lock()
+                                    .await
+                                    .get(&session_id)
+                                    .is_some_and(|owners| owners.contains(&conn_id_dispatch))
+                            {
+                                redeliver_pending_permissions(
+                                    &state_dispatch.agent,
+                                    &session_id,
+                                    &connection_dispatch,
+                                )
+                                .await;
+                            }
                             if let Some(session_id) = attach_session
                                 && state_dispatch
                                     .session_owners
@@ -925,26 +1159,13 @@ async fn handle_websocket_connection(
                                     .get(&session_id)
                                     .is_some_and(|owners| owners.contains(&conn_id_dispatch))
                             {
-                                for claim in crate::elicitation::claimed_elicitation_deliveries(
-                                    state_dispatch.agent.as_ref(),
+                                deliver_attached_interactions(
+                                    &state_dispatch.agent,
+                                    &state_dispatch.elicitation_recovery,
                                     &session_id,
-                                    &conn_id_dispatch,
+                                    &connection_dispatch,
                                 )
-                                .await
-                                {
-                                    if let Err(error) = deliver_claimed_websocket_elicitation(
-                                        state_dispatch.agent.clone(),
-                                        state_dispatch.elicitation_recovery.clone(),
-                                        claim,
-                                        connection_dispatch.clone(),
-                                    )
-                                    .await
-                                    {
-                                        log::warn!(
-                                            "Failed to re-deliver attached elicitation: {error}"
-                                        );
-                                    }
-                                }
+                                .await;
                             }
                         });
                     }
@@ -1080,6 +1301,9 @@ pub(crate) struct ConnectionEventState {
     pub(crate) forwarded_elicitations: Arc<Mutex<HashSet<(String, String)>>>,
     pub(crate) request_counter: Arc<AtomicU64>,
     pub(crate) connection_cancel: CancellationToken,
+    /// Per-session delivered position of this connection: dedups, recovers
+    /// lag/gaps from the journal and backs the prompt-response wait.
+    pub(crate) delivery: Arc<crate::acp::delivery::ConnectionDelivery>,
 }
 
 fn spawn_global_notification_forwarders(state: WsServerState, connection: ConnectionEventState) {
@@ -1196,119 +1420,222 @@ pub(crate) fn spawn_event_forwarders(
 
         tokio::spawn(async move {
             let connection_cancel = connection_events.connection_cancel.clone();
+            let delivery = connection_events.delivery.clone();
             loop {
-                let event = tokio::select! {
+                let batch = tokio::select! {
                     _ = connection_cancel.cancelled() => break,
                     result = events.recv() => match result {
-                        Ok(event) => event,
-                        Err(_) => break,
+                        Ok(event) => delivery.admit(event).await,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Recover the missed durable range from the journal and
+                            // keep going; a lag must never end the connection's
+                            // session updates.
+                            log::warn!(
+                                "WebSocket event forwarder lagged: conn_id={} skipped={skipped}",
+                                connection_events.conn_id
+                            );
+                            let recovered = delivery.recover_after_lag().await;
+                            let keep_going = forward_admitted(
+                                &state_events,
+                                &connection_events,
+                                &translator,
+                                recovered,
+                            )
+                            .await;
+                            delivery.finish_lag_recovery();
+                            if !keep_going {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
                 };
-                if matches!(
-                    event.kind(),
-                    crate::events::AgentEventKind::RunCompleted { .. }
-                        | crate::events::AgentEventKind::ToolCallEnd { .. }
-                        | crate::events::AgentEventKind::Cancelled
-                ) {
-                    state_events
-                        .elicitation_recovery
-                        .retire_session_if_idle(event.session_id(), state_events.agent.as_ref())
-                        .await;
-                }
-                if !is_event_owned(
-                    &state_events.session_owners,
-                    &connection_events.conn_id,
-                    &event,
-                )
-                .await
-                {
-                    continue;
-                }
-
-                if let crate::events::AgentEventKind::ElicitationRequested {
-                    elicitation_id,
-                    session_id,
-                    ..
-                } = event.kind()
-                {
-                    let key = (session_id.clone(), elicitation_id.clone());
-                    if !connection_events
-                        .forwarded_elicitations
-                        .lock()
-                        .await
-                        .insert(key)
-                    {
-                        continue;
-                    }
-
-                    if let Some(resume_authority) = state_events
-                        .elicitation_recovery
-                        .issue_for_session(
-                            &connection_events.conn_id,
-                            session_id,
-                            state_events.agent.as_ref(),
-                        )
-                        .await
-                    {
-                        let notification = crate::control::elicitation_recovery::ElicitationRecoveryAuthorityNotification {
-                            version: crate::control::elicitation_recovery::ELICITATION_RECOVERY_VERSION,
-                            session_id: session_id.clone(),
-                            resume_authority,
-                        };
-                        if send_websocket_notification(
-                            &connection_events.tx,
-                            crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION,
-                            &notification,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
-
-                    let Some(claim) = state_events
-                        .elicitation_recovery
-                        .claim_live_delivery(
-                            &connection_events.conn_id,
-                            session_id,
-                            elicitation_id,
-                            state_events.agent.as_ref(),
-                        )
-                        .await
-                    else {
-                        continue;
-                    };
-                    if let Err(error) = deliver_claimed_websocket_elicitation(
-                        state_events.agent.clone(),
-                        state_events.elicitation_recovery.clone(),
-                        claim,
-                        connection_events.clone(),
-                    )
-                    .await
-                    {
-                        log::warn!(
-                            "Failed to deliver WebSocket elicitation: session_id={} elicitation_id={} error={}",
-                            session_id,
-                            elicitation_id,
-                            error
-                        );
-                        break;
-                    }
-                    continue;
-                }
-
-                let notifications = translator
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .translate_notifications(&event);
-                for notification in notifications {
-                    let json = serde_json::to_string(&notification).unwrap_or_default();
-                    if connection_events.tx.send(json).await.is_err() {
-                        break;
-                    }
+                if !forward_admitted(&state_events, &connection_events, &translator, batch).await {
+                    break;
                 }
             }
         });
     }
+}
+
+/// Forward admitted events in order; each event's delivered position advances
+/// once it was handled (the guard drops after the notification is queued).
+async fn forward_admitted(
+    state: &WsServerState,
+    connection: &ConnectionEventState,
+    translator: &Arc<StdMutex<AcpLiveEventTranslator>>,
+    batch: Vec<crate::acp::delivery::Admitted>,
+) -> bool {
+    for admitted in batch {
+        let crate::acp::delivery::Admitted { event, guard } = admitted;
+        let keep_going = forward_session_event(state, connection, translator, event).await;
+        drop(guard);
+        if !keep_going {
+            return false;
+        }
+    }
+    true
+}
+
+/// Forward one live event to a WebSocket connection.
+///
+/// Returns `false` when the connection can no longer be served and the
+/// forwarder should stop.
+async fn forward_session_event(
+    state: &WsServerState,
+    connection: &ConnectionEventState,
+    translator: &Arc<StdMutex<AcpLiveEventTranslator>>,
+    event: crate::events::EventEnvelope,
+) -> bool {
+    if matches!(
+        event.kind(),
+        crate::events::AgentEventKind::RunCompleted { .. }
+            | crate::events::AgentEventKind::ToolCallEnd { .. }
+            | crate::events::AgentEventKind::Cancelled
+    ) {
+        state
+            .elicitation_recovery
+            .retire_session_if_idle(event.session_id(), state.agent.as_ref())
+            .await;
+    }
+    if !is_event_owned(&state.session_owners, &connection.conn_id, &event).await {
+        return true;
+    }
+
+    if let crate::events::AgentEventKind::ElicitationRequested {
+        elicitation_id,
+        session_id,
+        ..
+    } = event.kind()
+    {
+        let key = (session_id.clone(), elicitation_id.clone());
+        if !connection.forwarded_elicitations.lock().await.insert(key) {
+            return true;
+        }
+
+        if let Some(resume_authority) = state
+            .elicitation_recovery
+            .issue_for_session(&connection.conn_id, session_id, state.agent.as_ref())
+            .await
+        {
+            let notification =
+                crate::control::elicitation_recovery::ElicitationRecoveryAuthorityNotification {
+                    version: crate::control::elicitation_recovery::ELICITATION_RECOVERY_VERSION,
+                    session_id: session_id.clone(),
+                    resume_authority,
+                };
+            if send_websocket_notification(
+                &connection.tx,
+                crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION,
+                &notification,
+            )
+            .await
+            .is_err()
+            {
+                return false;
+            }
+        }
+
+        let Some(claim) = state
+            .elicitation_recovery
+            .claim_live_delivery(
+                &connection.conn_id,
+                session_id,
+                elicitation_id,
+                state.agent.as_ref(),
+            )
+            .await
+        else {
+            return true;
+        };
+        if let Err(error) = deliver_claimed_websocket_elicitation(
+            state.agent.clone(),
+            state.elicitation_recovery.clone(),
+            claim,
+            connection.clone(),
+        )
+        .await
+        {
+            log::warn!(
+                "Failed to deliver WebSocket elicitation: session_id={} elicitation_id={} error={}",
+                session_id,
+                elicitation_id,
+                error
+            );
+            return false;
+        }
+        return true;
+    }
+
+    if let crate::events::AgentEventKind::PermissionRequested {
+        permission_id,
+        request: Some(_),
+        ..
+    } = event.kind()
+    {
+        let session_id = event.session_id().to_string();
+        let key = (session_id.clone(), permission_id.clone());
+        if !connection.forwarded_elicitations.lock().await.insert(key) {
+            return true;
+        }
+
+        // A permission-only session must be recoverable after a reconnect just
+        // like a pending question, so issue the resume authority here too.
+        if let Some(resume_authority) = state
+            .elicitation_recovery
+            .issue_for_session(&connection.conn_id, &session_id, state.agent.as_ref())
+            .await
+        {
+            let notification =
+                crate::control::elicitation_recovery::ElicitationRecoveryAuthorityNotification {
+                    version: crate::control::elicitation_recovery::ELICITATION_RECOVERY_VERSION,
+                    session_id: session_id.clone(),
+                    resume_authority,
+                };
+            if send_websocket_notification(
+                &connection.tx,
+                crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION,
+                &notification,
+            )
+            .await
+            .is_err()
+            {
+                return false;
+            }
+        }
+
+        let Some(claim) = crate::elicitation::claim_live_elicitation_delivery(
+            state.agent.as_ref(),
+            &session_id,
+            permission_id,
+            &connection.conn_id,
+        )
+        .await
+        else {
+            return true;
+        };
+        if let Err(error) =
+            deliver_claimed_websocket_permission(state.agent.clone(), claim, connection.clone())
+                .await
+        {
+            log::warn!(
+                "Failed to deliver WebSocket permission request: session_id={session_id} permission_id={permission_id} error={error}"
+            );
+            return false;
+        }
+        return true;
+    }
+
+    let notifications = translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .translate_notifications(&event);
+    for notification in notifications {
+        let json = serde_json::to_string(&notification).unwrap_or_default();
+        if connection.tx.send(json).await.is_err() {
+            return false;
+        }
+    }
+    true
 }

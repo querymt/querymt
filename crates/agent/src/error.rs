@@ -101,6 +101,15 @@ pub enum AgentError {
     #[error("mesh admission rejected: {reason}")]
     AdmissionRejected { reason: String },
 
+    /// The remote node does not support the session interaction contract
+    /// (it lacks the interaction messages). All mesh nodes must be upgraded.
+    #[error("remote node '{node}' must be upgraded: it does not support session interactions")]
+    RemoteNodeUpgradeRequired { node: String },
+
+    /// A submitted interaction answer failed validation; the interaction stays pending.
+    #[error("invalid interaction response: {detail}")]
+    InvalidInteractionResponse { detail: String },
+
     #[error("turn control error: {message}")]
     TurnControl { kind: String, message: String },
 
@@ -167,6 +176,16 @@ impl From<AgentError> for AcpError {
                 "expected": expected,
                 "found": found,
             }));
+        }
+        if let AgentError::RemoteNodeUpgradeRequired { node } = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": "remote_upgrade_required",
+                "node": node,
+                "message": e.to_string(),
+            }));
+        }
+        if let AgentError::InvalidInteractionResponse { detail } = &e {
+            return AcpError::invalid_params().data(detail.clone());
         }
         if let AgentError::RemoteTransport(failure) = &e {
             return AcpError::new(-32603, e.to_string()).data(serde_json::json!({

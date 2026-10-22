@@ -91,6 +91,7 @@ nav:
     - '`.agents` Protocol': agent/dotagents.md
     - 'Protocol Support Matrix': agent/dotagents_support_matrix.md
     - Mesh Networking: agent/mesh.md
+    - Event Ordering: agent/event-ordering.md
     - Export & Fine-Tuning: agent/export.md
     - API Reference: agent/api_reference.md
     - Examples: agent/examples.md

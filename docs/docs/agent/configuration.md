@@ -682,6 +682,8 @@ assume_mutating = false
 mutating_tools = ["edit", "multiedit", "write_file", "shell", "replace_symbol"]
 ```
 
+A permission-required tool call that no cached choice, tool policy or hook decides waits for an explicit user answer, delivered as an ACP `session/request_permission` request. It is never auto-granted, including when no client is attached. Unattended runs (schedules, headless) must restrict `tools` / `mutating_tools` or add `permission_request` hooks, or they pause at the first unanswered permission. See [Session Interactions](mesh.md#session-interactions) for the full lifecycle and the all-nodes-upgrade requirement (`RemoteNodeUpgradeRequired`).
+
 ## Scheduled Tasks Configuration
 
 QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime with the `querymt/schedules/create` ACP extension, not through static TOML configuration. The embedded dashboard discovers schedule capabilities through ACP.

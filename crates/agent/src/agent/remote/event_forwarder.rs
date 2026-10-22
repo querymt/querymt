@@ -16,7 +16,7 @@ use kameo::actor::RemoteActorRef;
 use kameo::error::{Infallible, RemoteSendError};
 
 #[cfg(feature = "remote")]
-use super::event_relay::{EventRelayActor, RelayedEvent};
+use super::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 
 /// An owned event-forwarder task. Dropping the handle cancels the task.
 pub struct EventForwarderHandle {
@@ -125,6 +125,25 @@ impl EventForwarder {
                             skipped = n,
                             "forwarder lagged behind fanout"
                         );
+                        // Tell the relay so it fetches the durable tail now;
+                        // it cannot see a loss at the end of a burst itself.
+                        // Best effort: a later event still reveals the gap.
+                        if let Err(error) = relay_ref
+                            .tell(&RelayLagged {
+                                session_id: filter_session_id.clone(),
+                                skipped: n,
+                            })
+                            .mailbox_timeout(std::time::Duration::from_secs(3))
+                            .send_ack()
+                            .await
+                        {
+                            tracing::debug!(
+                                target: "remote::event_forwarder",
+                                source = %source_label,
+                                %error,
+                                "failed to send lag signal to relay actor"
+                            );
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::debug!(
