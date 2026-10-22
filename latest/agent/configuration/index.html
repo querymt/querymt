@@ -2131,6 +2131,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../event-ordering/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Event Ordering
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../export/" class="md-nav__link">
         
   
@@ -3205,6 +3232,7 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <a id="__codelineno-27-2" name="__codelineno-27-2"></a><span class="n">assume_mutating</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
 <a id="__codelineno-27-3" name="__codelineno-27-3"></a><span class="n">mutating_tools</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s2">"edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"multiedit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"write_file"</span><span class="p">,</span><span class="w"> </span><span class="s2">"shell"</span><span class="p">,</span><span class="w"> </span><span class="s2">"replace_symbol"</span><span class="p">]</span>
 </code></pre></div></td></tr></table></div>
+<p>A permission-required tool call that no cached choice, tool policy or hook decides waits for an explicit user answer, delivered as an ACP <code>session/request_permission</code> request. It is never auto-granted, including when no client is attached. Unattended runs (schedules, headless) must restrict <code>tools</code> / <code>mutating_tools</code> or add <code>permission_request</code> hooks, or they pause at the first unanswered permission. See <a href="../mesh/#session-interactions">Session Interactions</a> for the full lifecycle and the all-nodes-upgrade requirement (<code>RemoteNodeUpgradeRequired</code>).</p>
 <h2 id="scheduled-tasks-configuration">Scheduled Tasks Configuration</h2>
 <p>QueryMT supports scheduled tasks for autonomous recurring work. Schedules are created at runtime with the <code>querymt/schedules/create</code> ACP extension, not through static TOML configuration. The embedded dashboard discovers schedule capabilities through ACP.</p>
 <h3 id="schedule-types">Schedule Types</h3>

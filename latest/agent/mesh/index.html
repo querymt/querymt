@@ -15,7 +15,7 @@
         <link rel="prev" href="../dotagents_support_matrix/">
       
       
-        <link rel="next" href="../export/">
+        <link rel="next" href="../event-ordering/">
       
       
         
@@ -2456,6 +2456,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#session-interactions" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Session Interactions
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#session-persistence" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -3138,10 +3149,48 @@
   
 </li>
       
+        <li class="md-nav__item">
+  <a href="#event-ordering-across-nodes" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Event ordering across nodes
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
     </ul>
   
 </nav>
       
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../event-ordering/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Event Ordering
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -4601,6 +4650,23 @@ struct literals must add <code>iroh_dns: None</code> to preserve existing behavi
 <li>Protocol mismatch and serialization failures are never retried.</li>
 </ul>
 <p><strong>Mixed-version compatibility.</strong> New protocol fields (direct relay capability, source cursor, connection state, structured error codes) are additive with serde defaults, so older peers ignore them. New clients fall back to the generation-specific DHT relay name when talking to hosts that predate capability handoff, and hosts that predate cursor backfill are reported as potentially stale history rather than connection failure. Legacy <code>LoadSession</code>/<code>AttachRemoteSession</code> remain supported wrappers over the unified open operation, and legacy <code>prompt</code> RPCs are fulfilled with acknowledged submissions.</p>
+<h3 id="session-interactions">Session Interactions</h3>
+<p>Tool permission requests and form questions (elicitation) follow the same lifecycle whether a session runs on the local agent or on a remote mesh node. A client never needs location-specific handling.</p>
+<ol>
+<li><strong>Request.</strong> The session registers a pending interaction on its host node and emits a durable event (<code>PermissionRequested</code> or <code>ElicitationRequested</code>). The event is relayed to every attached client through the normal event path.</li>
+<li><strong>Delivery.</strong> The transport the client is connected to (WebSocket or stdio) claims the delivery through the session and sends a standard ACP request: <code>session/request_permission</code> or <code>elicitation/create</code>. Claims, re-delivery and recovery go through the session actor, so a question from a remote session is discoverable and answerable through the local agent the client is connected to.</li>
+<li><strong>Resolution.</strong> The client's answer is submitted to the owning session. Only the first valid answer for an interaction is accepted; later answers get a not-pending or stale result. An invalid form answer is rejected, the tool keeps waiting and the question is re-delivered for correction.</li>
+<li><strong>Retirement.</strong> Cancelling the run, or the tool exiting, retires the interaction. A late answer is rejected as not pending and a reconnect cannot revive it.</li>
+</ol>
+<p>Sessions and prompts carry no per-connection client bridge. <code>session/prompt</code> works the same for remote sessions as for local ones.</p>
+<p><strong>Unanswered permission waits.</strong> A permission-required tool call that is not decided by a cached "always" choice, tool policy or hook waits for an explicit user answer. It is not granted because no client is attached, delivery failed, the client disconnected, the response timed out or the answer was malformed. The request stays pending and is delivered again to the next authorized client that attaches.</p>
+<blockquote>
+<p><strong>Unattended runs.</strong> Scheduled or headless runs that previously relied on implicit auto-grant now stay paused at the first unanswered permission until a user answers or the run is cancelled. Restrict the enabled <code>tools</code> list, set <code>mutating_tools</code> / <code>assume_mutating</code> so only intended tools need permission, or add <code>permission_request</code> hooks that allow or deny explicitly for those runs. See <a href="../hooks/">Hooks</a>.</p>
+</blockquote>
+<p><strong>"Always" choices.</strong> Answering "Always allow" or "Always reject" applies to later calls of the same tool in that session, for local and remote sessions alike.</p>
+<p><strong>Editor workspace queries.</strong> The <code>language_query</code> tool needs a locally hosted session with an attached editor connection. For a session on a remote node it returns an "unavailable" result that names remote sessions, and the run continues.</p>
+<p><strong>All nodes must be upgraded together.</strong> This contract adds new session messages to the mesh wire protocol. Mixed-version meshes are not supported, and there is no fallback to bridge-based or auto-granted behavior. If the local agent attaches to or prompts a session on a node that lacks the interaction messages, the operation fails with <code>RemoteNodeUpgradeRequired</code>. Clients receive it as an ACP error (code <code>-32603</code>) with <code>data.category = "remote_upgrade_required"</code> and <code>data.node</code> set to the outdated node. Upgrade that node, and every other node in the mesh, to the same agent version. Rolling back means reverting the agent on all nodes together.</p>
+<p><strong>Prompt response ordering.</strong> The response to <code>session/prompt</code> is sent only after the requesting connection has delivered every <code>session/update</code> the prompt produced, for remote-hosted sessions as well as local ones. The wait is bounded: if the relay disconnects, the connection lags and cannot fully recover, or the 30 second safety limit passes, the response is sent anyway and a warning is logged. See <a href="#event-ordering-across-nodes">Event ordering across nodes</a>.</p>
 <h3 id="session-persistence">Session Persistence</h3>
 <p>Remote sessions are persisted on the host node:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-47-1">1</a></span>
@@ -5314,6 +5380,8 @@ Batched unreliable datagrams are deliberately not used for actor/provider traffi
 <li><a href="../examples/">Examples</a> - Mesh networking examples</li>
 <li><a href="../api_reference/">API Reference</a> - Mesh API types and functions</li>
 </ul>
+<h2 id="event-ordering-across-nodes">Event ordering across nodes</h2>
+<p>Relayed session events keep the host's per-session <code>session_seq</code>. The relay fetches durable events it missed from the host when it sees a gap, or when the host's forwarder reports that it fell behind (which also covers a loss at the end of a burst). A <code>session/prompt</code> response on an attached node follows the updates relayed for that prompt. All nodes of a mesh must run a version that supports this. See <a href="../event-ordering/">Event Ordering</a>.</p>
 
 
 
