@@ -2144,6 +2144,39 @@ fn migrations_are_idempotent() {
     assert_eq!(count_after_first, count_after_second);
 }
 
+/// `apply_migrations` keys on the full version string and records it with
+/// `INSERT OR IGNORE`. Two entries sharing a string would both run on a fresh
+/// database, but the second would be silently skipped on any database that
+/// already applied the first. Numeric prefixes may repeat across branches
+/// (different full names are fine); full strings must not.
+#[test]
+fn migration_versions_are_unique_and_well_formed() {
+    let mut seen = std::collections::HashSet::new();
+    for migration in MIGRATIONS {
+        let version = migration.version;
+        assert!(
+            seen.insert(version),
+            "duplicate migration version `{version}`: a duplicate is silently skipped on \
+             databases that already applied it"
+        );
+
+        let (number, name) = version
+            .split_once('_')
+            .unwrap_or_else(|| panic!("migration version `{version}` must be `NNNN_name`"));
+        assert!(
+            number.len() == 4 && number.bytes().all(|b| b.is_ascii_digit()),
+            "migration version `{version}` must start with a four-digit number"
+        );
+        assert!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+            "migration version `{version}` name must be non-empty lowercase snake_case"
+        );
+    }
+}
+
 #[tokio::test]
 async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill() {
     let db = tempfile::NamedTempFile::new().unwrap();
