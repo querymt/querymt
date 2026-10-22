@@ -1460,6 +1460,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Creating an isolated session">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#default-baseline" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Default baseline
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -1491,6 +1508,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#discovering-support" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Discovering support
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#native-commands-and-typed-operations" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -1501,6 +1529,34 @@
   
     <nav class="md-nav" aria-label="Native commands and typed operations">
       <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#management-from-code" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Management from code
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Management from code">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#error-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Error codes
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
         
           <li class="md-nav__item">
   <a href="#opt-in-workflow" class="md-nav__link">
@@ -1938,39 +1994,27 @@ file collisions between sessions; it does not confine a misbehaving
 tool.</p>
 </div>
 <h2 id="enabling-the-workspace-service">Enabling the workspace service</h2>
-<p>Workspace isolation is opt-in. Configure a <code>WorkspaceService</code> on the agent
-builder; without it every session executes locally exactly as before:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-0-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-0-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-0-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-0-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-0-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-0-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-0-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-0-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-0-10">10</a></span>
-<span class="normal"><a href="#__codelineno-0-11">11</a></span>
-<span class="normal"><a href="#__codelineno-0-12">12</a></span>
-<span class="normal"><a href="#__codelineno-0-13">13</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">Arc</span><span class="p">;</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">worktree</span><span class="p">::{</span><span class="n">GixRepoOps</span><span class="p">,</span><span class="w"> </span><span class="n">WorkspaceService</span><span class="p">};</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3"></a>
-<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">storage_root</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">dirs</span><span class="p">::</span><span class="n">data_dir</span><span class="p">().</span><span class="n">unwrap</span><span class="p">().</span><span class="n">join</span><span class="p">(</span><span class="s">"qmt/worktrees"</span><span class="p">);</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">service</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">WorkspaceService</span><span class="p">::</span><span class="n">new</span><span class="p">(</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6"></a><span class="w">    </span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">GixRepoOps</span><span class="p">::</span><span class="n">new</span><span class="p">()),</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7"></a><span class="w">    </span><span class="n">storage</span><span class="p">.</span><span class="n">workspace_repository</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">"backend exposes a workspace repository"</span><span class="p">),</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8"></a><span class="w">    </span><span class="n">storage_root</span><span class="p">,</span><span class="w"> </span><span class="c1">// durable worktree storage, e.g. ~/.local/share/qmt/worktrees</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9"></a><span class="p">));</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10"></a>
-<a id="__codelineno-0-11" name="__codelineno-0-11"></a><span class="kd">let</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AgentConfigBuilder</span><span class="p">::</span><span class="n">from_provider</span><span class="p">(</span><span class="n">storage</span><span class="p">,</span><span class="w"> </span><span class="n">provider</span><span class="p">,</span><span class="w"> </span><span class="n">journal</span><span class="p">)</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12"></a><span class="w">    </span><span class="p">.</span><span class="n">with_workspace_service</span><span class="p">(</span><span class="n">service</span><span class="p">)</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">();</span>
+<p>Workspace isolation is opt-in, and <strong>enabling the service never isolates a
+session by itself</strong>. The service only makes isolation <em>available</em>; a session
+is isolated only when it asks for it (see
+<a href="#creating-an-isolated-session">Creating an isolated session</a>). An option-less
+<code>session/new</code>, <code>chat_session()</code> or Python <code>chat_session()</code> stays local, creates
+no worktree, and is unchanged whether or not the service is enabled.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="1:3"><input checked="checked" id="__tabbed_1_1" name="__tabbed_1" type="radio" /><input id="__tabbed_1_2" name="__tabbed_1" type="radio" /><input id="__tabbed_1_3" name="__tabbed_1" type="radio" /><div class="tabbed-labels"><label for="__tabbed_1_1">TOML</label><label for="__tabbed_1_2">Rust</label><label for="__tabbed_1_3">Python</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span>
+<span class="normal"><a href="#__codelineno-0-2">2</a></span>
+<span class="normal"><a href="#__codelineno-0-3">3</a></span>
+<span class="normal"><a href="#__codelineno-0-4">4</a></span>
+<span class="normal"><a href="#__codelineno-0-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a><span class="k">[agent.workspace]</span><span class="w">            </span><span class="c1"># or [quorum.workspace] for a multi-agent quorum</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">               </span><span class="c1"># default false: no service, behavior unchanged</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a><span class="c1"># storage_root = "~/.qmt/worktrees"   # default; relative paths resolve</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a><span class="c1">#                                       # against the config file</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a><span class="c1"># baseline = "commit"        # "commit" (default) | "current_working_tree"</span>
 </code></pre></div></td></tr></table></div>
-<p>Managed checkouts live under <code>&lt;storage-root&gt;/&lt;repo-slug&gt;/&lt;workspace-id&gt;/</code>,
-survive session completion, process restarts, and machine reboots.</p>
-<h2 id="creating-an-isolated-session">Creating an isolated session</h2>
-<p>Isolation is requested per session through the ACP <code>_meta.querymt.sessionWorkspace</code>
-extension (additive; upstream protocol types are unchanged):</p>
+</div>
+<div class="tabbed-block">
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1">1</a></span>
 <span class="normal"><a href="#__codelineno-1-2">2</a></span>
 <span class="normal"><a href="#__codelineno-1-3">3</a></span>
@@ -1978,14 +2022,66 @@ extension (additive; upstream protocol types are unchanged):</p>
 <span class="normal"><a href="#__codelineno-1-5">5</a></span>
 <span class="normal"><a href="#__codelineno-1-6">6</a></span>
 <span class="normal"><a href="#__codelineno-1-7">7</a></span>
-<span class="normal"><a href="#__codelineno-1-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a><span class="p">{</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2"></a><span class="w">  </span><span class="nt">"cwd"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/home/me/project"</span><span class="p">,</span>
-<a id="__codelineno-1-3" name="__codelineno-1-3"></a><span class="w">  </span><span class="nt">"_meta"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-1-4" name="__codelineno-1-4"></a><span class="w">    </span><span class="nt">"querymt"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="w">      </span><span class="nt">"sessionWorkspace"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"execution"</span><span class="p">:</span><span class="w"> </span><span class="s2">"worktree"</span><span class="w"> </span><span class="p">}</span>
-<a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="w">  </span><span class="p">}</span>
-<a id="__codelineno-1-8" name="__codelineno-1-8"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-1-8">8</a></span>
+<span class="normal"><a href="#__codelineno-1-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">api</span><span class="p">::</span><span class="n">Agent</span><span class="p">;</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">config</span><span class="p">::</span><span class="n">WorkspaceSettings</span><span class="p">;</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3"></a>
+<a id="__codelineno-1-4" name="__codelineno-1-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"/path/to/repo"</span><span class="p">)</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7"></a><span class="w">    </span><span class="p">.</span><span class="n">workspace</span><span class="p">(</span><span class="n">WorkspaceSettings</span><span class="p">::</span><span class="n">enabled</span><span class="p">())</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</code></pre></div></td></tr></table></div>
+<p>A prebuilt service can be injected instead with <code>.workspace_service(arc)</code>
+(also on <code>Agent::multi()</code>); it takes precedence over the settings. Lower
+level embedders can still attach one with
+<code>AgentConfigBuilder::with_workspace_service</code>.</p>
+</div>
+<div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1">1</a></span>
+<span class="normal"><a href="#__codelineno-2-2">2</a></span>
+<span class="normal"><a href="#__codelineno-2-3">3</a></span>
+<span class="normal"><a href="#__codelineno-2-4">4</a></span>
+<span class="normal"><a href="#__codelineno-2-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="n">agent</span> <span class="o">=</span> <span class="k">await</span> <span class="n">Agent</span><span class="o">.</span><span class="n">single</span><span class="p">(</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2"></a>    <span class="n">provider</span><span class="o">=</span><span class="s2">"anthropic"</span><span class="p">,</span> <span class="n">model</span><span class="o">=</span><span class="s2">"claude-sonnet-4-5-20250929"</span><span class="p">,</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3"></a>    <span class="n">cwd</span><span class="o">=</span><span class="s2">"/path/to/repo"</span><span class="p">,</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4"></a>    <span class="n">worktrees</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>   <span class="c1"># or {"storage_root": "...", "baseline": "commit"}</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5"></a><span class="p">)</span>
+</code></pre></div></td></tr></table></div>
+<p><code>Agent.from_config(path)</code> picks the section up from TOML. Unknown keys in
+the dict raise <code>ValueError</code>.</p>
+</div>
+</div>
+</div>
+<p>Settings are validated <strong>when the agent is built</strong>, not at the first isolated
+session: the storage backend must expose a workspace repository, <code>storage_root</code>
+must be creatable and be on the local filesystem, and a quorum delegate
+configured <code>isolation = "isolated"</code> requires the service. A quorum builds
+exactly <strong>one</strong> service shared by the planner and every delegate.</p>
+<p>Managed checkouts live under <code>&lt;storage-root&gt;/&lt;repo-slug&gt;/&lt;workspace-id&gt;/</code>,
+survive session completion, process restarts, and machine reboots. They
+accumulate until you archive and remove them, so programmatic callers creating
+sessions in a loop should do so deliberately (see
+<a href="#management-from-code">Management from code</a>).</p>
+<h2 id="creating-an-isolated-session">Creating an isolated session</h2>
+<p>Isolation is requested per session through the ACP <code>_meta.querymt.sessionWorkspace</code>
+extension (additive; upstream protocol types are unchanged):</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
+<span class="normal"><a href="#__codelineno-3-2">2</a></span>
+<span class="normal"><a href="#__codelineno-3-3">3</a></span>
+<span class="normal"><a href="#__codelineno-3-4">4</a></span>
+<span class="normal"><a href="#__codelineno-3-5">5</a></span>
+<span class="normal"><a href="#__codelineno-3-6">6</a></span>
+<span class="normal"><a href="#__codelineno-3-7">7</a></span>
+<span class="normal"><a href="#__codelineno-3-8">8</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="p">{</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="w">  </span><span class="nt">"cwd"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/home/me/project"</span><span class="p">,</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="w">  </span><span class="nt">"_meta"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="w">    </span><span class="nt">"querymt"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="w">      </span><span class="nt">"sessionWorkspace"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">"execution"</span><span class="p">:</span><span class="w"> </span><span class="s2">"worktree"</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7"></a><span class="w">  </span><span class="p">}</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <table>
 <thead>
@@ -2038,6 +2134,20 @@ extension (additive; upstream protocol types are unchanged):</p>
   storage, or local filesystem placement is unavailable, creation fails with
   an actionable error instead of silently running shared.</li>
 </ul>
+<h3 id="default-baseline">Default baseline</h3>
+<p><code>baseline</code> in the settings is a <em>default for explicitly requested top-level
+isolation</em> that did not choose a baseline itself. It never decides <strong>whether</strong>
+to isolate. Precedence, per request:</p>
+<ol>
+<li>an explicit <code>baseline</code> / <code>includeLocalChanges</code> value (including an explicit
+   <code>false</code>) always wins;</li>
+<li>an explicit <code>baseRef</code> means a commit baseline from that ref, so a
+   <code>current_working_tree</code> default yields to it instead of failing validation;</li>
+<li>otherwise the configured default applies.</li>
+</ol>
+<p>The resolved mode is disclosed in the <code>session/new</code> response and in <code>create</code>
+results (<code>baseline</code>, <code>localChangesExcluded</code>). Delegates always start from the
+parent's working contents and forks keep their own rules; neither is affected.</p>
 <p><code>current_working_tree</code> capture details:</p>
 <ul>
 <li><strong>Tracked membership comes from HEAD plus the real index.</strong> A file
@@ -2134,29 +2244,47 @@ through its own tools: arbitrary shell commands the model runs, and any
 configured external filters or hooks, execute Git however they choose and
 are neither intercepted nor restricted by this service. Built-in typed
 operations never shell out and never parse Git command output.</p>
+<h2 id="discovering-support">Discovering support</h2>
+<p>An agent with a workspace service advertises it in <code>initialize</code>
+(<code>agentCapabilities._meta.querymt.workspace</code>), so clients can offer an explicit
+Local / Worktree choice at creation. Agents without the service omit it.</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
+<span class="normal"><a href="#__codelineno-4-2">2</a></span>
+<span class="normal"><a href="#__codelineno-4-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="p">{</span><span class="w"> </span><span class="nt">"supported"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nt">"defaultBaseline"</span><span class="p">:</span><span class="w"> </span><span class="s2">"commit"</span><span class="p">,</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="w">  </span><span class="nt">"executionModes"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"local"</span><span class="p">,</span><span class="w"> </span><span class="s2">"worktree"</span><span class="p">],</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="w">  </span><span class="nt">"baselines"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"commit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"current_working_tree"</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<p>For an isolated <code>session/new</code>, the response's
+<code>_meta.querymt.sessionWorkspace</code> discloses the resolved binding: <code>sessionCwd</code>
+(the directory the session actually executes in), <code>workspaceId</code>, <code>branch</code>,
+<code>baseline</code>, <code>baselineCommit</code>, <code>localChangesExcluded</code> and
+<code>ignoredUntrackedFilesExcluded</code>. Local sessions carry no such metadata.</p>
+<p>Clients that cannot send creation metadata use the documented flow: submit
+<code>/worktree create</code> from any session, then load the returned session id; the
+loaded session runs in its bound checkout. No live switching is involved.</p>
 <h2 id="native-commands-and-typed-operations">Native commands and typed operations</h2>
 <p>Submit these as ordinary ACP <code>session/prompt</code> text, not queued or steering
 input. They are intercepted before prompt expansion and never ask the model
 to run Git commands:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-2-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-2-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-2-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-2-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-2-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-2-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-2-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-2-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-2-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a>/worktree create
-<a id="__codelineno-2-2" name="__codelineno-2-2"></a>/worktree create HEAD review
-<a id="__codelineno-2-3" name="__codelineno-2-3"></a>/worktree create --include-local-changes review
-<a id="__codelineno-2-4" name="__codelineno-2-4"></a>/worktree list
-<a id="__codelineno-2-5" name="__codelineno-2-5"></a>/worktree status &lt;workspace-id&gt;
-<a id="__codelineno-2-6" name="__codelineno-2-6"></a>/worktree result &lt;workspace-id&gt;
-<a id="__codelineno-2-7" name="__codelineno-2-7"></a>/worktree publish [workspace-id]
-<a id="__codelineno-2-8" name="__codelineno-2-8"></a>/worktree archive &lt;workspace-id&gt;
-<a id="__codelineno-2-9" name="__codelineno-2-9"></a>/worktree remove &lt;workspace-id&gt;
-<a id="__codelineno-2-10" name="__codelineno-2-10"></a>/worktree recover &lt;workspace-id&gt;
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-5-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-5-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-5-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-5-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-5-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-5-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-5-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-5-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-5-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a>/worktree create
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a>/worktree create HEAD review
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a>/worktree create --include-local-changes review
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a>/worktree list
+<a id="__codelineno-5-5" name="__codelineno-5-5"></a>/worktree status &lt;workspace-id&gt;
+<a id="__codelineno-5-6" name="__codelineno-5-6"></a>/worktree result &lt;workspace-id&gt;
+<a id="__codelineno-5-7" name="__codelineno-5-7"></a>/worktree publish [workspace-id]
+<a id="__codelineno-5-8" name="__codelineno-5-8"></a>/worktree archive &lt;workspace-id&gt;
+<a id="__codelineno-5-9" name="__codelineno-5-9"></a>/worktree remove &lt;workspace-id&gt;
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a>/worktree recover &lt;workspace-id&gt;
 </code></pre></div></td></tr></table></div>
 <p><code>create</code> returns a <strong>new session ID</strong>, workspace ID, checkout path, branch,
 and baseline. Attach to that new session to work there: the conversation
@@ -2226,6 +2354,112 @@ files, and every other checkout remain unchanged. Publication performs no
 verification, which is reported as <code>skipped</code>. A failed capture reports an
 explicit error and keeps the checkout untouched; it never records a partial
 result. Inspection (<code>result</code>) is read-only and never republishes live state.</p>
+<h3 id="management-from-code">Management from code</h3>
+<p>Every operation above is implemented once, as typed requests and responses
+plus a typed error enum (<code>querymt_agent::worktree::WorktreeOps</code>). The ACP
+extensions, the native <code>/worktree</code> command, the simple API and the Python
+bindings are thin adapters over it, so ownership, lease and removal rules
+cannot drift between surfaces. Existing ACP JSON shapes are unchanged.</p>
+<div class="tabbed-set tabbed-alternate" data-tabs="2:2"><input checked="checked" id="__tabbed_2_1" name="__tabbed_2" type="radio" /><input id="__tabbed_2_2" name="__tabbed_2" type="radio" /><div class="tabbed-labels"><label for="__tabbed_2_1">Rust</label><label for="__tabbed_2_2">Python</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-6-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-6-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-6-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-6-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-6-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-6-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-6-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-6-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-6-10">10</a></span>
+<span class="normal"><a href="#__codelineno-6-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">api</span><span class="p">::</span><span class="n">SessionOptions</span><span class="p">;</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2"></a>
+<a id="__codelineno-6-3" name="__codelineno-6-3"></a><span class="c1">// Explicit isolation; default options are a plain local session.</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5"></a><span class="w">    </span><span class="p">.</span><span class="n">chat_session_with</span><span class="p">(</span><span class="n">SessionOptions</span><span class="p">::</span><span class="n">worktree</span><span class="p">().</span><span class="n">name</span><span class="p">(</span><span class="s">"refactor"</span><span class="p">))</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"{}"</span><span class="p">,</span><span class="w"> </span><span class="n">session</span><span class="p">.</span><span class="n">workspace</span><span class="p">().</span><span class="n">unwrap</span><span class="p">()[</span><span class="s">"sessionCwd"</span><span class="p">]);</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8"></a>
+<a id="__codelineno-6-9" name="__codelineno-6-9"></a><span class="c1">// None when the agent has no workspace service.</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10"></a><span class="kd">let</span><span class="w"> </span><span class="n">worktrees</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">worktrees</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">"enabled"</span><span class="p">);</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11"></a><span class="kd">let</span><span class="w"> </span><span class="n">listed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">worktrees</span><span class="p">.</span><span class="n">list</span><span class="p">().</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+</code></pre></div></td></tr></table></div>
+</div>
+<div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
+<span class="normal"><a href="#__codelineno-7-2">2</a></span>
+<span class="normal"><a href="#__codelineno-7-3">3</a></span>
+<span class="normal"><a href="#__codelineno-7-4">4</a></span>
+<span class="normal"><a href="#__codelineno-7-5">5</a></span>
+<span class="normal"><a href="#__codelineno-7-6">6</a></span>
+<span class="normal"><a href="#__codelineno-7-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="n">session</span> <span class="o">=</span> <span class="k">await</span> <span class="n">agent</span><span class="o">.</span><span class="n">chat_session</span><span class="p">(</span><span class="n">workspace</span><span class="o">=</span><span class="s2">"worktree"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"refactor"</span><span class="p">,</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a>                                   <span class="n">include_local_changes</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="nb">print</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">workspace</span><span class="p">[</span><span class="s2">"sessionCwd"</span><span class="p">])</span>      <span class="c1"># None for a local session</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4"></a>
+<a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="n">wt</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">worktrees</span>                         <span class="c1"># None when not enabled</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">list</span><span class="p">();</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">status</span><span class="p">(</span><span class="n">wid</span><span class="p">);</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">result</span><span class="p">(</span><span class="n">wid</span><span class="p">)</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">);</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">archive</span><span class="p">(</span><span class="n">wid</span><span class="p">);</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">wid</span><span class="p">)</span>
+</code></pre></div></td></tr></table></div>
+<p>Failures raise <code>querymt_agent.WorktreeError</code> (a <code>RuntimeError</code>) carrying a
+<code>.code</code>.</p>
+</div>
+</div>
+</div>
+<h4 id="error-codes">Error codes</h4>
+<p>Every surface reports the same stable, machine-readable <code>code</code> (ACP error
+<code>data.code</code>, <code>WorktreeOpError::code()</code>, Python <code>WorktreeError.code</code>). Human
+readable messages may be reworded; codes do not change.</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>workspace_service_unavailable</code></td>
+<td>isolation or an operation was requested but no service is configured (never downgraded to shared execution)</td>
+</tr>
+<tr>
+<td><code>invalid_options</code></td>
+<td>malformed or contradictory request (for example a ref with <code>current_working_tree</code>)</td>
+</tr>
+<tr>
+<td><code>isolation_unsupported_layout</code></td>
+<td>not a supported repository (non-Git, bare, sparse, submodule, ...)</td>
+</tr>
+<tr>
+<td><code>workspace_not_found</code></td>
+<td>unknown workspace id</td>
+</tr>
+<tr>
+<td><code>workspace_missing</code></td>
+<td>the bound checkout is gone; there is no fallback to the source</td>
+</tr>
+<tr>
+<td><code>conflicting_cwd</code></td>
+<td>load/resume with a cwd that contradicts the persisted binding</td>
+</tr>
+<tr>
+<td><code>owner_conflict</code></td>
+<td>another session already owns the writable workspace</td>
+</tr>
+<tr>
+<td><code>removal_refused</code></td>
+<td>removal refused (active owner, dirty/untracked/ignored content, unpreserved commits)</td>
+</tr>
+<tr>
+<td><code>operation_refused</code></td>
+<td>another lifecycle operation was refused in the current state</td>
+</tr>
+<tr>
+<td><code>repository_error</code>, <code>storage_error</code>, <code>session_start_failed</code>, <code>internal_error</code></td>
+<td>infrastructure failures</td>
+</tr>
+</tbody>
+</table>
 <h3 id="opt-in-workflow">Opt-in workflow</h3>
 <ol>
 <li>Configure the durable workspace service and create a session with
@@ -2357,17 +2591,17 @@ process was started in:</p>
   explicitly configured paths) follow the same discovery configuration as
   agent startup, and the scripts policy (enabled/disabled) is unchanged.</li>
 </ul>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
-<span class="normal"><a href="#__codelineno-3-2">2</a></span>
-<span class="normal"><a href="#__codelineno-3-3">3</a></span>
-<span class="normal"><a href="#__codelineno-3-4">4</a></span>
-<span class="normal"><a href="#__codelineno-3-5">5</a></span>
-<span class="normal"><a href="#__codelineno-3-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="gp"># </span>In<span class="w"> </span>the<span class="w"> </span>original<span class="w"> </span>checkout,<span class="w"> </span>/deploy<span class="w"> </span>may<span class="w"> </span>read:
-<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="gp">#   </span><span class="s2">"Deploy to staging"</span><span class="w">  </span><span class="o">(</span>project<span class="w"> </span><span class="nb">command</span><span class="w"> </span>committed<span class="w"> </span>on<span class="w"> </span>main<span class="o">)</span>
-<a id="__codelineno-3-3" name="__codelineno-3-3"></a><span class="go">/worktree create feature-x</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="gp"># </span>In<span class="w"> </span>the<span class="w"> </span>isolated<span class="w"> </span>session,<span class="w"> </span>the<span class="w"> </span>same<span class="w"> </span>.qmt/commands/deploy.md<span class="w"> </span>now<span class="w"> </span>reads:
-<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="gp">#   </span><span class="s2">"Deploy the service"</span><span class="w">  </span><span class="o">(</span>as<span class="w"> </span>defined<span class="w"> </span><span class="k">in</span><span class="w"> </span>that<span class="w"> </span>checkout<span class="o">)</span>
-<a id="__codelineno-3-6" name="__codelineno-3-6"></a><span class="go">/deploy api</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
+<span class="normal"><a href="#__codelineno-8-2">2</a></span>
+<span class="normal"><a href="#__codelineno-8-3">3</a></span>
+<span class="normal"><a href="#__codelineno-8-4">4</a></span>
+<span class="normal"><a href="#__codelineno-8-5">5</a></span>
+<span class="normal"><a href="#__codelineno-8-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="gp"># </span>In<span class="w"> </span>the<span class="w"> </span>original<span class="w"> </span>checkout,<span class="w"> </span>/deploy<span class="w"> </span>may<span class="w"> </span>read:
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="gp">#   </span><span class="s2">"Deploy to staging"</span><span class="w">  </span><span class="o">(</span>project<span class="w"> </span><span class="nb">command</span><span class="w"> </span>committed<span class="w"> </span>on<span class="w"> </span>main<span class="o">)</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="go">/worktree create feature-x</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="gp"># </span>In<span class="w"> </span>the<span class="w"> </span>isolated<span class="w"> </span>session,<span class="w"> </span>the<span class="w"> </span>same<span class="w"> </span>.qmt/commands/deploy.md<span class="w"> </span>now<span class="w"> </span>reads:
+<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="gp">#   </span><span class="s2">"Deploy the service"</span><span class="w">  </span><span class="o">(</span>as<span class="w"> </span>defined<span class="w"> </span><span class="k">in</span><span class="w"> </span>that<span class="w"> </span>checkout<span class="o">)</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="go">/deploy api</span>
 </code></pre></div></td></tr></table></div>
 <p>Absolute paths inside command prompts are <strong>not rewritten</strong> — a prompt that
 hard-codes <code>/Users/me/project/src</code> keeps referring there, so prefer
@@ -2473,9 +2707,9 @@ consulting the live checkout:</p>
   create-only ref.</li>
 </ul>
 <p>You can also reproduce the delta with Git directly:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
-<span class="normal"><a href="#__codelineno-4-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
+<span class="normal"><a href="#__codelineno-9-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
 </code></pre></div></td></tr></table></div>
 <p>Example: a parent with uncommitted edits to <code>config.rs</code> dispatches an
 isolated delegate that changes <code>auth.rs</code> and leaves <code>notes.md</code> untracked.
@@ -2492,11 +2726,11 @@ workspace's changes since its baseline.</p>
 baseline, so <code>git merge &lt;managed-branch&gt;</code> (or cherry-picking its tip
 wholesale) can bring the parent's baseline edits along with the
 workspace's work. Integrate the delta deliberately instead:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
-<span class="normal"><a href="#__codelineno-5-2">2</a></span>
-<span class="normal"><a href="#__codelineno-5-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
+<span class="normal"><a href="#__codelineno-10-2">2</a></span>
+<span class="normal"><a href="#__codelineno-10-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
 </code></pre></div></td></tr></table></div>
 <p>or, if the workspace produced real commits and the parent was clean,
 cherry-pick the commit range. If the parent was dirty, either commit the
