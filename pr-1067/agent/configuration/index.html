@@ -2131,6 +2131,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../event-ordering/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Event Ordering
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../export/" class="md-nav__link">
         
   
@@ -2688,7 +2715,12 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <span class="normal"><a href="#__codelineno-10-32">32</a></span>
 <span class="normal"><a href="#__codelineno-10-33">33</a></span>
 <span class="normal"><a href="#__codelineno-10-34">34</a></span>
-<span class="normal"><a href="#__codelineno-10-35">35</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Agent mode middleware (build/plan/review modes)</span>
+<span class="normal"><a href="#__codelineno-10-35">35</a></span>
+<span class="normal"><a href="#__codelineno-10-36">36</a></span>
+<span class="normal"><a href="#__codelineno-10-37">37</a></span>
+<span class="normal"><a href="#__codelineno-10-38">38</a></span>
+<span class="normal"><a href="#__codelineno-10-39">39</a></span>
+<span class="normal"><a href="#__codelineno-10-40">40</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Agent mode middleware (build/plan/review modes)</span>
 <a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="k">[[middleware]]</span>
 <a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"agent_mode"</span>
 <a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="n">default</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"build"</span>
@@ -2718,11 +2750,16 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <a id="__codelineno-10-28" name="__codelineno-10-28"></a><span class="n">threshold</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.85</span>
 <a id="__codelineno-10-29" name="__codelineno-10-29"></a><span class="n">min_lines</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span>
 <a id="__codelineno-10-30" name="__codelineno-10-30"></a>
-<a id="__codelineno-10-31" name="__codelineno-10-31"></a><span class="c1"># Custom middleware (if registered)</span>
+<a id="__codelineno-10-31" name="__codelineno-10-31"></a><span class="c1"># Parallel edit guard (on in "warn" mode by default; "deny" rejects redundant same-file edits)</span>
 <a id="__codelineno-10-32" name="__codelineno-10-32"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-10-33" name="__codelineno-10-33"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"custom_middleware"</span>
-<a id="__codelineno-10-34" name="__codelineno-10-34"></a><span class="n">option1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"value1"</span>
-<a id="__codelineno-10-35" name="__codelineno-10-35"></a><span class="n">option2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span>
+<a id="__codelineno-10-33" name="__codelineno-10-33"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"parallel_edit_guard"</span>
+<a id="__codelineno-10-34" name="__codelineno-10-34"></a><span class="n">mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"deny"</span>
+<a id="__codelineno-10-35" name="__codelineno-10-35"></a>
+<a id="__codelineno-10-36" name="__codelineno-10-36"></a><span class="c1"># Custom middleware (if registered)</span>
+<a id="__codelineno-10-37" name="__codelineno-10-37"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-10-38" name="__codelineno-10-38"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"custom_middleware"</span>
+<a id="__codelineno-10-39" name="__codelineno-10-39"></a><span class="n">option1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"value1"</span>
+<a id="__codelineno-10-40" name="__codelineno-10-40"></a><span class="n">option2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="mesh-configuration">Mesh Configuration</h2>
 <p>Enable cross-machine collaboration:</p>
