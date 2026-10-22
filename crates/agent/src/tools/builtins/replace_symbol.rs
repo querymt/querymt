@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, resolve_arg_path,
+};
 
 use super::helpers::{resolve_root, resolve_target};
 
@@ -117,6 +119,43 @@ impl Tool for ReplaceSymbolTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&Path>) -> FileAccess {
+        // Mirror `call`: the `root` argument (or cwd) must resolve, and every
+        // target goes through `ToolContext::resolve_path` (relative paths are
+        // joined with cwd), so a target is only resolvable when `cwd` exists or
+        // the path is absolute.
+        let root_ok = match args.get("root").and_then(Value::as_str) {
+            Some(root) => resolve_arg_path(root, cwd).is_some(),
+            None => cwd.is_some(),
+        };
+        if !root_ok {
+            return FileAccess::None;
+        }
+        let Some(entries) = args.get("replacements").and_then(Value::as_array) else {
+            return FileAccess::None;
+        };
+
+        let mut writes: Vec<PathBuf> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Some(path) = entry
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(|raw| resolve_arg_path(raw, cwd))
+            else {
+                // Malformed entry: the call fails validation before writing.
+                return FileAccess::None;
+            };
+            if !writes.contains(&path) {
+                writes.push(path);
+            }
+        }
+        if writes.is_empty() {
+            FileAccess::None
+        } else {
+            FileAccess::writes(writes)
+        }
     }
 
     async fn call(
@@ -624,6 +663,61 @@ mod tests {
                 .await
                 .unwrap()
                 .contains("20")
+        );
+    }
+
+    #[test]
+    fn file_access_writes_every_replacement_path_with_custom_root() {
+        let dir = TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        let tool = ReplaceSymbolTool::new();
+
+        // Same resolution as `call`: relative paths go through
+        // `ToolContext::resolve_path` (joined with cwd); `root` must resolve.
+        let access = tool.file_access(
+            &json!({
+                "root": "sub",
+                "replacements": [
+                    {"path": "a.rs", "symbol": "alpha", "newText": "x"},
+                    {"path": cwd.join("sub/b.rs").to_str().unwrap(), "symbol": "beta", "newText": "y"},
+                    {"path": "./a.rs", "symbol": "alpha2", "newText": "z"}
+                ]
+            }),
+            Some(&cwd),
+        );
+
+        // Duplicate spellings of a.rs collapse into one entry.
+        assert_eq!(
+            access,
+            FileAccess::writes([cwd.join("a.rs"), cwd.join("sub/b.rs")])
+        );
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = ReplaceSymbolTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"replacements": []}), Some(&cwd)),
+            FileAccess::None
+        );
+        assert_eq!(
+            tool.file_access(
+                &json!({"replacements": [{"symbol": "a", "newText": "b"}]}),
+                Some(&cwd)
+            ),
+            FileAccess::None
+        );
+        // Relative paths cannot be resolved without a cwd.
+        assert_eq!(
+            tool.file_access(
+                &json!({"replacements": [{"path": "a.rs", "symbol": "a", "newText": "b"}]}),
+                None
+            ),
+            FileAccess::None
         );
     }
 

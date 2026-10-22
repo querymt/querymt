@@ -763,6 +763,22 @@ impl AgentBuilder {
             }
         }
 
+        // Auto-add ParallelEditGuard (warn mode) unless the user supplied a driver
+        // or any `parallel_edit_guard` config entry (including a disabled one).
+        let has_guard_entry = self
+            .middleware_entries
+            .iter()
+            .any(|e| e.middleware_type == "parallel_edit_guard");
+        let has_guard_driver = middleware_drivers
+            .iter()
+            .any(|d| d.name() == "ParallelEditGuard");
+        if !has_guard_entry && !has_guard_driver {
+            middleware_drivers.push(Arc::new(crate::middleware::ParallelEditGuard::new(
+                initial_config.tool_registry.clone(),
+                crate::middleware::ParallelEditMode::Warn,
+            )));
+        }
+
         // Drop the temporary handle so Arc::try_unwrap can succeed
         // (avoids a full clone of AgentConfig).
         drop(temp_handle);

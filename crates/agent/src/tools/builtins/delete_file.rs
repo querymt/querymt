@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError,
+    single_path_write_access,
+};
 
 pub struct DeleteFileTool;
 
@@ -49,6 +52,10 @@ impl ToolTrait for DeleteFileTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        single_path_write_access(args, "path", cwd)
     }
 
     async fn call(
@@ -119,6 +126,30 @@ mod tests {
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_access_writes_normalised_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path().canonicalize().unwrap();
+        fs::write(root.join("a.md"), "x").unwrap();
+        let tool = DeleteFileTool::new();
+
+        let access = tool.file_access(&json!({"path": "./a.md"}), Some(&root));
+
+        assert_eq!(access, FileAccess::writes([root.join("a.md")]));
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = DeleteFileTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"path": true}), Some(&cwd)),
+            FileAccess::None
+        );
+    }
 
     #[tokio::test]
     async fn test_delete_file() {

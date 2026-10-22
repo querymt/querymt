@@ -353,6 +353,45 @@ system = ["You are a test agent"]
 }
 
 #[tokio::test]
+async fn test_load_config_accepts_parallel_edit_guard_middleware() {
+    // Mirrors the example in docs/docs/agent/configuration.md and middleware.md.
+    let inline = r#"
+[agent]
+provider = "test"
+model = "test-model"
+tools = []
+system = ["You are a test agent"]
+
+[[middleware]]
+type = "parallel_edit_guard"
+mode = "deny"
+
+[[middleware]]
+type = "parallel_edit_guard"
+enabled = false
+"#;
+
+    let cfg = load_config(ConfigSource::Toml(inline.to_string()))
+        .await
+        .expect("parallel_edit_guard config should load");
+
+    match cfg {
+        Config::Single(single) => {
+            assert_eq!(single.middleware.len(), 2);
+            assert!(
+                single
+                    .middleware
+                    .iter()
+                    .all(|m| m.middleware_type == "parallel_edit_guard")
+            );
+            assert_eq!(single.middleware[0].config["mode"], "deny");
+            assert_eq!(single.middleware[1].config["enabled"], false);
+        }
+        Config::Multi(_) => panic!("expected single-agent config"),
+    }
+}
+
+#[tokio::test]
 async fn test_load_config_accepts_profile_metadata_for_single_and_quorum() {
     let single = r#"
 [profile]

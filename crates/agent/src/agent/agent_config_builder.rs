@@ -654,6 +654,16 @@ impl AgentConfigBuilder {
         self.middleware_drivers.push(driver);
     }
 
+    /// Whether a middleware driver with this `name()` was already pushed.
+    pub fn has_middleware_named(&self, name: &str) -> bool {
+        self.middleware_drivers.iter().any(|d| d.name() == name)
+    }
+
+    /// Clone of the current tool registry.
+    pub fn tool_registry_snapshot(&self) -> ToolRegistry {
+        self.tool_registry.clone()
+    }
+
     /// Borrow the `SessionProvider` (used by `DelegationMiddleware` constructor in quorum).
     pub fn provider(&self) -> &Arc<SessionProvider> {
         &self.provider

@@ -20,6 +20,7 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::TaskStatus;
 use log::debug;
 use querymt::chat::ChatRole;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{Instrument, Span, info_span, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -1112,6 +1113,38 @@ pub(super) async fn record_tool_side_effects(
     Ok(None)
 }
 
+/// Return `results` stable-sorted by the position of each `call_id` in the last
+/// assistant message's tool calls.
+///
+/// Results whose id is not among those calls (or all results, when there is no
+/// assistant tool-call message) keep their relative order and go at the end.
+fn order_results_by_call_position(
+    results: &[ToolResult],
+    messages: &[querymt::chat::ChatMessage],
+) -> Vec<ToolResult> {
+    let mut ordered = results.to_vec();
+    let Some(assistant) = messages
+        .iter()
+        .rfind(|message| message.role == ChatRole::Assistant)
+    else {
+        return ordered;
+    };
+
+    let mut positions: HashMap<&str, usize> = HashMap::new();
+    for (position, call) in assistant.function_calls().enumerate() {
+        // First occurrence wins if an id is (unexpectedly) repeated.
+        positions.entry(call.call_id.as_str()).or_insert(position);
+    }
+    // `sort_by_key` is stable, so unknown ids (usize::MAX) keep their order.
+    ordered.sort_by_key(|result| {
+        positions
+            .get(result.call_id.as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
+    ordered
+}
+
 /// Store all completed tool results back into conversation history.
 ///
 /// This function:
@@ -1140,11 +1173,16 @@ pub(super) async fn store_all_tool_results(
     let mut messages = (*context.messages).to_vec();
     let mut wait_conditions = Vec::new();
 
+    // Middleware may pre-fill `results` (e.g. rejected calls), so the incoming
+    // order is not necessarily the order of the assistant's tool calls. Store
+    // results in call order.
+    let ordered_results = order_results_by_call_position(results, &context.messages);
+
     // Record per-result side effects (delegations, artifacts, etc.) before
     // persisting the combined tool_result message so hook-driven rewrites are
     // visible to the model in the stored transcript.
-    let mut adjusted_results = Vec::with_capacity(results.len());
-    for mut result in results.iter().cloned() {
+    let mut adjusted_results = Vec::with_capacity(ordered_results.len());
+    for mut result in ordered_results.iter().cloned() {
         if let Some(wait_condition) =
             record_tool_side_effects(config, &mut result, exec_ctx).await?
         {
@@ -1229,7 +1267,7 @@ pub(super) async fn store_all_tool_results(
 
     // Aggregate changed file paths from tool results for dedup check
     let mut combined = crate::index::DiffPaths::default();
-    for result in results.iter() {
+    for result in ordered_results.iter() {
         if let Some(ref snapshot) = result.snapshot_part
             && let Some(paths) = snapshot.changed_paths()
         {
@@ -1269,6 +1307,77 @@ pub(super) async fn store_all_tool_results(
     Ok(ExecutionState::BeforeLlmCall {
         context: new_context,
     })
+}
+
+#[cfg(test)]
+mod result_order_tests {
+    use super::*;
+    use querymt::chat::ChatMessage;
+
+    fn result(call_id: &str) -> ToolResult {
+        ToolResult::new(
+            call_id.to_string(),
+            vec![querymt::chat::ToolResultPart::text(call_id)],
+            false,
+            Some("tool".to_string()),
+            None,
+        )
+    }
+
+    fn ids(results: &[ToolResult]) -> Vec<&str> {
+        results.iter().map(|r| r.call_id.as_str()).collect()
+    }
+
+    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
+        let mut builder = ChatMessage::assistant();
+        for id in ids {
+            builder = builder.tool_use(*id, "edit", serde_json::json!({}));
+        }
+        builder.build()
+    }
+
+    #[test]
+    fn prefilled_out_of_order_results_follow_call_order() {
+        let messages = [assistant_with_calls(&["c1", "c2", "c3"])];
+        // Deny-mode style: the rejected c2 was pre-filled before c1/c3 ran.
+        let results = [result("c2"), result("c3"), result("c1")];
+
+        let ordered = order_results_by_call_position(&results, &messages);
+
+        assert_eq!(ids(&ordered), ["c1", "c2", "c3"]);
+    }
+
+    #[test]
+    fn unknown_ids_keep_relative_order_at_the_end() {
+        let messages = [assistant_with_calls(&["c1", "c2"])];
+        let results = [result("x2"), result("c2"), result("x1"), result("c1")];
+
+        let ordered = order_results_by_call_position(&results, &messages);
+
+        assert_eq!(ids(&ordered), ["c1", "c2", "x2", "x1"]);
+    }
+
+    #[test]
+    fn only_the_last_assistant_message_defines_order() {
+        let messages = [
+            assistant_with_calls(&["old1", "old2"]),
+            assistant_with_calls(&["b", "a"]),
+        ];
+        let results = [result("a"), result("b")];
+
+        let ordered = order_results_by_call_position(&results, &messages);
+
+        assert_eq!(ids(&ordered), ["b", "a"]);
+    }
+
+    #[test]
+    fn without_an_assistant_message_order_is_unchanged() {
+        let results = [result("b"), result("a")];
+
+        let ordered = order_results_by_call_position(&results, &[]);
+
+        assert_eq!(ids(&ordered), ["b", "a"]);
+    }
 }
 
 #[cfg(test)]

@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError, resolve_arg_path,
+};
 
 use super::read_shared::{DEFAULT_READ_LIMIT, render_read_output};
 
@@ -71,6 +73,13 @@ impl ToolTrait for ReadTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        args.get("path")
+            .and_then(Value::as_str)
+            .and_then(|raw| resolve_arg_path(raw, cwd))
+            .map_or(FileAccess::None, |path| FileAccess::reads([path]))
+    }
+
     fn truncation_hint(&self) -> Option<&'static str> {
         Some(
             "TIP: Use offset/limit to page through large files or directories, and use search_text when you only need specific content.",
@@ -128,6 +137,30 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_access_reads_normalised_path() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let tool = ReadTool::new();
+
+        let access = tool.file_access(&json!({"path": "./src/../a.rs"}), Some(&root));
+
+        assert_eq!(access, FileAccess::reads([root.join("a.rs")]));
+        assert!(!access.has_writes());
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = ReadTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"path": 1}), Some(&cwd)),
+            FileAccess::None
+        );
+    }
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

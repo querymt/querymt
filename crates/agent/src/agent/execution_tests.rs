@@ -299,6 +299,8 @@ struct SchedulingTool {
     result: &'static str,
     log: Arc<StdMutex<Vec<String>>>,
     cancel_on_start: bool,
+    /// File this tool claims to write (drives conflict-aware scheduling).
+    write_path: Option<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -313,6 +315,17 @@ impl AgentTool for SchedulingTool {
 
     fn execution_class(&self) -> ToolExecutionClass {
         self.class
+    }
+
+    fn file_access(
+        &self,
+        _args: &serde_json::Value,
+        _cwd: Option<&std::path::Path>,
+    ) -> crate::tools::FileAccess {
+        match &self.write_path {
+            Some(path) => crate::tools::FileAccess::writes([path.clone()]),
+            None => crate::tools::FileAccess::None,
+        }
     }
 
     async fn call(
@@ -349,6 +362,26 @@ fn scheduling_tool(
         result,
         log: log.clone(),
         cancel_on_start: false,
+        write_path: None,
+    })
+}
+
+/// A `ParallelSafe` tool that declares a write to `path`.
+fn writing_tool(
+    name: &'static str,
+    path: &std::path::Path,
+    delay_ms: u64,
+    cancel_on_start: bool,
+    log: &Arc<StdMutex<Vec<String>>>,
+) -> Arc<dyn AgentTool> {
+    Arc::new(SchedulingTool {
+        name,
+        class: ToolExecutionClass::ParallelSafe,
+        delay_ms,
+        result: "ok",
+        log: log.clone(),
+        cancel_on_start,
+        write_path: Some(path.to_path_buf()),
     })
 }
 
@@ -739,6 +772,7 @@ async fn mixed_scheduler_cancellation_stores_one_result_per_call() {
         result: "cancelled",
         log: log.clone(),
         cancel_on_start: true,
+        write_path: None,
     });
     harness.with_builtin_tools(vec![
         cancelling,
@@ -779,6 +813,264 @@ async fn mixed_scheduler_cancellation_stores_one_result_per_call() {
         result_call_ids,
         BTreeSet::from(["call-a", "call-b", "call-cancel"])
     );
+}
+
+/// Queue one provider response carrying `calls`, then a final text response.
+async fn expect_tool_batch_then_done(
+    harness: &TestHarness,
+    calls: Vec<querymt::ToolCall>,
+    final_expected: bool,
+) {
+    let mut seq = Sequence::new();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_, _| Ok(MockChatResponse::with_tools("", calls.clone()).into()));
+    if final_expected {
+        harness
+            .provider_mut()
+            .await
+            .expect_chat_with_tools()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Ok(MockChatResponse::text_only("done").into()));
+    }
+}
+
+/// `(call_id, is_error)` of every stored tool result, in storage order.
+fn stored_tool_results(harness: &TestHarness) -> Vec<(String, bool)> {
+    harness
+        .stored_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            crate::model::MessagePart::ToolResult {
+                call_id, is_error, ..
+            } => Some((call_id.clone(), *is_error)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn edit_args(path: &std::path::Path, old: &str, new: &str) -> String {
+    json!({
+        "filePath": path.to_str().unwrap(),
+        "oldString": old,
+        "newString": new,
+    })
+    .to_string()
+}
+
+/// Regression for the lost-update incident: several real `edit` calls on one
+/// file in a single response must all persist.
+#[tokio::test]
+async fn same_file_edits_in_one_batch_all_persist() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("design.md");
+    let lines: Vec<String> = (0..8).map(|i| format!("line-{i}")).collect();
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    harness.with_builtin_tools(vec![Arc::new(crate::tools::builtins::EditTool::new())]);
+    let calls: Vec<_> = (0..8)
+        .map(|i| {
+            mock_querymt_tool_call(
+                &format!("call-{i}"),
+                "edit",
+                &edit_args(&path, &format!("line-{i}"), &format!("edited-{i}")),
+            )
+        })
+        .collect();
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    for i in 0..8 {
+        assert!(
+            content.contains(&format!("edited-{i}")),
+            "edit {i} was lost: {content}"
+        );
+        assert!(!content.contains(&format!("line-{i}\n")));
+    }
+    let results = stored_tool_results(&harness);
+    let expected: Vec<_> = (0..8).map(|i| (format!("call-{i}"), false)).collect();
+    assert_eq!(results, expected, "results must be in call order, all ok");
+}
+
+/// Edit B's `oldString` only exists once edit A has been applied, so the batch
+/// only succeeds if A runs to completion before B starts.
+#[tokio::test]
+async fn dependent_same_file_edits_run_in_model_order() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a.md");
+    std::fs::write(&path, "alpha\n").unwrap();
+
+    harness.with_builtin_tools(vec![Arc::new(crate::tools::builtins::EditTool::new())]);
+    let calls = vec![
+        mock_querymt_tool_call("call-a", "edit", &edit_args(&path, "alpha", "beta")),
+        mock_querymt_tool_call("call-b", "edit", &edit_args(&path, "beta", "gamma")),
+    ];
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "gamma\n");
+    assert_eq!(
+        stored_tool_results(&harness),
+        vec![("call-a".to_string(), false), ("call-b".to_string(), false)]
+    );
+}
+
+/// End to end: one response with two `edit` calls on the same file. Both edits
+/// persist, and the next model request carries the warn-mode guidance after the
+/// tool results (never between a tool call and its result).
+#[tokio::test]
+async fn same_file_edits_persist_and_next_request_carries_warn_guidance() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("design.md");
+    std::fs::write(&path, "alpha\nbeta\n").unwrap();
+
+    harness.with_builtin_tools(vec![Arc::new(crate::tools::builtins::EditTool::new())]);
+    let guard = Arc::new(crate::middleware::ParallelEditGuard::new(
+        harness.config.tool_registry.clone(),
+        crate::middleware::ParallelEditMode::Warn,
+    ));
+    harness.config = Arc::new((*harness.config).clone().with_middleware(vec![guard]));
+
+    let calls = vec![
+        mock_querymt_tool_call("call-1", "edit", &edit_args(&path, "alpha", "ALPHA")),
+        mock_querymt_tool_call("call-2", "edit", &edit_args(&path, "beta", "BETA")),
+    ];
+    // (role-is-user, has_tool_result, text) of every message in the 2nd request.
+    let second_request: Arc<StdMutex<Vec<(bool, bool, String)>>> =
+        Arc::new(StdMutex::new(Vec::new()));
+    let captured = second_request.clone();
+    let mut seq = Sequence::new();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_, _| Ok(MockChatResponse::with_tools("", calls.clone()).into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |messages, _| {
+            *captured.lock().unwrap() = messages
+                .iter()
+                .map(|m| {
+                    (
+                        matches!(m.role, querymt::chat::ChatRole::User),
+                        m.has_tool_result(),
+                        m.text(),
+                    )
+                })
+                .collect();
+            Ok(MockChatResponse::text_only("done").into())
+        });
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "ALPHA\nBETA\n");
+    assert_eq!(
+        stored_tool_results(&harness),
+        vec![("call-1".to_string(), false), ("call-2".to_string(), false)]
+    );
+
+    let request = second_request.lock().unwrap();
+    let last_result = request
+        .iter()
+        .rposition(|(_, has_result, _)| *has_result)
+        .expect("second request carries the tool results");
+    let note = request
+        .iter()
+        .position(|(is_user, has_result, text)| {
+            *is_user && !*has_result && text.contains("design.md") && text.contains("multiedit")
+        })
+        .expect("second request carries the warn guidance");
+    assert!(
+        note > last_result,
+        "guidance must come after the tool results: {request:?}"
+    );
+}
+
+/// Calls on different files, and calls from tools that declare no access, are
+/// not serialized behind a conflicting pair.
+#[tokio::test]
+async fn non_conflicting_writes_still_overlap_while_conflicting_ones_serialize() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let shared = std::path::PathBuf::from("/ws/shared.md");
+    let other = std::path::PathBuf::from("/ws/other.md");
+    harness.with_builtin_tools(vec![
+        writing_tool("w1", &shared, 30, false, &log),
+        writing_tool("w2", &shared, 0, false, &log),
+        writing_tool("w3", &other, 30, false, &log),
+    ]);
+    let calls = vec![
+        mock_querymt_tool_call("call-1", "w1", "{}"),
+        mock_querymt_tool_call("call-2", "w2", "{}"),
+        mock_querymt_tool_call("call-3", "w3", "{}"),
+    ];
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    let log = log.lock().unwrap().clone();
+    let position = |entry: &str| log.iter().position(|item| item == entry).unwrap();
+    // Same file: w2 starts only after w1 finished.
+    assert!(position("end:w1") < position("start:w2"));
+    // Different file: w3 overlaps with w1.
+    assert!(position("start:w3") < position("end:w1"));
+}
+
+/// A call waiting on a conflicting earlier call still gets exactly one
+/// (cancelled) result when the user cancels, and never starts.
+#[tokio::test]
+async fn cancellation_while_conflicting_call_waits_yields_one_result_per_call() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let shared = std::path::PathBuf::from("/ws/shared.md");
+    harness.with_builtin_tools(vec![
+        writing_tool("first", &shared, 0, true, &log),
+        writing_tool("second", &shared, 0, false, &log),
+        writing_tool("third", &shared, 0, false, &log),
+    ]);
+    let calls = vec![
+        mock_querymt_tool_call("call-1", "first", "{}"),
+        mock_querymt_tool_call("call-2", "second", "{}"),
+        mock_querymt_tool_call("call-3", "third", "{}"),
+    ];
+    expect_tool_batch_then_done(&harness, calls, false).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Cancelled);
+
+    let started: Vec<_> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.starts_with("start:"))
+        .cloned()
+        .collect();
+    assert_eq!(started, vec!["start:first".to_string()]);
+
+    let results = stored_tool_results(&harness);
+    let ids: Vec<_> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["call-1", "call-2", "call-3"], "one result per call");
+    // The calls that were still waiting report cancellation.
+    assert!(results[1].1 && results[2].1);
 }
 
 #[tokio::test]
