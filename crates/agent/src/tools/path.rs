@@ -7,6 +7,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::context::FileAccess;
+use super::read_scope::{ReadFilter, ReadScope};
 
 /// Normalise a tool-call path into a stable identity key.
 ///
@@ -107,6 +108,24 @@ pub fn path_or_cwd_read_access(
     }
 }
 
+/// Like [`path_or_cwd_read_access`], but the directory read is narrowed by
+/// `filter` (the include/exclude/file-type filter the walker itself applies),
+/// so only writes the walker could observe are ordered against it.
+pub fn path_or_cwd_filtered_read_access(
+    args: &serde_json::Value,
+    key: &str,
+    cwd: Option<&Path>,
+    filter: ReadFilter,
+) -> FileAccess {
+    let root = match args.get(key).and_then(serde_json::Value::as_str) {
+        Some(raw) => resolve_arg_path(raw, cwd),
+        None => cwd.map(|cwd| normalize_tool_path(cwd, None)),
+    };
+    root.map_or(FileAccess::None, |root| {
+        FileAccess::read_scopes([ReadScope::filtered(root, filter)])
+    })
+}
+
 /// `FileAccess` for tools that read every string in the array `args[key]`.
 ///
 /// Requires [`root_arg_resolves`], mirroring tools that call `resolve_root`
@@ -153,7 +172,8 @@ pub fn collect_read_paths(paths: impl IntoIterator<Item = Option<PathBuf>>) -> F
 }
 
 /// Whether two normalised paths overlap: they are equal, or one contains the
-/// other (so a directory conflicts with anything beneath it).
+/// other (so a directory conflicts with anything beneath it). Used for
+/// write/write conflicts; reads go through [`ReadScope::observes_write`].
 pub fn paths_overlap(a: &Path, b: &Path) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }

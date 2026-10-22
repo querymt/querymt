@@ -58,6 +58,22 @@ A call that reads a file and a call that writes that same file in one response S
 - **WHEN** a response contains an `edit` on `src/a.rs` followed by `search_text`, `ls` or `glob` over `src`
 - **THEN** the search runs after the edit completes, while a search over an unrelated directory runs concurrently
 
+#### Scenario: Filtered search ignores writes it cannot observe
+- **WHEN** a response contains an `edit` on `src/a.rs` and a `search_text` over `src` with `include = "*.md"`
+- **THEN** the two calls run concurrently
+
+#### Scenario: Filtered search still waits for matching writes
+- **WHEN** a response contains an `edit` on `src/a.md` followed by a `search_text` over `src` with `include = "*.md"`
+- **THEN** the search runs after the edit completes
+
+#### Scenario: Deleting a directory under a filtered search
+- **WHEN** a response deletes the directory `src/docs` and then runs `search_text` over `src` with `include = "*.md"`
+- **THEN** the search runs after the deletion completes
+
+#### Scenario: Grouped batches cost one extra wave regardless of order
+- **WHEN** a response contains a workspace search and two reads followed by three edits of other files, or the same calls in the opposite order
+- **THEN** the calls run in two waves in both cases
+
 ### Requirement: Shell commands do not overlap with file-writing tools
 A tool call whose file access cannot be determined (such as a shell command) SHALL NOT run concurrently with any call that writes a file in the same response. It MAY run concurrently with read-only or non-file calls, and with other undetermined-access calls.
 

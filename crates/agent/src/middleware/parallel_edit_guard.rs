@@ -12,10 +12,11 @@
 //! - `deny`: only the first writing call per file runs; later writers get an
 //!   error result telling the model to combine them into one `multiedit`.
 //!
-//! File access is read from the agent's *live* tool registry (bound through
-//! [`MiddlewareDriver::bind_agent`] when the config is assembled), so
-//! the guard and the scheduler always agree on which tools exist and which
-//! paths they write.
+//! File access is read from the agent's tool registry: `bind_agent` (called
+//! when the `AgentConfig` is assembled) installs the same `Arc<ToolRegistry>`
+//! the scheduler uses, so both always agree on which tools exist and which
+//! paths they write. UI notices are emitted with `EventSink::emit_detached`,
+//! so a slow event journal never delays tool execution.
 //!
 //! # Example (TOML config)
 //!
@@ -31,11 +32,12 @@ use crate::middleware::factory::MiddlewareFactory;
 use crate::middleware::{ExecutionState, MiddlewareDriver, Result, ToolCall, ToolResult};
 use crate::tools::{FileAccess, ToolRegistry};
 use anyhow::Result as AnyhowResult;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 
 use crate::event_sink::EventSink;
 use crate::events::AgentEventKind;
@@ -70,20 +72,21 @@ struct FlaggedFile {
 
 /// Middleware that detects and reacts to multiple same-file writes per response.
 pub struct ParallelEditGuard {
-    /// The agent's tool registry; replaced by the live one in `bind_agent`.
-    registry: RwLock<ToolRegistry>,
+    /// The agent's tool registry. `bind_agent` swaps in the very `Arc` the
+    /// scheduler uses, so both always see the same tools.
+    registry: ArcSwap<ToolRegistry>,
     /// Where warnings are published for UIs; set by `bind_agent`.
-    events: RwLock<Option<Arc<EventSink>>>,
+    events: ArcSwapOption<EventSink>,
     mode: ParallelEditMode,
     /// Guidance waiting to be injected, keyed by session id.
     pending: Mutex<HashMap<String, String>>,
 }
 
 impl ParallelEditGuard {
-    pub fn new(registry: ToolRegistry, mode: ParallelEditMode) -> Self {
+    pub fn new(registry: impl Into<Arc<ToolRegistry>>, mode: ParallelEditMode) -> Self {
         Self {
-            registry: RwLock::new(registry),
-            events: RwLock::new(None),
+            registry: ArcSwap::new(registry.into()),
+            events: ArcSwapOption::empty(),
             mode,
             pending: Mutex::new(HashMap::new()),
         }
@@ -93,40 +96,29 @@ impl ParallelEditGuard {
         self.mode
     }
 
-    fn registry_snapshot(&self) -> ToolRegistry {
-        self.registry
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+    /// The registry currently in use (shared, not copied).
+    pub fn registry(&self) -> Arc<ToolRegistry> {
+        self.registry.load_full()
     }
 
-    /// Tell UIs about a flagged batch (`HookNotice`, like other middleware warnings).
-    async fn notify(&self, session_id: &str, message: String) {
-        let sink = self
-            .events
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        let Some(sink) = sink else { return };
-        if let Err(error) = sink
-            .emit_durable(
+    /// Tell UIs about a flagged batch. Never waits for the event journal.
+    fn notify(&self, session_id: &str, message: String) {
+        if let Some(sink) = self.events.load_full() {
+            sink.emit_detached(
                 session_id,
                 AgentEventKind::HookNotice {
                     event_name: "parallel_edit_guard".to_string(),
                     message,
                     is_error: false,
                 },
-            )
-            .await
-        {
-            log::warn!("parallel_edit_guard: failed to emit notice: {error}");
+            );
         }
     }
 
     /// Declared file access of every call (already path-normalised by the
     /// tools), evaluated once off the async executor.
     async fn accesses(&self, calls: &[ToolCall], cwd: Option<&Path>) -> Vec<FileAccess> {
-        self.registry_snapshot()
+        self.registry()
             .file_access_batch(
                 calls
                     .iter()
@@ -184,6 +176,21 @@ impl ParallelEditGuard {
             }
         }
         path.display().to_string()
+    }
+
+    /// Short `file (N writes)` list for UI notices.
+    fn summary(flagged: &[FlaggedFile], cwd: Option<&Path>) -> String {
+        flagged
+            .iter()
+            .map(|f| {
+                format!(
+                    "`{}` ({} writes)",
+                    Self::display_path(&f.path, cwd),
+                    f.writers
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn warn_note(flagged: &[FlaggedFile], cwd: Option<&Path>) -> String {
@@ -321,7 +328,13 @@ impl MiddlewareDriver for ParallelEditGuard {
         match self.mode {
             ParallelEditMode::Warn => {
                 let note = Self::warn_note(&flagged, cwd);
-                self.notify(&context.session_id, note.clone()).await;
+                self.notify(
+                    &context.session_id,
+                    format!(
+                        "Several calls modified the same file in one response: {}. They ran in order; `multiedit` was recommended.",
+                        Self::summary(&flagged, cwd)
+                    ),
+                );
                 self.lock_pending()
                     .insert(context.session_id.to_string(), note);
                 Ok(ExecutionState::ProcessingToolCalls {
@@ -353,22 +366,13 @@ impl MiddlewareDriver for ParallelEditGuard {
                     }
                 }
 
-                let summary = flagged
-                    .iter()
-                    .map(|f| {
-                        format!(
-                            "`{}` ({} writes)",
-                            Self::display_path(&f.path, cwd),
-                            f.writers
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
                 self.notify(
                     &context.session_id,
-                    format!("Rejected redundant same-file writes in one response: {summary}"),
-                )
-                .await;
+                    format!(
+                        "Rejected redundant same-file writes in one response: {}. Only the first write per file ran.",
+                        Self::summary(&flagged, cwd)
+                    ),
+                );
 
                 Ok(ExecutionState::ProcessingToolCalls {
                     remaining_calls: Arc::from(kept.into_boxed_slice()),
@@ -379,15 +383,9 @@ impl MiddlewareDriver for ParallelEditGuard {
         }
     }
 
-    fn bind_agent(&self, registry: &ToolRegistry, events: &Arc<EventSink>) {
-        *self
-            .registry
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = registry.clone();
-        *self
-            .events
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(events.clone());
+    fn bind_agent(&self, registry: &Arc<ToolRegistry>, events: &Arc<EventSink>) {
+        self.registry.store(Arc::clone(registry));
+        self.events.store(Some(Arc::clone(events)));
     }
 
     fn reset(&self) {
@@ -740,8 +738,92 @@ mod tests {
         assert!(detect_in(&guard, &calls).await.is_empty());
 
         let agent = crate::test_utils::TestAgent::new().await;
-        guard.bind_agent(&registry(), &agent.config.event_sink);
+        guard.bind_agent(&Arc::new(registry()), &agent.config.event_sink);
         assert_eq!(detect_in(&guard, &calls).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bind_agent_shares_the_configs_registry_arc() {
+        let agent = crate::test_utils::TestAgent::new().await;
+        let guard = ParallelEditGuard::new(ToolRegistry::new(), ParallelEditMode::Warn);
+        guard.bind_agent(&agent.config.tool_registry, &agent.config.event_sink);
+        assert!(Arc::ptr_eq(&guard.registry(), &agent.config.tool_registry));
+    }
+
+    #[tokio::test]
+    async fn builder_binds_the_same_registry_arc_into_the_guard() {
+        let agent = crate::test_utils::TestAgent::new().await;
+        let guard = Arc::new(ParallelEditGuard::new(
+            ToolRegistry::new(),
+            ParallelEditMode::Warn,
+        ));
+        let config = (*agent.config)
+            .clone()
+            .with_middleware(vec![guard.clone() as Arc<dyn MiddlewareDriver>]);
+        assert!(Arc::ptr_eq(&guard.registry(), &config.tool_registry));
+    }
+
+    /// Run a flagged batch through a guard bound to a real event sink and
+    /// return the `parallel_edit_guard` notice published for the session.
+    async fn flagged_notice(mode: ParallelEditMode) -> String {
+        let (_dir, root) = temp_root();
+        let agent = crate::test_utils::TestAgent::new().await;
+        let session_id = agent.create_session().await;
+        let mut rx = agent.config.event_sink.fanout().subscribe();
+
+        let guard = ParallelEditGuard::new(registry(), mode);
+        guard.bind_agent(&Arc::new(registry()), &agent.config.event_sink);
+        let state = ExecutionState::ProcessingToolCalls {
+            remaining_calls: Arc::from(vec![
+                edit("1", &root.join("a.md")),
+                edit("2", &root.join("a.md")),
+            ]),
+            results: Arc::from([]),
+            context: Arc::new(ConversationContext::new(
+                session_id.as_str().into(),
+                Arc::from([]),
+                Arc::new(AgentStats::default()),
+                "mock".into(),
+                "mock".into(),
+            )),
+        };
+        // Returns before the event is persisted: emission is detached.
+        guard.on_processing_tool_calls(state, None).await.unwrap();
+
+        let deadline = std::time::Duration::from_secs(5);
+        loop {
+            let envelope = tokio::time::timeout(deadline, rx.recv())
+                .await
+                .expect("notice published")
+                .expect("fanout open");
+            if let AgentEventKind::HookNotice {
+                event_name,
+                message,
+                is_error,
+            } = envelope.kind()
+                && event_name == "parallel_edit_guard"
+            {
+                assert_eq!(envelope.session_id(), session_id);
+                assert!(envelope.is_durable());
+                assert!(!is_error);
+                return message.clone();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn warn_mode_publishes_a_durable_ui_notice() {
+        let message = flagged_notice(ParallelEditMode::Warn).await;
+        assert!(message.contains("a.md"), "{message}");
+        assert!(message.contains("2 writes"), "{message}");
+        assert!(!message.starts_with("System note"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn deny_mode_publishes_a_durable_ui_notice() {
+        let message = flagged_notice(ParallelEditMode::Deny).await;
+        assert!(message.contains("Rejected"), "{message}");
+        assert!(message.contains("a.md"), "{message}");
     }
 
     #[tokio::test]

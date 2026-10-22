@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::knowledge::{KnowledgeStore, ScopePolicy};
+use crate::tools::read_scope::ReadScope;
 
 /// Capability requirements that tools may need
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -225,10 +226,17 @@ pub enum FileAccess {
     /// The call does not touch files (or does not declare it). Default.
     #[default]
     None,
-    /// The call reads and/or writes the listed paths.
+    /// The call reads the listed scopes and/or writes the listed paths.
     Paths {
-        reads: Vec<PathBuf>,
+        /// What the call observes. A scope may be a directory narrowed by the
+        /// same include/exclude/file-type filter the tool applies.
+        reads: Vec<ReadScope>,
+        /// Files the call creates, modifies or deletes.
         writes: Vec<PathBuf>,
+        /// Directories the call removes or replaces as a whole. Unlike a file
+        /// write, this changes every entry beneath the directory, so read
+        /// filters do not apply to it.
+        tree_writes: Vec<PathBuf>,
     },
     /// The call may touch any file (e.g. a shell command).
     Unknown,
@@ -240,18 +248,35 @@ impl FileAccess {
         Self::Paths {
             reads: Vec::new(),
             writes: paths.into_iter().collect(),
+            tree_writes: Vec::new(),
         }
     }
 
-    /// Access that only reads the given paths.
-    pub fn reads(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+    /// Access that removes or replaces a whole directory tree.
+    pub fn writes_tree(dir: PathBuf) -> Self {
         Self::Paths {
-            reads: paths.into_iter().collect(),
+            reads: Vec::new(),
             writes: Vec::new(),
+            tree_writes: vec![dir],
         }
     }
 
-    /// Paths written by this call (empty for `None` and `Unknown`).
+    /// Access that only reads everything at or beneath the given paths.
+    pub fn reads(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self::read_scopes(paths.into_iter().map(ReadScope::all))
+    }
+
+    /// Access that only reads the given (possibly filtered) scopes.
+    pub fn read_scopes(scopes: impl IntoIterator<Item = ReadScope>) -> Self {
+        Self::Paths {
+            reads: scopes.into_iter().collect(),
+            writes: Vec::new(),
+            tree_writes: Vec::new(),
+        }
+    }
+
+    /// Files written by this call (empty for `None` and `Unknown`). Directory
+    /// tree writes are not included; see [`Self::written_trees`].
     pub fn written_paths(&self) -> &[PathBuf] {
         match self {
             Self::Paths { writes, .. } => writes,
@@ -259,9 +284,25 @@ impl FileAccess {
         }
     }
 
-    /// Whether the call declares at least one written path.
+    /// Scopes read by this call (empty for `None` and `Unknown`).
+    pub fn read_scopes_slice(&self) -> &[ReadScope] {
+        match self {
+            Self::Paths { reads, .. } => reads,
+            Self::None | Self::Unknown => &[],
+        }
+    }
+
+    /// Directory trees removed or replaced by this call.
+    pub fn written_trees(&self) -> &[PathBuf] {
+        match self {
+            Self::Paths { tree_writes, .. } => tree_writes,
+            Self::None | Self::Unknown => &[],
+        }
+    }
+
+    /// Whether the call declares at least one written file or tree.
     pub fn has_writes(&self) -> bool {
-        !self.written_paths().is_empty()
+        !self.written_paths().is_empty() || !self.written_trees().is_empty()
     }
 }
 

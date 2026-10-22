@@ -17,6 +17,10 @@ The system SHALL detect when a single model response contains two or more tool c
 - **WHEN** a response contains one `edit` on `a.md` and one on `b.md`
 - **THEN** nothing is flagged
 
+#### Scenario: Earlier gated calls do not disable detection
+- **WHEN** a response contains a call with invalid arguments and two `edit` calls on `design.md`
+- **THEN** the batch is still flagged for `design.md`
+
 #### Scenario: Shell does not trigger detection
 - **WHEN** a response contains one `edit` on `a.md` and a `shell` call
 - **THEN** nothing is flagged
@@ -35,6 +39,17 @@ In warn mode (the default), the system SHALL execute every call in a flagged bat
 #### Scenario: Guidance is sent once
 - **WHEN** a flagged batch is followed by two further model requests
 - **THEN** the guidance message is added only before the first of them
+
+#### Scenario: Undelivered guidance does not leak into a later turn
+- **WHEN** a flagged batch is cancelled before the next model request
+- **THEN** the guidance message is not added to the following turn
+
+### Requirement: Flagged batches notify the UI without delaying tools
+The system SHALL publish a durable notice naming each flagged file and its number of writes, in both warn and deny modes. Publishing MUST NOT delay the execution of the batch's tool calls.
+
+#### Scenario: Notice for a flagged batch
+- **WHEN** a response with two `edit` calls on `design.md` is flagged
+- **THEN** a `parallel_edit_guard` notice naming `design.md` is published for the session
 
 ### Requirement: Deny mode rejects redundant same-file writes
 In deny mode, the system SHALL execute only the first writing call per flagged file and return an error result for each later writing call to that file, without executing it. The error MUST name the file and tell the model to combine the edits into one `multiedit` call.

@@ -28,15 +28,16 @@
 ## 4. Integration checks
 
 - [x] 4.1 End-to-end test with a mock provider emitting one response with two `edit` calls on the same file: both edits persist, and the next request contains the warn guidance after the tool results; verify with `cargo nextest run -p querymt-agent`
-- [x] 4.2 Run full `cargo nextest run -p querymt-agent` and `cargo clippy --workspace -- -D warnings`; verify both pass
+- [x] 4.2 Run full `cargo nextest run -p querymt-agent` and `cargo clippy --package querymt-agent --all-targets --features dashboard,oauth,remote -- -D warnings`; verify both pass
 
 ## 5. Review follow-ups
 
 - [x] 5.1 Guard inspects every batch (pre-filled `results` no longer disable it); deny mode appends rejections to existing results; verify with guard unit tests
-- [x] 5.2 Guard and scheduler share the live tool registry (`MiddlewareDriver::bind_agent`, `ToolRegistry::file_access[_batch]`, evaluated on the blocking pool); verify `bind_agent_replaces_the_registry`
-- [x] 5.3 Auto-added guard is last in both `api/agent.rs` and `api/quorum.rs`; stale notes dropped at turn start/end; neutral wording; writer count in the deny message; `HookNotice` event; guard module no longer `pub`
+- [x] 5.2 Guard and scheduler share one `Arc<ToolRegistry>` (`AgentConfig::tool_registry` is an `Arc`; `MiddlewareDriver::bind_agent` stores it in an `ArcSwap`; `ToolRegistry::file_access_batch` runs on the blocking pool without copying the map); verify `bind_agent_shares_the_configs_registry_arc` and `builder_binds_the_same_registry_arc_into_the_guard`
+- [x] 5.3 Auto-added guard is last in both `api/agent.rs` and `api/quorum.rs`; stale notes dropped at turn start/end; neutral wording; writer count in the deny message; durable `HookNotice` with a UI summary emitted via `EventSink::emit_detached` (never blocks tools; `AgentConfig::emit_event` delegates to it); guard module no longer `pub`; verify `warn_mode_publishes_a_durable_ui_notice` and `deny_mode_publishes_a_durable_ui_notice`
 - [x] 5.4 Path identity: `dunce` canonicalization, `..` resolved by the OS before the symlink is lost; verify `parent_segment_after_symlink_follows_the_link_target`
 - [x] 5.5 Reads declared for `get_function`, `get_symbol`, `index`, `mdq`, `find_references`, `search_text`, `ls`, `glob`; planner treats a directory as overlapping files beneath it; verify planner and per-tool tests
+- [x] 5.7 Filter-aware read scopes (`tools/read_scope.rs`): `search_text` declares `include`/`exclude`/`file_type`, `glob` declares `pattern`; writes outside the filter no longer conflict; `delete_file` on a directory is a tree write that ignores filters; verify `read_scope` tests, `filtered_search_*`, `removing_a_directory_beneath_a_filtered_search_is_ordered`, and the grouped/interleaved planner tests
 - [x] 5.6 `replace_symbol` documented as resolving like the tool (root does not rebase relative paths); nits (test rename, shell test placement)
 
 ## Workflow follow-up

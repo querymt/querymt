@@ -67,7 +67,7 @@ pub trait MiddlewareDriver: Send + Sync {
     /// middleware that surfaces warnings to UIs can keep the sink.
     fn bind_agent(
         &self,
-        _registry: &crate::tools::ToolRegistry,
+        _registry: &Arc<crate::tools::ToolRegistry>,
         _events: &Arc<crate::event_sink::EventSink>,
     ) {
     }

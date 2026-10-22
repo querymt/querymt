@@ -243,6 +243,8 @@ impl Tool for ListTool {
     }
 
     fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        // Deliberately unfiltered: `ls` also lists directories, so a write of an
+        // ignored file can still create a visible parent directory.
         path_or_cwd_read_access(args, "path", cwd)
     }
 

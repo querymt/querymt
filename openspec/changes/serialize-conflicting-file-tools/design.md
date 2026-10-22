@@ -54,14 +54,14 @@ Declared access per tool:
 | `shell` | `Unknown` |
 | everything else | `None` (default) |
 
-Read-only file tools declare their reads, so a read is ordered against a write of the same file (or of a file beneath a directory they read). `read_tool`, `get_function`, `get_symbol`, `index`, `mdq` and `find_references` read the files they name; `search_text`, `ls` and `glob` read the directory they walk (`path`, default cwd). Path overlap is containment (equal, or one is an ancestor of the other), so `search_text` over `src/` waits for an `edit` of `src/a.rs`. Tools that declare nothing stay `None`.
+Read-only file tools declare their reads, so a read is ordered against a write it could observe. `read_tool`, `get_function`, `get_symbol`, `index`, `mdq` and `find_references` read the files or directories they name. Directory walkers declare a *filtered read scope* (`ReadScope { path, filter }`, `tools/read_scope.rs`): `search_text` carries its `include`, `exclude` and `file_type`; `glob` carries its `pattern`. The filter is the same matching the tool applies (`glob::Pattern::matches_path` on the path relative to the root; ripgrep file types on the file name), so `search_text include="*.md"` over `src/` does not wait for an `edit` of `src/a.rs`, but does wait for an `edit` of `src/a.md`. Filters only ever narrow a scope: an invalid pattern or unknown file type is dropped, which makes the scope broader. `ls` stays unfiltered because it also lists directories, so even a write of an ignored file can change its output. A write of the scope root or one of its ancestors always conflicts. `delete_file` on a directory is declared as a *tree write*, which conflicts with any read scope above or below it regardless of filters. Tools that declare nothing stay `None`.
 
 ### D2. Normalise paths in one shared helper
 
 `normalize_tool_path(raw, cwd) -> PathBuf`:
 1. Resolve against cwd, the same way as `ToolContext::resolve_path`.
-2. Lexically clean `.` and `..`.
-3. Canonicalize the longest existing prefix of the *uncleaned* path (so `link/../x` follows the symlink target as the OS does) and append the remaining components, resolving `.`/`..` lexically. Canonicalization uses `dunce` so Windows paths never carry the `\\\\?\\` verbatim prefix.
+2. Canonicalize the longest existing prefix of the path *before* any lexical cleaning, so `link/../x` follows the symlink target the way the OS does. Canonicalization uses `dunce`, so Windows paths never carry the `\\?\` verbatim prefix.
+3. Append the remaining (not yet existing) components, resolving `.` and `..` lexically.
 
 The scheduler and the middleware both use it. That keeps `./a.md`, `a.md`, the absolute path and symlinked paths as the same key. The helper does not try to handle case-insensitive file systems; see Risks.
 
@@ -107,7 +107,8 @@ On cancellation, every call that hasn't run yet gets the existing synthetic "Can
   - The new `ProcessingToolCalls` contains the reduced `remaining_calls`.
   - This depends on the order fix in D5.
 - **Default on.** In `api/agent.rs`, next to the existing ContextMiddleware auto-add: if no driver is named `ParallelEditGuard` *and* the config has no `parallel_edit_guard` entry (including a disabled one), push a warn-mode instance. Apply the same in `api/quorum.rs` where middleware entries are built.
-- **Event.** The guard publishes a `HookNotice` event (`event_name = "parallel_edit_guard"`) so UIs can show the warning. It gets the event sink and the live tool registry through `MiddlewareDriver::bind_agent`, called when the `AgentConfig` is assembled, so it always agrees with the scheduler about which tools exist.
+- **Event.** The guard publishes a durable `HookNotice` (`event_name = "parallel_edit_guard"`) with a short UI summary (`file (N writes)`), not the model-facing note. It uses `EventSink::emit_detached`, the same fire-and-forget path as `AgentConfig::emit_event`: ephemeral events publish at once and durable ones persist on a spawned task, so a slow journal never delays tool execution. The notice may therefore be stored after the batch's `ToolCallStart` events.
+- **Shared registry.** `AgentConfig::tool_registry` is an `Arc<ToolRegistry>` (immutable after build). `MiddlewareDriver::bind_agent` hands that same `Arc` and the event sink to the guard, which keeps it in an `ArcSwap`, so the guard and scheduler share one registry object and no batch copies the map.
 - **Stale notes.** A pending note is dropped at turn start and when the turn ends (`Complete`/`Stopped`/`Cancelled`); the wording is neutral about whether the calls succeeded.
 - **Every batch is inspected.** Calls gated earlier for invalid arguments pre-fill `results`; this does not disable detection. Deny mode appends its rejections to existing results.
 - **Middleware order.** The auto-added guard is pushed last in both `api/agent.rs` and `api/quorum.rs`, so its note is the final message of the request.
@@ -127,6 +128,8 @@ Today the executor appends new results after `results`. In deny mode, the pre-fi
 ## Risks / Trade-offs
 
 - **Shell is `Unknown`, so it waits for writing tools in the same batch.** → Small loss of parallelism, by design (confirmed with user).
+- **Unfiltered workspace reads are ordered against every write.** A `search_text` without `include`/`file_type`, or an `ls`, over the workspace waits for earlier writes and later writes wait for it. Grouped batches cost one extra wave regardless of order (`search + reads, then edits` and `edits, then search + reads` are both 2 waves); interleaving read/write/read/write follows the dependency chain the model wrote. Filtered scopes remove most of these false conflicts. → Accepted: dropping the ordering would let a search observe a truncated file mid-`tokio::fs::write`. A later change could make writes atomic (temp file + rename) and relax read-before-write ordering for searches.
+- **Filter semantics drift.** If a tool's matching changes, its declared filter must change with it. → The filter is built from the same crates and calls the tools use, and per-tool tests pin it.
 - **Case-insensitive file systems (macOS default, Windows).** Two spellings of a *not-yet-existing* file that differ only by case won't be detected as the same file. → Rare. Existing files are handled by canonicalisation.
 - **Paths outside the workspace or with odd symlinks.** Canonicalisation could fail. → Fall back to the lexically cleaned absolute path. Worst case, two calls run in parallel as they do today.
 - **Restructuring a central executor.** → `plan_waves` is pure and tested on its own. The existing scheduling tests in `agent/execution_tests.rs` (`scheduling_tool`) must keep passing unchanged, and new tests cover conflicts and cancellation.
@@ -139,5 +142,4 @@ No data or config migration. Rollback means reverting the commit. The guard can 
 
 ## Open Questions
 
-- Whether to add a generic "middleware warning" `AgentEventKind` so UIs can show guard warnings. This doesn't affect the specs or the scheduling design.
-t the specs or the scheduling design.
+- The guard currently reuses `HookNotice` for its UI notice. A dedicated generic "middleware warning" `AgentEventKind` would describe it better; this is a follow-up and does not affect the specs or the scheduling design.

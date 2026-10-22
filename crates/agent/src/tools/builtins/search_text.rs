@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::tools::{
-    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError,
-    path_or_cwd_read_access,
+    CapabilityRequirement, FileAccess, ReadFilter, Tool as ToolTrait, ToolContext, ToolError,
+    path_or_cwd_filtered_read_access,
 };
 
 /// Maximum bytes for a single matched line's text.
@@ -457,8 +457,20 @@ impl ToolTrait for SearchTextTool {
     }
 
     fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
-        // Reads the tree under `path` (default: the working directory).
-        path_or_cwd_read_access(args, "path", cwd)
+        // Reads the files under `path` (default: the working directory) that
+        // pass the same include/exclude/file-type filter the search applies,
+        // so it is only ordered against writes it could actually observe.
+        let mut filter = ReadFilter::new();
+        if let Some(include) = args.get("include").and_then(Value::as_str) {
+            filter = filter.include(include);
+        }
+        if let Some(exclude) = args.get("exclude").and_then(Value::as_array) {
+            filter = filter.exclude_all(exclude.iter().filter_map(Value::as_str));
+        }
+        if let Some(file_type) = args.get("file_type").and_then(Value::as_str) {
+            filter = filter.file_type(file_type);
+        }
+        path_or_cwd_filtered_read_access(args, "path", cwd, filter)
     }
 
     fn truncation_hint(&self) -> Option<&'static str> {
@@ -602,6 +614,29 @@ mod tests {
             tool.file_access(&serde_json::json!({"pattern": "x"}), None),
             Access::None
         );
+    }
+
+    #[test]
+    fn file_access_carries_the_search_filter() {
+        use std::path::Path;
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let access = SearchTextTool::new().file_access(
+            &serde_json::json!({
+                "pattern": "x",
+                "include": "*.rs",
+                "exclude": ["gen/**"],
+            }),
+            Some(&root),
+        );
+        let [scope] = access.read_scopes_slice() else {
+            panic!("expected one scope: {access:?}");
+        };
+        assert_eq!(scope.path, root);
+        assert!(scope.observes_write(&root.join("src/lib.rs")));
+        assert!(!scope.observes_write(&root.join("README.md")));
+        assert!(!scope.observes_write(&root.join("gen/out.rs")));
+        assert!(!scope.observes_write(Path::new("/elsewhere/a.rs")));
     }
 
     use super::*;

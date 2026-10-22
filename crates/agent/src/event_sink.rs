@@ -7,6 +7,8 @@
 //! Rules:
 //! - `emit_durable` persists to the journal (awaited), then publishes to fanout.
 //! - `emit_ephemeral` publishes to fanout only — never persisted.
+//! - `emit_detached` classifies and never blocks the caller (durable writes
+//!   run on a spawned task).
 //! - Domain code MUST NOT call EventJournal directly.
 
 use crate::event_fanout::EventFanout;
@@ -17,6 +19,7 @@ use crate::events::{
 use crate::session::error::SessionResult;
 use crate::session::projection::{EventJournal, NewDurableEvent};
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// Single ingress API for all event producers.
 ///
@@ -106,6 +109,42 @@ impl EventSink {
                 Ok(Some(persisted))
             }
         }
+    }
+
+    /// Fire-and-forget emit that never blocks the caller.
+    ///
+    /// Ephemeral events are published immediately. Durable events are
+    /// persisted and then published on a spawned task, so a slow journal never
+    /// delays the caller; a failed write is logged. Delegation events keep the
+    /// caller's span as parent for tracing.
+    ///
+    /// Use [`Self::emit_durable`] instead when the caller needs the persisted
+    /// event or must order later work after it.
+    pub fn emit_detached(self: &Arc<Self>, session_id: &str, kind: AgentEventKind) {
+        if classify_durability(&kind) == Durability::Ephemeral {
+            self.emit_ephemeral(session_id, kind);
+            return;
+        }
+
+        let sink = Arc::clone(self);
+        let session_id = session_id.to_string();
+        let parent = if EventFanout::is_delegation_event(&kind) {
+            tracing::Span::current()
+        } else {
+            tracing::Span::none()
+        };
+        tokio::spawn(
+            async move {
+                if let Err(err) = sink.emit_durable(&session_id, kind).await {
+                    log::warn!(
+                        "failed to emit durable event for session {}: {}",
+                        session_id,
+                        err
+                    );
+                }
+            }
+            .instrument(parent),
+        );
     }
 
     /// Emit an ephemeral event. Published to fanout only — never persisted.

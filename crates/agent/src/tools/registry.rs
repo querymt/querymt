@@ -76,12 +76,13 @@ impl ToolRegistry {
     /// If a tool's `file_access` panics the batch falls back to
     /// [`FileAccess::Unknown`], which is the conservative (serializing) choice.
     pub async fn file_access_batch(
-        &self,
+        self: &Arc<Self>,
         calls: Vec<(String, String)>,
         cwd: Option<PathBuf>,
     ) -> Vec<FileAccess> {
         let count = calls.len();
-        let registry = self.clone();
+        // Shares the registry with the blocking task; no map copy.
+        let registry = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             calls
                 .iter()
