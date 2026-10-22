@@ -75,7 +75,9 @@ pub(crate) fn handle_mdns_discovered<B: libp2p::swarm::NetworkBehaviour>(
             100,
         );
         let _ = peer_events_tx.send(PeerEvent::RouteAdded { peer_id, route });
-        if !was_alive {
+        // A new address can restore access to a previously missed catalog even
+        // when another connection already pins this peer's route.
+        if !was_alive || has_new_addr {
             let _ = peer_events_tx.send(PeerEvent::Discovered(peer_id));
         }
         // Establish transport before publishing actors; discovery alone does not
@@ -534,6 +536,33 @@ mod tests {
             }
         }
         assert_eq!(discovered, 1);
+
+        // A genuinely new address is a recovery opportunity even while the
+        // existing connection keeps the peer's route alive.
+        routes.connection_established(
+            peer,
+            MeshTransportKind::Lan,
+            MeshScopeId::lan_default(),
+            address,
+            100,
+        );
+        let new_address: Multiaddr = format!("/ip4/127.0.0.1/tcp/2/p2p/{peer}").parse().unwrap();
+        for _ in 0..3 {
+            handle_mdns_discovered(
+                &mut swarm,
+                vec![(peer, new_address.clone())],
+                &known,
+                &routes,
+                &tx,
+            );
+        }
+        let notifications = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|event| matches!(event, MeshEvent::Discovered(id) if *id == peer))
+            .count();
+        assert_eq!(
+            notifications, 1,
+            "new addresses must trigger one inventory retry, not one per announcement"
+        );
     }
 
     #[tokio::test]
