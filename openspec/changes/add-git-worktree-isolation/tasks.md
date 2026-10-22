@@ -96,8 +96,8 @@ Finding map: F1 authoritative fork cwd -> 11 and 16; F2 fail-closed fork creatio
 
 ## 10. Native gix dependency and typed repository operations
 
-- [x] 10.1 Upgrade gix 0.80 to 0.89, explicitly enabling sha1 with required basic/attributes/worktree-mutation features and updating Cargo.lock; verify the supported toolchain meets Rust 1.88 and cargo check -p querymt-agent succeeds, then run formatting only after the check passes.
-- [x] 10.2 Migrate discovery/error classification and affected gix call sites, including the existing snapshot backend, to 0.89 APIs and gix::Result; verify missing/untrusted/unusable repository errors remain distinguishable and existing snapshot/discovery tests pass without changing undo coverage.
+- [x] 10.1 Upgrade gix 0.80 to 0.90, explicitly enabling sha1 with required basic/attributes/worktree-mutation features and updating Cargo.lock; verify the supported toolchain meets Rust 1.88 and cargo check -p querymt-agent succeeds, then run formatting only after the check passes.
+- [x] 10.2 Migrate discovery/error classification and affected gix call sites, including the existing snapshot backend, to 0.90 APIs and gix::Result; verify missing/untrusted/unusable repository errors remain distinguishable and existing snapshot/discovery tests pass without changing undo coverage.
 - [x] 10.3 Replace GitRunner's argv/stdout boundary with typed injectable repository operations and fault-injection support; verify allocation/capture/lifecycle tests can inject operation failures without parsing Git commands or fabricating porcelain output, and blocking native calls do not run on async executor threads.
 - [x] 10.4 Implement native linked-worktree creation, inventory, inspection, and removal using high-level gix APIs while retaining QueryMT's stricter ownership/activity/ignored-file/result checks; verify distinct concurrent checkouts, no-force removal, and unchanged source files/index/HEAD in real-repository tests.
 - [x] 10.5 Replace remaining production Git subprocess calls for private index/tree/commit/ref operations, status, ancestry, and baseline-relative diffs with native primitives; verify a source audit and built-in operation tests show no Git executable dependency, and inherited Git directory/worktree/index overrides cannot redirect operations.
@@ -206,3 +206,13 @@ Section 18 validation notes (this session; no historical claims reused):
   - The `/worktree` catalog hint lists `publish`, `recover` and `archive`.
   - New-session creation takes the SQLite write lock up front (`BEGIN IMMEDIATE`) so concurrent processes wait instead of failing with `database is locked`.
 - Not changed, deliberately: baseline capture still performs three captures per validation attempt (`capture.rs`); the existing race tests assert that exact count, and reducing it is a performance refactor rather than a correctness fix. Tasks 7.4, 8.3 and 18.3 stay open (no interactive walkthrough was run; crate-wide strict lint is still blocked by unrelated pre-existing warnings). A full `cargo check` for `x86_64-pc-windows-msvc` could not run on this macOS host (`ring`/`aws-lc-sys` need a Windows C toolchain); the platform-neutral helpers were type-checked for that target in an isolated crate with the same `gix` version.
+
+## 20. gix 0.90 upgrade
+
+- [x] 20.1 Upgrade gix 0.89 to 0.90 (gix-worktree 0.59) and update Cargo.lock; no call-site migration required.
+- [x] 20.2 Ignore replacement refs in every `RepositoryOps` handle (`core.useReplaceRefs=false`); regression `is_ancestor_ignores_replacement_refs`.
+- [x] 20.3 Refuse worktree creation for sparse sources (config or pattern file) and roll back sparse children; regressions `add_worktree_refuses_sparse_source_via_config`, `add_worktree_refuses_sparse_source_via_pattern_file`, `add_worktree_succeeds_for_non_sparse_source`.
+- [x] 20.4 Refuse creation that would upgrade the shared format via `worktree.useRelativePaths`; regression `add_worktree_refuses_relative_paths_format_upgrade`.
+- [x] 20.5 Update docs and artifacts for 0.90 and record the sparse regression.
+- [ ] 20.6 Follow-up (not in this change): lock managed worktrees (`set_lock`, unlock -> `Force::Never` -> relock, prune/recovery handling) and two-phase `prepare_add_worktree`.
+

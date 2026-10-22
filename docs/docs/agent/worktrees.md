@@ -91,6 +91,16 @@ Semantics that matter:
   launches.** Active submodules are detected from gitlink entries in HEAD or
   the index (no `.gitmodules` required); sparse checkouts and unborn HEAD or
   unresolved conflicts fail as before.
+- **Sparse repositories are rejected in commit mode too.** `gix` 0.90 copies
+  the sparse-checkout patterns of the main worktree into every new linked
+  worktree, so a sparse main checkout would silently produce sparse children
+  whose absent paths look like deletions. Creation fails before anything is
+  made when `core.sparseCheckout` is enabled or `info/sparse-checkout` exists,
+  and a child that nevertheless turns out sparse is rolled back. Supporting
+  sparse checkouts is a possible follow-up.
+- **`worktree.useRelativePaths` is refused until the repository already uses
+  `extensions.relativeWorktrees`.** Otherwise `gix` would permanently upgrade
+  the shared repository format (Git 2.48+ only), even if creation then fails.
 - **External filter processes are unsupported and rejected via effective
   attributes.** Attribute resolution follows Git semantics — nested
   `.gitattributes` files, `$GIT_DIR/info/attributes`, global attribute
@@ -111,11 +121,16 @@ Semantics that matter:
 
 All built-in workspace operations — baseline capture, branch and ref
 administration, linked-worktree creation/inventory/removal, status, and
-ancestry checks — are implemented natively in Rust on top of `gix` (0.89).
+ancestry checks — are implemented natively in Rust on top of `gix` (0.90).
 No Git executable is required, installed, or invoked for these built-in
 operations; QueryMT needs a supported toolchain (Rust ≥ 1.88) but nothing
 else. Building the `WorkspaceService` takes a `GixRepoOps` value (see the
 example above); there is no Git-CLI configuration knob.
+
+Replacement refs (`refs/replace/*`, grafts) are ignored by every handle
+(`core.useReplaceRefs=false`): `gix` enables them by default and `isolated()`
+cannot switch them off through the environment, and a replacement could make
+unpreserved commits look reachable from a kept ref during removal checks.
 
 Repository-opening policy: administration operations (branches, refs,
 worktree registration/inventory/removal, ancestry) open the canonical Git

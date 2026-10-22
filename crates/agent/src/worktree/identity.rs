@@ -89,12 +89,12 @@ pub fn resolve_repository(cwd: &Path) -> WorktreeResult<ResolvedRepository> {
     })
 }
 
-/// Classify gix 0.89 discovery failures that mean "no usable repository
+/// Classify gix 0.90 discovery failures that mean "no usable repository
 /// here".
 ///
 /// `gix::discover()` returns `gix::Result`, whose erased `gix::Error`
 /// (gix-error) preserves the concrete cause. The upwards-discovery error
-/// (`gix::discover::upwards::Error`, paired with gix 0.89) is recovered from
+/// (`gix::discover::upwards::Error`, paired with gix 0.90) is recovered from
 /// the error chain; every one of its variants means no usable repository was
 /// found (including the untrusted-repository case), matching the previous
 /// gix 0.80 classification.

@@ -245,11 +245,22 @@ fn is_not_found(err: &gix::Error) -> bool {
 /// external Git directory, or a bare repository — never a working directory
 /// reconstructed from a checkout.
 fn open_repo(path: &Path) -> Result<gix::Repository, WorktreeError> {
-    // `isolated()` ignores inherited GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE
-    // overrides so an ambient environment cannot redirect operations to a
-    // different repository, worktree, or index (repository-local config is
-    // still honored).
-    gix::open_opts(path, gix::open::Options::isolated()).map_err(native_err)
+    gix::open_opts(path, base_open_options()).map_err(native_err)
+}
+
+/// Base open options shared by every repository handle in this module.
+///
+/// - `isolated()` ignores inherited GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE
+///   overrides so an ambient environment cannot redirect operations to a
+///   different repository, worktree, or index (repository-local config is
+///   still honored).
+/// - `core.useReplaceRefs=false`: replacement refs (`refs/replace/*`, grafts)
+///   are enabled by default in gix and cannot be disabled through the
+///   environment under `isolated()`. A replacement could make unpreserved
+///   commits look reachable from a kept ref, so preservation and ancestry
+///   checks must always see the real objects.
+fn base_open_options() -> gix::open::Options {
+    gix::open::Options::isolated().config_overrides(["core.useReplaceRefs=false"])
 }
 
 /// Open a checkout for status enumeration.
@@ -262,7 +273,7 @@ fn open_repo(path: &Path) -> Result<gix::Repository, WorktreeError> {
 fn open_repo_for_status(path: &Path) -> Result<gix::Repository, WorktreeError> {
     open_checkout_with(
         path,
-        gix::open::Options::isolated().config_overrides(["status.showUntrackedFiles=all"]),
+        base_open_options().config_overrides(["status.showUntrackedFiles=all"]),
     )
 }
 
@@ -272,7 +283,7 @@ fn open_repo_for_status(path: &Path) -> Result<gix::Repository, WorktreeError> {
 /// directory, this searches upwards. Environment overrides are ignored for
 /// the same reason as in [`open_repo`].
 fn open_checkout(path: &Path) -> Result<gix::Repository, WorktreeError> {
-    open_checkout_with(path, gix::open::Options::isolated())
+    open_checkout_with(path, base_open_options())
 }
 
 fn open_checkout_with(
@@ -559,10 +570,64 @@ impl RepositoryOps for GixRepoOps {
         let full = full_branch_name(branch);
         tokio::task::spawn_blocking(move || {
             let repo = open_repo(&common_dir)?;
+
+            // gix 0.90 copies the source worktree's active sparse-checkout
+            // patterns into new linked worktrees. The source here is the
+            // main worktree (we administer through the common directory),
+            // so a sparse main checkout would silently yield sparse
+            // children whose absent paths later look like deletions.
+            // Fail closed before anything is created.
+            if repo_is_sparse(&repo) {
+                return Err(sparse_unsupported_error("the repository"));
+            }
+
+            // `worktree.useRelativePaths` makes gix permanently upgrade the
+            // shared config to `extensions.relativeWorktrees` (Git >= 2.48
+            // only), even when creation then fails. Refuse to be the one
+            // that performs that irreversible repository-format change.
+            let snapshot = repo.config_snapshot();
+            if snapshot
+                .boolean("worktree.useRelativePaths")
+                .unwrap_or(false)
+                && !snapshot
+                    .boolean("extensions.relativeWorktrees")
+                    .unwrap_or(false)
+            {
+                return Err(WorktreeError::InvalidOperation(
+                    "worktree.useRelativePaths is enabled but the repository does not yet \
+                     use extensions.relativeWorktrees; creating a worktree would upgrade the \
+                     shared repository format (Git 2.48+ only). Run `git worktree add` once \
+                     yourself or disable the setting"
+                        .to_string(),
+                ));
+            }
+
             let head = gix::worktree::add::Head::Attached(full);
             let interrupt = std::sync::atomic::AtomicBool::new(false);
-            repo.add_worktree(&path, head, gix::progress::Discard, &interrupt)
+            let (child, _outcome) = repo
+                .add_worktree(&path, head, gix::progress::Discard, &interrupt)
                 .map_err(native_err)?;
+
+            // Post-check on the actual child, independent of which source
+            // gix copied from or which config file carries the setting.
+            if repo_is_sparse(&child) {
+                drop(child);
+                // Roll back; `Force::Never` still refuses anything unexpected.
+                let rollback = repo
+                    .remove_worktree(
+                        &path,
+                        gix::worktree::remove::Force::Never,
+                        gix::progress::Discard,
+                    )
+                    .map_err(native_err);
+                let mut err = sparse_unsupported_error("the new worktree");
+                if let Err(rollback_err) = rollback {
+                    err = WorktreeError::InvalidOperation(format!(
+                        "{err}; rollback of the new worktree also failed: {rollback_err}"
+                    ));
+                }
+                return Err(err);
+            }
             Ok(())
         })
         .await
@@ -977,6 +1042,29 @@ impl RepositoryOps for GixRepoOps {
         .await
         .map_err(native_err)?
     }
+}
+
+/// Whether sparse checkout is active for this repository handle: either
+/// `core.sparseCheckout` is enabled (any Git boolean spelling) or the
+/// handle's private Git directory carries `info/sparse-checkout` patterns
+/// (gix only copies those into a new worktree when they are active).
+fn repo_is_sparse(repo: &gix::Repository) -> bool {
+    repo.config_snapshot()
+        .boolean("core.sparseCheckout")
+        .unwrap_or(false)
+        || repo
+            .git_dir()
+            .join("info")
+            .join("sparse-checkout")
+            .is_file()
+}
+
+fn sparse_unsupported_error(what: &str) -> WorktreeError {
+    WorktreeError::InvalidOperation(format!(
+        "cannot create an isolated worktree: sparse checkout is enabled for {what}; \
+         sparse checkouts are unsupported in this version (new worktrees would inherit \
+         the sparse patterns and absent paths would be mistaken for deletions)"
+    ))
 }
 
 /// Attached branch (short name) of a checkout repository, if any.
@@ -2146,5 +2234,151 @@ mod tests {
         // comparison legitimately reports HEAD files as index deletions;
         // asserting an empty `uncommitted` would test fixture semantics,
         // not env isolation.
+    }
+
+    fn append_config(repo: &Path, text: &str) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(repo.join(".git/config"))
+            .unwrap();
+        writeln!(f, "{text}").unwrap();
+    }
+
+    /// Prepare a repo with one commit and a managed branch at HEAD.
+    async fn repo_with_branch(name: &str) -> (tempfile::TempDir, PathBuf, ManagedBranch) {
+        let repo = init_repo();
+        let head = commit_files(repo.path(), "root", &[("a.txt", "1")]);
+        let common = repo.path().join(".git");
+        let branch = ManagedBranch::from_raw(name);
+        GixRepoOps::new()
+            .create_branch(&common, &branch, &head.to_string())
+            .await
+            .unwrap();
+        (repo, common, branch)
+    }
+
+    /// gix 0.90 copies sparse-checkout state into new worktrees; a sparse
+    /// main checkout must be refused before anything is created.
+    #[tokio::test]
+    async fn add_worktree_refuses_sparse_source_via_config() {
+        let (repo, common, branch) = repo_with_branch("sparse-cfg").await;
+        append_config(repo.path(), "[core]\n\tsparseCheckout = yes");
+        let parent = tempfile::TempDir::new().unwrap();
+        let checkout = parent.path().join("wt");
+
+        let err = GixRepoOps::new()
+            .add_worktree(&common, &checkout, &branch)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("sparse"), "{err}");
+        assert!(!checkout.exists(), "nothing may be created");
+        assert!(!common.join("worktrees").exists(), "no registration");
+    }
+
+    /// Active sparse patterns without `core.sparseCheckout` are detected too.
+    #[tokio::test]
+    async fn add_worktree_refuses_sparse_source_via_pattern_file() {
+        let (repo, common, branch) = repo_with_branch("sparse-file").await;
+        std::fs::create_dir_all(common.join("info")).unwrap();
+        std::fs::write(common.join("info/sparse-checkout"), "/*\n!/a.txt\n").unwrap();
+        let parent = tempfile::TempDir::new().unwrap();
+        let checkout = parent.path().join("wt");
+
+        let err = GixRepoOps::new()
+            .add_worktree(&common, &checkout, &branch)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("sparse"), "{err}");
+        assert!(!checkout.exists());
+        drop(repo);
+    }
+
+    /// A non-sparse repository still gets a full checkout.
+    #[tokio::test]
+    async fn add_worktree_succeeds_for_non_sparse_source() {
+        let (_repo, common, branch) = repo_with_branch("full").await;
+        let parent = tempfile::TempDir::new().unwrap();
+        let checkout = parent.path().join("wt");
+
+        GixRepoOps::new()
+            .add_worktree(&common, &checkout, &branch)
+            .await
+            .unwrap();
+
+        assert!(checkout.join("a.txt").is_file());
+    }
+
+    /// `worktree.useRelativePaths` would permanently upgrade the shared
+    /// repository format; refuse instead of performing that change.
+    #[tokio::test]
+    async fn add_worktree_refuses_relative_paths_format_upgrade() {
+        let (repo, common, branch) = repo_with_branch("relpaths").await;
+        append_config(repo.path(), "[worktree]\n\tuseRelativePaths = true");
+        let parent = tempfile::TempDir::new().unwrap();
+        let checkout = parent.path().join("wt");
+
+        let err = GixRepoOps::new()
+            .add_worktree(&common, &checkout, &branch)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("useRelativePaths"), "{err}");
+        assert!(!checkout.exists());
+        let config = std::fs::read_to_string(common.join("config")).unwrap();
+        assert!(
+            !config.contains("relativeWorktrees"),
+            "shared config must not be upgraded: {config}"
+        );
+    }
+
+    /// A replacement ref must not make an unrelated commit look like an
+    /// ancestor: preservation checks have to see the real objects.
+    #[tokio::test]
+    async fn is_ancestor_ignores_replacement_refs() {
+        let repo = init_repo();
+        let root = commit_files(repo.path(), "root", &[("a.txt", "1")]);
+        let tip = commit_files(repo.path(), "tip", &[("a.txt", "2")]);
+        let g = gix::open(repo.path()).unwrap();
+        let tree = g.find_commit(tip).unwrap().tree_id().unwrap().detach();
+        // An unrelated root commit and a lookalike of `tip` built on top of it.
+        let unrelated = g
+            .commit(
+                "refs/heads/unrelated",
+                "unrelated",
+                tree,
+                Vec::<gix::ObjectId>::new(),
+            )
+            .unwrap()
+            .detach();
+        let fake_tip = g
+            .commit("refs/heads/fake", "fake tip", tree, [unrelated])
+            .unwrap()
+            .detach();
+        // refs/replace/<tip> -> fake_tip: with replacements honored, walking
+        // from `tip` would reach `unrelated`.
+        g.reference(
+            format!("refs/replace/{tip}"),
+            fake_tip,
+            PreviousValue::Any,
+            "test replace",
+        )
+        .unwrap();
+
+        let ops = GixRepoOps::new();
+        let common = repo.path().join(".git");
+        assert!(
+            !ops.is_ancestor(&common, &unrelated.to_string(), &tip.to_string())
+                .await
+                .unwrap(),
+            "replacement must not create ancestry"
+        );
+        assert!(
+            ops.is_ancestor(&common, &root.to_string(), &tip.to_string())
+                .await
+                .unwrap()
+        );
     }
 }
