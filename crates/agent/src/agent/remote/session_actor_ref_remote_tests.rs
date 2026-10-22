@@ -820,6 +820,118 @@ mod session_actor_ref_remote_tests {
         assert!(host_config.pending_elicitations.lock().await.is_empty());
     }
 
+    /// A permission-only remote session is recoverable by a client without
+    /// form-question support, and the recovery attach delivers the claimed
+    /// permission as `session/request_permission` (not through the question
+    /// sender, which would drop it).
+    #[tokio::test]
+    async fn reconnect_redelivers_pending_remote_permission_without_form_support() {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        use crate::acp::websocket::{deliver_attached_interactions, route_websocket_response};
+        use crate::control::elicitation_recovery::{
+            AttachPendingElicitationSessionRequest, ELICITATION_RECOVERY_VERSION,
+            ElicitationRecoveryRegistry,
+        };
+
+        let (session_ref, _local, host_config, session_id) =
+            remote_session_ref_with_host("e15b").await;
+        let alpha = crate::test_utils::TestAgent::new().await;
+        alpha
+            .handle
+            .registry
+            .lock()
+            .await
+            .insert(session_id.clone(), session_ref);
+
+        let request = RequestPermissionRequest::new(
+            session_id.clone(),
+            ToolCallUpdate::new(
+                ToolCallId::from("remote-call".to_string()),
+                ToolCallUpdateFields::new().title("Run shell"),
+            ),
+            vec![PermissionOption::new(
+                PermissionOptionId::from("allow_once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+        let (tx, mut waiter) = tokio::sync::oneshot::channel();
+        crate::elicitation::register_pending_permission(
+            &host_config.pending_elicitations,
+            "remote-perm".to_string(),
+            session_id.clone(),
+            request,
+            Some("run".to_string()),
+            Some("remote-call".to_string()),
+            tx,
+        )
+        .await;
+
+        // Neither connection advertised form-question support.
+        let recovery = ElicitationRecoveryRegistry::default();
+        for connection in ["original", "replacement"] {
+            recovery
+                .register_connection(connection.to_string(), true)
+                .await;
+        }
+        let secret = recovery
+            .issue_for_session("original", &session_id, alpha.handle.as_ref())
+            .await
+            .expect("a permission-only remote session gets an authority");
+        // The original connection received the request and then dropped.
+        crate::elicitation::claim_live_elicitation_delivery(
+            alpha.handle.as_ref(),
+            &session_id,
+            "remote-perm",
+            "original",
+        )
+        .await
+        .expect("first claim reaches the remote session");
+
+        let attach = recovery
+            .authorize_attach(
+                "replacement",
+                &AttachPendingElicitationSessionRequest {
+                    version: ELICITATION_RECOVERY_VERSION,
+                    session_id: session_id.clone(),
+                    resume_authority: secret,
+                },
+                alpha.handle.as_ref(),
+            )
+            .await
+            .expect("attach reaches the remote permission");
+        assert_eq!(attach.elicitation_ids, vec!["remote-perm"]);
+
+        let (conn, pending, mut wire) = ws_connection("replacement");
+        deliver_attached_interactions(&alpha.handle, &recovery, &session_id, &conn).await;
+        let prompt = next_wire(&mut wire).await;
+        assert_eq!(prompt["method"], "session/request_permission");
+        assert_eq!(prompt["params"]["toolCall"]["toolCallId"], "remote-call");
+        assert!(matches!(
+            waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        assert!(
+            route_websocket_response(
+                &pending,
+                prompt["id"].clone(),
+                Some(serde_json::json!({"outcome": {"outcome": "selected", "optionId": "allow_once"}})),
+                None,
+            )
+            .await
+        );
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("remote tool resumed")
+            .expect("answer");
+        assert_eq!(answer.selected_permission_option(), Some("allow_once"));
+        assert!(host_config.pending_elicitations.lock().await.is_empty());
+    }
+
     // ── E.12 ─────────────────────────────────────────────────────────────────
 
     #[tokio::test]

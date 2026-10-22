@@ -837,6 +837,16 @@ pub(super) async fn ensure_tool_permission(
         })
         .raw_input(args.clone());
 
+    // Unique interaction ID; the tool-call ID is carried separately in the
+    // request. The ID also rides on the wire request so any client can key its
+    // card by it and match it against the recovery pending set.
+    let permission_id = uuid::Uuid::now_v7().to_string();
+    let mut request_meta = serde_json::Map::new();
+    request_meta.insert(
+        "querymt".to_string(),
+        serde_json::json!({ "interaction_id": permission_id }),
+    );
+
     let request = RequestPermissionRequest::new(
         exec_ctx.session_id.clone(),
         ToolCallUpdate::new(
@@ -865,10 +875,9 @@ pub(super) async fn ensure_tool_permission(
                 PermissionOptionKind::RejectAlways,
             ),
         ],
-    );
+    )
+    .meta(request_meta);
 
-    // Unique interaction ID; the tool-call ID is carried separately in the request.
-    let permission_id = uuid::Uuid::now_v7().to_string();
     let (response_tx, response_rx) = tokio::sync::oneshot::channel();
     crate::elicitation::register_pending_permission(
         &config.pending_elicitations,
@@ -2041,6 +2050,37 @@ mod permission_interaction_tests {
         let (granted, ()) = tokio::join!(ensure, driver);
         assert!(granted.unwrap());
         assert!(pending_is_empty(config).await);
+    }
+
+    #[tokio::test]
+    async fn request_carries_its_interaction_id_in_meta() {
+        let (fixture, exec) = fixture().await;
+        let config = fixture.config.as_ref();
+        let args = serde_json::json!({});
+
+        let ensure =
+            ensure_tool_permission(config, &exec, "call-i", "shell", &args, permission_ctx());
+        let driver = async {
+            let id = wait_pending(config, "call-i").await;
+            let wire_id = {
+                let pending = config.pending_elicitations.lock().await;
+                let InteractionKind::Permission { request } = &pending[&id].kind else {
+                    panic!("expected a permission interaction");
+                };
+                let wire = serde_json::to_value(request.as_ref()).unwrap();
+                wire["_meta"]["querymt"]["interaction_id"]
+                    .as_str()
+                    .map(str::to_string)
+            };
+            assert_eq!(
+                wire_id.as_deref(),
+                Some(id.as_str()),
+                "the wire request must carry the pending interaction ID"
+            );
+            answer(config, &exec.session_id, &id, "allow_once").await;
+        };
+        let (granted, ()) = tokio::join!(ensure, driver);
+        assert!(granted.unwrap());
     }
 
     #[tokio::test]

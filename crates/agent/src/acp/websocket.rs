@@ -629,6 +629,46 @@ pub(crate) async fn redeliver_pending_permissions(
     }
 }
 
+/// Deliver every pending interaction the recovery attach just claimed for
+/// `connection`, each through the sender that matches its kind.
+///
+/// A recovery attach claims permissions and form questions together. A
+/// permission has no form to render, so it MUST go out as a standard
+/// `session/request_permission`; sending it through the question sender would
+/// fail to build a form and silently drop it, leaving the tool waiting.
+pub(crate) async fn deliver_attached_interactions(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    recovery: &crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
+    session_id: &str,
+    connection: &ConnectionEventState,
+) {
+    for claim in crate::elicitation::claimed_elicitation_deliveries(
+        agent.as_ref(),
+        session_id,
+        &connection.conn_id,
+    )
+    .await
+    {
+        let result = match claim.kind {
+            crate::elicitation::InteractionKind::Permission { .. } => {
+                deliver_claimed_websocket_permission(agent.clone(), claim, connection.clone()).await
+            }
+            _ => {
+                deliver_claimed_websocket_elicitation(
+                    agent.clone(),
+                    recovery.clone(),
+                    claim,
+                    connection.clone(),
+                )
+                .await
+            }
+        };
+        if let Err(error) = result {
+            log::warn!("Failed to re-deliver attached interaction: {error}");
+        }
+    }
+}
+
 pub(crate) async fn deliver_claimed_websocket_elicitation(
     agent: Arc<crate::agent::LocalAgentHandle>,
     recovery: crate::control::elicitation_recovery::ElicitationRecoveryRegistry,
@@ -1119,26 +1159,13 @@ async fn handle_websocket_connection(
                                     .get(&session_id)
                                     .is_some_and(|owners| owners.contains(&conn_id_dispatch))
                             {
-                                for claim in crate::elicitation::claimed_elicitation_deliveries(
-                                    state_dispatch.agent.as_ref(),
+                                deliver_attached_interactions(
+                                    &state_dispatch.agent,
+                                    &state_dispatch.elicitation_recovery,
                                     &session_id,
-                                    &conn_id_dispatch,
+                                    &connection_dispatch,
                                 )
-                                .await
-                                {
-                                    if let Err(error) = deliver_claimed_websocket_elicitation(
-                                        state_dispatch.agent.clone(),
-                                        state_dispatch.elicitation_recovery.clone(),
-                                        claim,
-                                        connection_dispatch.clone(),
-                                    )
-                                    .await
-                                    {
-                                        log::warn!(
-                                            "Failed to re-deliver attached elicitation: {error}"
-                                        );
-                                    }
-                                }
+                                .await;
                             }
                         });
                     }
@@ -1552,6 +1579,32 @@ async fn forward_session_event(
         if !connection.forwarded_elicitations.lock().await.insert(key) {
             return true;
         }
+
+        // A permission-only session must be recoverable after a reconnect just
+        // like a pending question, so issue the resume authority here too.
+        if let Some(resume_authority) = state
+            .elicitation_recovery
+            .issue_for_session(&connection.conn_id, &session_id, state.agent.as_ref())
+            .await
+        {
+            let notification =
+                crate::control::elicitation_recovery::ElicitationRecoveryAuthorityNotification {
+                    version: crate::control::elicitation_recovery::ELICITATION_RECOVERY_VERSION,
+                    session_id: session_id.clone(),
+                    resume_authority,
+                };
+            if send_websocket_notification(
+                &connection.tx,
+                crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION,
+                &notification,
+            )
+            .await
+            .is_err()
+            {
+                return false;
+            }
+        }
+
         let Some(claim) = crate::elicitation::claim_live_elicitation_delivery(
             state.agent.as_ref(),
             &session_id,

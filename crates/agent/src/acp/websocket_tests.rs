@@ -2169,6 +2169,167 @@ async fn permission_is_delivered_as_request_permission_and_selected_option_resol
 }
 
 #[tokio::test]
+async fn permission_event_issues_authority_then_request_on_secure_connection_without_form_support()
+{
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let session_id = "perm-authority-session";
+    state
+        .session_owners
+        .lock()
+        .await
+        .insert(session_id.to_string(), HashSet::from(["conn".to_string()]));
+    // Secure connection that did NOT advertise form-elicitation support.
+    state
+        .elicitation_recovery
+        .register_connection("conn".to_string(), true)
+        .await;
+    let _waiter = register_permission_for_test(&fixture, session_id, "perm-a").await;
+
+    let (wire_tx, mut wire_rx) = mpsc::channel::<String>(8);
+    let cancel = CancellationToken::new();
+    spawn_event_forwarders(
+        state,
+        ConnectionEventState {
+            conn_id: "conn".to_string(),
+            tx: wire_tx,
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+            delivery: crate::acp::delivery::ConnectionDelivery::new(None, cancel.clone()),
+        },
+        test_translator(),
+    );
+    fixture
+        .config
+        .event_sink
+        .fanout()
+        .publish(EventEnvelope::Ephemeral(EphemeralEvent {
+            session_seq: 0,
+            session_id: session_id.to_string(),
+            timestamp: 1,
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::PermissionRequested {
+                permission_id: "perm-a".to_string(),
+                task_id: None,
+                tool_name: "shell".to_string(),
+                reason: "needs permission".to_string(),
+                tool_call_id: "perm-a".to_string(),
+                request: Some(permission_request_for_test(session_id, "perm-a")),
+            },
+        }));
+
+    let authority: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("authority notification is sent for a permission request")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        authority["method"],
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION
+    );
+    assert_eq!(authority["params"]["session_id"], session_id);
+    assert_eq!(
+        authority["params"]["resume_authority"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+
+    let request: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .expect("the permission request follows the authority")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["method"], "session/request_permission");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn recovery_attach_delivers_claimed_permission_as_request_permission() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    let waiter = register_permission_for_test(&fixture, "session", "perm-1").await;
+
+    for conn in ["original", "replacement"] {
+        state
+            .elicitation_recovery
+            .register_connection(conn.to_string(), true)
+            .await;
+        state
+            .elicitation_recovery
+            .record_client_capabilities(conn, true)
+            .await;
+    }
+    let secret = state
+        .elicitation_recovery
+        .issue_for_session("original", "session", state.agent.as_ref())
+        .await
+        .expect("a pending permission is covered by the issued authority");
+
+    let attached = state
+        .elicitation_recovery
+        .authorize_attach(
+            "replacement",
+            &crate::control::elicitation_recovery::AttachPendingElicitationSessionRequest {
+                version: crate::control::elicitation_recovery::ELICITATION_RECOVERY_VERSION,
+                session_id: "session".to_string(),
+                resume_authority: secret,
+            },
+            state.agent.as_ref(),
+        )
+        .await
+        .expect("attach succeeds");
+    assert_eq!(attached.elicitation_ids, vec!["perm-1".to_string()]);
+
+    let pending: PendingWsRequestMap = Arc::new(Mutex::new(HashMap::new()));
+    let (wire_tx, mut wire) = mpsc::channel::<String>(16);
+    let connection = connection_state_for_test(
+        "replacement",
+        wire_tx,
+        pending.clone(),
+        Arc::new(AtomicU64::new(1)),
+    );
+    super::websocket::deliver_attached_interactions(
+        &state.agent,
+        &state.elicitation_recovery,
+        "session",
+        &connection,
+    )
+    .await;
+
+    let request: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire.recv())
+            .await
+            .expect("the claimed permission reaches the attaching connection")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(request["method"], "session/request_permission");
+    assert_eq!(request["params"]["toolCall"]["toolCallId"], "perm-1");
+    assert!(
+        route_websocket_response(
+            &pending,
+            request["id"].clone(),
+            Some(selected("allow_once")),
+            None
+        )
+        .await
+    );
+    let answer = timeout(Duration::from_secs(2), waiter)
+        .await
+        .expect("answer reaches the waiting tool")
+        .unwrap();
+    assert_eq!(answer.selected_permission_option(), Some("allow_once"));
+}
+
+#[tokio::test]
 async fn permission_disconnect_keeps_request_pending_and_next_client_decides() {
     let fixture = crate::test_utils::TestAgent::new().await;
     let mut waiter = register_permission_for_test(&fixture, "session", "call-d").await;

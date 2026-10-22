@@ -753,6 +753,37 @@ pub async fn has_pending_elicitation_for_agent_session(
 /// `connection_id` does not already hold, wherever the session runs. Used to
 /// re-deliver permission requests to a client that attaches after the request
 /// was raised.
+/// True when `session_id` has pending interactions and every one of them is a
+/// permission request. Such a session needs no form-question support from the
+/// client, so recovery does not have to require it.
+pub async fn session_pending_is_permission_only(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+) -> bool {
+    let pending = if let Some(session_ref) = find_session_ref(agent, session_id).await {
+        session_ref
+            .list_pending_interactions(None)
+            .await
+            .unwrap_or_else(|error| {
+                warn_interaction_call("permission_only", session_id, &error);
+                Vec::new()
+            })
+    } else {
+        let mut snapshots = Vec::new();
+        for map in all_pending_maps(agent).await {
+            snapshots.extend(snapshot_pending_elicitations(&map).await);
+        }
+        snapshots
+            .into_iter()
+            .filter(|entry| entry.session_id == session_id)
+            .collect()
+    };
+    !pending.is_empty()
+        && pending
+            .iter()
+            .all(|entry| matches!(entry.kind, InteractionKind::Permission { .. }))
+}
+
 pub async fn undelivered_permission_ids_for_session(
     agent: &crate::agent::LocalAgentHandle,
     session_id: &str,

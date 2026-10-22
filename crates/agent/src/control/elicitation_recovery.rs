@@ -83,17 +83,28 @@ impl ElicitationRecoveryRegistry {
         session_id: &str,
         agent: &crate::agent::LocalAgentHandle,
     ) -> Option<String> {
-        let existing_verifier = {
+        let (existing_verifier, supports_forms) = {
             let state = self.inner.lock().await;
             let connection = state.connections.get(connection_id)?;
-            if !connection.secure_transport || !connection.supports_form_elicitation {
+            if !connection.secure_transport {
                 return None;
             }
-            state
-                .sessions
-                .get(session_id)
-                .map(|authority| authority.verifier)
+            (
+                state
+                    .sessions
+                    .get(session_id)
+                    .map(|authority| authority.verifier),
+                connection.supports_form_elicitation,
+            )
         };
+        // A client without form-question support can still answer permission
+        // requests, so it may recover a session whose pending items are all
+        // permissions (and only such a session).
+        if !supports_forms
+            && !crate::elicitation::session_pending_is_permission_only(agent, session_id).await
+        {
+            return None;
+        }
 
         let still_scoped = if let Some(verifier) = existing_verifier {
             let verifier_hex = hex::encode(verifier);
@@ -107,7 +118,7 @@ impl ElicitationRecoveryRegistry {
 
         let mut state = self.inner.lock().await;
         let connection = state.connections.get(connection_id)?;
-        if !connection.secure_transport || !connection.supports_form_elicitation {
+        if !connection.secure_transport {
             return None;
         }
         if !still_scoped
@@ -204,12 +215,31 @@ impl ElicitationRecoveryRegistry {
         request: &ListPendingElicitationSessionsRequest,
         agent: &crate::agent::LocalAgentHandle,
     ) -> Result<ListPendingElicitationSessionsResponse, Error> {
-        self.verify_connection(connection_id, request.version)
+        let supports_forms = self
+            .verify_connection(connection_id, request.version)
             .await?;
         let verifier = authority_verifier(&request.resume_authority);
         let verifier_hex = hex::encode(verifier);
-        let session_ids =
+        let mut session_ids =
             crate::elicitation::pending_sessions_for_authority(agent, &verifier_hex).await;
+        if !supports_forms && !session_ids.is_empty() {
+            // Without form-question support only permission-only sessions are
+            // recoverable. Deny without pruning: the authority is still valid
+            // for the client that holds form support.
+            let mut recoverable = Vec::new();
+            for session_id in session_ids {
+                if crate::elicitation::session_pending_is_permission_only(agent, &session_id).await
+                {
+                    recoverable.push(session_id);
+                }
+            }
+            if recoverable.is_empty() {
+                return Err(elicitation_recovery_denied(
+                    ElicitationRecoveryDenialReason::CapabilityMismatch,
+                ));
+            }
+            session_ids = recoverable;
+        }
         if session_ids.is_empty() {
             self.prune_authority(&verifier).await;
             return Err(elicitation_recovery_denied(
@@ -228,7 +258,8 @@ impl ElicitationRecoveryRegistry {
         request: &AttachPendingElicitationSessionRequest,
         agent: &crate::agent::LocalAgentHandle,
     ) -> Result<AttachPendingElicitationSessionResponse, Error> {
-        self.verify_connection(connection_id, request.version)
+        let supports_forms = self
+            .verify_connection(connection_id, request.version)
             .await?;
         let verifier = authority_verifier(&request.resume_authority);
         let verifier_hex = hex::encode(verifier);
@@ -242,6 +273,14 @@ impl ElicitationRecoveryRegistry {
         if !session_is_authorized {
             return Err(elicitation_recovery_denied(
                 ElicitationRecoveryDenialReason::Unauthorized,
+            ));
+        }
+        if !supports_forms
+            && !crate::elicitation::session_pending_is_permission_only(agent, &request.session_id)
+                .await
+        {
+            return Err(elicitation_recovery_denied(
+                ElicitationRecoveryDenialReason::CapabilityMismatch,
             ));
         }
         if let Some(authority) = self
@@ -310,7 +349,9 @@ impl ElicitationRecoveryRegistry {
         }
     }
 
-    async fn verify_connection(&self, connection_id: &str, version: u32) -> Result<(), Error> {
+    /// Verify version and transport; returns whether the connection supports
+    /// form questions (permission-only sessions do not need it).
+    async fn verify_connection(&self, connection_id: &str, version: u32) -> Result<bool, Error> {
         if version != ELICITATION_RECOVERY_VERSION {
             return Err(elicitation_recovery_denied(
                 ElicitationRecoveryDenialReason::CapabilityMismatch,
@@ -327,12 +368,7 @@ impl ElicitationRecoveryRegistry {
                 ElicitationRecoveryDenialReason::InsecureTransport,
             ));
         }
-        if !connection.supports_form_elicitation {
-            return Err(elicitation_recovery_denied(
-                ElicitationRecoveryDenialReason::CapabilityMismatch,
-            ));
-        }
-        Ok(())
+        Ok(connection.supports_form_elicitation)
     }
 
     async fn prune_authority(&self, verifier: &[u8; 32]) {
@@ -865,6 +901,124 @@ mod tests {
                 agent_client_protocol::ErrorCode::Other(ELICITATION_RECOVERY_DENIED_CODE)
             );
         }
+    }
+
+    async fn permission_only_fixture(session_id: &str) -> crate::test_utils::TestAgent {
+        use crate::acp::protocol::{
+            PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionRequest,
+            ToolCallId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let request = RequestPermissionRequest::new(
+            session_id.to_string(),
+            ToolCallUpdate::new(
+                ToolCallId::from("call-1".to_string()),
+                ToolCallUpdateFields::new().title("Run shell"),
+            ),
+            vec![PermissionOption::new(
+                PermissionOptionId::from("allow_once"),
+                "Allow once",
+                PermissionOptionKind::AllowOnce,
+            )],
+        );
+        crate::elicitation::register_pending_permission(
+            &fixture.handle.pending_elicitations(),
+            "perm-1".to_string(),
+            session_id.to_string(),
+            request,
+            None,
+            Some("call-1".to_string()),
+            sender,
+        )
+        .await;
+        // Keep the waiter alive for the whole test.
+        std::mem::forget(_receiver);
+        fixture
+    }
+
+    #[tokio::test]
+    async fn permission_only_session_gets_authority_without_form_support() {
+        let registry = ElicitationRecoveryRegistry::default();
+        let fixture = permission_only_fixture("session-p").await;
+        registry
+            .register_connection("no-forms".to_string(), true)
+            .await;
+
+        let secret = registry
+            .issue_for_session("no-forms", "session-p", fixture.handle.as_ref())
+            .await
+            .expect("a permission-only session is recoverable without form support");
+
+        registry
+            .register_connection("replacement".to_string(), true)
+            .await;
+        let attached = registry
+            .authorize_attach(
+                "replacement",
+                &AttachPendingElicitationSessionRequest {
+                    version: ELICITATION_RECOVERY_VERSION,
+                    session_id: "session-p".to_string(),
+                    resume_authority: secret,
+                },
+                fixture.handle.as_ref(),
+            )
+            .await
+            .expect("permission-only attach works without form support");
+        assert_eq!(attached.elicitation_ids, vec!["perm-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn permission_only_session_still_requires_secure_transport() {
+        let registry = ElicitationRecoveryRegistry::default();
+        let fixture = permission_only_fixture("session-p").await;
+        registry
+            .register_connection("insecure".to_string(), false)
+            .await;
+
+        assert!(
+            registry
+                .issue_for_session("insecure", "session-p", fixture.handle.as_ref())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_session_still_requires_form_support() {
+        let (registry, fixture, _secret) = authorized_fixture("session-m", "question-1").await;
+        // Add a permission alongside the pending question.
+        let permission_fixture_map = fixture.handle.pending_elicitations();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        std::mem::forget(receiver);
+        crate::elicitation::register_pending_permission(
+            &permission_fixture_map,
+            "perm-m".to_string(),
+            "session-m".to_string(),
+            crate::acp::protocol::RequestPermissionRequest::new(
+                "session-m".to_string(),
+                crate::acp::protocol::ToolCallUpdate::new(
+                    crate::acp::protocol::ToolCallId::from("call-m".to_string()),
+                    crate::acp::protocol::ToolCallUpdateFields::new(),
+                ),
+                vec![],
+            ),
+            None,
+            Some("call-m".to_string()),
+            sender,
+        )
+        .await;
+        registry
+            .register_connection("no-forms".to_string(), true)
+            .await;
+
+        assert!(
+            registry
+                .issue_for_session("no-forms", "session-m", fixture.handle.as_ref())
+                .await
+                .is_none(),
+            "a question is pending, so form support is still required"
+        );
     }
 
     #[test]
