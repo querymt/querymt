@@ -252,6 +252,8 @@ pub struct Delegation {
 
 `isolation` is the resolved execution-workspace policy: `shared` (legacy behavior — the delegate runs in the parent's checkout) or `isolated` (a private managed Git worktree seeded from the parent's current code state; see [Git Worktree Workspaces](worktrees.md)). The `delegate` tool accepts an optional `isolation` argument (`inherit` | `isolated` | `shared`); `inherit` resolves from the parent session — isolated parents isolate every delegate by default, local parents keep shared execution. Explicit `shared` overrides on isolated parents are disclosed as shared execution, and a requested isolation that cannot be satisfied fails the delegation instead of falling back to sharing.
 
+In a quorum, each `[[delegates]]` entry may also set `isolation = "inherit" | "isolated" | "shared"` (default `inherit`) — the configured analogue of the tool argument. Precedence is: an explicit non-`inherit` value on the `delegate` tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (`request`, `delegate_config` or `inherited`) are persisted with the delegation and disclosed in the tool result. `isolated` requires `[quorum.workspace] enabled = true` and is rejected at load/build time otherwise. See [Git Worktree Workspaces](worktrees.md).
+
 ### 2. Session Creation
 
 The orchestrator creates a new session for the delegate:

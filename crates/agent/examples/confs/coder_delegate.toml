@@ -19,6 +19,22 @@ delegation_wait_timeout_secs = 2400
 delegation_cancel_grace_secs = 5
 max_parallel_delegations = 5
 
+# -----------------------------------------------------------------------------
+# Optional: managed Git worktree workspaces (disabled by default).
+# One workspace service is shared by the planner and every delegate.
+#
+# [quorum.workspace]
+# enabled = true
+# storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
+# baseline = "commit"                 # or "current_working_tree"
+#
+# Per-delegate isolation (see [[delegates]] below):
+#   isolation = "inherit"   # default: isolated parents isolate delegates
+#   isolation = "isolated"  # always a private checkout (needs the service)
+#   isolation = "shared"    # share the parent's checkout (disclosed as shared)
+# A non-"inherit" value on the `delegate` tool call overrides this setting.
+# -----------------------------------------------------------------------------
+
 [planner]
 provider = "codex"
 model = "gpt-5.5"
@@ -116,6 +132,7 @@ provider = "codex"
 model = "gpt-5.4"
 
 [[delegates]]
+# isolation = "inherit"   # "inherit" | "isolated" | "shared" (see [quorum.workspace])
 id = "coder"
 provider = "codex"
 model = "gpt-5.4"

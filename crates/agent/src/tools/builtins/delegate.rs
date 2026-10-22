@@ -241,6 +241,7 @@ mod tests {
             let mut registry = DefaultAgentRegistry::new();
             registry.register(
                 AgentInfo {
+                    isolation: Default::default(),
                     id: "coder".into(),
                     name: "coder".into(),
                     description: String::new(),

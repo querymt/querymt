@@ -11856,6 +11856,8 @@ dependencies = [
  "pyo3",
  "pyo3-async-runtimes",
  "querymt-agent",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

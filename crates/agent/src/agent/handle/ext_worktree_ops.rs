@@ -1,83 +1,69 @@
 //! Additive ACP extension surface for managed worktree workspaces.
 //!
-//! Five typed operations — create, list, status, result, remove — exposed as
-//! `querymt/worktree/*` extension methods (see [`super::ext`]). All payloads
-//! are plain JSON responses; upstream protocol types are not modified.
+//! The `querymt/worktree/*` extension methods and the native `/worktree`
+//! command are thin adapters over [`WorktreeOps`]: each parses its own input,
+//! calls the typed operation, and renders the typed response. Ownership,
+//! lease and removal rules live in the operations core, so this surface
+//! cannot drift from the simple API or the Python bindings. Upstream protocol
+//! types are not modified.
 //!
 //! `create` goes through the same materialization path as ACP session
 //! creation (`_meta.querymt.sessionWorkspace`), so the new session receives
-//! its own workspace and the current session is never moved. `list`,
-//! `status`, `result`, and `remove` wrap the durable registry and the
-//! lifecycle manager, including their conservative removal semantics.
+//! its own workspace and the current session is never moved.
 
 use super::utils::ext_json_response;
 use super::*;
 use crate::acp::protocol::{
     ContentBlock, ContentChunk, SessionNotification, SessionUpdate, StopReason, TextContent,
 };
+use crate::worktree::{
+    IsolatedSessionSpawner, WorkspaceTarget, WorktreeCreateRequest, WorktreeError, WorktreeOpError,
+    WorktreeOps, WorktreeRecoverResponse,
+};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+const NATIVE_USAGE: &str = "usage: /worktree create [ref] [name] | create --include-local-changes [name], \
+     list, status [id], result [id], publish [id], remove <id>, recover <id>, archive <id>; \
+     no force removal";
+const CREATE_USAGE: &str =
+    "usage: /worktree create [ref] [name] OR /worktree create --include-local-changes [name]";
 
 fn parse_workspace_op_request<T: serde::de::DeserializeOwned>(req: ExtRequest) -> Result<T, Error> {
     serde_json::from_str(req.params.get())
         .map_err(|e| Error::invalid_params().data(serde_json::json!({ "error": e.to_string() })))
 }
 
-fn baseline_mode_label(mode: &crate::worktree::BaselineMode) -> &'static str {
-    match mode {
-        crate::worktree::BaselineMode::Commit => "commit",
-        crate::worktree::BaselineMode::CurrentWorkingTree => "current_working_tree",
-    }
+/// Map a typed operation error onto ACP error semantics. The stable `code`
+/// travels in the error data on every failure; the message stays readable.
+fn op_error_to_acp(err: WorktreeOpError) -> Error {
+    let base = match &err {
+        WorktreeOpError::ServiceUnavailable
+        | WorktreeOpError::Internal(_)
+        | WorktreeOpError::SessionStart(_) => Error::internal_error(),
+        WorktreeOpError::InvalidOptions(_) => Error::invalid_params(),
+        WorktreeOpError::Rejected { code, .. } if code == "invalid_options" => {
+            Error::invalid_params()
+        }
+        WorktreeOpError::Rejected { .. } => Error::invalid_request(),
+        WorktreeOpError::UnknownWorkspace(_) | WorktreeOpError::RemovalRefused { .. } => {
+            Error::invalid_request()
+        }
+        WorktreeOpError::Worktree(inner) => match inner {
+            WorktreeError::Storage(_) | WorktreeError::Io(_) => Error::internal_error(),
+            WorktreeError::SessionCwdConflict { .. } => Error::invalid_params(),
+            _ => Error::invalid_request(),
+        },
+    };
+    base.data(serde_json::json!({ "code": err.code(), "message": err.to_string() }))
 }
 
-// ── Request/response payloads ────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-struct WorktreeCreateRequest {
-    /// Source repository cwd to isolate from.
-    cwd: String,
-    /// Include the source's current uncommitted working state in the new
-    /// checkout (explicit `current_working_tree` baseline).
-    #[serde(default)]
-    include_local_changes: bool,
-    /// Explicit base ref for commit-mode isolation.
-    #[serde(default, alias = "baseRef")]
-    base_ref: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
+/// Render a typed outcome as an ACP extension response.
+fn render<T: Serialize>(outcome: Result<T, WorktreeOpError>) -> Result<ExtResponse, Error> {
+    ext_json_response(&outcome.map_err(op_error_to_acp)?)
 }
 
-#[derive(Debug, Serialize)]
-struct WorktreeCreateResponse {
-    session_id: String,
-    workspace_id: String,
-    checkout_path: String,
-    /// The cwd the new session executes in.
-    session_cwd: String,
-    branch: String,
-    baseline_mode: &'static str,
-    baseline_commit: Option<String>,
-    /// Disclosed for `current_working_tree` baselines: ignored untracked
-    /// files are never copied.
-    ignored_files: Vec<String>,
-    local_changes_excluded: bool,
-    ignored_untracked_files_excluded: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct WorktreeSummaryResponse {
-    workspace_id: String,
-    project: String,
-    checkout_path: String,
-    branch: String,
-    lifecycle: String,
-    baseline_mode: Option<&'static str>,
-    baseline_commit: Option<String>,
-    owner_session_id: Option<String>,
-    parent_session_id: Option<String>,
-    parent_workspace_id: Option<String>,
-    delegation_id: Option<String>,
-    delegation_batch_id: Option<String>,
-}
+// ── Request payloads that only exist at the ACP boundary ─────────────────────
 
 #[derive(Debug, Deserialize)]
 struct WorktreeIdRequest {
@@ -105,169 +91,75 @@ struct WorktreeRecoverRequest {
     session_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct WorktreeStatusResponse {
-    #[serde(flatten)]
-    summary: WorktreeSummaryResponse,
-    checkout_exists: bool,
-    registered: bool,
-    branch_head: Option<String>,
-    uncommitted: Vec<String>,
-    untracked: Vec<String>,
-    ignored: Vec<String>,
-    unique_commit_count: u64,
-    dirty: bool,
-    clean_for_removal: bool,
+// ── Native `/worktree` command ───────────────────────────────────────────────
+
+/// A parsed native command. Parsing is pure so every malformed input is
+/// rejected before any administration happens.
+#[derive(Debug, PartialEq, Eq)]
+enum NativeCommand {
+    Create {
+        include_local_changes: bool,
+        base_ref: Option<String>,
+        name: Option<String>,
+    },
+    List,
+    Status(Option<String>),
+    Result(Option<String>),
+    Publish(Option<String>),
+    Remove(String),
+    Recover(String),
+    Archive(String),
 }
 
-#[derive(Debug, Serialize)]
-struct WorktreeChangedPath {
-    path: String,
-    kind: String,
-}
-
-#[derive(Debug, Serialize)]
-struct WorktreeResultEntry {
-    baseline_commit: String,
-    result_commit: Option<String>,
-    result_ref: Option<String>,
-    /// HEAD of the checkout at capture time — distinct from the live
-    /// `branch_head` reported by `status`.
-    captured_head: Option<String>,
-    verification: Option<&'static str>,
-    captured_at: String,
-    /// Baseline-relative changes from the immutable result; empty when the
-    /// delta could not be computed (see `review_error`).
-    changed_paths: Vec<WorktreeChangedPath>,
-    /// Present when the immutable diff could not be computed; the entry is
-    /// then unverified rather than silently omitted.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    review_error: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct WorktreeResultResponse {
-    workspace_id: String,
-    checkout_path: String,
-    branch: String,
-    results: Vec<WorktreeResultEntry>,
-    /// Whether the workspace baseline captured uncommitted parent edits;
-    /// merging the private branch directly would import them.
-    baseline_includes_uncommitted_edits: bool,
-    /// Present when the baseline is dirty; never implies integration.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    integration_warning: Option<String>,
-    // -- live state, reported separately from immutable review data --------
-    live_head: Option<String>,
-    dirty: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct WorktreeRemoveResponse {
-    workspace_id: String,
-    checkout_removed: bool,
-    removed_branch: Option<String>,
-    /// Set when an external writer moved the branch between the safety
-    /// checks and deletion: the branch (with its new history) was retained,
-    /// never deleted unconditionally.
-    branch_moved_during_removal: Option<String>,
-    retained_refs: Vec<String>,
-}
-
-// ── Operations ───────────────────────────────────────────────────────────────
-
-fn summarize_record(record: &crate::worktree::WorkspaceRecord) -> WorktreeSummaryResponse {
-    WorktreeSummaryResponse {
-        workspace_id: record.id.to_string(),
-        project: record.repository.project_name.clone(),
-        checkout_path: record.checkout_path.display().to_string(),
-        branch: record.branch.as_str().to_string(),
-        lifecycle: record.lifecycle.to_string(),
-        baseline_mode: record
-            .baseline
-            .as_ref()
-            .map(|b| baseline_mode_label(&b.mode)),
-        baseline_commit: record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
-        owner_session_id: record.ownership.owner_session_id.clone(),
-        parent_session_id: record.ownership.parent_session_id.clone(),
-        parent_workspace_id: record
-            .ownership
-            .parent_workspace_id
-            .as_ref()
-            .map(|id| id.to_string()),
-        delegation_id: record.ownership.delegation_id.clone(),
-        delegation_batch_id: record.ownership.delegation_batch_id.clone(),
-    }
-}
-
-/// Summary of one retained result: immutable provenance plus its
-/// baseline-relative delta. A failed diff is disclosed via `review_error`
-/// rather than silently omitted or replaced by live state.
-async fn summarize_result(
-    service: &crate::worktree::WorkspaceService,
-    record: &crate::worktree::WorkspaceRecord,
-    provenance: &crate::worktree::ResultProvenance,
-) -> WorktreeResultEntry {
-    let review = service.review_result(record, provenance).await;
-    match review {
-        Ok(review) => WorktreeResultEntry {
-            baseline_commit: review.baseline_commit,
-            result_commit: Some(review.result_commit),
-            result_ref: review.result_ref,
-            captured_head: Some(review.captured_head),
-            verification: review.verification.map(verification_label),
-            captured_at: review
-                .captured_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
-            changed_paths: review
-                .changed_paths
-                .into_iter()
-                .map(|changed| WorktreeChangedPath {
-                    path: changed.path,
-                    kind: changed.kind.to_string(),
+impl NativeCommand {
+    fn parse(words: &[String]) -> Result<Self, Error> {
+        const INCLUDE: &str = "--include-local-changes";
+        let usage = || Error::invalid_params().data(NATIVE_USAGE);
+        let operation = words.first().map(String::as_str).unwrap_or("");
+        let args = &words[words.len().min(1)..];
+        let single_id = || match args {
+            [id] if !id.starts_with('-') => Ok(id.clone()),
+            _ => Err(usage()),
+        };
+        let optional_id = || match args {
+            [] => Ok(None),
+            [id] => Ok(Some(id.clone())),
+            _ => Err(usage()),
+        };
+        match operation {
+            "create" => {
+                let flags = args.iter().filter(|a| a.as_str() == INCLUDE).count();
+                let positional: Vec<&String> =
+                    args.iter().filter(|a| a.as_str() != INCLUDE).collect();
+                let include = flags == 1;
+                let max_positional = if include { 1 } else { 2 };
+                if flags > 1
+                    || positional.len() > max_positional
+                    || positional.iter().any(|a| a.starts_with('-'))
+                {
+                    return Err(Error::invalid_params().data(CREATE_USAGE));
+                }
+                let (base_ref, name) = if include {
+                    (None, positional.first())
+                } else {
+                    (positional.first(), positional.get(1))
+                };
+                Ok(Self::Create {
+                    include_local_changes: include,
+                    base_ref: base_ref.map(|s| (*s).clone()),
+                    name: name.map(|s| (*s).clone()),
                 })
-                .collect(),
-            review_error: None,
-        },
-        Err(err) => WorktreeResultEntry {
-            baseline_commit: provenance.baseline_commit.clone(),
-            result_commit: provenance.result_commit.clone(),
-            result_ref: provenance.result_ref.clone(),
-            captured_head: provenance.captured_head.clone(),
-            verification: provenance.verification.map(verification_label),
-            captured_at: provenance
-                .captured_at
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap_or_default(),
-            changed_paths: Vec::new(),
-            review_error: Some(err.to_string()),
-        },
+            }
+            "list" if args.is_empty() => Ok(Self::List),
+            "status" => optional_id().map(Self::Status),
+            "result" => optional_id().map(Self::Result),
+            "publish" => optional_id().map(Self::Publish),
+            "remove" => single_id().map(Self::Remove),
+            "recover" => single_id().map(Self::Recover),
+            "archive" => single_id().map(Self::Archive),
+            _ => Err(usage()),
+        }
     }
-}
-
-fn verification_label(value: crate::worktree::ResultVerificationStatus) -> &'static str {
-    match value {
-        crate::worktree::ResultVerificationStatus::Passed => "passed",
-        crate::worktree::ResultVerificationStatus::Failed => "failed",
-        crate::worktree::ResultVerificationStatus::Pending => "pending",
-        crate::worktree::ResultVerificationStatus::Skipped => "skipped",
-    }
-}
-
-/// Dirty-baseline guidance: a private branch based on uncommitted parent
-/// edits must not be merged raw.
-fn dirty_baseline_warning(record: &crate::worktree::WorkspaceRecord) -> Option<String> {
-    record
-        .baseline
-        .as_ref()
-        .is_some_and(|b| b.mode == crate::worktree::BaselineMode::CurrentWorkingTree)
-        .then(|| {
-            "the baseline includes inherited uncommitted parent edits; merging the \
-             private branch directly can import them — apply only the reviewed \
-             baseline-relative delta"
-                .to_string()
-        })
 }
 
 /// Native commands are parsed before prompt expansion and never sent to a model.
@@ -287,7 +179,50 @@ pub(super) fn native_worktree_command(
     Ok(Some(words.into_iter().skip(1).collect()))
 }
 
+/// Session creation for [`WorktreeOps::create`] goes through the normal ACP
+/// materialization path, so isolation behaves exactly like `session/new`.
+#[async_trait::async_trait]
+impl IsolatedSessionSpawner for LocalAgentHandle {
+    async fn spawn(
+        &self,
+        cwd: PathBuf,
+        session_workspace: serde_json::Value,
+        name: Option<String>,
+    ) -> Result<String, WorktreeOpError> {
+        let mut querymt_meta = serde_json::Map::new();
+        querymt_meta.insert(
+            crate::worktree::SESSION_WORKSPACE_META_KEY.to_string(),
+            session_workspace,
+        );
+        let mut meta = serde_json::Map::new();
+        meta.insert("querymt".to_string(), querymt_meta.into());
+
+        let response = self
+            .new_session(crate::acp::protocol::NewSessionRequest::new(cwd).meta(meta))
+            .await
+            // Preserve the stable isolation `code` attached by the session layer.
+            .map_err(|err| WorktreeOpError::from_acp(&err))?;
+        let session_id = response.session_id.to_string();
+        if let Some(name) = name {
+            self.config
+                .storage
+                .session_store()
+                .set_session_name(&session_id, Some(name))
+                .await
+                .map_err(WorktreeOpError::from)?;
+        }
+        Ok(session_id)
+    }
+}
+
 impl LocalAgentHandle {
+    fn worktree_ops(&self) -> Result<WorktreeOps, WorktreeOpError> {
+        self.config
+            .workspace_service()
+            .map(WorktreeOps::new)
+            .ok_or(WorktreeOpError::ServiceUnavailable)
+    }
+
     pub(super) async fn handle_native_worktree_prompt(
         &self,
         req: &PromptRequest,
@@ -303,67 +238,12 @@ impl LocalAgentHandle {
             return Err(Error::invalid_request()
                 .data("worktree administration requires local filesystem execution"));
         }
-        let session = self
-            .config
-            .storage
-            .session_store()
-            .get_session(&session_id)
+        let command = NativeCommand::parse(&words)?;
+        let value = self
+            .run_native_command(&session_id, command)
             .await
-            .map_err(|e| Error::internal_error().data(e.to_string()))?
-            .ok_or_else(|| Error::invalid_request().data("session not found"))?;
-        let operation = words.first().map(String::as_str).unwrap_or("");
-        let args = &words[words.len().min(1)..];
-        let params = match operation {
-            "create" => {
-                let include = args.iter().any(|s| s == "--include-local-changes");
-                let positional: Vec<_> = args.iter().filter(|s| s.as_str() != "--include-local-changes").collect();
-                if positional.len() > if include { 1 } else { 2 } || positional.iter().any(|s| s.starts_with('-'))
-                    || args.iter().filter(|s| s.as_str() == "--include-local-changes").count() > 1 {
-                    return Err(Error::invalid_params().data("usage: /worktree create [ref] [name] OR /worktree create --include-local-changes [name]"));
-                }
-                // Resolve the isolation source through the single session-cwd
-                // path: a bound session isolates from its own bound checkout,
-                // never from a stale row cwd copied from a fork source.
-                let source_cwd = match self.config.workspace_service() {
-                    Some(service) => service
-                        .resolve_session_cwd(&session_id, session.cwd.clone())
-                        .await
-                        .map_err(|err| {
-                            Error::invalid_request().data(format!(
-                                "cannot resolve the session's effective workspace: {err}"
-                            ))
-                        })?,
-                    None => session.cwd,
-                };
-                serde_json::json!({"cwd": source_cwd.ok_or_else(|| Error::invalid_request().data("session has no cwd"))?,
-                    "include_local_changes": include, "base_ref": if include { None } else { positional.first() }, "name": positional.get(if include { 0 } else { 1 })})
-            }
-            "list" if args.is_empty() => serde_json::json!({}),
-            "status" | "result" if args.len() <= 1 => {
-                let id = if let Some(id) = args.first() { id.clone() } else {
-                    self.workspace_service()?.registry().get_workspace_by_session(&session_id).await
-                        .map_err(|e| Error::internal_error().data(e.to_string()))?
-                        .ok_or_else(|| Error::invalid_request().data("current session has no managed workspace; supply an id"))?.id.to_string()
-                };
-                serde_json::json!({"workspace_id": id})
-            }
-            // Explicit top-level publication; defaults to the current
-            // session's workspace.
-            "publish" if args.len() <= 1 => match args.first() {
-                Some(id) => serde_json::json!({"workspace_id": id}),
-                None => serde_json::json!({"session_id": session_id}),
-            },
-            "remove" | "recover" | "archive" if args.len() == 1 && !args[0].starts_with('-') => serde_json::json!({"workspace_id": args[0]}),
-            _ => return Err(Error::invalid_params().data("usage: /worktree create [ref] [name] | create --include-local-changes [name], list, status [id], result [id], publish [id], remove <id>, recover <id>, archive <id>; no force removal")),
-        };
-        let raw = serde_json::value::RawValue::from_string(params.to_string())
-            .map_err(|e| Error::internal_error().data(e.to_string()))?;
-        let result = self
-            .handle_ext_method(ExtRequest::new(
-                format!("querymt/worktree/{operation}"),
-                raw.into(),
-            ))
-            .await?;
+            .map_err(op_error_to_acp)?;
+
         let session_bridge = self
             .config
             .session_bridges
@@ -375,29 +255,87 @@ impl LocalAgentHandle {
                 .notify(SessionNotification::new(
                     req.session_id.clone(),
                     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                        TextContent::new(result.0.get()),
+                        TextContent::new(value.to_string()),
                     ))),
                 ))
                 .await?;
         }
         let mut meta = serde_json::Map::new();
-        meta.insert(
-            "querymt.worktree".into(),
-            serde_json::from_str(result.0.get())
-                .map_err(|e| Error::internal_error().data(e.to_string()))?,
-        );
+        meta.insert("querymt.worktree".into(), value);
         Ok(Some(PromptResponse::new(StopReason::EndTurn).meta(meta)))
     }
 
-    fn workspace_service(
+    /// Execute a parsed native command against the typed operations core.
+    async fn run_native_command(
         &self,
-    ) -> Result<std::sync::Arc<crate::worktree::WorkspaceService>, Error> {
-        self.config.workspace_service().ok_or_else(|| {
-            Error::internal_error().data(
-                "no workspace service is configured; worktree operations are unavailable \
-                 (enable isolation on the agent builder)",
-            )
-        })
+        session_id: &str,
+        command: NativeCommand,
+    ) -> Result<serde_json::Value, WorktreeOpError> {
+        fn to_value<T: Serialize>(value: &T) -> Result<serde_json::Value, WorktreeOpError> {
+            serde_json::to_value(value).map_err(|e| WorktreeOpError::Internal(e.to_string()))
+        }
+        let ops = self.worktree_ops()?;
+        // A command without an explicit id targets the session's own workspace.
+        let own_or = |id: Option<String>| {
+            let ops = ops.clone();
+            async move {
+                match id {
+                    Some(id) => Ok(id),
+                    None => ops
+                        .workspace_of_session(session_id)
+                        .await
+                        .map(|r| r.id.to_string()),
+                }
+            }
+        };
+        match command {
+            NativeCommand::Create {
+                include_local_changes,
+                base_ref,
+                name,
+            } => {
+                // Isolate from the session's effective workspace, never from a
+                // stale row cwd copied from a fork source.
+                let persisted = self
+                    .config
+                    .storage
+                    .session_store()
+                    .get_session(session_id)
+                    .await?
+                    .ok_or_else(|| WorktreeOpError::InvalidOptions("session not found".into()))?
+                    .cwd;
+                let source_cwd = ops
+                    .service()
+                    .resolve_session_cwd(session_id, persisted)
+                    .await?
+                    .ok_or_else(|| WorktreeOpError::InvalidOptions("session has no cwd".into()))?;
+                let response = ops
+                    .create(
+                        self,
+                        WorktreeCreateRequest {
+                            cwd: source_cwd.display().to_string(),
+                            include_local_changes: include_local_changes.then_some(true),
+                            base_ref,
+                            name,
+                        },
+                    )
+                    .await?;
+                to_value(&response)
+            }
+            NativeCommand::List => to_value(&ops.list().await?),
+            NativeCommand::Status(id) => to_value(&ops.status(&own_or(id).await?).await?),
+            NativeCommand::Result(id) => to_value(&ops.result(&own_or(id).await?).await?),
+            NativeCommand::Publish(Some(id)) => {
+                to_value(&ops.publish(&WorkspaceTarget::Workspace(id)).await?)
+            }
+            NativeCommand::Publish(None) => to_value(
+                &ops.publish(&WorkspaceTarget::Session(session_id.to_string()))
+                    .await?,
+            ),
+            NativeCommand::Remove(id) => to_value(&ops.remove(&id).await?),
+            NativeCommand::Recover(id) => to_value(&ops.recover(&id).await?),
+            NativeCommand::Archive(id) => to_value(&ops.archive(&id).await?),
+        }
     }
 
     /// `querymt/worktree/create`: create a new isolated session with its own
@@ -407,98 +345,13 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
         let parsed: WorktreeCreateRequest = parse_workspace_op_request(req)?;
-        let ignored_files = if parsed.include_local_changes {
-            let source = crate::worktree::resolve_repository(std::path::Path::new(&parsed.cwd))
-                .map_err(|e| Error::invalid_request().data(e.to_string()))?;
-            service
-                .ops()
-                .checkout_status(&source.checkout.root)
-                .await
-                .map_err(|e| Error::invalid_request().data(e.to_string()))?
-                .ignored
-        } else {
-            Vec::new()
-        };
-
-        let mut session_workspace = serde_json::json!({ "execution": "worktree" });
-        if parsed.include_local_changes {
-            session_workspace["baseline"] =
-                serde_json::Value::String("current_working_tree".to_string());
-        }
-        if let Some(base_ref) = &parsed.base_ref {
-            session_workspace["baseRef"] = serde_json::Value::String(base_ref.clone());
-        }
-        let mut querymt_meta = serde_json::Map::new();
-        querymt_meta.insert(
-            crate::worktree::SESSION_WORKSPACE_META_KEY.to_string(),
-            session_workspace,
-        );
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "querymt".to_string(),
-            serde_json::Value::Object(querymt_meta),
-        );
-
-        let new_session =
-            crate::acp::protocol::NewSessionRequest::new(std::path::PathBuf::from(&parsed.cwd))
-                .meta(meta);
-        let response = self.new_session(new_session).await?;
-        let session_id = response.session_id.to_string();
-        if let Some(name) = parsed.name {
-            self.config
-                .storage
-                .session_store()
-                .set_session_name(&session_id, Some(name))
-                .await
-                .map_err(|e| Error::internal_error().data(e.to_string()))?;
-        }
-
-        let record = service
-            .registry()
-            .get_workspace_by_session(&session_id)
-            .await
-            .map_err(|err| {
-                Error::internal_error()
-                    .data(format!("workspace lookup failed after creation: {err}"))
-            })?
-            .ok_or_else(|| {
-                Error::internal_error().data(
-                    "session was created without a workspace binding; isolation failed \
-                     closed before execution and the session must not be used"
-                        .to_string(),
-                )
-            })?;
-
-        // Disclose the effective session cwd from the durable binding.
-        ext_json_response(&WorktreeCreateResponse {
-            session_id,
-            workspace_id: record.id.to_string(),
-            checkout_path: record.checkout_path.display().to_string(),
-            session_cwd: record.session_cwd().display().to_string(),
-            branch: record.branch.as_str().to_string(),
-            baseline_mode: record
-                .baseline
-                .as_ref()
-                .map(|b| baseline_mode_label(&b.mode))
-                .unwrap_or("commit"),
-            baseline_commit: record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
-            ignored_files,
-            local_changes_excluded: !parsed.include_local_changes,
-            ignored_untracked_files_excluded: true,
-        })
+        render(async { self.worktree_ops()?.create(self, parsed).await }.await)
     }
 
     /// `querymt/worktree/list`: all managed workspaces, newest first.
     pub(super) async fn handle_ext_worktree_list(&self) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
-        let records = service.registry().list_workspaces().await.map_err(|err| {
-            Error::internal_error().data(format!("failed to list workspaces: {err}"))
-        })?;
-        ext_json_response(&serde_json::json!({
-            "workspaces": records.iter().map(summarize_record).collect::<Vec<_>>(),
-        }))
+        render(async { self.worktree_ops()?.list().await }.await)
     }
 
     /// `querymt/worktree/status`: durable record plus live Git state.
@@ -506,166 +359,46 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
         let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        let record = self
-            .lookup_workspace(&service, &parsed.workspace_id)
-            .await?;
-        let status = service.manager().status(&record).await.map_err(|err| {
-            Error::internal_error().data(format!(
-                "failed to inspect workspace {}: {err}",
-                parsed.workspace_id
-            ))
-        })?;
-        // Compute the derived flags before moving fields into the response.
-        let dirty = status.is_dirty();
-        let clean_for_removal = status.is_clean_for_removal();
-        ext_json_response(&WorktreeStatusResponse {
-            summary: summarize_record(&record),
-            checkout_exists: status.checkout_exists,
-            registered: status.registered,
-            branch_head: status.head_commit,
-            dirty,
-            clean_for_removal,
-            uncommitted: status.uncommitted,
-            untracked: status.untracked,
-            ignored: status.ignored,
-            unique_commit_count: status.unique_commit_count,
-        })
+        render(async { self.worktree_ops()?.status(&parsed.workspace_id).await }.await)
     }
 
     /// `querymt/worktree/result`: retained baseline-relative review of
-    /// published results; absence never implies integration. Inspection is
-    /// read-only and never republishes live state.
+    /// published results; absence never implies integration. Read-only.
     pub(super) async fn handle_ext_worktree_result(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
         let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        let record = self
-            .lookup_workspace(&service, &parsed.workspace_id)
-            .await?;
-        let results = service
-            .registry()
-            .list_results(&record.id)
-            .await
-            .map_err(|err| {
-                Error::internal_error().data(format!(
-                    "failed to load results for workspace {}: {err}",
-                    parsed.workspace_id
-                ))
-            })?;
-        let status = service.manager().status(&record).await.ok();
-        let mut entries = Vec::with_capacity(results.len());
-        for result in &results {
-            entries.push(summarize_result(&service, &record, result).await);
-        }
-        ext_json_response(&WorktreeResultResponse {
-            workspace_id: record.id.to_string(),
-            checkout_path: record.checkout_path.display().to_string(),
-            branch: record.branch.as_str().to_string(),
-            baseline_includes_uncommitted_edits: record
-                .baseline
-                .as_ref()
-                .is_some_and(|b| b.mode == crate::worktree::BaselineMode::CurrentWorkingTree),
-            integration_warning: dirty_baseline_warning(&record),
-            results: entries,
-            live_head: status.as_ref().and_then(|s| s.head_commit.clone()),
-            dirty: status.map(|s| s.is_dirty()).unwrap_or(true),
-        })
+        render(async { self.worktree_ops()?.result(&parsed.workspace_id).await }.await)
     }
 
     /// `querymt/worktree/publish`: explicitly publish the current working
-    /// state of a workspace checkout as an immutable, reviewable result.
-    ///
-    /// Shared with automatic delegate publication; this is the explicit
-    /// top-level entry point. Publishing never stages, commits, resets, or
-    /// merges anything in the checkout. Verification state is reported as
-    /// `skipped` because publication performs none.
+    /// state of a workspace as an immutable, reviewable result.
     pub(super) async fn handle_ext_worktree_publish(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
         let parsed: WorktreePublishRequest = parse_workspace_op_request(req)?;
-        let workspace_id = match parsed.workspace_id {
-            Some(id) => id,
-            None => service
-                .registry()
-                .get_workspace_by_session(&parsed.session_id.ok_or_else(|| {
-                    Error::invalid_params().data("provide workspace_id or session_id")
-                })?)
-                .await
-                .map_err(|err| Error::internal_error().data(err.to_string()))?
-                .ok_or_else(|| Error::invalid_request().data("session has no managed workspace"))?
-                .id
-                .to_string(),
-        };
-        let record = self.lookup_workspace(&service, &workspace_id).await?;
-        // Publication coordinates with cooperating writers through the same
-        // checkout-keyed mutation gate used by capture.
-        let gate = crate::worktree::CheckoutMutationGate::new(
-            service.storage_root(),
-            &record.checkout_path,
+        render(
+            async {
+                let ops = self.worktree_ops()?;
+                // Default to the caller's own workspace when only a session is given.
+                let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
+                ops.publish(&target).await
+            }
+            .await,
         )
-        .map_err(|err| Error::invalid_request().data(err.to_string()))?;
-        let provenance = service
-            .publish_result(
-                &record,
-                &record.checkout_path,
-                Some(&gate),
-                Some(crate::worktree::ResultVerificationStatus::Skipped),
-            )
-            .await
-            .map_err(|err| {
-                Error::invalid_request().data(format!(
-                    "workspace {} result was not published: {err}. The checkout and its \
-                     files are retained unchanged; nothing was integrated.",
-                    record.id
-                ))
-            })?;
-        let entry = summarize_result(&service, &record, &provenance).await;
-        ext_json_response(&serde_json::json!({
-            "workspace_id": record.id.to_string(),
-            "checkout_path": record.checkout_path.display().to_string(),
-            "branch": record.branch.as_str().to_string(),
-            "baseline_includes_uncommitted_edits": record
-                .baseline
-                .as_ref()
-                .is_some_and(|b| b.mode == crate::worktree::BaselineMode::CurrentWorkingTree),
-            "integration_warning": dirty_baseline_warning(&record),
-            "result": entry,
-        }))
     }
 
     /// `querymt/worktree/remove`: conservative removal. Refuses active
-    /// ownership or any content that would be lost; reports exactly which
-    /// refs remain for recovery.
+    /// ownership or any content that would be lost; reports retained refs.
     pub(super) async fn handle_ext_worktree_remove(
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
         let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        let record = self
-            .lookup_workspace(&service, &parsed.workspace_id)
-            .await?;
-        let report = service.manager().remove(&record).await.map_err(|err| {
-            Error::invalid_request().data(format!(
-                "workspace {} was not removed: {err}",
-                parsed.workspace_id
-            ))
-        })?;
-        ext_json_response(&WorktreeRemoveResponse {
-            workspace_id: report.workspace_id.to_string(),
-            checkout_removed: report.checkout_removed,
-            removed_branch: report.removed_branch.map(|b| b.as_str().to_string()),
-            branch_moved_during_removal: report
-                .branch_moved_during_removal
-                .map(|b| b.as_str().to_string()),
-            retained_refs: report.retained_refs,
-        })
+        render(async { self.worktree_ops()?.remove(&parsed.workspace_id).await }.await)
     }
 
     /// Archive inactive execution while preserving the durable session binding.
@@ -673,17 +406,8 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let service = self.workspace_service()?;
         let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        let record = self
-            .lookup_workspace(&service, &parsed.workspace_id)
-            .await?;
-        let archived = service
-            .manager()
-            .archive(&record)
-            .await
-            .map_err(|err| Error::invalid_request().data(err.to_string()))?;
-        ext_json_response(&summarize_record(&archived))
+        render(async { self.worktree_ops()?.archive(&parsed.workspace_id).await }.await)
     }
 
     /// Explicitly recover persisted allocation/removal intent, or release a
@@ -694,20 +418,14 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: WorktreeRecoverRequest = parse_workspace_op_request(req)?;
-        match (parsed.workspace_id.as_deref(), parsed.session_id.as_deref()) {
-            (Some(_), Some(_)) => {
-                Err(Error::invalid_params()
-                    .data("provide either workspace_id or session_id, not both"))
-            }
-            (None, None) => Err(Error::invalid_params().data("provide workspace_id or session_id")),
+        match (parsed.workspace_id, parsed.session_id) {
             (None, Some(session_id)) => {
-                // Session-scoped recovery: complete a pending isolated
-                // fork's provisioning (reusing its bound workspace when a
-                // previous attempt already attached it) and release the
-                // durable startup barrier.
+                // Session-scoped recovery: complete a pending isolated fork's
+                // provisioning (reusing its bound workspace when a previous
+                // attempt already attached it) and release the startup barrier.
                 let response = self
                     .session_materializer
-                    .recover_pending_fork(session_id)
+                    .recover_pending_fork(&session_id)
                     .await?;
                 let workspace = response
                     .meta
@@ -721,85 +439,86 @@ impl LocalAgentHandle {
                     "sessionWorkspace": workspace,
                 }))
             }
-            (Some(workspace_id), None) => {
-                let service = self.workspace_service()?;
-                let id = crate::worktree::WorkspaceId::from_raw(workspace_id);
-                let record = service
-                    .registry()
-                    .get_workspace(&id)
-                    .await
-                    .map_err(|err| {
-                        Error::internal_error()
-                            .data(format!("failed to load workspace {workspace_id}: {err}"))
-                    })?
-                    .ok_or_else(|| {
-                        Error::invalid_request().data(format!("unknown workspace: {workspace_id}"))
-                    })?;
-                match record.lifecycle {
-                    crate::worktree::WorkspaceLifecycle::Provisioning => {
-                        // Recovery is self-contained: administration and
-                        // recovery-time capture use the record's canonical
-                        // common directory and recorded source checkout.
-                        let recovered = service
-                            .allocator()
-                            .recover(&record)
-                            .await
-                            .map_err(|err| Error::invalid_request().data(err.to_string()))?;
-                        // Disclose whether the baseline was durably bound
-                        // before the interruption or captured at recovery
-                        // time from the recorded source.
-                        let baseline_source = match recovered.baseline_source {
-                            crate::worktree::BaselineSource::BoundBeforeInterruption => {
-                                "bound-before-interruption"
-                            }
-                            crate::worktree::BaselineSource::CapturedDuringRecovery => {
-                                "captured-during-recovery"
-                            }
-                        };
-                        ext_json_response(&serde_json::json!({
-                            "summary": summarize_record(&recovered.record),
-                            "baselineSource": baseline_source,
-                        }))
+            (workspace_id, session_id) => render(
+                async {
+                    // Rejects "both" and "neither" with the shared diagnostics.
+                    match WorkspaceTarget::from_parts(workspace_id, session_id)? {
+                        WorkspaceTarget::Workspace(id) => {
+                            let recovered: WorktreeRecoverResponse =
+                                self.worktree_ops()?.recover(&id).await?;
+                            Ok(recovered)
+                        }
+                        WorkspaceTarget::Session(_) => unreachable!("handled above"),
                     }
-                    crate::worktree::WorkspaceLifecycle::Removing => {
-                        let report = service
-                            .manager()
-                            .remove(&record)
-                            .await
-                            .map_err(|err| Error::invalid_request().data(err.to_string()))?;
-                        ext_json_response(&WorktreeRemoveResponse {
-                            workspace_id: report.workspace_id.to_string(),
-                            checkout_removed: report.checkout_removed,
-                            removed_branch: report.removed_branch.map(|b| b.as_str().to_string()),
-                            branch_moved_during_removal: report
-                                .branch_moved_during_removal
-                                .map(|b| b.as_str().to_string()),
-                            retained_refs: report.retained_refs,
-                        })
-                    }
-                    _ => Err(Error::invalid_request()
-                        .data("workspace has no interrupted provisioning or removal to recover")),
                 }
-            }
+                .await,
+            ),
         }
     }
+}
 
-    async fn lookup_workspace(
-        &self,
-        service: &std::sync::Arc<crate::worktree::WorkspaceService>,
-        workspace_id: &str,
-    ) -> Result<crate::worktree::WorkspaceRecord, Error> {
-        let id = crate::worktree::WorkspaceId::from_raw(workspace_id);
-        service
-            .registry()
-            .get_workspace(&id)
-            .await
-            .map_err(|err| {
-                Error::internal_error()
-                    .data(format!("failed to load workspace {workspace_id}: {err}"))
-            })?
-            .ok_or_else(|| {
-                Error::invalid_request().data(format!("unknown workspace: {workspace_id}"))
-            })
+#[cfg(test)]
+mod native_command_tests {
+    use super::*;
+
+    fn parse(line: &str) -> Result<NativeCommand, Error> {
+        let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+        NativeCommand::parse(&words)
+    }
+
+    #[test]
+    fn parses_every_supported_command() {
+        assert_eq!(
+            parse("create").unwrap(),
+            NativeCommand::Create {
+                include_local_changes: false,
+                base_ref: None,
+                name: None
+            }
+        );
+        assert_eq!(
+            parse("create v1 child").unwrap(),
+            NativeCommand::Create {
+                include_local_changes: false,
+                base_ref: Some("v1".into()),
+                name: Some("child".into())
+            }
+        );
+        assert_eq!(
+            parse("create --include-local-changes child").unwrap(),
+            NativeCommand::Create {
+                include_local_changes: true,
+                base_ref: None,
+                name: Some("child".into())
+            }
+        );
+        assert_eq!(parse("list").unwrap(), NativeCommand::List);
+        assert_eq!(parse("status").unwrap(), NativeCommand::Status(None));
+        assert_eq!(
+            parse("publish ws-1").unwrap(),
+            NativeCommand::Publish(Some("ws-1".into()))
+        );
+        assert_eq!(
+            parse("remove ws-1").unwrap(),
+            NativeCommand::Remove("ws-1".into())
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_and_forced_commands() {
+        for invalid in [
+            "",
+            "list extra",
+            "create --force",
+            "create HEAD name extra",
+            "create --include-local-changes HEAD name",
+            "create --include-local-changes --include-local-changes",
+            "remove",
+            "remove --force",
+            "status a b",
+            "bogus",
+        ] {
+            assert!(parse(invalid).is_err(), "{invalid:?} must be rejected");
+        }
     }
 }

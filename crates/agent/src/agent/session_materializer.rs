@@ -318,6 +318,7 @@ impl SessionMaterializer {
 
         let Some(service) = self.workspace_service() else {
             return Err(Error::internal_error().data(serde_json::json!({
+                "code": "workspace_service_unavailable",
                 "message": "worktree isolation requested but no workspace service is \
                             configured; refusing to downgrade to shared execution",
             })));
@@ -329,6 +330,11 @@ impl SessionMaterializer {
                             inside the target repository",
             })));
         };
+
+        // The configured default baseline only fills in a choice the request
+        // left open; the resolved mode is disclosed by the binding's baseline.
+        let options =
+            crate::worktree::apply_default_baseline(options, meta, service.default_baseline());
 
         // Allocation provisions the checkout and records the ready binding
         // durably; the caller persists the owner association right after the
@@ -1643,13 +1649,16 @@ fn fork_message_id_from_meta(
 /// allocation failures are server-side diagnostics.
 fn worktree_error_to_acp(err: crate::worktree::WorktreeError) -> Error {
     let message = err.to_string();
+    let code = err.code();
     match &err {
         crate::worktree::WorktreeError::SessionCwdConflict { .. } => {
             Error::invalid_params().data(serde_json::json!({
+                "code": code,
                 "message": message,
             }))
         }
         _ => Error::internal_error().data(serde_json::json!({
+            "code": code,
             "message": message,
         })),
     }
@@ -1658,6 +1667,7 @@ fn worktree_error_to_acp(err: crate::worktree::WorktreeError) -> Error {
 /// A malformed workspace request (options or missing cwd) is invalid params.
 fn invalid_workspace_request(message: &str) -> Error {
     Error::invalid_params().data(serde_json::json!({
+        "code": "invalid_options",
         "message": message,
     }))
 }

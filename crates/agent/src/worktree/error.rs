@@ -101,5 +101,31 @@ pub enum WorktreeError {
     },
 }
 
+impl WorktreeError {
+    /// Stable machine-readable code, identical on every surface (ACP error
+    /// data, native command responses, simple API, Python). Human-readable
+    /// messages may change; codes do not.
+    pub fn code(&self) -> &'static str {
+        use crate::session::error::SessionError;
+        match self {
+            Self::NotGitRepository { .. }
+            | Self::BareRepositoryUnsupported { .. }
+            | Self::RelativeCwdOutsideCheckout { .. }
+            | Self::RelativeCwdAbsent { .. }
+            | Self::GitDiscovery(_) => "isolation_unsupported_layout",
+            Self::SessionCwdConflict { .. } => "conflicting_cwd",
+            Self::CheckoutMissing { .. } => "workspace_missing",
+            Self::Storage(SessionError::WorkspaceAlreadyOwned { .. }) => "owner_conflict",
+            Self::Storage(SessionError::WorkspaceNotFound(_)) => "workspace_not_found",
+            Self::Storage(_) => "storage_error",
+            Self::Io(_)
+            | Self::GitCommand { .. }
+            | Self::GitTimeout { .. }
+            | Self::GitSpawn { .. } => "repository_error",
+            Self::InvalidOperation(_) => "operation_refused",
+        }
+    }
+}
+
 /// Convenience alias for [`WorktreeError`] results.
 pub type WorktreeResult<T> = Result<T, WorktreeError>;

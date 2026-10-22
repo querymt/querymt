@@ -42,9 +42,17 @@ impl LocalAgentHandle {
                     .delete(SessionDeleteCapabilities::new()),
             );
 
-        // Add delegation metadata if agent registry is available
-        if let Some(delegation_meta) = self.build_delegation_meta() {
-            capabilities = capabilities.meta(delegation_meta);
+        // Additive `_meta`: delegation targets, and workspace support when (and
+        // only when) a workspace service is configured.
+        let mut meta = self.build_delegation_meta().unwrap_or_default();
+        if let Some(service) = self.config.workspace_service() {
+            meta.insert(
+                crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::json!({ "workspace": service.capability_meta() }),
+            );
+        }
+        if !meta.is_empty() {
+            capabilities = capabilities.meta(meta);
         }
 
         Ok(InitializeResponse::new(protocol_version)

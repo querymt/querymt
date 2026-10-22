@@ -53,6 +53,30 @@ impl WorkspaceBinding {
     }
 }
 
+impl WorkspaceBinding {
+    /// Disclosure of the resolved binding for a `session/new` response
+    /// (`_meta.querymt.sessionWorkspace`): the actual execution cwd, workspace
+    /// id, branch, baseline mode/OID and what was excluded.
+    pub fn disclosure(&self) -> serde_json::Value {
+        let mode = self
+            .record
+            .baseline
+            .as_ref()
+            .map_or(BaselineMode::Commit, |b| b.mode);
+        serde_json::json!({
+            "execution": "worktree",
+            "workspaceId": self.record.id.as_str(),
+            "sessionCwd": self.effective_cwd.display().to_string(),
+            "checkoutPath": self.record.checkout_path.display().to_string(),
+            "branch": self.record.branch.as_str(),
+            "baseline": mode.to_string(),
+            "baselineCommit": self.record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
+            "localChangesExcluded": mode == BaselineMode::Commit,
+            "ignoredUntrackedFilesExcluded": true,
+        })
+    }
+}
+
 /// Facade over managed workspace operations for the session layer.
 pub struct WorkspaceService {
     git: Arc<dyn RepositoryOps>,
@@ -60,6 +84,7 @@ pub struct WorkspaceService {
     manager: WorkspaceManager,
     registry: Arc<dyn WorkspaceRepository>,
     storage_root: PathBuf,
+    default_baseline: BaselineMode,
 }
 
 impl WorkspaceService {
@@ -75,7 +100,70 @@ impl WorkspaceService {
             manager: WorkspaceManager::new(git, registry.clone(), storage_root.clone()),
             registry,
             storage_root,
+            default_baseline: BaselineMode::Commit,
         }
+    }
+
+    /// Set the baseline used for explicitly requested top-level isolation that
+    /// does not choose one. Delegates and forks are unaffected.
+    #[must_use]
+    pub fn with_default_baseline(mut self, baseline: BaselineMode) -> Self {
+        self.default_baseline = baseline;
+        self
+    }
+
+    /// Default baseline for explicit top-level isolation requests.
+    pub fn default_baseline(&self) -> BaselineMode {
+        self.default_baseline
+    }
+
+    /// Capability advertisement for `initialize` (`_meta.querymt.workspace`),
+    /// so clients can offer an explicit Local/Worktree choice at creation.
+    pub fn capability_meta(&self) -> serde_json::Value {
+        serde_json::json!({
+            "supported": true,
+            "defaultBaseline": self.default_baseline.to_string(),
+            "executionModes": ["local", "worktree"],
+            "baselines": ["commit", "current_working_tree"],
+        })
+    }
+
+    /// Build the single workspace service described by `settings`.
+    ///
+    /// Returns `Ok(None)` when the service is disabled, so callers can thread
+    /// the result straight into a builder. Everything that can be wrong with
+    /// the settings is reported here, at build time, instead of at the first
+    /// isolated session: the backend must expose a workspace repository, the
+    /// storage root must be creatable and a directory, and it must be on the
+    /// local filesystem.
+    pub fn from_settings(
+        settings: &crate::config::WorkspaceSettings,
+        storage: &dyn crate::session::backend::StorageBackend,
+    ) -> WorktreeResult<Option<Arc<Self>>> {
+        if !settings.enabled {
+            return Ok(None);
+        }
+        let registry = storage.workspace_repository().ok_or_else(|| {
+            WorktreeError::InvalidOperation(
+                "workspace isolation is enabled but the storage backend does not expose a \
+                 workspace repository"
+                    .to_string(),
+            )
+        })?;
+        let root = settings
+            .resolved_storage_root()
+            .map_err(|err| WorktreeError::InvalidOperation(format!("{err:#}")))?;
+        crate::worktree::placement::ensure_local_filesystem_execution(&root)?;
+        std::fs::create_dir_all(&root).map_err(|err| {
+            WorktreeError::InvalidOperation(format!(
+                "workspace storage_root {} is unusable: {err}",
+                root.display()
+            ))
+        })?;
+        Ok(Some(Arc::new(
+            Self::new(Arc::new(crate::worktree::GixRepoOps::new()), registry, root)
+                .with_default_baseline(settings.baseline),
+        )))
     }
 
     pub fn registry(&self) -> &Arc<dyn WorkspaceRepository> {
@@ -2123,5 +2211,79 @@ mod tests {
     fn baseline_refs_are_namespaced_per_workspace() {
         let id = WorkspaceId::from_raw("ws-9");
         assert_eq!(baseline_ref_for(&id), "refs/qmt/baselines/ws-9");
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use crate::config::WorkspaceSettings;
+    use crate::session::sqlite_storage::SqliteStorage;
+
+    async fn storage() -> (tempfile::TempDir, Arc<SqliteStorage>) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = SqliteStorage::connect(dir.path().join("s.db"))
+            .await
+            .unwrap();
+        (dir, Arc::new(storage))
+    }
+
+    #[tokio::test]
+    async fn disabled_settings_build_no_service() {
+        let (_dir, storage) = storage().await;
+        let built =
+            WorkspaceService::from_settings(&WorkspaceSettings::default(), storage.as_ref());
+        assert!(built.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn enabled_settings_create_the_storage_root() {
+        let (dir, storage) = storage().await;
+        let root = dir.path().join("nested").join("wt");
+        let settings = WorkspaceSettings {
+            storage_root: Some(root.clone()),
+            ..WorkspaceSettings::enabled()
+        };
+        let service = WorkspaceService::from_settings(&settings, storage.as_ref())
+            .unwrap()
+            .expect("enabled");
+        assert!(root.is_dir());
+        assert_eq!(service.storage_root(), root);
+    }
+
+    #[tokio::test]
+    async fn unusable_storage_root_fails_at_build_time() {
+        let (dir, storage) = storage().await;
+        let file = dir.path().join("occupied");
+        std::fs::write(&file, b"x").unwrap();
+        let settings = WorkspaceSettings {
+            storage_root: Some(file.join("wt")),
+            ..WorkspaceSettings::enabled()
+        };
+        let err = WorkspaceService::from_settings(&settings, storage.as_ref())
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("unusable"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn backend_without_a_workspace_repository_fails_at_build_time() {
+        struct NoRepo(Arc<SqliteStorage>);
+        impl crate::session::backend::StorageBackend for NoRepo {
+            fn session_store(&self) -> Arc<dyn crate::session::store::SessionStore> {
+                self.0.session_store()
+            }
+            fn event_journal(&self) -> Arc<dyn crate::session::projection::EventJournal> {
+                self.0.event_journal()
+            }
+            fn view_store(&self) -> Option<Arc<dyn crate::session::projection::ViewStore>> {
+                self.0.view_store()
+            }
+        }
+        let (_dir, storage) = storage().await;
+        let err = WorkspaceService::from_settings(&WorkspaceSettings::enabled(), &NoRepo(storage))
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("workspace repository"), "{err}");
     }
 }

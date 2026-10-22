@@ -22,6 +22,7 @@ mod quorum;
 mod schema;
 mod single;
 mod tools;
+mod workspace;
 
 pub use execution::*;
 pub use extensions::*;
@@ -35,6 +36,7 @@ pub use quorum::*;
 pub use schema::{schema_for_system_parts, schema_for_value};
 pub use single::*;
 pub use tools::*;
+pub use workspace::WorkspaceSettings;
 
 /// Top-level config discriminator
 #[derive(Debug)]

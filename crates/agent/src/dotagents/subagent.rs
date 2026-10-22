@@ -181,6 +181,7 @@ pub fn plan_agent(
     diagnostics.extend(mcp_diagnostics);
 
     let info = AgentInfo {
+        isolation: Default::default(),
         id: agent.id.clone(),
         name: agent.name.clone(),
         description: agent.description.clone(),
@@ -231,6 +232,7 @@ fn unsupported_connection_plan(agent: &DotagentsAgent, declared: &str) -> Dotage
     DotagentsSubAgentPlan {
         id: agent.id.clone(),
         info: AgentInfo {
+            isolation: Default::default(),
             id: agent.id.clone(),
             name: agent.name.clone(),
             description: agent.description.clone(),

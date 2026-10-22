@@ -1147,8 +1147,16 @@ pub(super) async fn record_tool_side_effects(
             },
             None => crate::worktree::ExecutionMode::Local,
         };
-        let resolved_isolation =
-            crate::worktree::resolve_delegation_isolation(parent_mode, requested_isolation);
+        let configured_isolation = config
+            .agent_registry
+            .get_agent(&target_agent_id)
+            .map(|info| info.isolation)
+            .unwrap_or_default();
+        let (resolved_isolation, isolation_source) = crate::worktree::resolve_delegation_policy(
+            parent_mode,
+            requested_isolation,
+            configured_isolation,
+        );
 
         if let Ok(serialized_args) = serde_json::to_string(&serde_json::json!({
             "target_agent_id": target_agent_id,
@@ -1157,6 +1165,7 @@ pub(super) async fn record_tool_side_effects(
             "constraints": constraints,
             "expected_output": expected_output,
             "isolation": resolved_isolation_label(resolved_isolation),
+            "isolation_source": isolation_source.label(),
         })) {
             result.tool_arguments = Some(serialized_args);
         }
@@ -1165,7 +1174,8 @@ pub(super) async fn record_tool_side_effects(
         // presented as isolated and explicit overrides are visible.
         result.content.push(querymt::chat::ToolResultPart::Text {
             text: format!(
-                "Execution workspace: {}.",
+                "Execution workspace ({} policy): {}.",
+                isolation_source.label(),
                 match resolved_isolation {
                     crate::worktree::ResolvedIsolation::Isolated => {
                         "isolated (private Git worktree checkout seeded from this session's current code state)"

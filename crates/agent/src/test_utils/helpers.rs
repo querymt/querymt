@@ -623,6 +623,7 @@ impl DelegateTestFixture {
         let mut registry = DefaultAgentRegistry::new();
         registry.register(
             AgentInfo {
+                isolation: Default::default(),
                 id: "coder".to_string(),
                 name: "Coder".to_string(),
                 description: "Delegate coder".to_string(),

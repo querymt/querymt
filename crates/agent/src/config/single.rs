@@ -195,6 +195,11 @@ pub struct AgentSettings {
     /// Hook command system configuration.
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    /// Managed Git worktree workspaces (`[agent.workspace]`). Disabled by
+    /// default; enabling never isolates an option-less session.
+    #[serde(default)]
+    pub workspace: WorkspaceSettings,
 }
 
 #[allow(dead_code)]

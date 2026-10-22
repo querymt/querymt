@@ -471,6 +471,7 @@ mod tests {
         let delegate_registry = plugin_registry.clone();
         builder = builder.add_delegate_agent(
             AgentInfo {
+                isolation: Default::default(),
                 id: "coder".into(),
                 name: "Coder".into(),
                 description: String::new(),

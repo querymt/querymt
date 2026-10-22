@@ -259,8 +259,18 @@ fn open_repo(path: &Path) -> Result<gix::Repository, WorktreeError> {
 ///   environment under `isolated()`. A replacement could make unpreserved
 ///   commits look reachable from a kept ref, so preservation and ancestry
 ///   checks must always see the real objects.
+/// - `committer.*`: `isolated()` also ignores the user's global Git config, so
+///   a user whose identity lives only there would otherwise fail every ref
+///   update that writes a reflog entry ("Could not update reflog"). Reflogs of
+///   QueryMT-managed refs are attributed to the internal identity, exactly like
+///   the private baseline/result commits. This is only a fallback source for
+///   the committer: it never touches `user.*` or any commit's author.
 fn base_open_options() -> gix::open::Options {
-    gix::open::Options::isolated().config_overrides(["core.useReplaceRefs=false"])
+    gix::open::Options::isolated().config_overrides([
+        "core.useReplaceRefs=false".to_string(),
+        format!("committer.name={INTERNAL_COMMIT_NAME}"),
+        format!("committer.email={INTERNAL_COMMIT_EMAIL}"),
+    ])
 }
 
 /// Open a checkout for status enumeration.

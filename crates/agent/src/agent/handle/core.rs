@@ -664,9 +664,31 @@ impl LocalAgentHandle {
             .session_config_options(Some(&session_id), current_mode, reasoning_effort)
             .await?;
 
-        Ok(NewSessionResponse::new(session_id)
+        let response = NewSessionResponse::new(session_id.clone())
             .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(config_options))
+            .config_options(config_options);
+
+        // Disclose the resolved binding for isolated sessions only; a local
+        // session's response is unchanged.
+        let Some(service) = self.config.workspace_service() else {
+            return Ok(response);
+        };
+        let binding = service
+            .resolve_existing_session(&session_id, None)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        Ok(match binding {
+            Some(binding) => response.meta(
+                serde_json::json!({
+                    crate::acp::shared::QUERYMT_META_NAMESPACE: {
+                        crate::worktree::SESSION_WORKSPACE_META_KEY: binding.disclosure(),
+                    },
+                })
+                .as_object()
+                .cloned(),
+            ),
+            None => response,
+        })
     }
 
     /// Load an existing session. MCP attachments are resolved internally by

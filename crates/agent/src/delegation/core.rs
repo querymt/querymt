@@ -91,6 +91,9 @@ pub struct AgentInfo {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub required_capabilities: Vec<crate::tools::CapabilityRequirement>,
+    /// Configured isolation for tasks delegated to this agent (`inherit` unless set).
+    #[serde(default)]
+    pub isolation: crate::worktree::DelegationIsolation,
     #[serde(skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub meta: Option<serde_json::Value>,
 }
@@ -3216,6 +3219,7 @@ mod tests {
 
     fn make_agent_info(id: &str) -> AgentInfo {
         AgentInfo {
+            isolation: Default::default(),
             id: id.to_string(),
             name: format!("Agent {id}"),
             description: format!("Description for {id}"),
@@ -3308,6 +3312,7 @@ mod tests {
     #[test]
     fn test_agent_info_serde_round_trip() {
         let info = AgentInfo {
+            isolation: Default::default(),
             id: "coder".to_string(),
             name: "Coder Agent".to_string(),
             description: "Writes code".to_string(),
@@ -3327,6 +3332,7 @@ mod tests {
     #[test]
     fn test_agent_info_meta_none_omitted_in_json() {
         let info = AgentInfo {
+            isolation: Default::default(),
             id: "minimal".to_string(),
             name: "Minimal".to_string(),
             description: "No meta".to_string(),

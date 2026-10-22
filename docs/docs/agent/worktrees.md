@@ -15,27 +15,66 @@ files.
 
 ## Enabling the workspace service
 
-Workspace isolation is opt-in. Configure a `WorkspaceService` on the agent
-builder; without it every session executes locally exactly as before:
+Workspace isolation is opt-in, and **enabling the service never isolates a
+session by itself**. The service only makes isolation *available*; a session
+is isolated only when it asks for it (see
+[Creating an isolated session](#creating-an-isolated-session)). An option-less
+`session/new`, `chat_session()` or Python `chat_session()` stays local, creates
+no worktree, and is unchanged whether or not the service is enabled.
 
-```rust
-use std::sync::Arc;
-use querymt_agent::worktree::{GixRepoOps, WorkspaceService};
+=== "TOML"
 
-let storage_root = dirs::data_dir().unwrap().join("qmt/worktrees");
-let service = Arc::new(WorkspaceService::new(
-    Arc::new(GixRepoOps::new()),
-    storage.workspace_repository().expect("backend exposes a workspace repository"),
-    storage_root, // durable worktree storage, e.g. ~/.local/share/qmt/worktrees
-));
+    ```toml
+    [agent.workspace]            # or [quorum.workspace] for a multi-agent quorum
+    enabled = true               # default false: no service, behavior unchanged
+    # storage_root = "~/.qmt/worktrees"   # default; relative paths resolve
+    #                                       # against the config file
+    # baseline = "commit"        # "commit" (default) | "current_working_tree"
+    ```
 
-let config = AgentConfigBuilder::from_provider(storage, provider, journal)
-    .with_workspace_service(service)
-    .build();
-```
+=== "Rust"
+
+    ```rust
+    use querymt_agent::api::Agent;
+    use querymt_agent::config::WorkspaceSettings;
+
+    let agent = Agent::single()
+        .provider("anthropic", "claude-sonnet-4-5-20250929")
+        .cwd("/path/to/repo")
+        .workspace(WorkspaceSettings::enabled())
+        .build()
+        .await?;
+    ```
+
+    A prebuilt service can be injected instead with `.workspace_service(arc)`
+    (also on `Agent::multi()`); it takes precedence over the settings. Lower
+    level embedders can still attach one with
+    `AgentConfigBuilder::with_workspace_service`.
+
+=== "Python"
+
+    ```python
+    agent = await Agent.single(
+        provider="anthropic", model="claude-sonnet-4-5-20250929",
+        cwd="/path/to/repo",
+        worktrees=True,   # or {"storage_root": "...", "baseline": "commit"}
+    )
+    ```
+
+    `Agent.from_config(path)` picks the section up from TOML. Unknown keys in
+    the dict raise `ValueError`.
+
+Settings are validated **when the agent is built**, not at the first isolated
+session: the storage backend must expose a workspace repository, `storage_root`
+must be creatable and be on the local filesystem, and a quorum delegate
+configured `isolation = "isolated"` requires the service. A quorum builds
+exactly **one** service shared by the planner and every delegate.
 
 Managed checkouts live under `<storage-root>/<repo-slug>/<workspace-id>/`,
-survive session completion, process restarts, and machine reboots.
+survive session completion, process restarts, and machine reboots. They
+accumulate until you archive and remove them, so programmatic callers creating
+sessions in a loop should do so deliberately (see
+[Management from code](#management-from-code)).
 
 ## Creating an isolated session
 
@@ -74,6 +113,22 @@ Semantics that matter:
 - **Requested isolation never falls back.** If Git, the repository, durable
   storage, or local filesystem placement is unavailable, creation fails with
   an actionable error instead of silently running shared.
+
+### Default baseline
+
+`baseline` in the settings is a *default for explicitly requested top-level
+isolation* that did not choose a baseline itself. It never decides **whether**
+to isolate. Precedence, per request:
+
+1. an explicit `baseline` / `includeLocalChanges` value (including an explicit
+   `false`) always wins;
+2. an explicit `baseRef` means a commit baseline from that ref, so a
+   `current_working_tree` default yields to it instead of failing validation;
+3. otherwise the configured default applies.
+
+The resolved mode is disclosed in the `session/new` response and in `create`
+results (`baseline`, `localChangesExcluded`). Delegates always start from the
+parent's working contents and forks keep their own rules; neither is affected.
 
 `current_working_tree` capture details:
 
@@ -179,6 +234,28 @@ configured external filters or hooks, execute Git however they choose and
 are neither intercepted nor restricted by this service. Built-in typed
 operations never shell out and never parse Git command output.
 
+## Discovering support
+
+An agent with a workspace service advertises it in `initialize`
+(`agentCapabilities._meta.querymt.workspace`), so clients can offer an explicit
+Local / Worktree choice at creation. Agents without the service omit it.
+
+```json
+{ "supported": true, "defaultBaseline": "commit",
+  "executionModes": ["local", "worktree"],
+  "baselines": ["commit", "current_working_tree"] }
+```
+
+For an isolated `session/new`, the response's
+`_meta.querymt.sessionWorkspace` discloses the resolved binding: `sessionCwd`
+(the directory the session actually executes in), `workspaceId`, `branch`,
+`baseline`, `baselineCommit`, `localChangesExcluded` and
+`ignoredUntrackedFilesExcluded`. Local sessions carry no such metadata.
+
+Clients that cannot send creation metadata use the documented flow: submit
+`/worktree create` from any session, then load the returned session id; the
+loaded session runs in its bound checkout. No live switching is involved.
+
 ## Native commands and typed operations
 
 Submit these as ordinary ACP `session/prompt` text, not queued or steering
@@ -238,6 +315,64 @@ files, and every other checkout remain unchanged. Publication performs no
 verification, which is reported as `skipped`. A failed capture reports an
 explicit error and keeps the checkout untouched; it never records a partial
 result. Inspection (`result`) is read-only and never republishes live state.
+
+### Management from code
+
+Every operation above is implemented once, as typed requests and responses
+plus a typed error enum (`querymt_agent::worktree::WorktreeOps`). The ACP
+extensions, the native `/worktree` command, the simple API and the Python
+bindings are thin adapters over it, so ownership, lease and removal rules
+cannot drift between surfaces. Existing ACP JSON shapes are unchanged.
+
+=== "Rust"
+
+    ```rust
+    use querymt_agent::api::SessionOptions;
+
+    // Explicit isolation; default options are a plain local session.
+    let session = agent
+        .chat_session_with(SessionOptions::worktree().name("refactor"))
+        .await?;
+    println!("{}", session.workspace().unwrap()["sessionCwd"]);
+
+    // None when the agent has no workspace service.
+    let worktrees = agent.worktrees().expect("enabled");
+    let listed = worktrees.list().await?;
+    ```
+
+=== "Python"
+
+    ```python
+    session = await agent.chat_session(workspace="worktree", name="refactor",
+                                       include_local_changes=True)
+    print(session.workspace["sessionCwd"])      # None for a local session
+
+    wt = agent.worktrees                         # None when not enabled
+    await wt.list(); await wt.status(wid); await wt.result(wid)
+    await wt.publish(workspace_id=wid); await wt.archive(wid); await wt.remove(wid)
+    ```
+
+    Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) carrying a
+    `.code`.
+
+#### Error codes
+
+Every surface reports the same stable, machine-readable `code` (ACP error
+`data.code`, `WorktreeOpError::code()`, Python `WorktreeError.code`). Human
+readable messages may be reworded; codes do not change.
+
+| Code | Meaning |
+|------|---------|
+| `workspace_service_unavailable` | isolation or an operation was requested but no service is configured (never downgraded to shared execution) |
+| `invalid_options` | malformed or contradictory request (for example a ref with `current_working_tree`) |
+| `isolation_unsupported_layout` | not a supported repository (non-Git, bare, sparse, submodule, ...) |
+| `workspace_not_found` | unknown workspace id |
+| `workspace_missing` | the bound checkout is gone; there is no fallback to the source |
+| `conflicting_cwd` | load/resume with a cwd that contradicts the persisted binding |
+| `owner_conflict` | another session already owns the writable workspace |
+| `removal_refused` | removal refused (active owner, dirty/untracked/ignored content, unpreserved commits) |
+| `operation_refused` | another lifecycle operation was refused in the current state |
+| `repository_error`, `storage_error`, `session_start_failed`, `internal_error` | infrastructure failures |
 
 ### Opt-in workflow
 

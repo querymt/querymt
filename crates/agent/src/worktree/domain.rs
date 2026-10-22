@@ -140,7 +140,9 @@ pub fn baseline_ref_for(workspace_id: &WorkspaceId) -> String {
 // ---------------------------------------------------------------------------
 
 /// What the baseline of a new isolated workspace is captured from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum BaselineMode {
     /// Capture a committed ref only. Uncommitted local edits in the source
@@ -374,7 +376,9 @@ impl FromStr for ExecutionMode {
 }
 
 /// Delegation isolation requested for a delegate relative to its parent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegationIsolation {
     /// Resolve from the parent's execution mode: isolated parents isolate
@@ -415,6 +419,47 @@ pub fn resolve_delegation_isolation(
             ExecutionMode::Worktree => ResolvedIsolation::Isolated,
         },
     }
+}
+
+/// Where a resolved delegation isolation came from. Persisted with the
+/// request and disclosed so explicit overrides are never mistaken for defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationSource {
+    /// An explicit non-`inherit` value on the `delegate` tool call.
+    Request,
+    /// The target delegate's configured `isolation`.
+    DelegateConfig,
+    /// Inherited from the parent session's execution mode.
+    Inherited,
+}
+
+impl IsolationSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::DelegateConfig => "delegate_config",
+            Self::Inherited => "inherited",
+        }
+    }
+}
+
+/// Resolve delegation isolation with full precedence (design decision 8):
+/// an explicit non-`inherit` request, then the delegate's configured value,
+/// then inheritance from the parent's execution mode.
+pub fn resolve_delegation_policy(
+    parent_mode: ExecutionMode,
+    request: DelegationIsolation,
+    configured: DelegationIsolation,
+) -> (ResolvedIsolation, IsolationSource) {
+    let (effective, source) = match (request, configured) {
+        (DelegationIsolation::Inherit, DelegationIsolation::Inherit) => {
+            (DelegationIsolation::Inherit, IsolationSource::Inherited)
+        }
+        (DelegationIsolation::Inherit, configured) => (configured, IsolationSource::DelegateConfig),
+        (request, _) => (request, IsolationSource::Request),
+    };
+    (resolve_delegation_isolation(parent_mode, effective), source)
 }
 
 /// Typed options for creating an isolated workspace. Absent options preserve
@@ -1178,5 +1223,68 @@ mod tests {
         let record = sample_record();
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("2026-01-15T12:00:00"));
+    }
+}
+
+#[cfg(test)]
+mod delegation_policy_tests {
+    use super::*;
+    use DelegationIsolation::{Inherit, Isolated, Shared};
+    use ExecutionMode::{Local, Worktree};
+
+    #[test]
+    fn precedence_is_request_then_delegate_config_then_parent() {
+        let cases = [
+            // (parent, request, configured) -> (resolved, source)
+            (
+                Local,
+                Inherit,
+                Inherit,
+                ResolvedIsolation::Shared,
+                IsolationSource::Inherited,
+            ),
+            (
+                Worktree,
+                Inherit,
+                Inherit,
+                ResolvedIsolation::Isolated,
+                IsolationSource::Inherited,
+            ),
+            (
+                Local,
+                Inherit,
+                Isolated,
+                ResolvedIsolation::Isolated,
+                IsolationSource::DelegateConfig,
+            ),
+            (
+                Worktree,
+                Inherit,
+                Shared,
+                ResolvedIsolation::Shared,
+                IsolationSource::DelegateConfig,
+            ),
+            (
+                Local,
+                Isolated,
+                Shared,
+                ResolvedIsolation::Isolated,
+                IsolationSource::Request,
+            ),
+            (
+                Worktree,
+                Shared,
+                Isolated,
+                ResolvedIsolation::Shared,
+                IsolationSource::Request,
+            ),
+        ];
+        for (parent, request, configured, resolved, source) in cases {
+            assert_eq!(
+                resolve_delegation_policy(parent, request, configured),
+                (resolved, source),
+                "parent={parent} request={request:?} configured={configured:?}"
+            );
+        }
     }
 }

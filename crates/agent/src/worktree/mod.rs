@@ -25,6 +25,7 @@ pub mod identity;
 mod layout_lifecycle_tests;
 pub mod lifecycle;
 pub mod lock;
+pub mod ops;
 pub mod placement;
 pub mod repo_ops;
 pub mod repo_workspace;
@@ -39,10 +40,10 @@ pub use capture::{
 };
 pub use domain::{
     Baseline, BaselineMode, ChangeKind, ChangedPath, DelegationIsolation, ExecutionMode,
-    ManagedBranch, ProvisioningPhase, RepositoryIdentity, ResolvedIsolation, ResultProvenance,
-    ResultReview, ResultVerificationStatus, WorkspaceCreationOptions, WorkspaceId,
-    WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
-    resolve_delegation_isolation,
+    IsolationSource, ManagedBranch, ProvisioningPhase, RepositoryIdentity, ResolvedIsolation,
+    ResultProvenance, ResultReview, ResultVerificationStatus, WorkspaceCreationOptions,
+    WorkspaceId, WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
+    resolve_delegation_isolation, resolve_delegation_policy,
 };
 pub use error::{WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;
@@ -54,6 +55,12 @@ pub use identity::{
 };
 pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
+pub use ops::{
+    IsolatedSessionSpawner, WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse,
+    WorktreeListResponse, WorktreeOpError, WorktreeOps, WorktreePublishResponse,
+    WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry, WorktreeResultResponse,
+    WorktreeStatusResponse, WorktreeSummary,
+};
 pub use repo_ops::{
     CapturedWorkingState, CheckoutStatus, FailurePoint, FaultInjectingRepoOps, GixRepoOps,
     RegisteredWorktree, RepositoryOps, validate_ref_name,
@@ -61,6 +68,6 @@ pub use repo_ops::{
 pub use repo_workspace::{SqliteWorkspaceRepository, WorkspaceRepository};
 pub use service::{WorkspaceBinding, WorkspaceService};
 pub use session_options::{
-    SESSION_WORKSPACE_META_KEY, SessionCreationOptions, fork_creation_options_from_meta,
-    session_creation_options_from_meta,
+    SESSION_WORKSPACE_META_KEY, SessionCreationOptions, apply_default_baseline,
+    fork_creation_options_from_meta, session_creation_options_from_meta,
 };

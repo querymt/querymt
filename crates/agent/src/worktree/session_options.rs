@@ -240,14 +240,20 @@ pub fn session_creation_options_from_meta(
 pub fn fork_creation_options_from_meta(
     meta: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> Result<Option<SessionCreationOptions>, String> {
-    let Some(options) = session_creation_options_from_meta(meta)? else {
+    let Some(mut options) = session_creation_options_from_meta(meta)? else {
         return Ok(None);
     };
-    // A baseline is pinned by a non-null `baseline` or by an explicit
-    // boolean `includeLocalChanges` (including `false`, which requests a
-    // commit baseline and must not be upgraded to a working-tree capture).
-    let baseline_pinned = meta
-        .and_then(|meta| meta.get(crate::acp::shared::QUERYMT_META_NAMESPACE))
+    if options.requests_isolation() && !baseline_pinned(meta) && options.base_ref.is_none() {
+        options.baseline = BaselineMode::CurrentWorkingTree;
+    }
+    Ok(Some(options))
+}
+
+/// Whether the request chose its own baseline: a non-null `baseline` or an
+/// explicit boolean `includeLocalChanges` (including `false`, which asks for a
+/// commit baseline and must not be overridden by any default).
+fn baseline_pinned(meta: Option<&serde_json::Map<String, serde_json::Value>>) -> bool {
+    meta.and_then(|meta| meta.get(crate::acp::shared::QUERYMT_META_NAMESPACE))
         .and_then(|querymt| querymt.get(SESSION_WORKSPACE_META_KEY))
         .is_some_and(|workspace| {
             workspace.get("baseline").is_some_and(|v| !v.is_null())
@@ -258,12 +264,25 @@ pub fn fork_creation_options_from_meta(
                             .get(*key)
                             .is_some_and(serde_json::Value::is_boolean)
                     })
-        });
-    let mut options = options;
-    if options.requests_isolation() && !baseline_pinned && options.base_ref.is_none() {
-        options.baseline = BaselineMode::CurrentWorkingTree;
+        })
+}
+
+/// Apply the configured default baseline to an explicitly requested
+/// top-level isolated session.
+///
+/// The default never decides *whether* to isolate (local options pass through
+/// untouched) and never overrides a baseline the request chose itself. An
+/// explicit `base_ref` always means a commit baseline from that ref, so a
+/// `current_working_tree` default yields to it instead of failing validation.
+pub fn apply_default_baseline(
+    mut options: SessionCreationOptions,
+    meta: Option<&serde_json::Map<String, serde_json::Value>>,
+    default: BaselineMode,
+) -> SessionCreationOptions {
+    if options.requests_isolation() && !baseline_pinned(meta) && options.base_ref.is_none() {
+        options.baseline = default;
     }
-    Ok(Some(options))
+    options
 }
 
 #[cfg(test)]
@@ -510,6 +529,39 @@ mod tests {
             BaselineMode::CurrentWorkingTree,
             "a null baseline is not an explicit pin"
         );
+    }
+
+    #[test]
+    fn default_baseline_applies_only_to_unpinned_isolation() {
+        let cwt = BaselineMode::CurrentWorkingTree;
+        let apply = |value: serde_json::Value| {
+            let meta = meta_with_workspace(value);
+            let options = session_creation_options_from_meta(Some(&meta))
+                .unwrap()
+                .unwrap();
+            apply_default_baseline(options, Some(&meta), cwt)
+        };
+
+        // Unpinned isolation takes the default.
+        assert_eq!(
+            apply(serde_json::json!({"execution": "worktree"})).baseline,
+            cwt
+        );
+        // Explicit choices win, including an explicit `false`.
+        for pinned in [
+            serde_json::json!({"execution": "worktree", "baseline": "commit"}),
+            serde_json::json!({"execution": "worktree", "includeLocalChanges": false}),
+        ] {
+            assert_eq!(apply(pinned).baseline, BaselineMode::Commit);
+        }
+        // An explicit ref resolves to commit mode and stays valid.
+        let with_ref = apply(serde_json::json!({"execution": "worktree", "baseRef": "v1"}));
+        assert_eq!(with_ref.baseline, BaselineMode::Commit);
+        with_ref.validate().unwrap();
+        // The default never turns a local request into isolation.
+        let local = apply(serde_json::json!({"execution": "local"}));
+        assert!(!local.requests_isolation());
+        assert_eq!(local.baseline, BaselineMode::Commit);
     }
 
     #[test]

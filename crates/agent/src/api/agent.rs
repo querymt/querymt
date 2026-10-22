@@ -8,6 +8,7 @@ use super::quorum::QuorumBuilder;
 use super::session::AgentSession;
 use super::sessions::{AgentSessions, ListSessionsOptions, SessionListPage};
 use super::utils::{default_registry, latest_assistant_message, to_absolute_path};
+use super::worktrees::{AgentWorktrees, SessionOptions};
 use crate::acp::AcpTransport;
 use crate::acp::protocol::{ContentBlock, NewSessionRequest, PromptRequest, TextContent};
 use crate::acp::stdio::serve_stdio;
@@ -119,6 +120,10 @@ pub struct AgentBuilder {
     dotagents_manifest: Option<crate::dotagents::DotagentsManifest>,
     /// Optional host approval mechanism for workspace protocol tasks.
     dotagents_task_approver: Option<Arc<dyn crate::dotagents::DotagentsTaskApprover>>,
+    /// Workspace settings from the builder or TOML; service built at `build()`.
+    workspace: Option<crate::config::WorkspaceSettings>,
+    /// Prebuilt workspace service; wins over `workspace`.
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
@@ -162,6 +167,8 @@ impl AgentBuilder {
             dotagents_options: None,
             dotagents_manifest: None,
             dotagents_task_approver: None,
+            workspace: None,
+            workspace_service: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
@@ -287,6 +294,22 @@ impl AgentBuilder {
     /// Configure slash-command discovery.
     pub fn slash_commands(mut self, config: SlashCommandsConfig) -> Self {
         self.slash_commands_config = Some(config);
+        self
+    }
+
+    /// Configure managed Git worktree workspaces.
+    ///
+    /// Enabling the service only makes isolation *available*; a session is
+    /// isolated only when it asks for it. An injected
+    /// [`workspace_service`](Self::workspace_service) takes precedence.
+    pub fn workspace(mut self, settings: crate::config::WorkspaceSettings) -> Self {
+        self.workspace = Some(settings);
+        self
+    }
+
+    /// Inject a prebuilt workspace service (wins over [`workspace`](Self::workspace)).
+    pub fn workspace_service(mut self, service: Arc<crate::worktree::WorkspaceService>) -> Self {
+        self.workspace_service = Some(service);
         self
     }
 
@@ -569,6 +592,22 @@ impl AgentBuilder {
             builder = builder.with_agent_registry(Arc::new(registry));
         } else if let Some(registry) = explicit_registry {
             builder = builder.with_agent_registry(registry);
+        }
+
+        // Workspace service: an injected instance wins; otherwise build one from
+        // the settings. Invalid settings fail here, not at the first session.
+        let workspace_service = match self.workspace_service.take() {
+            Some(service) => Some(service),
+            None => match &self.workspace {
+                Some(settings) => {
+                    crate::worktree::WorkspaceService::from_settings(settings, backend.as_ref())
+                        .map_err(|err| anyhow!("invalid workspace configuration: {err}"))?
+                }
+                None => None,
+            },
+        };
+        if let Some(service) = workspace_service {
+            builder = builder.with_workspace_service(service);
         }
 
         // Wire schedule repository and knowledge store from the storage backend.
@@ -940,6 +979,53 @@ impl Agent {
     pub async fn chat_session(&self) -> Result<AgentSession> {
         let session_id = self.create_session().await?;
         Ok(AgentSession::new(self.inner.clone(), session_id))
+    }
+
+    /// Create a session with explicit [`SessionOptions`].
+    ///
+    /// `SessionOptions::default()` is identical to [`chat_session`](Self::chat_session):
+    /// a local session. Requested isolation fails closed (no workspace service,
+    /// unsupported layout, ...) with a typed error carrying a stable
+    /// [`code`](crate::worktree::WorktreeOpError::code), and never falls back
+    /// to the shared checkout.
+    pub async fn chat_session_with(
+        &self,
+        options: SessionOptions,
+    ) -> Result<AgentSession, crate::worktree::WorktreeOpError> {
+        use crate::worktree::WorktreeOpError;
+        options.validate()?;
+        let mut request = match &self.cwd {
+            Some(cwd) => NewSessionRequest::new(cwd.clone()),
+            None => NewSessionRequest::new(PathBuf::new()),
+        };
+        if let Some(meta) = options.new_session_meta() {
+            request = request.meta(meta);
+        }
+        let response = self
+            .inner
+            .new_session(request)
+            .await
+            .map_err(|err| WorktreeOpError::from_acp(&err))?;
+        let session_id = response.session_id.to_string();
+        if let Some(name) = options.session_name() {
+            self.storage
+                .session_store()
+                .set_session_name(&session_id, Some(name.to_string()))
+                .await?;
+        }
+        let workspace = super::worktrees::disclosed_workspace(response.meta.as_ref());
+        Ok(AgentSession::new(self.inner.clone(), session_id).with_workspace(workspace))
+    }
+
+    /// Managed-worktree operations, or `None` when this agent has no
+    /// workspace service (see [`AgentBuilder::workspace`]).
+    pub fn worktrees(&self) -> Option<AgentWorktrees> {
+        let service = self.inner.config.workspace_service()?;
+        Some(AgentWorktrees::new(
+            crate::worktree::WorktreeOps::new(service),
+            self.inner.clone(),
+            self.cwd.clone(),
+        ))
     }
 
     pub fn sessions(&self) -> AgentSessions {
@@ -1506,6 +1592,9 @@ impl Agent {
         builder.skills_config = Some(config.agent.skills);
         builder.slash_commands_config = Some(config.agent.slash_commands);
         builder.hooks_config = Some(config.agent.hooks);
+        if config.agent.workspace.enabled {
+            builder.workspace = Some(config.agent.workspace);
+        }
 
         // Wire MCP servers from TOML `[[mcp]]` config.
         if !config.mcp.is_empty() {

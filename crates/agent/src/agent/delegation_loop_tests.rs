@@ -1169,6 +1169,7 @@ async fn build_delegate_handle(
 
 fn agent_info(id: &str) -> AgentInfo {
     AgentInfo {
+        isolation: Default::default(),
         id: id.to_string(),
         name: format!("{} name", id),
         description: format!("{} description", id),

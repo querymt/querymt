@@ -194,6 +194,13 @@ struct WorktreeExtFixture {
 }
 
 async fn worktree_fixture(configure_service: bool) -> WorktreeExtFixture {
+    worktree_fixture_with(configure_service, crate::worktree::BaselineMode::Commit).await
+}
+
+async fn worktree_fixture_with(
+    configure_service: bool,
+    default_baseline: crate::worktree::BaselineMode,
+) -> WorktreeExtFixture {
     let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
     let shared = SharedLlmProvider {
         inner: provider,
@@ -223,13 +230,16 @@ async fn worktree_fixture(configure_service: bool) -> WorktreeExtFixture {
     crate::worktree::test_support::materialize(repo.path(), &[("README.md", "hello\n")]);
 
     let storage_root = tempfile::TempDir::new().unwrap();
-    let service = Arc::new(crate::worktree::WorkspaceService::new(
-        Arc::new(crate::worktree::GixRepoOps::new()),
-        storage
-            .workspace_repository()
-            .expect("sqlite storage exposes a workspace repository"),
-        storage_root.path(),
-    ));
+    let service = Arc::new(
+        crate::worktree::WorkspaceService::new(
+            Arc::new(crate::worktree::GixRepoOps::new()),
+            storage
+                .workspace_repository()
+                .expect("sqlite storage exposes a workspace repository"),
+            storage_root.path(),
+        )
+        .with_default_baseline(default_baseline),
+    );
     if configure_service {
         builder = builder.with_workspace_service(service.clone());
     }
@@ -242,6 +252,245 @@ async fn worktree_fixture(configure_service: bool) -> WorktreeExtFixture {
         _storage_root: storage_root,
         _plugin_dir: plugin_dir,
     }
+}
+
+fn new_session_request(
+    cwd: &std::path::Path,
+    session_workspace: Option<serde_json::Value>,
+) -> crate::acp::protocol::NewSessionRequest {
+    let request = crate::acp::protocol::NewSessionRequest::new(cwd.to_path_buf());
+    match session_workspace {
+        Some(value) => request.meta(
+            serde_json::json!({ "querymt": { "sessionWorkspace": value } })
+                .as_object()
+                .cloned(),
+        ),
+        None => request,
+    }
+}
+
+/// 21.10: workspace support is advertised only when a service is configured.
+#[tokio::test]
+async fn initialize_advertises_workspace_support_only_with_a_service() {
+    use crate::acp::protocol::{InitializeRequest, ProtocolVersion};
+
+    let workspace_meta = |resp: crate::acp::protocol::InitializeResponse| {
+        resp.agent_capabilities
+            .meta
+            .and_then(|meta| meta.get("querymt").cloned())
+            .and_then(|querymt| querymt.get("workspace").cloned())
+    };
+
+    let without = worktree_fixture(false).await;
+    let resp = without
+        .handle
+        .initialize(InitializeRequest::new(ProtocolVersion::LATEST))
+        .await
+        .unwrap();
+    assert!(workspace_meta(resp).is_none(), "no service, no capability");
+
+    let with = worktree_fixture_with(true, crate::worktree::BaselineMode::CurrentWorkingTree).await;
+    let resp = with
+        .handle
+        .initialize(InitializeRequest::new(ProtocolVersion::LATEST))
+        .await
+        .unwrap();
+    let advertised = workspace_meta(resp).expect("service configured");
+    assert_eq!(advertised["supported"], true);
+    assert_eq!(advertised["defaultBaseline"], "current_working_tree");
+    assert_eq!(
+        advertised["executionModes"],
+        serde_json::json!(["local", "worktree"])
+    );
+}
+
+/// 21.4 + 21.10: an option-less `session/new` stays local with the service
+/// enabled (no worktree, no disclosure); an explicit request is isolated and
+/// the response discloses the resolved binding.
+#[tokio::test]
+async fn option_less_session_new_stays_local_and_explicit_request_discloses_binding() {
+    let f = worktree_fixture(true).await;
+
+    let local = f
+        .handle
+        .new_session(new_session_request(f.repo.path(), None))
+        .await
+        .unwrap();
+    assert!(
+        local.meta.is_none(),
+        "local response carries no workspace meta"
+    );
+    assert!(
+        f.service
+            .registry()
+            .list_workspaces()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let row = f
+        .storage
+        .session_store()
+        .get_session(&local.session_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.cwd.as_deref(), Some(f.repo.path()));
+
+    let isolated = f
+        .handle
+        .new_session(new_session_request(
+            f.repo.path(),
+            Some(serde_json::json!({ "execution": "worktree" })),
+        ))
+        .await
+        .unwrap();
+    let disclosed = isolated.meta.as_ref().unwrap()["querymt"]["sessionWorkspace"].clone();
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&isolated.session_id.to_string())
+        .await
+        .unwrap()
+        .expect("explicit request is bound");
+    assert_eq!(disclosed["workspaceId"], record.id.as_str());
+    assert_eq!(disclosed["baseline"], "commit");
+    assert_eq!(disclosed["localChangesExcluded"], true);
+    assert_eq!(
+        disclosed["sessionCwd"],
+        record.session_cwd().display().to_string()
+    );
+    assert_eq!(
+        f.service.registry().list_workspaces().await.unwrap().len(),
+        1
+    );
+    f.handle.shutdown().await;
+}
+
+/// 21.3: the configured default baseline fills in only an unmade choice; an
+/// explicit request value and an explicit ref win; delegates/forks unaffected.
+#[tokio::test]
+async fn configured_default_baseline_applies_only_to_unpinned_isolation() {
+    let f = worktree_fixture_with(true, crate::worktree::BaselineMode::CurrentWorkingTree).await;
+    std::fs::write(f.repo.path().join("README.md"), "dirty\n").unwrap();
+
+    let session = |workspace: serde_json::Value| {
+        let handle = &f.handle;
+        let cwd = f.repo.path().to_path_buf();
+        async move {
+            handle
+                .new_session(new_session_request(&cwd, Some(workspace)))
+                .await
+                .unwrap()
+                .meta
+                .unwrap()["querymt"]["sessionWorkspace"]
+                .clone()
+        }
+    };
+
+    // Unpinned: takes the default and discloses it.
+    let unpinned = session(serde_json::json!({ "execution": "worktree" })).await;
+    assert_eq!(unpinned["baseline"], "current_working_tree");
+    assert_eq!(unpinned["localChangesExcluded"], false);
+    // Explicit choices win, including an explicit `false`.
+    let pinned =
+        session(serde_json::json!({ "execution": "worktree", "baseline": "commit" })).await;
+    assert_eq!(pinned["baseline"], "commit");
+    let off =
+        session(serde_json::json!({ "execution": "worktree", "includeLocalChanges": false })).await;
+    assert_eq!(off["baseline"], "commit");
+    // An explicit ref resolves to commit mode instead of failing validation.
+    let by_ref = session(serde_json::json!({ "execution": "worktree", "baseRef": "HEAD" })).await;
+    assert_eq!(by_ref["baseline"], "commit");
+
+    // The typed `create` operation resolves the same way and discloses it.
+    let source = f
+        .handle
+        .new_session(new_session_request(f.repo.path(), None))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let created = native_command(&f.handle, &source, "/worktree create")
+        .await
+        .unwrap();
+    assert_eq!(created["baseline_mode"], "current_working_tree");
+    assert_eq!(created["local_changes_excluded"], false);
+    let by_ref = native_command(&f.handle, &source, "/worktree create HEAD")
+        .await
+        .unwrap();
+    assert_eq!(by_ref["baseline_mode"], "commit");
+    f.handle.shutdown().await;
+}
+
+/// 21.5: errors carry a stable machine-readable code on the ACP surface.
+#[tokio::test]
+async fn worktree_errors_carry_stable_codes() {
+    let code_of = |err: crate::acp::protocol::Error| {
+        err.data
+            .and_then(|data| data.get("code").and_then(|c| c.as_str().map(str::to_owned)))
+    };
+    let without = worktree_fixture(false).await;
+    let err = without
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/worktree/list",
+            raw_params("{}"),
+        ))
+        .await
+        .expect_err("no service");
+    assert_eq!(
+        code_of(err).as_deref(),
+        Some("workspace_service_unavailable")
+    );
+
+    let with = worktree_fixture(true).await;
+    let err = with
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/worktree/status",
+            raw_params(r#"{"workspace_id":"ws-unknown"}"#),
+        ))
+        .await
+        .expect_err("unknown workspace");
+    assert_eq!(code_of(err).as_deref(), Some("workspace_not_found"));
+}
+
+/// Management creation must surface the same stable isolation code as plain
+/// `session/new`, not a generic `session_start_failed`.
+#[tokio::test]
+async fn management_create_preserves_session_creation_error_codes() {
+    let code_of = |err: crate::acp::protocol::Error| {
+        err.data
+            .and_then(|data| data.get("code").and_then(|c| c.as_str().map(str::to_owned)))
+    };
+    let f = worktree_fixture(true).await;
+    let not_a_repo = tempfile::TempDir::new().unwrap();
+
+    let via_session = f
+        .handle
+        .new_session(new_session_request(
+            not_a_repo.path(),
+            Some(serde_json::json!({ "execution": "worktree" })),
+        ))
+        .await
+        .expect_err("unsupported layout");
+    let session_code = code_of(via_session).expect("session creation carries a code");
+    assert_eq!(session_code, "isolation_unsupported_layout");
+
+    let params = serde_json::json!({ "cwd": not_a_repo.path() }).to_string();
+    let via_management = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/worktree/create",
+            raw_params(&params),
+        ))
+        .await
+        .expect_err("unsupported layout");
+    assert_eq!(
+        code_of(via_management).as_deref(),
+        Some(session_code.as_str())
+    );
 }
 
 #[tokio::test]

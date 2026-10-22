@@ -1305,7 +1305,25 @@ impl AgentSessions {
             ))
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
-        Ok(AgentSession::new(self.agent.clone(), session_id))
+        let workspace = self.durable_workspace_disclosure(&session_id).await?;
+        Ok(AgentSession::new(self.agent.clone(), session_id).with_workspace(workspace))
+    }
+
+    /// The session's durable managed-workspace binding, disclosed in the same
+    /// shape as `session/new`; `None` for local sessions or when no workspace
+    /// service is configured.
+    async fn durable_workspace_disclosure(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let Some(service) = self.agent.config.workspace_service() else {
+            return Ok(None);
+        };
+        let binding = service
+            .resolve_existing_session(session_id, None)
+            .await
+            .map_err(|e| anyhow!("failed to resolve workspace binding: {e}"))?;
+        Ok(binding.map(|b| b.disclosure()))
     }
 
     pub async fn load_with_snapshot(
@@ -1321,8 +1339,9 @@ impl AgentSessions {
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
         let snapshot = load_session_snapshot(&self.agent, self.view_store()?, &session_id).await?;
+        let workspace = self.durable_workspace_disclosure(&session_id).await?;
         Ok(AgentLoadedSession {
-            session: AgentSession::new(self.agent.clone(), session_id),
+            session: AgentSession::new(self.agent.clone(), session_id).with_workspace(workspace),
             snapshot,
         })
     }
