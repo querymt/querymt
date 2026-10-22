@@ -5,7 +5,10 @@ use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, ReadFilter, Tool, ToolContext, ToolError,
+    path_or_cwd_filtered_read_access,
+};
 
 /// Fast file pattern matching tool
 pub struct GlobTool;
@@ -123,6 +126,15 @@ impl Tool for GlobTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        // Glob only reports files matching `pattern` (relative to `path`), so
+        // creating or editing other files cannot change its result.
+        let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
+            return FileAccess::None;
+        };
+        path_or_cwd_filtered_read_access(args, "path", cwd, ReadFilter::new().include(pattern))
+    }
+
     fn truncation_hint(&self) -> Option<&'static str> {
         Some(
             "TIP: Many matches found and truncated. Refine your glob pattern \
@@ -187,6 +199,26 @@ impl Tool for GlobTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_path_or_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = GlobTool::new();
+        let access = tool.file_access(&serde_json::json!({"pattern": "**/*.rs"}), Some(&root));
+        let [scope] = access.read_scopes_slice() else {
+            panic!("expected one scope: {access:?}");
+        };
+        assert_eq!(scope.path, root);
+        assert!(scope.observes_write(&root.join("src/lib.rs")));
+        assert!(!scope.observes_write(&root.join("README.md")));
+        assert_eq!(
+            tool.file_access(&serde_json::json!({}), Some(&root)),
+            Access::None
+        );
+    }
+
     use super::*;
 
     fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {

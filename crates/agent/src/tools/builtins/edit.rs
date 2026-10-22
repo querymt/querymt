@@ -5,7 +5,9 @@ use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 
 use crate::tools::builtins::edit_output;
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, single_path_write_access,
+};
 
 /// Edit tool for precise string replacement with fuzzy matching
 pub struct EditTool;
@@ -569,6 +571,10 @@ impl Tool for EditTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        single_path_write_access(args, "filePath", cwd)
+    }
+
     async fn call(
         &self,
         args: Value,
@@ -642,6 +648,39 @@ mod tests {
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_access_writes_normalised_file_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp_dir.path()).unwrap();
+        let tool = EditTool::new();
+
+        let relative = tool.file_access(&json!({"filePath": "./a.md"}), Some(&root));
+        let absolute = tool.file_access(
+            &json!({"filePath": root.join("a.md").to_str().unwrap()}),
+            Some(&root),
+        );
+
+        assert_eq!(relative, FileAccess::writes([root.join("a.md")]));
+        assert_eq!(relative, absolute);
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = EditTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"filePath": 42}), Some(&cwd)),
+            FileAccess::None
+        );
+        // Relative path with no cwd cannot be resolved; the call will fail.
+        assert_eq!(
+            tool.file_access(&json!({"filePath": "a.md"}), None),
+            FileAccess::None
+        );
+    }
 
     #[tokio::test]
     async fn test_edit_simple() {

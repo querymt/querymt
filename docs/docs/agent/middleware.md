@@ -143,6 +143,56 @@ min_lines = 10
 - Warns about similar existing code
 - Helps avoid code duplication
 
+### ParallelEditGuard
+
+Detects a single model response that writes the same file with several tool calls
+(for example two `edit` calls on `design.md`) and steers the model toward one
+`multiedit` call per file.
+
+Same-file writes in one batch are always executed one after another in the model's
+order, so no edit is lost, whether or not this middleware is active. The guard only
+changes what the model is told.
+
+**Configuration:**
+```toml
+[[middleware]]
+type = "parallel_edit_guard"
+mode = "warn"   # "warn" (default) or "deny"
+```
+
+**Modes:**
+- `warn` (default): every call runs. Before the next model request, a guidance
+  message naming the affected files and recommending `multiedit` is added after the
+  tool results. It is sent once.
+- `deny`: only the first writing call per file runs. Each later writing call to that
+  file gets an error result that names the file and tells the model to combine the
+  edits into one `multiedit` call. Calls to other files still run, and every tool
+  call still gets exactly one result.
+
+**Default:** the guard is active in `warn` mode for every agent. Adding a
+`parallel_edit_guard` entry replaces the default instance.
+
+**Disable:**
+```toml
+[[middleware]]
+type = "parallel_edit_guard"
+enabled = false
+```
+
+Only calls that declare file writes count (`edit`, `multiedit`, `write_file`,
+`delete_file`, `replace_symbol`). `shell` and read-only calls are not counted.
+
+When a batch is flagged, a `HookNotice` event (`parallel_edit_guard`) is also
+published so UIs can show the warning. It is persisted in the background and
+never delays the tool calls. A guidance message that was not delivered
+(for example because the turn was cancelled) is discarded at the next turn start.
+
+Read-only file tools (`read_tool`, `get_function`, `get_symbol`, `index`, `mdq`,
+`find_symbol_references`, `search_text`, `ls`, `glob`) are ordered after earlier writes to
+the files (or directories) they read, so they never observe a half-written file.
+`search_text` and `glob` only wait for writes their filter could see: a
+`search_text` with `include = "*.md"` runs alongside an `edit` of `src/a.rs`.
+
 ### ContextFactory Middleware
 
 Legacy context management middleware.

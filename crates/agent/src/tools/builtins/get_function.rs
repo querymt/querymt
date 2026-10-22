@@ -8,7 +8,9 @@ use serde_json::{Value, json};
 use std::path::Path;
 
 use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind};
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, path_list_read_access,
+};
 
 use super::helpers::{parse_paths, resolve_root, resolve_target};
 
@@ -73,6 +75,10 @@ impl Tool for GetFunctionTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        path_list_read_access(args, "paths", cwd)
     }
 
     async fn call(
@@ -241,6 +247,33 @@ fn matches_function_kind(kind: SymbolKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_every_path() {
+        let dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let access = GetFunctionTool::new().file_access(
+            &json!({"paths": ["a.rs", "./b.rs"], "names": ["x"]}),
+            Some(&root),
+        );
+        assert_eq!(
+            access,
+            Access::reads([root.join("a.rs"), root.join("b.rs")])
+        );
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let cwd = std::env::temp_dir();
+        let tool = GetFunctionTool::new();
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), Access::None);
+        assert_eq!(
+            tool.file_access(&json!({"paths": ["a.rs"]}), None),
+            Access::None
+        );
+    }
+
     use super::*;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;

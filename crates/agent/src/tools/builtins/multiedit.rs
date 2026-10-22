@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 
 use super::edit::EditTool;
 use crate::tools::builtins::edit_output;
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, single_path_write_access,
+};
 
 #[derive(Deserialize)]
 struct EditOperation {
@@ -88,6 +90,10 @@ impl Tool for MultiEditTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        single_path_write_access(args, "filePath", cwd)
     }
 
     async fn call(
@@ -187,6 +193,29 @@ mod tests {
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_access_writes_normalised_file_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp_dir.path()).unwrap();
+        let tool = MultiEditTool::new();
+
+        let access = tool.file_access(&json!({"filePath": "docs/../a.md"}), Some(&root));
+
+        assert_eq!(access, FileAccess::writes([root.join("a.md")]));
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = MultiEditTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"filePath": null}), Some(&cwd)),
+            FileAccess::None
+        );
+    }
 
     #[tokio::test]
     async fn test_multiedit() {

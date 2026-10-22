@@ -63,7 +63,8 @@ pub struct AgentConfig {
     /// Lock-free reads via `ArcSwap`. `None` = use model heuristic defaults.
     pub default_reasoning_effort: Arc<ArcSwap<Option<ReasoningEffort>>>,
     pub tool_config: ToolConfig,
-    pub tool_registry: ToolRegistry,
+    /// Immutable after build; shared (not copied) with tool-aware middleware.
+    pub tool_registry: Arc<ToolRegistry>,
     pub middleware_drivers: Vec<Arc<dyn MiddlewareDriver>>,
     pub auth_methods: Vec<AuthMethod>,
 
@@ -113,6 +114,9 @@ impl AgentConfig {
     /// Used by `AgentBuilder::build()` to swap in the final middleware chain
     /// without manually cloning every field.
     pub(crate) fn with_middleware(mut self, drivers: Vec<Arc<dyn MiddlewareDriver>>) -> Self {
+        for driver in &drivers {
+            driver.bind_agent(&self.tool_registry, &self.event_sink);
+        }
         self.middleware_drivers = drivers;
         self
     }
@@ -184,36 +188,7 @@ impl AgentConfig {
     /// For durable events this spawns an async task that persists and publishes.
     /// For ephemeral events this publishes immediately (no persistence).
     pub fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
-        use crate::events::{Durability, classify_durability};
-
-        // Ephemeral events: publish immediately via sink, no persistence.
-        if classify_durability(&kind) == Durability::Ephemeral {
-            self.event_sink.emit_ephemeral(session_id, kind);
-            return;
-        }
-
-        // Durable events: persist via EventSink journal in a spawned task.
-        let sink = self.event_sink.clone();
-        let session_id = session_id.to_string();
-        let parent = if crate::event_fanout::EventFanout::is_delegation_event(&kind) {
-            tracing::Span::current()
-        } else {
-            tracing::Span::none()
-        };
-
-        use tracing::Instrument;
-        tokio::spawn(
-            async move {
-                if let Err(err) = sink.emit_durable(&session_id, kind).await {
-                    log::warn!(
-                        "failed to emit durable event for session {}: {}",
-                        session_id,
-                        err
-                    );
-                }
-            }
-            .instrument(parent),
-        );
+        self.event_sink.emit_detached(session_id, kind);
     }
 
     /// Persists and publishes a durable event, returning the `DurableEvent`.
@@ -239,9 +214,9 @@ impl AgentConfig {
         self.agent_registry.clone()
     }
 
-    /// Access the tool registry (clone).
+    /// Shared handle to the tool registry (cheap `Arc` clone).
     pub fn tool_registry_arc(&self) -> Arc<ToolRegistry> {
-        Arc::new(self.tool_registry.clone())
+        self.tool_registry.clone()
     }
 
     /// Access the workspace manager actor ref.

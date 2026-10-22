@@ -5,7 +5,7 @@ use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError};
 
 pub struct ShellTool;
 
@@ -82,6 +82,11 @@ impl ToolTrait for ShellTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, _args: &Value, _cwd: Option<&std::path::Path>) -> FileAccess {
+        // A shell command may read or write anything; we do not parse it.
+        FileAccess::Unknown
     }
 
     fn truncation_hint(&self) -> Option<&'static str> {
@@ -221,6 +226,18 @@ mod tests {
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn file_access_is_unknown() {
+        let tool = ShellTool::new();
+
+        assert_eq!(
+            tool.file_access(&json!({"command": "rm -rf x"}), None),
+            FileAccess::Unknown
+        );
+        // Unknown access never counts as a declared write.
+        assert!(!FileAccess::Unknown.has_writes());
+    }
 
     #[cfg(unix)]
     async fn wait_for_pid(path: &std::path::Path) -> i32 {

@@ -11,6 +11,7 @@ mod delegation;
 pub mod delegation_guard;
 mod limits;
 mod modes;
+mod parallel_edit_guard;
 mod presets;
 mod specialized;
 mod tasks;
@@ -38,6 +39,7 @@ pub use factory::{MIDDLEWARE_REGISTRY, MiddlewareFactory, MiddlewareRegistry};
 pub use limits::{
     LimitsConfig, LimitsMiddleware, MaxStepsMiddleware, PriceLimitMiddleware, TurnLimitMiddleware,
 };
+pub use parallel_edit_guard::{ParallelEditGuard, ParallelEditGuardFactory, ParallelEditMode};
 pub use presets::MiddlewarePresets;
 pub use specialized::{AgentModeMiddleware, DuplicateToolCallMiddleware};
 

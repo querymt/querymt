@@ -6,6 +6,7 @@
 //! - AfterLlm → ProcessingToolCalls or Complete (response handling)
 //! - ProcessingToolCalls → BeforeLlmCall or WaitingForEvent (parallel tool execution)
 
+use super::wave_plan::{CallInfo, plan_waves, serialized_call_count};
 use crate::acp::client_bridge::ClientBridgeSender;
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
@@ -1590,8 +1591,11 @@ pub(super) async fn transition_after_llm(
 
 /// Transition from ProcessingToolCalls to BeforeLlmCall or WaitingForEvent.
 ///
-/// This executes parallel-safe runs concurrently while preserving stateful and
-/// clarification boundaries, then either:
+/// The batch is planned into ordered waves (see `wave_plan::plan_waves`).
+/// Calls in one wave have no file conflicts and run concurrently; calls that
+/// conflict on a file run in later waves in the model's original order, and
+/// stateful / clarification calls act as solo barrier waves. Results are
+/// stored in the original call order. Then either:
 /// - Returns to BeforeLlmCall with results (normal flow)
 /// - Enters WaitingForEvent if a delegation was initiated
 ///
@@ -1614,7 +1618,8 @@ pub(super) async fn transition_after_llm(
         session_id = %exec_ctx.session_id,
         remaining_calls = remaining_calls.len(),
         completed_results = results.len(),
-        execution_mode = tracing::field::Empty,
+        wave_count = tracing::field::Empty,
+        serialized_calls = tracing::field::Empty,
         state_reload_ms = tracing::field::Empty,
     )
 )]
@@ -1654,290 +1659,132 @@ pub(super) async fn transition_processing_tool_calls(
         return Ok(next_state);
     }
 
-    let execution_class = |call: &MiddlewareToolCall| {
-        config
-            .tool_registry
-            .find(&call.function.name)
-            .map(|tool| tool.execution_class())
-            .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe)
-    };
-    let has_execution_boundary = remaining_calls
-        .iter()
-        .any(|call| execution_class(call) != crate::tools::ToolExecutionClass::ParallelSafe);
-    if has_execution_boundary {
-        tracing::Span::current().record("execution_mode", "mixed_boundary");
-        debug!(
-            "Executing mixed tool batch with stateful boundaries for session {}",
-            exec_ctx.session_id
-        );
-        let mut all_results = (**results).to_vec();
-        let mut unprocessed_start = if already_cancelled { Some(0) } else { None };
-        let mut cancelled = already_cancelled;
-        let mut stateful_executed = false;
-        let mut call_index = 0;
-
-        while call_index < remaining_calls.len() && !cancelled {
-            let class = execution_class(&remaining_calls[call_index]);
-            if class == crate::tools::ToolExecutionClass::ParallelSafe {
-                let group_end = remaining_calls[call_index..]
-                    .iter()
-                    .position(|call| {
-                        execution_class(call) != crate::tools::ToolExecutionClass::ParallelSafe
-                    })
-                    .map_or(remaining_calls.len(), |offset| call_index + offset);
-                let exec_ctx_ref: &ExecutionContext = exec_ctx;
-                let futures = remaining_calls[call_index..group_end].iter().map(|call| {
-                    let call = call.clone();
-                    let cancel = exec_ctx_ref.cancellation_token.clone();
-                    async move {
-                        tokio::select! {
-                            result = super::tool_calls::execute_tool_call(
-                                config, &call, exec_ctx_ref, bridge,
-                            ) => result,
-                            _ = cancel.cancelled() => Ok(ToolResult::new(
-                                call.id.clone(),
-                                vec![querymt::chat::ToolResultPart::Text { text: "Error: Cancelled by user".to_string() }],
-                                true,
-                                Some(call.function.name.clone()),
-                                Some(call.function.arguments.clone()),
-                            )),
-                        }
-                    }
-                });
-                for (result, call) in join_all(futures)
-                    .await
-                    .into_iter()
-                    .zip(remaining_calls[call_index..group_end].iter())
-                {
-                    match result {
-                        Ok(tool_result) => all_results.push(tool_result),
-                        Err(error) => all_results.push(ToolResult::new(
-                            call.id.clone(),
-                            vec![querymt::chat::ToolResultPart::Text {
-                                text: format!("Error: internal tool execution failed: {error}")
-                                    .to_string(),
-                            }],
-                            true,
-                            Some(call.function.name.clone()),
-                            Some(call.function.arguments.clone()),
-                        )),
-                    }
-                }
-                call_index = group_end;
-                if exec_ctx.cancellation_token.is_cancelled() {
-                    cancelled = true;
-                    unprocessed_start = Some(call_index);
-                }
-                continue;
-            }
-
-            let call = &remaining_calls[call_index];
-            stateful_executed |= class == crate::tools::ToolExecutionClass::SerialStateful;
-            let cancel = exec_ctx.cancellation_token.clone();
-            let result = tokio::select! {
-                result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge) => result,
-                _ = cancel.cancelled() => Ok(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: "Error: Cancelled by user".to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                )),
-            };
-            let mut clarification_applied = false;
-            match result {
-                Ok(tool_result) => {
-                    if class == crate::tools::ToolExecutionClass::ClarificationBoundary
-                        && !tool_result.is_error
-                    {
-                        let clarification = tool_result
-                            .content
-                            .iter()
-                            .filter_map(|block| block.as_text())
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if !clarification.trim().is_empty() {
-                            let summary = exec_ctx
-                                .state
-                                .current_intent
-                                .as_ref()
-                                .map(|intent| intent.summary.clone())
-                                .unwrap_or_else(|| clarification.clone());
-                            match exec_ctx
-                                .state
-                                .update_intent_projection(
-                                    summary,
-                                    None,
-                                    Some(clarification.clone()),
-                                    "clarification_answer".to_string(),
-                                    Some(call.id.clone()),
-                                )
-                                .await
-                            {
-                                Ok(_) => {
-                                    clarification_applied = true;
-                                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                                        objective.amend(
-                                            crate::agent::objective::ObjectiveDirective {
-                                                text: clarification.clone(),
-                                                source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
-                                                source_ref: Some(call.id.clone()),
-                                                accepted_at_ms: None,
-                                                application_boundary: Some(
-                                                    "clarification_boundary".to_string(),
-                                                ),
-                                            },
-                                        );
-                                    }
-                                }
-                                Err(error) => warn!(
-                                    "Failed to persist clarification intent projection for tool call {}: {}",
-                                    call.id, error
-                                ),
-                            }
-                        }
-                    }
-                    all_results.push(tool_result)
-                }
-                Err(error) => all_results.push(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: format!("Error: internal tool execution failed: {error}").to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                )),
-            }
-            call_index += 1;
-            if exec_ctx.cancellation_token.is_cancelled() {
-                cancelled = true;
-                unprocessed_start = Some(call_index);
-            } else if clarification_applied {
-                unprocessed_start = Some(call_index);
-                break;
-            }
-        }
-
-        if let Some(start) = unprocessed_start {
-            for call in remaining_calls.iter().skip(start) {
-                let message = if cancelled {
-                    "Error: Cancelled by user"
-                } else {
-                    "Skipped because a user clarification changed the run objective; the model must reconsider this action."
-                };
-                all_results.push(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: message.to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                ));
-            }
-        }
-        if stateful_executed {
-            let reload_started = std::time::Instant::now();
-            match exec_ctx.state.load_working_context().await {
-                Ok(()) => {
-                    if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                        objective.set_task(
-                            exec_ctx.state.active_task.as_ref(),
-                            crate::agent::objective::ObjectiveSource::TaskUpdated,
-                        );
-                    }
-                }
-                Err(error) => warn!(
-                    "Failed to refresh working context after stateful tool execution: {}",
-                    error
-                ),
-            }
-            tracing::Span::current().record(
-                "state_reload_ms",
-                reload_started.elapsed().as_millis() as u64,
-            );
-        }
-        let next_state = super::tool_calls::store_all_tool_results(
-            config,
-            &Arc::from(all_results.into_boxed_slice()),
-            context,
-            exec_ctx,
+    // Plan the batch into ordered waves. Calls inside a wave never conflict on a
+    // file and run concurrently; waves (and execution barriers) run in order.
+    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
+    let accesses = config
+        .tool_registry
+        .file_access_batch(
+            remaining_calls
+                .iter()
+                .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
+                .collect(),
+            cwd,
         )
-        .await?;
-        if cancelled {
-            return Ok(ExecutionState::Cancelled);
-        }
-        return Ok(next_state);
-    }
-
-    tracing::Span::current().record("execution_mode", "parallel");
+        .await;
+    let call_infos: Vec<CallInfo> = remaining_calls
+        .iter()
+        .zip(accesses)
+        .map(|(call, access)| CallInfo {
+            class: config
+                .tool_registry
+                .find(&call.function.name)
+                .map(|tool| tool.execution_class())
+                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe),
+            access,
+        })
+        .collect();
+    let waves = plan_waves(&call_infos);
+    let span = tracing::Span::current();
+    span.record("wave_count", waves.len() as u64);
+    span.record(
+        "serialized_calls",
+        serialized_call_count(&call_infos, &waves) as u64,
+    );
     debug!(
-        "Executing {} tool calls in parallel for session {}",
+        "Executing {} tool calls in {} wave(s) for session {}",
         remaining_calls.len(),
+        waves.len(),
         exec_ctx.session_id
     );
 
-    // Wrap each individual tool future with a per-call cancel race.
-    //
-    // When the cancel signal fires, each future resolves immediately with a
-    // synthetic error result rather than waiting for the underlying work to
-    // finish. This lets `join_all` complete quickly on cancellation without
-    // leaving orphaned `tool_use` blocks in history.
-    //
-    // We reborrow `exec_ctx` as a plain `&ExecutionContext` (immutable) so it
-    // can be shared across all futures — `execute_tool_call` only needs `&`.
-    let exec_ctx_ref: &ExecutionContext = exec_ctx;
-    let mut futures = Vec::with_capacity(remaining_calls.len());
-    for call in remaining_calls.iter() {
-        let per_call_cancel = exec_ctx_ref.cancellation_token.clone();
-        let call = call.clone();
-        futures.push(async move {
-            tokio::select! {
-                result = super::tool_calls::execute_tool_call(
-                    config, &call, exec_ctx_ref, bridge,
-                ) => result,
-                _ = per_call_cancel.cancelled() => {
-                    // Produce a synthetic cancelled result so history stays valid.
-                    Ok(ToolResult::new(
-                        call.id.clone(),
-                        vec![querymt::chat::ToolResultPart::Text { text: "Error: Cancelled by user".to_string() }],
-                        true,
-                        Some(call.function.name.clone()),
-                        Some(call.function.arguments.clone()),
-                    ))
+    // One slot per call so results can be stored in the model's original order
+    // regardless of the order in which waves completed.
+    let mut slots: Vec<Option<ToolResult>> = (0..remaining_calls.len()).map(|_| None).collect();
+    let mut cancelled = already_cancelled;
+    let mut stateful_executed = false;
+    let mut clarification_applied = false;
+
+    for wave in &waves {
+        if cancelled || clarification_applied {
+            break;
+        }
+        if exec_ctx.cancellation_token.is_cancelled() {
+            cancelled = true;
+            break;
+        }
+
+        let first = wave[0];
+        let class = call_infos[first].class;
+        if class == crate::tools::ToolExecutionClass::ParallelSafe {
+            // Reborrow immutably so the context can be shared across the wave;
+            // `execute_tool_call` only needs `&ExecutionContext`.
+            let exec_ctx_ref: &ExecutionContext = exec_ctx;
+            let futures = wave.iter().map(|&index| {
+                let call = &remaining_calls[index];
+                async move {
+                    (
+                        index,
+                        run_tool_call(config, call, exec_ctx_ref, bridge).await,
+                    )
                 }
+            });
+            for (index, result) in join_all(futures).await {
+                slots[index] = Some(result);
             }
-        });
+        } else {
+            let call = &remaining_calls[first];
+            stateful_executed |= class == crate::tools::ToolExecutionClass::SerialStateful;
+            let result = run_tool_call(config, call, exec_ctx, bridge).await;
+            if class == crate::tools::ToolExecutionClass::ClarificationBoundary && !result.is_error
+            {
+                clarification_applied = apply_clarification_answer(exec_ctx, call, &result).await;
+            }
+            slots[first] = Some(result);
+        }
+
+        if exec_ctx.cancellation_token.is_cancelled() {
+            cancelled = true;
+        }
     }
 
-    let tool_results = join_all(futures).await;
+    let was_cancelled = cancelled || exec_ctx.cancellation_token.is_cancelled();
 
-    let was_cancelled = already_cancelled || exec_ctx.cancellation_token.is_cancelled();
-
+    // Exactly one result per call: calls that never started (cancellation, or
+    // a clarification that changed the run objective) get a synthetic result.
     let mut all_results = (**results).to_vec();
-    for (result, call) in tool_results.into_iter().zip(remaining_calls.iter()) {
-        match result {
-            Ok(tool_result) => all_results.push(tool_result),
-            Err(e) => {
-                warn!(
-                    "Tool call {} ({}) failed with infrastructure error: {}. \
-                     Synthesizing error result to maintain tool_use/tool_result invariant.",
-                    call.id, call.function.name, e
-                );
-                all_results.push(ToolResult::new(
-                    call.id.clone(),
-                    vec![querymt::chat::ToolResultPart::Text {
-                        text: format!("Error: internal tool execution failed: {}", e).to_string(),
-                    }],
-                    true,
-                    Some(call.function.name.clone()),
-                    Some(call.function.arguments.clone()),
-                ));
+    all_results.reserve(remaining_calls.len());
+    for (call, slot) in remaining_calls.iter().zip(slots) {
+        all_results.push(slot.unwrap_or_else(|| {
+            let message = if was_cancelled {
+                "Error: Cancelled by user"
+            } else {
+                "Skipped because a user clarification changed the run objective; the model must reconsider this action."
+            };
+            synthetic_error_result(call, message)
+        }));
+    }
+
+    if stateful_executed {
+        let reload_started = std::time::Instant::now();
+        match exec_ctx.state.load_working_context().await {
+            Ok(()) => {
+                if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                    objective.set_task(
+                        exec_ctx.state.active_task.as_ref(),
+                        crate::agent::objective::ObjectiveSource::TaskUpdated,
+                    );
+                }
             }
+            Err(error) => warn!(
+                "Failed to refresh working context after stateful tool execution: {}",
+                error
+            ),
         }
+        tracing::Span::current().record(
+            "state_reload_ms",
+            reload_started.elapsed().as_millis() as u64,
+        );
     }
 
     debug!(
@@ -1968,6 +1815,110 @@ pub(super) async fn transition_processing_tool_calls(
     }
 
     Ok(next_state)
+}
+
+/// Build a synthetic error result for a call that did not produce one.
+fn synthetic_error_result(call: &MiddlewareToolCall, text: &str) -> ToolResult {
+    ToolResult::new(
+        call.id.clone(),
+        vec![querymt::chat::ToolResultPart::Text {
+            text: text.to_string(),
+        }],
+        true,
+        Some(call.function.name.clone()),
+        Some(call.function.arguments.clone()),
+    )
+}
+
+/// Run one tool call, racing it against the cancellation token.
+///
+/// A cancelled call resolves immediately with a synthetic `"Cancelled by user"`
+/// result, and an infrastructure error becomes an error result, so the
+/// `tool_use` → `tool_result` history invariant always holds.
+async fn run_tool_call(
+    config: &AgentConfig,
+    call: &MiddlewareToolCall,
+    exec_ctx: &ExecutionContext,
+    bridge: Option<&ClientBridgeSender>,
+) -> ToolResult {
+    let cancel = exec_ctx.cancellation_token.clone();
+    tokio::select! {
+        result = super::tool_calls::execute_tool_call(config, call, exec_ctx, bridge) => {
+            match result {
+                Ok(tool_result) => tool_result,
+                Err(error) => {
+                    warn!(
+                        "Tool call {} ({}) failed with infrastructure error: {}. \
+                         Synthesizing error result to maintain tool_use/tool_result invariant.",
+                        call.id, call.function.name, error
+                    );
+                    synthetic_error_result(
+                        call,
+                        &format!("Error: internal tool execution failed: {error}"),
+                    )
+                }
+            }
+        }
+        _ = cancel.cancelled() => synthetic_error_result(call, "Error: Cancelled by user"),
+    }
+}
+
+/// Fold a successful clarification answer into the run objective.
+///
+/// Returns `true` when the answer was persisted and applied, which means the
+/// rest of the batch must be skipped so the model can reconsider.
+async fn apply_clarification_answer(
+    exec_ctx: &mut ExecutionContext,
+    call: &MiddlewareToolCall,
+    tool_result: &ToolResult,
+) -> bool {
+    let clarification = tool_result
+        .content
+        .iter()
+        .filter_map(|block| block.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if clarification.trim().is_empty() {
+        return false;
+    }
+
+    let summary = exec_ctx
+        .state
+        .current_intent
+        .as_ref()
+        .map(|intent| intent.summary.clone())
+        .unwrap_or_else(|| clarification.clone());
+    match exec_ctx
+        .state
+        .update_intent_projection(
+            summary,
+            None,
+            Some(clarification.clone()),
+            "clarification_answer".to_string(),
+            Some(call.id.clone()),
+        )
+        .await
+    {
+        Ok(_) => {
+            if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                objective.amend(crate::agent::objective::ObjectiveDirective {
+                    text: clarification,
+                    source: crate::agent::objective::ObjectiveSource::ClarificationAnswer,
+                    source_ref: Some(call.id.clone()),
+                    accepted_at_ms: None,
+                    application_boundary: Some("clarification_boundary".to_string()),
+                });
+            }
+            true
+        }
+        Err(error) => {
+            warn!(
+                "Failed to persist clarification intent projection for tool call {}: {}",
+                call.id, error
+            );
+            false
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════

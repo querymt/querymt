@@ -285,6 +285,67 @@ async fn with_profiles_reuses_root_agent_for_active_profile() -> Result<()> {
     Ok(())
 }
 
+async fn agent_with_middleware_entries(
+    entries: Vec<crate::config::MiddlewareEntry>,
+) -> Result<Agent> {
+    let storage =
+        Arc::new(crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into()).await?);
+    let (registry, _temp_dir) = empty_plugin_registry()?;
+    Agent::single()
+        .provider("openai", "gpt-4o-mini")
+        .infra(AgentInfra {
+            plugin_registry: Arc::new(registry),
+            storage: Some(storage),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        })
+        .middleware_from_config(entries)
+        .build()
+        .await
+}
+
+fn guard_entry(config: serde_json::Value) -> crate::config::MiddlewareEntry {
+    crate::config::MiddlewareEntry {
+        middleware_type: "parallel_edit_guard".to_string(),
+        config,
+    }
+}
+
+fn guard_count(agent: &Agent) -> usize {
+    agent
+        .handle()
+        .config
+        .middleware_drivers
+        .iter()
+        .filter(|d| d.name() == "ParallelEditGuard")
+        .count()
+}
+
+#[tokio::test]
+async fn default_agent_has_parallel_edit_guard() -> Result<()> {
+    let agent = test_agent().await?;
+    assert_eq!(guard_count(&agent), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_deny_guard_config_yields_single_instance() -> Result<()> {
+    let agent =
+        agent_with_middleware_entries(vec![guard_entry(serde_json::json!({"mode": "deny"}))])
+            .await?;
+    assert_eq!(guard_count(&agent), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn disabled_guard_config_yields_no_guard() -> Result<()> {
+    let agent =
+        agent_with_middleware_entries(vec![guard_entry(serde_json::json!({"enabled": false}))])
+            .await?;
+    assert_eq!(guard_count(&agent), 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn programmatic_builder_does_not_discover_slash_commands_by_default() -> Result<()> {
     let agent = test_agent().await?;

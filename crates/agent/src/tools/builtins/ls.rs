@@ -5,7 +5,9 @@ use querymt::chat::{FunctionTool, Tool as ChatTool, ToolResultPart};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, path_or_cwd_read_access,
+};
 
 pub struct ListTool;
 
@@ -240,6 +242,12 @@ impl Tool for ListTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        // Deliberately unfiltered: `ls` also lists directories, so a write of an
+        // ignored file can still create a visible parent directory.
+        path_or_cwd_read_access(args, "path", cwd)
+    }
+
     fn truncation_hint(&self) -> Option<&'static str> {
         Some(
             "TIP: The file list was truncated. Use search_text or more specific \
@@ -298,6 +306,20 @@ impl Tool for ListTool {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_path_or_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = ListTool::new();
+        assert_eq!(
+            tool.file_access(&serde_json::json!({}), Some(&root)),
+            Access::reads([root.clone()])
+        );
+        assert_eq!(tool.file_access(&serde_json::json!({}), None), Access::None);
+    }
+
     use super::*;
 
     fn first_text_block(blocks: Vec<querymt::chat::ToolResultPart>) -> String {

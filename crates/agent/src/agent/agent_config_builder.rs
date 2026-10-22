@@ -197,6 +197,10 @@ impl AgentConfigBuilder {
             self.event_journal.clone(),
             self.event_fanout.clone(),
         ));
+        let tool_registry = Arc::new(self.tool_registry);
+        for driver in &self.middleware_drivers {
+            driver.bind_agent(&tool_registry, &event_sink);
+        }
         AgentConfig {
             provider: self.provider,
             storage: self.storage,
@@ -208,7 +212,7 @@ impl AgentConfigBuilder {
             default_mode: self.default_mode,
             default_reasoning_effort: Arc::new(ArcSwap::from_pointee(None)),
             tool_config: self.tool_config,
-            tool_registry: self.tool_registry,
+            tool_registry,
             middleware_drivers: self.middleware_drivers,
             auth_methods: self.auth_methods,
             max_steps: self.max_steps,
@@ -652,6 +656,16 @@ impl AgentConfigBuilder {
     /// Mutably push a middleware driver (for quorum helper function).
     pub fn push_middleware(&mut self, driver: Arc<dyn MiddlewareDriver>) {
         self.middleware_drivers.push(driver);
+    }
+
+    /// Whether a middleware driver with this `name()` was already pushed.
+    pub fn has_middleware_named(&self, name: &str) -> bool {
+        self.middleware_drivers.iter().any(|d| d.name() == name)
+    }
+
+    /// Clone of the current tool registry.
+    pub fn tool_registry_snapshot(&self) -> ToolRegistry {
+        self.tool_registry.clone()
     }
 
     /// Borrow the `SessionProvider` (used by `DelegationMiddleware` constructor in quorum).

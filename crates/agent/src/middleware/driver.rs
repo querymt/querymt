@@ -61,6 +61,17 @@ pub trait MiddlewareDriver: Send + Sync {
         Ok(state)
     }
 
+    /// Called once the agent's final tool registry and event sink are known
+    /// (when the `AgentConfig` is assembled). Tool-aware middleware should use
+    /// this registry so they agree with the scheduler about what tools exist;
+    /// middleware that surfaces warnings to UIs can keep the sink.
+    fn bind_agent(
+        &self,
+        _registry: &Arc<crate::tools::ToolRegistry>,
+        _events: &Arc<crate::event_sink::EventSink>,
+    ) {
+    }
+
     /// Reset internal state (called at start of execute_cycle)
     fn reset(&self);
 

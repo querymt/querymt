@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use querymt::chat::{FunctionTool, Tool, ToolResultPart};
 use serde_json::{Value, json};
 
-use crate::tools::{CapabilityRequirement, Tool as ToolTrait, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError,
+    single_path_write_access,
+};
 
 pub struct DeleteFileTool;
 
@@ -49,6 +52,17 @@ impl ToolTrait for DeleteFileTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        // Deleting a directory removes everything beneath it, so it is declared
+        // as a tree write (read filters cannot exclude it).
+        match single_path_write_access(args, "path", cwd) {
+            FileAccess::Paths { writes, .. } if writes.len() == 1 && writes[0].is_dir() => {
+                FileAccess::writes_tree(writes[0].clone())
+            }
+            other => other,
+        }
     }
 
     async fn call(
@@ -119,6 +133,40 @@ mod tests {
     use crate::tools::AgentToolContext;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_access_writes_normalised_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp_dir.path()).unwrap();
+        fs::write(root.join("a.md"), "x").unwrap();
+        let tool = DeleteFileTool::new();
+
+        let access = tool.file_access(&json!({"path": "./a.md"}), Some(&root));
+
+        assert_eq!(access, FileAccess::writes([root.join("a.md")]));
+    }
+
+    #[test]
+    fn file_access_declares_directories_as_tree_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = dunce::canonicalize(temp_dir.path()).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+
+        let access = DeleteFileTool::new().file_access(&json!({"path": "docs"}), Some(&root));
+        assert_eq!(access, FileAccess::writes_tree(root.join("docs")));
+    }
+
+    #[test]
+    fn file_access_is_none_for_invalid_args() {
+        let tool = DeleteFileTool::new();
+        let cwd = std::env::temp_dir();
+
+        assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
+        assert_eq!(
+            tool.file_access(&json!({"path": true}), Some(&cwd)),
+            FileAccess::None
+        );
+    }
 
     #[tokio::test]
     async fn test_delete_file() {

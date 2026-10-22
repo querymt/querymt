@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use crate::index::symbol_index::SymbolIndex;
-use crate::tools::{CapabilityRequirement, Tool, ToolContext, ToolError};
+use crate::tools::{
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, path_list_read_access,
+};
 
 use super::helpers::{parse_paths, resolve_root, resolve_target};
 
@@ -90,6 +92,10 @@ impl Tool for FindSymbolReferencesTool {
 
     fn required_capabilities(&self) -> &'static [CapabilityRequirement] {
         &[CapabilityRequirement::Filesystem]
+    }
+
+    fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
+        path_list_read_access(args, "paths", cwd)
     }
 
     async fn call(
@@ -310,6 +316,19 @@ fn format_matches(matches: &[RefMatch], root: &Path, truncated: bool) -> String 
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::FileAccess as Access;
+
+    #[test]
+    fn file_access_reads_search_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let access = FindSymbolReferencesTool::new().file_access(
+            &serde_json::json!({"paths": ["src"], "symbols": ["x"]}),
+            Some(&root),
+        );
+        assert_eq!(access, Access::reads([root.join("src")]));
+    }
+
     use super::*;
     use crate::tools::AgentToolContext;
     use tempfile::TempDir;

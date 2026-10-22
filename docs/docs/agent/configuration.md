@@ -277,6 +277,11 @@ type = "dedup_check"
 threshold = 0.85
 min_lines = 10
 
+# Parallel edit guard (on in "warn" mode by default; "deny" rejects redundant same-file edits)
+[[middleware]]
+type = "parallel_edit_guard"
+mode = "deny"
+
 # Custom middleware (if registered)
 [[middleware]]
 type = "custom_middleware"

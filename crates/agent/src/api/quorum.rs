@@ -1352,6 +1352,8 @@ fn apply_middleware_from_config(
         )
         .with_agent_registry(builder.agent_registry())
         .with_execution_policy(ephemeral_policy)
+        // Tool-aware middleware (e.g. parallel_edit_guard) read the registry.
+        .with_tool_registry(builder.tool_registry_snapshot())
         .build(),
     );
 
@@ -1378,6 +1380,20 @@ fn apply_middleware_from_config(
         log::info!("Auto-enabling ContextMiddleware for compaction");
         builder.push_middleware(Arc::new(crate::middleware::ContextMiddleware::new(
             crate::middleware::ContextConfig::default().auto_compact(true),
+        )));
+    }
+
+    // The guard goes last (same order as `AgentBuilder::build`) so its note is
+    // the final message of the request, after any compaction.
+    // Auto-add ParallelEditGuard (warn mode) unless a driver or any
+    // `parallel_edit_guard` entry (including a disabled one) is present.
+    let has_guard_entry = entries
+        .iter()
+        .any(|e| e.middleware_type == "parallel_edit_guard");
+    if !has_guard_entry && !builder.has_middleware_named("ParallelEditGuard") {
+        builder.push_middleware(Arc::new(crate::middleware::ParallelEditGuard::new(
+            builder.tool_registry_snapshot(),
+            crate::middleware::ParallelEditMode::Warn,
         )));
     }
 }
