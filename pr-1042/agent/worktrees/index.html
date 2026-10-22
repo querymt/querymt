@@ -1742,6 +1742,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../event-ordering/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Event Ordering
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../export/" class="md-nav__link">
         
   
@@ -2027,6 +2054,16 @@ extension (additive; upstream protocol types are unchanged):</p>
   launches.</strong> Active submodules are detected from gitlink entries in HEAD or
   the index (no <code>.gitmodules</code> required); sparse checkouts and unborn HEAD or
   unresolved conflicts fail as before.</li>
+<li><strong>Sparse repositories are rejected in commit mode too.</strong> <code>gix</code> 0.90 copies
+  the sparse-checkout patterns of the main worktree into every new linked
+  worktree, so a sparse main checkout would silently produce sparse children
+  whose absent paths look like deletions. Creation fails before anything is
+  made when <code>core.sparseCheckout</code> is enabled or <code>info/sparse-checkout</code> exists,
+  and a child that nevertheless turns out sparse is rolled back. Supporting
+  sparse checkouts is a possible follow-up.</li>
+<li><strong><code>worktree.useRelativePaths</code> is refused until the repository already uses
+  <code>extensions.relativeWorktrees</code>.</strong> Otherwise <code>gix</code> would permanently upgrade
+  the shared repository format (Git 2.48+ only), even if creation then fails.</li>
 <li><strong>External filter processes are unsupported and rejected via effective
   attributes.</strong> Attribute resolution follows Git semantics — nested
   <code>.gitattributes</code> files, <code>$GIT_DIR/info/attributes</code>, global attribute
@@ -2046,11 +2083,15 @@ extension (additive; upstream protocol types are unchanged):</p>
 <h2 id="native-git-operations">Native Git operations</h2>
 <p>All built-in workspace operations — baseline capture, branch and ref
 administration, linked-worktree creation/inventory/removal, status, and
-ancestry checks — are implemented natively in Rust on top of <code>gix</code> (0.89).
+ancestry checks — are implemented natively in Rust on top of <code>gix</code> (0.90).
 No Git executable is required, installed, or invoked for these built-in
 operations; QueryMT needs a supported toolchain (Rust ≥ 1.88) but nothing
 else. Building the <code>WorkspaceService</code> takes a <code>GixRepoOps</code> value (see the
 example above); there is no Git-CLI configuration knob.</p>
+<p>Replacement refs (<code>refs/replace/*</code>, grafts) are ignored by every handle
+(<code>core.useReplaceRefs=false</code>): <code>gix</code> enables them by default and <code>isolated()</code>
+cannot switch them off through the environment, and a replacement could make
+unpreserved commits look reachable from a kept ref during removal checks.</p>
 <p>Repository-opening policy: administration operations (branches, refs,
 worktree registration/inventory/removal, ancestry) open the canonical Git
 <strong>common directory</strong> resolved from the source at creation time and stored on
