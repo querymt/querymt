@@ -3645,6 +3645,7 @@ mod tests {
         assert_eq!(published, vec![1, 2, 3, 4]);
     }
 
+    #[cfg(feature = "remote")]
     #[tokio::test]
     async fn relayed_sequence_gap_is_fetched_from_host_before_later_events() {
         use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};
