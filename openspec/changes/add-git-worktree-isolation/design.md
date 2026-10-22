@@ -120,6 +120,8 @@ Provide typed create/list/status/result/remove agent operations, with ACP extens
 - `recover <id>` completes interrupted provisioning/removal intent without launching an actor or binding a new owner.
 - `remove <id>` refuses non-archived owners, active activity leases, dirty/untracked/ignored content, and unintegrated result commits without retained recovery references. First version has no force-delete operation. Committed results can be preserved by retaining their branch/ref; report exactly what remains.
 
+Implement every management operation once, as typed requests/responses and a typed error enum (the existing private `Worktree*Request`/`Worktree*Response` shapes in `handle/ext_worktree_ops.rs` become the public contract). ACP `querymt/worktree/*` extensions, native `/worktree` dispatch, the simple-API facade, and Python bindings are thin adapters: they parse their own input, call the core directly, and render its result. Native `/worktree` stops round-tripping through JSON ext dispatch. Existing ext JSON shapes stay byte-compatible. Alternative: separate simple-API calls straight into `WorkspaceService` would duplicate ownership, lease, and owner-binding rules and let surfaces drift.
+
 Removal of a clean baseline-only inactive checkout is allowed with explicit user intent, retaining any baseline refs still referenced by records. For changed commits require proof they are preserved in a retained result ref or an accepted target history, not merely a clean index. Never delete externally owned worktrees. Observe branch targets during preservation checks and delete branches only if their targets are unchanged, using Repository::delete_local_branches_if_unchanged() or an equivalent expected-target transaction. Repository-admin locks only coordinate QueryMT; ordinary Git processes may update refs. On a changed target, retain the branch and report the race or refuse/retry after revalidation, never unconditionally delete it. Repeat this rule during interrupted-removal recovery. Session listing uses repository/project identity for associated sessions while preserving legacy grouping for unassociated local sessions.
 
 ### 7. Recovery, concurrency, and snapshot provenance
@@ -129,6 +131,37 @@ Worktree creation and SQLite writes cannot form one atomic transaction. Persist 
 The current undo implementation scans child-session patches and restores them through the caller's worktree (`crates/agent/src/agent/undo.rs:126`, `crates/agent/src/agent/undo.rs:217`). Retain child aggregation only for children demonstrably sharing the same snapshot workspace/cwd; exclude isolated children from parent undo aggregation. Parent undo must not fail merely because isolated children exist, nor restore their patches into the parent. Validate all selected patches before any restoration, including the fallback snapshot path, rather than warning and continuing after a provenance mismatch.
 
 Attach workspace identity to new snapshot/revert provenance (or equivalent durable association) and validate it before undo. Legacy snapshots remain usable in the original local session, but copied parent snapshots in a newly isolated fork are context-only. Resume of the same workspace keeps its existing snapshot path and history. Before removing a managed workspace, require its owner to be inactive; retained snapshot metadata is not justification to delete unsaved files. Undo modifies files through the existing backend, not project branch refs or HEAD.
+
+### 8. Configuration and embedding surfaces
+
+Isolation stays an explicit per-request decision. Configuration only enables the capability and tunes how a requested worktree is built. An omitted request is local on every surface, whether or not the service is enabled. Comparable tools follow the same model: Claude Code isolates only via `--worktree` (config picks the base ref) and Codex offers a per-chat Local/Worktree choice (config picks root and retention); neither has a global "always isolate" default.
+
+Rejected alternative: a configured default execution mode. It would silently change the documented meaning of option-less ACP `session/new`; break non-repository, unsupported-layout, and remote-filesystem folders that work locally today, because requested isolation fails closed; move execution away from the folder an editor opened; convert inherited delegation to isolated with manual result integration; and accumulate durable checkouts in loops. An agent-object default limited to the simple API was rejected for the same reasons plus divergence from ACP.
+
+Settings (`config/workspace.rs`, `deny_unknown_fields`):
+
+```toml
+[agent.workspace]            # or [quorum.workspace]
+enabled = true               # default false: no service, behavior unchanged
+# storage_root = "~/.qmt/worktrees"   # default per decision 1; relative paths resolve against the config file
+# baseline = "commit"        # "commit" (default) | "current_working_tree"
+```
+
+`baseline` is a default for top-level isolated creation only. It applies when a request asks for isolation without its own baseline/`includeLocalChanges` choice, and never decides whether to isolate. An explicit request value always wins; an explicit `base_ref` together with a `current_working_tree` default resolves to the explicit ref in commit mode rather than failing, while an explicit `current_working_tree` request with `base_ref` keeps its existing validation error. Delegate baselines are unaffected (always the parent's working contents per decision 4); forks keep their existing rules. Requests and responses disclose the resolved baseline mode.
+
+The settings live beside, not inside, `ExecutionPolicy`: like the snapshot backend they are consumed at build time and do not survive into `RuntimeExecutionPolicy`. Settings are top-level per agent/quorum; no per-delegate service configuration exists.
+
+Per-delegate isolation (`[[delegates]] isolation = "inherit" | "isolated" | "shared"`, default `inherit`) is the configured analogue of the delegate tool's `isolation` argument, comparable to Claude Code's `isolation: worktree` subagent frontmatter. Precedence: an explicit non-`inherit` tool-call value, then the target delegate's configured value, then inheritance from the parent's execution mode (decision 2). The resolved policy and its source (request, delegate configuration, or inherited) are persisted and disclosed. It is enforceable configuration, not a prompt instruction. A delegate configured `isolated` while the quorum's service is disabled fails at build time; `shared` remains subject to existing shared-execution disclosure.
+
+Service construction: one helper builds `WorkspaceService` from settings plus the resolved storage backend. It requires `StorageBackend::workspace_repository()`, resolves and creates `storage_root`, validates local-filesystem placement, and fails at build on invalid settings. A quorum builds exactly one `Arc<WorkspaceService>` and attaches it to the planner and every delegate `AgentConfigBuilder`, because delegate handles materialize isolated sessions themselves and allocator/registry/lock ownership must be single. Embedders may still inject a prebuilt service, which takes precedence over settings.
+
+Simple API: `AgentBuilder`/`QuorumBuilder` gain `.workspace(settings)` and `.workspace_service(arc)`; TOML builder translation threads the sections through. Sessions gain `SessionOptions` (`local`, `worktree`, optional name, `base_ref`, `include_local_changes`) passed by `chat_session_with`, which emits the existing `_meta.querymt.sessionWorkspace` so the materializer remains the single parser. `AgentSession::workspace()` returns the binding. `Agent::worktrees()` returns the typed operations facade from decision 6, or `None` without a service.
+
+Python: `Agent.single(..., worktrees=bool|dict)` enables the service (`storage_root`, `baseline` keys; unknown keys raise `ValueError`); `Agent.from_config` picks up TOML. `chat_session(workspace="local"|"worktree", name=None, base_ref=None, include_local_changes=None)`; `AgentSession.workspace` returns a dict or `None`; `agent.worktrees` exposes async `create/list/status/result/publish/archive/remove/recover` returning dicts, and is `None` when disabled. Failures raise `WorktreeError(RuntimeError)` carrying the typed `.code`.
+
+Typed error codes: the core error enum maps to stable codes (for example `workspace_service_unavailable`, `isolation_unsupported_layout`, `workspace_missing`, `conflicting_cwd`, `owner_conflict`, `workspace_archived`, `removal_refused`, `invalid_options`) placed in ACP error data, native command responses, simple-API errors, and Python exceptions. Human-readable diagnostics are unchanged. This mirrors Claude Code's machine-readable `startup_failure_reason`.
+
+Discoverability: the agent advertises workspace support and the default baseline in additive initialize/capability `_meta`, so clients can offer an explicit Local/Worktree choice at creation. The `session/new` response discloses the resolved binding (execution cwd, workspace ID, branch, baseline mode/OID, excluded content). The `/worktree create` then load-the-returned-session flow remains the documented route for clients that cannot send creation metadata.
 
 ### As-built: native repository operations (section 10)
 
@@ -152,13 +185,25 @@ Bumped to gix 0.90 / gix-worktree 0.59. No API migration was needed for the call
 - [Result integration is manual initially] -> Supply an immutable baseline-relative result and clear recovery paths; defer unsafe automatic merging.
 - [Existing undo omits some file classes] -> Preserve and document its semantics; regression-test supported paths and Git metadata exclusion rather than claiming complete Git rollback.
 - [Concurrent ACP/session-update work] -> Keep integration additive, coordinate event payload changes during implementation, and do not overwrite the other change's dispatch/lifecycle logic.
+- [Checkout accumulation from programmatic creation] -> Isolation is never implicit; document archive/remove for Python/API loops. Automatic cleanup remains deferred.
+- [Divergent service instances in a quorum] -> Construct one service per quorum and share the same instance with the planner and every delegate; test instance identity.
+- [MCP with isolated sessions] -> Fixed-root MCP configs are still rejected per decision 5; configuration enabling the service does not relax that.
+
+## Deferred follow-ups (inspired by comparable tools, not in this change)
+
+- Opt-in `.worktreeinclude` copying of matching ignored files (shared by Claude Code and Codex), with secret-handling disclosure; conflicts with the current ignored-file non-goal and needs its own change.
+- Automatic removal of clean, unchanged delegate worktrees under the existing conservative removal checks.
+- Retention limit or age sweep that never touches dirty or unpublished work.
+- Worktree setup/teardown hooks (dependency install, non-Git VCS).
+- Guards rejecting edits/commands that target the source checkout from an isolated session, without claiming sandbox confinement.
+- Explicit per-task isolation for scheduled tasks.
 - [Worktree is not a sandbox] -> Surface effective roots and reject mismatched integrations; OS-level confinement is a separate feature.
 
 ## Migration Plan
 
 1. Upgrade and check the native gix dependency and typed operations boundary, preserving snapshot behavior; add migration/regression coverage before replacing the CLI implementation.
 2. Add nullable workspace associations and new registry/provenance tables through existing SQLite migrations. Existing sessions stay local; no checkout is moved.
-3. Add disabled-by-default top-level isolation configuration and explicit creation/delegation options. Enabling isolation for a session changes the inherited delegate default to isolated execution.
+3. Add disabled-by-default workspace configuration (TOML, simple API, Python) and explicit creation/delegation options. Enabling the service never isolates an option-less session; explicitly isolating a session changes its inherited delegate default to isolated execution. Example configurations ship commented-out blocks; embedded profiles stay unchanged.
 4. Ship local lifecycle, baseline capture, session routing, undo compatibility, and delegate results together; do not advertise isolation before all workspace consumers resolve correctly.
 5. Validate existing databases and old snapshot histories, then test crash recovery and concurrent sessions in temporary real Git repositories.
 6. Roll back behavior by disabling new isolated creation while preserving worktrees, private refs, and registry data for manual recovery. Do not drop tables or delete workspaces as part of rollback; older binaries must not be used to resume isolated sessions without understanding their persisted execution paths.

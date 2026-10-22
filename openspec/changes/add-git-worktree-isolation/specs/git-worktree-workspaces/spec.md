@@ -28,6 +28,10 @@ The system SHALL support local and isolated-worktree session creation without re
 - **WHEN** a caller creates a session without enabling isolation
 - **THEN** the existing local cwd behavior remains available without creating a managed worktree
 
+#### Scenario: Enabled service without a request stays local
+- **WHEN** the workspace service is enabled by configuration and a session is created through ACP, the simple API, or Python without isolation options
+- **THEN** the session executes locally in the requested cwd and no managed worktree is created
+
 ### Requirement: Durable workspace identity and binding
 The system SHALL persist workspace ownership, repository/project identity, execution path, baseline, branch, and relative cwd independently of conversation contents. Load and resume SHALL use the persisted isolated workspace binding and SHALL reject conflicting cwd requests or unavailable workspaces rather than silently falling back. A managed workspace SHALL NOT be attached to a second writable session.
 
@@ -188,6 +192,64 @@ Built-in workspace lifecycle, baseline/result capture, inspection, and recovery 
 #### Scenario: Inherited Git environment overrides
 - **WHEN** the process inherits Git directory, worktree, or index overrides pointing at another repository
 - **THEN** built-in operations use only the resolved workspace repository and leave the other repository unchanged
+
+### Requirement: Opt-in workspace configuration surfaces
+The workspace service SHALL be enableable through single-agent and quorum TOML, the simple API, and Python, and SHALL be disabled by default. Configuration SHALL NOT make option-less sessions isolated. A quorum SHALL share one service across planner and delegates. Invalid settings SHALL fail when the agent is built.
+
+#### Scenario: Disabled by default
+- **WHEN** an agent is built from a configuration without a workspace section
+- **THEN** no workspace service exists, `/worktree` is not advertised, and embedded profiles behave as before
+
+#### Scenario: Quorum enabled from TOML
+- **WHEN** a quorum configuration enables the workspace section
+- **THEN** the planner and every delegate use the same workspace service instance
+- **AND** isolated delegation succeeds without custom Rust wiring
+
+#### Scenario: Invalid workspace settings
+- **WHEN** settings contain unknown keys, an unusable storage root, or a storage backend without a workspace repository
+- **THEN** building the agent fails with an actionable error before any session starts
+
+#### Scenario: Python isolated session
+- **WHEN** a Python caller enables worktrees and requests a worktree session
+- **THEN** the session executes in a managed checkout under the storage root and exposes its binding
+- **AND** the source checkout is unchanged
+
+### Requirement: Configured default baseline
+Configuration MAY set a default baseline mode for top-level isolated creation. It SHALL apply only when isolation is explicitly requested without a baseline choice, SHALL NOT decide whether to isolate, and SHALL be overridden by explicit request values. The resolved baseline mode SHALL be disclosed.
+
+#### Scenario: Default current-working-tree baseline
+- **WHEN** the configured baseline is current-working-tree and a worktree session is requested without a baseline choice
+- **THEN** the checkout includes the source's validated working contents and the response discloses that mode
+
+#### Scenario: Explicit request overrides the default
+- **WHEN** a request specifies a commit baseline or an explicit ref while the configured default is current-working-tree
+- **THEN** the session starts from that commit and reports that local changes are excluded
+
+### Requirement: One operation core for all management surfaces
+Creation, listing, status, result, publication, archival, removal, and recovery SHALL share one typed implementation across ACP extensions, native `/worktree`, the simple API, and Python. Failures SHALL carry stable machine-readable error codes on every surface alongside human-readable diagnostics.
+
+#### Scenario: Equivalent results across surfaces
+- **WHEN** the same create or result operation is performed through native `/worktree` and through Python
+- **THEN** both report equivalent session, workspace, path, branch, baseline, and review fields
+
+#### Scenario: Service unavailable
+- **WHEN** worktree operations are invoked on an agent without a workspace service
+- **THEN** ACP and native surfaces return the `workspace_service_unavailable` code and Python reports `agent.worktrees` as unavailable
+
+#### Scenario: Typed failure code
+- **WHEN** an isolated request fails because of an unsupported repository layout or a missing workspace
+- **THEN** ACP error data and the Python exception expose the corresponding stable code
+
+### Requirement: Workspace capability discoverability
+Agents with a workspace service SHALL advertise workspace support and the default baseline through additive capability metadata. Isolated session creation SHALL disclose the resolved execution cwd, workspace identity, branch, baseline mode, and excluded content.
+
+#### Scenario: Client offers an explicit choice
+- **WHEN** a client initializes against an agent with the service enabled
+- **THEN** the capability metadata indicates that worktree sessions can be requested
+
+#### Scenario: Binding disclosed at creation
+- **WHEN** a worktree session is created through ACP
+- **THEN** the creation response identifies the execution cwd, workspace ID, branch, and baseline mode
 
 ### Requirement: Requested isolation fails closed
 When a usable repository/base, supported repository layout, durable storage, or local filesystem execution is unavailable, requested isolation SHALL fail with an actionable error before agent execution. The system SHALL NOT downgrade to shared execution. Concurrent administration SHALL prevent duplicate allocation and ownership across processes.

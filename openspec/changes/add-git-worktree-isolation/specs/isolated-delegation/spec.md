@@ -22,6 +22,25 @@ The system SHALL support explicit isolated delegation from local or isolated par
 - **WHEN** permitted policy explicitly selects shared execution
 - **THEN** the operation is labeled shared rather than isolated
 
+### Requirement: Per-delegate configured isolation
+Quorum configuration SHALL allow each delegate to declare `inherit`, `isolated`, or `shared` isolation, defaulting to `inherit`. Resolution SHALL apply an explicit non-inherit tool-call value first, then the delegate's configured value, then inheritance from the parent. The resolved policy and its source SHALL be persisted and disclosed.
+
+#### Scenario: Configured isolated delegate of a local parent
+- **WHEN** a delegate is configured `isolated` and a local parent delegates to it without an isolation argument
+- **THEN** the delegate runs in its own checkout and the disclosed source is the delegate configuration
+
+#### Scenario: Tool-call value overrides configuration
+- **WHEN** a delegate is configured `isolated` and the tool call explicitly requests `shared`
+- **THEN** the delegate shares the parent checkout, labeled as shared from the request
+
+#### Scenario: Inherit falls through to the parent
+- **WHEN** a delegate is configured `inherit` and the tool call omits isolation
+- **THEN** isolated parents isolate it and local parents share their checkout
+
+#### Scenario: Configured isolation without a service
+- **WHEN** a delegate is configured `isolated` but the quorum has no workspace service
+- **THEN** building the quorum fails with an actionable error rather than failing later at dispatch
+
 ### Requirement: Private baseline includes parent edits
 An isolated delegate SHALL start from a validated immutable baseline containing the parent's tracked working-file contents, tracked deletions, and non-ignored untracked files. It SHALL exclude ignored untracked files and disclose that exclusion. The baseline SHALL reflect working contents rather than reproduce the staging partition.
 
