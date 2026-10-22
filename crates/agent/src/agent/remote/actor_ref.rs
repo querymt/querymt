@@ -1311,6 +1311,7 @@ mod history_paging_tests {
             events: seqs
                 .into_iter()
                 .map(|seq| crate::events::AgentEvent {
+                    session_seq: 0,
                     seq,
                     timestamp: 0,
                     session_id: "s1".into(),

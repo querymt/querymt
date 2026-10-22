@@ -2479,6 +2479,7 @@ mod tests {
         let requested = storage
             .event_journal()
             .append_durable(&crate::session::projection::NewDurableEvent {
+                session_seq: None,
                 session_id: session.public_id.clone(),
                 origin: crate::events::EventOrigin::Local,
                 source_node: None,

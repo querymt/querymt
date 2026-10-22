@@ -511,6 +511,7 @@ async fn append_prompt_event(
 ) -> i64 {
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: session_id.to_string(),
             origin: EventOrigin::Local,
             source_node: None,
@@ -530,6 +531,7 @@ async fn append_prompt_event(
 async fn append_generic_event(journal: &dyn EventJournal, session_id: &str) -> i64 {
     journal
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: session_id.to_string(),
             origin: EventOrigin::Local,
             source_node: None,

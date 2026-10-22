@@ -94,6 +94,7 @@ mod tests {
         let mut rx = fanout.subscribe();
 
         let durable = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "e1".into(),
             stream_seq: 1,
             session_id: "s1".into(),
@@ -120,6 +121,7 @@ mod tests {
         let mut rx = fanout.subscribe();
 
         let ephemeral = EventEnvelope::Ephemeral(EphemeralEvent {
+            session_seq: 0,
             session_id: "s2".into(),
             timestamp: 200,
             origin: EventOrigin::Local,
@@ -148,6 +150,7 @@ mod tests {
         let mut rx2 = fanout.subscribe();
 
         fanout.publish(EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "e1".into(),
             stream_seq: 1,
             session_id: "s1".into(),
@@ -166,6 +169,7 @@ mod tests {
     async fn publish_with_no_subscribers_does_not_panic() {
         let fanout = EventFanout::new();
         fanout.publish(EventEnvelope::Ephemeral(EphemeralEvent {
+            session_seq: 0,
             session_id: "s1".into(),
             timestamp: 1,
             origin: EventOrigin::Local,

@@ -150,7 +150,6 @@ async fn maybe_update_session_intent(
 }
 
 /// Per-session actor. Each session gets its own actor with isolated state.
-#[derive(Actor)]
 pub struct SessionActor {
     // ── Shared config (read at turn start) ───────────────────────
     pub(crate) config: Arc<AgentConfig>,
@@ -189,6 +188,36 @@ pub struct SessionActor {
     // and SessionActor teardown cancel the corresponding background task.
     pub(crate) relay_forwarder_handles:
         HashMap<u64, crate::agent::remote::event_forwarder::EventForwarderHandle>,
+}
+
+impl Actor for SessionActor {
+    type Args = Self;
+    type Error = kameo::error::Infallible;
+
+    fn name() -> &'static str {
+        "SessionActor"
+    }
+
+    async fn on_start(
+        args: Self::Args,
+        _actor_ref: kameo::actor::ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
+        Ok(args)
+    }
+
+    /// Release the session's ordered event stream once everything emitted so
+    /// far is persisted, so stopped sessions do not keep a writer task alive.
+    async fn on_stop(
+        &mut self,
+        _actor_ref: kameo::actor::WeakActorRef<Self>,
+        _reason: kameo::error::ActorStopReason,
+    ) -> Result<(), Self::Error> {
+        self.config
+            .event_sink
+            .retire_session_stream(&self.session_id)
+            .await;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -410,8 +439,14 @@ impl SessionActor {
 
         let exec = self.prompt_execution(req, run_id.clone(), steering, phase_tx);
         let completion_token = self.turn_state.token.clone();
+        let event_stream = self.config.event_sink.session_stream(&self.session_id);
         tokio::spawn(async move {
-            let result = execute_prompt_detached(exec).await;
+            // The reply carries the last `session_seq` the run produced, so a
+            // transport can hold the response until its connection has
+            // delivered every update of this prompt.
+            let result = execute_prompt_detached(exec)
+                .await
+                .map(|response| crate::acp::delivery::with_event_tip(response, event_stream.tip()));
             let disposition = if completion_token.is_cancelled() {
                 RunCompletionDisposition::Cancelled
             } else if result.is_err() {
@@ -1469,8 +1504,9 @@ impl Message<crate::agent::messages::GetEventStreamSince> for SessionActor {
             .limit
             .min(crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE);
         let after_source_seq = msg.after_source_seq.map(|seq| seq.max(0));
+        // Raw `stream_seq` order: the receiver's cursor must strictly increase.
         let events = journal
-            .load_session_stream(&self.session_id, after_source_seq, Some(limit))
+            .load_session_page(&self.session_id, after_source_seq, Some(limit))
             .await
             .map_err(|e| AgentError::Internal(e.to_string()))?;
         let latest_source_seq = journal
@@ -3433,6 +3469,7 @@ mod tests {
             Some("peer-a".into()),
             "node-a".into(),
             3,
+            None,
         )
         .await
         .unwrap();
@@ -3519,6 +3556,173 @@ mod tests {
             }
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A relayed event whose host `session_seq` skips a number makes the relay
+    /// fetch the missing durable events from the host before delivering the
+    /// later one, so the attached node publishes the host's order.
+    #[cfg(feature = "remote")]
+    /// A loss at the very end of a burst has no later event to reveal it; the
+    /// host forwarder's lag signal makes the relay fetch the durable tail.
+    #[tokio::test]
+    async fn relay_lag_signal_fetches_missed_tail_without_a_later_event() {
+        use crate::agent::remote::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
+
+        let host = ActorFixture::new().await;
+        for _ in 0..4 {
+            host.config
+                .emit_event_persisted(
+                    "test-session",
+                    crate::events::AgentEventKind::SessionCreated,
+                )
+                .await
+                .unwrap();
+        }
+        let host_events: Vec<crate::events::AgentEvent> = host
+            .config
+            .event_sink
+            .journal()
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+
+        let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap();
+        let journal = storage.event_journal();
+        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        let mut rx = fanout.subscribe();
+        let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
+        let relay = EventRelayActor::new(
+            sink,
+            "test-session".to_string(),
+            "peer-a".to_string(),
+            Some("node-a".to_string()),
+            None,
+        )
+        .with_gap_source(crate::agent::remote::SessionActorRef::from(
+            host.actor_ref.clone(),
+        ));
+        let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
+
+        // Only the first two events arrive; 3 and 4 were dropped by the host
+        // forwarder and nothing later follows.
+        for event in &host_events[..2] {
+            relay_ref
+                .tell(RelayedEvent {
+                    event: event.clone(),
+                })
+                .await
+                .unwrap();
+        }
+        relay_ref
+            .tell(RelayLagged {
+                session_id: "test-session".to_string(),
+                skipped: 2,
+            })
+            .await
+            .unwrap();
+        // A signal for another session is ignored.
+        relay_ref
+            .tell(RelayLagged {
+                session_id: "other-session".to_string(),
+                skipped: 9,
+            })
+            .await
+            .unwrap();
+
+        let mut published = Vec::new();
+        for _ in 0..4 {
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("missed tail is fetched")
+                .unwrap();
+            published.push(envelope.session_seq());
+        }
+        assert_eq!(published, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn relayed_sequence_gap_is_fetched_from_host_before_later_events() {
+        use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};
+
+        let host = ActorFixture::new().await;
+        for _ in 0..4 {
+            host.config
+                .emit_event_persisted(
+                    "test-session",
+                    crate::events::AgentEventKind::SessionCreated,
+                )
+                .await
+                .unwrap();
+        }
+        let host_events: Vec<crate::events::AgentEvent> = host
+            .config
+            .event_sink
+            .journal()
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(
+            host_events
+                .iter()
+                .map(|e| e.session_seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+
+        let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap();
+        let journal = storage.event_journal();
+        let fanout = Arc::new(crate::event_fanout::EventFanout::new());
+        let mut rx = fanout.subscribe();
+        let sink = Arc::new(crate::event_sink::EventSink::new(journal.clone(), fanout));
+        let relay = EventRelayActor::new(
+            sink,
+            "test-session".to_string(),
+            "peer-a".to_string(),
+            Some("node-a".to_string()),
+            None,
+        )
+        .with_gap_source(crate::agent::remote::SessionActorRef::from(
+            host.actor_ref.clone(),
+        ));
+        let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
+
+        // Events 2 and 3 never reach the relay; 4 arrives after 1.
+        for event in [&host_events[0], &host_events[3]] {
+            relay_ref
+                .tell(RelayedEvent {
+                    event: event.clone(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut published = Vec::new();
+        for _ in 0..4 {
+            let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("relayed event")
+                .unwrap();
+            published.push(envelope.session_seq());
+        }
+        assert_eq!(published, vec![1, 2, 3, 4], "host order, gap filled");
+        let stored: Vec<i64> = journal
+            .load_session_stream("test-session", None, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.session_seq)
+            .collect();
+        assert_eq!(stored, vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]

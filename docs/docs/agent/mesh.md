@@ -1082,7 +1082,7 @@ Sessions and prompts carry no per-connection client bridge. `session/prompt` wor
 
 **All nodes must be upgraded together.** This contract adds new session messages to the mesh wire protocol. Mixed-version meshes are not supported, and there is no fallback to bridge-based or auto-granted behavior. If the local agent attaches to or prompts a session on a node that lacks the interaction messages, the operation fails with `RemoteNodeUpgradeRequired`. Clients receive it as an ACP error (code `-32603`) with `data.category = "remote_upgrade_required"` and `data.node` set to the outdated node. Upgrade that node, and every other node in the mesh, to the same agent version. Rolling back means reverting the agent on all nodes together.
 
-**Prompt response ordering.** The response to `session/prompt` is not guaranteed to follow every `session/update` for that prompt. For remote sessions in particular, relayed updates can arrive after the response. Clients that need all updates should keep reading after the response. Strict ordering is tracked in the `ordered-session-events` change.
+**Prompt response ordering.** The response to `session/prompt` is sent only after the requesting connection has delivered every `session/update` the prompt produced, for remote-hosted sessions as well as local ones. The wait is bounded: if the relay disconnects, the connection lags and cannot fully recover, or the 30 second safety limit passes, the response is sent anyway and a warning is logged. See [Event ordering across nodes](#event-ordering-across-nodes).
 
 ### Session Persistence
 
@@ -1742,3 +1742,7 @@ cargo run --features remote -- --mesh=/ip4/192.168.1.100/tcp/9000
 - [Delegation](delegation.md) - Remote delegation patterns
 - [Examples](examples.md) - Mesh networking examples
 - [API Reference](api_reference.md) - Mesh API types and functions
+
+## Event ordering across nodes
+
+Relayed session events keep the host's per-session `session_seq`. The relay fetches durable events it missed from the host when it sees a gap, or when the host's forwarder reports that it fell behind (which also covers a loss at the end of a burst). A `session/prompt` response on an attached node follows the updates relayed for that prompt. All nodes of a mesh must run a version that supports this. See [Event Ordering](event-ordering.md).

@@ -472,6 +472,254 @@ async fn deliver_stdio_permission(
     }
 }
 
+/// Outcome of handling one live event in the stdio forwarder.
+enum StdioFlow {
+    /// The event was delivered to the client.
+    Forwarded,
+    /// The event produced nothing for this client.
+    Skipped,
+    /// The bridge is gone; stop forwarding.
+    Stop,
+}
+
+/// Handle one live event: elicitations, permissions and session updates.
+async fn forward_stdio_event(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    bridge: &ClientBridgeSender,
+    forwarded_elicitations: &Arc<Mutex<HashSet<(String, String)>>>,
+    translator: &Arc<Mutex<AcpLiveEventTranslator>>,
+    event: &crate::events::EventEnvelope,
+) -> StdioFlow {
+    if let crate::events::AgentEventKind::ElicitationRequested {
+        elicitation_id,
+        session_id,
+        message,
+        requested_schema,
+        source,
+    } = event.kind()
+    {
+        let key = (session_id.clone(), elicitation_id.clone());
+        let should_forward = forwarded_elicitations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key);
+        if should_forward {
+            let agent = agent.clone();
+            let bridge = bridge.clone();
+            let elicitation_id = elicitation_id.clone();
+            let session_id = session_id.clone();
+            let message = message.clone();
+            let requested_schema = requested_schema.clone();
+            let source = source.clone();
+            tokio::spawn(async move {
+                let response = match bridge
+                    .elicit(
+                        elicitation_id.clone(),
+                        session_id.clone(),
+                        message,
+                        requested_schema,
+                        source,
+                    )
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        log::warn!(
+                            "Native ACP elicitation {} ended without a user response: {}",
+                            elicitation_id,
+                            err
+                        );
+                        // Transport failure is not user cancellation. Leave the
+                        // shared waiter available for an authorized re-delivery.
+                        return;
+                    }
+                };
+
+                match crate::elicitation::resolve_elicitation_from_connection(
+                    &agent,
+                    Some(&session_id),
+                    &elicitation_id,
+                    "stdio",
+                    response,
+                )
+                .await
+                {
+                    Ok(crate::elicitation::ElicitationResolution::Resolved) => {
+                        log::debug!(
+                            "Elicitation response delivered: session_id={} elicitation_id={}",
+                            session_id,
+                            elicitation_id
+                        );
+                    }
+                    Ok(resolution) => {
+                        log::warn!(
+                            "Elicitation response not applied ({:?}): session_id={} elicitation_id={}",
+                            resolution,
+                            session_id,
+                            elicitation_id
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "Elicitation response rejected: session_id={} elicitation_id={} error={}",
+                            session_id,
+                            elicitation_id,
+                            error.message
+                        );
+                    }
+                }
+            });
+        }
+        return StdioFlow::Skipped;
+    }
+
+    if let crate::events::AgentEventKind::PermissionRequested {
+        permission_id,
+        request: Some(request),
+        ..
+    } = event.kind()
+    {
+        let session_id = event.session_id().to_string();
+        let key = (session_id.clone(), permission_id.clone());
+        let should_forward = forwarded_elicitations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key);
+        if should_forward {
+            let agent = agent.clone();
+            let bridge = bridge.clone();
+            let permission_id = permission_id.clone();
+            let request = request.clone();
+            tokio::spawn(async move {
+                deliver_stdio_permission(agent, bridge, session_id, permission_id, request).await;
+            });
+        }
+        return StdioFlow::Skipped;
+    }
+
+    let input_state = input_state_from_event(event);
+    let (delegation_update, session_updates) = {
+        let mut translator = translator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let delegation_update = translator.translate_delegation_update(event);
+        let session_updates = if delegation_update.is_none() {
+            translator.translate_updates(event)
+        } else {
+            Vec::new()
+        };
+        (delegation_update, session_updates)
+    };
+    let result = if let crate::events::AgentEventKind::DelegateModelsChanged { revision } =
+        event.kind()
+    {
+        let notification =
+            crate::acp::shared::delegate_models_changed_notification(event.session_id(), *revision);
+        let params = serde_json::value::RawValue::from_string(notification["params"].to_string())
+            .map(Arc::from)
+            .map_err(acp::Error::into_internal_error);
+        match params {
+            Ok(params) => {
+                bridge
+                    .notify_ext(crate::acp::protocol::ExtNotification::new(
+                        crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED,
+                        params,
+                    ))
+                    .await
+            }
+            Err(error) => Err(error),
+        }
+    } else if let Some(update) = input_state {
+        let params = serde_json::value::RawValue::from_string(
+            serde_json::to_string(&update).unwrap_or_else(|_| "null".to_string()),
+        )
+        .map(Arc::from)
+        .map_err(acp::Error::into_internal_error);
+        match params {
+            Ok(params) => {
+                bridge
+                    .notify_ext(crate::acp::protocol::ExtNotification::new(
+                        QMT_NOTIFICATION_INPUT_STATE,
+                        params,
+                    ))
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    } else if let Some(update) = delegation_update {
+        let params = serde_json::value::RawValue::from_string(
+            serde_json::to_string(&update).unwrap_or_else(|_| "null".to_string()),
+        )
+        .map(Arc::from)
+        .map_err(acp::Error::into_internal_error);
+        match params {
+            Ok(params) => {
+                bridge
+                    .notify_ext(crate::acp::protocol::ExtNotification::new(
+                        QMT_NOTIFICATION_DELEGATION_UPDATE,
+                        params,
+                    ))
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    } else if !session_updates.is_empty() {
+        let mut result = Ok(());
+        for update in session_updates {
+            result = bridge
+                .notify(SessionNotification::new(
+                    SessionId::from(event.session_id().to_owned()),
+                    update,
+                ))
+                .await;
+            if result.is_err() {
+                break;
+            }
+        }
+        result
+    } else {
+        return StdioFlow::Skipped;
+    };
+
+    if let Err(e) = result {
+        log::info!("Bridge closed, stopping forwarder: {}", e);
+        return StdioFlow::Stop;
+    }
+
+    StdioFlow::Forwarded
+}
+
+/// Handle admitted events in order. The delivered position of each event
+/// advances once it was handled.
+async fn forward_stdio_admitted(
+    agent: &Arc<crate::agent::LocalAgentHandle>,
+    bridge: &ClientBridgeSender,
+    forwarded_elicitations: &Arc<Mutex<HashSet<(String, String)>>>,
+    translator: &Arc<Mutex<AcpLiveEventTranslator>>,
+    batch: Vec<crate::acp::delivery::Admitted>,
+    forwarded_count: &mut u64,
+) -> bool {
+    for admitted in batch {
+        let crate::acp::delivery::Admitted { event, guard } = admitted;
+        let flow =
+            forward_stdio_event(agent, bridge, forwarded_elicitations, translator, &event).await;
+        drop(guard);
+        match flow {
+            StdioFlow::Stop => return false,
+            StdioFlow::Skipped => {}
+            StdioFlow::Forwarded => {
+                *forwarded_count += 1;
+                log::trace!(
+                    "Forwarded event {} for session {}",
+                    forwarded_count,
+                    event.session_id()
+                );
+            }
+        }
+    }
+    true
+}
+
 /// Forwards events from EventFanout to the client bridge.
 ///
 /// This task subscribes to the EventFanout and forwards all events to the ACP client
@@ -487,6 +735,7 @@ fn spawn_event_bridge_forwarder(
     agent: Arc<crate::agent::LocalAgentHandle>,
     forwarded_elicitations: Arc<Mutex<HashSet<(String, String)>>>,
     translator: Arc<Mutex<AcpLiveEventTranslator>>,
+    delivery: Arc<crate::acp::delivery::ConnectionDelivery>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -498,225 +747,23 @@ fn spawn_event_bridge_forwarder(
         loop {
             match events.recv().await {
                 Ok(event) => {
-                    if let crate::events::AgentEventKind::ElicitationRequested {
-                        elicitation_id,
-                        session_id,
-                        message,
-                        requested_schema,
-                        source,
-                    } = event.kind()
+                    let batch = delivery.admit(event).await;
+                    if !forward_stdio_admitted(
+                        &agent,
+                        &bridge,
+                        &forwarded_elicitations,
+                        &translator,
+                        batch,
+                        &mut forwarded_count,
+                    )
+                    .await
                     {
-                        let key = (session_id.clone(), elicitation_id.clone());
-                        let should_forward = forwarded_elicitations
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(key);
-                        if should_forward {
-                            let agent = agent.clone();
-                            let bridge = bridge.clone();
-                            let elicitation_id = elicitation_id.clone();
-                            let session_id = session_id.clone();
-                            let message = message.clone();
-                            let requested_schema = requested_schema.clone();
-                            let source = source.clone();
-                            tokio::spawn(async move {
-                                let response = match bridge
-                                    .elicit(
-                                        elicitation_id.clone(),
-                                        session_id.clone(),
-                                        message,
-                                        requested_schema,
-                                        source,
-                                    )
-                                    .await
-                                {
-                                    Ok(response) => response,
-                                    Err(err) => {
-                                        log::warn!(
-                                            "Native ACP elicitation {} ended without a user response: {}",
-                                            elicitation_id,
-                                            err
-                                        );
-                                        // Transport failure is not user cancellation. Leave the
-                                        // shared waiter available for an authorized re-delivery.
-                                        return;
-                                    }
-                                };
-
-                                match crate::elicitation::resolve_elicitation_from_connection(
-                                    &agent,
-                                    Some(&session_id),
-                                    &elicitation_id,
-                                    "stdio",
-                                    response,
-                                )
-                                .await
-                                {
-                                    Ok(crate::elicitation::ElicitationResolution::Resolved) => {
-                                        log::debug!(
-                                            "Elicitation response delivered: session_id={} elicitation_id={}",
-                                            session_id,
-                                            elicitation_id
-                                        );
-                                    }
-                                    Ok(resolution) => {
-                                        log::warn!(
-                                            "Elicitation response not applied ({:?}): session_id={} elicitation_id={}",
-                                            resolution,
-                                            session_id,
-                                            elicitation_id
-                                        );
-                                    }
-                                    Err(error) => {
-                                        log::warn!(
-                                            "Elicitation response rejected: session_id={} elicitation_id={} error={}",
-                                            session_id,
-                                            elicitation_id,
-                                            error.message
-                                        );
-                                    }
-                                }
-                            });
-                        }
-                        continue;
-                    }
-
-                    if let crate::events::AgentEventKind::PermissionRequested {
-                        permission_id,
-                        request: Some(request),
-                        ..
-                    } = event.kind()
-                    {
-                        let session_id = event.session_id().to_string();
-                        let key = (session_id.clone(), permission_id.clone());
-                        let should_forward = forwarded_elicitations
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(key);
-                        if should_forward {
-                            let agent = agent.clone();
-                            let bridge = bridge.clone();
-                            let permission_id = permission_id.clone();
-                            let request = request.clone();
-                            tokio::spawn(async move {
-                                deliver_stdio_permission(
-                                    agent,
-                                    bridge,
-                                    session_id,
-                                    permission_id,
-                                    request,
-                                )
-                                .await;
-                            });
-                        }
-                        continue;
-                    }
-
-                    let input_state = input_state_from_event(&event);
-                    let (delegation_update, session_updates) = {
-                        let mut translator = translator
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let delegation_update = translator.translate_delegation_update(&event);
-                        let session_updates = if delegation_update.is_none() {
-                            translator.translate_updates(&event)
-                        } else {
-                            Vec::new()
-                        };
-                        (delegation_update, session_updates)
-                    };
-                    let result =
-                        if let crate::events::AgentEventKind::DelegateModelsChanged { revision } =
-                            event.kind()
-                        {
-                            let notification =
-                                crate::acp::shared::delegate_models_changed_notification(
-                                    event.session_id(),
-                                    *revision,
-                                );
-                            let params = serde_json::value::RawValue::from_string(
-                                notification["params"].to_string(),
-                            )
-                            .map(Arc::from)
-                            .map_err(acp::Error::into_internal_error);
-                            match params {
-                            Ok(params) => bridge
-                                .notify_ext(crate::acp::protocol::ExtNotification::new(
-                                    crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED,
-                                    params,
-                                ))
-                                .await,
-                            Err(error) => Err(error),
-                        }
-                        } else if let Some(update) = input_state {
-                            let params = serde_json::value::RawValue::from_string(
-                                serde_json::to_string(&update)
-                                    .unwrap_or_else(|_| "null".to_string()),
-                            )
-                            .map(Arc::from)
-                            .map_err(acp::Error::into_internal_error);
-                            match params {
-                                Ok(params) => {
-                                    bridge
-                                        .notify_ext(crate::acp::protocol::ExtNotification::new(
-                                            QMT_NOTIFICATION_INPUT_STATE,
-                                            params,
-                                        ))
-                                        .await
-                                }
-                                Err(err) => Err(err),
-                            }
-                        } else if let Some(update) = delegation_update {
-                            let params = serde_json::value::RawValue::from_string(
-                                serde_json::to_string(&update)
-                                    .unwrap_or_else(|_| "null".to_string()),
-                            )
-                            .map(Arc::from)
-                            .map_err(acp::Error::into_internal_error);
-                            match params {
-                                Ok(params) => {
-                                    bridge
-                                        .notify_ext(crate::acp::protocol::ExtNotification::new(
-                                            QMT_NOTIFICATION_DELEGATION_UPDATE,
-                                            params,
-                                        ))
-                                        .await
-                                }
-                                Err(err) => Err(err),
-                            }
-                        } else if !session_updates.is_empty() {
-                            let mut result = Ok(());
-                            for update in session_updates {
-                                result = bridge
-                                    .notify(SessionNotification::new(
-                                        SessionId::from(event.session_id().to_owned()),
-                                        update,
-                                    ))
-                                    .await;
-                                if result.is_err() {
-                                    break;
-                                }
-                            }
-                            result
-                        } else {
-                            continue;
-                        };
-
-                    if let Err(e) = result {
                         log::info!(
-                            "Bridge closed after forwarding {} events, stopping forwarder: {}",
-                            forwarded_count,
-                            e
+                            "Bridge closed after forwarding {} events, stopping forwarder",
+                            forwarded_count
                         );
                         break;
                     }
-
-                    forwarded_count += 1;
-                    log::trace!(
-                        "Forwarded event {} for session {}",
-                        forwarded_count,
-                        event.session_id()
-                    );
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     log::info!(
@@ -731,7 +778,22 @@ fn spawn_event_bridge_forwarder(
                         skipped,
                         forwarded_count
                     );
-                    // Continue receiving - broadcast channel drops old messages
+                    // Recover the missed durable events from the journal and
+                    // keep forwarding; one lag must not drop session updates.
+                    let recovered = delivery.recover_after_lag().await;
+                    let keep_going = forward_stdio_admitted(
+                        &agent,
+                        &bridge,
+                        &forwarded_elicitations,
+                        &translator,
+                        recovered,
+                        &mut forwarded_count,
+                    )
+                    .await;
+                    delivery.finish_lag_recovery();
+                    if !keep_going {
+                        break;
+                    }
                 }
             }
         }
@@ -804,6 +866,12 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         crate::acp::shared::AcpSessionLoadPreferences::default(),
     ));
     let session_load_forwarders = session_load.clone();
+    // One delivery position per connection, shared by every forwarder: it
+    // recovers lag/gaps from the journal and backs the prompt-response wait.
+    let delivery = crate::acp::delivery::ConnectionDelivery::new(
+        Some(agent.config.event_sink.journal().clone()),
+        tokio_util::sync::CancellationToken::new(),
+    );
     for (idx, event_fanout) in event_sources.into_iter().enumerate() {
         let handle = spawn_event_bridge_forwarder(
             event_fanout,
@@ -811,6 +879,7 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
             agent.clone(),
             forwarded_elicitations.clone(),
             translator.clone(),
+            delivery.clone(),
             shutdown_tx.clone(),
         );
         forwarder_handles.push(handle);
@@ -884,13 +953,38 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
         .on_receive_request(
             {
                 let agent = agent.clone();
+                let delivery = delivery.clone();
+                let bridge_sender = bridge_sender.clone();
                 async move |req: PromptRequest, responder, cx| {
                     // Prompt execution can run for a long time, so spawn it and
                     // return immediately to keep ACP able to process cancel.
                     let agent = agent.clone();
-                    cx.spawn(
-                        async move { responder.respond_with_result(agent.prompt(req).await) },
-                    )?;
+                    let delivery = delivery.clone();
+                    let bridge_sender = bridge_sender.clone();
+                    let session_id = req.session_id.to_string();
+                    cx.spawn(async move {
+                        let result = agent.prompt(req).await.map(|mut response| {
+                            let tip = crate::acp::delivery::take_event_tip(&mut response);
+                            (response, tip)
+                        });
+                        let result = match result {
+                            Ok((response, Some(tip))) => {
+                                // Hold the response until this connection has
+                                // delivered the prompt's updates, then flush the
+                                // bridge so they are on the wire first.
+                                delivery.hold_response_for_updates(&session_id, tip).await;
+                                if let Err(error) = bridge_sender.flush().await {
+                                    log::warn!(
+                                        "session {session_id}: bridge flush before prompt response failed: {error:?}"
+                                    );
+                                }
+                                Ok(response)
+                            }
+                            Ok((response, None)) => Ok(response),
+                            Err(error) => Err(error),
+                        };
+                        responder.respond_with_result(result)
+                    })?;
                     Ok(())
                 }
             },
@@ -1118,6 +1212,7 @@ mod stdio_tests {
 
     fn assert_structured_user_message_replay(prompt_part: crate::model::MessagePart) {
         let event = crate::events::AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 1,
             session_id: "s-1".to_string(),
@@ -1205,6 +1300,10 @@ mod stdio_tests {
             fixture.handle.clone(),
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            crate::acp::delivery::ConnectionDelivery::new(
+                Some(fixture.config.event_sink.journal().clone()),
+                tokio_util::sync::CancellationToken::new(),
+            ),
             shutdown_tx,
         );
         tokio::task::yield_now().await;
@@ -1214,6 +1313,7 @@ mod stdio_tests {
             .fanout()
             .publish(crate::events::EventEnvelope::Durable(
                 crate::events::DurableEvent {
+                    session_seq: 0,
                     event_id: "assignment-event".into(),
                     stream_seq: 1,
                     session_id: "parent".into(),
@@ -1255,6 +1355,10 @@ mod stdio_tests {
             fixture.handle.clone(),
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            crate::acp::delivery::ConnectionDelivery::new(
+                Some(fixture.config.event_sink.journal().clone()),
+                tokio_util::sync::CancellationToken::new(),
+            ),
             shutdown_tx,
         );
         tokio::task::yield_now().await;
@@ -1264,6 +1368,7 @@ mod stdio_tests {
             .fanout()
             .publish(crate::events::EventEnvelope::Durable(
                 crate::events::DurableEvent {
+                    session_seq: 0,
                     event_id: "input-event".into(),
                     stream_seq: 1,
                     session_id: "parent".into(),
@@ -1309,6 +1414,10 @@ mod stdio_tests {
             fixture.handle.clone(),
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            crate::acp::delivery::ConnectionDelivery::new(
+                Some(fixture.config.event_sink.journal().clone()),
+                tokio_util::sync::CancellationToken::new(),
+            ),
             shutdown_tx,
         );
         tokio::task::yield_now().await;
@@ -1336,6 +1445,7 @@ mod stdio_tests {
             .fanout()
             .publish(crate::events::EventEnvelope::Durable(
                 crate::events::DurableEvent {
+                    session_seq: 0,
                     event_id: "event-1".into(),
                     stream_seq: 1,
                     session_id: "parent-1".into(),
@@ -1452,6 +1562,91 @@ mod stdio_tests {
         assert_eq!(cancelled.content, None);
     }
 
+    /// A stdio forwarder that falls behind the live buffer recovers the missed
+    /// durable updates from the journal and keeps forwarding, in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stdio_forwarder_recovers_from_broadcast_lag_in_order() {
+        const TOTAL: usize = 1_400; // more than the 1024-slot live buffer
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = "stdio-lagging-session";
+        // A one-slot bridge that nobody drains yet stalls the forwarder while
+        // the session keeps producing events.
+        let (bridge_tx, mut bridge_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = mpsc::channel(1);
+        let forwarder = spawn_event_bridge_forwarder(
+            fixture.config.event_sink.fanout().clone(),
+            ClientBridgeSender::new(bridge_tx),
+            fixture.handle.clone(),
+            Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            crate::acp::delivery::ConnectionDelivery::new(
+                Some(fixture.config.event_sink.journal().clone()),
+                tokio_util::sync::CancellationToken::new(),
+            ),
+            shutdown_tx,
+        );
+        tokio::task::yield_now().await;
+
+        let stream = fixture.config.event_sink.session_stream(session_id);
+        let stored = |content: String| crate::events::AgentEventKind::AssistantMessageStored {
+            content,
+            thinking: None,
+            reasoning_parts: Vec::new(),
+            message_id: None,
+        };
+        for n in 1..=TOTAL {
+            stream.emit(stored(format!("m{n}")));
+        }
+        timeout(Duration::from_secs(20), async {
+            while stream.published_tip() < TOTAL as i64 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("all events published");
+
+        async fn next_text(
+            bridge_rx: &mut mpsc::Receiver<ClientBridgeMessage>,
+            wait: Duration,
+        ) -> Option<String> {
+            loop {
+                let message = timeout(wait, bridge_rx.recv()).await.ok()??;
+                if let ClientBridgeMessage::Notification(notification) = message {
+                    let json = serde_json::to_value(&notification).unwrap();
+                    return json["update"]["content"]["text"]
+                        .as_str()
+                        .map(str::to_string);
+                }
+            }
+        }
+
+        let mut received = Vec::with_capacity(TOTAL);
+        while received.len() < TOTAL {
+            let text = next_text(&mut bridge_rx, Duration::from_secs(20))
+                .await
+                .unwrap_or_else(|| {
+                    panic!(
+                        "forwarder stopped after {} of {TOTAL} updates",
+                        received.len()
+                    )
+                });
+            received.push(text);
+        }
+        let expected: Vec<String> = (1..=TOTAL).map(|n| format!("m{n}")).collect();
+        assert_eq!(
+            received, expected,
+            "every durable update arrives once, in production order"
+        );
+
+        stream.emit(stored("after-lag".to_string()));
+        let text = next_text(&mut bridge_rx, Duration::from_secs(5))
+            .await
+            .expect("update after recovery");
+        assert_eq!(text, "after-lag");
+        forwarder.abort();
+    }
+
     #[tokio::test]
     async fn stdio_transport_error_keeps_original_elicitation_waiter_pending() {
         let fixture = crate::test_utils::TestAgent::new().await;
@@ -1474,6 +1669,10 @@ mod stdio_tests {
             fixture.handle.clone(),
             Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             Arc::new(std::sync::Mutex::new(AcpLiveEventTranslator::new())),
+            crate::acp::delivery::ConnectionDelivery::new(
+                Some(fixture.config.event_sink.journal().clone()),
+                tokio_util::sync::CancellationToken::new(),
+            ),
             shutdown_tx,
         );
         tokio::task::yield_now().await;
@@ -1483,6 +1682,7 @@ mod stdio_tests {
             .fanout()
             .publish(crate::events::EventEnvelope::Ephemeral(
                 crate::events::EphemeralEvent {
+                    session_seq: 0,
                     session_id: session_id.to_string(),
                     timestamp: 0,
                     origin: crate::events::EventOrigin::Local,

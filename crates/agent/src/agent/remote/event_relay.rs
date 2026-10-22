@@ -45,6 +45,12 @@ pub struct EventRelayActor {
     disconnect_tx: Option<mpsc::UnboundedSender<RemoteSessionDisconnect>>,
     /// Running count of RelayedEvent messages received — used for loop diagnosis.
     received: u64,
+    /// Host session used to fetch events the live relay missed.
+    gap_source: Option<super::actor_ref::SessionActorRef>,
+    /// Highest host `session_seq` relayed so far (`0` = none yet).
+    last_session_seq: i64,
+    /// Highest host journal sequence persisted through this relay (`0` = unknown).
+    last_source_seq: i64,
 }
 
 impl Actor for EventRelayActor {
@@ -109,7 +115,112 @@ impl EventRelayActor {
             relay_actor_id: None,
             disconnect_tx,
             received: 0,
+            gap_source: None,
+            last_session_seq: 0,
+            last_source_seq: 0,
         }
+    }
+
+    /// Let the relay fetch events it missed from the host when it sees a gap
+    /// in the host's `session_seq`.
+    pub(crate) fn with_gap_source(
+        mut self,
+        session_ref: super::actor_ref::SessionActorRef,
+    ) -> Self {
+        self.gap_source = Some(session_ref);
+        self
+    }
+
+    /// If `session_seq` skips numbers, fetch the missing durable events from
+    /// the host before the new event is delivered. Missed ephemeral events are
+    /// not recoverable (the journal does not hold them).
+    async fn recover_gap(&mut self, session_seq: i64) {
+        if session_seq <= 0
+            || self.last_session_seq <= 0
+            || session_seq <= self.last_session_seq + 1
+        {
+            return;
+        }
+        self.recover_from_host(Some(session_seq)).await;
+    }
+
+    /// Fetch everything durable the host has beyond what this relay has
+    /// persisted. Used when the host reports it dropped events: the loss may
+    /// be at the very end of a burst, with no later event to reveal it.
+    async fn recover_tail(&mut self) {
+        self.recover_from_host(None).await;
+    }
+
+    async fn recover_from_host(&mut self, received: Option<i64>) {
+        let (Some(session_ref), Some(node_id)) = (&self.gap_source, &self.remote_node_id) else {
+            return;
+        };
+        let mut after = self.last_source_seq;
+        if after <= 0 {
+            after = self
+                .event_sink
+                .journal()
+                .latest_source_seq(&self.session_id, node_id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(0);
+        }
+        match super::event_backfill::recover_source_gap(
+            &self.event_sink,
+            session_ref,
+            &self.session_id,
+            node_id,
+            &self.source_label,
+            after,
+        )
+        .await
+        {
+            Ok(tip) => self.last_source_seq = self.last_source_seq.max(tip),
+            Err(error) => tracing::warn!(
+                target: "remote::event_relay",
+                source = %self.source_label,
+                session_id = %self.session_id,
+                expected = self.last_session_seq + 1,
+                received = ?received,
+                %error,
+                "failed to recover relayed sequence gap from host"
+            ),
+        }
+    }
+}
+
+/// Sent by the host's `EventForwarder` when it fell behind the host fanout and
+/// dropped `skipped` events.
+///
+/// The relay cannot notice a loss at the end of a burst by itself (it detects
+/// gaps only when a later event arrives), so the forwarder says so explicitly
+/// and the relay fetches the durable tail it is missing from the host.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RelayLagged {
+    pub session_id: String,
+    pub skipped: u64,
+}
+
+impl Message<RelayLagged> for EventRelayActor {
+    type Reply = ();
+
+    async fn handle(
+        &mut self,
+        msg: RelayLagged,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if msg.session_id != self.session_id {
+            return;
+        }
+        tracing::debug!(
+            target: "remote::event_relay",
+            source = %self.source_label,
+            session_id = %self.session_id,
+            skipped = msg.skipped,
+            "host forwarder lagged; fetching the missed durable tail"
+        );
+        self.recover_tail().await;
     }
 }
 
@@ -152,6 +263,15 @@ impl Message<RelayedEvent> for EventRelayActor {
             return;
         }
 
+        // A skipped host `session_seq` means events were lost between the host
+        // forwarder and this relay (forwarder lag, transport). Repair the
+        // durable part from the host before delivering anything later.
+        self.recover_gap(msg.event.session_seq).await;
+        self.last_session_seq = self.last_session_seq.max(msg.event.session_seq);
+        if msg.event.seq > 0 {
+            self.last_source_seq = self.last_source_seq.max(msg.event.seq);
+        }
+
         // Set remote provenance metadata.
         let mut event = msg.event;
         event.origin = EventOrigin::Remote;
@@ -173,6 +293,9 @@ impl Message<RelayedEvent> for EventRelayActor {
                 // between the live relay and reconnect backfill is a no-op.
                 let source_node_id = self.remote_node_id.clone();
                 let source_seq = (event.seq > 0).then_some(event.seq);
+                // The host's per-session sequence is kept as-is, so one cursor
+                // describes the session on every node.
+                let host_session_seq = (event.session_seq > 0).then_some(event.session_seq);
                 let result = match (source_node_id, source_seq) {
                     (Some(node_id), Some(seq)) => self
                         .event_sink
@@ -182,6 +305,7 @@ impl Message<RelayedEvent> for EventRelayActor {
                             source_node,
                             node_id,
                             seq,
+                            host_session_seq,
                         )
                         .await
                         .map(|inserted| {
@@ -217,11 +341,11 @@ impl Message<RelayedEvent> for EventRelayActor {
                 }
             }
             Durability::Ephemeral => {
-                self.event_sink.emit_ephemeral_with_origin(
+                self.event_sink.emit_ephemeral_relayed(
                     &event.session_id,
                     event.kind,
-                    EventOrigin::Remote,
                     source_node,
+                    event.session_seq,
                 );
             }
         }
@@ -268,6 +392,7 @@ mod tests {
 
         // Send a relayed durable event
         let test_event = AgentEvent {
+            session_seq: 0,
             seq: 42,
             timestamp: 1234567890,
             session_id: "test-session".to_string(),
@@ -319,6 +444,7 @@ mod tests {
         let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 7,
             timestamp: 1234567890,
             session_id: "test-session".to_string(),
@@ -373,6 +499,7 @@ mod tests {
         let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 5,
             timestamp: 1234567890,
             session_id: "test-session".to_string(),
@@ -415,6 +542,7 @@ mod tests {
         let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
 
         let test_event = AgentEvent {
+            session_seq: 0,
             seq: 99,
             timestamp: 1700000000,
             session_id: "remote-sess".to_string(),
@@ -457,6 +585,7 @@ mod tests {
         let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
 
         let ephemeral_event = AgentEvent {
+            session_seq: 0,
             seq: 0,
             timestamp: 1700000000,
             session_id: "s-eph".to_string(),
@@ -508,6 +637,7 @@ mod tests {
         let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 100,
             session_id: "s-default".to_string(),
@@ -550,6 +680,7 @@ mod tests {
         let relay_ref = <EventRelayActor as kameo::actor::Spawn>::spawn(relay);
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 100,
             session_id: "s-preserve".to_string(),
@@ -593,6 +724,7 @@ mod tests {
         relay_ref
             .tell(RelayedEvent {
                 event: AgentEvent {
+                    session_seq: 0,
                     seq: 1,
                     timestamp: 100,
                     session_id: "other-session".to_string(),

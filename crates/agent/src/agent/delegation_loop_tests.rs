@@ -458,6 +458,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                             .event_sink
                             .fanout()
                             .publish(EventEnvelope::Durable(DurableEvent {
+                                session_seq: 0,
                                 event_id: "replayed".into(),
                                 stream_seq: 1,
                                 session_id: harness.exec_ctx.session_id.clone(),

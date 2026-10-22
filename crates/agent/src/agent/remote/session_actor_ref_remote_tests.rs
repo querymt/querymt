@@ -312,6 +312,18 @@ mod session_actor_ref_remote_tests {
             response.stop_reason,
             crate::acp::protocol::StopReason::EndTurn
         );
+        // The reply carries the last session_seq of the run across the mesh,
+        // and it is exactly the host stream's tip once the run is over.
+        let mut response = response;
+        let tip = crate::acp::delivery::take_event_tip(&mut response)
+            .expect("remote prompt reply carries event_tip");
+        assert!(tip > 0);
+        // The run may emit lifecycle events after it replied, so the host's
+        // stream can be ahead of the tip but never behind it.
+        assert!(
+            tip <= host_config.event_sink.session_stream(&session_id).tip(),
+            "event_tip never exceeds the host's last session_seq"
+        );
 
         let mut saw_assistant_text = false;
         while let Ok(Ok(event)) =
@@ -334,8 +346,6 @@ mod session_actor_ref_remote_tests {
     /// updates relayed from the host reach the attached client before the
     /// prompt response, with no client bridge involved.
     #[tokio::test]
-    #[ignore = "known gap: relayed host updates trail the prompt response; \
-                owned by openspec change ordered-session-events (task 5.3)"]
     async fn remote_prompt_updates_are_sent_before_prompt_response() {
         use crate::session::backend::StorageBackend as _;
         use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
@@ -516,6 +526,10 @@ mod session_actor_ref_remote_tests {
             )),
             request_counter: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             connection_cancel: tokio_util::sync::CancellationToken::new(),
+            delivery: crate::acp::delivery::ConnectionDelivery::new(
+                None,
+                tokio_util::sync::CancellationToken::new(),
+            ),
         };
         (state, pending, rx)
     }

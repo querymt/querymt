@@ -1044,6 +1044,7 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
         .await?;
     storage
         .append_durable(&NewDurableEvent {
+            session_seq: None,
             session_id: child.public_id.clone(),
             origin: EventOrigin::Local,
             source_node: None,

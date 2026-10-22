@@ -180,24 +180,7 @@ impl ToolContext for AgentToolContext {
 
     fn emit_event(&self, kind: crate::events::AgentEventKind) {
         if let Some(ref sink) = self.event_sink {
-            use crate::events::{Durability, classify_durability};
-
-            let session_id = self.session_id.clone();
-
-            if classify_durability(&kind) == Durability::Ephemeral {
-                sink.emit_ephemeral(&session_id, kind);
-            } else {
-                let sink = sink.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = sink.emit_durable(&session_id, kind).await {
-                        log::warn!(
-                            "failed to emit durable event for session {}: {}",
-                            session_id,
-                            err
-                        );
-                    }
-                });
-            }
+            sink.session_stream(&self.session_id).emit(kind);
         }
     }
 

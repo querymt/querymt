@@ -9,6 +9,7 @@ fn main() {
     // Create a simple example trajectory with mock events
     let events = vec![
         AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 1704067200, // 2024-01-01 00:00:00 UTC
             session_id: "example-session-123".to_string(),
@@ -17,6 +18,7 @@ fn main() {
             kind: AgentEventKind::SessionCreated,
         },
         AgentEvent {
+            session_seq: 0,
             seq: 2,
             timestamp: 1704067201,
             session_id: "example-session-123".to_string(),
@@ -28,6 +30,7 @@ fn main() {
             },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 3,
             timestamp: 1704067202,
             session_id: "example-session-123".to_string(),
@@ -36,6 +39,7 @@ fn main() {
             kind: AgentEventKind::LlmRequestStart { message_count: 2 },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 4,
             timestamp: 1704067203,
             session_id: "example-session-123".to_string(),
@@ -49,6 +53,7 @@ fn main() {
             },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 5,
             timestamp: 1704067204,
             session_id: "example-session-123".to_string(),
@@ -61,6 +66,7 @@ fn main() {
             },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 6,
             timestamp: 1704067205,
             session_id: "example-session-123".to_string(),
@@ -74,6 +80,7 @@ fn main() {
             },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 7,
             timestamp: 1704067206,
             session_id: "example-session-123".to_string(),
@@ -94,6 +101,7 @@ fn main() {
             },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 8,
             timestamp: 1704067207,
             session_id: "example-session-123".to_string(),
@@ -102,6 +110,7 @@ fn main() {
             kind: AgentEventKind::LlmRequestStart { message_count: 4 },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 9,
             timestamp: 1704067208,
             session_id: "example-session-123".to_string(),
@@ -115,6 +124,7 @@ fn main() {
             },
         },
         AgentEvent {
+            session_seq: 0,
             seq: 10,
             timestamp: 1704067209,
             session_id: "example-session-123".to_string(),

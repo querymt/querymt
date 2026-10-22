@@ -198,23 +198,30 @@ impl AgentConfig {
             )
     }
 
-    /// Emits an event through the EventSink (auto-classifies as durable/ephemeral).
+    /// Emits an event through the session's ordered stream (auto-classifies as
+    /// durable/ephemeral).
     ///
-    /// For durable events this spawns an async task that persists and publishes.
-    /// For ephemeral events this publishes immediately (no persistence).
+    /// The event is numbered (`session_seq`) synchronously, before this call
+    /// returns. Durable events are then persisted in order by the session's
+    /// writer and published after they are persisted; ephemeral events publish
+    /// immediately unless an earlier durable event is still unpublished.
     pub fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
-        self.event_sink.emit_detached(session_id, kind);
+        self.event_sink.session_stream(session_id).emit(kind);
     }
 
     /// Persists and publishes a durable event, returning the `DurableEvent`.
     ///
-    /// Use this path when caller-side ordering matters (awaited).
+    /// Use this path when caller-side ordering matters (awaited). The event is
+    /// ordered with every other event of the session.
     pub async fn emit_event_persisted(
         &self,
         session_id: &str,
         kind: AgentEventKind,
     ) -> crate::session::error::SessionResult<DurableEvent> {
-        self.event_sink.emit_durable(session_id, kind).await
+        self.event_sink
+            .session_stream(session_id)
+            .emit_persisted(kind)
+            .await
     }
 
     /// Subscribes to agent events via the fanout (live stream).
@@ -574,6 +581,69 @@ mod tests {
     async fn workspace_manager_actor_returns_ref() {
         let (config, _td) = make_config().await;
         let _actor = config.workspace_manager_actor();
+    }
+
+    /// Probe for "Replay matches live order": a tool-call start and end
+    /// emitted back to back must be journaled start-before-end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn back_to_back_tool_events_keep_production_order_in_journal() {
+        const PAIRS: usize = 50;
+        let (config, _td) = make_config().await;
+
+        for i in 0..PAIRS {
+            let tool_call_id = format!("tc-{i}");
+            config.emit_event(
+                "s-probe",
+                AgentEventKind::ToolCallStart {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: "shell".into(),
+                    arguments: "{}".into(),
+                },
+            );
+            config.emit_event(
+                "s-probe",
+                AgentEventKind::ToolCallEnd {
+                    tool_call_id,
+                    tool_name: "shell".into(),
+                    is_error: false,
+                    result: "ok".into(),
+                },
+            );
+        }
+
+        let journal = config.event_sink.journal().clone();
+        let events = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let events = journal
+                    .load_session_stream("s-probe", None, None)
+                    .await
+                    .expect("load journal");
+                if events.len() >= PAIRS * 2 {
+                    break events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all durable events persisted");
+
+        let ids: Vec<String> = events
+            .iter()
+            .map(|event| match &event.kind {
+                AgentEventKind::ToolCallStart { tool_call_id, .. } => {
+                    format!("start:{tool_call_id}")
+                }
+                AgentEventKind::ToolCallEnd { tool_call_id, .. } => format!("end:{tool_call_id}"),
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        let expected: Vec<String> = (0..PAIRS)
+            .flat_map(|i| [format!("start:tc-{i}"), format!("end:tc-{i}")])
+            .collect();
+        assert_eq!(
+            ids, expected,
+            "journal replay order must equal production order"
+        );
     }
 
     #[tokio::test]

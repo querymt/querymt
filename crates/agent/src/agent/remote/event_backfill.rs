@@ -18,6 +18,56 @@ use super::actor_ref::SessionActorRef;
 /// in full.
 const BACKFILL_PAGE_SIZE: usize = crate::agent::messages::MAX_EVENT_STREAM_PAGE_SIZE;
 
+/// Fetch durable events the live relay missed (a gap in the host's
+/// `session_seq`) from the host and persist/publish them in host order.
+///
+/// Pages after `after_source_seq` up to the host tip. Unlike
+/// [`backfill_remote_events`] this never touches the remote sync checkpoint:
+/// it repairs a hole in the live stream and says nothing about whether the
+/// historical snapshot is complete. Persistence is idempotent per source
+/// identity, so overlap with the live event that revealed the gap is a no-op.
+///
+/// Returns the highest source sequence now persisted.
+pub(crate) async fn recover_source_gap(
+    event_sink: &EventSink,
+    session_ref: &SessionActorRef,
+    session_id: &str,
+    source_node_id: &str,
+    peer_label: &str,
+    after_source_seq: i64,
+) -> Result<i64, crate::error::AgentError> {
+    let mut after = after_source_seq;
+    loop {
+        let page = session_ref
+            .get_event_stream_since(Some(after), BACKFILL_PAGE_SIZE)
+            .await?;
+        let mut previous = after;
+        for event in page.events {
+            if event.seq <= previous || event.session_id != session_id {
+                return Err(crate::error::AgentError::Internal(
+                    "invalid gap recovery page".into(),
+                ));
+            }
+            previous = event.seq;
+            event_sink
+                .emit_durable_from_source(
+                    session_id,
+                    event.kind,
+                    Some(peer_label.to_string()),
+                    source_node_id.to_string(),
+                    event.seq,
+                    (event.session_seq > 0).then_some(event.session_seq),
+                )
+                .await
+                .map_err(|error| crate::error::AgentError::Internal(error.to_string()))?;
+        }
+        if previous == after || previous >= page.latest_source_seq {
+            return Ok(previous);
+        }
+        after = previous;
+    }
+}
+
 /// Backfill durable events for a freshly (re)attached remote session.
 ///
 /// Spawn-and-forget: must never block connection establishment nor fail it.
@@ -74,6 +124,7 @@ pub(crate) async fn backfill_remote_events(
                     Some(peer_label.clone()),
                     source_node_id.clone(),
                     event.seq,
+                    (event.session_seq > 0).then_some(event.session_seq),
                 ).await {
                     Ok(Some(_)) => backfilled += 1,
                     Ok(None) => {},

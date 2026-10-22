@@ -679,6 +679,7 @@ mod event_relay_extended {
 
         let events = vec![
             AgentEvent {
+                session_seq: 0,
                 seq: 1,
                 timestamp: 100,
                 session_id: "s1".to_string(),
@@ -687,6 +688,7 @@ mod event_relay_extended {
                 kind: AgentEventKind::SessionCreated,
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 2,
                 timestamp: 200,
                 session_id: "s1".to_string(),
@@ -698,6 +700,7 @@ mod event_relay_extended {
                 },
             },
             AgentEvent {
+                session_seq: 0,
                 seq: 3,
                 timestamp: 300,
                 session_id: "s1".to_string(),
@@ -761,6 +764,7 @@ mod event_relay_extended {
         let mut rx = sink.fanout().subscribe();
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 99,
             timestamp: 555,
             session_id: "unique-session-id-xyz".to_string(),
@@ -799,6 +803,7 @@ mod event_relay_extended {
         let mut rx = sink.fanout().subscribe();
 
         let event = AgentEvent {
+            session_seq: 0,
             seq: 7,
             timestamp: 777,
             session_id: "s1".to_string(),
@@ -844,6 +849,7 @@ mod event_relay_extended {
         let mut rx = sink.fanout().subscribe();
 
         let event_a = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 100,
             session_id: "session-a".to_string(),
@@ -852,6 +858,7 @@ mod event_relay_extended {
             kind: AgentEventKind::SessionCreated,
         };
         let event_b = AgentEvent {
+            session_seq: 0,
             seq: 2,
             timestamp: 200,
             session_id: "session-b".to_string(),

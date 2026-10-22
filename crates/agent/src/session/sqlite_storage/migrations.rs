@@ -105,6 +105,10 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0023_session_pins",
         apply: migration_0023_session_pins,
     },
+    Migration {
+        version: "0024_event_journal_session_seq",
+        apply: migration_0024_event_journal_session_seq,
+    },
 ];
 
 fn migration_0021_normalize_session_cwd_slashes(
@@ -750,6 +754,51 @@ fn migration_0015_event_source_identity(conn: &mut Connection) -> Result<(), rus
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_journal_source_identity \
          ON event_journal(session_id, source_node_id, source_seq) \
          WHERE source_node_id IS NOT NULL AND source_seq IS NOT NULL;",
+    )?;
+    tx.commit()
+}
+
+/// Producer-assigned per-session event sequence (`ordered-session-events`).
+///
+/// Adds `event_journal.session_seq` with a unique index on
+/// `(session_id, session_seq)` (local rows only, see below) and backfills
+/// locally produced legacy rows from
+/// their `stream_seq` order (1..n per session). Relayed legacy rows
+/// (`source_node_id` set or remote origin) stay `NULL`: the host's per-session
+/// numbering is unknown for them, and numbering them locally could collide
+/// with the host values later relayed events carry. Replay orders by
+/// `session_seq` and falls back to `stream_seq`, so legacy order is unchanged.
+///
+/// Downgrade note: an older binary ignores the column but assigns journal order
+/// itself, so restore a pre-migration backup to roll back.
+fn migration_0024_event_journal_session_seq(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let has_column: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('event_journal') WHERE name = 'session_seq')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
+    if !has_column {
+        tx.execute_batch("ALTER TABLE event_journal ADD COLUMN session_seq INTEGER;")?;
+    }
+    tx.execute_batch(
+        "UPDATE event_journal SET session_seq = (
+             SELECT n FROM (
+                 SELECT event_id AS id,
+                        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY stream_seq) AS n
+                 FROM event_journal
+                 WHERE source_node_id IS NULL AND origin != 'remote'
+             ) AS numbered
+             WHERE numbered.id = event_journal.event_id
+         )
+         WHERE session_seq IS NULL AND source_node_id IS NULL AND origin != 'remote';
+         -- Uniqueness covers this node's own numbering only. Relayed rows keep
+         -- the host's numbers (a separate sequence, deduplicated by source
+         -- identity), so they must not collide with local ones.
+         DROP INDEX IF EXISTS idx_event_journal_session_order;
+         CREATE UNIQUE INDEX idx_event_journal_session_order
+             ON event_journal(session_id, session_seq)
+             WHERE session_seq IS NOT NULL AND source_node_id IS NULL;",
     )?;
     tx.commit()
 }

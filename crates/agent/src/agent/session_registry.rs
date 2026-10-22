@@ -873,13 +873,16 @@ pub(crate) async fn prepare_remote_attachment(
         peer_label: peer_label.clone(),
         remote_node_id: remote_node_id.clone(),
     };
-    let relay_ref = EventRelayActor::spawn(EventRelayActor::new(
-        context.event_sink,
-        session_id.clone(),
-        peer_label,
-        remote_node_id,
-        context.disconnect_tx,
-    ));
+    let relay_ref = EventRelayActor::spawn(
+        EventRelayActor::new(
+            context.event_sink,
+            session_id.clone(),
+            peer_label,
+            remote_node_id,
+            context.disconnect_tx,
+        )
+        .with_gap_source(session_ref.clone()),
+    );
     let relay_actor_id = relay_ref.id().sequence_id();
     let mut candidate = PreparedRemoteAttachment {
         armed: true,

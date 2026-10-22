@@ -29,6 +29,36 @@ use crate::session::error::{SessionError, SessionResult};
 
 use migrations::apply_migrations;
 
+/// Switch file databases to WAL with `synchronous=NORMAL`.
+///
+/// The ordered per-session event writer batches durable events, and the
+/// `event_emit` benchmark showed streaming latency stays within its threshold
+/// only when commits do not each pay a full fsync (see the `ordered-session-events`
+/// design). `synchronous=NORMAL` in WAL mode may lose the most recent commits
+/// on power loss but cannot corrupt the database. In-memory databases are left
+/// unchanged. A failure to enable WAL (for example on a filesystem without
+/// shared-memory support) is logged and the default journal mode is kept.
+fn configure_journal_durability(
+    conn: &Connection,
+    path: &std::path::Path,
+) -> Result<(), rusqlite::Error> {
+    if path.as_os_str() == ":memory:" || path.as_os_str().is_empty() {
+        return Ok(());
+    }
+    match conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0)) {
+        Ok(mode) if mode.eq_ignore_ascii_case("wal") => {
+            conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        }
+        Ok(mode) => {
+            log::warn!("SQLite journal_mode stayed '{mode}'; keeping default durability settings");
+        }
+        Err(err) => {
+            log::warn!("failed to enable SQLite WAL mode: {err}; keeping default settings");
+        }
+    }
+    Ok(())
+}
+
 /// A unified SQLite storage implementation.
 ///
 /// This implementation provides all storage functionality in a single struct:
@@ -89,6 +119,7 @@ impl SqliteStorage {
             let mut conn = Connection::open(&db_path)?;
             conn.execute("PRAGMA foreign_keys = ON;", [])?;
             if migrate {
+                configure_journal_durability(&conn, &db_path)?;
                 apply_migrations(&mut conn)?;
             }
             Ok(conn)

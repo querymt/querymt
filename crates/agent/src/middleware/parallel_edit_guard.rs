@@ -15,7 +15,7 @@
 //! File access is read from the agent's tool registry: `bind_agent` (called
 //! when the `AgentConfig` is assembled) installs the same `Arc<ToolRegistry>`
 //! the scheduler uses, so both always agree on which tools exist and which
-//! paths they write. UI notices are emitted with `EventSink::emit_detached`,
+//! paths they write. UI notices are emitted with the session's ordered event stream,
 //! so a slow event journal never delays tool execution.
 //!
 //! # Example (TOML config)
@@ -104,14 +104,12 @@ impl ParallelEditGuard {
     /// Tell UIs about a flagged batch. Never waits for the event journal.
     fn notify(&self, session_id: &str, message: String) {
         if let Some(sink) = self.events.load_full() {
-            sink.emit_detached(
-                session_id,
-                AgentEventKind::HookNotice {
+            sink.session_stream(session_id)
+                .emit(AgentEventKind::HookNotice {
                     event_name: "parallel_edit_guard".to_string(),
                     message,
                     is_error: false,
-                },
-            );
+                });
         }
     }
 

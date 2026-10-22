@@ -334,6 +334,9 @@ pub struct RpcDispatchContext {
     /// the negotiated client capabilities are parsed into it so the
     /// snapshot-vs-replay choice stays scoped to this connection.
     pub session_load: Option<Arc<std::sync::Mutex<AcpSessionLoadPreferences>>>,
+    /// The connection's delivery position. `session/prompt` waits on it so the
+    /// response follows the session updates the prompt produced.
+    pub(crate) delivery: Option<Arc<crate::acp::delivery::ConnectionDelivery>>,
 }
 
 impl RpcDispatchContext {
@@ -2150,10 +2153,18 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 true,
                             )
                             .await?;
-                            agent
-                                .prompt(params)
-                                .await
-                                .map(|r| serde_json::to_value(r).unwrap())
+                            let mut response = agent.prompt(params).await?;
+                            // The reply carries the last `session_seq` the run
+                            // produced. Hold the response until this connection
+                            // delivered every update up to it (bounded; a lost
+                            // delivery is logged and the response proceeds). A
+                            // missing tip means "no watermark".
+                            if let Some(tip) = crate::acp::delivery::take_event_tip(&mut response)
+                                && let Some(delivery) = context.delivery.as_ref()
+                            {
+                                delivery.hold_response_for_updates(&session_id, tip).await;
+                            }
+                            Ok(serde_json::to_value(response).unwrap())
                         }
                         Err(e) => Err(Error::invalid_params()
                             .data(serde_json::json!({"error": e.to_string()}))),
@@ -2802,6 +2813,7 @@ mod tests {
         subscribe_connection(&subscriptions, "session".to_string(), "conn-b").await;
 
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "event".into(),
             stream_seq: 1,
             session_id: "session".into(),
@@ -2955,6 +2967,7 @@ mod tests {
 
         for (index, (kind, expected)) in cases.into_iter().enumerate() {
             let event = EventEnvelope::Durable(DurableEvent {
+                session_seq: 0,
                 event_id: format!("input-event-{index}"),
                 stream_seq: index as i64 + 1,
                 session_id: "s-1".into(),
@@ -3015,6 +3028,7 @@ mod tests {
 
     fn tool_start_event(tool_name: &str, arguments: serde_json::Value) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-1".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3031,6 +3045,7 @@ mod tests {
 
     fn tool_end_event(tool_name: &str) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-2".into(),
             stream_seq: 2,
             timestamp: 0,
@@ -3049,6 +3064,7 @@ mod tests {
     #[test]
     fn prompt_received_preserves_message_id() {
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-prompt".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3087,6 +3103,7 @@ mod tests {
             .map(|(index, block)| {
                 translator
                     .translate_update(&EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+                        session_seq: 0,
                         session_id: "s-1".to_string(),
                         timestamp: index as i64,
                         origin: EventOrigin::Local,
@@ -3130,6 +3147,7 @@ mod tests {
         ));
 
         let summary = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-prompt".into(),
             stream_seq: 4,
             timestamp: 4,
@@ -3236,6 +3254,7 @@ mod tests {
     #[test]
     fn assistant_updates_preserve_message_id() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3250,6 +3269,7 @@ mod tests {
             },
         });
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3284,6 +3304,7 @@ mod tests {
     #[test]
     fn live_translator_suppresses_stored_message_after_streaming_delta() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3294,6 +3315,7 @@ mod tests {
             },
         });
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3319,6 +3341,7 @@ mod tests {
     #[test]
     fn live_translator_forwards_non_streaming_stored_message() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3351,6 +3374,7 @@ mod tests {
     #[test]
     fn replay_translation_skips_streaming_deltas() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3383,6 +3407,7 @@ mod tests {
     #[test]
     fn live_translator_forwards_thinking_delta_as_agent_thought_chunk() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3421,6 +3446,7 @@ mod tests {
     #[test]
     fn replay_projects_each_summary_part_as_its_own_thought_chunk() {
         let stored = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-stored".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -3468,6 +3494,7 @@ mod tests {
     #[test]
     fn live_translator_skips_empty_thinking_delta() {
         let delta = EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+            session_seq: 0,
             timestamp: 0,
             session_id: "s-1".to_string(),
             origin: EventOrigin::Local,
@@ -3492,6 +3519,7 @@ mod tests {
             "s-1",
             vec![
                 AgentEvent {
+                    session_seq: 0,
                     seq: 1,
                     timestamp: 1,
                     session_id: "s-1".to_string(),
@@ -3503,6 +3531,7 @@ mod tests {
                     },
                 },
                 AgentEvent {
+                    session_seq: 0,
                     seq: 2,
                     timestamp: 2,
                     session_id: "s-1".to_string(),
@@ -3516,6 +3545,7 @@ mod tests {
                     },
                 },
                 AgentEvent {
+                    session_seq: 0,
                     seq: 3,
                     timestamp: 3,
                     session_id: "s-1".to_string(),
@@ -3543,6 +3573,7 @@ mod tests {
     #[test]
     fn replay_uses_persisted_structured_prompt_blocks_when_available() {
         let event = AgentEvent {
+            session_seq: 0,
             seq: 1,
             timestamp: 1,
             session_id: "s-1".to_string(),
@@ -3629,6 +3660,7 @@ mod tests {
     #[test]
     fn malformed_todowrite_arguments_do_not_emit_update() {
         let event = EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: "evt-3".into(),
             stream_seq: 1,
             timestamp: 0,
@@ -4236,6 +4268,7 @@ mod tests {
             elicitation_recovery: None,
             translator: None,
             session_load: None,
+            delivery: None,
         };
 
         for session_id in ["s-load-new", "s-load-existing"] {
@@ -4304,6 +4337,7 @@ mod tests {
             elicitation_recovery: None,
             translator: None,
             session_load: None,
+            delivery: None,
         };
 
         for (method, params) in [
@@ -4393,6 +4427,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4450,6 +4485,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4581,6 +4617,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await;
@@ -4648,6 +4685,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: None,
                 session_load: None,
+                delivery: None,
             },
         )
         .await
@@ -4698,6 +4736,7 @@ mod tests {
                 elicitation_recovery: None,
                 translator: Some(translator),
                 session_load: Some(Arc::new(std::sync::Mutex::new(preferences))),
+                delivery: None,
             },
         )
         .await
@@ -4743,6 +4782,7 @@ mod tests {
         ] {
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -4918,6 +4958,7 @@ mod tests {
         let journal = fixture.storage.event_journal();
         journal
             .append_durable(&NewDurableEvent {
+                session_seq: None,
                 session_id: session_id.clone(),
                 origin: EventOrigin::Local,
                 source_node: None,
@@ -5932,6 +5973,7 @@ mod tests {
             for _ in 0..10_001 {
                 journal
                     .append_durable(&NewDurableEvent {
+                        session_seq: None,
                         session_id: session_id.clone(),
                         origin: EventOrigin::Local,
                         source_node: None,
@@ -5944,6 +5986,7 @@ mod tests {
             }
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -5966,6 +6009,7 @@ mod tests {
                 .expect("persist replay event");
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,
@@ -6102,6 +6146,7 @@ mod session_update_tests {
 
     fn envelope(seq: i64, kind: AgentEventKind) -> EventEnvelope {
         EventEnvelope::Durable(DurableEvent {
+            session_seq: 0,
             event_id: format!("evt-{seq}"),
             stream_seq: seq,
             timestamp: 0,
@@ -6114,6 +6159,7 @@ mod session_update_tests {
 
     fn agent_event(seq: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
+            session_seq: 0,
             seq,
             timestamp: 0,
             session_id: "s-1".to_string(),
@@ -6649,6 +6695,7 @@ mod session_update_tests {
         for kind in kinds {
             journal
                 .append_durable(&NewDurableEvent {
+                    session_seq: None,
                     session_id: session_id.clone(),
                     origin: EventOrigin::Local,
                     source_node: None,

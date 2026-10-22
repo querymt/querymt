@@ -32,6 +32,10 @@ QueryMT SHALL assign every durable event of a session a sequence number at produ
 - **WHEN** an attached node relays a durable event of a remote-hosted session
 - **THEN** the event carries the host's session sequence on the attached node
 
+#### Scenario: Host numbering never collides with local numbering
+- **WHEN** an attached node stores a relayed event whose host sequence equals a number the node used for its own events of that session
+- **THEN** both events are stored, and the node's own numbering continues unaffected by host numbers
+
 ### Requirement: Replay matches live order
 QueryMT SHALL replay a session's durable events in the same order in which they were delivered live.
 
@@ -86,3 +90,7 @@ A connection that falls behind a session's event stream or detects a missing ses
 #### Scenario: Gap in relayed sequence
 - **WHEN** an attached node receives a relayed event whose session sequence skips a number
 - **THEN** it fetches the missing events from the host before delivering later ones
+
+#### Scenario: Host forwarder lags at the end of a burst
+- **WHEN** the host's forwarder falls behind and drops the last events of a burst, and no later event follows
+- **THEN** the attached node is told about the loss and fetches the missed durable events from the host without waiting for a later event

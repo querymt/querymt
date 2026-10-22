@@ -16,7 +16,7 @@
 //! dispatch to find our actor and message handlers at runtime.
 
 use crate::agent::messages;
-use crate::agent::remote::event_relay::{EventRelayActor, RelayedEvent};
+use crate::agent::remote::event_relay::{EventRelayActor, RelayLagged, RelayedEvent};
 use crate::agent::session_actor::SessionActor;
 use kameo::remote::_internal;
 
@@ -284,6 +284,52 @@ static EVENT_RELAY_ACTOR_REG: (&'static str, _internal::RemoteActorFns) = (
 );
 
 // ── EventRelayActor RemoteMessage ────────────────────────────────────────
+
+impl kameo::remote::RemoteMessage<RelayLagged> for EventRelayActor {
+    const REMOTE_ID: &'static str = "querymt::RelayLagged";
+}
+
+#[_internal::linkme::distributed_slice(_internal::REMOTE_MESSAGES)]
+#[linkme(crate = _internal::linkme)]
+static REG_RELAY_LAGGED: (
+    _internal::RemoteMessageRegistrationID<'static>,
+    _internal::RemoteMessageFns,
+) = (
+    _internal::RemoteMessageRegistrationID {
+        actor_remote_id: <EventRelayActor as kameo::remote::RemoteActor>::REMOTE_ID,
+        message_remote_id:
+            <EventRelayActor as kameo::remote::RemoteMessage<RelayLagged>>::REMOTE_ID,
+    },
+    _internal::RemoteMessageFns {
+        ask: (|actor_id, msg, mailbox_timeout, reply_timeout| {
+            Box::pin(_internal::ask::<EventRelayActor, RelayLagged>(
+                actor_id,
+                msg,
+                mailbox_timeout,
+                reply_timeout,
+            ))
+        }) as _internal::RemoteAskFn,
+        try_ask: (|actor_id, msg, reply_timeout| {
+            Box::pin(_internal::try_ask::<EventRelayActor, RelayLagged>(
+                actor_id,
+                msg,
+                reply_timeout,
+            ))
+        }) as _internal::RemoteTryAskFn,
+        tell: (|actor_id, msg, mailbox_timeout| {
+            Box::pin(_internal::tell::<EventRelayActor, RelayLagged>(
+                actor_id,
+                msg,
+                mailbox_timeout,
+            ))
+        }) as _internal::RemoteTellFn,
+        try_tell: (|actor_id, msg| {
+            Box::pin(_internal::try_tell::<EventRelayActor, RelayLagged>(
+                actor_id, msg,
+            ))
+        }) as _internal::RemoteTryTellFn,
+    },
+);
 
 impl kameo::remote::RemoteMessage<RelayedEvent> for EventRelayActor {
     const REMOTE_ID: &'static str = "querymt::RelayedEvent";

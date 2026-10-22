@@ -456,6 +456,9 @@ impl AgentHandle for RemoteAgentHandle {
     fn emit_event(&self, session_id: &str, kind: AgentEventKind) {
         let envelope = EventEnvelope::Ephemeral(EphemeralEvent {
             session_id: session_id.to_string(),
+            // Local annotation on a remote-hosted session: the host owns the
+            // session's sequence, so this event is unsequenced.
+            session_seq: 0,
             timestamp: time::OffsetDateTime::now_utc().unix_timestamp(),
             origin: EventOrigin::Local,
             source_node: None,

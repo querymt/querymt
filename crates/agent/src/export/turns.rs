@@ -286,6 +286,7 @@ mod tests {
 
     fn make_event(seq: i64, ts: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
+            session_seq: 0,
             seq,
             timestamp: ts,
             session_id: "test-session".to_string(),

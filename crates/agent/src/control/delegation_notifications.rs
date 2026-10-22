@@ -418,6 +418,7 @@ mod tests {
 
     fn event(timestamp: i64, kind: AgentEventKind) -> AgentEvent {
         AgentEvent {
+            session_seq: 0,
             seq: timestamp,
             timestamp,
             session_id: "parent-1".into(),
