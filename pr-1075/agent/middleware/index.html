@@ -2211,7 +2211,7 @@ published so UIs can show the warning. It is persisted in the background and
 never delays the tool calls. A guidance message that was not delivered
 (for example because the turn was cancelled) is discarded at the next turn start.</p>
 <p>Read-only file tools (<code>read_tool</code>, <code>get_function</code>, <code>get_symbol</code>, <code>index</code>, <code>mdq</code>,
-<code>find_references</code>, <code>search_text</code>, <code>ls</code>, <code>glob</code>) are ordered after earlier writes to
+<code>find_symbol_references</code>, <code>search_text</code>, <code>ls</code>, <code>glob</code>) are ordered after earlier writes to
 the files (or directories) they read, so they never observe a half-written file.
 <code>search_text</code> and <code>glob</code> only wait for writes their filter could see: a
 <code>search_text</code> with <code>include = "*.md"</code> runs alongside an <code>edit</code> of <code>src/a.rs</code>.</p>
