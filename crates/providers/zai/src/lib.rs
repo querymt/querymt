@@ -1,9 +1,11 @@
 use http::{Request, Response};
 use qmt_openai::api::{
-    OpenAIProviderConfig, OpenAIToolUseState, classify_openai_http_error, openai_chat_request,
-    openai_embed_request, openai_list_models_request, openai_parse_chat, openai_parse_embed,
-    openai_parse_list_models, parse_openai_sse_chunk, url_schema,
+    OpenAIErrorClassification, OpenAIProviderConfig, OpenAIToolUseState,
+    classify_openai_http_error_with, openai_chat_request, openai_embed_request,
+    openai_list_models_request, openai_parse_chat_with, openai_parse_embed,
+    openai_parse_list_models, parse_openai_sse_chunk_with, url_schema,
 };
+use querymt::error::ProviderErrorKind;
 use querymt::{
     HTTPLLMProvider,
     chat::{
@@ -36,6 +38,19 @@ where
 {
     let url = Url::deserialize(deserializer)?;
     Ok(normalize_base_url(url))
+}
+
+fn classify_zai_error(error: &Value) -> Option<OpenAIErrorClassification> {
+    let code = error.get("code")?;
+    let code = code
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| code.as_i64().map(|code| code.to_string()))?;
+
+    (code == "1311").then_some(OpenAIErrorClassification {
+        kind: ProviderErrorKind::QuotaExceeded,
+        error_type: None,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema, Serialize)]
@@ -137,7 +152,7 @@ impl OpenAIProviderConfig for Zai {
 
 impl HTTPChatProvider for Zai {
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
-        classify_openai_http_error(response)
+        classify_openai_http_error_with(response, Some(classify_zai_error))
     }
 
     fn chat_request(
@@ -159,7 +174,7 @@ impl HTTPChatProvider for Zai {
     }
 
     fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
-        openai_parse_chat(self, response)
+        openai_parse_chat_with(self, response, Some(classify_zai_error))
     }
 
     fn supports_streaming(&self) -> bool {
@@ -178,7 +193,7 @@ struct ZaiStreamParser {
 
 impl ChatStreamParser for ZaiStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
-        parse_openai_sse_chunk(chunk, &mut self.tool_states)
+        parse_openai_sse_chunk_with(chunk, &mut self.tool_states, Some(classify_zai_error))
     }
 }
 
@@ -259,6 +274,105 @@ pub fn create_http_factory() -> Arc<dyn HTTPLLMProviderFactory> {
 #[unsafe(no_mangle)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
     Box::into_raw(Box::new(ZaiFactory)) as *mut _
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use querymt::error::ProviderErrorKind;
+    use serde_json::json;
+
+    fn provider() -> Zai {
+        serde_json::from_value(json!({
+            "api_key": "test-key",
+            "model": "glm-4.5"
+        }))
+        .unwrap()
+    }
+
+    fn error_response(status: u16, code: Value) -> Response<Vec<u8>> {
+        Response::builder()
+            .status(status)
+            .body(
+                json!({
+                    "error": {
+                        "message": "model is not available for this subscription plan",
+                        "code": code
+                    }
+                })
+                .to_string()
+                .into_bytes(),
+            )
+            .unwrap()
+    }
+
+    fn assert_error_kind(error: &LLMError, kind: ProviderErrorKind, retryable: bool) {
+        match error {
+            LLMError::ProviderResponseError(failure) => assert_eq!(failure.kind(), kind),
+            other => panic!("expected provider response error, got {other}"),
+        }
+        assert_eq!(error.is_retryable(), retryable);
+    }
+
+    #[test]
+    fn subscription_plan_error_is_permanent_for_http_envelopes_and_sse() {
+        let provider = provider();
+        for code in [json!(1311), json!("1311")] {
+            let http_error = provider.classify_chat_error(&error_response(429, code.clone()));
+            assert_error_kind(&http_error, ProviderErrorKind::QuotaExceeded, false);
+
+            let body_error = provider
+                .parse_chat(error_response(200, code.clone()))
+                .unwrap_err();
+            assert_error_kind(&body_error, ProviderErrorKind::QuotaExceeded, false);
+
+            let event = json!({
+                "error": {
+                    "message": "model is not available for this subscription plan",
+                    "code": code
+                }
+            });
+            let chunk = format!("data: {event}\n\n");
+            let mut parser = ZaiStreamParser::default();
+            let stream_error = parser.parse_chunk(chunk.as_bytes()).unwrap_err();
+            assert_error_kind(&stream_error, ProviderErrorKind::QuotaExceeded, false);
+        }
+    }
+
+    #[test]
+    fn rate_limit_error_remains_retryable_across_chat_paths() {
+        let provider = provider();
+        let response = |status| {
+            Response::builder()
+                .status(status)
+                .body(
+                    json!({
+                        "error": {
+                            "message": "rate limit reached",
+                            "type": "rate_limit_error",
+                            "code": "rate_limit_exceeded"
+                        }
+                    })
+                    .to_string()
+                    .into_bytes(),
+                )
+                .unwrap()
+        };
+
+        let http_error = provider.classify_chat_error(&response(429));
+        assert_error_kind(&http_error, ProviderErrorKind::RateLimited, true);
+
+        let body_error = provider.parse_chat(response(200)).unwrap_err();
+        assert_error_kind(&body_error, ProviderErrorKind::RateLimited, true);
+
+        let chunk = format!(
+            "data: {}\n\n",
+            String::from_utf8(response(200).body().clone()).unwrap()
+        );
+        let mut parser = ZaiStreamParser::default();
+        let stream_error = parser.parse_chunk(chunk.as_bytes()).unwrap_err();
+        assert_error_kind(&stream_error, ProviderErrorKind::RateLimited, true);
+    }
 }
 
 #[cfg(feature = "extism")]
