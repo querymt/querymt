@@ -173,6 +173,7 @@ impl EventRelayActor {
             node_id,
             &self.source_label,
             after,
+            received,
         )
         .await
         {

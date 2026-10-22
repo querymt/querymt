@@ -27,6 +27,10 @@ const BACKFILL_PAGE_SIZE: usize = crate::agent::messages::MAX_EVENT_STREAM_PAGE_
 /// historical snapshot is complete. Persistence is idempotent per source
 /// identity, so overlap with the live event that revealed the gap is a no-op.
 ///
+/// With `before_session_seq` set, recovery stops before the first event whose
+/// host `session_seq` is at or beyond it, so repair never overtakes the event
+/// the caller is about to deliver. `None` recovers up to the host tip.
+///
 /// Returns the highest source sequence now persisted.
 pub(crate) async fn recover_source_gap(
     event_sink: &EventSink,
@@ -35,6 +39,7 @@ pub(crate) async fn recover_source_gap(
     source_node_id: &str,
     peer_label: &str,
     after_source_seq: i64,
+    before_session_seq: Option<i64>,
 ) -> Result<i64, crate::error::AgentError> {
     let mut after = after_source_seq;
     loop {
@@ -47,6 +52,11 @@ pub(crate) async fn recover_source_gap(
                 return Err(crate::error::AgentError::Internal(
                     "invalid gap recovery page".into(),
                 ));
+            }
+            if before_session_seq
+                .is_some_and(|bound| event.session_seq > 0 && event.session_seq >= bound)
+            {
+                return Ok(previous);
             }
             previous = event.seq;
             event_sink

@@ -108,12 +108,28 @@ impl SessionEventStream {
     /// journal already holds, and start its writer task.
     ///
     /// Must be called inside a Tokio runtime.
+    #[cfg(test)]
     pub(crate) fn new(
         session_id: &str,
         journal: Arc<dyn EventJournal>,
         fanout: Arc<EventFanout>,
     ) -> Arc<Self> {
         let base = journal.max_session_seq_blocking(session_id).max(0);
+        Self::with_base(session_id, journal, fanout, base)
+    }
+
+    /// Create the stream for `session_id`, numbering from `base + 1`, and
+    /// start its writer task. The caller supplies `base` (the journal's
+    /// highest number, or a retired stream's tip if higher) so the lookup can
+    /// run outside any lock.
+    ///
+    /// Must be called inside a Tokio runtime.
+    pub(crate) fn with_base(
+        session_id: &str,
+        journal: Arc<dyn EventJournal>,
+        fanout: Arc<EventFanout>,
+        base: i64,
+    ) -> Arc<Self> {
         let shared = Arc::new(Shared {
             session_id: session_id.to_string(),
             journal,

@@ -29,7 +29,16 @@ use std::sync::Arc;
 pub struct EventSink {
     journal: Arc<dyn EventJournal>,
     fanout: Arc<EventFanout>,
-    streams: Mutex<HashMap<String, Arc<SessionEventStream>>>,
+    streams: Mutex<StreamRegistry>,
+}
+
+#[derive(Default)]
+struct StreamRegistry {
+    live: HashMap<String, Arc<SessionEventStream>>,
+    /// Last sequence number assigned by a retired stream. Ephemeral events
+    /// consume numbers that the journal never sees, so a replacement stream
+    /// must continue after this tip, not just after the journal's maximum.
+    retired_tips: HashMap<String, i64>,
 }
 
 impl EventSink {
@@ -38,7 +47,7 @@ impl EventSink {
         Self {
             journal,
             fanout,
-            streams: Mutex::new(HashMap::new()),
+            streams: Mutex::new(StreamRegistry::default()),
         }
     }
 
@@ -48,12 +57,28 @@ impl EventSink {
     /// scheduler) share this handle, so they share one `session_seq` counter.
     /// Must be called inside a Tokio runtime.
     pub fn session_stream(&self, session_id: &str) -> Arc<SessionEventStream> {
-        let mut streams = self.streams.lock();
-        if let Some(stream) = streams.get(session_id) {
+        if let Some(stream) = self.streams.lock().live.get(session_id) {
             return stream.clone();
         }
-        let stream = SessionEventStream::new(session_id, self.journal.clone(), self.fanout.clone());
-        streams.insert(session_id.to_string(), stream.clone());
+
+        // The journal lookup may wait on the storage connection, so it runs
+        // without the registry lock. It can be stale by the time the lock is
+        // retaken; the retained tip of a retired stream covers that case.
+        let durable_base = self.journal.max_session_seq_blocking(session_id).max(0);
+
+        let mut registry = self.streams.lock();
+        // A concurrent caller may have created the stream meanwhile.
+        if let Some(stream) = registry.live.get(session_id) {
+            return stream.clone();
+        }
+        let retired_tip = registry.retired_tips.remove(session_id).unwrap_or(0);
+        let stream = SessionEventStream::with_base(
+            session_id,
+            self.journal.clone(),
+            self.fanout.clone(),
+            durable_base.max(retired_tip),
+        );
+        registry.live.insert(session_id.to_string(), stream.clone());
         stream
     }
 
@@ -62,31 +87,36 @@ impl EventSink {
     ///
     /// Waits until everything already emitted is persisted and published, then
     /// removes the stream only if it is idle and nobody else holds it. A later
-    /// emit creates a fresh stream that continues after the journal's highest
-    /// number, which is safe because the writer has drained. Returns whether
-    /// the stream was released.
+    /// emit creates a fresh stream that continues after the highest number the
+    /// retired stream assigned (and the journal's highest number), so numbers
+    /// consumed by ephemeral events are never reused. Returns whether the
+    /// stream was released.
     pub async fn retire_session_stream(&self, session_id: &str) -> bool {
-        let Some(stream) = self.streams.lock().get(session_id).cloned() else {
+        let Some(stream) = self.streams.lock().live.get(session_id).cloned() else {
             return false;
         };
         stream.flush().await;
 
-        let mut streams = self.streams.lock();
+        let mut registry = self.streams.lock();
         // The map's entry plus our local clone are the two expected owners.
-        let released = streams
+        let released = registry
+            .live
             .get(session_id)
             .is_some_and(|current| Arc::ptr_eq(current, &stream))
             && stream.is_idle()
             && Arc::strong_count(&stream) == 2;
         if released {
-            streams.remove(session_id);
+            registry.live.remove(session_id);
+            registry
+                .retired_tips
+                .insert(session_id.to_string(), stream.tip());
         }
         released
     }
 
     /// Number of live per-session streams (diagnostics and tests).
     pub fn session_stream_count(&self) -> usize {
-        self.streams.lock().len()
+        self.streams.lock().live.len()
     }
 
     /// Emit a durable event. Persists to journal (awaited), then publishes to fanout.
@@ -304,6 +334,47 @@ mod tests {
             .unwrap();
         let seqs: Vec<i64> = stored.iter().map(|e| e.session_seq).collect();
         assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn retired_stream_tip_covers_ephemeral_numbers() {
+        let sink = make_sink().await;
+        sink.emit_durable("s1", AgentEventKind::SessionCreated)
+            .await
+            .unwrap();
+        sink.emit_ephemeral(
+            "s1",
+            AgentEventKind::AssistantContentDelta {
+                content: "t".into(),
+                message_id: "m1".into(),
+            },
+        );
+        let tip = sink.session_stream("s1").tip();
+        assert_eq!(tip, 2);
+
+        assert!(sink.retire_session_stream("s1").await);
+        let next = sink
+            .emit_durable("s1", AgentEventKind::Cancelled)
+            .await
+            .unwrap();
+        assert_eq!(next.session_seq, 3, "ephemeral number 2 is not reused");
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_stream_calls_share_one_stream() {
+        let sink = Arc::new(make_sink().await);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let sink = sink.clone();
+                tokio::spawn(async move { sink.session_stream("s1") })
+            })
+            .collect();
+        let mut streams = Vec::new();
+        for handle in handles {
+            streams.push(handle.await.unwrap());
+        }
+        assert!(streams.iter().all(|s| Arc::ptr_eq(s, &streams[0])));
+        assert_eq!(sink.session_stream_count(), 1);
     }
 
     #[tokio::test]
