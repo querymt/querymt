@@ -188,7 +188,7 @@ never delays the tool calls. A guidance message that was not delivered
 (for example because the turn was cancelled) is discarded at the next turn start.
 
 Read-only file tools (`read_tool`, `get_function`, `get_symbol`, `index`, `mdq`,
-`find_references`, `search_text`, `ls`, `glob`) are ordered after earlier writes to
+`find_symbol_references`, `search_text`, `ls`, `glob`) are ordered after earlier writes to
 the files (or directories) they read, so they never observe a half-written file.
 `search_text` and `glob` only wait for writes their filter could see: a
 `search_text` with `include = "*.md"` runs alongside an `edit` of `src/a.rs`.

@@ -35,6 +35,8 @@ pub(super) type Wave = Vec<usize>;
 ///   (`ls`, `glob`, `search_text`) therefore waits only for writes beneath it
 ///   that pass the same include/exclude/file-type filter the tool applies.
 /// - `Unknown` vs a call that declares at least one write.
+/// - `Any` vs any call that declares file access (reads, writes, `Unknown`,
+///   `Any`).
 /// - Everything else (`None`, read/read, `Unknown` vs `Unknown`, `Unknown` vs
 ///   readers) is compatible.
 fn conflicts(a: &FileAccess, b: &FileAccess) -> bool {
@@ -60,6 +62,7 @@ fn conflicts(a: &FileAccess, b: &FileAccess) -> bool {
                 || reads_observe(a_reads, b_writes, b_trees)
                 || reads_observe(b_reads, a_writes, a_trees)
         }
+        (FileAccess::Any, other) | (other, FileAccess::Any) => !matches!(other, FileAccess::None),
         (FileAccess::Unknown, other) | (other, FileAccess::Unknown) => other.has_writes(),
         (FileAccess::None, _) | (_, FileAccess::None) => false,
     }
@@ -352,6 +355,32 @@ mod tests {
             write("src/docs/a.md"),
         ];
         assert_eq!(plan_waves(&calls), vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn any_access_conflicts_with_reads_writes_unknown_and_any() {
+        // Any waits for the read; the write and Unknown wait for Any (and
+        // Unknown also for the write); the second Any waits for everything.
+        let calls = [
+            read("a.md"),
+            call(FileAccess::Any),
+            write("b.md"),
+            call(FileAccess::Unknown),
+            call(FileAccess::Any),
+        ];
+        assert_eq!(
+            plan_waves(&calls),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
+        );
+        // Unknown alone after Any still waits (Unknown vs Unknown would not).
+        let calls = [call(FileAccess::Any), call(FileAccess::Unknown)];
+        assert_eq!(plan_waves(&calls), vec![vec![0], vec![1]]);
+    }
+
+    #[test]
+    fn any_access_runs_alongside_calls_without_file_access() {
+        let calls = [call(FileAccess::Any), call(FileAccess::None)];
+        assert_eq!(plan_waves(&calls), vec![vec![0, 1]]);
     }
 
     #[test]

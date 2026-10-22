@@ -240,6 +240,11 @@ pub enum FileAccess {
     },
     /// The call may touch any file (e.g. a shell command).
     Unknown,
+    /// The call must be treated as reading and writing every file. Conflicts
+    /// with every other call that declares file access (reads, writes and
+    /// `Unknown`). Used when a call's access could not be determined at all,
+    /// e.g. because the tool's `file_access` panicked.
+    Any,
 }
 
 impl FileAccess {
@@ -280,7 +285,7 @@ impl FileAccess {
     pub fn written_paths(&self) -> &[PathBuf] {
         match self {
             Self::Paths { writes, .. } => writes,
-            Self::None | Self::Unknown => &[],
+            Self::None | Self::Unknown | Self::Any => &[],
         }
     }
 
@@ -288,7 +293,7 @@ impl FileAccess {
     pub fn read_scopes_slice(&self) -> &[ReadScope] {
         match self {
             Self::Paths { reads, .. } => reads,
-            Self::None | Self::Unknown => &[],
+            Self::None | Self::Unknown | Self::Any => &[],
         }
     }
 
@@ -296,7 +301,7 @@ impl FileAccess {
     pub fn written_trees(&self) -> &[PathBuf] {
         match self {
             Self::Paths { tree_writes, .. } => tree_writes,
-            Self::None | Self::Unknown => &[],
+            Self::None | Self::Unknown | Self::Any => &[],
         }
     }
 
