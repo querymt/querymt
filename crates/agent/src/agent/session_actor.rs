@@ -243,8 +243,15 @@ impl Actor for SessionActor {
     async fn on_stop(
         &mut self,
         _actor_ref: kameo::actor::WeakActorRef<Self>,
-        _reason: kameo::error::ActorStopReason,
+        reason: kameo::error::ActorStopReason,
     ) -> Result<(), Self::Error> {
+        match &reason {
+            kameo::error::ActorStopReason::Normal
+            | kameo::error::ActorStopReason::SupervisorRestart => {
+                debug!("SessionActor {} stopped: {}", self.session_id, reason);
+            }
+            _ => warn!("SessionActor {} stopped: {}", self.session_id, reason),
+        }
         self.config
             .event_sink
             .retire_session_stream(&self.session_id)

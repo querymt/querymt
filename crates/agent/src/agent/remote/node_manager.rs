@@ -856,15 +856,13 @@ mod remote_impl {
             // ── Idempotency check ───────────────────────────────────────────
             // After acquiring the per-session lock, check whether another
             // caller already materialized this session.
+            if let Some(crate::agent::remote::SessionActorRef::Local(existing)) =
+                crate::agent::session_registry::live_session(&registry, &session_id).await
             {
-                let registry = registry.lock().await;
-                if let Some(existing) = registry.local_actor_ref(&session_id).cloned() {
-                    drop(registry);
-                    let handoff = self.handoff_for_local_actor(&session_id, existing).await;
-                    self.cleanup_materialization_lock(&session_id, &session_lock)
-                        .await;
-                    return Ok(handoff);
-                }
+                let handoff = self.handoff_for_local_actor(&session_id, existing).await;
+                self.cleanup_materialization_lock(&session_id, &session_lock)
+                    .await;
+                return Ok(handoff);
             }
 
             // ── Phase 1: Prepare (NO lock held) ─────────────────────────────
@@ -909,10 +907,8 @@ mod remote_impl {
 
             if let Some(prepared) = prepared.as_ref() {
                 // ── Phase 2: Register (lock held for microseconds) ──────────────
-                {
-                    let mut registry = registry.lock().await;
-                    registry.register_prepared_session(prepared).await;
-                }
+                crate::agent::session_registry::register_prepared_session(&registry, prepared)
+                    .await;
 
                 // ── Phase 3: Finalize (NO lock held) ────────────────────────────
                 materializer
