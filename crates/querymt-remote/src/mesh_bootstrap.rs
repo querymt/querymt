@@ -53,13 +53,20 @@ pub(crate) fn finalize_bootstrap(
     )
 }
 
+fn same_identity_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 // Preserve the existing default identity's files; custom identities get private sidecars.
 fn state_path(
     identity_file: Option<&std::path::Path>,
     filename: &str,
 ) -> Result<std::path::PathBuf, MeshError> {
     if let Some(identity) = identity_file
-        && default_identity_path().ok().as_deref() != Some(identity)
+        && !default_identity_path().is_ok_and(|default| same_identity_path(&default, identity))
     {
         let mut path = identity.as_os_str().to_os_string();
         path.push(format!(".{filename}"));
@@ -174,6 +181,27 @@ mod tests {
             state_path(Some(&identity), "invites.json").unwrap(),
             default_invite_store_path().unwrap()
         );
+    }
+
+    #[test]
+    fn identity_path_comparison_recognizes_aliases_without_conflating_custom_keys() {
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let identity = dir.path().join("default.key");
+        let custom = dir.path().join("custom.key");
+        std::fs::write(&identity, "default").unwrap();
+        std::fs::write(&custom, "custom").unwrap();
+        let absolute = std::fs::canonicalize(&identity).unwrap();
+        assert!(same_identity_path(&identity, &absolute));
+        assert!(!same_identity_path(&custom, &absolute));
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("alias.key");
+            std::os::unix::fs::symlink(&absolute, &alias).unwrap();
+            assert!(same_identity_path(&alias, &absolute));
+        }
+        let missing = dir.path().join("not-created.key");
+        assert!(same_identity_path(&missing, &missing));
+        assert!(!same_identity_path(&missing, &absolute));
     }
 
     #[test]
