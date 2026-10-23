@@ -15,14 +15,14 @@
         <link rel="prev" href="../middleware/">
       
       
-        <link rel="next" href="../dotagents/">
+        <link rel="next" href="../worktrees/">
       
       
         
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.71">
+      <meta name="generator" content="zensical-0.0.72">
     
     
       
@@ -33,7 +33,7 @@
       
         
       
-      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.e442bf79.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.4ab2de0c.min.css">
       
         
           
@@ -103,9 +103,10 @@
   <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 5v16M20.001 19A2 2 0 0 0 22 17V5a2 2 0 0 0-1.999-2L16 3.002A5 5 0 0 0 12 5a5 5 0 0 0-4-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 1.999 2H8a5 5 0 0 1 4 2 5 5 0 0 1 4-2z"/></svg>
 
     </a>
-    <label class="md-header__button md-icon" for="__drawer" aria-label="Navigation">
+    <label class="md-header__button md-icon" for="__drawer">
       
       <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
+      <span class="md-visually-hidden">Navigation</span>
     </label>
     <div class="md-header__title" data-md-component="header-title">
       <div class="md-header__ellipsis">
@@ -167,9 +168,10 @@
     
       
       
-        <label class="md-header__button md-icon" for="__search" aria-label="Search">
+        <label class="md-header__button md-icon" for="__search">
           
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
+          <span class="md-visually-hidden">Search</span>
         </label>
         <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
   <button type="button" class="md-search__button">
@@ -2028,6 +2030,33 @@
   
   
     <li class="md-nav__item">
+      <a href="../worktrees/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Git Worktree Workspaces
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../dotagents/" class="md-nav__link">
         
   
@@ -2530,7 +2559,7 @@ source identity and remote sync progress migrations already present on <code>mai
 <h2 id="delegation-lifecycle">Delegation Lifecycle</h2>
 <h3 id="1-delegation-request">1. Delegation Request</h3>
 <p>The planner decides to delegate and creates a delegation request.</p>
-<p>If hooks are enabled, <code>pre_delegation</code> runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as <code>target_agent_id</code>, <code>objective</code>, <code>context</code>, <code>constraints</code>, and <code>expected_output</code>.</p>
+<p>If hooks are enabled, <code>pre_delegation</code> runs before the delegation is recorded. It can block the delegation entirely or rewrite fields such as <code>target_agent_id</code>, <code>objective</code>, <code>context</code>, <code>constraints</code>, <code>expected_output</code>, and <code>isolation</code>.</p>
 <p>The planner-side tool result is updated when a delegation is blocked, so the model sees <code>Delegation blocked by hook: ...</code> instead of a misleading queued message.</p>
 <p>The delegation request shape is:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1"> 1</a></span>
@@ -2543,7 +2572,8 @@ source identity and remote sync progress migrations already present on <code>mai
 <span class="normal"><a href="#__codelineno-8-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-8-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-8-10">10</a></span>
-<span class="normal"><a href="#__codelineno-8-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">Delegation</span><span class="w"> </span><span class="p">{</span>
+<span class="normal"><a href="#__codelineno-8-11">11</a></span>
+<span class="normal"><a href="#__codelineno-8-12">12</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">Delegation</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">public_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">              </span><span class="c1">// Unique delegation ID</span>
 <a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">target_agent_id</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">        </span><span class="c1">// Which delegate to use</span>
 <a id="__codelineno-8-4" name="__codelineno-8-4"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">objective</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span><span class="w">              </span><span class="c1">// What needs to be done</span>
@@ -2553,8 +2583,11 @@ source identity and remote sync progress migrations already present on <code>mai
 <a id="__codelineno-8-8" name="__codelineno-8-8"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">task_id</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="w">        </span><span class="c1">// Associated task ID</span>
 <a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">planning_summary</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="nb">String</span><span class="o">&gt;</span><span class="p">,</span><span class="c1">// Summary of planning conversation</span>
 <a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">verification_spec</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">VerificationSpec</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="c1">// Optional verification</span>
-<a id="__codelineno-8-11" name="__codelineno-8-11"></a><span class="p">}</span>
+<a id="__codelineno-8-11" name="__codelineno-8-11"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">isolation</span><span class="p">:</span><span class="w"> </span><span class="nc">DelegationIsolation</span><span class="p">,</span><span class="w"> </span><span class="c1">// Resolved execution workspace policy</span>
+<a id="__codelineno-8-12" name="__codelineno-8-12"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
+<p><code>isolation</code> is the resolved execution-workspace policy: <code>shared</code> (legacy behavior — the delegate runs in the parent's checkout) or <code>isolated</code> (a private managed Git worktree seeded from the parent's current code state; see <a href="../worktrees/">Git Worktree Workspaces</a>). The <code>delegate</code> tool accepts an optional <code>isolation</code> argument (<code>inherit</code> | <code>isolated</code> | <code>shared</code>); <code>inherit</code> resolves from the parent session — isolated parents isolate every delegate by default, local parents keep shared execution. Explicit <code>shared</code> overrides on isolated parents are disclosed as shared execution, and a requested isolation that cannot be satisfied fails the delegation instead of falling back to sharing.</p>
+<p>In a quorum, each <code>[[delegates]]</code> entry may also set <code>isolation = "inherit" | "isolated" | "shared"</code> (default <code>inherit</code>) — the configured analogue of the tool argument. Precedence is: an explicit non-<code>inherit</code> value on the <code>delegate</code> tool call, then the target delegate's configured value, then inheritance from the parent session's execution mode. The resolved policy and where it came from (<code>request</code>, <code>delegate_config</code> or <code>inherited</code>) are persisted with the delegation and disclosed in the tool result. <code>isolated</code> requires <code>[quorum.workspace] enabled = true</code> and is rejected at load/build time otherwise. See <a href="../worktrees/">Git Worktree Workspaces</a>.</p>
 <h3 id="2-session-creation">2. Session Creation</h3>
 <p>The orchestrator creates a new session for the delegate:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
@@ -2899,7 +2932,10 @@ source identity and remote sync progress migrations already present on <code>mai
 <span class="normal"><a href="#__codelineno-22-14">14</a></span>
 <span class="normal"><a href="#__codelineno-22-15">15</a></span>
 <span class="normal"><a href="#__codelineno-22-16">16</a></span>
-<span class="normal"><a href="#__codelineno-22-17">17</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<span class="normal"><a href="#__codelineno-22-17">17</a></span>
+<span class="normal"><a href="#__codelineno-22-18">18</a></span>
+<span class="normal"><a href="#__codelineno-22-19">19</a></span>
+<span class="normal"><a href="#__codelineno-22-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-22-1" name="__codelineno-22-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
 <a id="__codelineno-22-2" name="__codelineno-22-2"></a><span class="k">use</span><span class="w"> </span><span class="n">agent_client_protocol</span><span class="p">::</span><span class="n">Delegation</span><span class="p">;</span>
 <a id="__codelineno-22-3" name="__codelineno-22-3"></a>
 <a id="__codelineno-22-4" name="__codelineno-22-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">delegation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Delegation</span><span class="w"> </span><span class="p">{</span>
@@ -2912,10 +2948,13 @@ source identity and remote sync progress migrations already present on <code>mai
 <a id="__codelineno-22-11" name="__codelineno-22-11"></a><span class="w">    </span><span class="n">task_id</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
 <a id="__codelineno-22-12" name="__codelineno-22-12"></a><span class="w">    </span><span class="n">planning_summary</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
 <a id="__codelineno-22-13" name="__codelineno-22-13"></a><span class="w">    </span><span class="n">verification_spec</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
-<a id="__codelineno-22-14" name="__codelineno-22-14"></a><span class="p">};</span>
-<a id="__codelineno-22-15" name="__codelineno-22-15"></a>
-<a id="__codelineno-22-16" name="__codelineno-22-16"></a><span class="c1">// Request delegation</span>
-<a id="__codelineno-22-17" name="__codelineno-22-17"></a><span class="n">agent</span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="n">delegation</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-22-14" name="__codelineno-22-14"></a><span class="w">    </span><span class="c1">// `Inherit` (default): isolated parents isolate delegates, local parents</span>
+<a id="__codelineno-22-15" name="__codelineno-22-15"></a><span class="w">    </span><span class="c1">// share. Use `Shared` or `Isolated` to force a mode.</span>
+<a id="__codelineno-22-16" name="__codelineno-22-16"></a><span class="w">    </span><span class="n">isolation</span><span class="p">:</span><span class="w"> </span><span class="nc">DelegationIsolation</span><span class="p">::</span><span class="n">Inherit</span><span class="p">,</span>
+<a id="__codelineno-22-17" name="__codelineno-22-17"></a><span class="p">};</span>
+<a id="__codelineno-22-18" name="__codelineno-22-18"></a>
+<a id="__codelineno-22-19" name="__codelineno-22-19"></a><span class="c1">// Request delegation</span>
+<a id="__codelineno-22-20" name="__codelineno-22-20"></a><span class="n">agent</span><span class="p">.</span><span class="n">delegate</span><span class="p">(</span><span class="n">delegation</span><span class="p">).</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="subscribing-to-delegation-events">Subscribing to Delegation Events</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-23-1"> 1</a></span>
@@ -3260,7 +3299,7 @@ Planner: Integrates both results</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../../assets/javascripts/workers/search.c47bb847.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.a2388154.min.js"></script>
+      <script src="../../assets/javascripts/bundle.10ee5ab6.min.js"></script>
       
     
   </body>

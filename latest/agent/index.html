@@ -22,7 +22,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.71">
+      <meta name="generator" content="zensical-0.0.72">
     
     
       
@@ -33,7 +33,7 @@
       
         
       
-      <link rel="stylesheet" href="../assets/stylesheets/modern/main.e442bf79.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/modern/main.4ab2de0c.min.css">
       
         
           
@@ -103,9 +103,10 @@
   <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 5v16M20.001 19A2 2 0 0 0 22 17V5a2 2 0 0 0-1.999-2L16 3.002A5 5 0 0 0 12 5a5 5 0 0 0-4-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 1.999 2H8a5 5 0 0 1 4 2 5 5 0 0 1 4-2z"/></svg>
 
     </a>
-    <label class="md-header__button md-icon" for="__drawer" aria-label="Navigation">
+    <label class="md-header__button md-icon" for="__drawer">
       
       <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
+      <span class="md-visually-hidden">Navigation</span>
     </label>
     <div class="md-header__title" data-md-component="header-title">
       <div class="md-header__ellipsis">
@@ -167,9 +168,10 @@
     
       
       
-        <label class="md-header__button md-icon" for="__search" aria-label="Search">
+        <label class="md-header__button md-icon" for="__search">
           
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
+          <span class="md-visually-hidden">Search</span>
         </label>
         <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
   <button type="button" class="md-search__button">
@@ -1500,6 +1502,45 @@
   
 </li>
         
+          <li class="md-nav__item">
+  <a href="#worktree-workspaces" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Worktree Workspaces
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Worktree Workspaces">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#lifecycle-operations-and-recovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Lifecycle operations and recovery
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#baseline-capture-semantics-and-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Baseline capture semantics and limits
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
       </ul>
     </nav>
   
@@ -1698,6 +1739,33 @@
     
   
   Delegation
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+                
+              
+                
+                  
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="./worktrees/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+  Git Worktree Workspaces
 
     
   </span>
@@ -2140,6 +2208,125 @@
 <li><strong>Event-driven schedules</strong>: Trigger on file changes, knowledge ingestion</li>
 <li><strong>Automation</strong>: Background tasks for maintenance and analysis</li>
 </ul>
+<h3 id="worktree-workspaces">Worktree Workspaces</h3>
+<p>Sessions execute in one of two modes: <strong>local</strong> (the default — the working
+directory you launched from) or <strong>isolated</strong> (a managed Git linked worktree
+created for the session). Isolation is strictly opt-in: sessions without
+isolation options keep existing local behavior unchanged.</p>
+<p>Key model invariants:</p>
+<ul>
+<li><strong>Project identity vs checkout identity</strong>: A project is identified by its
+  canonical Git common directory, so every linked worktree of one repository
+  shares a single project identity. Each checkout (the main working tree or a
+  linked worktree) keeps its own execution path; code indexes and snapshot
+  state are keyed by checkout identity, never shared by project identity.</li>
+<li><strong>Snapshot storage is separate</strong>: The undo/redo snapshot cache remains a
+  disposable, path-keyed store. Managed worktrees never live inside it —
+  isolated worktree storage is durable and lives under the storage root you
+  pass to <code>WorkspaceService::new</code> (there is no built-in default), laid out as
+  <code>&lt;storage-root&gt;/&lt;repo-slug&gt;/&lt;workspace-id&gt;</code>, never inside your project.</li>
+<li><strong>Single writable owner</strong>: A managed workspace is bound to at most one
+  writable session; additional connections to that same session are fine, a
+  second writable session attachment is rejected. Forks and delegates receive
+  their own workspaces.</li>
+<li><strong>Explicit lifecycle</strong>: Workspaces track durable states
+  (<code>provisioning → ready</code>, with <code>failed</code>, <code>missing</code>, <code>archived</code>, <code>removing</code>,
+  <code>removed</code>)
+  so crashes and externally deleted checkouts are detected and recoverable.
+  Removal never reuses a checkout path.</li>
+<li><strong>Delegation defaults</strong>: Delegates of isolated sessions run isolated by
+  default; local sessions keep shared (in-place) delegation unless isolation
+  is configured or explicitly requested. Shared execution is always
+  disclosed as shared — isolation is never faked, and it is not filesystem
+  sandboxing: delegates operate on a real checkout of the same repository.</li>
+</ul>
+<h4 id="lifecycle-operations-and-recovery">Lifecycle operations and recovery</h4>
+<p>The durable lifecycle (<code>provisioning</code>, <code>ready</code>, <code>failed</code>, <code>missing</code>,
+<code>archived</code>, <code>removing</code>, <code>removed</code>) is inspected and advanced through three workspace
+operations. None of them has a force flag:</p>
+<ul>
+<li><strong>status</strong> — live observation only: whether the checkout exists, whether
+  Git registers it on the managed branch, uncommitted/untracked/ignored
+  files, the checked-out branch, and how many commits the managed branch is
+  ahead of the recorded baseline. Dirty/clean is observed live, never
+  persisted as lifecycle state.</li>
+<li><strong>reconcile</strong> — when a checkout directory disappeared (deleted
+  externally), the workspace is marked <code>missing</code> with a diagnostic. Missing
+  workspaces are never silently re-created and never fall back to executing
+  in the original checkout.</li>
+<li><strong>remove</strong> — explicitly conservative. Removal is refused while a session
+  owns the workspace, while the checkout contains uncommitted, untracked, or
+  ignored files, when the directory is not a registered checkout of the
+  managed branch (externally owned content is never deleted), and when the
+  branch contains commits beyond the baseline that no retained result
+  reference preserves. On success it reports exactly what was deleted and
+  which refs (if any) were retained.</li>
+</ul>
+<p>Recovering interrupted operations:</p>
+<ol>
+<li><strong>Crash during creation</strong> — a crash between persisting the intent and
+   finishing the checkout leaves the workspace <code>provisioning</code>. Recovery
+   replays the idempotent provisioning steps (branch, checkout, binding) and
+   the workspace becomes <code>ready</code>. Pre-existing unknown directories at the
+   checkout path are preserved and reported, never overwritten.</li>
+<li><strong>Externally deleted checkout</strong> — the next status/reconcile marks the
+   workspace <code>missing</code>. Re-create the workspace (a new isolated session) or
+   remove the record explicitly; a <code>missing</code> workspace with no unpreserved
+   commits can be removed safely, which prunes the stale Git metadata.</li>
+<li><strong>Failed allocation</strong> — the record carries <code>last_error</code> naming the
+   failing step. Fix the cause (missing Git, invalid ref, absent
+   subdirectory) and retry creation; the failed record can be removed
+   explicitly.</li>
+</ol>
+<p>There is deliberately <strong>no force-delete</strong>. To remove a workspace you must
+detach its session owner, deal with its contents yourself (commit, or delete
+files), and retain or integrate any commits. Refusals name the blocking
+state and leave every file in place.</p>
+<h4 id="baseline-capture-semantics-and-limits">Baseline capture semantics and limits</h4>
+<p>When a delegate (or an isolated session created with
+<code>include-local-changes</code>) must see the parent's uncommitted work, QueryMT
+captures the parent's <em>actual working contents</em> into a private, immutable
+Git baseline before the child launches. What that means, precisely:</p>
+<ul>
+<li><strong>Supported Git layouts</strong>: ordinary non-bare repositories and linked
+  worktrees with at least one commit. The capture refuses — with an
+  explicit diagnostic, before any child starts — repositories with unborn
+  HEAD, unresolved merge conflicts, sparse checkouts, submodules, or
+  Git-LFS-managed content, rather than silently producing an incomplete
+  checkout.</li>
+<li><strong>Working contents, not the staging partition</strong>: a partially staged file
+  contributes its <em>working-file</em> content to the baseline. The parent's
+  index is not read as the source of truth and is left byte-for-byte
+  unchanged; the parent's HEAD, branch, stash, and working files are never
+  modified either.</li>
+<li><strong>Tracked and untracked handling</strong>: tracked working edits and tracked
+  deletions are captured, including tracked files that happen to match
+  <code>.gitignore</code> patterns and tracked dotfiles. Non-ignored untracked files
+  are included. <strong>Ignored untracked files are excluded</strong> (secrets,
+  <code>node_modules</code>, environment files) and that exclusion is disclosed in the
+  capture result.</li>
+<li><strong>File semantics preserved</strong>: executable bits, symlinks, binary contents,
+  and tracked hidden paths are captured with their real Git semantics —
+  the capture drives Git's own index machinery.</li>
+<li><strong>Shared batch baselines</strong>: delegates dispatched as one parallel batch
+  are captured once and start from identical contents. Delegates requested
+  later capture the parent's then-current state, so subsequent parent
+  edits are visible to them.</li>
+<li><strong>Private objects stay private</strong>: baseline commits use an internal
+  <code>QueryMT</code> identity, never require or use your commit identity, and never
+  run commit hooks. They live only in your local object database under
+  managed refs (<code>refs/qmt/baselines/…</code>) that keep them reachable; QueryMT
+  never pushes private refs anywhere. Note that captured baselines can
+  therefore contain secret-looking content that exists in your working
+  tree.</li>
+<li><strong>External writers</strong>: QueryMT coordinates its own writers with a
+  checkout-scoped mutation gate and validates a HEAD/working-state manifest
+  around the capture window, retrying a bounded number of times when an
+  external editor changes files mid-capture, then failing explicitly. This
+  is cooperation, not a transactional snapshot: a write that lands after
+  validation is not detectable, and shell/MCP tool writes are opaque to
+  the gate by design.</li>
+</ul>
 <h2 id="getting-started">Getting Started</h2>
 <h3 id="quick-start">Quick Start</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span>
@@ -2337,7 +2524,7 @@
       <script id="__config" type="application/json">{"annotate":null,"base":"..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../assets/javascripts/workers/search.c47bb847.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../assets/javascripts/bundle.a2388154.min.js"></script>
+      <script src="../assets/javascripts/bundle.10ee5ab6.min.js"></script>
       
     
   </body>
