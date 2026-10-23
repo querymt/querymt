@@ -133,6 +133,117 @@ async fn remote_create_keeps_explicit_owner_profile_and_rejects_invalid_selectio
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn remote_delegate_child_reuses_session_listing_attach_and_bookmarked_load() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer.handle.set_mesh(mesh.clone());
+    let (owner, _dir) = owner_profiles_fixture("cdr").await;
+    let (node_id, _) = register_remote_node(mesh, &owner, "delegate-child", true).await;
+    let parent = owner
+        .handle
+        .new_session(NewSessionRequest::new(std::path::PathBuf::new()))
+        .await
+        .unwrap();
+    let profiles = owner.handle.profiles().unwrap();
+    let runtime = profiles.runtime_for_profile("cdr").await.unwrap();
+    let delegate = runtime.agent().delegate("coder").unwrap();
+    let (child_id, child_ref) = delegate
+        .create_delegation_session(None, parent.session_id.to_string())
+        .await
+        .unwrap();
+    let mut binding = runtime.session_binding();
+    binding.agent_id = Some("coder".into());
+    profiles.set_session_binding(&child_id, binding).await;
+    profiles.set_active_profile("alpha").await.unwrap();
+    child_ref.set_mode(AgentMode::Review).await.unwrap();
+    delegate
+        .as_any()
+        .downcast_ref::<LocalAgentHandle>()
+        .unwrap()
+        .config
+        .event_sink
+        .emit_durable(
+            &child_id,
+            AgentEventKind::PromptReceived {
+                content: "Delegate conversation".into(),
+                message_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    for scope in ["root", "all"] {
+        let listed = viewer
+            .handle
+            .list_sessions(
+                serde_json::from_value(serde_json::json!({
+                    "_meta": {"session_scope": scope, "remoteNodeIds": [node_id]}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let child = listed
+            .sessions
+            .iter()
+            .find(|session| session.session_id.to_string() == child_id);
+        if scope == "root" {
+            assert!(child.is_none());
+        } else {
+            let meta = child.unwrap().meta.as_ref().unwrap();
+            assert_eq!(meta["nodeId"], node_id);
+            assert_eq!(meta["parentSessionId"], parent.session_id.to_string());
+            assert_eq!(meta["forkOrigin"], "delegation");
+        }
+    }
+    let attached = ext_method_json(
+        &viewer.handle,
+        "querymt/remote/attachSession",
+        serde_json::json!({"node_id": node_id, "session_id": child_id}),
+    )
+    .await;
+    assert_eq!(attached["profile_id"], "cdr");
+    assert_eq!(attached["config_options"][0]["currentValue"], "review");
+    assert!(
+        attached["snapshot"]["audit"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event["kind"]["type"] == "prompt_received"
+                    && event["kind"]["data"]["content"] == "Delegate conversation"
+            })
+    );
+    let loaded = viewer
+        .handle
+        .load_session(LoadSessionRequest::new(
+            child_id.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(loaded.meta.as_ref().unwrap()["nodeId"], node_id);
+    let bookmark = viewer
+        .storage
+        .session_store()
+        .get_remote_session_bookmark(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bookmark.node_id, node_id);
+    assert!(
+        viewer
+            .storage
+            .session_store()
+            .get_session(&child_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn remote_delegate_controls_reach_owner_and_preserve_revision_errors() {
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let viewer = RealStorageHandleFixture::new().await;
