@@ -188,7 +188,7 @@ pub struct SessionActor {
     // Tracks owned EventForwarder tasks by relay actor so replacement, unsubscribe,
     // and SessionActor teardown cancel the corresponding background task.
     pub(crate) relay_forwarder_handles:
-        HashMap<u64, crate::agent::remote::event_forwarder::EventForwarderHandle>,
+        HashMap<kameo::actor::ActorId, crate::agent::remote::event_forwarder::EventForwarderHandle>,
 }
 
 impl Actor for SessionActor {
@@ -204,6 +204,33 @@ impl Actor for SessionActor {
         _actor_ref: kameo::actor::ActorRef<Self>,
     ) -> Result<Self, Self::Error> {
         Ok(args)
+    }
+
+    async fn on_link_died(
+        &mut self,
+        _actor_ref: kameo::actor::WeakActorRef<Self>,
+        id: kameo::actor::ActorId,
+        reason: kameo::error::ActorStopReason,
+    ) -> Result<std::ops::ControlFlow<kameo::error::ActorStopReason>, Self::Error> {
+        use kameo::error::ActorStopReason;
+        use std::ops::ControlFlow;
+        // An event subscriber observes the session; it does not own its lifetime.
+        if self.relay_forwarder_handles.remove(&id).is_some() {
+            return Ok(ControlFlow::Continue(()));
+        }
+        Ok(match reason {
+            ActorStopReason::Normal | ActorStopReason::SupervisorRestart => {
+                ControlFlow::Continue(())
+            }
+            #[cfg(feature = "remote")]
+            ActorStopReason::PeerDisconnected => {
+                ControlFlow::Break(ActorStopReason::PeerDisconnected)
+            }
+            reason => ControlFlow::Break(ActorStopReason::LinkDied {
+                id,
+                reason: Box::new(reason),
+            }),
+        })
     }
 
     /// Release the session's ordered event stream once everything emitted so
@@ -1597,13 +1624,8 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                     })?
             };
 
-            // Completed forwarders no longer own a live subscription. Prune them
-            // before installing a generation so repeated reconnects cannot leave
-            // finished task handles in the session actor.
-            self.relay_forwarder_handles
-                .retain(|_, handle| !handle.is_finished());
-
-            if let Some(prev_handle) = self.relay_forwarder_handles.remove(&msg.relay_actor_id) {
+            let relay_id = relay_ref.id();
+            if let Some(prev_handle) = self.relay_forwarder_handles.remove(&relay_id) {
                 prev_handle.abort();
                 log::debug!(
                     "Session {}: SubscribeEvents relay_actor_id={} - aborted previous forwarder",
@@ -1619,8 +1641,7 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                 format!("session:{}", self.session_id),
                 self.session_id.clone(),
             );
-            self.relay_forwarder_handles
-                .insert(msg.relay_actor_id, handle);
+            self.relay_forwarder_handles.insert(relay_id, handle);
 
             // Re-emit readiness if indexing completed before the live path existed.
             if let Some(workspace) = self.runtime.workspace_handle.get()
@@ -1674,7 +1695,12 @@ impl Message<crate::agent::messages::UnsubscribeEvents> for SessionActor {
         msg: crate::agent::messages::UnsubscribeEvents,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if let Some(handle) = self.relay_forwarder_handles.remove(&msg.relay_actor_id) {
+        let relay_id = self
+            .relay_forwarder_handles
+            .keys()
+            .find(|id| id.sequence_id() == msg.relay_actor_id)
+            .copied();
+        if let Some(handle) = relay_id.and_then(|id| self.relay_forwarder_handles.remove(&id)) {
             handle.abort();
             info!(
                 "Session {}: UnsubscribeEvents relay_actor_id={} — forwarder task aborted",
@@ -3469,6 +3495,68 @@ mod tests {
                 history_writes,
             }
         }
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn only_observer_link_failures_are_isolated() {
+        use crate::agent::remote::event_relay::EventRelayActor;
+        crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let fixture = ActorFixture::new().await;
+        let relay = EventRelayActor::spawn(EventRelayActor::new(
+            fixture.config.event_sink.clone(),
+            "test-session".into(),
+            "viewer".into(),
+            None,
+            None,
+        ));
+        fixture
+            .actor_ref
+            .ask(SubscribeEvents {
+                relay_actor_id: relay.id().sequence_id(),
+                relay_ref: Some(relay.clone().into_remote_ref().await),
+                relay_dht_name: None,
+                after_source_seq: None,
+            })
+            .await
+            .unwrap();
+        relay.link(&fixture.actor_ref).await;
+        relay.kill();
+        relay.wait_for_shutdown().await;
+        // Drain the link notification before asking the owner to change its state.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        fixture
+            .actor_ref
+            .ask(SetReasoningEffort {
+                effort: Some(ReasoningEffort::High),
+            })
+            .await
+            .expect("observer death must not stop the session");
+        assert_eq!(
+            fixture.actor_ref.ask(GetReasoningEffort).await.unwrap(),
+            Some(ReasoningEffort::High)
+        );
+        // Unrelated linked actors retain Kameo's failure propagation behavior.
+        let unrelated = EventRelayActor::spawn(EventRelayActor::new(
+            fixture.config.event_sink.clone(),
+            "test-session".into(),
+            "unrelated".into(),
+            None,
+            None,
+        ));
+        unrelated.link(&fixture.actor_ref).await;
+        unrelated.kill();
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fixture.actor_ref.wait_for_shutdown_result(),
+        )
+        .await
+        .expect("unrelated actor failures still propagate")
+        .unwrap();
+        assert!(matches!(
+            stopped,
+            kameo::error::ActorStopReason::LinkDied { .. }
+        ));
     }
 
     // ── Cursor-based event stream paging (plan §16) ──────────────────────────

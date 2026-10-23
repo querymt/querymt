@@ -171,6 +171,21 @@ async fn websocket_event_forwarder_preserves_multi_update_order() {
         },
     ));
 
+    let model: serde_json::Value = serde_json::from_str(
+        &timeout(Duration::from_secs(2), wire_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        model["params"]["update"]["sessionUpdate"],
+        "config_option_update"
+    );
+    assert_eq!(
+        model["params"]["update"]["configOptions"][0]["currentValue"],
+        "local/m"
+    );
     let first: serde_json::Value = serde_json::from_str(
         &timeout(Duration::from_secs(2), wire_rx.recv())
             .await

@@ -342,6 +342,103 @@ mod session_actor_ref_remote_tests {
         assert!(saw_assistant_text, "prompt updates stream from the host");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owner_finishes_and_persists_prompt_after_observer_dies() {
+        use crate::agent::remote::event_relay::EventRelayActor;
+        use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+        use std::sync::{Arc, Mutex};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let wait = Mutex::new(wait);
+        let ready = started.clone();
+        let response = Arc::new(move || {
+            ready.notify_one();
+            wait.lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            Ok(MockChatResponse::text_only("owner completed").into())
+        });
+        let mut mock = MockLlmProvider::new();
+        let reply = response.clone();
+        mock.expect_chat().returning(move |_| reply());
+        mock.expect_chat_with_tools()
+            .returning(move |_, _| response());
+        let owner = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+        let (session, actor, _, id) =
+            remote_session_ref_for_config("autonomy", owner.config.clone(), "mock-model").await;
+        let mesh = get_test_mesh().await;
+        owner.config.provider.set_mesh(Some(mesh.clone()));
+        session
+            .set_session_model(crate::agent::session_control::SessionModelSelection {
+                model_id: "mock/mock-model".into(),
+                provider_node_id: Some(mesh.peer_id().to_string()),
+            })
+            .await
+            .unwrap();
+        let viewer = TestAgent::new().await;
+        let relay = EventRelayActor::spawn(EventRelayActor::new(
+            viewer.config.event_sink.clone(),
+            id.clone(),
+            "owner".into(),
+            None,
+            None,
+        ));
+        session
+            .subscribe_events_direct(
+                relay.id().sequence_id(),
+                relay.clone().into_remote_ref().await,
+                "autonomy".into(),
+            )
+            .await
+            .unwrap();
+        let SessionActorRef::Remote { actor_ref, .. } = &session else {
+            unreachable!()
+        };
+        relay.link_remote(actor_ref).await.unwrap();
+        let prompt_session = session.clone();
+        let request =
+            crate::acp::protocol::PromptRequest::new(id.clone(), vec!["finish on owner".into()]);
+        let prompt = tokio::spawn(async move { prompt_session.prompt_agent(request).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+            .await
+            .unwrap();
+        relay.kill();
+        relay.wait_for_shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        session
+            .get_mode()
+            .await
+            .expect("owner remains responsive after observer failure");
+        release.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.stop_reason,
+            crate::acp::protocol::StopReason::EndTurn
+        );
+        let history = owner
+            .config
+            .provider
+            .history_store()
+            .get_history(&id)
+            .await
+            .unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|message| message.role == querymt::chat::ChatRole::Assistant)
+        );
+        session
+            .get_session_control()
+            .await
+            .expect("completed owner can be reattached without replay");
+        actor.kill();
+    }
+
     /// The same prompt-ordering guarantee holds for a remote-hosted session:
     /// updates relayed from the host reach the attached client before the
     /// prompt response, with no client bridge involved.

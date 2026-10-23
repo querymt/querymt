@@ -1570,12 +1570,23 @@ impl AcpLiveEventTranslator {
                 }
                 vec![SessionUpdate::SessionInfoUpdate(update)]
             }
-            AgentEventKind::ProviderChanged { .. } => {
+            AgentEventKind::ProviderChanged {
+                provider,
+                model,
+                provider_node_id,
+                ..
+            } => {
                 self.usage
                     .entry(session_id)
                     .or_default()
                     .observe(event.seq(), event.kind());
-                Vec::new()
+                vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                    vec![crate::agent::session_registry::model_config_option(
+                        provider,
+                        model,
+                        provider_node_id.as_deref(),
+                    )],
+                ))]
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
                 let usage = self.usage.entry(session_id).or_default();
@@ -6369,6 +6380,30 @@ mod session_update_tests {
                 [SessionUpdate::ConfigOptionUpdate(_)]
             ));
         }
+    }
+
+    #[test]
+    fn provider_change_projects_model_identity_to_all_clients() {
+        let event = envelope(
+            1,
+            AgentEventKind::ProviderChanged {
+                provider: "codex".into(),
+                model: "test-model".into(),
+                config_id: 1,
+                context_limit: None,
+                provider_node_id: Some("provider-node".into()),
+            },
+        );
+        let updates = AcpLiveEventTranslator::new().translate_updates(&event);
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+            panic!("model update");
+        };
+        let json = serde_json::to_value(update).unwrap();
+        assert_eq!(json["configOptions"][0]["currentValue"], "codex/test-model");
+        assert_eq!(
+            json["configOptions"][0]["_meta"]["querymt"]["modelEntry"]["node_id"],
+            "provider-node"
+        );
     }
 
     // ── 1.3 Zero-to-many ordering ──────────────────────────────────────────

@@ -131,6 +131,27 @@ pub fn config_options_with_profiles(
     options
 }
 
+/// The selected model's identity, independent of discovery/catalog availability.
+pub(crate) fn model_config_option(
+    provider: &str,
+    model: &str,
+    provider_node_id: Option<&str>,
+) -> SessionConfigOption {
+    let id = format!("{provider}/{model}");
+    SessionConfigOption::select(
+        "model",
+        "Model",
+        id.clone(),
+        vec![SessionConfigSelectOption::new(id.clone(), model)],
+    )
+    .meta(serde_json::Map::from_iter([(
+        "querymt".into(),
+        serde_json::json!({ "modelEntry": {
+            "id": id, "provider": provider, "model": model, "node_id": provider_node_id,
+        }}),
+    )]))
+}
+
 /// Controls how a materialized session actor is integrated with remote infra.
 pub struct SessionMaterializationOptions {
     pub attach_mesh_handle: bool,
@@ -931,14 +952,6 @@ pub(crate) async fn prepare_remote_attachment(
         );
     }
 
-    if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
-        abort_prepared_remote_attachment(candidate).await;
-        return Err(AgentError::RemoteActor(format!(
-            "failed to link event relay to remote session: {error}"
-        )));
-    }
-    candidate.linked = true;
-
     let relay_remote_ref = candidate.relay_ref.into_remote_ref().await;
     if let Err(error) = candidate
         .session_ref
@@ -961,6 +974,15 @@ pub(crate) async fn prepare_remote_attachment(
         )));
     }
 
+    // Register the observer before linking: a disconnect must be recognizable
+    // by the owner even if it happens while the attachment is being installed.
+    if let Err(error) = candidate.relay_ref.link_remote(&remote_ref).await {
+        abort_prepared_remote_attachment(candidate).await;
+        return Err(AgentError::RemoteActor(format!(
+            "failed to link event relay to remote session: {error}"
+        )));
+    }
+    candidate.linked = true;
     Ok(candidate)
 }
 
@@ -1047,23 +1069,23 @@ async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notif
         mesh,
     } = parts;
     if notify_remote {
-        if let Err(error) = session_ref
-            .unsubscribe_events(attachment_id, relay_dht_name.to_string())
-            .await
-        {
-            log::warn!(
-                "remote attachment cleanup: unsubscribe failed for {} (attachment_id={}): {}",
-                session_id,
-                attachment_id,
-                error
-            );
-        }
         if linked
             && let SessionActorRef::Remote { actor_ref, .. } = session_ref
             && let Err(error) = relay_ref.unlink_remote(actor_ref).await
         {
             log::warn!(
                 "remote attachment cleanup: unlink failed for {} (attachment_id={}): {}",
+                session_id,
+                attachment_id,
+                error
+            );
+        }
+        if let Err(error) = session_ref
+            .unsubscribe_events(attachment_id, relay_dht_name.to_string())
+            .await
+        {
+            log::warn!(
+                "remote attachment cleanup: unsubscribe failed for {} (attachment_id={}): {}",
                 session_id,
                 attachment_id,
                 error

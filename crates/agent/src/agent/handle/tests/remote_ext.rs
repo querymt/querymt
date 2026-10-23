@@ -667,6 +667,10 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         .set_mode(AgentMode::Plan)
         .await
         .expect("set owner mode");
+    owner_ref
+        .set_reasoning_effort(Some(ReasoningEffort::High))
+        .await
+        .expect("set owner reasoning");
 
     let catalog: Arc<dyn ProfileCatalog> = Arc::new(LocalProfileCatalog::builder().build());
     let profile = catalog
@@ -721,7 +725,13 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     .await;
     assert_eq!(attached["profile_id"], profile.id);
     assert_eq!(attached["profile_label"], profile.name);
-    assert_eq!(attached["config_options"].as_array().map(Vec::len), Some(1));
+    assert_eq!(attached["config_options"].as_array().map(Vec::len), Some(3));
+    assert_eq!(attached["config_options"][1]["currentValue"], "high");
+    assert_eq!(attached["config_options"][2]["id"], "model");
+    assert_eq!(
+        attached["config_options"][2]["_meta"]["querymt"]["modelEntry"]["provider"],
+        "mock"
+    );
     assert_eq!(attached["config_options"][0]["id"], "mode");
     assert_eq!(attached["config_options"][0]["currentValue"], "plan");
     let attachment_id = f
@@ -744,7 +754,7 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     let json = serde_json::to_value(response).expect("serialize load response");
     assert_eq!(json["_meta"]["profileId"], profile.id);
     assert_eq!(json["_meta"]["profileLabel"], profile.name);
-    assert_eq!(json["configOptions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["configOptions"], attached["config_options"]);
     assert_eq!(json["configOptions"][0]["id"], "mode");
     assert_eq!(json["configOptions"][0]["currentValue"], "plan");
     assert_eq!(
@@ -771,7 +781,11 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         config_option_value(&changed.config_options, "mode").as_deref(),
         Some("review")
     );
-    assert_eq!(changed.config_options.len(), 1);
+    assert_eq!(
+        config_option_value(&changed.config_options, "reasoning_effort").as_deref(),
+        Some("high")
+    );
+    assert!(config_option_value(&changed.config_options, "model").is_some());
     assert_eq!(
         owner_ref.get_mode().await.expect("owner mode"),
         AgentMode::Review
