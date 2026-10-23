@@ -22,7 +22,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.71">
+      <meta name="generator" content="zensical-0.0.72">
     
     
       
@@ -33,7 +33,7 @@
       
         
       
-      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.e442bf79.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/modern/main.4ab2de0c.min.css">
       
         
           
@@ -103,9 +103,10 @@
   <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-book-open" viewBox="0 0 24 24"><path d="M12 5v16M20.001 19A2 2 0 0 0 22 17V5a2 2 0 0 0-1.999-2L16 3.002A5 5 0 0 0 12 5a5 5 0 0 0-4-2H4a2 2 0 0 0-2 2v12a2 2 0 0 0 1.999 2H8a5 5 0 0 1 4 2 5 5 0 0 1 4-2z"/></svg>
 
     </a>
-    <label class="md-header__button md-icon" for="__drawer" aria-label="Navigation">
+    <label class="md-header__button md-icon" for="__drawer">
       
       <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-menu" viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h16"/></svg>
+      <span class="md-visually-hidden">Navigation</span>
     </label>
     <div class="md-header__title" data-md-component="header-title">
       <div class="md-header__ellipsis">
@@ -167,9 +168,10 @@
     
       
       
-        <label class="md-header__button md-icon" for="__search" aria-label="Search">
+        <label class="md-header__button md-icon" for="__search">
           
           <svg xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" class="lucide lucide-search" viewBox="0 0 24 24"><path d="m21 21-4.34-4.34"/><circle cx="11" cy="11" r="8"/></svg>
+          <span class="md-visually-hidden">Search</span>
         </label>
         <div class="md-search" data-md-component="search" role="dialog" aria-label="Search">
   <button type="button" class="md-search__button">
@@ -1658,6 +1660,67 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#accepting-a-delegate-result" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Accepting a delegate result
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Accepting a delegate result">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#how-an-acceptance-runs" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        How an acceptance runs
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#hooks" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Hooks
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#refusal-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Refusal codes
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#recovery-of-an-interrupted-acceptance" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Recovery of an interrupted acceptance
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#reviewing-and-integrating-results" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2469,8 +2532,10 @@ readable messages may be reworded; codes do not change.</p>
 <li>Inspect the retained child ID/path and <code>/worktree result &lt;id&gt;</code>. Review only
    baseline-to-result changes using the exact OIDs/refs in the response. A
    top-level workspace publishes its own delta with <code>/worktree publish</code>.</li>
-<li>Integrate that delta manually after review. No completion, cancellation,
-   disconnection, or command merges it for you.</li>
+<li>Integrate that delta after review. Completion, cancellation, disconnection
+   and commands never merge it for you; for delegates the parent session accepts
+   it explicitly (see <a href="#accepting-a-delegate-result">Accepting a delegate result</a>).
+   A top-level workspace's delta is integrated manually.</li>
 <li>Close the owning session and any explicitly shared delegates. From another
    local conversation, run <code>/worktree archive &lt;id&gt;</code>, then <code>/worktree remove &lt;id&gt;</code>.
    Archive permanently retires execution while preserving conversation history
@@ -2684,6 +2749,185 @@ delegation, and the worktree command surface keep working without a
 snapshot backend, and undo reports its usual unavailable-backend behavior
 rather than substituting workspace Git refs as undo history. Enabling
 isolation never silently enables snapshots when they were disabled.</p>
+<h2 id="accepting-a-delegate-result">Accepting a delegate result</h2>
+<p>A session that has reviewed an isolated delegate's retained result accepts it
+with the <code>accept_delegation_result</code> tool (<code>delegation_id</code> and the reviewed
+<code>result_commit</code>; no paths, commands or messages). Integration is deterministic
+runtime code, not a prompt:</p>
+<ul>
+<li>The delegate's change is exactly <code>baseline → result</code>. It is applied with a
+  three-way merge against the checkout's <strong>current</strong> <code>HEAD</code>, so when parallel
+  siblings share one baseline, the one accepted second is layered on top of the
+  one accepted first. Overlapping edits report a <strong>conflict</strong> and change nothing.</li>
+<li>The change becomes <strong>one commit on the checkout's current branch</strong> (the branch
+  is advanced directly). The message names the objective and carries
+  <code>QueryMT-Delegation</code>, <code>QueryMT-Workspace</code>, <code>QueryMT-Result</code> and
+  <code>QueryMT-Baseline</code> trailers. The author and committer come from the
+  repository's Git configuration (system, global and user config are read; a
+  missing identity is refused, none is invented).</li>
+<li>Local work is never swept in: only the paths in the delta are written and
+  committed. If any of them has staged, unstaged, untracked or ignored local
+  state, or the delegate's baseline already contained uncommitted edits to it,
+  the request is <strong>refused</strong> and nothing changes. Detached <code>HEAD</code>, an
+  in-progress merge/rebase/cherry-pick, sparse checkout, submodule changes and
+  unresolved conflicts are also refused.</li>
+<li>Accepting the same result again returns the original commit
+  (<code>refs/qmt/integrations/&lt;workspace-id&gt;/&lt;result-commit&gt;</code>); only the delegation's
+  parent session may accept, and never into the delegate's own workspace.</li>
+<li>A refusal or conflict is final for that result. Delegate the underlying change
+  again from the current state rather than patching by hand.</li>
+</ul>
+<h3 id="how-an-acceptance-runs">How an acceptance runs</h3>
+<p>No Git executable is involved. The whole transaction runs under the requesting
+session's checkout mutation gate (a checkout-keyed gate under the storage root
+when the session has none) and holds the checkout's real <code>index.lock</code> from the
+local-work check until the index is updated:</p>
+<ol>
+<li>Recover an unfinished earlier acceptance on the same checkout (see
+   <a href="#recovery-of-an-interrupted-acceptance">Recovery</a>), then check the replay
+   record.</li>
+<li>Preflight, compute the delta <code>baseline → result</code>, three-way merge it with
+   <code>HEAD</code>, and check local work.</li>
+<li>Persist an intent file in the checkout's per-worktree Git directory
+   (<code>qmt-integration-intent.json</code>) and write exactly the touched files, with
+   attribute filters, executable bits and symlinks.</li>
+<li>Run the hooks, then re-read what they staged, commit, and move the branch and
+   create the integration record in <strong>one compare-and-swap reference
+   transaction</strong>.</li>
+<li>Update the real index for the touched paths, release the lock, remove the
+   intent, then run <code>post-commit</code>.</li>
+</ol>
+<h3 id="hooks">Hooks</h3>
+<p><code>pre-commit</code>, <code>prepare-commit-msg &lt;file&gt; message</code> and <code>commit-msg &lt;file&gt;</code> run from
+<code>core.hooksPath</code> (default <code>&lt;common dir&gt;/hooks</code>) after the files are on disk, so
+they see the result. They run with the checkout root as working directory, a
+private index holding the merged tree as <code>GIT_INDEX_FILE</code>, <code>GIT_EDITOR=:</code>, and
+every other inherited <code>GIT_*</code> variable removed. A hook that is not an executable
+file is skipped, as Git does. Each hook is limited to 600 seconds and its whole
+process tree is killed on timeout. On Windows hooks run through <code>sh</code>; a present
+hook without <code>sh</code> is refused (<code>hook_requires_sh</code>).</p>
+<p>Differences from <code>git commit</code>:</p>
+<ul>
+<li>There is <strong>no <code>--no-verify</code></strong>: hooks cannot be skipped, by the model or anyone
+  else.</li>
+<li><code>post-commit</code> runs after the commit is final; its failure is logged and the
+  acceptance still succeeds.</li>
+<li>A hook may re-stage files this acceptance <strong>writes</strong> (a formatter, for
+  example) and the staged content is committed. Staging anything else is
+  refused (<code>hook_changed_paths_outside_delta</code>), including delta paths an earlier
+  sibling already integrated, because those were never checked for your local
+  work. That staging is left in the private index only, and nothing is
+  committed.</li>
+<li>A hook that edits a written file <strong>without</strong> re-staging it commits the
+  applied content; the edit stays in your working tree and shows up in
+  <code>git status</code> (the index entry is not given the edited file's stat data).</li>
+<li>Hooks see the whole working tree, including your unrelated uncommitted
+  work, which looks "unstaged" relative to the private index. Hook managers
+  that stash or restore unstaged changes around the hook (pre-commit,
+  lint-staged) will touch those files; if such a hook is killed by the
+  timeout mid-stash, recover your work from <code>git stash list</code>. Commit or stash
+  unrelated work first when such hooks are installed.</li>
+<li>The commit message is cleaned like <code>git commit -m</code> (trailing whitespace
+  stripped, blank runs collapsed); an empty message is refused
+  (<code>empty_commit_message</code>).</li>
+<li>Hook managers that rely on variables Git sets for <code>git commit</code> itself may
+  behave differently.</li>
+<li><strong>Commit signing is not supported.</strong> With <code>commit.gpgSign=true</code> the request is
+  refused (<code>signing_unsupported</code>) before anything is written; QueryMT never
+  creates an unsigned commit instead.</li>
+</ul>
+<h3 id="refusal-codes">Refusal codes</h3>
+<p>Every refusal leaves the branch, the index contents and your files as they were
+(the one exception, <code>hook_changed_paths_outside_delta</code>, leaves the hook's own
+edits in place).</p>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>invalid_result_commit</code>, <code>ambiguous_result_commit</code>, <code>result_not_found</code>, <code>delegation_not_complete</code>, <code>no_isolated_workspace</code>, <code>no_baseline</code>, <code>not_parent_session</code>, <code>wrong_repository</code>, <code>wrong_target</code></td>
+<td>The request does not match durable state</td>
+</tr>
+<tr>
+<td><code>integration_record_unreachable</code></td>
+<td>A record exists for this result, but its commit is not on the current branch (for example after a reset); delete the ref named in the message to accept again</td>
+</tr>
+<tr>
+<td><code>unborn_head</code>, <code>detached_head</code>, <code>operation_in_progress</code>, <code>sparse_checkout</code>, <code>unknown_object</code>, <code>missing_identity</code>, <code>signing_unsupported</code>, <code>unsupported_gitlink</code>, <code>unsupported_filter</code></td>
+<td>The checkout or result cannot be integrated natively</td>
+</tr>
+<tr>
+<td><code>index_locked</code></td>
+<td>An <code>index.lock</code> exists that QueryMT did not create</td>
+</tr>
+<tr>
+<td><code>unmerged_entries</code>, <code>touches_local_changes</code>, <code>baseline_local_edits</code></td>
+<td>Local work is in the way</td>
+</tr>
+<tr>
+<td><code>integration_pending</code></td>
+<td>An intent file appeared between recovery and apply (another writer outside the gate)</td>
+</tr>
+<tr>
+<td><code>branch_moved</code>, <code>head_changed</code></td>
+<td>The branch moved (or <code>HEAD</code> left it) while the acceptance ran, or an earlier interrupted acceptance cannot be resolved because of it</td>
+</tr>
+<tr>
+<td><code>touched_paths_edited</code></td>
+<td>An interrupted acceptance would be rolled back, but files it wrote were changed since</td>
+</tr>
+<tr>
+<td><code>commit_rejected</code></td>
+<td>A hook exited non-zero, timed out or could not start; the message names the hook and its output</td>
+</tr>
+<tr>
+<td><code>hook_changed_paths_outside_delta</code>, <code>empty_commit_message</code>, <code>hook_requires_sh</code></td>
+<td>The hook phase did not produce a committable result</td>
+</tr>
+</tbody>
+</table>
+<p>A conflict is reported separately and lists the overlapping paths.</p>
+<h3 id="recovery-of-an-interrupted-acceptance">Recovery of an interrupted acceptance</h3>
+<p>If the process dies mid-acceptance, the intent file names what was in flight and
+the next acceptance on the same checkout resolves it first, under the gate:</p>
+<ul>
+<li><strong>The branch is still at the recorded <code>HEAD</code></strong> (the usual case): the touched
+  paths are restored to <code>HEAD</code>, a record left by a torn reference transaction is
+  deleted if it still names the abandoned commit, and the scratch files and
+  intent are removed. Your other files are never touched. If any touched file
+  now holds content that is neither what the acceptance wrote nor what <code>HEAD</code>
+  has (you kept working after the crash), nothing is rolled back: recovery
+  refuses with <code>touched_paths_edited</code>, naming the files. Move or restore them,
+  then retry.</li>
+<li><strong>The branch is at the recorded commit</strong> (the process died after the reference
+  transaction): the record is recreated if missing and the real index is brought
+  in line with the commit. The acceptance then reports <code>Integrated</code> with that
+  commit. <code>post-commit</code> does not run in this case.</li>
+<li><strong>Anything else</strong> (the branch moved to some other commit): recovery refuses
+  with <code>branch_moved</code> and keeps the intent and your files for inspection.</li>
+</ul>
+<p>A reference transaction that fails part-way (one of branch and record updated,
+the other not) is not rolled back on the spot; the intent is kept and the same
+recovery finishes or undoes it consistently.</p>
+<p>To give up on an intent that cannot be recovered (after inspecting it), delete
+<code>qmt-integration-intent.json</code> and any <code>qmt-integration-*</code> scratch files from the
+checkout's Git directory (<code>git rev-parse --git-dir</code>), and restore the touched
+paths it lists yourself.</p>
+<p>A surviving <code>index.lock</code> is removed only when its identity (device, inode and
+creation time) matches the one recorded in the intent, which proves the
+interrupted acceptance created it. Any other lock, including a stale one from a
+Git process, is never removed; the acceptance is refused with <code>index_locked</code>
+until you remove it yourself. A hook rejection or a failure before the reference
+transaction is rolled back in the same call while the acceptance still holds the
+index lock, so a failed acceptance does not leave applied files behind; if that
+rollback cannot run, the error says so and the next acceptance retries it.</p>
+<p>Delegation completion does not mean the objective succeeded: a delegate that
+stopped without changing anything reports a result with no baseline-relative
+changes, and the summary says so instead of offering it for acceptance.</p>
 <h2 id="reviewing-and-integrating-results">Reviewing and integrating results</h2>
 <p>Nothing is ever merged back automatically. Delegates publish their uncommitted
 output automatically on completion; top-level workspaces publish explicitly
@@ -2900,7 +3144,7 @@ been applied or accepted — review the delta and integrate it yourself.</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../../assets/javascripts/workers/search.c47bb847.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.a2388154.min.js"></script>
+      <script src="../../assets/javascripts/bundle.10ee5ab6.min.js"></script>
       
     
   </body>
