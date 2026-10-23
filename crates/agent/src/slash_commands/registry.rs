@@ -46,6 +46,27 @@ impl SlashCommandRegistry {
         Self::default()
     }
 
+    /// Re-resolve the prompt catalog for a workspace checkout root.
+    ///
+    /// Workspace-bound sessions resolve their prompt sources from the bound
+    /// checkout so prompts and prompt includes reflect the workspace's
+    /// contents rather than the agent builder's working directory. Global
+    /// and configured-path includes follow the same discovery config as
+    /// agent startup.
+    pub fn registry_for_workspace(
+        config: &crate::config::SlashCommandsConfig,
+        workspace_root: &Path,
+    ) -> Self {
+        let sources = discovery::search_paths(
+            Some(workspace_root),
+            config.include_global,
+            config.include_project,
+            &config.paths,
+        );
+        let (registry, _diagnostics) = Self::from_sources(&sources, &config.scripts);
+        registry
+    }
+
     /// Register a single command. Later registrations of the same name overwrite.
     pub fn register(&mut self, command: SlashCommand) {
         self.by_name.insert(command.name.clone(), Arc::new(command));
@@ -156,10 +177,77 @@ mod tests {
     #[test]
     fn test_register_and_get() {
         let mut reg = SlashCommandRegistry::new();
-        reg.register(make_command("review", "Review changes", false));
+        let cmd = make_command("deploy", "Deploy the app", false);
+        reg.register(cmd);
+        assert!(reg.get("deploy").is_some());
+        assert!(reg.get("missing").is_none());
+    }
 
-        assert!(reg.get("review").is_some());
-        assert!(reg.get("nonexistent").is_none());
+    #[test]
+    fn registry_for_workspace_resolves_prompt_sources_from_the_checkout() {
+        let workspace = TempDir::new().unwrap();
+        let commands = workspace.path().join(".qmt/commands");
+        fs::create_dir_all(&commands).unwrap();
+        fs::write(
+            commands.join("deploy.md"),
+            "---\ndescription: Deploy the service\n---\nBody\n",
+        )
+        .unwrap();
+
+        let config = crate::config::SlashCommandsConfig {
+            enabled: true,
+            include_global: false,
+            include_project: true,
+            ..Default::default()
+        };
+
+        // The bound checkout's prompts are discovered from that root.
+        let registry = SlashCommandRegistry::registry_for_workspace(&config, workspace.path());
+        assert!(registry.get("deploy").is_some());
+
+        // A different checkout without the command yields an empty catalog.
+        let other = TempDir::new().unwrap();
+        let other_registry = SlashCommandRegistry::registry_for_workspace(&config, other.path());
+        assert!(other_registry.get("deploy").is_none());
+    }
+
+    #[test]
+    fn registry_for_workspace_preserves_script_and_configured_path_policy() {
+        let workspace = TempDir::new().unwrap();
+        let commands = workspace.path().join(".qmt/commands");
+        fs::create_dir_all(&commands).unwrap();
+        fs::write(
+            commands.join("needs-script.md"),
+            "---\ndescription: Needs a script\nrequires-script: true\n---\nBody\n",
+        )
+        .unwrap();
+        let extra = TempDir::new().unwrap();
+        fs::write(
+            extra.path().join("configured.md"),
+            "---\ndescription: Configured command\n---\nBody\n",
+        )
+        .unwrap();
+
+        let config = crate::config::SlashCommandsConfig {
+            enabled: true,
+            include_global: false,
+            include_project: true,
+            paths: vec![extra.path().to_path_buf()],
+            ..Default::default()
+        };
+
+        // Scripts are disabled by default: script-required commands stay
+        // hidden, while configured (non-workspace) sources remain part of
+        // the global command policy.
+        let registry = SlashCommandRegistry::registry_for_workspace(&config, workspace.path());
+        assert!(registry.get("needs-script").is_none());
+        assert!(registry.get("configured").is_some());
+
+        let mut scripts_enabled = config.clone();
+        scripts_enabled.scripts.enabled = true;
+        let registry =
+            SlashCommandRegistry::registry_for_workspace(&scripts_enabled, workspace.path());
+        assert!(registry.get("needs-script").is_some());
     }
 
     #[test]

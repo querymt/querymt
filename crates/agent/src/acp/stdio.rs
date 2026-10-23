@@ -1422,6 +1422,7 @@ mod stdio_tests {
         );
         tokio::task::yield_now().await;
         let delegation = crate::session::domain::Delegation {
+            isolation: Default::default(),
             id: 0,
             public_id: "delegation-1".into(),
             session_id: 0,
@@ -1455,6 +1456,7 @@ mod stdio_tests {
                     kind: crate::events::AgentEventKind::DelegationRequested {
                         delegation,
                         tool_call_id: Some("call-1".into()),
+                        batch_id: None,
                     },
                 },
             ));

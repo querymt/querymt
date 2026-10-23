@@ -79,6 +79,8 @@ impl LocalAgentHandle {
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             #[cfg(feature = "remote")]
             remote_connect_gates: Default::default(),
+            #[cfg(feature = "remote")]
+            remote_connect_cooldowns: Default::default(),
             model_inventory,
             oauth_service,
             profiles: Arc::new(ArcSwap::from_pointee(None)),
@@ -124,12 +126,118 @@ impl LocalAgentHandle {
         } else {
             self.config.slash_command_registry.clone()
         };
-        if registry.is_empty() {
+        // Prompt sources resolve from the session's bound checkout when it
+        // participates in workspace isolation, so prompts and prompt
+        // includes reflect the workspace's contents instead of the agent
+        // builder's working directory. Local sessions keep the registry
+        // built at agent startup.
+        //
+        // A live session advertises exactly the registry it expands prompts
+        // with (installed once at materialization), so the catalog and
+        // invocation cannot diverge while the session is active. Only
+        // sessions without a live local actor re-resolve from the checkout.
+        let registry = match self.live_session_slash_registry(session_id).await {
+            Some(Some(live)) => (*live).clone(),
+            Some(None) => registry,
+            None => self
+                .workspace_catalog_registry(session_id)
+                .await
+                .unwrap_or(registry),
+        };
+        let mut update = crate::slash_commands::acp::registry_to_acp_update(&registry);
+        if self.config.workspace_service().is_some() {
+            update
+                .available_commands
+                .retain(|cmd| cmd.name != "/worktree");
+            update.available_commands.push(crate::acp::protocol::AvailableCommand::new(
+                "/worktree", "Create and inspect isolated sessions; conservative removal, no automatic integration",
+            ).input(crate::acp::protocol::AvailableCommandInput::Unstructured(
+                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | remove <id> | recover <id> | archive <id>"),
+            )));
+        }
+        if update.available_commands.is_empty() {
             return None;
         }
-        Some(crate::slash_commands::acp::build_commands_notification(
-            session_id, &registry,
+        Some(crate::acp::protocol::SessionNotification::new(
+            session_id.to_owned(),
+            crate::acp::protocol::SessionUpdate::AvailableCommandsUpdate(update),
         ))
+    }
+
+    /// The slash registry of the live local session actor.
+    ///
+    /// - `None`: no live local actor for `session_id`.
+    /// - `Some(None)`: live session without a session-scoped registry
+    ///   (legacy local session; the agent-level registry applies).
+    /// - `Some(Some(registry))`: the registry the actor expands with.
+    async fn live_session_slash_registry(
+        &self,
+        session_id: &str,
+    ) -> Option<Option<Arc<crate::slash_commands::SlashCommandRegistry>>> {
+        let actor = {
+            let registry = self.registry_lock().await;
+            registry.local_actor_ref(session_id).cloned()
+        }?;
+        actor
+            .ask(crate::agent::messages::GetSessionSlashRegistry)
+            .mailbox_timeout(std::time::Duration::from_secs(5))
+            .reply_timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .ok()
+    }
+
+    /// Prompt catalog re-resolved from the session's bound workspace
+    /// checkout, when applicable.
+    ///
+    /// Returns `None` — keeping the agent-level registry — for local
+    /// sessions, absent workspace service, or disabled/absent discovery
+    /// config.
+    async fn workspace_catalog_registry(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::slash_commands::SlashCommandRegistry> {
+        let service = self.config.workspace_service()?;
+        let slash_config = self.config.slash_commands_config.as_ref()?;
+        if !slash_config.enabled {
+            return None;
+        }
+        // Same rule the session actor uses to expand prompts: any session
+        // executing inside a managed checkout (the owner, or a shared child
+        // such as a non-isolated delegate) resolves sources from that
+        // checkout's root, so the advertised catalog and execution agree.
+        let root = match service
+            .resolve_existing_session(session_id, None)
+            .await
+            .ok()?
+        {
+            Some(binding) => crate::worktree::resolve_repository(&binding.effective_cwd)
+                .map(|repo| repo.checkout.root)
+                .unwrap_or(binding.effective_cwd),
+            None => {
+                let cwd = self
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session(session_id)
+                    .await
+                    .ok()??
+                    .cwd?;
+                let repo = crate::worktree::resolve_repository(&cwd).ok()?;
+                service
+                    .registry()
+                    .get_workspace_by_checkout(&repo.checkout.root)
+                    .await
+                    .ok()??;
+                repo.checkout.root
+            }
+        };
+        Some(
+            crate::slash_commands::SlashCommandRegistry::registry_for_workspace(
+                slash_config,
+                &root,
+            ),
+        )
     }
 
     pub(super) async fn session_config_options(
@@ -558,9 +666,31 @@ impl LocalAgentHandle {
             .session_config_options(Some(&session_id), current_mode, reasoning_effort)
             .await?;
 
-        Ok(NewSessionResponse::new(session_id)
+        let response = NewSessionResponse::new(session_id.clone())
             .modes(crate::agent::session_registry::mode_state(current_mode))
-            .config_options(config_options))
+            .config_options(config_options);
+
+        // Disclose the resolved binding for isolated sessions only; a local
+        // session's response is unchanged.
+        let Some(service) = self.config.workspace_service() else {
+            return Ok(response);
+        };
+        let binding = service
+            .resolve_existing_session(&session_id, None)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        Ok(match binding {
+            Some(binding) => response.meta(
+                serde_json::json!({
+                    crate::acp::shared::QUERYMT_META_NAMESPACE: {
+                        crate::worktree::SESSION_WORKSPACE_META_KEY: binding.disclosure(),
+                    },
+                })
+                .as_object()
+                .cloned(),
+            ),
+            None => response,
+        })
     }
 
     /// Load an existing session. MCP attachments are resolved internally by

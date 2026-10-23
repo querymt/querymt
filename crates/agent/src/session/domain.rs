@@ -235,6 +235,13 @@ pub struct Delegation {
     pub verification_spec: Option<crate::verification::VerificationSpec>,
     /// AI-generated summary of parent planning conversation for coder context
     pub planning_summary: Option<String>,
+    /// Execution isolation for this delegate. Requested policy from the
+    /// delegate tool/request, persisted as the resolved policy (`shared` or
+    /// `isolated`) once the parent's execution mode is known. Legacy rows
+    /// without the column deserialize as `inherit`.
+    #[serde(default)]
+    #[typeshare(serialized_as = "string")]
+    pub isolation: crate::worktree::DelegationIsolation,
     pub status: DelegationStatus,
     /// Number of retry attempts for this objective
     pub retry_count: u32,
@@ -317,6 +324,14 @@ pub struct RevertState {
     pub snapshot_id: String,
     /// Backend type used (e.g., "git")
     pub backend_id: String,
+    /// Workspace provenance: the checkout the snapshot was captured
+    /// against. `None` for frames recorded before provenance existed —
+    /// those keep legacy behavior (treated as same-workspace). Frames
+    /// recorded against a different workspace than the current execution
+    /// cwd are rejected before any restore, so a cross-workspace redo can
+    /// never partially restore files.
+    #[serde(default)]
+    pub workspace_root: Option<std::path::PathBuf>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }

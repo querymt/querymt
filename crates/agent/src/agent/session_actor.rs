@@ -3,6 +3,7 @@
 //! Prompt execution uses `ctx.spawn()` so the actor stays responsive for
 //! `Cancel`, `SetMode`, and other messages between turns.
 
+use crate::acp::client_bridge::ClientBridgeSender;
 use crate::acp::protocol::{ExtResponse, PromptResponse, StopReason};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::core::{AgentMode, SessionRuntime, ToolConfig};
@@ -205,13 +206,42 @@ impl Actor for SessionActor {
         Ok(args)
     }
 
+    /// The only actors linked to a `SessionActor` are remote event relays
+    /// (one per client attachment). A relay dying, being killed on cleanup, or
+    /// its peer disconnecting means the *attachment* went away, never that the
+    /// session should: kameo's default would stop the session here, leaving a
+    /// dead actor behind that the node keeps handing out on resume.
+    async fn on_link_died(
+        &mut self,
+        _actor_ref: kameo::actor::WeakActorRef<Self>,
+        id: kameo::actor::ActorId,
+        reason: kameo::error::ActorStopReason,
+    ) -> Result<std::ops::ControlFlow<kameo::error::ActorStopReason>, Self::Error> {
+        info!(
+            "SessionActor {}: linked actor {} died ({}); keeping session alive",
+            self.session_id, id, reason
+        );
+        Ok(std::ops::ControlFlow::Continue(()))
+    }
+
     /// Release the session's ordered event stream once everything emitted so
     /// far is persisted, so stopped sessions do not keep a writer task alive.
     async fn on_stop(
         &mut self,
         _actor_ref: kameo::actor::WeakActorRef<Self>,
-        _reason: kameo::error::ActorStopReason,
+        reason: kameo::error::ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // kameo only logs stop reasons at trace level; surface unexpected
+        // stops so a dead session actor is diagnosable from telemetry.
+        match &reason {
+            kameo::error::ActorStopReason::Normal
+            | kameo::error::ActorStopReason::SupervisorRestart => {
+                debug!("SessionActor {} stopped: {}", self.session_id, reason);
+            }
+            _ => {
+                warn!("SessionActor {} stopped: {}", self.session_id, reason);
+            }
+        }
         self.config
             .event_sink
             .retire_session_stream(&self.session_id)
@@ -1181,6 +1211,19 @@ impl Message<GetSessionLimits> for SessionActor {
     }
 }
 
+impl Message<crate::agent::messages::GetSessionSlashRegistry> for SessionActor {
+    type Reply =
+        Result<Option<Arc<crate::slash_commands::SlashCommandRegistry>>, kameo::error::Infallible>;
+
+    async fn handle(
+        &mut self,
+        _msg: crate::agent::messages::GetSessionSlashRegistry,
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        Ok(self.runtime.slash_registry.get().cloned())
+    }
+}
+
 impl Message<GetRuntimeStatus> for SessionActor {
     type Reply = Result<SessionRuntimeStatus, kameo::error::Infallible>;
 
@@ -1263,15 +1306,23 @@ impl Message<Undo> for SessionActor {
             .ok_or(UndoError::NoWorkingDirectory)?
             .to_path_buf();
 
-        // Delegate to free function using our owned state
-        crate::agent::undo::undo_impl(
+        // Delegate to free function using our owned state, under the
+        // checkout mutation gate when one is configured so undo never
+        // interleaves with baseline capture or cooperating tool writes.
+        let fut = crate::agent::undo::undo_impl(
             backend.as_ref(),
             &self.config.provider,
             &self.session_id,
             &msg.message_id,
             &worktree,
-        )
-        .await
+        );
+        match self.runtime.mutation_gate.get() {
+            Some(gate) => match gate.run(fut).await {
+                Ok(inner) => inner,
+                Err(err) => Err(UndoError::Other(err.to_string())),
+            },
+            None => fut.await,
+        }
     }
 }
 
@@ -1292,13 +1343,20 @@ impl Message<Redo> for SessionActor {
             .ok_or(UndoError::NoWorkingDirectory)?
             .to_path_buf();
 
-        crate::agent::undo::redo_impl(
+        // Restore under the checkout mutation gate when one is configured.
+        let fut = crate::agent::undo::redo_impl(
             backend.as_ref(),
             &self.config.provider,
             &self.session_id,
             &worktree,
-        )
-        .await
+        );
+        match self.runtime.mutation_gate.get() {
+            Some(gate) => match gate.run(fut).await {
+                Ok(inner) => inner,
+                Err(err) => Err(UndoError::Other(err.to_string())),
+            },
+            None => fut.await,
+        }
     }
 }
 
@@ -2286,6 +2344,29 @@ fn normalized_run_instruction(prompt: &[crate::acp::protocol::ContentBlock]) -> 
     render_prompt_for_display(prompt)
 }
 
+/// Fixed-root editor integrations cannot serve a workspace-bound session:
+/// the client bridge resolves language queries against the editor's opened
+/// checkout, not this session's isolated managed workspace. Disable the
+/// bridge with an explicit diagnostic instead of silently serving the
+/// original checkout; the `language_query` tool then rejects with a clear
+/// error for such sessions.
+fn editor_bridge_for_workspace(
+    workspace_bound: bool,
+    bridge: Option<ClientBridgeSender>,
+) -> Option<ClientBridgeSender> {
+    if !workspace_bound {
+        return bridge;
+    }
+    if bridge.is_some() {
+        warn!(
+            "editor workspace-query bridge disabled: the session runs in an \
+             isolated managed workspace, but the editor client is bound to a \
+             different checkout; language queries are rejected for this session"
+        );
+    }
+    None
+}
+
 fn validate_model_image_support(
     prompt: &[crate::acp::protocol::ContentBlock],
     llm_config: Option<&LLMConfig>,
@@ -2424,6 +2505,12 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
         req.prompt.len()
     );
     let client_prompt_id = client_prompt_id_from_meta(req.meta.as_ref());
+    if req.prompt.iter().any(|block| matches!(block,
+        crate::acp::protocol::ContentBlock::Text(text) if text.text.split_whitespace().next() == Some("/worktree"))) {
+        return Err(AgentError::InvalidPromptContent {
+            message: "native /worktree administration must be submitted through session/prompt, not scheduled or queued model input".to_string(),
+        });
+    }
     validate_prompt_blocks(&req.prompt)?;
 
     // Acquire execution permit (blocking with timeout)
@@ -2525,7 +2612,10 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
     .with_execution_origin(execution_origin)
     .with_knowledge_store(config.knowledge_store())
     .with_event_sink(config.event_sink.clone())
-    .with_workspace_query_bridge(config.workspace_query_bridge_for_session(&session_id))
+    .with_workspace_query_bridge(editor_bridge_for_workspace(
+        runtime.managed_checkout.get().copied().unwrap_or(false),
+        config.workspace_query_bridge_for_session(&session_id),
+    ))
     .with_turn_id(run_id.clone())
     .with_turn_mode(mode)
     .with_steering(steering)
@@ -2537,9 +2627,17 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
 
     // 4. Slash command expansion (before storing user messages)
     let mut req = req;
+    // Managed sessions expand against the registry resolved from their
+    // bound checkout, matching the advertised catalog; legacy local
+    // sessions keep the agent-level registry built at startup.
+    let slash_registry = runtime
+        .slash_registry
+        .get()
+        .map(Arc::as_ref)
+        .unwrap_or(&config.slash_command_registry);
     if let Some(crate::acp::protocol::ContentBlock::Text(text_content)) = req.prompt.first()
         && let Some(expansion) =
-            crate::slash_commands::try_expand(&text_content.text, &config.slash_command_registry)
+            crate::slash_commands::try_expand(&text_content.text, slash_registry)
     {
         log::info!(
             "Session {}: expanding slash command '/{}'",
@@ -2801,6 +2899,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
                                 let patch_part = MessagePart::TurnSnapshotPatch {
                                     turn_id: run_id.clone(),
                                     snapshot_id: post_snapshot_id.clone(),
+                                    workspace_root: Some(worktree.to_path_buf()),
+                                    inherited: false,
                                     changed_paths: changed
                                         .iter()
                                         .map(|p| p.to_string_lossy().to_string())
@@ -2901,6 +3001,8 @@ pub(crate) async fn ensure_pre_turn_snapshot_ready(
             let start_part = MessagePart::TurnSnapshotStart {
                 turn_id,
                 snapshot_id,
+                workspace_root: exec_ctx.runtime.cwd.clone(),
+                inherited: false,
             };
             let snapshot_msg = AgentMessage {
                 id: Uuid::new_v4().to_string(),
@@ -2940,6 +3042,29 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+
+    #[test]
+    fn editor_bridge_is_disabled_for_workspace_bound_sessions() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let bridge = Some(ClientBridgeSender::new(tx));
+
+        // Local sessions keep the editor bridge.
+        assert!(
+            editor_bridge_for_workspace(false, bridge.clone()).is_some(),
+            "local sessions keep the editor bridge"
+        );
+
+        // Workspace-bound sessions must not silently serve the editor's
+        // original checkout through the fixed-root bridge.
+        assert!(
+            editor_bridge_for_workspace(true, bridge).is_none(),
+            "workspace-bound sessions must not serve the original checkout"
+        );
+        assert!(
+            editor_bridge_for_workspace(true, None).is_none(),
+            "no bridge stays no bridge"
+        );
+    }
     use crate::agent::agent_config_builder::AgentConfigBuilder;
     use crate::agent::core::ToolPolicy;
     use crate::events::DurableEvent;

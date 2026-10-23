@@ -100,6 +100,12 @@ pub trait StorageBackend: Send + Sync {
     fn knowledge_store(&self) -> Option<Arc<dyn KnowledgeStore>> {
         None
     }
+
+    /// Managed worktree workspace registry (isolated Git execution workspaces).
+    /// Returns None if the backend cannot persist workspace records.
+    fn workspace_repository(&self) -> Option<Arc<dyn crate::worktree::WorkspaceRepository>> {
+        None
+    }
 }
 
 /// SQLite implementation of StorageBackend.
@@ -144,6 +150,12 @@ impl StorageBackend for SqliteStorage {
         Some(Arc::new(
             crate::knowledge::sqlite::SqliteKnowledgeStore::new(self.conn()),
         ))
+    }
+
+    fn workspace_repository(&self) -> Option<Arc<dyn crate::worktree::WorkspaceRepository>> {
+        Some(Arc::new(crate::worktree::SqliteWorkspaceRepository::new(
+            self.conn(),
+        )))
     }
 }
 

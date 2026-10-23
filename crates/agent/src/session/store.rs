@@ -80,6 +80,14 @@ impl RemoteSessionBookmark {
     }
 }
 
+/// Durable startup barrier for a copied conversation awaiting isolation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingForkIsolation {
+    pub source_session_id: String,
+    pub source_cwd: std::path::PathBuf,
+    pub options: crate::worktree::WorkspaceCreationOptions,
+}
+
 /// Represents the metadata for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
@@ -391,6 +399,21 @@ pub trait SessionStore: Send + Sync {
         ))
     }
 
+    /// Overwrite a session's durable working directory. Used when a session's
+    /// execution workspace changes durably — e.g. an isolated fork binding its
+    /// own checkout so the session row, workspace association, listing, load,
+    /// and resume all agree. Default stores reject the operation.
+    async fn set_session_cwd(
+        &self,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<()> {
+        let _ = (session_id, cwd);
+        Err(crate::session::error::SessionError::InvalidOperation(
+            "set_session_cwd is not supported by this store".to_string(),
+        ))
+    }
+
     /// None means this storage backend does not support durable assignments.
     /// Supporting backends return an empty snapshot for an existing, unconfigured session.
     async fn get_delegate_assignments(
@@ -461,6 +484,59 @@ pub trait SessionStore: Send + Sync {
         target_message_id: &str,
         fork_origin: ForkOrigin,
     ) -> SessionResult<String>;
+
+    /// Copy history and persist isolation intent in the same transaction.
+    /// Stores without this capability must reject isolated forks before copying.
+    async fn fork_session_with_isolation_intent(
+        &self,
+        source_session_id: &str,
+        target_message_id: &str,
+        fork_origin: ForkOrigin,
+        intent: Option<PendingForkIsolation>,
+    ) -> SessionResult<String> {
+        if intent.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "atomic fork isolation intent is unsupported by this store".into(),
+            ));
+        }
+        self.fork_session(source_session_id, target_message_id, fork_origin)
+            .await
+    }
+
+    /// Create a session and persist its non-runnable isolation barrier in the
+    /// same transaction. Stores without this capability must reject isolated
+    /// creation before the session row exists.
+    async fn create_session_with_isolation_intent(
+        &self,
+        name: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<String>,
+        fork_origin: Option<ForkOrigin>,
+        intent: Option<PendingForkIsolation>,
+    ) -> SessionResult<Session> {
+        if intent.is_some() {
+            return Err(SessionError::InvalidOperation(
+                "atomic session isolation intent is unsupported by this store".into(),
+            ));
+        }
+        self.create_session(name, cwd, parent_session_id, fork_origin)
+            .await
+    }
+
+    /// Return the pending isolation intent; absent for legacy local sessions.
+    async fn get_pending_fork_isolation(
+        &self,
+        _session_id: &str,
+    ) -> SessionResult<Option<PendingForkIsolation>> {
+        Ok(None)
+    }
+
+    /// Release the startup barrier only after workspace ownership and cwd persist.
+    async fn complete_fork_isolation(&self, _session_id: &str) -> SessionResult<()> {
+        Err(SessionError::InvalidOperation(
+            "fork isolation completion is unsupported by this store".into(),
+        ))
+    }
 
     /// Create or retrieve an LLM configuration
     async fn create_or_get_llm_config(&self, input: &LLMParams) -> SessionResult<LLMConfig>;
@@ -570,6 +646,13 @@ pub trait SessionStore: Send + Sync {
 
     /// Get fork information for a session
     async fn get_session_fork_info(&self, session_id: &str) -> SessionResult<Option<ForkInfo>>;
+
+    /// Resolve a session's public id and workspace cwd by internal row id
+    /// (fork records reference the parent session by internal id).
+    async fn get_session_ref_by_internal_id(
+        &self,
+        session_internal_id: i64,
+    ) -> SessionResult<Option<(String, Option<std::path::PathBuf>)>>;
 
     /// List child sessions (forks) of a parent session
     async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>>;

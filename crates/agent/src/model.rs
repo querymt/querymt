@@ -612,12 +612,20 @@ pub enum MessagePart {
     TurnSnapshotStart {
         turn_id: String,
         snapshot_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<std::path::PathBuf>,
+        #[serde(default)]
+        inherited: bool,
     },
     /// Turn snapshot patch: worktree state after turn completes, with changed files
     TurnSnapshotPatch {
         turn_id: String,
         snapshot_id: String,
         changed_paths: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_root: Option<std::path::PathBuf>,
+        #[serde(default)]
+        inherited: bool,
     },
 }
 

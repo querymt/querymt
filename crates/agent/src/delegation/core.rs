@@ -91,6 +91,9 @@ pub struct AgentInfo {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub required_capabilities: Vec<crate::tools::CapabilityRequirement>,
+    /// Configured isolation for tasks delegated to this agent (`inherit` unless set).
+    #[serde(default)]
+    pub isolation: crate::worktree::DelegationIsolation,
     #[serde(skip_serializing_if = "Option::is_none", rename = "_meta")]
     pub meta: Option<serde_json::Value>,
 }
@@ -170,6 +173,10 @@ pub struct DelegationOrchestrator {
     profile_id: Option<String>,
     /// Optional routing snapshot for per-agent routing decisions.
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
+    /// Workspace service for isolated delegation. `None` disables isolated
+    /// execution: delegates resolving to `isolated` fail closed instead of
+    /// silently sharing the parent's checkout.
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
 }
 
 impl DelegationOrchestrator {
@@ -197,6 +204,7 @@ impl DelegationOrchestrator {
             delegate_model_overrides: super::DelegateModelOverrideStore::default(),
             profile_id: None,
             routing_snapshot: None,
+            workspace_service: None,
         }
     }
 
@@ -263,6 +271,15 @@ impl DelegationOrchestrator {
         snapshot: crate::agent::remote::RoutingSnapshotHandle,
     ) -> Self {
         self.routing_snapshot = Some(snapshot);
+        self
+    }
+
+    /// Enable isolated delegation through the given workspace service.
+    pub fn with_workspace_service(
+        mut self,
+        service: Arc<crate::worktree::WorkspaceService>,
+    ) -> Self {
+        self.workspace_service = Some(service);
         self
     }
 
@@ -428,7 +445,11 @@ impl DelegationOrchestrator {
         }
         let session_id = envelope.session_id();
         match envelope.kind() {
-            AgentEventKind::DelegationRequested { delegation, .. } => {
+            AgentEventKind::DelegationRequested {
+                delegation,
+                batch_id,
+                ..
+            } => {
                 tracing::Span::current().record("event_kind", "DelegationRequested");
                 if let Some(profile_id) = self.profile_id.as_deref() {
                     let mut last_error = None;
@@ -529,6 +550,7 @@ impl DelegationOrchestrator {
                             target_agent_id: Some(&delegation.target_agent_id),
                             objective: Some(&delegation.objective),
                             child_session: None,
+                            execution_cwd: None,
                         },
                         &format!(
                             "Agent '{}' is not registered with a handle",
@@ -558,6 +580,8 @@ impl DelegationOrchestrator {
                 let active_delegations = self.active_delegations.clone();
                 let active_delegations_for_spawn = active_delegations.clone();
                 let hooks = self.hooks.clone();
+                let workspace_service = self.workspace_service.clone();
+                let batch_id = batch_id.clone();
                 let (start_tx, start_rx) = oneshot::channel();
 
                 // Store the cancellation token and join handle
@@ -584,6 +608,7 @@ impl DelegationOrchestrator {
                                         target_agent_id: Some(&delegation.target_agent_id),
                                         objective: Some(&delegation.objective),
                                         child_session: None,
+                                        execution_cwd: None,
                                     },
                                     "Delegation queue closed before execution could start",
                                 )
@@ -605,6 +630,8 @@ impl DelegationOrchestrator {
                             profile_id,
                             routing_snapshot,
                             cancellation: cancellation_for_spawn,
+                            workspace_service,
+                            batch_id,
                         };
                         execute_delegation(
                             ctx,
@@ -634,6 +661,7 @@ impl DelegationOrchestrator {
                             target_agent_id: None,
                             objective: None,
                             child_session: None,
+                            execution_cwd: None,
                         },
                         "Delegation cancelled because the orchestrator is shutting down",
                     )
@@ -748,6 +776,8 @@ struct DelegationContext {
     profile_id: Option<String>,
     routing_snapshot: Option<crate::agent::remote::RoutingSnapshotHandle>,
     cancellation: Arc<DelegationCancellation>,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    batch_id: Option<String>,
 }
 
 struct DelegationFailureContext<'a> {
@@ -761,6 +791,10 @@ struct DelegationFailureContext<'a> {
     target_agent_id: Option<&'a str>,
     objective: Option<&'a str>,
     child_session: Option<(&'a Arc<dyn crate::agent::handle::AgentHandle>, &'a str)>,
+    /// The delegate's effective execution cwd once its workspace/checkout
+    /// has been allocated; `None` for pre-allocation failures, which keep
+    /// explicit parent context only.
+    execution_cwd: Option<PathBuf>,
 }
 
 async fn teardown_failed_delegate_session(
@@ -843,34 +877,31 @@ async fn execute_delegation(
     let delegation_id = delegation.public_id.clone();
     let mut planning_context_additions = String::new();
 
-    let start_hook = ctx
-        .hooks
-        .run_delegation_start(DelegationStartRequest {
-            session_id: parent_session_id.clone(),
-            turn_id: String::new(),
-            cwd: ctx.config.cwd.clone(),
-            model: String::new(),
-            permission_mode: "default".to_string(),
-            delegation_id: delegation.public_id.clone(),
-            target_agent_id: delegation.target_agent_id.clone(),
-            objective: delegation.objective.clone(),
-            context: delegation.context.clone(),
-            constraints: delegation.constraints.clone(),
-            expected_output: delegation.expected_output.clone(),
-            status: "requested".to_string(),
-        })
+    // Isolated delegation fails closed without a workspace service: a
+    // requested isolation never falls back to sharing the parent checkout,
+    // and no child session is launched.
+    if delegation.isolation == crate::worktree::DelegationIsolation::Isolated
+        && (ctx.workspace_service.is_none() || !target.supports_local_workspaces())
+    {
+        fail_delegation(
+            DelegationFailureContext {
+                event_sink: &ctx.event_sink,
+                delegator: &ctx.delegator,
+                store: &ctx.store,
+                hooks: Some(&ctx.hooks),
+                config: &ctx.config,
+                parent_session_id: &parent_session_id,
+                delegation_id: &delegation.public_id,
+                target_agent_id: Some(&delegation.target_agent_id),
+                objective: Some(&delegation.objective),
+                execution_cwd: None,
+                child_session: None,
+            },
+            "isolated delegate execution requires a workspace service and local filesystem execution; no workspace service or unsupported remote target; requested isolation never falls back to shared execution",
+        )
         .await;
-    match start_hook {
-        Ok(result) => {
-            emit_hook_notices(&ctx.delegator, &parent_session_id, result.notices);
-            if !result.additional_contexts.is_empty() {
-                planning_context_additions = format!(
-                    "\n\n<hook-added-context>\n{}\n</hook-added-context>",
-                    result.additional_contexts.join("\n\n")
-                );
-            }
-        }
-        Err(_) => warn!("Delegation start hook failed"),
+        ctx.active_delegations.lock().await.remove(&delegation_id);
+        return;
     }
 
     // Snapshot the parent's current per-session setting. UI changes persist this value
@@ -895,6 +926,7 @@ async fn execute_delegation(
                         target_agent_id: Some(&delegation.target_agent_id),
                         objective: Some(&delegation.objective),
                         child_session: None,
+                        execution_cwd: None,
                     },
                     &error_message,
                 )
@@ -920,6 +952,7 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session: None,
+                    execution_cwd: None,
                 },
                 &error_message,
             )
@@ -944,6 +977,7 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session: None,
+                    execution_cwd: None,
                 },
                 &error_message,
             )
@@ -954,8 +988,13 @@ async fn execute_delegation(
     };
 
     // 1. Create session via AgentHandle trait
-    // Prefer parent session's cwd over orchestrator default
-    let parent_cwd = match ctx.store.get_session(&parent_session_id).await {
+    // Resolve the parent's effective cwd through the single session-cwd
+    // resolution path (worktree::WorkspaceService::resolve_session_cwd):
+    // the durable workspace binding wins over the persisted row cwd, which
+    // a fork copies from its source checkout. A bound parent whose
+    // workspace cannot be resolved fails the delegation closed — the child
+    // is never launched into a shared or source checkout as a fallback.
+    let persisted_parent_cwd = match ctx.store.get_session(&parent_session_id).await {
         Ok(Some(session)) => session.cwd,
         Ok(None) => {
             warn!("Parent session not found for cwd lookup, using orchestrator default");
@@ -966,19 +1005,233 @@ async fn execute_delegation(
             None
         }
     };
-    let effective_cwd = parent_cwd.or(ctx.config.cwd.clone());
+    let effective_cwd = match ctx.workspace_service.as_ref() {
+        Some(service) => {
+            match service
+                .resolve_session_cwd(&parent_session_id, persisted_parent_cwd.clone())
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(err) => {
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &ctx.event_sink,
+                            delegator: &ctx.delegator,
+                            store: &ctx.store,
+                            hooks: Some(&ctx.hooks),
+                            config: &ctx.config,
+                            parent_session_id: &parent_session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                            execution_cwd: None,
+                            child_session: None,
+                        },
+                        &format!("failed to resolve parent execution workspace: {err}"),
+                    )
+                    .await;
+                    ctx.active_delegations.lock().await.remove(&delegation_id);
+                    return;
+                }
+            }
+        }
+        None => persisted_parent_cwd,
+    }
+    .or(ctx.config.cwd.clone());
+    let source_parent_cwd = effective_cwd.clone();
+
+    // 1a. Isolated delegates allocate their private workspace BEFORE the
+    // child session exists; allocation errors fail the delegation closed —
+    // the child is never launched into shared execution. The parent's
+    // mutation gate is held only around batch baseline capture, never while
+    // waiting on the delegate.
+    let child_workspace = match (
+        delegation.isolation == crate::worktree::DelegationIsolation::Isolated,
+        ctx.workspace_service.as_ref(),
+    ) {
+        (true, Some(service)) => {
+            let Some(parent_cwd) = effective_cwd.clone() else {
+                fail_delegation(
+                    DelegationFailureContext {
+                        event_sink: &ctx.event_sink,
+                        delegator: &ctx.delegator,
+                        store: &ctx.store,
+                        hooks: Some(&ctx.hooks),
+                        config: &ctx.config,
+                        parent_session_id: &parent_session_id,
+                        delegation_id: &delegation.public_id,
+                        target_agent_id: Some(&delegation.target_agent_id),
+                        objective: Some(&delegation.objective),
+                        execution_cwd: None,
+                        child_session: None,
+                    },
+                    "isolated delegation requested but the parent session has no working directory",
+                )
+                .await;
+                ctx.active_delegations.lock().await.remove(&delegation_id);
+                return;
+            };
+            let parent_record = match service
+                .registry()
+                .get_workspace_by_session(&parent_session_id)
+                .await
+            {
+                Ok(record) => record,
+                Err(err) => {
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &ctx.event_sink,
+                            delegator: &ctx.delegator,
+                            store: &ctx.store,
+                            hooks: Some(&ctx.hooks),
+                            config: &ctx.config,
+                            parent_session_id: &parent_session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                            execution_cwd: Some(parent_cwd.clone()),
+                            child_session: None,
+                        },
+                        &format!("cannot resolve parent workspace: {err}"),
+                    )
+                    .await;
+                    ctx.active_delegations.lock().await.remove(&delegation_id);
+                    return;
+                }
+            };
+            let parent_gate = parent_record.as_ref().and_then(|record| {
+                crate::worktree::CheckoutMutationGate::new(
+                    service.storage_root(),
+                    &record.checkout_path,
+                )
+                .ok()
+            });
+            let batch_id = ctx
+                .batch_id
+                .clone()
+                .unwrap_or_else(|| delegation.public_id.clone());
+            match service
+                .allocate_for_delegation(
+                    &parent_session_id,
+                    parent_record.as_ref(),
+                    &parent_cwd,
+                    parent_gate.as_ref(),
+                    &delegation.public_id,
+                    Some(batch_id),
+                )
+                .await
+            {
+                Ok(binding) => Some(binding),
+                Err(err) => {
+                    fail_delegation(
+                        DelegationFailureContext {
+                            event_sink: &ctx.event_sink,
+                            delegator: &ctx.delegator,
+                            store: &ctx.store,
+                            hooks: Some(&ctx.hooks),
+                            config: &ctx.config,
+                            parent_session_id: &parent_session_id,
+                            delegation_id: &delegation.public_id,
+                            target_agent_id: Some(&delegation.target_agent_id),
+                            objective: Some(&delegation.objective),
+                            execution_cwd: None,
+                            child_session: None,
+                        },
+                        &format!("isolated workspace allocation failed: {err}"),
+                    )
+                    .await;
+                    ctx.active_delegations.lock().await.remove(&delegation_id);
+                    return;
+                }
+            }
+        }
+        (true, None) => unreachable!(
+            "the fail-closed gate above rejects isolated delegation without a workspace service"
+        ),
+        (false, _) => None,
+    };
+    // The delegate session always materializes in its own workspace when
+    // isolated — never in the parent's checkout.
+    let effective_cwd = child_workspace
+        .as_ref()
+        .map(|binding| binding.effective_cwd.clone())
+        .or(effective_cwd);
     let cwd_string = effective_cwd.as_ref().map(|p| p.display().to_string());
+
+    // delegation_start is a post-allocation hook: it identifies the
+    // delegate's actual execution root (the child workspace when isolated,
+    // the parent's checkout otherwise) rather than the orchestrator default.
+    // Its additional context feeds the delegate's planning prompt below.
+    let start_hook = ctx
+        .hooks
+        .run_delegation_start(DelegationStartRequest {
+            session_id: parent_session_id.clone(),
+            parent_cwd: source_parent_cwd.clone(),
+            turn_id: String::new(),
+            cwd: effective_cwd.clone(),
+            model: String::new(),
+            permission_mode: "default".to_string(),
+            delegation_id: delegation.public_id.clone(),
+            target_agent_id: delegation.target_agent_id.clone(),
+            objective: delegation.objective.clone(),
+            context: delegation.context.clone(),
+            constraints: delegation.constraints.clone(),
+            expected_output: delegation.expected_output.clone(),
+            status: "requested".to_string(),
+        })
+        .await;
+    match start_hook {
+        Ok(result) => {
+            emit_hook_notices(&ctx.delegator, &parent_session_id, result.notices);
+            if !result.additional_contexts.is_empty() {
+                planning_context_additions = format!(
+                    "\n\n<hook-added-context>\n{}\n</hook-added-context>",
+                    result.additional_contexts.join("\n\n")
+                );
+            }
+        }
+        Err(_) => warn!("Delegation start hook failed"),
+    }
     let (child_session_id, session_ref) = match async {
-        target
-            .create_delegation_session(cwd_string, parent_session_id.clone())
-            .await
+        match child_workspace.as_ref() {
+            Some(binding) => {
+                target
+                    .create_isolated_delegation_session(binding.clone(), parent_session_id.clone())
+                    .await
+            }
+            None => {
+                target
+                    .create_delegation_session(cwd_string, parent_session_id.clone())
+                    .await
+            }
+        }
     }
     .instrument(tracing::info_span!("delegation.create_session"))
     .await
     {
         Ok(result) => result,
         Err(e) => {
-            let error_message = format!("Failed to create session via kameo: {}", e);
+            // The child workspace was allocated before session creation. No
+            // session owns it, so mark it failed (resources retained for
+            // explicit recovery/removal) instead of leaving an orphaned
+            // Ready workspace, and disclose it in the failure.
+            if let (Some(binding), Some(service)) =
+                (child_workspace.as_ref(), ctx.workspace_service.as_ref())
+            {
+                let _ = service
+                    .mark_owner_binding_failed(
+                        &binding.record.id,
+                        &format!(
+                            "delegate session creation failed; workspace retained unused: {e}"
+                        ),
+                    )
+                    .await;
+            }
+            let error_message = format!(
+                "Failed to create session via kameo: {}{}",
+                e,
+                workspace_retention_note(child_workspace.as_ref())
+            );
             fail_delegation(
                 DelegationFailureContext {
                     event_sink: &ctx.event_sink,
@@ -991,10 +1244,12 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session: None,
+                    execution_cwd: child_workspace.as_ref().map(|b| b.effective_cwd.clone()),
                 },
                 &error_message,
             )
             .await;
+            ctx.active_delegations.lock().await.remove(&delegation_id);
             return;
         }
     };
@@ -1067,6 +1322,7 @@ async fn execute_delegation(
                 target_agent_id: Some(&delegation.target_agent_id),
                 objective: Some(&delegation.objective),
                 child_session,
+                execution_cwd: effective_cwd.clone(),
             },
             &format!("Failed to persist delegate session route: {err}"),
         )
@@ -1158,6 +1414,7 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session,
+                    execution_cwd: effective_cwd.clone(),
                 },
                 &format!("Failed to read delegate model assignment: {error}"),
             )
@@ -1193,6 +1450,7 @@ async fn execute_delegation(
                         target_agent_id: Some(&delegation.target_agent_id),
                         objective: Some(&delegation.objective),
                         child_session,
+                        execution_cwd: effective_cwd.clone(),
                     },
                     &error_message,
                 )
@@ -1231,6 +1489,7 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session,
+                    execution_cwd: effective_cwd.clone(),
                 },
                 &error_message,
             )
@@ -1272,6 +1531,7 @@ async fn execute_delegation(
                 target_agent_id: Some(&delegation.target_agent_id),
                 objective: Some(&delegation.objective),
                 child_session,
+                execution_cwd: effective_cwd.clone(),
             },
             &error_message,
         )
@@ -1447,6 +1707,21 @@ async fn execute_delegation(
                 },
             );
 
+            // Surface where the cancelled delegate's files remain
+            // recoverable; nothing is integrated or removed.
+            let retention = workspace_retention_note(child_workspace.as_ref());
+            if !retention.is_empty() {
+                emit_hook_notices(
+                    &ctx.delegator,
+                    &parent_session_id,
+                    vec![crate::hooks::HookNotice {
+                        event_name: "delegation_cancelled".to_string(),
+                        message: retention.trim_start().to_string(),
+                        is_error: false,
+                    }],
+                );
+            }
+
             let mut active = ctx.active_delegations.lock().await;
             active.remove(&delegation_id);
             return;
@@ -1458,8 +1733,11 @@ async fn execute_delegation(
             // Delegate stopped prematurely (e.g. context threshold, max turns, refusal).
             // This is NOT a successful completion — the delegate was cut short and its
             // output is likely truncated/incomplete.
-            let error_message =
-                format!("Delegate stopped prematurely: {:?}", response.stop_reason,);
+            let error_message = format!(
+                "Delegate stopped prematurely: {:?}{}",
+                response.stop_reason,
+                workspace_retention_note(child_workspace.as_ref())
+            );
             warn!(
                 "Delegation {} for agent '{}' stopped with {:?} instead of EndTurn",
                 delegation_id, delegation.target_agent_id, response.stop_reason,
@@ -1476,6 +1754,7 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session,
+                    execution_cwd: effective_cwd.clone(),
                 },
                 &error_message,
             )
@@ -1494,10 +1773,12 @@ async fn execute_delegation(
                             let agent_tool_registry = ctx.tool_registry.clone();
                             let service = VerificationService::new(agent_tool_registry.clone());
                             let verification_context = VerificationContext {
-                                session_id: parent_session_id.clone(),
+                                session_id: child_session_id.clone(),
                                 task_id: delegation.task_id.map(|id| id.to_string()),
                                 delegation_id: Some(delegation.public_id.clone()),
-                                cwd: ctx.config.cwd.clone(),
+                                // Verification runs in the delegate's own
+                                // checkout — never the orchestrator default.
+                                cwd: effective_cwd.clone(),
                                 tool_registry: agent_tool_registry.clone(),
                             };
                             let result = match service
@@ -1533,9 +1814,10 @@ async fn execute_delegation(
             .await;
 
             if !verification_passed {
-                let error_message =
-                    "Verification failed: The changes did not pass the specified verification checks."
-                        .to_string();
+                let error_message = format!(
+                    "Verification failed: The changes did not pass the specified verification checks.{}",
+                    workspace_retention_note(child_workspace.as_ref())
+                );
                 fail_delegation(
                     DelegationFailureContext {
                         event_sink: &ctx.event_sink,
@@ -1548,6 +1830,7 @@ async fn execute_delegation(
                         target_agent_id: Some(&delegation.target_agent_id),
                         objective: Some(&delegation.objective),
                         child_session,
+                        execution_cwd: effective_cwd.clone(),
                     },
                     &error_message,
                 )
@@ -1577,8 +1860,11 @@ async fn execute_delegation(
                 .hooks
                 .run_post_delegation(PostDelegationRequest {
                     session_id: parent_session_id.clone(),
+                    parent_cwd: source_parent_cwd.clone(),
                     turn_id: String::new(),
-                    cwd: ctx.config.cwd.clone(),
+                    // Execution hook: identifies the delegate's actual
+                    // execution root, not the orchestrator default.
+                    cwd: effective_cwd.clone(),
                     model: String::new(),
                     permission_mode: "default".to_string(),
                     delegation_id: delegation.public_id.clone(),
@@ -1599,6 +1885,84 @@ async fn execute_delegation(
                     }
                 }
                 Err(_) => warn!("Post-delegation hook failed"),
+            }
+
+            // 4b. Retain the delegate's uncommitted work as an immutable,
+            // baseline-relative review artifact before announcing
+            // completion. A capture error is disclosed but never fails the
+            // delegation or removes the workspace: the checkout and its
+            // files stay retained for manual recovery.
+            if let (Some(binding), Some(service)) =
+                (child_workspace.as_ref(), ctx.workspace_service.as_ref())
+            {
+                match service
+                    .publish_result(
+                        &binding.record,
+                        &binding.effective_cwd,
+                        Some(&binding.mutation_gate),
+                        Some(
+                            if ctx.config.run_verification
+                                && VerificationSpecBuilder::from_delegation(&delegation).is_some()
+                            {
+                                crate::worktree::ResultVerificationStatus::Passed
+                            } else {
+                                crate::worktree::ResultVerificationStatus::Skipped
+                            },
+                        ),
+                    )
+                    .await
+                {
+                    Ok(provenance) => {
+                        // Completion output carries the baseline-relative
+                        // review (changed paths and kinds) or an explicit
+                        // reference to it — never just an opaque commit id —
+                        // and never claims the result was integrated.
+                        let review = service
+                            .review_result(&binding.record, &provenance)
+                            .await
+                            .ok();
+                        match review {
+                            Some(review) => {
+                                summary.push_str(&format!(
+                                    "\n\nWorkspace result (retained for review; nothing was merged): \
+                                     workspace {}, branch {}, result {} (ref {}), captured HEAD {}, \
+                                     verification {}. Nothing was integrated; publish/review \
+                                     remain available through /worktree result {}.\n{}",
+                                    binding.record.id,
+                                    binding.record.branch.as_str(),
+                                    review.result_commit,
+                                    review.result_ref.as_deref().unwrap_or("(none)"),
+                                    review.captured_head,
+                                    review
+                                        .verification
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_else(|| "not reported".to_string()),
+                                    binding.record.id,
+                                    review.summary_text(),
+                                ));
+                            }
+                            None => {
+                                summary.push_str(&format!(
+                                    "\n\nWorkspace result (retained for review; nothing was merged): \
+                                     workspace {}, branch {}, result commit {} (ref {}). Review \
+                                     via /worktree result {}.",
+                                    binding.record.id,
+                                    binding.record.branch.as_str(),
+                                    provenance.result_commit.as_deref().unwrap_or("(none)"),
+                                    provenance.result_ref.as_deref().unwrap_or("(none)"),
+                                    binding.record.id,
+                                ));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        summary.push_str(&format!(
+                            "\n\nWorkspace result capture failed: {err}. The isolated \
+                             checkout and its files are retained unchanged for manual \
+                             recovery; nothing was integrated."
+                        ));
+                    }
+                }
             }
 
             match ctx
@@ -1655,7 +2019,11 @@ async fn execute_delegation(
             active.remove(&delegation_id);
         }
         Some(Err(e)) => {
-            let error_message = format!("Delegation failed: {}", e);
+            let error_message = format!(
+                "Delegation failed: {}{}",
+                e,
+                workspace_retention_note(child_workspace.as_ref())
+            );
             fail_delegation(
                 DelegationFailureContext {
                     event_sink: &ctx.event_sink,
@@ -1668,6 +2036,7 @@ async fn execute_delegation(
                     target_agent_id: Some(&delegation.target_agent_id),
                     objective: Some(&delegation.objective),
                     child_session,
+                    execution_cwd: effective_cwd.clone(),
                 },
                 &error_message,
             )
@@ -1679,6 +2048,22 @@ async fn execute_delegation(
         None => {
             // Already handled in the select! cancellation branch
         }
+    }
+}
+
+/// Retention note for terminal lifecycle outputs: where the isolated
+/// delegate's files remain recoverable after failure, cancellation, or a
+/// result-capture error. Empty for shared execution — nothing is retained.
+fn workspace_retention_note(child_workspace: Option<&crate::worktree::WorkspaceBinding>) -> String {
+    match child_workspace {
+        Some(binding) => format!(
+            " The isolated workspace {} at {} (branch {}) is retained with all its \
+             edits; nothing was integrated and the files remain recoverable.",
+            binding.record.id,
+            binding.record.checkout_path.display(),
+            binding.record.branch.as_str(),
+        ),
+        None => String::new(),
     }
 }
 
@@ -1783,7 +2168,9 @@ async fn fail_delegation(ctx: DelegationFailureContext<'_>, error_message: &str)
             .run_delegation_failure(DelegationFailureRequest {
                 session_id: ctx.parent_session_id.to_string(),
                 turn_id: String::new(),
-                cwd: ctx.config.cwd.clone(),
+                // The delegate's execution root once allocated; `None` keeps
+                // explicit parent context for pre-allocation failures.
+                cwd: ctx.execution_cwd.clone(),
                 model: String::new(),
                 permission_mode: "default".to_string(),
                 delegation_id: ctx.delegation_id.to_string(),
@@ -2433,6 +2820,7 @@ mod tests {
             .expect("session");
         let delegation = storage
             .create_delegation(Delegation {
+                isolation: Default::default(),
                 id: 0,
                 public_id: String::new(),
                 session_id: session.id,
@@ -2488,6 +2876,7 @@ mod tests {
                 kind: AgentEventKind::DelegationRequested {
                     delegation: delegation.clone(),
                     tool_call_id: None,
+                    batch_id: None,
                 },
             })
             .await
@@ -2545,6 +2934,7 @@ mod tests {
             None,
         );
         let delegation = Delegation {
+            isolation: Default::default(),
             id: 1,
             public_id: "delegation-1".to_string(),
             session_id: 1,
@@ -2568,8 +2958,268 @@ mod tests {
             .await;
     }
 
+    /// A stub handle that records delegation child-session launches.
+    struct CountingStubHandle {
+        child_launches: Arc<std::sync::atomic::AtomicUsize>,
+        event_fanout: Arc<EventFanout>,
+    }
+
+    impl CountingStubHandle {
+        fn new(child_launches: Arc<std::sync::atomic::AtomicUsize>) -> Arc<Self> {
+            Arc::new(Self {
+                child_launches,
+                event_fanout: Arc::new(EventFanout::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AgentHandle for CountingStubHandle {
+        async fn new_session(
+            &self,
+            _req: NewSessionRequest,
+        ) -> std::result::Result<NewSessionResponse, Error> {
+            Ok(NewSessionResponse::new("counting-session".to_string()))
+        }
+
+        async fn prompt(&self, _req: PromptRequest) -> std::result::Result<PromptResponse, Error> {
+            Ok(PromptResponse::new(
+                crate::acp::protocol::StopReason::EndTurn,
+            ))
+        }
+
+        async fn cancel(&self, _notif: CancelNotification) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+
+        async fn load_session(
+            &self,
+            _req: LoadSessionRequest,
+        ) -> std::result::Result<LoadSessionResponse, Error> {
+            Ok(LoadSessionResponse::new())
+        }
+
+        async fn create_delegation_session(
+            &self,
+            _cwd: Option<String>,
+            _parent_session_id: String,
+        ) -> std::result::Result<(String, SessionActorRef), Error> {
+            self.child_launches.fetch_add(1, Ordering::SeqCst);
+            Err(Error::internal_error().data("stub: not implemented"))
+        }
+
+        fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<EventEnvelope> {
+            self.event_fanout.subscribe()
+        }
+
+        fn event_fanout(&self) -> &Arc<EventFanout> {
+            &self.event_fanout
+        }
+
+        fn emit_event(&self, _session_id: &str, _kind: AgentEventKind) {}
+
+        fn agent_registry(&self) -> Arc<dyn AgentRegistry + Send + Sync> {
+            Arc::new(DefaultAgentRegistry::new())
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Failure/cancellation outputs retain workspace references: the note
+    /// identifies the isolated workspace, its path, and its branch; shared
+    /// execution produces no retention note.
+    #[test]
+    fn workspace_retention_note_identifies_the_isolated_workspace() {
+        // A real (temp) checkout path: the mutation gate canonicalizes it.
+        let checkout = tempfile::TempDir::new().unwrap();
+        let storage = tempfile::TempDir::new().unwrap();
+        let binding = crate::worktree::WorkspaceBinding {
+            record: crate::worktree::WorkspaceRecord {
+                id: crate::worktree::WorkspaceId::from_raw("ws-retain"),
+                repository: crate::worktree::RepositoryIdentity {
+                    common_dir: std::path::PathBuf::from("/repo/.git"),
+                    origin_path: std::path::PathBuf::from("/repo"),
+                    project_name: "repo".to_string(),
+                },
+                checkout_path: checkout.path().to_path_buf(),
+                branch: crate::worktree::ManagedBranch::for_workspace(
+                    &crate::worktree::WorkspaceId::from_raw("ws-retain"),
+                ),
+                relative_cwd: std::path::PathBuf::from(""),
+                execution: crate::worktree::ExecutionMode::Worktree,
+                baseline: None,
+                lifecycle: crate::worktree::WorkspaceLifecycle::Ready,
+                ownership: crate::worktree::WorkspaceOwnership::default(),
+                last_error: None,
+                requested_baseline_mode: crate::worktree::BaselineMode::Commit,
+                requested_base_ref: None,
+                operation_id: "op-retain".to_string(),
+                provisioning_phase: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                updated_at: time::OffsetDateTime::now_utc(),
+            },
+            effective_cwd: checkout.path().to_path_buf(),
+            mutation_gate: crate::worktree::CheckoutMutationGate::new(
+                storage.path(),
+                checkout.path(),
+            )
+            .unwrap()
+            .into(),
+        };
+
+        let note = workspace_retention_note(Some(&binding));
+        assert!(note.contains("ws-retain"), "note: {note}");
+        assert!(
+            note.contains(&checkout.path().to_string_lossy().to_string()),
+            "note: {note}"
+        );
+        assert!(
+            note.contains("retained with all its edits"),
+            "note must promise retention: {note}"
+        );
+        assert!(
+            note.contains("nothing was integrated"),
+            "note must not claim integration: {note}"
+        );
+
+        // Shared execution retains nothing and claims nothing.
+        assert_eq!(workspace_retention_note(None), "");
+    }
+
+    /// Isolated delegation fails closed when no workspace service is
+    /// configured: the failure is reported and no child session is ever
+    /// created — requested isolation never falls back to shared execution.
+    #[tokio::test]
+    async fn isolated_delegation_fails_closed_without_workspace_service() {
+        isolation_preflight_fails_closed(false).await;
+    }
+
+    #[tokio::test]
+    async fn isolated_delegation_rejects_remote_execution_before_allocation() {
+        isolation_preflight_fails_closed(true).await;
+    }
+
+    async fn isolation_preflight_fails_closed(configure_service: bool) {
+        let child_launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (failed_tx, failed_rx) = tokio::sync::oneshot::channel::<()>();
+        let failed_tx = Arc::new(std::sync::Mutex::new(Some(failed_tx)));
+        let mut store = MockSessionStore::new();
+        store
+            .expect_claim_delegation()
+            .withf(|id| id == "delegation-1")
+            .times(1)
+            .returning(|_| Ok(DelegationClaim::Claimed));
+        store
+            .expect_transition_delegation_status()
+            .withf(|id, expected, next| {
+                id == "delegation-1"
+                    && *expected == DelegationStatus::Running
+                    && *next == DelegationStatus::Failed
+            })
+            .times(1)
+            .returning(move |_, _, _| {
+                if let Some(tx) = failed_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                Ok(true)
+            });
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("storage"),
+        );
+        let fanout = Arc::new(EventFanout::new());
+        let event_sink = Arc::new(EventSink::new(storage.event_journal(), fanout));
+
+        let mut registry = DefaultAgentRegistry::new();
+        registry.register(
+            make_agent_info("coder"),
+            CountingStubHandle::new(child_launches.clone()),
+        );
+        let mut orchestrator = DelegationOrchestrator::new(
+            StubAgentHandle::new("delegator"),
+            event_sink,
+            store,
+            Arc::new(registry),
+            Arc::new(ToolRegistry::new()),
+            Hooks::default(),
+            None,
+        );
+        let storage_root = tempfile::TempDir::new().unwrap();
+        if configure_service {
+            orchestrator = orchestrator.with_workspace_service(Arc::new(
+                crate::worktree::WorkspaceService::new(
+                    Arc::new(crate::worktree::GixRepoOps::new()),
+                    storage.workspace_repository().unwrap(),
+                    storage_root.path(),
+                ),
+            ));
+        }
+
+        let delegation = Delegation {
+            isolation: crate::worktree::DelegationIsolation::Isolated,
+            id: 1,
+            public_id: "delegation-1".to_string(),
+            session_id: 1,
+            task_id: None,
+            target_agent_id: "coder".to_string(),
+            objective: "test".to_string(),
+            objective_hash: crate::hash::RapidHash::new(b"test"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+
+        let envelope = EventEnvelope::from(crate::events::AgentEvent {
+            seq: 0,
+            session_seq: 0,
+            timestamp: 0,
+            session_id: "session-1".to_string(),
+            origin: crate::events::EventOrigin::Local,
+            source_node: None,
+            kind: AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id: None,
+                batch_id: None,
+            },
+        });
+        orchestrator.handle_envelope(&envelope).await;
+
+        // The delegation is durably failed.
+        tokio::time::timeout(std::time::Duration::from_secs(5), failed_rx)
+            .await
+            .expect("delegation must fail closed in time")
+            .expect("failure signal sender dropped early");
+
+        assert_eq!(
+            child_launches.load(Ordering::SeqCst),
+            0,
+            "no child session may be launched without a workspace service or local execution capability"
+        );
+        assert!(
+            storage
+                .workspace_repository()
+                .unwrap()
+                .list_workspaces()
+                .await
+                .unwrap()
+                .is_empty(),
+            "remote filesystem isolation fails before any allocation"
+        );
+    }
+
     fn make_agent_info(id: &str) -> AgentInfo {
         AgentInfo {
+            isolation: Default::default(),
             id: id.to_string(),
             name: format!("Agent {id}"),
             description: format!("Description for {id}"),
@@ -2662,6 +3312,7 @@ mod tests {
     #[test]
     fn test_agent_info_serde_round_trip() {
         let info = AgentInfo {
+            isolation: Default::default(),
             id: "coder".to_string(),
             name: "Coder Agent".to_string(),
             description: "Writes code".to_string(),
@@ -2681,6 +3332,7 @@ mod tests {
     #[test]
     fn test_agent_info_meta_none_omitted_in_json() {
         let info = AgentInfo {
+            isolation: Default::default(),
             id: "minimal".to_string(),
             name: "Minimal".to_string(),
             description: "No meta".to_string(),

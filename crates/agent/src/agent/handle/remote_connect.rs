@@ -203,6 +203,12 @@ pub(crate) enum RemoteSessionConnectError {
         node_id: String,
         message: String,
     },
+    /// Recent attempts for this session failed; the caller must wait before
+    /// retrying so a dead remote session cannot be hammered in a hot loop.
+    CoolingDown {
+        session_id: String,
+        retry_after_ms: u64,
+    },
 }
 
 impl RemoteSessionConnectError {
@@ -219,7 +225,19 @@ impl RemoteSessionConnectError {
             Self::TimedOut { .. } => "remote_recovery_timeout",
             Self::HealthCheckFailed { .. } => "remote_recovery_failed",
             Self::SessionNotFoundOnHost { .. } => "remote_session_not_found_on_host",
+            Self::CoolingDown { .. } => "remote_connect_cooling_down",
         }
+    }
+
+    /// Whether this failure should extend the per-session retry cooldown.
+    fn counts_toward_cooldown(&self) -> bool {
+        matches!(
+            self,
+            Self::NodeUnavailable { .. }
+                | Self::RecoveryFailed { .. }
+                | Self::TimedOut { .. }
+                | Self::HealthCheckFailed { .. }
+        )
     }
 
     /// Typed transport failure for retry/invalidation decisions (Phase 6).
@@ -246,6 +264,7 @@ impl RemoteSessionConnectError {
             | Self::NodeUnavailable { .. }
             | Self::RecoveryFailed { .. }
             | Self::TimedOut { .. }
+            | Self::CoolingDown { .. }
             | Self::HealthCheckFailed { .. } => true,
         }
     }
@@ -281,6 +300,13 @@ impl RemoteSessionConnectError {
             } => {
                 data["session_id"] = serde_json::Value::String(session_id.clone());
                 data["node_id"] = serde_json::Value::String(node_id.clone());
+            }
+            Self::CoolingDown {
+                session_id,
+                retry_after_ms,
+            } => {
+                data["session_id"] = serde_json::Value::String(session_id.clone());
+                data["retry_after_ms"] = serde_json::Value::from(*retry_after_ms);
             }
             Self::RecoveryFailed { .. } | Self::TimedOut { .. } => {}
         }
@@ -346,6 +372,13 @@ impl std::fmt::Display for RemoteSessionConnectError {
                 f,
                 "remote session recovery exceeded the {budget_ms}ms budget"
             ),
+            Self::CoolingDown {
+                session_id,
+                retry_after_ms,
+            } => write!(
+                f,
+                "remote session '{session_id}' recently failed to connect; retry in {retry_after_ms}ms"
+            ),
             Self::HealthCheckFailed {
                 session_id,
                 message,
@@ -373,6 +406,39 @@ pub(crate) struct RemoteConnectOptions<'a> {
     /// Pre-resolved handoff from a create/resume response. Skips DHT lookup
     /// and node-manager resume entirely.
     pub(crate) handoff: Option<crate::agent::remote::node_manager::SessionHandoff>,
+}
+
+// ── Per-session failure cooldown ────────────────────────────────────────
+
+const CONNECT_COOLDOWN_BASE_MS: u64 = 2_000;
+const CONNECT_COOLDOWN_MAX_MS: u64 = 60_000;
+/// An explicit user-driven reconnect waits at most this long after a failure.
+const EXPLICIT_RECONNECT_COOLDOWN_MAX_MS: u64 = 2_000;
+
+/// Failure state for one session: when it last failed and how long to back off.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConnectCooldown {
+    failures: u32,
+    failed_at: Instant,
+    wait: Duration,
+}
+
+/// Per-session retry cooldowns, independent of the single-flight gates.
+pub(crate) type RemoteConnectCooldownMap =
+    Arc<parking_lot::Mutex<HashMap<String, ConnectCooldown>>>;
+
+/// Exponential backoff (2s, 4s, ... capped at 60s) with up to 20% jitter.
+fn connect_cooldown_wait(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(5);
+    let base = CONNECT_COOLDOWN_BASE_MS
+        .saturating_mul(1u64 << exponent)
+        .min(CONNECT_COOLDOWN_MAX_MS);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = nanos % (base / 5 + 1);
+    Duration::from_millis((base + jitter).min(CONNECT_COOLDOWN_MAX_MS))
 }
 
 // ── Per-session single-flight gate ──────────────────────────────────────
@@ -479,6 +545,7 @@ impl LocalAgentHandle {
             .instrument(span.clone())
             .await;
         span.record("elapsed_ms", started.elapsed().as_millis() as u64);
+        self.record_connect_outcome(session_id, &result);
         match &result {
             Ok(connected) => {
                 span.record("outcome", connected.outcome.as_str());
@@ -489,6 +556,74 @@ impl LocalAgentHandle {
             }
         }
         result
+    }
+
+    /// Reject a connect attempt while the session is inside its failure
+    /// cooldown. Explicit user reconnects only wait a short, capped time.
+    fn check_connect_cooldown(
+        &self,
+        session_id: &str,
+        reason: RemoteConnectReason,
+    ) -> Result<(), RemoteSessionConnectError> {
+        let Some(state) = self
+            .remote_connect_cooldowns
+            .lock()
+            .get(session_id)
+            .copied()
+        else {
+            return Ok(());
+        };
+        let wait = if reason == RemoteConnectReason::ExplicitReconnect {
+            state
+                .wait
+                .min(Duration::from_millis(EXPLICIT_RECONNECT_COOLDOWN_MAX_MS))
+        } else {
+            state.wait
+        };
+        let elapsed = state.failed_at.elapsed();
+        if elapsed >= wait {
+            return Ok(());
+        }
+        let retry_after_ms = (wait - elapsed).as_millis() as u64;
+        log::debug!(
+            "remote session {} connect: cooling down after {} failures (reason={}, retry in {}ms)",
+            session_id,
+            state.failures,
+            reason.as_str(),
+            retry_after_ms,
+        );
+        Err(RemoteSessionConnectError::CoolingDown {
+            session_id: session_id.to_string(),
+            retry_after_ms,
+        })
+    }
+
+    /// Success clears the cooldown; transport-level failures extend it.
+    fn record_connect_outcome(
+        &self,
+        session_id: &str,
+        result: &Result<ConnectedRemoteSession, RemoteSessionConnectError>,
+    ) {
+        let mut cooldowns = self.remote_connect_cooldowns.lock();
+        match result {
+            Ok(_) => {
+                cooldowns.remove(session_id);
+            }
+            Err(error) if error.counts_toward_cooldown() => {
+                let failures = cooldowns
+                    .get(session_id)
+                    .map_or(1, |state| state.failures.saturating_add(1));
+                cooldowns.insert(
+                    session_id.to_string(),
+                    ConnectCooldown {
+                        failures,
+                        failed_at: Instant::now(),
+                        wait: connect_cooldown_wait(failures),
+                    },
+                );
+            }
+            Err(_) => {}
+        }
     }
 
     async fn connect_remote_session_gated(
@@ -621,6 +756,9 @@ impl LocalAgentHandle {
             .ok_or_else(|| RemoteSessionConnectError::MeshUnavailable {
                 node_id: node_id.clone(),
             })?;
+
+        // Network work starts here: refuse if this session failed recently.
+        self.check_connect_cooldown(session_id, options.reason)?;
 
         // ── Bounded recovery.
         let budget = options.reason.connect_budget();
@@ -1403,6 +1541,152 @@ mod tests {
             }
             .is_retriable()
         );
+    }
+
+    fn node_unavailable() -> Result<ConnectedRemoteSession, RemoteSessionConnectError> {
+        Err(RemoteSessionConnectError::NodeUnavailable {
+            node_id: "n".into(),
+            transport: None,
+            message: "down".into(),
+        })
+    }
+
+    #[test]
+    fn cooldown_wait_grows_exponentially_and_is_capped() {
+        let w1 = connect_cooldown_wait(1);
+        let w3 = connect_cooldown_wait(3);
+        assert!(w1 >= Duration::from_millis(CONNECT_COOLDOWN_BASE_MS));
+        assert!(w1 <= Duration::from_millis(CONNECT_COOLDOWN_BASE_MS * 6 / 5));
+        assert!(w3 >= Duration::from_millis(CONNECT_COOLDOWN_BASE_MS * 4));
+        assert_eq!(
+            connect_cooldown_wait(1_000),
+            Duration::from_millis(CONNECT_COOLDOWN_MAX_MS)
+        );
+    }
+
+    #[test]
+    fn cooling_down_error_is_retriable_but_does_not_extend_cooldown() {
+        let err = RemoteSessionConnectError::CoolingDown {
+            session_id: "s".into(),
+            retry_after_ms: 1_500,
+        };
+        assert_eq!(err.code(), "remote_connect_cooling_down");
+        assert!(err.is_retriable());
+        assert!(!err.counts_toward_cooldown());
+        let acp = err.to_acp_error();
+        let data = acp.data.expect("data");
+        assert_eq!(data["retry_after_ms"], 1_500);
+        assert_eq!(data["retriable"], true);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_connect_starts_cooldown_and_blocks_hot_retries() {
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        assert!(
+            handle
+                .check_connect_cooldown("s1", RemoteConnectReason::Open)
+                .is_ok()
+        );
+
+        handle.record_connect_outcome("s1", &node_unavailable());
+        let err = handle
+            .check_connect_cooldown("s1", RemoteConnectReason::Open)
+            .unwrap_err();
+        assert_eq!(err.code(), "remote_connect_cooling_down");
+
+        // Other sessions are unaffected.
+        assert!(
+            handle
+                .check_connect_cooldown("s2", RemoteConnectReason::Open)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consecutive_failures_extend_the_cooldown() {
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.record_connect_outcome("s1", &node_unavailable());
+        let first = handle.remote_connect_cooldowns.lock()["s1"];
+        handle.record_connect_outcome("s1", &node_unavailable());
+        let second = handle.remote_connect_cooldowns.lock()["s1"];
+        assert_eq!(first.failures, 1);
+        assert_eq!(second.failures, 2);
+        assert!(second.wait > first.wait);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn structural_errors_do_not_start_a_cooldown() {
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.record_connect_outcome(
+            "s1",
+            &Err(RemoteSessionConnectError::BookmarkMissing {
+                session_id: "s1".into(),
+            }),
+        );
+        assert!(handle.remote_connect_cooldowns.lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_reconnect_waits_only_a_short_capped_time() {
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        // Simulate a long-running failure streak.
+        handle.remote_connect_cooldowns.lock().insert(
+            "s1".into(),
+            ConnectCooldown {
+                failures: 10,
+                failed_at: Instant::now()
+                    - Duration::from_millis(EXPLICIT_RECONNECT_COOLDOWN_MAX_MS + 100),
+                wait: Duration::from_millis(CONNECT_COOLDOWN_MAX_MS),
+            },
+        );
+        // A background retry is still blocked; the user's explicit reconnect is not.
+        assert!(
+            handle
+                .check_connect_cooldown("s1", RemoteConnectReason::Open)
+                .is_err()
+        );
+        assert!(
+            handle
+                .check_connect_cooldown("s1", RemoteConnectReason::ExplicitReconnect)
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cooldown_expires_and_success_clears_it() {
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.remote_connect_cooldowns.lock().insert(
+            "s1".into(),
+            ConnectCooldown {
+                failures: 2,
+                failed_at: Instant::now() - Duration::from_secs(120),
+                wait: Duration::from_secs(4),
+            },
+        );
+        assert!(
+            handle
+                .check_connect_cooldown("s1", RemoteConnectReason::Open)
+                .is_ok(),
+            "an elapsed cooldown no longer blocks"
+        );
+
+        // A successful outcome removes the failure streak entirely.
+        let ok = Ok(ConnectedRemoteSession {
+            session_ref: SessionActorRef::from(SessionActor::spawn(SessionActor::new(
+                handle.config.clone(),
+                "s1".to_string(),
+                SessionRuntime::new(
+                    None,
+                    std::collections::HashMap::new(),
+                    crate::agent::core::McpToolState::empty(),
+                ),
+            ))),
+            attachment_id: 1,
+            bookmark: None,
+            outcome: RemoteConnectOutcome::Resumed,
+        });
+        handle.record_connect_outcome("s1", &ok);
+        assert!(handle.remote_connect_cooldowns.lock().is_empty());
     }
 
     #[test]

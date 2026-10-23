@@ -203,7 +203,19 @@ impl VerificationService {
                 exists,
                 contains,
                 matches_regex: _,
-            } => self.verify_file(path, *exists, contains.as_deref()).await,
+            } => {
+                let effective_path = if path.is_relative() {
+                    context
+                        .cwd
+                        .as_ref()
+                        .map(|cwd| cwd.join(path))
+                        .unwrap_or_else(|| path.clone())
+                } else {
+                    path.clone()
+                };
+                self.verify_file(&effective_path, *exists, contains.as_deref())
+                    .await
+            }
 
             VerificationStep::WaitFor { .. } => Err(VerificationError::StepFailed {
                 step_index: 0,
@@ -591,6 +603,82 @@ mod tests {
         let ctx = make_context(Some(tmp.path().to_path_buf()));
         let result = service.verify(&spec, &ctx).await;
         assert!(result.is_ok(), "existing file should pass existence check");
+    }
+
+    /// A check with deliberately opposite parent/child outcomes reports the
+    /// result of the cwd it is routed to. Delegation routes verification to
+    /// the delegate's own checkout, so the reported outcome is the child's.
+    #[tokio::test]
+    async fn verification_check_reports_the_routed_context_cwd() {
+        struct CwdMarkerTool;
+
+        #[async_trait::async_trait]
+        impl Tool for CwdMarkerTool {
+            fn name(&self) -> &str {
+                "cwd_marker"
+            }
+
+            fn definition(&self) -> ChatTool {
+                ChatTool {
+                    tool_type: "function".to_string(),
+                    function: querymt::chat::FunctionTool {
+                        name: self.name().to_string(),
+                        description: "reads marker.txt relative to the context cwd".to_string(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false,
+                        }),
+                        strict: None,
+                    },
+                }
+            }
+
+            async fn call(
+                &self,
+                _args: Value,
+                context: &dyn ToolContext,
+            ) -> Result<Vec<ToolResultPart>, ToolError> {
+                let cwd = context
+                    .cwd()
+                    .ok_or_else(|| ToolError::InvalidRequest("no cwd".into()))?;
+                let content = std::fs::read_to_string(cwd.join("marker.txt"))
+                    .map_err(|err| ToolError::InvalidRequest(err.to_string()))?;
+                Ok(vec![ToolResultPart::text(content)])
+            }
+        }
+
+        let parent_dir = tempfile::TempDir::new().unwrap();
+        let child_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(parent_dir.path().join("marker.txt"), "parent outcome").unwrap();
+        std::fs::write(child_dir.path().join("marker.txt"), "child outcome").unwrap();
+
+        let service = make_service_with_tool(Arc::new(CwdMarkerTool));
+        let spec = VerificationSpec {
+            description: "child-only check".to_string(),
+            steps: vec![VerificationStep::ToolCall {
+                tool_name: Cow::Borrowed("cwd_marker"),
+                arguments: serde_json::json!({}),
+                expectation: Expectation::Contains("child outcome".to_string()),
+                error_message: None,
+            }],
+            strategy: VerificationStrategy::All,
+        };
+
+        // Routed to the child checkout: the child's outcome is reported.
+        let child = make_context(Some(child_dir.path().to_path_buf()));
+        assert!(
+            service.verify(&spec, &child).await.is_ok(),
+            "the check must report the child checkout's outcome"
+        );
+
+        // Routed to the parent checkout: the opposite (parent) outcome is
+        // reported instead — proving the routed cwd drives the result.
+        let parent = make_context(Some(parent_dir.path().to_path_buf()));
+        assert!(
+            service.verify(&spec, &parent).await.is_err(),
+            "the same check must report the parent checkout's opposite outcome"
+        );
     }
 
     #[tokio::test]

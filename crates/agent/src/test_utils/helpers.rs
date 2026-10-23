@@ -324,14 +324,22 @@ impl UndoTestFixture {
 
     /// Create a session and return its public ID
     pub async fn create_session(&self) -> Result<String> {
+        self.create_session_with_cwd(self.worktree.path()).await
+    }
+
+    /// Create a session bound to an explicit workspace cwd and return its
+    /// public ID. The session actor is registered against the same cwd so
+    /// undo/redo operate on that workspace.
+    pub async fn create_session_with_cwd(&self, cwd: &std::path::Path) -> Result<String> {
         let session = self
             .storage
             .session_store()
-            .create_session(None, Some(self.worktree.path().to_path_buf()), None, None)
+            .create_session(None, Some(cwd.to_path_buf()), None, None)
             .await?;
 
         // Spawn a SessionActor via the kameo registry
-        self.register_session_actor(&session.public_id).await;
+        self.register_session_actor_with_cwd(&session.public_id, cwd)
+            .await;
 
         Ok(session.public_id)
     }
@@ -357,11 +365,21 @@ impl UndoTestFixture {
 
     /// Helper to spawn a SessionActor for a session (needed for undo/redo via kameo)
     async fn register_session_actor(&self, session_id: &str) {
+        self.register_session_actor_with_cwd(session_id, self.worktree.path())
+            .await;
+    }
+
+    /// Spawn a SessionActor whose runtime cwd binds to an explicit workspace
+    pub(crate) async fn register_session_actor_with_cwd(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) {
         use crate::agent::session_actor::SessionActor;
         use kameo::actor::Spawn;
 
         let runtime = crate::agent::core::SessionRuntime::new(
-            Some(self.worktree.path().to_path_buf()),
+            Some(cwd.to_path_buf()),
             std::collections::HashMap::new(),
             crate::agent::core::McpToolState::empty(),
         );
@@ -451,8 +469,18 @@ impl UndoTestFixture {
 
     /// Take a snapshot and record TurnSnapshotStart
     pub async fn take_pre_snapshot(&self, session_id: &str) -> Result<(String, String)> {
-        let snapshot_id = self.backend.track(self.worktree.path()).await?;
-        let turn_id = Uuid::now_v7().to_string();
+        self.take_pre_snapshot_with_cwd(session_id, self.worktree.path())
+            .await
+    }
+
+    /// Take a snapshot in an explicit workspace and record TurnSnapshotStart
+    pub async fn take_pre_snapshot_with_cwd(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+    ) -> Result<(String, String)> {
+        let snapshot_id = self.backend.track(cwd).await?;
+        let turn_id = Uuid::new_v4().to_string();
 
         let msg = AgentMessage {
             id: Uuid::new_v4().to_string(),
@@ -461,6 +489,8 @@ impl UndoTestFixture {
             parts: vec![MessagePart::TurnSnapshotStart {
                 turn_id: turn_id.clone(),
                 snapshot_id: snapshot_id.clone(),
+                workspace_root: Some(cwd.to_path_buf()),
+                inherited: false,
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -482,11 +512,23 @@ impl UndoTestFixture {
         turn_id: &str,
         pre_snapshot: &str,
     ) -> Result<Vec<String>> {
-        let post_snapshot = self.backend.track(self.worktree.path()).await?;
+        self.take_post_snapshot_with_cwd(session_id, turn_id, pre_snapshot, self.worktree.path())
+            .await
+    }
+
+    /// Take a post-snapshot in an explicit workspace and record TurnSnapshotPatch
+    pub async fn take_post_snapshot_with_cwd(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        pre_snapshot: &str,
+        cwd: &std::path::Path,
+    ) -> Result<Vec<String>> {
+        let post_snapshot = self.backend.track(cwd).await?;
         let pre_snapshot_string = pre_snapshot.to_string();
         let changed_paths = self
             .backend
-            .diff(self.worktree.path(), &pre_snapshot_string, &post_snapshot)
+            .diff(cwd, &pre_snapshot_string, &post_snapshot)
             .await?;
 
         let changed_strs: Vec<String> = changed_paths
@@ -502,6 +544,8 @@ impl UndoTestFixture {
                 turn_id: turn_id.to_string(),
                 snapshot_id: post_snapshot,
                 changed_paths: changed_strs.clone(),
+                workspace_root: Some(cwd.to_path_buf()),
+                inherited: false,
             }],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             parent_message_id: None,
@@ -522,9 +566,20 @@ impl UndoTestFixture {
         Ok(())
     }
 
+    /// Convenience: write a file under an explicit workspace
+    pub fn write_file_in(&self, cwd: &std::path::Path, name: &str, content: &str) -> Result<()> {
+        std::fs::write(cwd.join(name), content)?;
+        Ok(())
+    }
+
     /// Convenience: read a file from the worktree
     pub fn read_file(&self, name: &str) -> Result<String> {
         Ok(std::fs::read_to_string(self.worktree.path().join(name))?)
+    }
+
+    /// Convenience: read a file under an explicit workspace
+    pub fn read_file_in(&self, cwd: &std::path::Path, name: &str) -> Result<String> {
+        Ok(std::fs::read_to_string(cwd.join(name))?)
     }
 
     /// Perform undo operation via AgentHandle
@@ -568,6 +623,7 @@ impl DelegateTestFixture {
         let mut registry = DefaultAgentRegistry::new();
         registry.register(
             AgentInfo {
+                isolation: Default::default(),
                 id: "coder".to_string(),
                 name: "Coder".to_string(),
                 description: "Delegate coder".to_string(),

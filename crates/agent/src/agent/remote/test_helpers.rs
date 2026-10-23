@@ -335,6 +335,8 @@ pub(crate) mod fixtures {
     pub struct NodeManagerFixture {
         pub actor_ref: ActorRef<RemoteNodeManager>,
         pub config: Arc<AgentConfig>,
+        /// The registry shared with the node manager (for inspecting/killing sessions).
+        pub registry: Arc<Mutex<SessionRegistry>>,
         pub _tempdir: TempDir,
     }
 
@@ -345,7 +347,7 @@ pub(crate) mod fixtures {
             let registry = Arc::new(Mutex::new(SessionRegistry::new(f.config.clone())));
             let nm = RemoteNodeManager::new(
                 f.config.clone(),
-                registry,
+                registry.clone(),
                 None,
                 Arc::new(parking_lot::Mutex::new(None)),
             );
@@ -353,6 +355,7 @@ pub(crate) mod fixtures {
             Self {
                 actor_ref,
                 config: f.config,
+                registry,
                 _tempdir: f._tempdir,
             }
         }
@@ -365,7 +368,7 @@ pub(crate) mod fixtures {
             registry.lock().await.set_mesh(Some(mesh.clone()));
             let nm = RemoteNodeManager::new(
                 f.config.clone(),
-                registry,
+                registry.clone(),
                 Some(mesh.clone()),
                 Arc::new(parking_lot::Mutex::new(None)),
             );
@@ -373,6 +376,7 @@ pub(crate) mod fixtures {
             Self {
                 actor_ref,
                 config: f.config,
+                registry,
                 _tempdir: f._tempdir,
             }
         }

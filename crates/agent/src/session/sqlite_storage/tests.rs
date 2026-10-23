@@ -22,6 +22,95 @@ use super::SqliteStorage;
 use super::migrations::{MIGRATIONS, apply_migrations};
 
 #[tokio::test]
+async fn fork_isolation_intent_is_atomic_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("sessions.db");
+    let storage = SqliteStorage::connect(db.clone()).await.unwrap();
+    let source = storage
+        .create_session(None, None, None, None)
+        .await
+        .unwrap();
+    let message = AgentMessage {
+        id: "fork-intent-message".into(),
+        session_id: source.public_id.clone(),
+        role: ChatRole::User,
+        parts: vec![],
+        created_at: 1,
+        parent_message_id: None,
+        source_provider: None,
+        source_model: None,
+    };
+    storage
+        .add_message(&source.public_id, message)
+        .await
+        .unwrap();
+    let intent = crate::session::store::PendingForkIsolation {
+        source_session_id: source.public_id.clone(),
+        source_cwd: dir.path().to_path_buf(),
+        options: crate::worktree::SessionCreationOptions::isolated_worktree(
+            crate::worktree::BaselineMode::CurrentWorkingTree,
+        )
+        .to_workspace_options(),
+    };
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_fork_intent BEFORE INSERT ON session_fork_isolation_intents
+             BEGIN SELECT RAISE(ABORT, 'injected intent failure'); END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .fork_session_with_isolation_intent(
+                &source.public_id,
+                "fork-intent-message",
+                ForkOrigin::User,
+                Some(intent.clone()),
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(storage.list_sessions().await.unwrap().len(), 1);
+    assert_eq!(
+        storage.get_history(&source.public_id).await.unwrap().len(),
+        1
+    );
+    storage
+        .run_blocking(|conn| {
+            conn.execute_batch("DROP TRIGGER reject_fork_intent;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let fork_id = storage
+        .fork_session_with_isolation_intent(
+            &source.public_id,
+            "fork-intent-message",
+            ForkOrigin::User,
+            Some(intent.clone()),
+        )
+        .await
+        .unwrap();
+    drop(storage);
+    let reopened = SqliteStorage::connect(db).await.unwrap();
+    assert_eq!(
+        reopened.get_pending_fork_isolation(&fork_id).await.unwrap(),
+        Some(intent)
+    );
+    assert_eq!(reopened.get_history(&fork_id).await.unwrap().len(), 1);
+    assert!(
+        reopened
+            .get_pending_fork_isolation(&source.public_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn prompt_blocks_round_trip_through_persistence_and_fork() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let session = storage
@@ -1172,6 +1261,38 @@ fn migration_0001_is_recorded() {
 }
 
 #[test]
+fn migration_0023_persists_revert_workspace_provenance() {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_migrations(&mut conn).expect("apply migrations");
+
+    conn.execute(
+        "INSERT INTO sessions (public_id, name, created_at, updated_at) \
+         VALUES ('sess-1', 'session', '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",
+        [],
+    )
+    .expect("insert session");
+    conn.execute(
+        "INSERT INTO revert_states (public_id, session_id, message_id, snapshot_id, \
+         backend_id, workspace_root, created_at) \
+         VALUES ('rev-1', (SELECT id FROM sessions WHERE public_id = 'sess-1'), \
+         'msg-1', 'snap-1', 'git', '/tmp/workspaces/ws-1', '2026-01-15T00:00:01Z')",
+        [],
+    )
+    .expect("insert revert frame with provenance");
+
+    // Provenance survives the round trip so a same-workspace restart or
+    // resume retains working undo history.
+    let root: Option<String> = conn
+        .query_row(
+            "SELECT workspace_root FROM revert_states WHERE public_id = 'rev-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query provenance");
+    assert_eq!(root.as_deref(), Some("/tmp/workspaces/ws-1"));
+}
+
+#[test]
 fn migration_0002_drops_legacy_events_table() {
     let mut conn = Connection::open_in_memory().expect("in-memory db");
     apply_migrations(&mut conn).expect("apply migrations");
@@ -2294,6 +2415,316 @@ async fn session_lifecycle_migration_upgrades_legacy_database_without_backfill()
     assert!(!lifecycle.archived);
     assert_eq!(lifecycle.resolved_at, None);
     assert_eq!(lifecycle.archived_at, None);
+}
+
+#[test]
+fn workspace_archival_migration_preserves_bindings_and_results() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    let old = crate::session::schema::WORKSPACE_TABLES_DDL
+        .replace("'missing', 'archived',", "'missing',");
+    conn.execute_batch(&old).unwrap();
+    conn.execute_batch("INSERT INTO sessions(public_id, created_at, updated_at) VALUES('owner', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, execution, baseline_mode, lifecycle, owner_session_id, created_at, updated_at)
+        VALUES('parent', '/repo/.git', '/repo', 'repo', '/wt/parent', 'qmt/parent', 'worktree', 'commit', 'ready', 'owner', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, execution, baseline_mode, lifecycle, parent_workspace_id, created_at, updated_at)
+        VALUES('child', '/repo/.git', '/repo', 'repo', '/wt/child', 'qmt/child', 'worktree', 'commit', 'ready', 'parent', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO workspace_results(workspace_public_id, baseline_commit, result_ref, captured_at) VALUES('child', 'base', 'refs/qmt/results/child/test', '2026-01-01T00:00:00Z');").unwrap();
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0025_workspace_archival")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    conn.execute(
+        "UPDATE workspaces SET lifecycle = 'archived' WHERE public_id = 'parent'",
+        [],
+    )
+    .unwrap();
+    let preserved: (String, String, i64) = conn.query_row("SELECT owner_session_id, (SELECT parent_workspace_id FROM workspaces WHERE public_id = 'child'), (SELECT count(*) FROM workspace_results) FROM workspaces WHERE public_id = 'parent'", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!(preserved, ("owner".into(), "parent".into(), 1));
+    let violations: i64 = conn
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    assert!(
+        conn.pragma_query_value(None, "foreign_keys", |r| r.get::<_, bool>(0))
+            .unwrap()
+    );
+}
+
+/// The archival rebuild copies by column name, so an old table carrying an
+/// additive column (added later by an `ALTER TABLE` helper, hence last in
+/// the old table but absent from the rebuild statement) keeps that column's
+/// data instead of misaligning or dropping it.
+#[test]
+fn workspace_archival_migration_preserves_additive_columns() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    let old = crate::session::schema::WORKSPACE_TABLES_DDL
+        .replace("'missing', 'archived',", "'missing',");
+    conn.execute_batch(&old).unwrap();
+    crate::session::schema::ensure_workspace_provisioning_columns(&mut conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, execution, baseline_mode, lifecycle, requested_base_ref, operation_id, provisioning_phase, created_at, updated_at)
+         VALUES('w', '/repo/.git', '/repo', 'repo', '/wt/w', 'qmt/w', 'worktree', 'commit', 'ready', 'v1.2', 'op-1', 'intent_persisted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0025_workspace_archival")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+
+    let row: (String, String, String, String) = conn
+        .query_row(
+            "SELECT branch, requested_base_ref, operation_id, provisioning_phase FROM workspaces WHERE public_id = 'w'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            "qmt/w".into(),
+            "v1.2".into(),
+            "op-1".into(),
+            "intent_persisted".into()
+        )
+    );
+    // The rebuilt table now accepts the new lifecycle value.
+    conn.execute(
+        "UPDATE workspaces SET lifecycle = 'archived' WHERE public_id = 'w'",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn worktree_workspace_migration_upgrades_existing_database() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    // Model an upgrade from the pre-worktree schema: everything except 0022.
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|m| m.version != "0022_worktree_workspaces")
+    {
+        (migration.apply)(&mut conn).unwrap();
+    }
+
+    // Existing local session with no workspace association.
+    conn.execute(
+        "INSERT INTO sessions (public_id, name, cwd, created_at, updated_at) \
+         VALUES ('legacy-sess', 'Keep me', '/repo', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0022_worktree_workspaces")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent on re-run.
+    (migration.apply)(&mut conn).unwrap();
+
+    // Registry and result tables exist with the expected columns.
+    for (table, expected_columns) in [
+        (
+            "workspaces",
+            vec![
+                "id",
+                "public_id",
+                "common_dir",
+                "origin_path",
+                "project_name",
+                "checkout_path",
+                "branch",
+                "relative_cwd",
+                "execution",
+                "baseline_mode",
+                "source_head",
+                "baseline_commit",
+                "lifecycle",
+                "owner_session_id",
+                "parent_workspace_id",
+                "parent_session_id",
+                "delegation_id",
+                "delegation_batch_id",
+                "last_error",
+                "created_at",
+                "updated_at",
+                "requested_base_ref",
+                "operation_id",
+                "provisioning_phase",
+            ],
+        ),
+        (
+            "workspace_results",
+            vec![
+                "id",
+                "workspace_public_id",
+                "baseline_commit",
+                "result_commit",
+                "result_ref",
+                "verification",
+                "captured_at",
+                "captured_head",
+            ],
+        ),
+    ] {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, expected_columns, "unexpected schema for {table}");
+    }
+
+    // Legacy sessions are untouched and unassociated.
+    let (name, count): (String, i64) = conn
+        .query_row(
+            "SELECT s.name, (SELECT COUNT(*) FROM workspaces) FROM sessions s \
+             WHERE s.public_id = 'legacy-sess'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(name, "Keep me");
+    assert_eq!(count, 0, "no workspaces exist after upgrade");
+
+    // Owner uniqueness is enforced by the partial unique index.
+    conn.execute(
+        "INSERT INTO workspaces (public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         owner_session_id, created_at, updated_at) \
+         VALUES ('ws-1', '/r/.git', '/r', 'r', '/wt/1', 'qmt/workspace/ws-1', '', \
+         'worktree', 'commit', 'ready', 'legacy-sess', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    let dup_owner = conn.execute(
+        "INSERT INTO workspaces (public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         owner_session_id, created_at, updated_at) \
+         VALUES ('ws-2', '/r/.git', '/r', 'r', '/wt/2', 'qmt/workspace/ws-2', '', \
+         'worktree', 'commit', 'ready', 'legacy-sess', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    );
+    assert!(dup_owner.is_err(), "a session may own only one workspace");
+
+    // Checkout paths are never reused.
+    let dup_checkout = conn.execute(
+        "INSERT INTO workspaces (public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         created_at, updated_at) \
+         VALUES ('ws-3', '/r/.git', '/r', 'r', '/wt/1', 'qmt/workspace/ws-3', '', \
+         'worktree', 'commit', 'provisioning', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        [],
+    );
+    assert!(dup_checkout.is_err(), "checkout paths are never reused");
+}
+
+/// The 0027 provisioning-intent migration upgrades an existing database:
+/// the replayable provisioning inputs (requested ref, operation id, phase)
+/// are added idempotently, pre-existing rows are preserved, and a true
+/// first intent (no baseline) round-trips through the repository without a
+/// fabricated capture.
+#[tokio::test]
+async fn provisioning_intent_migration_upgrades_existing_database() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    // Model an upgrade from the pre-0027 schema: run every migration, then
+    // recreate the workspace tables in their pre-0027 shape (the shared DDL
+    // predates the new columns), so only 0027 has to add them.
+    for migration in MIGRATIONS.iter().filter(|m| {
+        m.version != "0027_workspace_provisioning_intent" && m.version != "0022_worktree_workspaces"
+    }) {
+        (migration.apply)(&mut conn).unwrap();
+    }
+    conn.execute_batch("DROP TABLE workspace_results; DROP TABLE workspaces;")
+        .unwrap();
+    conn.execute_batch(crate::session::schema::WORKSPACE_TABLES_DDL)
+        .unwrap();
+
+    // A workspace provisioned by the older binary: no replay inputs.
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, \
+         checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, \
+         created_at, updated_at) \
+         VALUES('pre-27', '/repo/.git', '/repo', 'repo', '/wt/pre-27', 'qmt/pre-27', '', \
+         'worktree', 'current_working_tree', 'provisioning', \
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0027_workspace_provisioning_intent")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent on re-run.
+    (migration.apply)(&mut conn).unwrap();
+
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)").unwrap();
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for expected in ["requested_base_ref", "operation_id", "provisioning_phase"] {
+            assert!(
+                columns.iter().any(|c| c == expected),
+                "missing column {expected} after upgrade"
+            );
+        }
+    }
+
+    // The pre-migration row survives with NULL replay inputs.
+    use crate::worktree::repo_workspace::WorkspaceRepository as _;
+    let store = crate::worktree::SqliteWorkspaceRepository::new(std::sync::Arc::new(
+        std::sync::Mutex::new(conn),
+    ));
+    let id = crate::worktree::WorkspaceId::from_raw("pre-27");
+    let record = store.get_workspace(&id).await.unwrap().unwrap();
+    assert_eq!(
+        record.lifecycle,
+        crate::worktree::WorkspaceLifecycle::Provisioning
+    );
+    assert!(record.baseline.is_none(), "no fabricated baseline");
+    assert_eq!(
+        record.requested_baseline_mode,
+        crate::worktree::BaselineMode::CurrentWorkingTree
+    );
+    assert_eq!(record.requested_base_ref, None);
+    assert_eq!(record.operation_id, "");
+    assert_eq!(record.provisioning_phase, None);
+
+    // The true first persisted intent round-trips once the replay inputs
+    // are recorded.
+    let mut intent = record.clone();
+    intent.requested_base_ref = Some("refs/heads/main".into());
+    intent.operation_id = "op-first".into();
+    intent.provisioning_phase = Some(crate::worktree::ProvisioningPhase::IntentPersisted);
+    store.update_workspace(intent.clone()).await.unwrap();
+    let loaded = store.get_workspace(&id).await.unwrap().unwrap();
+    assert_eq!(loaded, intent);
 }
 
 #[tokio::test]

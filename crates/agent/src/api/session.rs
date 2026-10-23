@@ -16,6 +16,7 @@ pub struct AgentSession {
     agent: Arc<AgentHandle>,
     session_id: String,
     callbacks: Arc<EventCallbacksState>,
+    workspace: Option<Value>,
 }
 
 impl AgentSession {
@@ -25,7 +26,21 @@ impl AgentSession {
             agent,
             session_id,
             callbacks,
+            workspace: None,
         }
+    }
+
+    /// Attach the workspace binding disclosed when the session was created.
+    pub(crate) fn with_workspace(mut self, workspace: Option<Value>) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
+    /// The managed-workspace binding of this session (execution cwd, workspace
+    /// id, branch, baseline mode/OID and excluded content), or `None` for a
+    /// local session.
+    pub fn workspace(&self) -> Option<&Value> {
+        self.workspace.as_ref()
     }
 
     pub fn id(&self) -> &str {

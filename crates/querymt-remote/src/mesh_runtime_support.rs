@@ -23,6 +23,10 @@ pub(crate) enum SwarmCommand {
     LeaveIrohScope {
         mesh_id: String,
     },
+    /// Withdraw a DHT provider record published under `name`.
+    UnregisterActor {
+        name: String,
+    },
     Shutdown {
         completion: Option<tokio::sync::oneshot::Sender<()>>,
     },

@@ -196,6 +196,19 @@ impl SessionProvider {
         parent_session_id: Option<&str>,
         execution_config: &SessionExecutionConfig,
     ) -> SessionResult<SessionHandle> {
+        self.create_session_with_isolation_intent(cwd, parent_session_id, execution_config, None)
+            .await
+    }
+
+    /// Create a session whose non-runnable isolation barrier (when `intent`
+    /// is present) is persisted atomically with the session row.
+    pub async fn create_session_with_isolation_intent(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+        parent_session_id: Option<&str>,
+        execution_config: &SessionExecutionConfig,
+        intent: Option<crate::session::store::PendingForkIsolation>,
+    ) -> SessionResult<SessionHandle> {
         let fork_origin = if parent_session_id.is_some() {
             Some(crate::session::domain::ForkOrigin::Delegation)
         } else {
@@ -203,11 +216,12 @@ impl SessionProvider {
         };
         let mut session = self
             .history_store
-            .create_session(
+            .create_session_with_isolation_intent(
                 None,
                 cwd.clone(),
                 parent_session_id.map(|s| s.to_string()),
                 fork_origin,
+                intent,
             )
             .await?;
 

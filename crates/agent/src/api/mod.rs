@@ -68,6 +68,7 @@ mod quorum;
 mod session;
 mod sessions;
 mod utils;
+mod worktrees;
 
 // Re-export public API types
 pub use agent::{Agent, AgentBuilder, AgentInfra};
@@ -85,6 +86,7 @@ pub use sessions::{
     SessionLifecycleFilter, SessionLifecyclePatch, SessionListMode, SessionListPage,
     SessionListPageWithLifecycle, SessionMeta, SessionSummary, SessionSummaryWithLifecycle,
 };
+pub use worktrees::{AgentWorktrees, SessionOptions};
 
 #[cfg(test)]
 mod agent_tests;

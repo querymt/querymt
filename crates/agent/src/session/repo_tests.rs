@@ -840,6 +840,7 @@ mod tests {
 
         fn make_delegation(session_id: i64, target: &str, objective: &str) -> Delegation {
             Delegation {
+                isolation: Default::default(),
                 id: 0,
                 public_id: String::new(),
                 session_id,
@@ -888,6 +889,73 @@ mod tests {
 
             let delegations = repo.list_delegations(&session_public_id).await.unwrap();
             assert_eq!(delegations.len(), 2);
+        }
+
+        /// The resolved isolation policy round-trips through the delegations
+        /// table, and legacy rows (NULL column) read as `inherit`.
+        #[tokio::test]
+        async fn delegation_isolation_round_trips_and_legacy_rows_inherit() {
+            use crate::worktree::DelegationIsolation;
+
+            let db = open_db();
+            let session_repo = SqliteSessionRepository::new(db.clone());
+            let session = session_repo
+                .create_session(None, None, None, None)
+                .await
+                .unwrap();
+            let repo = SqliteDelegationRepository::new(db.clone());
+
+            let mut isolated = make_delegation(session.id, "agent-a", "isolated work");
+            isolated.isolation = DelegationIsolation::Isolated;
+            let isolated = repo.create_delegation(isolated).await.unwrap();
+
+            let mut shared = make_delegation(session.id, "agent-b", "shared work");
+            shared.isolation = DelegationIsolation::Shared;
+            let shared = repo.create_delegation(shared).await.unwrap();
+
+            let fetched_isolated = repo
+                .get_delegation(&isolated.public_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fetched_isolated.isolation, DelegationIsolation::Isolated);
+
+            let fetched_shared = repo
+                .get_delegation(&shared.public_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fetched_shared.isolation, DelegationIsolation::Shared);
+
+            // Legacy row: write a NULL isolation column directly.
+            let legacy = repo
+                .create_delegation(make_delegation(session.id, "agent-c", "legacy work"))
+                .await
+                .unwrap();
+            db.lock()
+                .unwrap()
+                .execute(
+                    "UPDATE delegations SET isolation = NULL WHERE public_id = ?",
+                    rusqlite::params![legacy.public_id],
+                )
+                .unwrap();
+            let fetched_legacy = repo
+                .get_delegation(&legacy.public_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(fetched_legacy.isolation, DelegationIsolation::Inherit);
+
+            // Updates persist the field too.
+            let mut updated = fetched_shared;
+            updated.isolation = DelegationIsolation::Isolated;
+            repo.update_delegation(updated).await.unwrap();
+            let reloaded = repo
+                .get_delegation(&shared.public_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reloaded.isolation, DelegationIsolation::Isolated);
         }
 
         #[tokio::test]

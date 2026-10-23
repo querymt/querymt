@@ -84,36 +84,41 @@ impl ToolTrait for DeleteFileTool {
             )));
         }
 
-        let result = if path.is_file() {
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|e| ToolError::ProviderError(format!("delete failed: {}", e)))?;
+        // Mutating phase runs under the checkout mutation gate when the
+        // session has one (see `run_under_mutation_gate`).
+        crate::tools::run_under_mutation_gate(context, async {
+            let result = if path.is_file() {
+                tokio::fs::remove_file(&path)
+                    .await
+                    .map_err(|e| ToolError::ProviderError(format!("delete failed: {}", e)))?;
 
-            json!({
-                "success": true,
-                "type": "file",
-                "path": path.display().to_string()
-            })
-        } else if path.is_dir() {
-            tokio::fs::remove_dir_all(&path)
-                .await
-                .map_err(|e| ToolError::ProviderError(format!("delete failed: {}", e)))?;
+                json!({
+                    "success": true,
+                    "type": "file",
+                    "path": path.display().to_string()
+                })
+            } else if path.is_dir() {
+                tokio::fs::remove_dir_all(&path)
+                    .await
+                    .map_err(|e| ToolError::ProviderError(format!("delete failed: {}", e)))?;
 
-            json!({
-                "success": true,
-                "type": "directory",
-                "path": path.display().to_string()
-            })
-        } else {
-            return Err(ToolError::InvalidRequest(format!(
-                "Path '{}' is neither a file nor directory",
-                path.display()
-            )));
-        };
+                json!({
+                    "success": true,
+                    "type": "directory",
+                    "path": path.display().to_string()
+                })
+            } else {
+                return Err(ToolError::InvalidRequest(format!(
+                    "Path '{}' is neither a file nor directory",
+                    path.display()
+                )));
+            };
 
-        serde_json::to_string(&result)
-            .map(|s| vec![ToolResultPart::text(s)])
-            .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+            serde_json::to_string(&result)
+                .map(|s| vec![ToolResultPart::text(s)])
+                .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+        })
+        .await
     }
 }
 

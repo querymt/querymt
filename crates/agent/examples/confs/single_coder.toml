@@ -42,6 +42,21 @@ system = [
 [agent.execution.snapshot]
 backend = "git"
 
+# -----------------------------------------------------------------------------
+# Optional: managed Git worktree workspaces (disabled by default).
+#
+# Enabling the service only makes isolation *available*. A session still runs
+# locally unless it explicitly asks for a worktree (ACP `session/new` metadata
+# `_meta.querymt.sessionWorkspace`, `/worktree create`, or the simple API /
+# Python `chat_session(workspace="worktree")`).
+#
+# [agent.workspace]
+# enabled = true
+# storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
+# baseline = "commit"                 # or "current_working_tree" (default for
+#                                     # explicit requests that don't choose one)
+# -----------------------------------------------------------------------------
+
 # Compaction: tool output truncation (Layer 1)
 [agent.execution.tool_output]
 max_lines = 2000
