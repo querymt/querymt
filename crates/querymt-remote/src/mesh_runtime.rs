@@ -465,6 +465,9 @@ pub async fn bootstrap_mesh_handle(config: &MeshRuntimeConfig) -> Result<MeshHan
                                 }
                             }
                         }
+                        SwarmCommand::UnregisterActor { name } => {
+                            swarm.behaviour_mut().kameo.registry.unregister(&name);
+                        }
                         SwarmCommand::Shutdown { completion } => {
                             reconnect_targets.clear();
                             reconnect_targets_by_scope.clear();

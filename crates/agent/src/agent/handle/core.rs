@@ -79,6 +79,8 @@ impl LocalAgentHandle {
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             #[cfg(feature = "remote")]
             remote_connect_gates: Default::default(),
+            #[cfg(feature = "remote")]
+            remote_connect_cooldowns: Default::default(),
             model_inventory,
             oauth_service,
             profiles: Arc::new(ArcSwap::from_pointee(None)),

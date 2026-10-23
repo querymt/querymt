@@ -270,7 +270,15 @@ pub fn try_setup_telemetry_with_layers(
         // Two separate instances because EnvFilter is not Clone.
         let telemetry_level =
             std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
-        let trace_filter = EnvFilter::new(&telemetry_level);
+        // iroh emits a span per UDP datagram (`poll_send`), producing millions
+        // of spans per day. Keep them out of exported traces unless the
+        // operator explicitly configured iroh directives.
+        let trace_level = if telemetry_level.contains("iroh") {
+            telemetry_level.clone()
+        } else {
+            format!("{telemetry_level},iroh=warn")
+        };
+        let trace_filter = EnvFilter::new(&trace_level);
         let log_filter = EnvFilter::new(&telemetry_level);
 
         let endpoint = config.resolve_endpoint();

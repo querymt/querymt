@@ -131,6 +131,34 @@ pub fn config_options_with_profiles(
     options
 }
 
+/// Evict `session_id` from `registry` as soon as `actor_ref` stops.
+///
+/// Holds only a weak reference so the watcher never keeps the actor alive, and
+/// removes the entry only if it still points at this exact actor, so a late
+/// notification cannot evict a freshly re-materialized replacement.
+pub(crate) fn spawn_local_actor_stop_watcher(
+    registry: Arc<tokio::sync::Mutex<SessionRegistry>>,
+    session_id: String,
+    actor_ref: &ActorRef<SessionActor>,
+) {
+    let weak = actor_ref.downgrade();
+    let actor_id = actor_ref.id().sequence_id();
+    tokio::spawn(async move {
+        weak.wait_for_shutdown().await;
+        let evicted = registry
+            .lock()
+            .await
+            .remove_local_if_same_actor(&session_id, actor_id);
+        if evicted {
+            log::warn!(
+                "SessionRegistry: session actor {} (actor_id={}) stopped; evicted from registry",
+                session_id,
+                actor_id
+            );
+        }
+    });
+}
+
 /// Controls how a materialized session actor is integrated with remote infra.
 pub struct SessionMaterializationOptions {
     pub attach_mesh_handle: bool,
@@ -388,6 +416,37 @@ impl SessionRegistry {
 
     pub fn local_actor_ref(&self, session_id: &str) -> Option<&ActorRef<SessionActor>> {
         self.local_actor_refs.get(session_id)
+    }
+
+    /// Return the live local actor for `session_id`. If the registered local
+    /// actor has stopped, evict the stale entry (including DHT re-register
+    /// closures) and return `None` so callers re-materialize a fresh actor.
+    pub fn live_local_actor_ref(&mut self, session_id: &str) -> Option<ActorRef<SessionActor>> {
+        let existing = self.local_actor_refs.get(session_id).cloned()?;
+        if existing.is_alive() {
+            return Some(existing);
+        }
+        log::warn!(
+            "SessionRegistry: evicting stopped session actor for {} (actor_id={})",
+            session_id,
+            existing.id().sequence_id()
+        );
+        self.remove(session_id);
+        None
+    }
+
+    /// Remove the local entry for `session_id` only if it still points at the
+    /// actor with `actor_id`. Used by stop watchers so a late notification can
+    /// never evict a freshly re-materialized replacement.
+    pub fn remove_local_if_same_actor(&mut self, session_id: &str, actor_id: u64) -> bool {
+        let same = self
+            .local_actor_refs
+            .get(session_id)
+            .is_some_and(|actor| actor.id().sequence_id() == actor_id);
+        if same {
+            self.remove(session_id);
+        }
+        same
     }
 
     pub async fn materialize_session_actor(
@@ -908,22 +967,9 @@ pub(crate) async fn prepare_remote_attachment(
             candidate.relay_actor_id
         );
         candidate.matched_scope = Some(selected_scope);
-        candidate
-            .registered_relay_names
-            .reserve(active_scopes.len());
-        for scope in &active_scopes {
-            // A generation-specific name lets an old attachment be cleaned up
-            // after commit without deregistering the replacement relay.
-            let name = format!(
-                "{}::{}",
-                scoped_event_relay(scope, &candidate.session_id, mesh.peer_id()),
-                candidate.relay_actor_id
-            );
-            candidate.registered_relay_names.push(name.clone());
-            runtime
-                .register_actor(candidate.relay_ref.clone(), name)
-                .await;
-        }
+        // DHT publication is deferred until link + subscribe succeed (below):
+        // failed attach attempts must not mint provider records, which are
+        // bounded (1024 keys) and were previously exhausted by reconnect loops.
     } else {
         candidate.relay_dht_name = format!(
             "event_relay::{}::local::{}",
@@ -955,10 +1001,43 @@ pub(crate) async fn prepare_remote_attachment(
             candidate.relay_actor_id,
             error
         );
-        abort_prepared_remote_attachment(candidate).await;
+        // A remote actor that is not running cannot process unsubscribe or
+        // unlink requests; skip those futile round-trips and clean up locally.
+        if error.data.as_ref().is_some_and(|data| {
+            data.get("category").and_then(|v| v.as_str()) == Some("remote_transport")
+                && data.get("kind").and_then(|v| v.as_str()) == Some("actor_unavailable")
+        }) {
+            abort_prepared_remote_attachment_local_only(candidate).await;
+        } else {
+            abort_prepared_remote_attachment(candidate).await;
+        }
         return Err(AgentError::RemoteActor(format!(
             "failed to subscribe remote session events: {error}"
         )));
+    }
+
+    // The attachment is established over the direct relay handoff; publishing
+    // the relay in the DHT is only a discoverability fallback, so do it last
+    // and only for attachments that actually work. A generation-specific name
+    // lets an old attachment be cleaned up after commit without
+    // deregistering the replacement relay.
+    if let Some(mesh) = candidate.mesh.clone() {
+        let runtime = MeshRuntimeHandle::from(mesh.clone());
+        let active_scopes = runtime.active_scopes();
+        candidate
+            .registered_relay_names
+            .reserve(active_scopes.len());
+        for scope in &active_scopes {
+            let name = format!(
+                "{}::{}",
+                scoped_event_relay(scope, &candidate.session_id, mesh.peer_id()),
+                candidate.relay_actor_id
+            );
+            candidate.registered_relay_names.push(name.clone());
+            runtime
+                .register_actor(candidate.relay_ref.clone(), name)
+                .await;
+        }
     }
 
     Ok(candidate)
@@ -968,6 +1047,16 @@ pub(crate) async fn prepare_remote_attachment(
 #[cfg(feature = "remote")]
 pub(crate) async fn abort_prepared_remote_attachment(mut candidate: PreparedRemoteAttachment) {
     cleanup_attachment_parts(candidate.cleanup_parts(), true).await;
+    candidate.armed = false;
+}
+
+/// Tear down a candidate without contacting the remote session (used when the
+/// remote actor is known to be gone).
+#[cfg(feature = "remote")]
+pub(crate) async fn abort_prepared_remote_attachment_local_only(
+    mut candidate: PreparedRemoteAttachment,
+) {
+    cleanup_attachment_parts(candidate.cleanup_parts(), false).await;
     candidate.armed = false;
 }
 
@@ -1201,6 +1290,138 @@ mod tests {
         assert!(f.registry.is_empty());
         assert_eq!(f.registry.len(), 0);
         assert!(f.registry.session_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_local_actor_ref_returns_live_actor() {
+        let mut f = RegistryFixture::new().await;
+        let actor = f.spawn_actor();
+        f.registry
+            .local_actor_refs
+            .insert("test-session".into(), actor.clone());
+        let live = f.registry.live_local_actor_ref("test-session");
+        assert_eq!(live.map(|a| a.id()), Some(actor.id()));
+    }
+
+    #[tokio::test]
+    async fn live_local_actor_ref_evicts_stopped_actor() {
+        let mut f = RegistryFixture::new().await;
+        let actor = f.spawn_actor();
+        f.registry.insert("test-session".into(), actor.clone());
+        f.registry
+            .local_actor_refs
+            .insert("test-session".into(), actor.clone());
+
+        actor.kill();
+        actor.wait_for_shutdown().await;
+
+        assert!(f.registry.live_local_actor_ref("test-session").is_none());
+        // The stale entry is gone everywhere so a fresh actor can be materialized.
+        assert!(f.registry.get("test-session").is_none());
+        assert!(f.registry.local_actor_ref("test-session").is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_local_if_same_actor_ignores_replacement() {
+        let mut f = RegistryFixture::new().await;
+        let old = f.spawn_actor();
+        let replacement = f.spawn_actor();
+        f.registry
+            .local_actor_refs
+            .insert("test-session".into(), replacement.clone());
+
+        assert!(
+            !f.registry
+                .remove_local_if_same_actor("test-session", old.id().sequence_id())
+        );
+        assert!(f.registry.local_actor_ref("test-session").is_some());
+        assert!(
+            f.registry
+                .remove_local_if_same_actor("test-session", replacement.id().sequence_id())
+        );
+        assert!(f.registry.local_actor_ref("test-session").is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_watcher_evicts_dead_actor_but_not_replacement() {
+        let f = RegistryFixture::new().await;
+        let actor = f.spawn_actor();
+        let replacement = f.spawn_actor();
+        let registry = Arc::new(Mutex::new(f.registry));
+        registry
+            .lock()
+            .await
+            .local_actor_refs
+            .insert("test-session".into(), actor.clone());
+        spawn_local_actor_stop_watcher(registry.clone(), "test-session".into(), &actor);
+
+        // Replace the entry first: the late stop notification must not evict it.
+        registry
+            .lock()
+            .await
+            .local_actor_refs
+            .insert("test-session".into(), replacement.clone());
+        actor.kill();
+        actor.wait_for_shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            registry
+                .lock()
+                .await
+                .local_actor_ref("test-session")
+                .is_some_and(|a| a.id() == replacement.id()),
+            "late stop notification must not evict the replacement actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_watcher_evicts_registered_actor_on_stop() {
+        let f = RegistryFixture::new().await;
+        let actor = f.spawn_actor();
+        let registry = Arc::new(Mutex::new(f.registry));
+        registry
+            .lock()
+            .await
+            .local_actor_refs
+            .insert("test-session".into(), actor.clone());
+        spawn_local_actor_stop_watcher(registry.clone(), "test-session".into(), &actor);
+
+        actor.kill();
+        actor.wait_for_shutdown().await;
+
+        let mut evicted = false;
+        for _ in 0..50 {
+            if registry
+                .lock()
+                .await
+                .local_actor_ref("test-session")
+                .is_none()
+            {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(evicted, "stopped actor must be evicted by the watcher");
+    }
+
+    /// A linked actor (a remote event relay in production) dying must never
+    /// take the session actor down with it.
+    #[tokio::test]
+    async fn session_actor_survives_linked_actor_death() {
+        let f = RegistryFixture::new().await;
+        let session = f.spawn_actor();
+        let sibling = f.spawn_actor();
+        session.link(&sibling).await;
+
+        sibling.kill();
+        sibling.wait_for_shutdown().await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert!(
+            session.is_alive(),
+            "session actor must outlive the death of a linked actor"
+        );
     }
 
     #[test]

@@ -251,6 +251,11 @@ pub struct LocalAgentHandle {
     #[cfg(feature = "remote")]
     pub(crate) remote_connect_gates: remote_connect::RemoteConnectGateMap,
 
+    /// Per-session failure cooldowns so a dead remote session is not retried
+    /// in a hot loop (each attempt spawns a relay and touches the DHT).
+    #[cfg(feature = "remote")]
+    pub(crate) remote_connect_cooldowns: remote_connect::RemoteConnectCooldownMap,
+
     /// Non-blocking model inventory with snapshot-based reads and background refresh.
     /// This is the canonical public API for model listing and cache management.
     pub model_inventory: crate::model_inventory::ModelInventory,

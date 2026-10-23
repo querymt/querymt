@@ -18,6 +18,45 @@ use crate::{
 
 pub type ReRegisterFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Minimum interval between repeated DHT registration warnings.
+const REGISTER_WARN_INTERVAL_SECS: u64 = 60;
+
+/// Log a DHT registration failure, rate-limited so a persistent condition
+/// (e.g. a full provider-record store) cannot flood the logs.
+fn warn_register_failure(name: &str, error: &dyn std::fmt::Display) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+    static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < REGISTER_WARN_INTERVAL_SECS
+        || LAST_WARN_SECS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        SUPPRESSED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let suppressed = SUPPRESSED.swap(0, Ordering::Relaxed);
+    let message = error.to_string();
+    let hint = if message.contains("cannot contain any more provider records") {
+        " (the local DHT provider-record store is full; restart the agent to clear it)"
+    } else {
+        ""
+    };
+    log::warn!(
+        "MeshHandle: failed to register '{}' in DHT: {}{} [{} similar warnings suppressed]",
+        name,
+        message,
+        hint,
+        suppressed
+    );
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteLookupError {
     #[error("remote actor lookup timed out after {timeout:?}")]
@@ -147,22 +186,33 @@ impl MeshHandle {
         let name = name.into();
         actor_ref.into_remote_ref().await;
         if let Err(e) = actor_ref.register(name.clone()).await {
-            log::warn!("MeshHandle: failed to register '{}' in DHT: {}", name, e);
+            warn_register_failure(&name, &e);
         }
 
+        // Hold only a weak reference: the closure must neither keep a stopped
+        // actor alive nor keep re-publishing it to the DHT forever. Once the
+        // actor is gone the closure removes its own entry.
         let name_clone = name.clone();
-        let actor_ref_clone = actor_ref.clone();
+        let weak_actor = actor_ref.downgrade();
+        let fns_weak = Arc::downgrade(&self.re_register_fns);
         let re_register: ReRegisterFn = Arc::new(move || {
             let name = name_clone.clone();
-            let actor_ref = actor_ref_clone.clone();
+            let weak_actor = weak_actor.clone();
+            let fns_weak = fns_weak.clone();
             Box::pin(async move {
+                let Some(actor_ref) = weak_actor.upgrade().filter(|a| a.is_alive()) else {
+                    if let Some(fns) = fns_weak.upgrade() {
+                        fns.write().remove(&name);
+                    }
+                    log::debug!(
+                        "MeshHandle: actor for '{}' stopped; dropping re-registration",
+                        name
+                    );
+                    return;
+                };
                 actor_ref.into_remote_ref().await;
                 if let Err(e) = actor_ref.register(name.clone()).await {
-                    log::warn!(
-                        "MeshHandle: re-registration of '{}' after peer discovery failed: {}",
-                        name,
-                        e
-                    );
+                    warn_register_failure(&name, &e);
                 }
             })
         });
@@ -244,8 +294,15 @@ impl MeshHandle {
         resolver(self, peer_name).await
     }
 
+    /// Stop re-publishing `name` and withdraw its provider record from the DHT.
+    ///
+    /// Provider records are capped per node (libp2p's default store holds 1024
+    /// keys), so names must be unregistered, not just forgotten locally.
     pub fn deregister_actor(&self, name: &str) {
         self.re_register_fns.write().remove(name);
+        let _ = self.swarm_cmd_tx.send(SwarmCommand::UnregisterActor {
+            name: name.to_string(),
+        });
     }
 
     pub fn re_register_fns_count(&self) -> usize {

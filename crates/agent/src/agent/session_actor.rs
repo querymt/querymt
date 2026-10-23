@@ -206,13 +206,42 @@ impl Actor for SessionActor {
         Ok(args)
     }
 
+    /// The only actors linked to a `SessionActor` are remote event relays
+    /// (one per client attachment). A relay dying, being killed on cleanup, or
+    /// its peer disconnecting means the *attachment* went away, never that the
+    /// session should: kameo's default would stop the session here, leaving a
+    /// dead actor behind that the node keeps handing out on resume.
+    async fn on_link_died(
+        &mut self,
+        _actor_ref: kameo::actor::WeakActorRef<Self>,
+        id: kameo::actor::ActorId,
+        reason: kameo::error::ActorStopReason,
+    ) -> Result<std::ops::ControlFlow<kameo::error::ActorStopReason>, Self::Error> {
+        info!(
+            "SessionActor {}: linked actor {} died ({}); keeping session alive",
+            self.session_id, id, reason
+        );
+        Ok(std::ops::ControlFlow::Continue(()))
+    }
+
     /// Release the session's ordered event stream once everything emitted so
     /// far is persisted, so stopped sessions do not keep a writer task alive.
     async fn on_stop(
         &mut self,
         _actor_ref: kameo::actor::WeakActorRef<Self>,
-        _reason: kameo::error::ActorStopReason,
+        reason: kameo::error::ActorStopReason,
     ) -> Result<(), Self::Error> {
+        // kameo only logs stop reasons at trace level; surface unexpected
+        // stops so a dead session actor is diagnosable from telemetry.
+        match &reason {
+            kameo::error::ActorStopReason::Normal
+            | kameo::error::ActorStopReason::SupervisorRestart => {
+                debug!("SessionActor {} stopped: {}", self.session_id, reason);
+            }
+            _ => {
+                warn!("SessionActor {} stopped: {}", self.session_id, reason);
+            }
+        }
         self.config
             .event_sink
             .retire_session_stream(&self.session_id)

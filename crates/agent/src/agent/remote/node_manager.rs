@@ -764,9 +764,12 @@ mod remote_impl {
             // ── Idempotency check ───────────────────────────────────────────
             // After acquiring the per-session lock, check whether another
             // caller already materialized this session.
+            // A stopped actor (e.g. its link to a disconnected peer died) must
+            // never be handed out again: `live_local_actor_ref` evicts it so we
+            // fall through to a fresh materialization below.
             {
-                let registry = self.registry.lock().await;
-                if let Some(existing) = registry.local_actor_ref(&session_id).cloned() {
+                let mut registry = self.registry.lock().await;
+                if let Some(existing) = registry.live_local_actor_ref(&session_id) {
                     drop(registry);
                     let handoff = self.handoff_for_local_actor(&session_id, existing).await;
                     self.cleanup_materialization_lock(&session_id, &session_lock)
@@ -822,6 +825,11 @@ mod remote_impl {
                     let mut registry = self.registry.lock().await;
                     registry.register_prepared_session(prepared).await;
                 }
+                crate::agent::session_registry::spawn_local_actor_stop_watcher(
+                    self.registry.clone(),
+                    session_id.clone(),
+                    &actor_ref,
+                );
 
                 // ── Phase 3: Finalize (NO lock held) ────────────────────────────
                 self.session_materializer
