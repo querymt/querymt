@@ -8217,12 +8217,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "minijinja"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90086695417a271bc96e6cb50618555614ca48fa3bb0d9aa96e3468b0f84431e"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "minijinja-contrib"
 version = "2.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
 dependencies = [
- "minijinja",
+ "minijinja 2.24.0",
  "serde",
 ]
 
@@ -8367,7 +8376,7 @@ dependencies = [
  "lrtable",
  "metrics",
  "mime_guess",
- "minijinja",
+ "minijinja 2.24.0",
  "minijinja-contrib",
  "mistralrs-audio",
  "mistralrs-code-exec",
@@ -11394,7 +11403,7 @@ dependencies = [
  "llama-cpp-2",
  "llguidance",
  "log",
- "minijinja",
+ "minijinja 3.0.3",
  "minijinja-contrib",
  "querymt",
  "querymt-provider-common",
@@ -11637,7 +11646,7 @@ dependencies = [
  "log",
  "mdq",
  "mime_guess",
- "minijinja",
+ "minijinja 3.0.3",
  "mockall",
  "moka",
  "notify",
