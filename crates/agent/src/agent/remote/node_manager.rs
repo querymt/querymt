@@ -484,6 +484,59 @@ mod remote_impl {
             })
         }
 
+        async fn bound_session_runtime(
+            &self,
+            session_id: &str,
+        ) -> Result<
+            Option<(
+                Arc<Mutex<SessionRegistry>>,
+                Arc<crate::agent::session_materializer::SessionMaterializer>,
+            )>,
+            AgentError,
+        > {
+            let profiles = self.profiles.load_full();
+            let Some(profiles) = profiles.as_ref().as_ref() else {
+                return Ok(None);
+            };
+            let Some(binding) = profiles.session_binding(session_id).await else {
+                return Ok(None);
+            };
+            let runtime = profiles.runtime_for_profile(&binding.profile_id).await?;
+            let handle = runtime
+                .session_handle(binding.agent_id.as_deref())
+                .ok_or_else(|| {
+                    AgentError::Internal(format!("Unknown owner runtime for session {session_id}"))
+                })?;
+            let local = handle
+                .as_any()
+                .downcast_ref::<crate::agent::LocalAgentHandle>()
+                .ok_or_else(|| {
+                    AgentError::Internal(format!(
+                        "Owner runtime is not local for session {session_id}"
+                    ))
+                })?;
+            if local.mesh().is_none()
+                && let Some(mesh) = &self.mesh
+            {
+                local.set_mesh(mesh.clone());
+            }
+            Ok(Some((
+                local.registry.clone(),
+                local.session_materializer.clone(),
+            )))
+        }
+
+        async fn session_registry(
+            &self,
+            session_id: &str,
+        ) -> Result<Arc<Mutex<SessionRegistry>>, AgentError> {
+            Ok(self
+                .bound_session_runtime(session_id)
+                .await?
+                .map(|(registry, _)| registry)
+                .unwrap_or_else(|| self.registry.clone()))
+        }
+
         fn scheduler_unavailable_error() -> AgentError {
             AgentError::Internal("scheduler unavailable".to_string())
         }
@@ -761,11 +814,16 @@ mod remote_impl {
             };
             let _guard = session_lock.lock().await;
 
+            let (registry, materializer) = self
+                .bound_session_runtime(&session_id)
+                .await?
+                .unwrap_or_else(|| (self.registry.clone(), self.session_materializer.clone()));
+
             // ── Idempotency check ───────────────────────────────────────────
             // After acquiring the per-session lock, check whether another
             // caller already materialized this session.
             {
-                let registry = self.registry.lock().await;
+                let registry = registry.lock().await;
                 if let Some(existing) = registry.local_actor_ref(&session_id).cloned() {
                     drop(registry);
                     let handoff = self.handoff_for_local_actor(&session_id, existing).await;
@@ -783,9 +841,8 @@ mod remote_impl {
                 cwd_path.clone().unwrap_or_default(),
             );
 
-            let (prepared, actor_ref) = match self
-                .session_materializer
-                .prepare_load_session(req, Some(&self.registry))
+            let (prepared, actor_ref) = match materializer
+                .prepare_load_session(req, Some(&registry))
                 .await
                 .map_err(|e| AgentError::Internal(e.to_string()))?
             {
@@ -819,12 +876,12 @@ mod remote_impl {
             if let Some(prepared) = prepared.as_ref() {
                 // ── Phase 2: Register (lock held for microseconds) ──────────────
                 {
-                    let mut registry = self.registry.lock().await;
+                    let mut registry = registry.lock().await;
                     registry.register_prepared_session(prepared).await;
                 }
 
                 // ── Phase 3: Finalize (NO lock held) ────────────────────────────
-                self.session_materializer
+                materializer
                     .finalize_session(prepared)
                     .await
                     .map_err(|e| AgentError::Internal(e.to_string()))?;
@@ -922,19 +979,33 @@ mod remote_impl {
                     )));
                 }
 
-                let session_context = shared_state
-                    .config
+                // Remote creation uses the owner's active profile, never a profile
+                // inferred from the requesting machine. Persist the binding before
+                // exporting the actor so direct owner loads select the same runtime.
+                let profiles = shared_state.profiles.load_full();
+                let owner_runtime = match profiles.as_ref().as_ref() {
+                    Some(profiles) => Some(profiles.active_runtime().await?),
+                    None => None,
+                };
+                let config = owner_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.agent().handle().config.clone())
+                    .unwrap_or_else(|| shared_state.config.clone());
+                let session_context = config
                     .provider
-                    .create_session(
-                        cwd_path.clone(),
-                        None,
-                        &shared_state.config.execution_config_snapshot(),
-                    )
+                    .create_session(cwd_path.clone(), None, &config.execution_config_snapshot())
                     .await
                     .map_err(|e| AgentError::Internal(e.to_string()))?;
 
                 let session = session_context.session();
                 let session_id = session.public_id.clone();
+                if let (Some(profiles), Some(runtime)) =
+                    (profiles.as_ref().as_ref(), &owner_runtime)
+                {
+                    profiles
+                        .bind_session_to_runtime(&session_id, runtime)
+                        .await?;
+                }
                 let title = session.name.clone();
                 let created_at = session
                     .created_at
@@ -1129,19 +1200,13 @@ mod remote_impl {
                 let page: Vec<_> = sorted.into_iter().skip(offset).take(limit).collect();
                 let page_len = page.len();
 
-                let registry_live: std::collections::HashMap<
-                    String,
-                    crate::agent::remote::SessionActorRef,
-                > = {
-                    let registry = shared_state.registry.lock().await;
-                    page.iter()
-                        .filter_map(|s| {
-                            registry
-                                .get(&s.public_id)
-                                .map(|r| (s.public_id.clone(), r.clone()))
-                        })
-                        .collect()
-                };
+                let mut registry_live = std::collections::HashMap::new();
+                for session in &page {
+                    let registry = shared_state.session_registry(&session.public_id).await?;
+                    if let Some(session_ref) = registry.lock().await.get(&session.public_id).cloned() {
+                        registry_live.insert(session.public_id.clone(), session_ref);
+                    }
+                }
 
                 let mut infos = Vec::with_capacity(page_len);
                 let loaded_profiles = shared_state.profiles.load_full();
@@ -1371,19 +1436,13 @@ mod remote_impl {
                 let limit = msg.limit.unwrap_or(20).clamp(1, 100) as usize;
                 let page: Vec<_> = matching.into_iter().skip(offset).take(limit).collect();
                 let page_len = page.len();
-                let registry_live: HashMap<
-                    String,
-                    crate::agent::remote::SessionActorRef,
-                > = {
-                    let registry = shared_state.registry.lock().await;
-                    page.iter()
-                        .filter_map(|(session, _)| {
-                            registry
-                                .get(&session.public_id)
-                                .map(|session_ref| (session.public_id.clone(), session_ref.clone()))
-                        })
-                        .collect()
-                };
+                let mut registry_live = HashMap::new();
+                for (session, _) in &page {
+                    let registry = shared_state.session_registry(&session.public_id).await?;
+                    if let Some(session_ref) = registry.lock().await.get(&session.public_id).cloned() {
+                        registry_live.insert(session.public_id.clone(), session_ref);
+                    }
+                }
                 let mut sessions = Vec::with_capacity(page_len);
                 for (session, lifecycle) in page {
                     let session_id = session.public_id.clone();
@@ -1625,7 +1684,8 @@ mod remote_impl {
                     "StopRemoteSessionRuntime spawned task started"
                 );
                 let session_ref = {
-                    let mut registry = shared_state.registry.lock().await;
+                    let registry = shared_state.session_registry(&msg.session_id).await?;
+                    let mut registry = registry.lock().await;
                     let removed = registry.remove(&msg.session_id);
                     tracing::debug!(
                         session_id = %msg.session_id,
