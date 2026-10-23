@@ -168,6 +168,8 @@ impl Tool for MultiEditTool {
             .await
             .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
+        edit_output::verify_written_content(&file_path, content.as_bytes()).await?;
+
         // Build compact line-numbered hunk output from the actual file diff so
         // sequential edits produce precise hunks instead of whole-file replacements.
         let file_output =

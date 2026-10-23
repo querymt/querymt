@@ -82,6 +82,13 @@ impl TestAgent {
     pub(crate) async fn execution_context(
         &self,
     ) -> crate::agent::execution_context::ExecutionContext {
+        self.execution_context_in(None).await
+    }
+
+    pub(crate) async fn execution_context_in(
+        &self,
+        cwd: Option<std::path::PathBuf>,
+    ) -> crate::agent::execution_context::ExecutionContext {
         let session_handle = self
             .config
             .provider
@@ -96,7 +103,7 @@ impl TestAgent {
         .await
         .unwrap();
         let runtime = crate::agent::core::SessionRuntime::new(
-            None,
+            cwd,
             Default::default(),
             crate::agent::core::McpToolState::empty(),
         );
