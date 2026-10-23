@@ -81,7 +81,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 mime_guess = "2.0"
 futures-util = "0.3"
 toml.workspace = true
-minijinja = { version = "2", default-features = false, features = ["serde"] }
+minijinja = { version = "3", default-features = false, features = ["serde"] }
 iana-time-zone = "0.1"
 regex.workspace = true
 tokio-util = { version = "0.7", features = ["compat", "rt"] }
