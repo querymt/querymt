@@ -123,6 +123,10 @@ async fn websocket_event_forwarder_preserves_multi_update_order() {
             notices: false,
             compaction: true,
         });
+    translator.lock().unwrap().seed_config_options(
+        session_id,
+        &crate::agent::session_registry::config_options(crate::agent::core::AgentMode::Build, None),
+    );
 
     spawn_event_forwarders(
         state,
@@ -182,8 +186,19 @@ async fn websocket_event_forwarder_preserves_multi_update_order() {
         model["params"]["update"]["sessionUpdate"],
         "config_option_update"
     );
+    let options = model["params"]["update"]["configOptions"]
+        .as_array()
+        .unwrap();
     assert_eq!(
-        model["params"]["update"]["configOptions"][0]["currentValue"],
+        options.len(),
+        3,
+        "wire updates replace the complete configuration"
+    );
+    assert_eq!(
+        options
+            .iter()
+            .find(|option| option["id"] == "model")
+            .unwrap()["currentValue"],
         "local/m"
     );
     let first: serde_json::Value = serde_json::from_str(

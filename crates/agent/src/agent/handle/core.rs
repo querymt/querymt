@@ -238,7 +238,7 @@ impl LocalAgentHandle {
         )
     }
 
-    pub(super) async fn session_config_options(
+    pub(crate) async fn session_config_options(
         &self,
         session_id: Option<&str>,
         mode: AgentMode,

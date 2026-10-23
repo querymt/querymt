@@ -893,6 +893,41 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     .await;
     assert_eq!(reattached["config_options"][0]["currentValue"], "review");
 
+    // A fork keeps its source profile even after the owner's active default changes.
+    let forked = node_manager
+        .ask(crate::agent::remote::ForkRemoteSession {
+            source_session_id: created.session_id.clone(),
+            message_id: history_before.last().unwrap().id.clone(),
+        })
+        .await
+        .expect("fork in the source runtime");
+    let fork_load = remote
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            forked.session_id.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("fork must load directly on its owner");
+    assert_eq!(
+        config_option_value(&fork_load.config_options.unwrap(), "profile").as_deref(),
+        Some("alpha")
+    );
+    assert!(
+        owner_handle
+            .registry
+            .lock()
+            .await
+            .get(&forked.session_id)
+            .is_some()
+    );
+    node_manager
+        .ask(crate::agent::remote::StopRemoteSessionRuntime {
+            session_id: forked.session_id,
+        })
+        .await
+        .unwrap();
+
     // Rebuild the owner's profile manager with a different active default. The
     // persisted binding must restore alpha, not silently switch this session to beta.
     f.handle.registry.lock().await.remove(&created.session_id);
@@ -928,6 +963,32 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     ));
     restarted.handle.set_profiles(restarted_profiles.clone());
     let (_, restarted_manager) = register_remote_node(mesh, &restarted, "owner", true).await;
+    for lifecycle in [false, true] {
+        if lifecycle {
+            restarted_manager
+                .ask(crate::agent::remote::ListRemoteSessionsWithLifecycle {
+                    offset: None,
+                    limit: None,
+                    cwd: None,
+                    scope: crate::session::projection::SessionScope::All,
+                    lifecycle: Default::default(),
+                })
+                .await
+                .expect("cold lifecycle listing");
+        } else {
+            restarted_manager
+                .ask(crate::agent::remote::ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
+                .await
+                .expect("cold listing");
+        }
+        assert!(
+            restarted_profiles.materialized_runtimes().await.is_empty(),
+            "listing persisted sessions must not build profile runtimes"
+        );
+    }
     let resumed = restarted_manager
         .ask(crate::agent::remote::ResumeRemoteSession {
             session_id: created.session_id.clone(),

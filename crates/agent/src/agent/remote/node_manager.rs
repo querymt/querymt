@@ -470,7 +470,13 @@ mod remote_impl {
         async fn session_profile(&self, session_id: &str) -> Option<RemoteSessionProfile> {
             let loaded = self.profiles.load_full();
             let profiles = loaded.as_ref().as_ref()?;
-            let binding = profiles.session_binding(session_id).await?;
+            let binding = self
+                .config
+                .provider
+                .history_store()
+                .get_session_runtime_binding(session_id)
+                .await
+                .ok()??;
             let profile_label = profiles
                 .list_profiles()
                 .await
@@ -535,6 +541,34 @@ mod remote_impl {
                 .await?
                 .map(|(registry, _)| registry)
                 .unwrap_or_else(|| self.registry.clone()))
+        }
+
+        /// Listing observes existing actors without constructing a profile runtime.
+        async fn live_session(
+            &self,
+            session_id: &str,
+        ) -> Option<crate::agent::remote::SessionActorRef> {
+            let loaded = self.profiles.load_full();
+            if let Some(profiles) = loaded.as_ref().as_ref()
+                && let Ok(Some(binding)) = self
+                    .config
+                    .provider
+                    .history_store()
+                    .get_session_runtime_binding(session_id)
+                    .await
+            {
+                let runtime = profiles
+                    .materialized_runtimes()
+                    .await
+                    .into_iter()
+                    .find(|runtime| runtime.profile_id() == binding.profile_id)?;
+                let handle = runtime.session_handle(binding.agent_id.as_deref())?;
+                let local = handle
+                    .as_any()
+                    .downcast_ref::<crate::agent::LocalAgentHandle>()?;
+                return local.registry.lock().await.get(session_id).cloned();
+            }
+            self.registry.lock().await.get(session_id).cloned()
         }
 
         fn scheduler_unavailable_error() -> AgentError {
@@ -1063,8 +1097,41 @@ mod remote_impl {
 
             // Spawn the heavy work as a background task
             ctx.spawn(async move {
-                let session = shared_state
-                    .config
+                let profiles = shared_state.profiles.load_full();
+                let source_binding = match profiles.as_ref().as_ref() {
+                    Some(profiles) => profiles.session_binding(&msg.source_session_id).await,
+                    None => None,
+                };
+                let owner_runtime = match profiles.as_ref().as_ref() {
+                    Some(profiles) => Some(match &source_binding {
+                        Some(binding) => profiles.runtime_for_profile(&binding.profile_id).await?,
+                        None => profiles.active_runtime().await?,
+                    }),
+                    None => None,
+                };
+                let config = match &owner_runtime {
+                    Some(runtime) => {
+                        let handle = runtime
+                            .session_handle(
+                                source_binding
+                                    .as_ref()
+                                    .and_then(|binding| binding.agent_id.as_deref()),
+                            )
+                            .ok_or_else(|| {
+                                AgentError::Internal("Unknown source session runtime".into())
+                            })?;
+                        handle
+                            .as_any()
+                            .downcast_ref::<crate::agent::LocalAgentHandle>()
+                            .ok_or_else(|| {
+                                AgentError::Internal("Source session runtime is not local".into())
+                            })?
+                            .config
+                            .clone()
+                    }
+                    None => shared_state.config.clone(),
+                };
+                let session = config
                     .provider
                     .history_store()
                     .get_session(&msg.source_session_id)
@@ -1074,8 +1141,7 @@ mod remote_impl {
                         session_id: msg.source_session_id.clone(),
                     })?;
 
-                let forked_session_id = shared_state
-                    .config
+                let forked_session_id = config
                     .provider
                     .history_store()
                     .fork_session(
@@ -1086,8 +1152,19 @@ mod remote_impl {
                     .await
                     .map_err(|e| AgentError::Internal(e.to_string()))?;
 
-                let forked_session = shared_state
-                    .config
+                if let (Some(profiles), Some(runtime)) =
+                    (profiles.as_ref().as_ref(), &owner_runtime)
+                {
+                    let mut binding = runtime.session_binding();
+                    binding.agent_id = source_binding
+                        .as_ref()
+                        .and_then(|binding| binding.agent_id.clone());
+                    profiles
+                        .set_session_binding(&forked_session_id, binding)
+                        .await;
+                }
+
+                let forked_session = config
                     .provider
                     .history_store()
                     .get_session(&forked_session_id)
@@ -1202,8 +1279,7 @@ mod remote_impl {
 
                 let mut registry_live = std::collections::HashMap::new();
                 for session in &page {
-                    let registry = shared_state.session_registry(&session.public_id).await?;
-                    if let Some(session_ref) = registry.lock().await.get(&session.public_id).cloned() {
+                    if let Some(session_ref) = shared_state.live_session(&session.public_id).await {
                         registry_live.insert(session.public_id.clone(), session_ref);
                     }
                 }
@@ -1218,8 +1294,8 @@ mod remote_impl {
                     std::collections::HashMap::new()
                 };
                 for session in &page {
-                    let profile = if let Some(profiles) = profiles {
-                        profiles.session_binding(&session.public_id).await.and_then(|binding| {
+                    let profile = if profiles.is_some() {
+                        store.get_session_runtime_binding(&session.public_id).await.ok().flatten().and_then(|binding| {
                             profile_names.get(&binding.profile_id).map(|label| (binding.profile_id, label.clone()))
                         })
                     } else { None };
@@ -1438,8 +1514,7 @@ mod remote_impl {
                 let page_len = page.len();
                 let mut registry_live = HashMap::new();
                 for (session, _) in &page {
-                    let registry = shared_state.session_registry(&session.public_id).await?;
-                    if let Some(session_ref) = registry.lock().await.get(&session.public_id).cloned() {
+                    if let Some(session_ref) = shared_state.live_session(&session.public_id).await {
                         registry_live.insert(session.public_id.clone(), session_ref);
                     }
                 }

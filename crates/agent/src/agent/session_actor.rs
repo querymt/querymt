@@ -187,8 +187,13 @@ pub struct SessionActor {
 
     // Tracks owned EventForwarder tasks by relay actor so replacement, unsubscribe,
     // and SessionActor teardown cancel the corresponding background task.
-    pub(crate) relay_forwarder_handles:
-        HashMap<kameo::actor::ActorId, crate::agent::remote::event_forwarder::EventForwarderHandle>,
+    pub(crate) relay_forwarder_handles: HashMap<
+        kameo::actor::ActorId,
+        (
+            Option<String>,
+            crate::agent::remote::event_forwarder::EventForwarderHandle,
+        ),
+    >,
 }
 
 impl Actor for SessionActor {
@@ -350,6 +355,23 @@ impl SessionActor {
     pub fn with_mesh(mut self, mesh: Option<crate::agent::remote::MeshHandle>) -> Self {
         self.mesh = mesh;
         self
+    }
+
+    fn remove_relay_forwarder(
+        &mut self,
+        sequence_id: u64,
+        relay_dht_name: &str,
+    ) -> Option<crate::agent::remote::event_forwarder::EventForwarderHandle> {
+        let relay_id = self
+            .relay_forwarder_handles
+            .iter()
+            .find(|(id, (name, _))| {
+                id.sequence_id() == sequence_id && name.as_deref() == Some(relay_dht_name)
+            })
+            .map(|(id, _)| *id)?;
+        self.relay_forwarder_handles
+            .remove(&relay_id)
+            .map(|(_, handle)| handle)
     }
 
     /// Return the original receipt for a repeated `client_input_id`, if it is
@@ -1625,7 +1647,7 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
             };
 
             let relay_id = relay_ref.id();
-            if let Some(prev_handle) = self.relay_forwarder_handles.remove(&relay_id) {
+            if let Some((_, prev_handle)) = self.relay_forwarder_handles.remove(&relay_id) {
                 prev_handle.abort();
                 log::debug!(
                     "Session {}: SubscribeEvents relay_actor_id={} - aborted previous forwarder",
@@ -1641,7 +1663,8 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
                 format!("session:{}", self.session_id),
                 self.session_id.clone(),
             );
-            self.relay_forwarder_handles.insert(relay_id, handle);
+            self.relay_forwarder_handles
+                .insert(relay_id, (msg.relay_dht_name, handle));
 
             // Re-emit readiness if indexing completed before the live path existed.
             if let Some(workspace) = self.runtime.workspace_handle.get()
@@ -1695,12 +1718,7 @@ impl Message<crate::agent::messages::UnsubscribeEvents> for SessionActor {
         msg: crate::agent::messages::UnsubscribeEvents,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let relay_id = self
-            .relay_forwarder_handles
-            .keys()
-            .find(|id| id.sequence_id() == msg.relay_actor_id)
-            .copied();
-        if let Some(handle) = relay_id.and_then(|id| self.relay_forwarder_handles.remove(&id)) {
+        if let Some(handle) = self.remove_relay_forwarder(msg.relay_actor_id, &msg.relay_dht_name) {
             handle.abort();
             info!(
                 "Session {}: UnsubscribeEvents relay_actor_id={} — forwarder task aborted",
@@ -3495,6 +3513,65 @@ mod tests {
                 history_writes,
             }
         }
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn unsubscribe_disambiguates_relay_sequence_ids_by_peer_scoped_name() {
+        use crate::agent::remote::{event_forwarder::EventForwarder, event_relay::EventRelayActor};
+        crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let fixture = ActorFixture::new().await;
+        let runtime = SessionRuntime::new(
+            None,
+            HashMap::new(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let mut actor = SessionActor::new(fixture.config.clone(), "test-session".into(), runtime);
+        let relay = EventRelayActor::spawn(EventRelayActor::new(
+            fixture.config.event_sink.clone(),
+            "test-session".into(),
+            "viewer".into(),
+            None,
+            None,
+        ));
+        let relay_ref = relay.clone().into_remote_ref().await;
+        let handle = || {
+            EventForwarder::start(
+                fixture.config.event_sink.fanout().clone(),
+                relay_ref.clone(),
+                "test".into(),
+                "test-session".into(),
+            )
+        };
+        let a = kameo::actor::ActorId::new_with_peer_id(
+            42,
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id(),
+        );
+        let b = kameo::actor::ActorId::new_with_peer_id(
+            42,
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id(),
+        );
+        actor
+            .relay_forwarder_handles
+            .insert(a, (Some("relay/peer-a".into()), handle()));
+        assert!(
+            actor.remove_relay_forwarder(42, "relay/peer-b").is_none(),
+            "another peer's sequence ID cannot unsubscribe A"
+        );
+        actor
+            .relay_forwarder_handles
+            .insert(b, (Some("relay/peer-b".into()), handle()));
+        actor
+            .remove_relay_forwarder(42, "relay/peer-b")
+            .expect("matching B forwarder")
+            .abort();
+        assert!(actor.relay_forwarder_handles.contains_key(&a));
+        assert!(!actor.relay_forwarder_handles.contains_key(&b));
+        relay.kill();
     }
 
     #[cfg(feature = "remote")]

@@ -28,8 +28,8 @@ use crate::acp::protocol::{
     AgentRequest, AuthenticateRequest, CancelNotification, ClientNotification, ClientRequest,
     CloseSessionRequest, DeleteSessionRequest, ExtRequest, ForkSessionRequest, InitializeRequest,
     ListSessionsRequest, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, PromptRequest,
-    ResumeSessionRequest, SessionId, SessionNotification, SetSessionConfigOptionRequest,
-    SetSessionModeRequest, SetSessionModelRequest,
+    ResumeSessionRequest, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, SetSessionModelRequest,
 };
 use crate::acp::shared::{
     AcpLiveEventTranslator, QMT_NOTIFICATION_DELEGATION_UPDATE, QMT_NOTIFICATION_INPUT_STATE,
@@ -132,7 +132,7 @@ pub(crate) async fn replay_loaded_session(
         }
     };
     let event_count = events.len();
-    let notifications = async {
+    let mut notifications = async {
         crate::acp::shared::replay_agent_events_materialized(
             session_id,
             events,
@@ -142,6 +142,27 @@ pub(crate) async fn replay_loaded_session(
     }
     .instrument(info_span!("acp.replay.translate", session.id = %session_id))
     .await;
+    // Historical events do not carry profile selectors. Replay the owner's full
+    // current configuration, not a partial historical replacement.
+    let options = agent
+        .session_config_options(Some(session_id), crate::agent::core::AgentMode::Build, None)
+        .await?;
+    notifications.retain(|notification| {
+        !matches!(notification.update, SessionUpdate::ConfigOptionUpdate(_))
+    });
+    let config_index = notifications
+        .iter()
+        .position(|notification| matches!(notification.update, SessionUpdate::CurrentModeUpdate(_)))
+        .map_or(0, |index| index + 1);
+    notifications.insert(
+        config_index,
+        SessionNotification::new(
+            SessionId::from(session_id.to_string()),
+            SessionUpdate::ConfigOptionUpdate(crate::acp::protocol::ConfigOptionUpdate::new(
+                options,
+            )),
+        ),
+    );
     Ok((notifications, event_count))
 }
 
@@ -227,10 +248,15 @@ async fn load_session_and_enqueue_replay(
         };
         let session_id = req.session_id.to_string();
         let outcome = prepare_session_load(agent, req, &capabilities, &preferences).await?;
-        let seeded = translator
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .seed_usage_from_meta(&session_id, outcome.response.meta.as_ref());
+        let seeded = {
+            let mut translator = translator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(options) = outcome.response.config_options.as_ref() {
+                translator.seed_config_options(&session_id, options);
+            }
+            translator.seed_usage_from_meta(&session_id, outcome.response.meta.as_ref())
+        };
         if !seeded {
             crate::acp::shared::restore_session_usage(agent, &session_id, translator).await;
         }
@@ -938,8 +964,13 @@ pub async fn serve_stdio(agent: Arc<crate::agent::LocalAgentHandle>) -> anyhow::
             {
                 let agent = agent.clone();
                 let bridge_sender = bridge_sender.clone();
+                let translator = translator.clone();
                 async move |req: NewSessionRequest, responder, _cx| {
                     let result = agent.new_session(req).await;
+                    if let Ok(response) = &result
+                        && let Some(options) = response.config_options.as_ref() {
+                        translator.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).seed_config_options(&response.session_id.to_string(), options);
+                    }
                     let session_id = result.as_ref().ok().map(|r| r.session_id.to_string());
                     let send_result = responder.respond_with_result(result);
                     if let Some(session_id) = session_id {
