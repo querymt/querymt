@@ -82,6 +82,8 @@ pub struct AgentToolContext {
     event_sink: Option<Arc<EventSink>>,
     task_service: Option<crate::session::TaskService>,
     mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
 }
 
 impl AgentToolContext {
@@ -103,7 +105,27 @@ impl AgentToolContext {
             event_sink: None,
             task_service: None,
             mutation_gate: None,
+            workspace_service: None,
+            session_store: None,
         }
+    }
+
+    /// Attach the managed worktree workspace service (when configured).
+    pub fn with_workspace_service(
+        mut self,
+        service: Option<Arc<crate::worktree::WorkspaceService>>,
+    ) -> Self {
+        self.workspace_service = service;
+        self
+    }
+
+    /// Attach the durable session store.
+    pub fn with_session_store(
+        mut self,
+        store: Arc<dyn crate::session::store::SessionStore>,
+    ) -> Self {
+        self.session_store = Some(store);
+        self
     }
 
     /// Create a context with an explicit cancellation token.
@@ -280,6 +302,14 @@ impl ToolContext for AgentToolContext {
 
     fn checkout_mutation_gate(&self) -> Option<Arc<crate::worktree::gate::CheckoutMutationGate>> {
         self.mutation_gate.clone()
+    }
+
+    fn workspace_service(&self) -> Option<Arc<crate::worktree::WorkspaceService>> {
+        self.workspace_service.clone()
+    }
+
+    fn session_store(&self) -> Option<Arc<dyn crate::session::store::SessionStore>> {
+        self.session_store.clone()
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -45,6 +45,18 @@ pub trait WorkspaceRepository: Send + Sync {
         session_id: &str,
     ) -> SessionResult<Option<WorkspaceRecord>>;
 
+    /// The workspace allocated for one delegation, when it ran isolated.
+    async fn get_workspace_by_delegation(
+        &self,
+        delegation_id: &str,
+    ) -> SessionResult<Option<WorkspaceRecord>> {
+        Ok(self
+            .list_workspaces()
+            .await?
+            .into_iter()
+            .find(|r| r.ownership.delegation_id.as_deref() == Some(delegation_id)))
+    }
+
     /// List all workspaces, newest first.
     async fn list_workspaces(&self) -> SessionResult<Vec<WorkspaceRecord>>;
 
@@ -344,6 +356,20 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
         self.run_blocking(move |conn| {
             let sql = select_by_owner_sql();
             conn.query_row(&sql, params![owner], row_to_workspace)
+                .optional()
+        })
+        .await
+    }
+
+    async fn get_workspace_by_delegation(
+        &self,
+        delegation_id: &str,
+    ) -> SessionResult<Option<WorkspaceRecord>> {
+        let delegation_id = delegation_id.to_string();
+        self.run_blocking(move |conn| {
+            let sql =
+                format!("SELECT {SELECT_COLS} FROM workspaces WHERE delegation_id = ?1 LIMIT 1");
+            conn.query_row(&sql, params![delegation_id], row_to_workspace)
                 .optional()
         })
         .await

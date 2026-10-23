@@ -297,6 +297,8 @@ async fn execute_tool_call_inner(
 
     let tool_context = exec_ctx
         .tool_context(config.agent_registry.clone(), Some(elicitation_tx))
+        .with_workspace_service(config.workspace_service())
+        .with_session_store(exec_ctx.state.store.clone())
         .with_task_service(crate::session::TaskService::new(
             exec_ctx.state.store.clone(),
             exec_ctx.session_id.clone(),

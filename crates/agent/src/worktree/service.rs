@@ -774,6 +774,7 @@ impl WorkspaceService {
 mod tests {
     use super::*;
     use crate::session::schema;
+    use crate::worktree::AcceptRequest;
     use crate::worktree::GitRunner as _;
     use crate::worktree::GixRepoOps;
     use crate::worktree::domain::{BaselineMode, baseline_ref_for};
@@ -782,6 +783,7 @@ mod tests {
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
     use rusqlite::Connection;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
 
@@ -1350,6 +1352,111 @@ mod tests {
             fs::read_to_string(repo.path().join("file.txt")).unwrap(),
             "parent dirty"
         );
+
+        // Explicit result acceptance, including an executable hook, with no
+        // Git executable reachable: delta, merge, apply, hook, commit,
+        // reference transaction and index update are all native. The hook
+        // only uses shell builtins because `PATH` is empty.
+        let source = init_repo();
+        commit_files(source.path(), "init", &[("file.txt", "one")]);
+        materialize(source.path(), &[("file.txt", "one")]);
+        let parent_owner = storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let parent = svc
+            .allocate_for_new_session(
+                source.path(),
+                &SessionCreationOptions::isolated_worktree(BaselineMode::Commit),
+            )
+            .await
+            .unwrap()
+            .expect("isolation allocates");
+        let parent_record = svc
+            .bind_owner(&parent.record.id, &parent_owner.public_id)
+            .await
+            .unwrap();
+        let child = svc
+            .allocate_for_delegation(
+                &parent_owner.public_id,
+                Some(&parent_record),
+                &parent_record.checkout_path,
+                None,
+                "delegation-no-git",
+                None,
+            )
+            .await
+            .unwrap();
+        fs::write(child.effective_cwd.join("out.txt"), "delegate work").unwrap();
+        let produced = svc
+            .publish_result(
+                &child.record,
+                &child.effective_cwd,
+                Some(&child.mutation_gate),
+                None,
+            )
+            .await
+            .unwrap()
+            .result_commit
+            .unwrap();
+
+        #[cfg(unix)]
+        let marker = {
+            use std::os::unix::fs::PermissionsExt;
+            let marker = data.path().join("hook-ran");
+            let hooks = source.path().join(".git/hooks");
+            fs::create_dir_all(&hooks).unwrap();
+            let hook = hooks.join("pre-commit");
+            fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\ntest -f out.txt && echo ran > '{}'\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+            marker
+        };
+
+        let request = crate::worktree::AcceptRequest {
+            delegation_id: "delegation-no-git",
+            result_commit: &produced,
+            requesting_session_id: &parent_owner.public_id,
+            target_cwd: &parent_record.checkout_path,
+            objective: "Add out.txt",
+            mutation_gate: None,
+            delegation_status: crate::session::domain::DelegationStatus::Complete,
+        };
+        let crate::worktree::IntegrationOutcome::Integrated(done) =
+            svc.accept_delegation_result(&request).await.unwrap()
+        else {
+            panic!("acceptance must integrate without a Git executable");
+        };
+        #[cfg(unix)]
+        assert!(
+            marker.exists(),
+            "the executable hook ran against the applied files"
+        );
+        assert_eq!(
+            fs::read_to_string(parent_record.checkout_path.join("out.txt")).unwrap(),
+            "delegate work"
+        );
+        assert_eq!(
+            gix::open(&parent_record.checkout_path)
+                .unwrap()
+                .head_id()
+                .unwrap()
+                .to_string(),
+            done.commit
+        );
+        let crate::worktree::IntegrationOutcome::AlreadyIntegrated { commit } =
+            svc.accept_delegation_result(&request).await.unwrap()
+        else {
+            panic!("a repeated acceptance reports the original commit");
+        };
+        assert_eq!(commit, done.commit);
     }
 
     async fn service() -> (TempDir, TempDir, WorkspaceService) {
@@ -1393,6 +1500,732 @@ mod tests {
         svc.bind_owner(&binding.record.id, session_id)
             .await
             .unwrap()
+    }
+
+    /// Explicit acceptance integrates exactly the delegate's delta as one
+    /// commit on the parent's current branch, is replay-safe, and only the
+    /// delegation's parent session may ask for it.
+    #[tokio::test]
+    async fn accepting_a_delegate_result_commits_its_delta_once() {
+        use crate::worktree::{AcceptRequest, IntegrationOutcome};
+
+        let (repo, _storage, svc) = service().await;
+        let parent = provision_owned(&svc, repo.path(), "sess-owner").await;
+        let child = svc
+            .allocate_for_delegation(
+                "sess-owner",
+                Some(&parent),
+                &parent.checkout_path,
+                None,
+                "delegation-accept",
+                None,
+            )
+            .await
+            .unwrap();
+        fs::write(child.effective_cwd.join("out.txt"), "delegate work").unwrap();
+        let provenance = svc
+            .publish_result(
+                &child.record,
+                &child.effective_cwd,
+                Some(&child.mutation_gate),
+                None,
+            )
+            .await
+            .unwrap();
+        let result = provenance.result_commit.clone().unwrap();
+        let request = |session: &'static str| AcceptRequest {
+            delegation_id: "delegation-accept",
+            result_commit: &result,
+            requesting_session_id: session,
+            target_cwd: &parent.checkout_path,
+            objective: "Add out.txt\nsecond line",
+            mutation_gate: None,
+            delegation_status: crate::session::domain::DelegationStatus::Complete,
+        };
+
+        let head_before = CliGit::new()
+            .run(&parent.checkout_path, &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .stdout_str();
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&request("someone-else"))
+            .await
+            .unwrap()
+        else {
+            panic!("a foreign session must be refused");
+        };
+        assert_eq!(refusal.code, "not_parent_session");
+        assert!(!parent.checkout_path.join("out.txt").exists());
+
+        let IntegrationOutcome::Integrated(done) = svc
+            .accept_delegation_result(&request("sess-owner"))
+            .await
+            .unwrap()
+        else {
+            panic!("the delegate's delta must be integrated");
+        };
+        assert_eq!(done.parent, head_before.trim());
+        assert_eq!(
+            std::fs::read_to_string(parent.checkout_path.join("out.txt")).unwrap(),
+            "delegate work"
+        );
+        let head_after = CliGit::new()
+            .run(&parent.checkout_path, &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .stdout_str();
+        assert_eq!(head_after.trim(), done.commit);
+
+        // Replay: the original commit is reported and nothing new is made.
+        let IntegrationOutcome::AlreadyIntegrated { commit } = svc
+            .accept_delegation_result(&request("sess-owner"))
+            .await
+            .unwrap()
+        else {
+            panic!("a repeated acceptance must report the original commit");
+        };
+        assert_eq!(commit, done.commit);
+    }
+
+    /// A service over fault-injecting operations, a managed parent owned by
+    /// `sess-owner`, and a delegate result that adds `out.txt`.
+    async fn acceptance_world() -> (
+        TempDir,
+        TempDir,
+        Arc<crate::worktree::FaultInjectingRepoOps>,
+        WorkspaceService,
+        WorkspaceRecord,
+    ) {
+        use crate::worktree::FaultInjectingRepoOps;
+
+        let repo = init_repo();
+        commit_files(repo.path(), "init", &[("file.txt", "one")]);
+        materialize(repo.path(), &[("file.txt", "one")]);
+        let storage = TempDir::new().unwrap();
+        let faults = Arc::new(FaultInjectingRepoOps::new(Arc::new(GixRepoOps::new())));
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA foreign_keys = ON;", []).unwrap();
+        schema::init_schema(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (public_id, name, created_at, updated_at) \
+             VALUES ('sess-owner', 'owner', '2026-01-15T00:00:00Z', '2026-01-15T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let svc = WorkspaceService::new(
+            faults.clone(),
+            Arc::new(SqliteWorkspaceRepository::new(Arc::new(StdMutex::new(
+                conn,
+            )))),
+            storage.path(),
+        );
+        let parent = provision_owned(&svc, repo.path(), "sess-owner").await;
+        (repo, storage, faults, svc, parent)
+    }
+
+    /// Allocate an isolated delegate of `parent`, let it write `files`, and
+    /// return its published result commit.
+    async fn delegate_result(
+        svc: &WorkspaceService,
+        parent: &WorkspaceRecord,
+        delegation_id: &str,
+        files: &[(&str, &str)],
+    ) -> String {
+        let child = svc
+            .allocate_for_delegation(
+                "sess-owner",
+                Some(parent),
+                &parent.checkout_path,
+                None,
+                delegation_id,
+                None,
+            )
+            .await
+            .unwrap();
+        for (path, content) in files {
+            let target = child.effective_cwd.join(path);
+            if let Some(dir) = target.parent() {
+                fs::create_dir_all(dir).unwrap();
+            }
+            fs::write(target, content).unwrap();
+        }
+        svc.publish_result(
+            &child.record,
+            &child.effective_cwd,
+            Some(&child.mutation_gate),
+            None,
+        )
+        .await
+        .unwrap()
+        .result_commit
+        .unwrap()
+    }
+
+    /// The world plus one delegate (`delegation-accept`) that adds `out.txt`.
+    async fn acceptance_fixture() -> (
+        TempDir,
+        TempDir,
+        Arc<crate::worktree::FaultInjectingRepoOps>,
+        WorkspaceService,
+        WorkspaceRecord,
+        String,
+    ) {
+        let (repo, storage, faults, svc, parent) = acceptance_world().await;
+        let result = delegate_result(
+            &svc,
+            &parent,
+            "delegation-accept",
+            &[("out.txt", "delegate work")],
+        )
+        .await;
+        (repo, storage, faults, svc, parent, result)
+    }
+
+    fn accept_for<'a>(
+        parent: &'a WorkspaceRecord,
+        delegation_id: &'a str,
+        result: &'a str,
+    ) -> AcceptRequest<'a> {
+        AcceptRequest {
+            delegation_id,
+            result_commit: result,
+            requesting_session_id: "sess-owner",
+            target_cwd: &parent.checkout_path,
+            objective: "Add out.txt",
+            mutation_gate: None,
+            delegation_status: crate::session::domain::DelegationStatus::Complete,
+        }
+    }
+
+    fn accept_request<'a>(parent: &'a WorkspaceRecord, result: &'a str) -> AcceptRequest<'a> {
+        accept_for(parent, "delegation-accept", result)
+    }
+
+    #[cfg(unix)]
+    fn install_pre_commit(common_dir: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hooks = common_dir.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        fs::write(&hook, script).unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Content of `path` in `commit`.
+    fn committed(parent: &WorkspaceRecord, commit: &str, path: &str) -> Vec<u8> {
+        let repo = gix::open(&parent.checkout_path).unwrap();
+        let id = repo
+            .rev_parse_single(format!("{commit}:{path}").as_str())
+            .unwrap();
+        repo.find_blob(id).unwrap().data.clone()
+    }
+
+    /// The delta is committed on its own: the user's edit to another
+    /// tracked file and an untracked file stay local work.
+    #[tokio::test]
+    async fn only_the_delta_is_committed_next_to_local_work() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        fs::write(parent.checkout_path.join("file.txt"), "user edit").unwrap();
+        fs::write(parent.checkout_path.join("notes.local"), "mine").unwrap();
+
+        let IntegrationOutcome::Integrated(done) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("unrelated local work must not block the acceptance");
+        };
+
+        let paths: Vec<_> = done.changed_paths.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["out.txt"]);
+        assert_eq!(
+            committed(&parent, &done.commit, "out.txt"),
+            b"delegate work"
+        );
+        assert_eq!(&committed(&parent, &done.commit, "file.txt")[..], b"one");
+        assert_eq!(
+            fs::read_to_string(parent.checkout_path.join("file.txt")).unwrap(),
+            "user edit"
+        );
+        assert_eq!(
+            fs::read_to_string(parent.checkout_path.join("notes.local")).unwrap(),
+            "mine"
+        );
+    }
+
+    /// Local state on a path the result touches refuses and keeps the
+    /// user's file.
+    #[tokio::test]
+    async fn local_work_on_a_touched_path_refuses_the_acceptance() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let head = head_of(&parent);
+        fs::write(parent.checkout_path.join("out.txt"), "my own").unwrap();
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("local work on a touched path must refuse");
+        };
+
+        assert_eq!(refusal.code, "touches_local_changes");
+        assert_eq!(refusal.paths, ["out.txt"]);
+        assert_eq!(
+            fs::read_to_string(parent.checkout_path.join("out.txt")).unwrap(),
+            "my own"
+        );
+        assert_eq!(head_of(&parent), head);
+    }
+
+    /// Parallel siblings from one baseline: disjoint results layer, each
+    /// commit carrying only its own delta.
+    #[tokio::test]
+    async fn parallel_siblings_layer_on_the_moved_branch() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent) = acceptance_world().await;
+        let one = delegate_result(&svc, &parent, "d-one", &[("a.txt", "from one")]).await;
+        let two = delegate_result(&svc, &parent, "d-two", &[("b.txt", "from two")]).await;
+
+        let IntegrationOutcome::Integrated(first) = svc
+            .accept_delegation_result(&accept_for(&parent, "d-one", &one))
+            .await
+            .unwrap()
+        else {
+            panic!("the first sibling integrates");
+        };
+        let IntegrationOutcome::Integrated(second) = svc
+            .accept_delegation_result(&accept_for(&parent, "d-two", &two))
+            .await
+            .unwrap()
+        else {
+            panic!("the second sibling layers on the first");
+        };
+
+        assert_eq!(second.parent, first.commit);
+        let paths: Vec<_> = second
+            .changed_paths
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect();
+        assert_eq!(paths, ["b.txt"]);
+        assert_eq!(head_of(&parent), second.commit);
+        for (file, content) in [("a.txt", "from one"), ("b.txt", "from two")] {
+            assert_eq!(
+                fs::read_to_string(parent.checkout_path.join(file)).unwrap(),
+                content
+            );
+        }
+    }
+
+    /// Overlapping sibling edits are a conflict, and nothing changes.
+    #[tokio::test]
+    async fn overlapping_siblings_conflict_without_changing_anything() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent) = acceptance_world().await;
+        let one = delegate_result(&svc, &parent, "d-one", &[("file.txt", "two")]).await;
+        let two = delegate_result(&svc, &parent, "d-two", &[("file.txt", "three")]).await;
+        let IntegrationOutcome::Integrated(first) = svc
+            .accept_delegation_result(&accept_for(&parent, "d-one", &one))
+            .await
+            .unwrap()
+        else {
+            panic!("the first sibling integrates");
+        };
+
+        let IntegrationOutcome::Conflicted { paths } = svc
+            .accept_delegation_result(&accept_for(&parent, "d-two", &two))
+            .await
+            .unwrap()
+        else {
+            panic!("overlapping edits must conflict");
+        };
+
+        assert_eq!(paths, ["file.txt"]);
+        assert_eq!(head_of(&parent), first.commit);
+        assert_eq!(
+            fs::read_to_string(parent.checkout_path.join("file.txt")).unwrap(),
+            "two"
+        );
+    }
+
+    /// `commit.gpgSign=true` is refused before anything is written: QueryMT
+    /// cannot sign and never makes an unsigned commit instead.
+    #[tokio::test]
+    async fn commit_signing_is_refused_without_creating_a_commit() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let head = head_of(&parent);
+        let config = parent.repository.common_dir.join("config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str("\n[commit]\n\tgpgSign = true\n");
+        fs::write(&config, text).unwrap();
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("signing must be refused");
+        };
+
+        assert_eq!(refusal.code, "signing_unsupported");
+        assert_checkout_unchanged(&parent, &head);
+    }
+
+    /// An external commit that lands while the hooks run wins the
+    /// compare-and-swap: it is kept, nothing is committed, files restored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_branch_moved_during_the_hooks_loses_the_compare_and_swap() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let head = head_of(&parent);
+        let handle = gix::open(&parent.checkout_path).unwrap();
+        let tree = handle.head_commit().unwrap().tree_id().unwrap().detach();
+        let external = handle
+            .write_object(&gix::objs::Commit {
+                tree,
+                parents: vec![head.parse::<gix::ObjectId>().unwrap()].into(),
+                author: crate::worktree::repo_ops::internal_signature(),
+                committer: crate::worktree::repo_ops::internal_signature(),
+                encoding: None,
+                message: "external".into(),
+                extra_headers: Default::default(),
+            })
+            .unwrap()
+            .detach()
+            .to_string();
+        let branch_ref = parent
+            .repository
+            .common_dir
+            .join("refs/heads")
+            .join(parent.branch.as_str());
+        install_pre_commit(
+            &parent.repository.common_dir,
+            &format!("#!/bin/sh\necho {external} > '{}'\n", branch_ref.display()),
+        );
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("a moved branch must refuse");
+        };
+
+        assert_eq!(refusal.code, "branch_moved");
+        assert_checkout_unchanged(&parent, &external);
+    }
+
+    /// A hook that re-stages a delta path has its content committed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_restaging_a_delta_path_is_committed_end_to_end() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        install_pre_commit(
+            &parent.repository.common_dir,
+            "#!/bin/sh\nprintf 'formatted' > out.txt\ngit add out.txt\n",
+        );
+
+        let IntegrationOutcome::Integrated(done) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("a re-staging hook inside the delta is fine");
+        };
+
+        assert_eq!(committed(&parent, &done.commit, "out.txt"), b"formatted");
+    }
+
+    /// A hook that stages something outside the delta is refused and the
+    /// branch stays where it was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hook_staging_outside_the_delta_is_refused_end_to_end() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let head = head_of(&parent);
+        install_pre_commit(
+            &parent.repository.common_dir,
+            "#!/bin/sh\nprintf 'sneaked' > file.txt\ngit add file.txt\n",
+        );
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("staging outside the delta must refuse");
+        };
+
+        assert_eq!(refusal.code, "hook_changed_paths_outside_delta");
+        assert_eq!(refusal.paths, ["file.txt"]);
+        assert_checkout_unchanged(&parent, &head);
+    }
+
+    /// Nothing is left of an acceptance: no intent, no scratch file, no
+    /// lock, no applied file, and the branch is where it was.
+    fn assert_checkout_unchanged(parent: &WorkspaceRecord, head: &str) {
+        let git_dir = fs::read_to_string(parent.checkout_path.join(".git"))
+            .unwrap()
+            .trim()
+            .trim_start_matches("gitdir:")
+            .trim()
+            .to_string();
+        let git_dir = PathBuf::from(git_dir);
+        assert!(!parent.checkout_path.join("out.txt").exists());
+        assert!(!git_dir.join("qmt-integration-intent.json").exists());
+        assert!(!git_dir.join("index.lock").exists());
+        let scratch: Vec<_> = fs::read_dir(&git_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("qmt-integration-"))
+            .collect();
+        assert!(scratch.is_empty(), "left behind: {scratch:?}");
+        let repo = gix::open(&parent.checkout_path).unwrap();
+        assert_eq!(repo.head_id().unwrap().to_string(), head);
+    }
+
+    fn head_of(parent: &WorkspaceRecord) -> String {
+        gix::open(&parent.checkout_path)
+            .unwrap()
+            .head_id()
+            .unwrap()
+            .to_string()
+    }
+
+    /// A rejecting hook is a refusal, and the applied files are rolled back
+    /// by the caller (the hook phase leaves them in place).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rejecting_hook_restores_the_checkout() {
+        use crate::worktree::IntegrationOutcome;
+        use std::os::unix::fs::PermissionsExt;
+
+        let (repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let head = head_of(&parent);
+        let hooks = repo.path().join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\ntest -e out.txt || exit 3\necho nope >&2\nexit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("a rejecting hook must refuse");
+        };
+
+        assert_eq!(refusal.code, "commit_rejected");
+        assert!(
+            refusal.message.contains("pre-commit"),
+            "{}",
+            refusal.message
+        );
+        assert!(refusal.message.contains("nope"), "{}", refusal.message);
+        assert_checkout_unchanged(&parent, &head);
+
+        // The next acceptance is not blocked by the rejected one.
+        fs::remove_file(&hook).unwrap();
+        assert!(matches!(
+            svc.accept_delegation_result(&accept_request(&parent, &result))
+                .await
+                .unwrap(),
+            IntegrationOutcome::Integrated(_)
+        ));
+    }
+
+    /// A failure injected before finalization leaves applied files that the
+    /// service itself recovers; a later acceptance succeeds.
+    #[tokio::test]
+    async fn failures_before_finalization_are_recovered() {
+        use crate::worktree::{FailurePoint, IntegrationOutcome};
+
+        for point in [
+            FailurePoint::PrepareIntegration,
+            FailurePoint::ApplyIntegration,
+            FailurePoint::RunHooks,
+            FailurePoint::FinalizeIntegration,
+        ] {
+            let (_repo, _storage, faults, svc, parent, result) = acceptance_fixture().await;
+            let head = head_of(&parent);
+            faults.fail_next(point, 1, "boom");
+
+            let err = svc
+                .accept_delegation_result(&accept_request(&parent, &result))
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("boom"), "{point:?}: {err}");
+            assert_checkout_unchanged(&parent, &head);
+            assert!(matches!(
+                svc.accept_delegation_result(&accept_request(&parent, &result))
+                    .await
+                    .unwrap(),
+                IntegrationOutcome::Integrated(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_delegation_is_refused_by_the_service() {
+        use crate::worktree::IntegrationOutcome;
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let mut request = accept_request(&parent, &result);
+        request.delegation_status = crate::session::domain::DelegationStatus::Running;
+
+        let IntegrationOutcome::Refused(refusal) =
+            svc.accept_delegation_result(&request).await.unwrap()
+        else {
+            panic!("a running delegation must be refused");
+        };
+        assert_eq!(refusal.code, "delegation_not_complete");
+        assert!(!parent.checkout_path.join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_record_off_the_branch_is_not_reported_as_integrated() {
+        use crate::worktree::IntegrationOutcome;
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let IntegrationOutcome::Integrated(done) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("the first acceptance integrates");
+        };
+        // The user resets the branch to before the integration.
+        let repo = gix::open(&parent.checkout_path).unwrap();
+        let branch = repo.head_name().unwrap().unwrap();
+        repo.reference(
+            branch.as_ref(),
+            done.parent.parse::<gix::hash::ObjectId>().unwrap(),
+            gix::refs::transaction::PreviousValue::Any,
+            "reset",
+        )
+        .unwrap();
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("an unreachable record must not report AlreadyIntegrated");
+        };
+        assert_eq!(refusal.code, "integration_record_unreachable");
+    }
+
+    /// A crash inside finalization is recovered before the call returns:
+    /// rolled back while the branch is unchanged, completed once it moved.
+    #[tokio::test]
+    async fn crashes_during_finalization_are_recovered() {
+        use crate::worktree::{FailurePoint, IntegrationOutcome};
+
+        for point in [
+            FailurePoint::FinalizeCommit,
+            FailurePoint::FinalizeRefTransaction,
+        ] {
+            let (_repo, _storage, faults, svc, parent, result) = acceptance_fixture().await;
+            let head = head_of(&parent);
+            faults.fail_next(point, 1, "boom");
+
+            let err = svc
+                .accept_delegation_result(&accept_request(&parent, &result))
+                .await
+                .unwrap_err();
+
+            assert!(err.to_string().contains("boom"), "{point:?}: {err}");
+            assert_checkout_unchanged(&parent, &head);
+            assert!(matches!(
+                svc.accept_delegation_result(&accept_request(&parent, &result))
+                    .await
+                    .unwrap(),
+                IntegrationOutcome::Integrated(_)
+            ));
+        }
+
+        // Died after the branch moved: the index update is completed, the
+        // acceptance reports the commit, and a repeat is a replay.
+        let (_repo, _storage, faults, svc, parent, result) = acceptance_fixture().await;
+        faults.fail_next(FailurePoint::FinalizeIndexUpdate, 1, "boom");
+        let IntegrationOutcome::Integrated(done) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("recovery must complete the interrupted acceptance");
+        };
+        assert_eq!(head_of(&parent), done.commit);
+        assert_eq!(
+            fs::read_to_string(parent.checkout_path.join("out.txt")).unwrap(),
+            "delegate work"
+        );
+        let index = gix::open(&parent.checkout_path)
+            .unwrap()
+            .open_index()
+            .unwrap();
+        assert!(index.entry_by_path("out.txt".into()).is_some());
+        let IntegrationOutcome::AlreadyIntegrated { commit } = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("a repeat must report the original commit");
+        };
+        assert_eq!(commit, done.commit);
+    }
+
+    /// A lock QueryMT did not create is never removed; the acceptance is
+    /// refused and nothing changes.
+    #[tokio::test]
+    async fn a_foreign_index_lock_blocks_acceptance_without_being_removed() {
+        use crate::worktree::IntegrationOutcome;
+
+        let (_repo, _storage, _faults, svc, parent, result) = acceptance_fixture().await;
+        let head = head_of(&parent);
+        let git_dir = PathBuf::from(
+            fs::read_to_string(parent.checkout_path.join(".git"))
+                .unwrap()
+                .trim()
+                .trim_start_matches("gitdir:")
+                .trim(),
+        );
+        let lock = git_dir.join("index.lock");
+        fs::write(&lock, "someone else").unwrap();
+
+        let IntegrationOutcome::Refused(refusal) = svc
+            .accept_delegation_result(&accept_request(&parent, &result))
+            .await
+            .unwrap()
+        else {
+            panic!("a foreign lock must refuse");
+        };
+
+        assert_eq!(refusal.code, "index_locked");
+        assert_eq!(fs::read(&lock).unwrap(), b"someone else");
+        assert!(!parent.checkout_path.join("out.txt").exists());
+        assert_eq!(head_of(&parent), head);
     }
 
     #[tokio::test]

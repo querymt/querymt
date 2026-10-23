@@ -304,3 +304,81 @@ impl WorkspaceRepository for FaultInjectingWorkspaceRepository {
         self.inner().list_results(id).await
     }
 }
+
+const CHILD_ENV: &str = "QMT_TEST_CHILD";
+
+/// True inside a process started by [`run_in_child`].
+pub(crate) fn in_child() -> bool {
+    std::env::var_os(CHILD_ENV).is_some()
+}
+
+/// Re-run the test at `test_path` (module path below the crate root, e.g.
+/// `worktree::repo_ops::tests::probe`) in a child process with `env`
+/// applied. gix reads the process environment while opening a repository,
+/// so checks that depend on it must not mutate the shared test process.
+/// The child half returns early unless [`in_child`] is true.
+pub(crate) fn run_in_child(test_path: &str, env: &[(&str, &std::ffi::OsStr)]) {
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", test_path, "--nocapture", "--test-threads=1"])
+        .env(CHILD_ENV, "1");
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{test_path} failed in the child:\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child probe must actually run: {stdout}"
+    );
+}
+
+/// Write the real index from the current HEAD tree, as a checkout after
+/// `git commit` would have it. Fixtures that build commits through object
+/// APIs never write one, and a missing index reads as "every tracked file is
+/// staged for deletion".
+pub(crate) fn write_index_from_head(root: &Path) {
+    let repo = gix::open(root).unwrap();
+    let tree = repo.head_commit().unwrap().tree_id().unwrap();
+    let mut index = repo.index_from_tree(&tree).unwrap();
+    index.write(Default::default()).unwrap();
+}
+
+/// Run the Git CLI in `root` (fixture setup only, never production code) and
+/// return trimmed stdout. Inherited repository redirection is cleared.
+pub(crate) fn git(root: &Path, args: &[&str]) -> String {
+    git_with_stdin(root, args, "")
+}
+
+pub(crate) fn git_with_stdin(root: &Path, args: &[&str], stdin: &str) -> String {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn git");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}

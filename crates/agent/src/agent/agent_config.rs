@@ -535,6 +535,8 @@ mod tests {
         assert!(config.requires_permission_for_tool("write_file"));
         assert!(config.requires_permission_for_tool("edit"));
         assert!(config.requires_permission_for_tool("multiedit"));
+        // Integration rewrites tracked files and advances the branch.
+        assert!(config.requires_permission_for_tool("accept_delegation_result"));
         assert!(config.requires_permission_for_tool("delete_file"));
         assert!(config.requires_permission_for_tool("shell"));
         // read-only tools do NOT require permission

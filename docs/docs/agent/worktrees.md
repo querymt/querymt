@@ -383,8 +383,10 @@ readable messages may be reworded; codes do not change.
 3. Inspect the retained child ID/path and `/worktree result <id>`. Review only
    baseline-to-result changes using the exact OIDs/refs in the response. A
    top-level workspace publishes its own delta with `/worktree publish`.
-4. Integrate that delta manually after review. No completion, cancellation,
-   disconnection, or command merges it for you.
+4. Integrate that delta after review. Completion, cancellation, disconnection
+   and commands never merge it for you; for delegates the parent session accepts
+   it explicitly (see [Accepting a delegate result](#accepting-a-delegate-result)).
+   A top-level workspace's delta is integrated manually.
 5. Close the owning session and any explicitly shared delegates. From another
    local conversation, run `/worktree archive <id>`, then `/worktree remove <id>`.
    Archive permanently retires execution while preserving conversation history
@@ -609,6 +611,160 @@ delegation, and the worktree command surface keep working without a
 snapshot backend, and undo reports its usual unavailable-backend behavior
 rather than substituting workspace Git refs as undo history. Enabling
 isolation never silently enables snapshots when they were disabled.
+
+## Accepting a delegate result
+
+A session that has reviewed an isolated delegate's retained result accepts it
+with the `accept_delegation_result` tool (`delegation_id` and the reviewed
+`result_commit`; no paths, commands or messages). Integration is deterministic
+runtime code, not a prompt:
+
+- The delegate's change is exactly `baseline → result`. It is applied with a
+  three-way merge against the checkout's **current** `HEAD`, so when parallel
+  siblings share one baseline, the one accepted second is layered on top of the
+  one accepted first. Overlapping edits report a **conflict** and change nothing.
+- The change becomes **one commit on the checkout's current branch** (the branch
+  is advanced directly). The message names the objective and carries
+  `QueryMT-Delegation`, `QueryMT-Workspace`, `QueryMT-Result` and
+  `QueryMT-Baseline` trailers. The author and committer come from the
+  repository's Git configuration (system, global and user config are read; a
+  missing identity is refused, none is invented).
+- Local work is never swept in: only the paths in the delta are written and
+  committed. If any of them has staged, unstaged, untracked or ignored local
+  state, or the delegate's baseline already contained uncommitted edits to it,
+  the request is **refused** and nothing changes. Detached `HEAD`, an
+  in-progress merge/rebase/cherry-pick, sparse checkout, submodule changes and
+  unresolved conflicts are also refused.
+- Accepting the same result again returns the original commit
+  (`refs/qmt/integrations/<workspace-id>/<result-commit>`); only the delegation's
+  parent session may accept, and never into the delegate's own workspace.
+- A refusal or conflict is final for that result. Delegate the underlying change
+  again from the current state rather than patching by hand.
+
+### How an acceptance runs
+
+No Git executable is involved. The whole transaction runs under the requesting
+session's checkout mutation gate (a checkout-keyed gate under the storage root
+when the session has none) and holds the checkout's real `index.lock` from the
+local-work check until the index is updated:
+
+1. Recover an unfinished earlier acceptance on the same checkout (see
+   [Recovery](#recovery-of-an-interrupted-acceptance)), then check the replay
+   record.
+2. Preflight, compute the delta `baseline → result`, three-way merge it with
+   `HEAD`, and check local work.
+3. Persist an intent file in the checkout's per-worktree Git directory
+   (`qmt-integration-intent.json`) and write exactly the touched files, with
+   attribute filters, executable bits and symlinks.
+4. Run the hooks, then re-read what they staged, commit, and move the branch and
+   create the integration record in **one compare-and-swap reference
+   transaction**.
+5. Update the real index for the touched paths, release the lock, remove the
+   intent, then run `post-commit`.
+
+### Hooks
+
+`pre-commit`, `prepare-commit-msg <file> message` and `commit-msg <file>` run from
+`core.hooksPath` (default `<common dir>/hooks`) after the files are on disk, so
+they see the result. They run with the checkout root as working directory, a
+private index holding the merged tree as `GIT_INDEX_FILE`, `GIT_EDITOR=:`, and
+every other inherited `GIT_*` variable removed. A hook that is not an executable
+file is skipped, as Git does. Each hook is limited to 600 seconds and its whole
+process tree is killed on timeout. On Windows hooks run through `sh`; a present
+hook without `sh` is refused (`hook_requires_sh`).
+
+Differences from `git commit`:
+
+- There is **no `--no-verify`**: hooks cannot be skipped, by the model or anyone
+  else.
+- `post-commit` runs after the commit is final; its failure is logged and the
+  acceptance still succeeds.
+- A hook may re-stage files this acceptance **writes** (a formatter, for
+  example) and the staged content is committed. Staging anything else is
+  refused (`hook_changed_paths_outside_delta`), including delta paths an earlier
+  sibling already integrated, because those were never checked for your local
+  work. That staging is left in the private index only, and nothing is
+  committed.
+- A hook that edits a written file **without** re-staging it commits the
+  applied content; the edit stays in your working tree and shows up in
+  `git status` (the index entry is not given the edited file's stat data).
+- Hooks see the whole working tree, including your unrelated uncommitted
+  work, which looks "unstaged" relative to the private index. Hook managers
+  that stash or restore unstaged changes around the hook (pre-commit,
+  lint-staged) will touch those files; if such a hook is killed by the
+  timeout mid-stash, recover your work from `git stash list`. Commit or stash
+  unrelated work first when such hooks are installed.
+- The commit message is cleaned like `git commit -m` (trailing whitespace
+  stripped, blank runs collapsed); an empty message is refused
+  (`empty_commit_message`).
+- Hook managers that rely on variables Git sets for `git commit` itself may
+  behave differently.
+- **Commit signing is not supported.** With `commit.gpgSign=true` the request is
+  refused (`signing_unsupported`) before anything is written; QueryMT never
+  creates an unsigned commit instead.
+
+### Refusal codes
+
+Every refusal leaves the branch, the index contents and your files as they were
+(the one exception, `hook_changed_paths_outside_delta`, leaves the hook's own
+edits in place).
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_result_commit`, `ambiguous_result_commit`, `result_not_found`, `delegation_not_complete`, `no_isolated_workspace`, `no_baseline`, `not_parent_session`, `wrong_repository`, `wrong_target` | The request does not match durable state |
+| `integration_record_unreachable` | A record exists for this result, but its commit is not on the current branch (for example after a reset); delete the ref named in the message to accept again |
+| `unborn_head`, `detached_head`, `operation_in_progress`, `sparse_checkout`, `unknown_object`, `missing_identity`, `signing_unsupported`, `unsupported_gitlink`, `unsupported_filter` | The checkout or result cannot be integrated natively |
+| `index_locked` | An `index.lock` exists that QueryMT did not create |
+| `unmerged_entries`, `touches_local_changes`, `baseline_local_edits` | Local work is in the way |
+| `integration_pending` | An intent file appeared between recovery and apply (another writer outside the gate) |
+| `branch_moved`, `head_changed` | The branch moved (or `HEAD` left it) while the acceptance ran, or an earlier interrupted acceptance cannot be resolved because of it |
+| `touched_paths_edited` | An interrupted acceptance would be rolled back, but files it wrote were changed since |
+| `commit_rejected` | A hook exited non-zero, timed out or could not start; the message names the hook and its output |
+| `hook_changed_paths_outside_delta`, `empty_commit_message`, `hook_requires_sh` | The hook phase did not produce a committable result |
+
+A conflict is reported separately and lists the overlapping paths.
+
+### Recovery of an interrupted acceptance
+
+If the process dies mid-acceptance, the intent file names what was in flight and
+the next acceptance on the same checkout resolves it first, under the gate:
+
+- **The branch is still at the recorded `HEAD`** (the usual case): the touched
+  paths are restored to `HEAD`, a record left by a torn reference transaction is
+  deleted if it still names the abandoned commit, and the scratch files and
+  intent are removed. Your other files are never touched. If any touched file
+  now holds content that is neither what the acceptance wrote nor what `HEAD`
+  has (you kept working after the crash), nothing is rolled back: recovery
+  refuses with `touched_paths_edited`, naming the files. Move or restore them,
+  then retry.
+- **The branch is at the recorded commit** (the process died after the reference
+  transaction): the record is recreated if missing and the real index is brought
+  in line with the commit. The acceptance then reports `Integrated` with that
+  commit. `post-commit` does not run in this case.
+- **Anything else** (the branch moved to some other commit): recovery refuses
+  with `branch_moved` and keeps the intent and your files for inspection.
+
+A reference transaction that fails part-way (one of branch and record updated,
+the other not) is not rolled back on the spot; the intent is kept and the same
+recovery finishes or undoes it consistently.
+
+To give up on an intent that cannot be recovered (after inspecting it), delete
+`qmt-integration-intent.json` and any `qmt-integration-*` scratch files from the
+checkout's Git directory (`git rev-parse --git-dir`), and restore the touched
+paths it lists yourself.
+
+A surviving `index.lock` is removed only when its identity (device, inode and
+creation time) matches the one recorded in the intent, which proves the
+interrupted acceptance created it. Any other lock, including a stale one from a
+Git process, is never removed; the acceptance is refused with `index_locked`
+until you remove it yourself. A hook rejection or a failure before the reference
+transaction is rolled back in the same call while the acceptance still holds the
+index lock, so a failed acceptance does not leave applied files behind; if that
+rollback cannot run, the error says so and the next acceptance retries it.
+
+Delegation completion does not mean the objective succeeded: a delegate that
+stopped without changing anything reports a result with no baseline-relative
+changes, and the summary says so instead of offering it for acceptance.
 
 ## Reviewing and integrating results
 

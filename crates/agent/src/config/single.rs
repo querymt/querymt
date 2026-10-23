@@ -139,7 +139,7 @@ pub struct AgentSettings {
     ///
     /// Built-in tools: `read_tool`, `index`, `edit`, `write_file`, `delete_file`,
     /// `shell`, `glob`, `search_text`, `ls`, `web_fetch`, `browse`, `mdq`,
-    /// `question`, `delegate`, `create_task`, `read_task`, `update_task`, `complete_task`,
+    /// `question`, `delegate`, `accept_delegation_result`, `create_task`, `read_task`, `update_task`, `complete_task`,
     /// `todowrite`, `todoread`,
     /// `semantic_edit`, `multiedit`, `get_function`, `get_symbol`,
     /// `replace_symbol`, `find_symbol_references`,

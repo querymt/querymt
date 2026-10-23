@@ -1923,11 +1923,26 @@ async fn execute_delegation(
                             .ok();
                         match review {
                             Some(review) => {
+                                let next_step = if review.changed_paths.is_empty() {
+                                    "The delegate made NO changes relative to its baseline, so \
+                                     there is nothing to accept: completion of the run does not \
+                                     mean the objective was achieved. Read its summary above; \
+                                     if it reports being blocked, resolve that and delegate \
+                                     again."
+                                        .to_string()
+                                } else {
+                                    format!(
+                                        "After reviewing, integrate it with \
+                                         accept_delegation_result(delegation_id=\"{}\", \
+                                         result_commit=\"{}\"); do not delegate patch/merge work.",
+                                        delegation.public_id, review.result_commit,
+                                    )
+                                };
                                 summary.push_str(&format!(
                                     "\n\nWorkspace result (retained for review; nothing was merged): \
                                      workspace {}, branch {}, result {} (ref {}), captured HEAD {}, \
-                                     verification {}. Nothing was integrated; publish/review \
-                                     remain available through /worktree result {}.\n{}",
+                                     verification {}. Nothing was integrated yet; review \
+                                     remains available through /worktree result {}. {}\n{}",
                                     binding.record.id,
                                     binding.record.branch.as_str(),
                                     review.result_commit,
@@ -1938,6 +1953,7 @@ async fn execute_delegation(
                                         .map(|v| v.to_string())
                                         .unwrap_or_else(|| "not reported".to_string()),
                                     binding.record.id,
+                                    next_step,
                                     review.summary_text(),
                                 ));
                             }

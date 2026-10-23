@@ -1054,6 +1054,41 @@ mod tests {
             self.inner.sparse_checkout_enabled(checkout).await
         }
 
+        async fn prepare_integration(
+            &self,
+            request: crate::worktree::integrate::PrepareRequest,
+        ) -> WorktreeResult<crate::worktree::integrate::PrepareOutcome> {
+            self.inner.prepare_integration(request).await
+        }
+
+        async fn apply_integration(
+            &self,
+            prepared: crate::worktree::integrate::PreparedIntegration,
+        ) -> WorktreeResult<crate::worktree::integrate::ApplyOutcome> {
+            self.inner.apply_integration(prepared).await
+        }
+
+        async fn run_integration_hooks(
+            &self,
+            request: crate::worktree::hooks::HookRequest,
+        ) -> WorktreeResult<crate::worktree::hooks::HookOutcome> {
+            self.inner.run_integration_hooks(request).await
+        }
+
+        async fn finalize_integration(
+            &self,
+            request: crate::worktree::integrate::FinalizeRequest,
+        ) -> WorktreeResult<crate::worktree::integrate::FinalizeOutcome> {
+            self.inner.finalize_integration(request).await
+        }
+
+        async fn recover_integration(
+            &self,
+            checkout: &Path,
+        ) -> WorktreeResult<crate::worktree::integrate::RecoveryOutcome> {
+            self.inner.recover_integration(checkout).await
+        }
+
         async fn branch_tip(
             &self,
             common_dir: &Path,

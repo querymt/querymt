@@ -209,6 +209,59 @@ pub trait RepositoryOps: Send + Sync {
 
     /// Whether `core.sparseCheckout` is enabled for the checkout.
     async fn sparse_checkout_enabled(&self, checkout: &Path) -> WorktreeResult<bool>;
+
+    /// Steps 1-3 of explicit result acceptance, read-only: preflight the
+    /// target checkout, compute the typed baseline-to-result delta and
+    /// three-way merge it with the checkout's HEAD. Native gix; see
+    /// [`crate::worktree::prepare`].
+    async fn prepare_integration(
+        &self,
+        request: crate::worktree::integrate::PrepareRequest,
+    ) -> WorktreeResult<crate::worktree::integrate::PrepareOutcome>;
+
+    /// Step 5 of explicit result acceptance: persist the integration intent
+    /// in the checkout's per-worktree Git directory, then write exactly the
+    /// touched entries to the working tree through gix's checkout (filters,
+    /// executable bits, symlinks; deletions remove files). A failure restores
+    /// the touched paths to `HEAD` and removes the intent. The branch and the
+    /// real index contents are untouched; the index lock stays held by the
+    /// returned value. See [`crate::worktree::apply`].
+    async fn apply_integration(
+        &self,
+        prepared: crate::worktree::integrate::PreparedIntegration,
+    ) -> WorktreeResult<crate::worktree::integrate::ApplyOutcome>;
+
+    /// Step 6 of explicit result acceptance: run `pre-commit`,
+    /// `prepare-commit-msg` and `commit-msg` natively against a private
+    /// index built from the merged tree, after the files were applied. No
+    /// bypass. A non-zero exit is a [`HookOutcome::Rejected`]; the caller
+    /// then rolls the applied files back. See [`crate::worktree::hooks`].
+    async fn run_integration_hooks(
+        &self,
+        request: crate::worktree::hooks::HookRequest,
+    ) -> WorktreeResult<crate::worktree::hooks::HookOutcome>;
+
+    /// Steps 7-10 of explicit result acceptance: re-read the hooked private
+    /// index, clean the message, write the commit, advance the branch and
+    /// create the integration record in one reference transaction, update the
+    /// real index, release the lock and remove the intent; then run
+    /// `post-commit`, whose failure is only logged. Every outcome other than
+    /// `Integrated` leaves the branch unchanged and the touched paths
+    /// restored. See [`crate::worktree::finalize`].
+    async fn finalize_integration(
+        &self,
+        request: crate::worktree::integrate::FinalizeRequest,
+    ) -> WorktreeResult<crate::worktree::integrate::FinalizeOutcome>;
+
+    /// Resolve an integration intent left in the checkout by an acceptance
+    /// that did not finish: roll the touched paths back when the branch is
+    /// still at the recorded `HEAD`, finish the index update when it points
+    /// at the recorded commit. A foreign `index.lock` is never removed. Run
+    /// under the checkout's mutation gate. See [`crate::worktree::recover`].
+    async fn recover_integration(
+        &self,
+        checkout: &Path,
+    ) -> WorktreeResult<crate::worktree::integrate::RecoveryOutcome>;
 }
 
 /// Native repository operations backed entirely by `gix`.
@@ -224,14 +277,14 @@ impl GixRepoOps {
 }
 
 /// Map a `gix` error to the worktree error taxonomy.
-fn native_err(err: impl std::fmt::Display) -> WorktreeError {
+pub(crate) fn native_err(err: impl std::fmt::Display) -> WorktreeError {
     WorktreeError::GitDiscovery(err.to_string())
 }
 
 /// True when the erased error means "not found" (unknown revision/ref or
 /// unborn HEAD). gix reports missing revisions as validation-class spec
 /// parse failures ("couldn't parse revision"), so both classes count.
-fn is_not_found(err: &gix::Error) -> bool {
+pub(crate) fn is_not_found(err: &gix::Error) -> bool {
     matches!(
         err.classify().dominant_class(),
         Some(gix_error::Class::NotFound | gix_error::Class::Validation)
@@ -273,6 +326,87 @@ fn base_open_options() -> gix::open::Options {
     ])
 }
 
+/// Open options for the target of an explicit result acceptance.
+///
+/// Acceptance behaves like a user-run `git commit`, so unlike
+/// [`base_open_options`] it reads system, global (`~/.gitconfig`,
+/// `$XDG_CONFIG_HOME/git/config`) and user configuration plus the global
+/// attributes: author/committer identity, `core.hooksPath`,
+/// `commit.gpgSign`, filters and merge drivers must take effect.
+///
+/// What stays blocked is *redirection*. gix gates `GIT_WORK_TREE`,
+/// `GIT_INDEX_FILE` and every other `GIT_*` variable (including
+/// `GIT_CONFIG_*`) behind the `git_prefix` permission, and `GIT_DIR` is only
+/// consulted by the environment-aware discovery entry points, which are never
+/// used here. Denying `git_prefix`, `objects`, `identity` and the transport
+/// permissions therefore keeps an ambient environment from pointing the
+/// operation at another repository, worktree or index, or from injecting
+/// identity or configuration. `HOME` and `XDG_CONFIG_HOME` stay readable so
+/// the global files are found. Config-level environment injection
+/// (`GIT_CONFIG_COUNT`, ...) is switched off as well.
+///
+/// No committer fallback is supplied: a missing identity must surface as a
+/// refusal instead of silently attributing the commit to QueryMT.
+fn acceptance_open_options() -> gix::open::Options {
+    use gix::open::{Permissions, permissions};
+    use gix::sec::Permission::{Allow, Deny};
+
+    let permissions = Permissions {
+        env: permissions::Environment {
+            xdg_config_home: Allow,
+            home: Allow,
+            http_transport: Deny,
+            identity: Deny,
+            objects: Deny,
+            git_prefix: Deny,
+            other: Deny,
+            ssh_prefix: Deny,
+        },
+        config: permissions::Config {
+            env: false,
+            ..permissions::Config::all()
+        },
+        attributes: permissions::Attributes::all(),
+    };
+    gix::open::Options::isolated()
+        .permissions(permissions)
+        // Same reasoning as `base_open_options`: preservation and ancestry
+        // checks must always see the real objects. `status.showUntrackedFiles`
+        // is forced on because local-work protection must see untracked
+        // files even when the user's config hides them from `git status`.
+        .config_overrides(["core.useReplaceRefs=false", "status.showUntrackedFiles=all"])
+}
+
+/// Open the acceptance target containing `path` (checkout root or any
+/// directory below it) with the configuration scope of
+/// [`acceptance_open_options`].
+pub(crate) fn open_acceptance_checkout(path: &Path) -> Result<gix::Repository, WorktreeError> {
+    open_checkout_with(path, acceptance_open_options())
+}
+
+/// Directory the repository's hooks are read from, as Git resolves it:
+/// `core.hooksPath` when set (absolute as written, relative to the checkout
+/// root because hooks run with the checkout as their working directory),
+/// otherwise `<common_dir>/hooks`.
+pub(crate) fn hooks_dir(repo: &gix::Repository) -> WorktreeResult<PathBuf> {
+    let configured = repo
+        .config_snapshot()
+        .trusted_path("core.hooksPath")
+        .map_err(native_err)?;
+    match configured {
+        Some(path) if path.is_absolute() => Ok(path),
+        Some(path) => {
+            let root = repo.workdir().ok_or_else(|| {
+                WorktreeError::InvalidOperation(
+                    "a relative core.hooksPath needs a working tree".into(),
+                )
+            })?;
+            Ok(root.join(path))
+        }
+        None => Ok(repo.common_dir().join("hooks")),
+    }
+}
+
 /// Open a checkout for status enumeration.
 ///
 /// `status.showUntrackedFiles=no` in repository config disables gix's
@@ -292,11 +426,11 @@ fn open_repo_for_status(path: &Path) -> Result<gix::Repository, WorktreeError> {
 /// their checkout). Unlike [`open_repo`], which takes an exact Git
 /// directory, this searches upwards. Environment overrides are ignored for
 /// the same reason as in [`open_repo`].
-fn open_checkout(path: &Path) -> Result<gix::Repository, WorktreeError> {
+pub(crate) fn open_checkout(path: &Path) -> Result<gix::Repository, WorktreeError> {
     open_checkout_with(path, base_open_options())
 }
 
-fn open_checkout_with(
+pub(crate) fn open_checkout_with(
     path: &Path,
     options: gix::open::Options,
 ) -> Result<gix::Repository, WorktreeError> {
@@ -314,7 +448,7 @@ fn full_name(name: &str) -> WorktreeResult<gix::refs::FullName> {
         .map_err(|_| WorktreeError::InvalidOperation(format!("invalid ref name: {name}")))
 }
 
-fn parse_oid(expr: &str) -> WorktreeResult<gix::hash::ObjectId> {
+pub(crate) fn parse_oid(expr: &str) -> WorktreeResult<gix::hash::ObjectId> {
     gix::hash::ObjectId::from_hex(expr.as_bytes())
         .map_err(|_| WorktreeError::InvalidOperation(format!("not a valid object id: {expr}")))
 }
@@ -337,6 +471,83 @@ fn ref_edit_update(
         name,
         deref: false,
     }
+}
+
+/// Working-tree state of one checkout, computed on the calling thread.
+pub(crate) fn checkout_status_sync(checkout: &Path) -> WorktreeResult<CheckoutStatus> {
+    let repo = open_repo_for_status(checkout)?;
+    let mut status = CheckoutStatus::default();
+
+    // Index-vs-worktree changes plus untracked/ignored discovery.
+    // `into_index_worktree_iter` deliberately deactivates the
+    // HEAD-tree comparison thread so no object access happens off
+    // this thread; staged changes are computed below, synchronously.
+    let platform = repo
+        .status(gix::progress::Discard)
+        .map_err(native_err)?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .dirwalk_options(|mut opts| {
+            opts.set_emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
+            opts
+        });
+    for item in platform
+        .into_index_worktree_iter(Vec::new())
+        .map_err(native_err)?
+    {
+        let item = item.map_err(native_err)?;
+        match item {
+            gix::status::index_worktree::Item::Modification { rela_path, .. } => {
+                status.uncommitted.push(rela_path.to_string());
+            }
+            gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
+                match classify_dirwalk_entry(entry) {
+                    Some(DirwalkDisposition::Ignored(path)) => {
+                        status.ignored.push(path);
+                    }
+                    Some(DirwalkDisposition::Untracked(path)) => {
+                        status.untracked.push(path);
+                    }
+                    None => {}
+                }
+            }
+            gix::status::index_worktree::Item::Rewrite { dirwalk_entry, .. } => {
+                match classify_dirwalk_entry(dirwalk_entry) {
+                    Some(DirwalkDisposition::Ignored(path)) => {
+                        status.ignored.push(path);
+                    }
+                    Some(DirwalkDisposition::Untracked(path)) => {
+                        status.untracked.push(path);
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    // Staged changes: HEAD-tree vs real index, compared on this
+    // thread (matches `status --porcelain` staged reporting, which
+    // feeds the removal-safety dirty check).
+    if let Some(head_tree) = head_tree_id(&repo)? {
+        let mut head_entries = std::collections::HashMap::new();
+        flatten_tree(&repo, head_tree, &mut head_entries, String::new())?;
+        if repo.index_path().exists() {
+            let index = repo.open_index().map_err(native_err)?;
+            for entry in index.entries() {
+                if entry.stage() != gix::index::entry::Stage::Unconflicted {
+                    continue;
+                }
+                let path: gix::bstr::BString = entry.path(&index).to_vec().into();
+                match head_entries.remove(&path) {
+                    Some((mode, oid)) if mode == entry.mode && oid == entry.id => {}
+                    _ => status.uncommitted.push(path.to_string()),
+                }
+            }
+        }
+        for path in head_entries.keys() {
+            status.uncommitted.push(path.to_string());
+        }
+    }
+    Ok(status)
 }
 
 #[async_trait]
@@ -699,83 +910,9 @@ impl RepositoryOps for GixRepoOps {
 
     async fn checkout_status(&self, checkout: &Path) -> WorktreeResult<CheckoutStatus> {
         let checkout = checkout.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            let repo = open_repo_for_status(&checkout)?;
-            let mut status = CheckoutStatus::default();
-
-            // Index-vs-worktree changes plus untracked/ignored discovery.
-            // `into_index_worktree_iter` deliberately deactivates the
-            // HEAD-tree comparison thread so no object access happens off
-            // this thread; staged changes are computed below, synchronously.
-            let platform = repo
-                .status(gix::progress::Discard)
-                .map_err(native_err)?
-                .untracked_files(gix::status::UntrackedFiles::Files)
-                .dirwalk_options(|mut opts| {
-                    opts.set_emit_ignored(Some(gix::dir::walk::EmissionMode::Matching));
-                    opts
-                });
-            for item in platform
-                .into_index_worktree_iter(Vec::new())
-                .map_err(native_err)?
-            {
-                let item = item.map_err(native_err)?;
-                match item {
-                    gix::status::index_worktree::Item::Modification { rela_path, .. } => {
-                        status.uncommitted.push(rela_path.to_string());
-                    }
-                    gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
-                        match classify_dirwalk_entry(entry) {
-                            Some(DirwalkDisposition::Ignored(path)) => {
-                                status.ignored.push(path);
-                            }
-                            Some(DirwalkDisposition::Untracked(path)) => {
-                                status.untracked.push(path);
-                            }
-                            None => {}
-                        }
-                    }
-                    gix::status::index_worktree::Item::Rewrite { dirwalk_entry, .. } => {
-                        match classify_dirwalk_entry(dirwalk_entry) {
-                            Some(DirwalkDisposition::Ignored(path)) => {
-                                status.ignored.push(path);
-                            }
-                            Some(DirwalkDisposition::Untracked(path)) => {
-                                status.untracked.push(path);
-                            }
-                            None => {}
-                        }
-                    }
-                }
-            }
-
-            // Staged changes: HEAD-tree vs real index, compared on this
-            // thread (matches `status --porcelain` staged reporting, which
-            // feeds the removal-safety dirty check).
-            if let Some(head_tree) = head_tree_id(&repo)? {
-                let mut head_entries = std::collections::HashMap::new();
-                flatten_tree(&repo, head_tree, &mut head_entries, String::new())?;
-                if repo.index_path().exists() {
-                    let index = repo.open_index().map_err(native_err)?;
-                    for entry in index.entries() {
-                        if entry.stage() != gix::index::entry::Stage::Unconflicted {
-                            continue;
-                        }
-                        let path: gix::bstr::BString = entry.path(&index).to_vec().into();
-                        match head_entries.remove(&path) {
-                            Some((mode, oid)) if mode == entry.mode && oid == entry.id => {}
-                            _ => status.uncommitted.push(path.to_string()),
-                        }
-                    }
-                }
-                for path in head_entries.keys() {
-                    status.uncommitted.push(path.to_string());
-                }
-            }
-            Ok(status)
-        })
-        .await
-        .map_err(native_err)?
+        tokio::task::spawn_blocking(move || checkout_status_sync(&checkout))
+            .await
+            .map_err(native_err)?
     }
 
     async fn head_commit(&self, checkout: &Path) -> WorktreeResult<Option<String>> {
@@ -1052,13 +1189,74 @@ impl RepositoryOps for GixRepoOps {
         .await
         .map_err(native_err)?
     }
+
+    async fn prepare_integration(
+        &self,
+        request: crate::worktree::integrate::PrepareRequest,
+    ) -> WorktreeResult<crate::worktree::integrate::PrepareOutcome> {
+        tokio::task::spawn_blocking(move || crate::worktree::prepare::prepare_blocking(&request))
+            .await
+            .map_err(native_err)?
+    }
+
+    async fn apply_integration(
+        &self,
+        prepared: crate::worktree::integrate::PreparedIntegration,
+    ) -> WorktreeResult<crate::worktree::integrate::ApplyOutcome> {
+        tokio::task::spawn_blocking(move || crate::worktree::apply::apply_blocking(prepared))
+            .await
+            .map_err(native_err)?
+    }
+
+    async fn run_integration_hooks(
+        &self,
+        request: crate::worktree::hooks::HookRequest,
+    ) -> WorktreeResult<crate::worktree::hooks::HookOutcome> {
+        crate::worktree::hooks::run_hooks(request, crate::worktree::hooks::HOOK_TIMEOUT).await
+    }
+
+    async fn finalize_integration(
+        &self,
+        request: crate::worktree::integrate::FinalizeRequest,
+    ) -> WorktreeResult<crate::worktree::integrate::FinalizeOutcome> {
+        let checkout = request.applied.prepared.checkout.clone();
+        let operation_id = request.applied.operation_id.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::worktree::finalize::finalize_blocking(request)
+        })
+        .await
+        .map_err(native_err)??;
+        if matches!(
+            outcome,
+            crate::worktree::integrate::FinalizeOutcome::Integrated(_)
+        ) && let Some(problem) = crate::worktree::hooks::run_post_commit(
+            checkout,
+            operation_id,
+            crate::worktree::hooks::HOOK_TIMEOUT,
+        )
+        .await
+        {
+            tracing::warn!(problem, "post-commit hook failed; the integration stands");
+        }
+        Ok(outcome)
+    }
+
+    async fn recover_integration(
+        &self,
+        checkout: &Path,
+    ) -> WorktreeResult<crate::worktree::integrate::RecoveryOutcome> {
+        let checkout = checkout.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::worktree::recover::recover_blocking(&checkout))
+            .await
+            .map_err(native_err)?
+    }
 }
 
 /// Whether sparse checkout is active for this repository handle: either
 /// `core.sparseCheckout` is enabled (any Git boolean spelling) or the
 /// handle's private Git directory carries `info/sparse-checkout` patterns
 /// (gix only copies those into a new worktree when they are active).
-fn repo_is_sparse(repo: &gix::Repository) -> bool {
+pub(crate) fn repo_is_sparse(repo: &gix::Repository) -> bool {
     repo.config_snapshot()
         .boolean("core.sparseCheckout")
         .unwrap_or(false)
@@ -1086,7 +1284,7 @@ fn repo_branch_of(checkout: &gix::Repository) -> Option<String> {
     })
 }
 
-fn internal_signature() -> gix::actor::Signature {
+pub(crate) fn internal_signature() -> gix::actor::Signature {
     gix::actor::Signature {
         name: INTERNAL_COMMIT_NAME.into(),
         email: INTERNAL_COMMIT_EMAIL.into(),
@@ -1149,13 +1347,10 @@ fn head_tree_id(repo: &gix::Repository) -> WorktreeResult<Option<gix::hash::Obje
 
 /// Flatten a tree into `path -> (index mode, object id)`, recursing into
 /// subtrees. Runs on the calling thread only.
-fn flatten_tree(
+pub(crate) fn flatten_tree(
     repo: &gix::Repository,
     tree_id: gix::hash::ObjectId,
-    out: &mut std::collections::HashMap<
-        gix::bstr::BString,
-        (gix::index::entry::Mode, gix::hash::ObjectId),
-    >,
+    out: &mut FlatTree,
     prefix: String,
 ) -> WorktreeResult<()> {
     let tree = repo.find_tree(tree_id).map_err(native_err)?;
@@ -1184,7 +1379,7 @@ fn flatten_tree(
 }
 
 /// Peel a resolved revision to its tree, accepting commits and trees.
-fn peel_to_tree(
+pub(crate) fn peel_to_tree(
     repo: &gix::Repository,
     id: gix::hash::ObjectId,
 ) -> WorktreeResult<gix::hash::ObjectId> {
@@ -1202,17 +1397,26 @@ fn peel_to_tree(
 /// `tip_tree` is added, only in `base_tree` is deleted, and otherwise
 /// modified when either its object id or its mode differs. Runs on the
 /// calling thread only.
-fn changed_paths_between_trees(
+pub(crate) fn changed_paths_between_trees(
     repo: &gix::Repository,
     base_tree: gix::hash::ObjectId,
     tip_tree: gix::hash::ObjectId,
 ) -> WorktreeResult<Vec<ChangedPath>> {
-    let mut base = std::collections::HashMap::new();
+    let mut base = FlatTree::new();
     flatten_tree(repo, base_tree, &mut base, String::new())?;
-    let mut tip = std::collections::HashMap::new();
+    let mut tip = FlatTree::new();
     flatten_tree(repo, tip_tree, &mut tip, String::new())?;
+    Ok(diff_flattened(&base, &tip))
+}
+
+/// A tree flattened to `path -> (index mode, object id)`.
+pub(crate) type FlatTree =
+    std::collections::HashMap<gix::bstr::BString, (gix::index::entry::Mode, gix::hash::ObjectId)>;
+
+/// Diff two flattened trees without rename detection; sorted by path.
+pub(crate) fn diff_flattened(base: &FlatTree, tip: &FlatTree) -> Vec<ChangedPath> {
     let mut changes: Vec<ChangedPath> = Vec::with_capacity(base.len().max(tip.len()));
-    for (path, (tip_mode, tip_oid)) in &tip {
+    for (path, (tip_mode, tip_oid)) in tip {
         match base.get(path) {
             None => changes.push(ChangedPath {
                 path: path.to_string(),
@@ -1237,7 +1441,7 @@ fn changed_paths_between_trees(
         }
     }
     changes.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(changes)
+    changes
 }
 
 /// Classify the working tree and reconcile the private index with actual
@@ -1494,22 +1698,58 @@ fn reject_external_filter_paths(
     private_index: &gix::index::State,
     kept: &std::collections::HashSet<gix::bstr::BString>,
 ) -> WorktreeResult<()> {
-    if kept.is_empty() {
+    let Some(found) = find_external_filter(
+        repo,
+        private_index,
+        kept.iter().map(|p| p.as_bstr()),
+        AttributeSource::WorktreeThenIdMapping,
+    )?
+    else {
         return Ok(());
-    }
-    let mut stack = repo
-        .attributes_only(
-            private_index,
-            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-        )
-        .map_err(native_err)?;
+    };
+    let path = found.path.to_str_lossy();
+    Err(WorktreeError::InvalidOperation(
+        if found.filter.as_bytes() == b"lfs" {
+            format!(
+                "cannot capture baseline: Git LFS content is unsupported in this version \
+                 (path `{path}` resolves to filter=lfs)"
+            )
+        } else {
+            format!(
+                "cannot capture baseline: external filter processes are unsupported in \
+                 this version (path `{path}` resolves to filter={})",
+                found.filter.to_str_lossy()
+            )
+        },
+    ))
+}
+
+/// A path whose effective attributes select an external filter process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExternalFilter {
+    pub path: gix::bstr::BString,
+    pub filter: gix::bstr::BString,
+}
+
+pub(crate) use gix::worktree::stack::state::attributes::Source as AttributeSource;
+
+/// First of `paths` whose effective `filter` attribute names an external
+/// process, resolved through the attribute stack over `index`. `source`
+/// selects where `.gitattributes` files come from: capture reads the
+/// worktree first, result acceptance reads the objects of the tree `index`
+/// was built from. Shared so both apply the same support rules.
+pub(crate) fn find_external_filter<'a>(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    paths: impl IntoIterator<Item = &'a gix::bstr::BStr>,
+    source: AttributeSource,
+) -> WorktreeResult<Option<ExternalFilter>> {
+    let mut stack = repo.attributes_only(index, source).map_err(native_err)?;
     let collection = stack.attributes_collection();
     let mut outcome = gix::attrs::search::Outcome::default();
     outcome.initialize_with_selection(collection, ["filter"]);
-    for path in kept {
-        let platform = stack
-            .at_path(gix_pathbuf(path.as_bstr()), None)
-            .map_err(native_err)?;
+    for path in paths {
+        let platform = stack.at_path(gix_pathbuf(path), None).map_err(native_err)?;
         if !platform.matching_attributes(&mut outcome) {
             continue;
         }
@@ -1518,27 +1758,15 @@ fn reject_external_filter_paths(
             if assignment.name.as_str() != "filter" {
                 continue;
             }
-            match &assignment.state {
-                gix::attrs::StateRef::Value(value) if value.as_bstr() == b"lfs".as_bstr() => {
-                    return Err(WorktreeError::InvalidOperation(format!(
-                        "cannot capture baseline: Git LFS content is unsupported in this version \
-                         (path `{}` resolves to filter=lfs)",
-                        path.to_str_lossy()
-                    )));
-                }
-                gix::attrs::StateRef::Value(value) => {
-                    return Err(WorktreeError::InvalidOperation(format!(
-                        "cannot capture baseline: external filter processes are unsupported in \
-                         this version (path `{}` resolves to filter={})",
-                        path.to_str_lossy(),
-                        value.as_bstr().to_str_lossy()
-                    )));
-                }
-                _ => {}
+            if let gix::attrs::StateRef::Value(value) = &assignment.state {
+                return Ok(Some(ExternalFilter {
+                    path: path.to_owned(),
+                    filter: value.as_bstr().to_owned(),
+                }));
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -1586,7 +1814,7 @@ fn index_mode_for(kind: FileKind) -> gix::index::entry::Mode {
 ///
 /// Only paths in `kept` are included: tracked files that still exist on
 /// disk plus every unioned/untracked addition made during reconciliation.
-fn write_tree_from_index(
+pub(crate) fn write_tree_from_index(
     repo: &gix::Repository,
     index: &gix::index::State,
     kept: &std::collections::HashSet<gix::bstr::BString>,
@@ -1771,6 +1999,19 @@ pub enum FailurePoint {
     IndexManifest,
     HasUnmergedEntries,
     SparseCheckoutEnabled,
+    PrepareIntegration,
+    ApplyIntegration,
+    RunHooks,
+    FinalizeIntegration,
+    /// Simulated process death inside finalization, after the hooks and
+    /// before the commit object is written.
+    FinalizeCommit,
+    /// ... after the commit is recorded in the intent, before the
+    /// reference transaction.
+    FinalizeRefTransaction,
+    /// ... after the reference transaction, before the real index update.
+    FinalizeIndexUpdate,
+    RecoverIntegration,
 }
 
 impl FaultInjectingRepoOps {
@@ -2020,12 +2261,278 @@ impl RepositoryOps for FaultInjectingRepoOps {
         }
         self.inner().sparse_checkout_enabled(checkout).await
     }
+
+    async fn prepare_integration(
+        &self,
+        request: crate::worktree::integrate::PrepareRequest,
+    ) -> WorktreeResult<crate::worktree::integrate::PrepareOutcome> {
+        if let Some(err) = self.take_failure(FailurePoint::PrepareIntegration) {
+            return Err(err);
+        }
+        self.inner().prepare_integration(request).await
+    }
+
+    async fn apply_integration(
+        &self,
+        prepared: crate::worktree::integrate::PreparedIntegration,
+    ) -> WorktreeResult<crate::worktree::integrate::ApplyOutcome> {
+        if let Some(err) = self.take_failure(FailurePoint::ApplyIntegration) {
+            return Err(err);
+        }
+        self.inner().apply_integration(prepared).await
+    }
+
+    async fn run_integration_hooks(
+        &self,
+        request: crate::worktree::hooks::HookRequest,
+    ) -> WorktreeResult<crate::worktree::hooks::HookOutcome> {
+        if let Some(err) = self.take_failure(FailurePoint::RunHooks) {
+            return Err(err);
+        }
+        self.inner().run_integration_hooks(request).await
+    }
+
+    async fn finalize_integration(
+        &self,
+        mut request: crate::worktree::integrate::FinalizeRequest,
+    ) -> WorktreeResult<crate::worktree::integrate::FinalizeOutcome> {
+        use crate::worktree::integrate::{FinalizeFault, FinalizeStage};
+        if let Some(err) = self.take_failure(FailurePoint::FinalizeIntegration) {
+            return Err(err);
+        }
+        // These stop inside the real finalization, like a killed process:
+        // no rollback, and the `index.lock` file stays behind.
+        for (point, stage) in [
+            (FailurePoint::FinalizeCommit, FinalizeStage::Commit),
+            (
+                FailurePoint::FinalizeRefTransaction,
+                FinalizeStage::RefTransaction,
+            ),
+            (
+                FailurePoint::FinalizeIndexUpdate,
+                FinalizeStage::IndexUpdate,
+            ),
+        ] {
+            if let Some(error) = self.take_failure(point) {
+                request.fault = Some(FinalizeFault { stage, error });
+                break;
+            }
+        }
+        self.inner().finalize_integration(request).await
+    }
+
+    async fn recover_integration(
+        &self,
+        checkout: &Path,
+    ) -> WorktreeResult<crate::worktree::integrate::RecoveryOutcome> {
+        if let Some(err) = self.take_failure(FailurePoint::RecoverIntegration) {
+            return Err(err);
+        }
+        self.inner().recover_integration(checkout).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worktree::test_support::{commit_files, init_repo};
+    use crate::worktree::test_support::{commit_files, in_child, init_repo, run_in_child};
+
+    /// Repository without any repository-local identity or hook settings.
+    fn bare_config_repo() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        gix::init(tmp.path()).unwrap();
+        tmp
+    }
+
+    fn canonical(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap()
+    }
+
+    /// Identity, an absolute `core.hooksPath` and `commit.gpgSign` that live
+    /// only in the user's global configuration take effect for acceptance
+    /// handles, from the checkout root and from a subdirectory.
+    #[test]
+    fn acceptance_handles_read_identity_hooks_path_and_signing_from_global_config() {
+        let home = tempfile::TempDir::new().unwrap();
+        let hooks = home.path().join("global-hooks");
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            format!(
+                "[user]\n\tname = Global Person\n\temail = global@example.com\n\
+                 [core]\n\thooksPath = {}\n[commit]\n\tgpgSign = true\n",
+                hooks.display()
+            ),
+        )
+        .unwrap();
+        let repo = bare_config_repo();
+        std::fs::create_dir(repo.path().join("sub")).unwrap();
+        run_in_child(
+            "worktree::repo_ops::tests::acceptance_global_config_child",
+            &[
+                ("HOME", home.path().as_os_str()),
+                ("XDG_CONFIG_HOME", home.path().join("xdg").as_os_str()),
+                ("QMT_TEST_REPO", repo.path().as_os_str()),
+                ("QMT_TEST_HOOKS", hooks.as_os_str()),
+            ],
+        );
+    }
+
+    #[test]
+    fn acceptance_global_config_child() {
+        if !in_child() {
+            return;
+        }
+        let repo_root = PathBuf::from(std::env::var_os("QMT_TEST_REPO").unwrap());
+        let hooks = PathBuf::from(std::env::var_os("QMT_TEST_HOOKS").unwrap());
+        for start in [repo_root.clone(), repo_root.join("sub")] {
+            let repo = open_acceptance_checkout(&start).unwrap();
+            let committer = repo.committer().expect("global identity").unwrap();
+            assert_eq!(committer.name, "Global Person");
+            assert_eq!(committer.email, "global@example.com");
+            let author = repo.author().expect("global identity").unwrap();
+            assert_eq!(author.name, "Global Person");
+            assert!(
+                repo.config_snapshot()
+                    .boolean("commit.gpgSign")
+                    .unwrap_or(false),
+                "commit.gpgSign must be visible so acceptance can refuse it"
+            );
+            assert_eq!(hooks_dir(&repo).unwrap(), hooks);
+            // Replacement refs stay disabled regardless of the wider scope.
+            assert_eq!(
+                repo.config_snapshot().boolean("core.useReplaceRefs"),
+                Some(false)
+            );
+        }
+        // The administrative handle must keep ignoring the same global file.
+        let admin = open_checkout(&repo_root).unwrap();
+        assert_eq!(admin.committer().unwrap().unwrap().name, "QueryMT");
+        assert!(
+            !admin
+                .config_snapshot()
+                .boolean("commit.gpgSign")
+                .unwrap_or(false)
+        );
+    }
+
+    /// A relative `core.hooksPath` resolves against the checkout root (where
+    /// hooks run), also when the session started in a subdirectory.
+    #[test]
+    fn relative_hooks_path_resolves_against_the_checkout_root() {
+        let repo = bare_config_repo();
+        let config_path = repo.path().join(".git/config");
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str("\n[core]\n\thooksPath = .githooks\n");
+        std::fs::write(&config_path, config).unwrap();
+        std::fs::create_dir(repo.path().join("sub")).unwrap();
+        let root = canonical(repo.path());
+
+        for start in [repo.path().to_path_buf(), repo.path().join("sub")] {
+            let handle = open_acceptance_checkout(&start).unwrap();
+            assert_eq!(
+                canonical(handle.workdir().unwrap()).join(".githooks"),
+                root.join(".githooks")
+            );
+            assert_eq!(
+                hooks_dir(&handle).unwrap(),
+                handle.workdir().unwrap().join(".githooks")
+            );
+        }
+    }
+
+    /// Without `core.hooksPath` the hooks live in the common directory,
+    /// which for a linked worktree is the shared one, not the per-worktree
+    /// Git directory.
+    #[test]
+    fn default_hooks_dir_is_the_common_directory_hooks() {
+        let repo = bare_config_repo();
+        let handle = open_acceptance_checkout(repo.path()).unwrap();
+        let hooks = hooks_dir(&handle).unwrap();
+        assert!(hooks.ends_with("hooks"));
+        assert_eq!(
+            canonical(hooks.parent().unwrap()),
+            canonical(&repo.path().join(".git"))
+        );
+    }
+
+    /// Ambient `GIT_DIR` / `GIT_WORK_TREE` / `GIT_INDEX_FILE` redirection,
+    /// environment identity and `GIT_CONFIG_*` injection cannot move the
+    /// acceptance target, its index, its identity or its hook directory.
+    #[test]
+    fn acceptance_handles_ignore_environment_redirection() {
+        let home = tempfile::TempDir::new().unwrap();
+        let target = bare_config_repo();
+        let decoy = bare_config_repo();
+        let evil_config = home.path().join("evil.gitconfig");
+        std::fs::write(
+            &evil_config,
+            "[user]\n\tname = Evil\n\temail = evil@example.com\n\
+             [core]\n\thooksPath = /evil/hooks\n",
+        )
+        .unwrap();
+        run_in_child(
+            "worktree::repo_ops::tests::acceptance_environment_redirection_child",
+            &[
+                ("HOME", home.path().as_os_str()),
+                ("QMT_TEST_REPO", target.path().as_os_str()),
+                ("GIT_DIR", decoy.path().join(".git").as_os_str()),
+                ("GIT_WORK_TREE", decoy.path().as_os_str()),
+                (
+                    "GIT_INDEX_FILE",
+                    decoy.path().join("redirected-index").as_os_str(),
+                ),
+                ("GIT_COMMITTER_NAME", "Evil".as_ref()),
+                ("GIT_COMMITTER_EMAIL", "evil@example.com".as_ref()),
+                ("GIT_AUTHOR_NAME", "Evil".as_ref()),
+                ("GIT_AUTHOR_EMAIL", "evil@example.com".as_ref()),
+                ("EMAIL", "evil@example.com".as_ref()),
+                ("GIT_CONFIG_GLOBAL", evil_config.as_os_str()),
+                ("GIT_CONFIG_COUNT", "1".as_ref()),
+                ("GIT_CONFIG_KEY_0", "core.hooksPath".as_ref()),
+                ("GIT_CONFIG_VALUE_0", "/evil/hooks".as_ref()),
+            ],
+        );
+    }
+
+    #[test]
+    fn acceptance_environment_redirection_child() {
+        if !in_child() {
+            return;
+        }
+        let target = PathBuf::from(std::env::var_os("QMT_TEST_REPO").unwrap());
+        let repo = open_acceptance_checkout(&target).unwrap();
+        assert_eq!(
+            canonical(repo.workdir().unwrap()),
+            canonical(&target),
+            "GIT_DIR/GIT_WORK_TREE must not redirect the working tree"
+        );
+        assert_eq!(
+            canonical(repo.git_dir()),
+            canonical(&target.join(".git")),
+            "GIT_DIR must not redirect the Git directory"
+        );
+        assert_eq!(
+            repo.index_path().file_name().unwrap(),
+            "index",
+            "GIT_INDEX_FILE must not redirect the index: {:?}",
+            repo.index_path()
+        );
+        assert_eq!(
+            canonical(repo.index_path().parent().unwrap()),
+            canonical(&target.join(".git")),
+            "GIT_INDEX_FILE must not move the index out of the Git directory"
+        );
+        assert!(
+            repo.committer().is_none(),
+            "environment identity must be ignored, found {:?}",
+            repo.committer().map(|c| c.map(|c| c.name.to_string()))
+        );
+        assert_eq!(
+            hooks_dir(&repo).unwrap(),
+            repo.common_dir().join("hooks"),
+            "GIT_CONFIG_* injection must not change the hook directory"
+        );
+    }
 
     /// `commits_between(base, tip)` is `tip ^base`: with a merge tip whose
     /// parents are `base` and a sibling, only the merge and the sibling

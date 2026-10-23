@@ -63,7 +63,7 @@ impl ToolTrait for DelegateTool {
                         "isolation": {
                             "type": "string",
                             "enum": ["inherit", "isolated", "shared"],
-                            "description": "Execution workspace for this delegate. 'inherit' (default) resolves from the parent session: isolated parents isolate every delegate by default, local parents share their checkout. 'isolated' explicitly requests a private Git worktree checkout seeded from the parent's current code state. 'shared' explicitly shares the parent's checkout and is disclosed as shared execution."
+                            "description": "Execution workspace for this delegate. Precedence: an explicit 'isolated'/'shared' here wins; otherwise the target agent's configured isolation applies (listed per agent under Available Agents); otherwise it follows the parent session (isolated parents isolate every delegate, local parents share their checkout). 'inherit' (default) means 'use the configured/parent policy'. 'isolated' is a private Git worktree seeded from the parent's current code state; its result is integrated with accept_delegation_result, never by delegating a patch/merge task. 'shared' shares the parent's checkout and is disclosed as shared execution. The resolved policy is reported in the tool result."
                         }
                     },
                     "required": ["target_agent_id", "objective"]

@@ -90,6 +90,16 @@ pub trait ToolContext: Send + Sync {
         None
     }
 
+    /// Managed worktree workspace service, when the runtime has one.
+    fn workspace_service(&self) -> Option<Arc<crate::worktree::WorkspaceService>> {
+        None
+    }
+
+    /// Durable session store, for tools that resolve persisted records.
+    fn session_store(&self) -> Option<Arc<dyn crate::session::store::SessionStore>> {
+        None
+    }
+
     /// Record progress for long-running operations
     async fn record_progress(
         &self,

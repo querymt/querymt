@@ -113,7 +113,7 @@ The system SHALL run delegate tools and verification against the child's effecti
 - **THEN** its context identifies the child's execution path and the parent association without substituting the orchestrator default cwd
 
 ### Requirement: Durable baseline-relative results
-A completed isolated delegate SHALL report its workspace, branch, baseline identity, current HEAD, verification status, and changes relative to the baseline. Uncommitted results SHALL be preserved as an immutable reviewable result when capture succeeds, without modifying the child's real staging state. Completion SHALL NOT silently merge, cherry-pick, or apply results to the parent. Failure or cancellation SHALL retain recoverable work and report result-capture failures explicitly.
+A completed isolated delegate SHALL report its workspace, branch, baseline identity, current HEAD, verification status, and changes relative to the baseline. Uncommitted results SHALL be preserved as an immutable reviewable result when capture succeeds, without modifying the child's real staging state. Results SHALL reach the parent only through explicit acceptance, never by completion. Failure or cancellation SHALL retain recoverable work and report result-capture failures explicitly.
 
 #### Scenario: Result excludes inherited edits
 - **WHEN** the parent baseline includes changes to file A and the delegate changes only file B
@@ -144,3 +144,58 @@ A completed isolated delegate SHALL report its workspace, branch, baseline ident
 - **WHEN** a user inspects a result based on uncommitted parent edits
 - **THEN** the system identifies the baseline-relative delta and warns that directly merging the private branch can also introduce baseline changes
 - **AND** the system does not imply the result has already been applied or accepted
+
+### Requirement: Explicit result acceptance
+The parent session of a completed isolated delegation SHALL be able to accept a reviewed result, named only by delegation and result commit, as one native commit of exactly the baseline-relative delta on its current branch. Files SHALL be written before commit hooks run. The branch SHALL advance only by compare-and-swap, atomically with a create-only integration record; earlier refusals or failures SHALL change nothing. Acceptance SHALL be edit-class for permissions.
+
+#### Scenario: Delta-only commit
+- **WHEN** the parent accepts a result whose baseline included uncommitted parent edits to file A while the delegate changed only file B, and the parent has unrelated local edits to file C
+- **THEN** one commit changing only B is created on the current branch with the configured identity
+- **AND** C's local edits and staging remain unchanged
+
+#### Scenario: Touched path has local state
+- **WHEN** a path in the delta has staged, unstaged, untracked, or ignored local state, or already differed between the source HEAD and the baseline
+- **THEN** acceptance is refused naming the paths and nothing changes
+
+#### Scenario: Overlapping sibling result
+- **WHEN** a sibling result was accepted first and both edited the same lines
+- **THEN** acceptance reports a conflict with the paths and nothing changes
+- **AND** a non-overlapping sibling result is layered onto the moved branch
+
+#### Scenario: Hooks observe and may reject the result
+- **WHEN** a pre-commit hook reads the changed files from the working tree
+- **THEN** it observes the result contents
+- **AND** when a hook exits non-zero, the touched paths are restored, the branch is unchanged, and no integration record exists
+
+#### Scenario: Hook re-stages paths
+- **WHEN** a hook rewrites and re-stages a path the acceptance writes
+- **THEN** the committed tree contains the re-staged content
+- **AND** when a hook stages any other path (including a delta path already integrated by a sibling), acceptance is refused and the branch is unchanged
+- **AND** when a hook edits a written file without re-staging it, the commit holds the applied content and the edit remains visible as a working-tree change
+
+#### Scenario: Branch moved during acceptance
+- **WHEN** the current branch is moved by an external process after preflight and before the branch update
+- **THEN** acceptance is refused, the branch keeps the external commit, and the touched paths are restored
+
+#### Scenario: Repeated acceptance
+- **WHEN** the same result is accepted again
+- **THEN** the original integration commit is reported and no second commit is created
+- **AND** when the recorded commit is no longer reachable from the current branch, acceptance is refused instead of reporting it as integrated
+
+#### Scenario: Unsupported commit configuration or state
+- **WHEN** `commit.gpgSign` is enabled, no user identity is configured, HEAD is detached or unborn, sparse checkout is enabled, or a merge, rebase, cherry-pick, or revert is in progress
+- **THEN** acceptance is refused with a stable code and no unsigned or partial commit is created
+
+#### Scenario: Unauthorized or inapplicable acceptance
+- **WHEN** a session other than the delegation's parent requests acceptance, the delegation is not complete, it ran without an isolated workspace, or the result commit does not match a retained result
+- **THEN** acceptance is refused and nothing changes
+
+#### Scenario: No Git executable
+- **WHEN** no Git executable is available
+- **THEN** acceptance, including hook execution, succeeds
+
+#### Scenario: Interrupted acceptance
+- **WHEN** the process stops after applying files or after the branch update but before completing
+- **THEN** the next acceptance on that checkout first restores the touched paths or completes the index update according to the branch target, and removes only a lock QueryMT provably owns
+- **AND** a touched path edited since the interruption is never overwritten; recovery is refused and the intent kept
+- **AND** a reference transaction that applied only one of its two updates is resolved by the same recovery rather than rolled back immediately

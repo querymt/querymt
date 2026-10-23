@@ -25,7 +25,7 @@ The user confirmed that isolated delegates must include parent edits. The branch
 - Reuse snapshot infrastructure; introduce only missing linked-checkout, Git-baseline, and ownership functionality.
 
 **Non-Goals:**
-- WorkPacket scheduling, live cwd mutation, automatically merging or cherry-picking results, remote filesystem transfer, arbitrary filesystem sandboxing, and automatic retention sweeps.
+- WorkPacket scheduling, live cwd mutation, integrating results without an explicit acceptance request, raw merges or cherry-picks of private branches, remote filesystem transfer, arbitrary filesystem sandboxing, and automatic retention sweeps.
 - Copying ignored files/secrets, provisioning dependencies, or silently flattening dirty submodules into baseline commits.
 - Expanding existing undo's file-type/hidden-file coverage as part of worktree support.
 
@@ -75,7 +75,7 @@ Open repositories using the canonical common Git directory and resolved checkout
 
 With default features disabled, explicitly enable sha1 alongside the required basic, attributes, and worktree-mutation features. Update Cargo.lock and audit 0.90 error handling (gix::Result), discovery classification, and the Rust 1.88 minimum against the supported toolchain. Migrate every affected snapshot/discovery call site without changing existing undo coverage. The production snapshot backend already uses gix; its Git CLI fixture commands are not a production dependency and need not be replaced merely for consistency.
 
-Native capture uses private in-memory/index state, Git attributes/filters, and object writers rather than emulating git argv or porcelain output. Do not substitute an unfiltered recursive filesystem copy for index semantics. Test production creation, capture, review, recovery, and removal with the Git executable unavailable, creating fixtures beforehand or natively. This removes the Git executable requirement for built-in repository operations, not arbitrary shell tools or configured external filter processes. Both backends can share genuinely identical path/error helpers, but snapshot history and repository administration remain separate boundaries.
+Native capture uses private in-memory/index state, Git attributes/filters, and object writers rather than emulating git argv or porcelain output. Do not substitute an unfiltered recursive filesystem copy for index semantics. Test production creation, capture, review, recovery, and removal with the Git executable unavailable, creating fixtures beforehand or natively. This removes the Git executable requirement for built-in repository operations, not arbitrary shell tools, configured external filter or merge drivers, or the repository hooks run during explicit acceptance (decision 9). Both backends can share genuinely identical path/error helpers, but snapshot history and repository administration remain separate boundaries.
 
 References: https://docs.rs/gix/0.90.0/gix/ and https://docs.rs/gix-worktree/0.59.0/gix_worktree/.
 
@@ -107,7 +107,7 @@ On completion, retain the workspace and report workspace ID/path, branch, baseli
 
 Use the same result publication/review service for top-level workspaces and delegates. An explicit result operation can publish an immutable current working-state result for a top-level workspace; inspecting an existing result must not silently replace it with live state. Return retained baseline/result OIDs and refs, baseline-relative changed paths with change kinds, verification status, captured HEAD, separately labeled live HEAD/dirty state, and capture errors. Later edits must not change an already-published delta; a subsequent publication gets a distinct create-only ref. Delegate completion and summarizer output include the review data or a durable reference to it, not just opaque commit IDs.
 
-Dirty-parent baselines are already committed privately. A raw merge of a child branch into the parent's branch could unintentionally bring baseline edits with it. Review therefore presents only baseline-to-result changes, labels private branches accordingly, and explains that integration must apply that delta deliberately (or commit the baseline coherently first). A supported automatic apply/merge transaction is deferred, rather than pretending raw branch merge is always correct.
+Dirty-parent baselines are already committed privately. A raw merge of a child branch into the parent's branch could unintentionally bring baseline edits with it. Review therefore presents only baseline-to-result changes, labels private branches accordingly, and explains that integration must apply that delta deliberately (or commit the baseline coherently first). Raw branch merges remain unsupported; explicit acceptance (decision 9) applies the delta deliberately.
 
 ### 6. Management surface and conservative cleanup
 
@@ -163,6 +163,39 @@ Typed error codes: the core error enum maps to stable codes (for example `worksp
 
 Discoverability: the agent advertises workspace support and the default baseline in additive initialize/capability `_meta`, so clients can offer an explicit Local/Worktree choice at creation. The `session/new` response discloses the resolved binding (execution cwd, workspace ID, branch, baseline mode/OID, excluded content). The `/worktree create` then load-the-returned-session flow remains the documented route for clients that cannot send creation metadata.
 
+### 9. Explicit result acceptance
+
+Trigger and authority: only the delegation's parent session may accept, and only a `Complete` delegation, via `accept_delegation_result(delegation_id, result_commit)`. The model supplies identifiers only; workspace (`WorkspaceRepository::get_workspace_by_delegation`), baseline, source HEAD, target checkout, and commit message are resolved from durable state. `result_commit` pins acceptance to the reviewed result (full id or unambiguous prefix of at least 7 hex digits). The tool is classified `ToolKind::Edit`, so permission policy applies; exempting it is an explicit policy choice, not an accident of classification. Acceptance serializes on the tool context's checkout mutation gate, falling back to the same checkout-keyed gate when the context provides none.
+
+Repository access: native gix only (gix `merge` feature); no Git executable and no CLI fallback. Unlike administrative handles, the target checkout is opened with system/global/user configuration so author/committer identity, `core.hooksPath`, `commit.gpgSign`, attributes, and merge drivers take effect, while `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` redirection is still ignored. Blocking gix work runs on the blocking pool; hook processes run asynchronously.
+
+Transaction (files are applied before hooks, so hooks observe the result on disk):
+
+```
+gate -> real index.lock -> recover pending intent -> preflight -> delta -> merge
+     -> local-state check -> persist intent -> apply touched files
+     -> hooks (private index) -> re-read index -> commit
+     -> ref txn (branch CAS + integration record) -> real index update
+     -> release lock -> post-commit
+```
+
+1. Preflight: refuse unborn HEAD, detached HEAD, an operation in progress (merge/cherry-pick/revert/rebase markers in the per-worktree Git directory, not the common directory), sparse checkout, unknown baseline/result objects, missing user identity, and `commit.gpgSign=true` (gix cannot sign; never create an unsigned commit instead).
+2. Delta: typed tree diff B0 -> R without rename detection. Empty -> `NoChanges`. Refuse gitlinks and paths requiring unsupported external filters, using the capture rules.
+3. Merge: `merge_trees(B0, HEAD, R)` with rewrites disabled so merge and delta report the same paths. Unresolved conflicts -> `Conflicted{paths}` with nothing written. Merged tree equal to the HEAD tree -> `NoChanges`.
+4. Protect local work, under the real `index.lock`: status-platform state, not porcelain. Refuse unmerged entries; refuse touched paths equal to, inside, or containing any staged, unstaged, untracked, or ignored path; refuse touched paths that already differed between source HEAD and B0 (`baseline_local_edits`).
+5. Apply: persist an intent file in the per-worktree Git directory (HEAD, branch, merged tree, touched paths), then check out exactly the touched entries through gix worktree checkout with attribute/filter pipelines, executable bits, and symlinks; deletions remove files.
+6. Hooks, always run (no bypass): write a private index built from the merged tree, then run executable `pre-commit`, `prepare-commit-msg <file> message`, and `commit-msg <file>` from the resolved `core.hooksPath` (default `<common_dir>/hooks`). Environment: cwd = checkout root, `GIT_INDEX_FILE` = private index, inherited `GIT_*` redirection cleared, `GIT_EDITOR=:`. Timeout 600 s with process-tree kill. On Windows hooks run through `sh`; a present hook without `sh` refuses. Non-zero exit -> `commit_rejected`.
+7. Re-read the private index: re-staged touched paths (`HEAD -> merged`, the paths this acceptance writes and checked for local work) are accepted; any other change, including delta paths a sibling already integrated -> `hook_changed_paths_outside_delta`. The message is read back from the message file with `git commit -m` whitespace cleanup; empty -> refuse.
+8. Commit: write the tree from the private index and a commit with the configured author/committer whose parent is HEAD.
+9. One reference transaction: branch `MustExistAndMatch(HEAD)` plus `refs/qmt/integrations/<workspace>/<result>` `MustNotExist`. A failed compare-and-swap -> `branch_moved`. gix does not roll back a partially committed transaction, so when either ref already names the new commit the failure is treated as torn: nothing is rolled back and the intent is left for recovery. A repeated acceptance reports `AlreadyIntegrated` only when the recorded commit is reachable from the target HEAD; otherwise it refuses with `integration_record_unreachable`.
+10. Write the touched entries from the commit into the real index; an entry gets fresh stat data only when its file still has the stat recorded right after apply and no hook re-staged it (otherwise the default stat, so a hook's unstaged edit stays visible), commit the lock, remove the intent, then run `post-commit`; its failure is logged and the outcome stays `Integrated`.
+
+Rollback and recovery: any failure before step 9 restores the touched paths to HEAD (they were proven clean, so no user work is lost) while the transaction still holds its lock, then releases it. Changes a hook made outside the delta are reported, not reverted. A pending intent found by the next acceptance on the same checkout is resolved first: branch still at the recorded HEAD -> roll back touched paths, unless one now holds content that is neither the merged nor the HEAD version (`touched_paths_edited`, intent kept); branch at the recorded integration commit -> re-apply index entries. A stale `index.lock` is removed only when the intent proves QueryMT owns it.
+
+Boundary: `RepositoryOps::prepare_integration` (blocking; steps 1-5 plus private index), the async hook runner, `RepositoryOps::finalize_integration` (blocking; steps 7-10), and `RepositoryOps::recover_integration`, each with a `FailurePoint`.
+
+Trade-off: native hook execution is less faithful than `git commit` (no `--no-verify`, hook managers relying on Git-set variables may differ). In exchange production stays Git-free, refusals are typed, and the branch update is a real compare-and-swap. Rejected: running `git commit`/`merge-tree`/`restore` (violates decision 3 and races external commits); running hooks after updating the branch but before writing files (hooks would inspect stale files).
+
 ### As-built: native repository operations (section 10)
 
 Implemented as specified: `crates/agent/src/worktree/repo_ops.rs` replaces the argv/stdout Git runner with a typed `RepositoryOps` boundary (`GixRepoOps`), implemented entirely with gix 0.90 primitives (reference edits, `add_worktree`/`remove_worktree`/worktree enumeration, status platform, private index/tree/commit capture, commit-graph walks). The CLI adapter (`git.rs`) is compiled for test fixtures only (`#[cfg(test)]`); no production path spawns a Git executable. Every blocking gix call runs through `tokio::task::spawn_blocking`, never on an async executor thread. Repositories are opened with `gix::open::Options::isolated()`, so inherited `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` cannot redirect operations (verified by test). Status comparisons keep object access on the calling thread (staged changes are computed by flattening the HEAD tree synchronously) to avoid sharing the thread-local object store with gix's status worker threads. Fault injection happens at named operation boundaries via `FaultInjectingRepoOps`/`FailurePoint`; tests never parse Git commands or fabricate porcelain output. Toolchain: gix 0.90 with `default-features = false` and `sha1` plus `basic`, `attributes`, `worktree-mutation`, `status` (Rust ≥ 1.88).
@@ -182,7 +215,7 @@ Bumped to gix 0.90 / gix-worktree 0.59. No API migration was needed for the call
 - [External writers during capture] -> Cooperative gates plus validation/retry; document the remaining non-atomic external-writer limitation.
 - [Baseline files can contain secrets even when not ignored] -> Capture only declared repository working state, never push private refs automatically, warn that private baselines enter the local object database.
 - [Unsupported Git layouts] -> Fail closed before child launch with explicit diagnostics; add coverage before claiming support.
-- [Result integration is manual initially] -> Supply an immutable baseline-relative result and clear recovery paths; defer unsafe automatic merging.
+- [Integration fidelity] -> Acceptance is explicit, delta-only, refuses rather than guesses, and runs hooks natively (decision 9); hook semantics are close to, not identical with, `git commit`.
 - [Existing undo omits some file classes] -> Preserve and document its semantics; regression-test supported paths and Git metadata exclusion rather than claiming complete Git rollback.
 - [Concurrent ACP/session-update work] -> Keep integration additive, coordinate event payload changes during implementation, and do not overwrite the other change's dispatch/lifecycle logic.
 - [Checkout accumulation from programmatic creation] -> Isolation is never implicit; document archive/remove for Python/API loops. Automatic cleanup remains deferred.

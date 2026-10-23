@@ -6,7 +6,14 @@
 //!
 //! Layout:
 //! - [`domain`]: pure domain types (identity, lifecycle, policy, provenance)
-//! - [`git`]: injectable Git CLI adapter (explicit argv, controlled env)
+//! - [`git`]: injectable Git CLI adapter (test fixtures only; production is native gix)
+//! - [`integrate`]: deterministic integration of an accepted delegate result
+//! - [`prepare`]: preflight, delta and merge for that integration
+//! - [`protect`]: real `index.lock` and local-work protection for it
+//! - [`apply`]: persisted integration intent and checkout of the touched entries
+//! - [`hooks`]: native commit-hook runner over a private index
+//! - [`finalize`]: commit, reference transaction and real-index update
+//! - [`recover`]: rollback or completion of an interrupted acceptance
 //! - [`identity`]: repository/checkout identity and relative-cwd resolution
 //! - [`lock`]: cross-process repository-administration locking
 //! - [`repo_workspace`]: durable workspace registry (SQLite)
@@ -14,19 +21,26 @@
 //! - [`lifecycle`]: live status, missing-workspace reconciliation, removal
 
 pub mod allocate;
+pub mod apply;
 pub mod capture;
 pub mod domain;
 pub mod error;
+pub mod finalize;
 pub mod gate;
 #[cfg(test)]
 pub(crate) mod git;
+pub mod hooks;
 pub mod identity;
+pub mod integrate;
 #[cfg(test)]
 mod layout_lifecycle_tests;
 pub mod lifecycle;
 pub mod lock;
 pub mod ops;
 pub mod placement;
+pub mod prepare;
+pub mod protect;
+pub mod recover;
 pub mod repo_ops;
 pub mod repo_workspace;
 pub mod service;
@@ -49,9 +63,16 @@ pub use error::{WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;
 #[cfg(test)]
 pub(crate) use git::{CliGit, GitRunner};
+pub use hooks::{HookOutcome, HookRejection, HookRequest, HookStatus, HookedIntegration};
 pub use identity::{
     CheckoutIdentity, ResolvedRepository, ensure_relative_cwd_exists, relative_cwd,
     resolve_repository,
+};
+pub use integrate::{
+    AcceptRequest, AppliedIntegration, ApplyOutcome, FinalizeFault, FinalizeOutcome,
+    FinalizeRequest, FinalizeStage, INTEGRATION_REF_PREFIX, IntegratedCommit, IntegrationOutcome,
+    PrepareOutcome, PrepareRequest, PreparedIntegration, RecoveryOutcome, Refusal,
+    sanitize_subject,
 };
 pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
@@ -61,6 +82,7 @@ pub use ops::{
     WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry, WorktreeResultResponse,
     WorktreeStatusResponse, WorktreeSummary,
 };
+pub use protect::IndexLock;
 pub use repo_ops::{
     CapturedWorkingState, CheckoutStatus, FailurePoint, FaultInjectingRepoOps, GixRepoOps,
     RegisteredWorktree, RepositoryOps, validate_ref_name,
