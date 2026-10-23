@@ -8,7 +8,7 @@ Provide portable, repository-owned knowledge that developers can share through s
 
 ### Requirement: Repository knowledge is explicitly enabled and configured
 
-The system SHALL require host opt-in and a supported `.agents/knowledge.toml` source manifest before indexing repository knowledge. The manifest SHALL select documentation and code using repository-relative include/exclude patterns, with excludes taking precedence. Repository content SHALL NOT enable the feature, grant tools, or expand host filesystem access. Disabled or absent configuration SHALL preserve existing behavior and SHALL NOT create repository files.
+The system SHALL require host opt-in and a supported `.qmt/knowledge.toml` source manifest at the selected root before indexing repository knowledge. The manifest SHALL select documentation and code using repository-relative include/exclude patterns, with excludes taking precedence. Repository content SHALL NOT enable the feature, grant tools, or expand host filesystem access. Disabled or absent configuration SHALL preserve existing behavior and SHALL NOT create repository files.
 
 #### Scenario: Feature is disabled
 - **WHEN** a workspace contains a knowledge manifest but host repository knowledge is disabled
@@ -20,14 +20,28 @@ The system SHALL require host opt-in and a supported `.agents/knowledge.toml` so
 - **THEN** the system reports that repository knowledge is not configured
 - **AND** it does not implicitly crawl the repository or create a manifest
 
-#### Scenario: Unsupported manifest version
-- **WHEN** the manifest declares an unsupported format version
+#### Scenario: Unsupported manifest version or table
+- **WHEN** the manifest declares an unsupported format version or an unknown top-level table
 - **THEN** repository indexing is unavailable with an actionable diagnostic
 - **AND** source files and legacy knowledge are not modified
 
+### Requirement: QueryMT control files do not occupy the shared .agents namespace
+
+The system SHALL keep QueryMT-specific repository knowledge control files (the source manifest and evidence acknowledgements) under the project `.qmt/` directory. The system SHALL NOT read a knowledge manifest from, or write any repository knowledge file into, `.agents/`. Selecting existing `.agents/memories/*.md` files as documentation inputs SHALL remain supported and SHALL NOT change `dotagents-protocol` discovery, layering, or import behavior.
+
+#### Scenario: Manifest placed under .agents
+- **WHEN** a repository contains `.agents/knowledge.toml` but no `.qmt/knowledge.toml`
+- **THEN** repository knowledge reports not configured
+- **AND** the `.agents` file is not interpreted as a repository knowledge manifest
+
+#### Scenario: Protocol memories are selected as documents
+- **WHEN** `.qmt/knowledge.toml` selects `.agents/memories/*.md` and the dotagents protocol is also enabled
+- **THEN** both systems read the files independently
+- **AND** no file is created or modified under `.agents/`
+
 ### Requirement: Authoritative knowledge is portable text
 
-The system SHALL accept selected Markdown, including workspace `.agents/memories/*.md`, architecture documents, and directory `AGENTS.md` files, without requiring a developer's database. Shared configuration, citations, document identities, and optional evidence metadata SHALL use repository-relative references rather than machine-local paths or session IDs. Explicit document IDs SHALL survive moves; documents without an explicit ID SHALL use path-derived identity.
+The system SHALL accept selected Markdown, including workspace `.agents/memories/*.md`, architecture documents, and directory `AGENTS.md` files, without requiring a developer's database. Shared configuration, citations, document identities, and evidence metadata SHALL use repository-relative references rather than machine-local paths or session IDs. Explicit document IDs SHALL survive moves; documents without an explicit ID SHALL use path-derived identity.
 
 #### Scenario: Another developer clones the repository
 - **WHEN** two developers index identical configured source contents in different checkout paths using the same index format
@@ -38,9 +52,18 @@ The system SHALL accept selected Markdown, including workspace `.agents/memories
 - **WHEN** a document with an explicit ID moves within the configured corpus and retains its ID
 - **THEN** its document identity remains stable and its citation updates to the new relative path
 
+### Requirement: Document frontmatter is optional and uses existing conventions
+
+Documents SHALL NOT require frontmatter. When present, frontmatter SHALL be parsed with the existing dotagents frontmatter conventions. The recognized optional keys SHALL be `id`, `title`, `description`, `tags`, `status`, `knowledge_sources`, and `knowledge_paths`. Unknown keys SHALL be retained and ignored. Workspace memories SHALL keep their legacy parsing and enabled semantics.
+
+#### Scenario: Plain Markdown and legacy memory coexist
+- **WHEN** selected inputs contain plain Markdown without frontmatter, Markdown with unknown frontmatter keys, and a legacy memory
+- **THEN** all valid inputs are available through one repository projection with original source coordinates
+- **AND** existing memory parsing and enabled semantics remain unchanged
+
 ### Requirement: Optional delivery metadata is portable and declarative
 
-The manifest SHALL support optional selected-document or section entrypoints for initial orientation. Documents SHALL support optional repository-relative path associations distinct from evidence dependencies. Invalid entrypoints or associations SHALL produce diagnostics without hiding unrelated valid sources. Delivery metadata SHALL NOT contain executable hook rules, enable automatic delivery, expand indexed coverage, or grant permissions. Associated document bodies SHALL remain ordinary authored Markdown and need no generated trigger prose.
+The manifest SHALL support optional selected-document or section entrypoints for initial orientation. Documents SHALL support optional `knowledge_paths` repository-relative path associations distinct from `knowledge_sources` evidence dependencies. Invalid entrypoints or associations SHALL produce diagnostics without hiding unrelated valid sources. Delivery metadata SHALL NOT contain executable hook rules, enable automatic delivery, expand indexed coverage, or grant permissions.
 
 #### Scenario: Repository supplies an orientation entrypoint
 - **WHEN** a selected repository-map document is referenced by the optional orientation configuration
@@ -50,11 +73,11 @@ The manifest SHALL support optional selected-document or section entrypoints for
 #### Scenario: Directory association does not acknowledge evidence
 - **WHEN** a note declares applicability to a repository-relative source-directory glob
 - **THEN** that association can select it for authorized index enrichment
-- **AND** the association alone neither marks its claims reviewed nor permits reading excluded files
+- **AND** the association alone neither marks its claims acknowledged nor permits reading excluded files
 
 ### Requirement: Discovery is confined and diagnosable
 
-The system SHALL confine discovery and reads to the authorized knowledge root, reject traversal and external symlink escapes, and exclude ignored content unless the host explicitly allows it. Selected hidden documentation SHALL be supported. The system SHALL enforce host file/count/byte limits and disclose incomplete coverage. Invalid documents and conflicting IDs SHALL produce source-specific diagnostics without hiding valid siblings; overlapping source patterns SHALL NOT duplicate documents.
+The system SHALL confine discovery and reads to the authorized knowledge root, reject traversal and external symlink escapes, and exclude ignored content unless the host explicitly allows it. Selected hidden documentation SHALL be supported. The system SHALL enforce host file/count/byte limits and disclose incomplete coverage. Overlapping source patterns SHALL NOT duplicate documents.
 
 #### Scenario: Selected hidden memory is indexed
 - **WHEN** the manifest selects a valid, non-ignored `.agents/memories/runtime.md` within the root
@@ -65,10 +88,26 @@ The system SHALL confine discovery and reads to the authorized knowledge root, r
 - **THEN** no external contents are read or indexed
 - **AND** a diagnostic identifies the rejected repository-relative source
 
+### Requirement: Invalid sources are isolated
+
+Invalid documents, malformed frontmatter, conflicting explicit IDs, and over-limit files SHALL be excluded with source-specific diagnostics. Valid sibling documents SHALL remain available, and coverage SHALL be reported as incomplete.
+
 #### Scenario: Conflicting IDs or size limits
 - **WHEN** two documents use the same explicit ID or a selected file exceeds host limits
 - **THEN** affected documents are excluded with diagnostics
 - **AND** valid unrelated documents remain available with incomplete-coverage information
+
+#### Scenario: Malformed frontmatter
+- **WHEN** one selected document has unparseable frontmatter
+- **THEN** only that document is excluded with a diagnostic
+
+### Requirement: Document references do not expand authorization
+
+Relative Markdown references SHALL resolve from their containing document and remain confined to the authorized checkout. Links SHALL NOT select extra index inputs or grant access. External URLs SHALL remain inert metadata during indexing and checking.
+
+#### Scenario: Reference escapes or names an external URL
+- **WHEN** a reference escapes the checkout or names an external URL
+- **THEN** escaping filesystem reads are rejected and the URL is not fetched automatically
 
 ### Requirement: Knowledge belongs to the effective checkout
 
@@ -82,6 +121,14 @@ The system SHALL resolve repository knowledge from the effective session checkou
 - **WHEN** two linked worktrees contain different versions of an indexed document
 - **THEN** each session retrieves the document from its own effective worktree
 - **AND** refreshing one does not overwrite the other's active corpus
+
+### Requirement: The local index lives under the QueryMT config directory
+
+The local index SHALL be stored under the QueryMT config directory resolved by the shared config-directory helper, keyed by checkout, and SHALL NOT be written into the repository or `sessions.db`. Public citations and portable IDs SHALL NOT contain the machine-local key.
+
+#### Scenario: Config directory is overridden
+- **WHEN** the host resolves a non-default QueryMT config directory
+- **THEN** the repository index is created under that directory rather than a hardcoded home path
 
 ### Requirement: Derived indexes refresh without modifying their sources
 
@@ -106,59 +153,29 @@ The system SHALL persist a locally rebuildable index and reconcile current confi
 - **THEN** it can be rebuilt solely from configured source files and portable metadata
 - **AND** authoritative files and private knowledge are unchanged
 
-### Requirement: Explicit OKF bundles coexist with existing Markdown
+### Requirement: Freshness checks avoid hashing unchanged files
 
-The manifest SHALL support explicitly selected OKF bundle roots alongside plain Markdown and legacy memories. OKF concepts SHALL require YAML frontmatter with a nonempty type; reserved index/log roles SHALL apply only within bundles. Plain Markdown SHALL NOT require conversion. Selection conflicts SHALL be diagnosed deterministically.
+Reconciliation SHALL compare stored file size, modification time, and file identity before reading content. It SHALL hash content only when any of these differ, when the stored modification time is within a racy-timestamp window of the previous index time, or when reliable metadata is unavailable. Content SHALL be reparsed only when its hash changed. Sources SHALL be revalidated by the same rule before a body or coordinates are emitted.
 
-#### Scenario: Mixed portable inputs
-- **WHEN** selected inputs contain plain Markdown, a legacy memory, and an OKF v0.2 bundle
-- **THEN** all valid inputs are available through one repository projection with original source coordinates
-- **AND** existing memory parsing and enabled semantics remain unchanged
+#### Scenario: Warm query with no changes
+- **WHEN** a repository query runs and no selected file's metadata has changed outside the racy window
+- **THEN** reconciliation completes without reading selected file contents
 
-#### Scenario: Invalid concept or overlapping bundle selection
-- **WHEN** an OKF concept lacks a type, bundle roots overlap, or one file is selected under conflicting formats
-- **THEN** the affected selection is diagnosed rather than resolved by enumeration order
-- **AND** valid unrelated sources remain available
+#### Scenario: Same-size edit within the racy window
+- **WHEN** a file is rewritten with the same size and a modification time within the racy-timestamp window of the last index
+- **THEN** its content is hashed and the edit is detected
 
-### Requirement: OKF metadata is extensible and structurally preserved
+#### Scenario: Metadata changes but content does not
+- **WHEN** a file's modification time changes but its content hash is unchanged
+- **THEN** its parsed records are reused without reparsing
 
-The system SHALL consume nested OKF v0.2 metadata within bounded parsing resources, tolerate unknown types/keys, and normalize a bare verified mapping as a list. Unknown declared OKF versions SHALL receive best-effort consumption with diagnostics. Explicit metadata rewrites SHALL preserve unknown fields or refuse a lossy operation.
+### Requirement: Hosts can force full content hashing
 
-#### Scenario: Nested metadata and future extensions
-- **WHEN** a concept contains sources, generated metadata, a bare verified mapping, and an unknown extension
-- **THEN** nested values and the extension remain structurally available and verified is interpreted as one event
-- **AND** the unknown extension or concept type does not invalidate the document
+A host setting SHALL force content hashing of every selected file during reconciliation, bypassing the metadata fast path.
 
-#### Scenario: Excessive YAML complexity
-- **WHEN** a metadata document exceeds nesting, expansion, or byte limits
-- **THEN** it is rejected with a source diagnostic without unbounded processing or executable object construction
-
-#### Scenario: Unknown OKF version
-- **WHEN** a bundle declares an unrecognized okf_version
-- **THEN** supported structures are consumed with a version diagnostic
-- **AND** this does not change rejection of unsupported source-manifest versions
-
-### Requirement: Bundle references do not expand authorization
-
-OKF root-relative references SHALL resolve from the selected bundle root and relative references from their document. Reads SHALL remain confined to the authorized checkout. Links and provenance SHALL NOT select extra index inputs or grant access. URLs and scope descriptors SHALL remain inert metadata during indexing and checking.
-
-#### Scenario: Bundle-root link and repository-code source
-- **WHEN** a bundle document links to /subsystem.md and relatively references code outside the bundle but inside the checkout
-- **THEN** the link resolves within the bundle and the code reference resolves within the checkout
-- **AND** every read still requires host authorization and applicable source policy
-
-#### Scenario: Reference escapes or names an external URL
-- **WHEN** a reference escapes the checkout or names an external URL
-- **THEN** escaping filesystem reads are rejected and the URL is not fetched automatically
-
-### Requirement: OKF identities map to portable repository identities
-
-The system SHALL map bundle-relative OKF concept paths into repository-relative identities while retaining explicit IDs that survive moves. Public citations SHALL identify current source paths without machine-local bundle or checkout identifiers.
-
-#### Scenario: Identical bundles in two selected directories
-- **WHEN** distinct non-overlapping bundles contain the same concept-relative filename without explicit IDs
-- **THEN** repository identities remain distinct through their bundle-root paths
-- **AND** identical checkouts reproduce the same logical identities
+#### Scenario: Forced hashing is enabled
+- **WHEN** the host enables forced hashing and no file metadata has changed
+- **THEN** every selected file's content is hashed during reconciliation
 
 ### Requirement: Repository projection does not publish private knowledge
 
