@@ -47,7 +47,7 @@ The system SHALL reuse unchanged extracted records and invalidate records when s
 
 ### Requirement: Partial extraction is explicit
 
-Unsupported languages, parse failures, and host size limits SHALL be visible through path-level records or coverage diagnostics as appropriate. The system SHALL NOT describe partial extraction as a complete semantic index or omit skipped files without explanation. Out-of-policy sources SHALL remain unread.
+Path-level records (relative path, language, size) SHALL be available whenever a selected code file is indexed, independently of symbol extraction. Unsupported languages, parse failures, and host size limits SHALL be visible through path-level records or coverage diagnostics as appropriate. The system SHALL NOT describe partial extraction as a complete semantic index or omit skipped files without explanation. Out-of-policy sources SHALL remain unread.
 
 #### Scenario: Unsupported selected source
 - **WHEN** a selected regular source file has an unsupported language
@@ -66,14 +66,14 @@ The system SHALL provide bounded directory/file map retrieval and explicit porta
 - **WHEN** an export targets an existing document without an unambiguous managed block
 - **THEN** it refuses to overwrite that document and reports how to select a safe generated destination
 
-### Requirement: Code maps complement portable concepts without format conversion
+### Requirement: Code maps complement authored documents without format conversion
 
-Generated code records SHALL remain source-derived navigation aids separate from authored concepts. Indexing code SHALL NOT require generating an OKF document per file or symbol. Portable concepts SHALL be able to cite selected code records without converting them into authored explanations or automatically acknowledging evidence.
+Generated code records SHALL remain source-derived navigation aids separate from authored documents. Indexing code SHALL NOT require generating a Markdown document per file or symbol. Authored documents SHALL be able to cite selected code records without converting them into authored explanations or automatically acknowledging evidence.
 
 #### Scenario: Curated concept links to source code
-- **WHEN** an OKF or plain-Markdown subsystem concept references selected source files
+- **WHEN** a Markdown subsystem document references selected source files
 - **THEN** code navigation and authored explanations remain distinguishable and independently citable
-- **AND** indexing does not create per-symbol OKF documents or mark the concept reviewed
+- **AND** indexing does not create per-file or per-symbol documents or acknowledge the document's evidence
 
 ### Requirement: Existing source tools retain their contracts
 
