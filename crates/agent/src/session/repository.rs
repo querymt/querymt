@@ -39,6 +39,21 @@ pub trait SessionRepository: Send + Sync {
         ))
     }
 
+    /// Overwrite a session's durable working directory (RFC 3339 `updated_at`
+    /// bump included). Used when a session's execution workspace changes
+    /// durably — e.g. an isolated fork binding its own checkout so the session
+    /// row, workspace association, listing, load, and resume all agree.
+    async fn set_session_cwd(
+        &self,
+        session_id: &str,
+        cwd: Option<std::path::PathBuf>,
+    ) -> SessionResult<()> {
+        let _ = (session_id, cwd);
+        Err(crate::session::error::SessionError::InvalidOperation(
+            "set_session_cwd is not supported by this store".to_string(),
+        ))
+    }
+
     /// List all sessions
     async fn list_sessions(&self) -> SessionResult<Vec<Session>>;
 
@@ -67,6 +82,16 @@ pub trait SessionRepository: Send + Sync {
 
     /// Get fork information for a session
     async fn get_session_fork_info(&self, session_id: &str) -> SessionResult<Option<ForkInfo>>;
+
+    /// Resolve a session's public id and workspace cwd by internal row id.
+    ///
+    /// Fork records reference the parent session by internal id; undo needs
+    /// both to decide whether inherited fork snapshots are context-only.
+    /// Returns `None` when no session has that internal id.
+    async fn get_session_ref_by_internal_id(
+        &self,
+        session_internal_id: i64,
+    ) -> SessionResult<Option<(String, Option<std::path::PathBuf>)>>;
 
     /// List child sessions (forks) of a parent session
     async fn list_child_sessions(&self, parent_id: &str) -> SessionResult<Vec<String>>;

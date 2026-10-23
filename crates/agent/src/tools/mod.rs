@@ -13,6 +13,7 @@ pub use builtins::{
 };
 pub use context::{
     CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, ToolExecutionClass,
+    run_under_mutation_gate,
 };
 pub use context_impl::{AgentToolContext, ElicitationRequest};
 pub use path::{

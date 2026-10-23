@@ -3,6 +3,7 @@
 use super::utils::infer_required_capabilities;
 use crate::config::{ExecutionPolicy, HooksConfig, McpServerConfig, MiddlewareEntry, SkillsConfig};
 use crate::tools::CapabilityRequirement;
+use crate::worktree::DelegationIsolation;
 use querymt::{LLMParams, chat::ReasoningEffort};
 use serde_json::Value;
 
@@ -24,6 +25,8 @@ pub(super) struct AgentConfig {
     /// MCP servers resolved for this agent, attached to its runtime through the
     /// existing stdio and streamable-http transports.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Configured isolation for tasks delegated to this agent.
+    pub isolation: DelegationIsolation,
 }
 
 impl AgentConfig {
@@ -42,6 +45,7 @@ impl AgentConfig {
             mutating_tools: None,
             hooks: HooksConfig::default(),
             mcp_servers: Vec::new(),
+            isolation: DelegationIsolation::default(),
         }
     }
 }
@@ -222,6 +226,13 @@ impl DelegateConfigBuilder {
 
     pub fn skills(mut self, config: SkillsConfig) -> Self {
         self.config.skills = Some(config);
+        self
+    }
+
+    /// Workspace isolation for tasks delegated to this delegate. An explicit
+    /// non-`Inherit` value on the `delegate` tool call still wins.
+    pub fn isolation(mut self, isolation: DelegationIsolation) -> Self {
+        self.config.isolation = isolation;
         self
     }
 

@@ -2327,3 +2327,270 @@ async fn lifecycle_capabilities_require_session_store_and_view_filter_support() 
     agent.shutdown().await;
     Ok(())
 }
+
+// ── Managed worktree workspaces (simple API) ─────────────────────────────────
+
+mod workspace_api {
+    use super::*;
+    use crate::api::SessionOptions;
+    use crate::config::WorkspaceSettings;
+    use crate::worktree::test_support::{commit_files, init_repo, materialize};
+
+    struct Fixture {
+        agent: Agent,
+        repo: tempfile::TempDir,
+        storage_root: tempfile::TempDir,
+        _plugins: tempfile::TempDir,
+    }
+
+    async fn fixture(workspace: Option<WorkspaceSettings>) -> Fixture {
+        let repo = init_repo();
+        commit_files(repo.path(), "initial", &[("README.md", "hello\n")]);
+        materialize(repo.path(), &[("README.md", "hello\n")]);
+        let storage_root = tempfile::TempDir::new().unwrap();
+        let (registry, plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let mut builder = Agent::single()
+            .provider("openai", "gpt-4o-mini")
+            .cwd(repo.path())
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            });
+        if let Some(mut settings) = workspace {
+            settings.storage_root = Some(storage_root.path().to_path_buf());
+            builder = builder.workspace(settings);
+        }
+        Fixture {
+            agent: builder.build().await.unwrap(),
+            repo,
+            storage_root,
+            _plugins: plugins,
+        }
+    }
+
+    /// 21.7: no settings -> no service, no facade, no `/worktree`.
+    #[tokio::test]
+    async fn agent_without_workspace_settings_has_no_service() {
+        let f = fixture(None).await;
+        assert!(f.agent.worktrees().is_none());
+        assert!(f.agent.handle().config.workspace_service().is_none());
+        let err = f
+            .agent
+            .chat_session_with(SessionOptions::worktree())
+            .await
+            .err()
+            .expect("requested isolation fails closed without a service");
+        assert_eq!(err.code(), "workspace_service_unavailable", "{err}");
+    }
+
+    /// 21.4: with the service enabled, option-less sessions stay local.
+    #[tokio::test]
+    async fn option_less_chat_session_stays_local_with_the_service_enabled() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let worktrees = f.agent.worktrees().expect("service enabled");
+
+        for session in [
+            f.agent.chat_session().await.unwrap(),
+            f.agent
+                .chat_session_with(SessionOptions::default())
+                .await
+                .unwrap(),
+        ] {
+            assert!(session.workspace().is_none());
+        }
+        assert!(worktrees.list().await.unwrap().workspaces.is_empty());
+        assert!(
+            std::fs::read_dir(f.storage_root.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "no checkout directory is created for local sessions"
+        );
+    }
+
+    /// 21.9: explicit isolation binds the session to its own checkout and the
+    /// management facade operates on it with stable error codes.
+    #[tokio::test]
+    async fn explicit_worktree_session_and_management_facade() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let worktrees = f.agent.worktrees().unwrap();
+
+        let session = f
+            .agent
+            .chat_session_with(SessionOptions::worktree().name("iso"))
+            .await
+            .unwrap();
+        let binding = session.workspace().expect("disclosed binding");
+        let workspace_id = binding["workspaceId"].as_str().unwrap().to_string();
+        let cwd = std::path::PathBuf::from(binding["sessionCwd"].as_str().unwrap());
+        assert_ne!(cwd, f.repo.path());
+        assert!(cwd.starts_with(f.storage_root.path()));
+        assert_eq!(binding["baseline"], "commit");
+
+        let listed = worktrees.list().await.unwrap();
+        assert_eq!(listed.workspaces.len(), 1);
+        assert_eq!(
+            listed.workspaces[0].owner_session_id.as_deref(),
+            Some(session.id())
+        );
+        assert_eq!(
+            worktrees
+                .status(&workspace_id)
+                .await
+                .unwrap()
+                .summary
+                .workspace_id,
+            workspace_id
+        );
+
+        // Removal of an actively owned workspace is refused with a stable code.
+        let err = worktrees.remove(&workspace_id).await.unwrap_err();
+        assert_eq!(err.code(), "removal_refused");
+        let err = worktrees.status("ws-unknown").await.unwrap_err();
+        assert_eq!(err.code(), "workspace_not_found");
+        assert_eq!(
+            worktrees.list().await.unwrap().workspaces.len(),
+            1,
+            "a refused removal loses nothing"
+        );
+
+        // The typed `create` operation reuses the agent's cwd by default.
+        let created = worktrees
+            .create(crate::worktree::WorktreeCreateRequest::default())
+            .await
+            .unwrap();
+        assert_ne!(created.workspace_id, workspace_id);
+        assert_eq!(created.baseline_mode, "commit");
+    }
+
+    /// A loaded isolated session reports its durable binding; a loaded local
+    /// session still reports none.
+    #[tokio::test]
+    async fn loaded_sessions_report_their_durable_workspace_binding() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let isolated = f
+            .agent
+            .chat_session_with(SessionOptions::worktree())
+            .await
+            .unwrap();
+        let local = f.agent.chat_session().await.unwrap();
+
+        let loaded = f.agent.load_session(isolated.id()).await.unwrap();
+        let created = isolated.workspace().expect("disclosed at creation");
+        let reloaded = loaded.workspace().expect("disclosed on load");
+        assert_eq!(reloaded["workspaceId"], created["workspaceId"]);
+        assert_eq!(reloaded["sessionCwd"], created["sessionCwd"]);
+        assert_eq!(reloaded["baseline"], created["baseline"]);
+
+        let loaded_local = f.agent.load_session(local.id()).await.unwrap();
+        assert!(loaded_local.workspace().is_none());
+
+        let with_snapshot = f
+            .agent
+            .sessions()
+            .load_with_snapshot(isolated.id())
+            .await
+            .unwrap();
+        assert_eq!(
+            with_snapshot.session.workspace().expect("binding")["workspaceId"],
+            created["workspaceId"]
+        );
+    }
+
+    #[tokio::test]
+    async fn contradictory_session_options_are_rejected_before_creation() {
+        let f = fixture(Some(WorkspaceSettings::enabled())).await;
+        let err = f
+            .agent
+            .chat_session_with(SessionOptions::local().base_ref("main"))
+            .await
+            .err()
+            .expect("invalid options");
+        assert_eq!(err.code(), "invalid_options", "{err}");
+        assert!(
+            f.agent
+                .worktrees()
+                .unwrap()
+                .list()
+                .await
+                .unwrap()
+                .workspaces
+                .is_empty()
+        );
+    }
+
+    /// 21.2 at build time: an unusable storage root fails `build()`.
+    #[tokio::test]
+    async fn unusable_storage_root_fails_the_agent_build() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let (registry, _plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let err = Agent::single()
+            .provider("openai", "gpt-4o-mini")
+            .workspace(WorkspaceSettings {
+                storage_root: Some(file.path().join("nested")),
+                ..WorkspaceSettings::enabled()
+            })
+            .infra(AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            })
+            .build()
+            .await
+            .err()
+            .expect("build must fail");
+        assert!(
+            err.to_string().contains("invalid workspace configuration"),
+            "{err}"
+        );
+    }
+
+    /// 21.7: TOML translation threads the section through to the builder.
+    #[tokio::test]
+    async fn toml_workspace_section_enables_the_service() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let toml = format!(
+            "[agent]\nprovider = \"openai\"\nmodel = \"gpt-4o-mini\"\n\n[agent.workspace]\nenabled = true\nstorage_root = {:?}\n",
+            dir.path().join("wt")
+        );
+        let crate::config::Config::Single(config) =
+            crate::config::load_config(crate::config::ConfigSource::Toml(toml))
+                .await
+                .unwrap()
+        else {
+            panic!("single config");
+        };
+        let (registry, _plugins) = empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .unwrap(),
+        );
+        let agent = Agent::from_config(
+            *config,
+            AgentInfra {
+                plugin_registry: Arc::new(registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(agent.worktrees().is_some());
+        assert!(dir.path().join("wt").is_dir());
+    }
+}

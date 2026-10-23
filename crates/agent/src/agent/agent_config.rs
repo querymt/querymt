@@ -119,8 +119,17 @@ pub struct AgentConfig {
     pub knowledge_store: Option<Arc<dyn crate::knowledge::KnowledgeStore>>,
     /// Slash command registry for prompt expansion and ACP advertising.
     pub slash_command_registry: crate::slash_commands::SlashCommandRegistry,
+    /// The slash command discovery configuration, retained so workspace-bound
+    /// sessions can re-resolve prompt sources from their bound checkout.
+    pub slash_commands_config: Option<crate::config::SlashCommandsConfig>,
     /// Hook command registry for lifecycle policy checks.
     pub hooks: Hooks,
+    /// Managed Git worktree workspace service for isolated session creation.
+    ///
+    /// `None` keeps every session local (existing behavior). When set, new
+    /// sessions may request isolated worktree execution and existing sessions
+    /// resolve their persisted workspace binding before startup.
+    pub workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
 }
 
 impl AgentConfig {
@@ -254,6 +263,13 @@ impl AgentConfig {
     /// Access the knowledge store, if configured.
     pub fn knowledge_store(&self) -> Option<Arc<dyn crate::knowledge::KnowledgeStore>> {
         self.knowledge_store.clone()
+    }
+
+    /// Managed worktree workspace service, when configured.
+    ///
+    /// `None` means every session executes locally (existing behavior).
+    pub fn workspace_service(&self) -> Option<Arc<crate::worktree::WorkspaceService>> {
+        self.workspace_service.clone()
     }
 
     /// Determines if a tool should trigger snapshotting.
@@ -519,6 +535,8 @@ mod tests {
         assert!(config.requires_permission_for_tool("write_file"));
         assert!(config.requires_permission_for_tool("edit"));
         assert!(config.requires_permission_for_tool("multiedit"));
+        // Integration rewrites tracked files and advances the branch.
+        assert!(config.requires_permission_for_tool("accept_delegation_result"));
         assert!(config.requires_permission_for_tool("delete_file"));
         assert!(config.requires_permission_for_tool("shell"));
         // read-only tools do NOT require permission

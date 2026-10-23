@@ -407,6 +407,7 @@ impl SessionRegistry {
             session_id.clone(),
             &crate::agent::mcp::agent_implementation(),
             tool_state.clone(),
+            cwd.as_deref(),
         )
         .await?;
 

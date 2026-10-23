@@ -662,9 +662,26 @@ impl SessionScope {
     }
 }
 
+/// Durable managed-workspace provenance; execution cwd stays on the session item.
+#[typeshare::typeshare]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWorkspaceView {
+    pub workspace_id: String,
+    pub repository_id: String,
+    pub project_name: String,
+    pub checkout_path: String,
+    pub branch: String,
+    pub baseline_mode: String,
+    pub baseline_commit: Option<String>,
+    pub lifecycle: String,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionListItem {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<SessionWorkspaceView>,
     pub name: Option<String>,
     pub cwd: Option<String>,
     pub title: Option<String>,
@@ -681,9 +698,26 @@ pub struct SessionListItem {
     /// Whether this session has child sessions
     pub has_children: bool,
     pub fork_count: usize,
+    /// A persisted fork-isolation intent is still outstanding: the fork is
+    /// not runnable (load/resume fail closed) until explicit recovery
+    /// completes provisioning. Set for pending and failed isolated fork
+    /// creation alike; the workspace view, when present, carries the
+    /// workspace-level lifecycle (e.g. `failed`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending_isolation: bool,
 }
 
-/// Group of sessions by CWD
+impl SessionListItem {
+    /// Managed sessions group by canonical repository identity, local ones by cwd.
+    pub fn group_key(&self) -> Option<String> {
+        self.workspace
+            .as_ref()
+            .map(|w| format!("repository:{}", w.repository_id))
+            .or_else(|| self.cwd.clone())
+    }
+}
+
+/// Group of sessions by local cwd or `repository:<common-dir>` for managed sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGroup {
     pub cwd: Option<String>,
@@ -916,6 +950,7 @@ mod tests {
     fn test_session_list_item_construction() {
         let item = SessionListItem {
             session_id: "sess-x".to_string(),
+            workspace: None,
             name: Some("My Session".to_string()),
             cwd: Some("/home/user/project".to_string()),
             title: None,
@@ -926,6 +961,7 @@ mod tests {
             session_kind: None,
             has_children: false,
             fork_count: 0,
+            pending_isolation: false,
         };
         assert_eq!(item.session_id, "sess-x");
         assert!(!item.has_children);

@@ -683,10 +683,15 @@ impl SessionActorRef {
     /// over the kameo mesh.
     pub async fn undo(&self, message_id: String) -> Result<UndoResult, UndoError> {
         match self {
-            Self::Local(actor_ref) => actor_ref
-                .ask(messages::Undo { message_id })
-                .await
-                .map_err(|e| UndoError::ActorSend(e.to_string())),
+            Self::Local(actor_ref) => {
+                actor_ref
+                    .ask(messages::Undo { message_id })
+                    .await
+                    .map_err(|e| match e {
+                        kameo::error::SendError::HandlerError(error) => error,
+                        error => UndoError::ActorSend(error.to_string()),
+                    })
+            }
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref
@@ -714,10 +719,10 @@ impl SessionActorRef {
     /// over the kameo mesh.
     pub async fn redo(&self) -> Result<RedoResult, UndoError> {
         match self {
-            Self::Local(actor_ref) => actor_ref
-                .ask(messages::Redo)
-                .await
-                .map_err(|e| UndoError::ActorSend(e.to_string())),
+            Self::Local(actor_ref) => actor_ref.ask(messages::Redo).await.map_err(|e| match e {
+                kameo::error::SendError::HandlerError(error) => error,
+                error => UndoError::ActorSend(error.to_string()),
+            }),
 
             #[cfg(feature = "remote")]
             Self::Remote { actor_ref, .. } => actor_ref

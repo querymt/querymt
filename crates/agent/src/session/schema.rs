@@ -6,6 +6,7 @@
 //! - Internal-only tables skip public_id to save space
 
 use rusqlite::Connection;
+use std::collections::HashSet;
 
 /// Initialize the hybrid INTEGER PK + UUID v7 public_id schema
 pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
@@ -133,6 +134,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             expected_output TEXT,
             verification_spec TEXT,  -- Structured verification specification (JSON)
             planning_summary TEXT,  -- AI-generated summary of parent planning conversation
+            isolation TEXT,  -- Delegation execution isolation: inherit | shared | isolated (NULL = inherit)
             status TEXT NOT NULL,
             retry_count INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -331,6 +333,7 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             message_id TEXT NOT NULL,
             snapshot_id TEXT NOT NULL,
             backend_id TEXT NOT NULL DEFAULT 'git',
+            workspace_root TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
@@ -603,8 +606,205 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
             INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts, rowid, summary, insight)
             VALUES ('delete', old.id, old.summary, old.insight);
         END;
+
         "#,
     )?;
 
+    conn.execute_batch(WORKSPACE_TABLES_DDL)?;
+    ensure_workspace_provisioning_columns(conn)?;
+
     Ok(())
+}
+
+/// Additive provisioning-intent columns for the `workspaces` table.
+///
+/// Persist the replayable provisioning inputs (requested baseline ref,
+/// operation id, and the last completed provisioning phase) so an
+/// interrupted allocation can be recovered without a fabricated baseline.
+/// Kept out of [`WORKSPACE_TABLES_DDL`]'s `workspaces` CREATE TABLE because
+/// the `0025_workspace_archival` rebuild copies rows with
+/// `INSERT ... SELECT *`; guarding each `ALTER TABLE` keeps this idempotent
+/// for both fresh installs (where [`init_schema`] calls it right after
+/// creating the tables) and existing databases (via the
+/// `0027_workspace_provisioning_intent` migration).
+pub fn ensure_workspace_provisioning_columns(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    for (column, definition) in [
+        ("requested_base_ref", "TEXT"),
+        ("operation_id", "TEXT"),
+        ("provisioning_phase", "TEXT"),
+    ] {
+        if !existing.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE workspaces ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Add the `captured_head` column to `workspace_results` when an existing
+/// database predates it.
+///
+/// Fresh installs get the column from [`WORKSPACE_TABLES_DDL`]; guarded so
+/// the paired migration stays idempotent. Existing rows keep NULL and review
+/// falls back to the workspace baseline commit.
+pub fn ensure_workspace_result_columns(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let existing: HashSet<String> = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspace_results)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<_, _>>()?
+    };
+    if !existing.contains("captured_head") {
+        conn.execute(
+            "ALTER TABLE workspace_results ADD COLUMN captured_head TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// DDL for managed worktree workspaces and their retained result provenance.///
+/// Shared between `init_schema` (fresh installs) and the additive
+/// `0022_worktree_workspaces` migration (existing databases) so the two can
+/// never drift. All statements are `IF NOT EXISTS` and safe to re-run.
+/// The `CREATE TABLE IF NOT EXISTS workspaces (...)` statement from
+/// [`WORKSPACE_TABLES_DDL`], located by the statement itself rather than by
+/// a neighbouring comment so reflowing comments cannot break the
+/// table-rebuild migrations that reuse it.
+pub fn workspaces_create_table_statement() -> &'static str {
+    const START: &str = "CREATE TABLE IF NOT EXISTS workspaces (";
+    let start = WORKSPACE_TABLES_DDL
+        .find(START)
+        .expect("WORKSPACE_TABLES_DDL defines the workspaces table");
+    let rest = &WORKSPACE_TABLES_DDL[start..];
+    let end = rest
+        .find(");")
+        .expect("the workspaces CREATE TABLE statement is terminated");
+    &rest[..end + 2]
+}
+
+pub const WORKSPACE_TABLES_DDL: &str = r#"
+    -- ========================================================================
+    -- TIER 1: WORKTREE WORKSPACES (with public_id) — isolated Git workspaces
+    -- ========================================================================
+
+    -- One managed workspace per linked-worktree checkout. Repository identity
+    -- is the canonical common directory; checkout identity is the checkout
+    -- path (never reused after removal). `owner_session_id` is the nullable
+    -- session association: a workspace has at most one writable owner.
+    CREATE TABLE IF NOT EXISTS workspaces (
+        id INTEGER PRIMARY KEY,
+        public_id TEXT UNIQUE NOT NULL,
+        common_dir TEXT NOT NULL,
+        origin_path TEXT NOT NULL,
+        project_name TEXT NOT NULL,
+        checkout_path TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        relative_cwd TEXT NOT NULL DEFAULT '',
+        execution TEXT NOT NULL CHECK (execution IN ('local', 'worktree')),
+        baseline_mode TEXT NOT NULL CHECK (baseline_mode IN ('commit', 'current_working_tree')),
+        source_head TEXT,
+        baseline_commit TEXT,
+        lifecycle TEXT NOT NULL CHECK (lifecycle IN ('provisioning', 'ready', 'failed', 'missing', 'archived', 'removing', 'removed')),
+        owner_session_id TEXT,
+        parent_workspace_id TEXT,
+        parent_session_id TEXT,
+        delegation_id TEXT,
+        delegation_batch_id TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(parent_workspace_id) REFERENCES workspaces(public_id) ON DELETE SET NULL,
+        FOREIGN KEY(owner_session_id) REFERENCES sessions(public_id) ON DELETE SET NULL
+    );
+
+    -- A managed workspace has at most one writable session owner.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_owner
+        ON workspaces(owner_session_id) WHERE owner_session_id IS NOT NULL;
+    -- Checkout paths are never reused, including after removal.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_checkout
+        ON workspaces(checkout_path);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_common_dir
+        ON workspaces(common_dir, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_batch
+        ON workspaces(delegation_batch_id) WHERE delegation_batch_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_workspaces_parent
+        ON workspaces(parent_workspace_id) WHERE parent_workspace_id IS NOT NULL;
+
+    -- Retained result provenance for delegates working in a workspace:
+    -- baseline-relative result commits and verification outcome. Absent rows
+    -- never imply integration.
+    CREATE TABLE IF NOT EXISTS workspace_results (
+        id INTEGER PRIMARY KEY,
+        workspace_public_id TEXT NOT NULL,
+        baseline_commit TEXT NOT NULL,
+        result_commit TEXT,
+        result_ref TEXT,
+        verification TEXT CHECK (verification IN ('pending', 'passed', 'failed', 'skipped')),
+        captured_at TEXT NOT NULL,
+        -- Checkout HEAD at capture time, kept distinct from live HEAD so
+        -- review stays accurate after later commits. NULL for rows written
+        -- before the column existed.
+        captured_head TEXT,
+        FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_workspace_results_workspace
+        ON workspace_results(workspace_public_id, captured_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_results_result_ref
+        ON workspace_results(result_ref) WHERE result_ref IS NOT NULL;
+"#;
+
+#[cfg(test)]
+mod fts_trigger_tests {
+    use super::*;
+
+    /// Deleting a consolidation must remove *both* indexed columns from the
+    /// external-content FTS index. The delete trigger has to replay the
+    /// original `summary` and `insight` values; omitting `summary` leaves
+    /// stale postings and corrupts the index.
+    #[test]
+    fn consolidation_delete_removes_summary_and_insight_postings() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_schema(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO knowledge_consolidations \
+             (public_id, scope, source_entry_public_ids_json, summary, insight, created_at) \
+             VALUES ('c1', 'scope', '[]', 'zebrafish summary', 'quokka insight', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let hits = |conn: &Connection, term: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM knowledge_consolidations_fts WHERE knowledge_consolidations_fts MATCH ?1",
+                [term],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(hits(&conn, "zebrafish"), 1);
+        assert_eq!(hits(&conn, "quokka"), 1);
+
+        conn.execute(
+            "DELETE FROM knowledge_consolidations WHERE public_id = 'c1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(hits(&conn, "zebrafish"), 0, "summary postings removed");
+        assert_eq!(hits(&conn, "quokka"), 0, "insight postings removed");
+
+        // The index must remain structurally consistent after the delete.
+        conn.execute(
+            "INSERT INTO knowledge_consolidations_fts(knowledge_consolidations_fts) VALUES('integrity-check')",
+            [],
+        )
+        .expect("FTS index integrity check passes after delete");
+    }
 }

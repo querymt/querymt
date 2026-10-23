@@ -208,6 +208,25 @@ timeout_sec = 5
 
 Hook commands receive JSON on stdin and return JSON on stdout. Supported events now include compaction hooks and delegation hooks in addition to tool, prompt, session, permission, and stop hooks. See the [Hooks Guide](hooks.md) for the full event list, schema files, and `stop` continuation behavior.
 
+### Workspace (Git worktree) Configuration
+
+Managed Git worktree isolation is disabled by default. Enabling it only makes
+isolation *available*; sessions still run locally unless they explicitly ask
+for a worktree.
+
+```toml
+[agent.workspace]          # [quorum.workspace] for a quorum
+enabled = true             # default false
+storage_root = "~/.qmt/worktrees"   # default; relative paths resolve against this file
+baseline = "commit"        # "commit" (default) | "current_working_tree"
+```
+
+`baseline` is a default for explicitly requested top-level isolation that does
+not choose its own baseline. Invalid settings (unusable `storage_root`, a
+backend without a workspace repository) fail when the agent is built. See
+[Git Worktree Workspaces](worktrees.md) for requesting isolation, the error
+codes, and the Rust/Python APIs.
+
 ## MCP Servers
 
 MCP (Model Context Protocol) servers extend agent capabilities:
@@ -387,6 +406,11 @@ capabilities = ["coding", "filesystem"]
 tools = ["edit", "write_file", "shell", "read_tool"]
 
 system = "You are a coder agent. Implement the requested changes."
+
+# Workspace isolation for tasks delegated to this agent (default "inherit").
+# isolation = "inherit"   # isolated parents isolate delegates; local parents share
+# isolation = "isolated"  # always a private worktree (needs [quorum.workspace])
+# isolation = "shared"    # share the parent's checkout (disclosed as shared)
 
 [delegates.execution]
 # Same execution policy structure

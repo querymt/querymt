@@ -608,27 +608,36 @@ impl Tool for EditTool {
 
         let file_path = context.resolve_path(file_path_str)?;
 
-        // Read current content
-        let content = tokio::fs::read_to_string(&file_path)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
+        // Mutating phase runs under the checkout mutation gate when the
+        // session has one, so baseline capture never observes a half-applied
+        // edit (and vice versa).
+        crate::tools::run_under_mutation_gate(context, async {
+            // Read current content
+            let content = tokio::fs::read_to_string(&file_path)
+                .await
+                .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {}", e)))?;
 
-        // Perform replacement
-        let replacement =
-            Self::replace_with_metadata(&content, old_string, new_string, replace_all)
-                .map_err(ToolError::ProviderError)?;
+            // Perform replacement
+            let replacement =
+                Self::replace_with_metadata(&content, old_string, new_string, replace_all)
+                    .map_err(ToolError::ProviderError)?;
 
-        // Write new content
-        tokio::fs::write(&file_path, &replacement.content)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
+            // Write new content
+            tokio::fs::write(&file_path, &replacement.content)
+                .await
+                .map_err(|e| ToolError::ProviderError(format!("Failed to write file: {}", e)))?;
 
-        // Build compact line-numbered hunk output from the actual file diff so
-        // large context-matching replacements only mark lines that really changed.
-        let file_output =
-            edit_output::build_file_output_from_diff(&file_path, &content, &replacement.content);
-        let output_text = edit_output::format_compact_receipt(&[file_output]);
-        Ok(vec![ToolResultPart::text(output_text)])
+            // Build compact line-numbered hunk output from the actual file diff so
+            // large context-matching replacements only mark lines that really changed.
+            let file_output = edit_output::build_file_output_from_diff(
+                &file_path,
+                &content,
+                &replacement.content,
+            );
+            let output_text = edit_output::format_compact_receipt(&[file_output]);
+            Ok(vec![ToolResultPart::text(output_text)])
+        })
+        .await
     }
 }
 

@@ -256,6 +256,7 @@ pub struct Delegation {
     pub task_id: Option<String>,
     pub planning_summary: Option<String>,
     pub verification_spec: Option<VerificationSpec>,
+    pub isolation: DelegationIsolation, // Inherit (default) | Shared | Isolated
 }
 ```
 

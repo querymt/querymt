@@ -1,11 +1,31 @@
 use anyhow::Result;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
+use ::querymt_agent::api::{AgentWorktrees, SessionOptions};
+use ::querymt_agent::config::WorkspaceSettings;
+use ::querymt_agent::worktree::{
+    BaselineMode, WorkspaceTarget, WorktreeCreateRequest, WorktreeOpError,
+};
+
 type AgentHandle = ::querymt_agent::api::Agent;
 type AgentSessionHandle = ::querymt_agent::api::AgentSession;
+
+pyo3::create_exception!(
+    querymt_agent,
+    WorktreeError,
+    PyRuntimeError,
+    "A managed-worktree operation failed. `.code` is a stable machine-readable \
+     identifier (for example `workspace_service_unavailable`, `invalid_options`, \
+     `removal_refused`, `workspace_not_found`, `isolation_unsupported_layout`)."
+);
+
+#[pyclass(name = "Worktrees")]
+struct PyWorktrees {
+    inner: AgentWorktrees,
+}
 
 #[pyclass(name = "Agent")]
 struct PyAgent {
@@ -20,7 +40,7 @@ struct PyAgentSession {
 #[pymethods]
 impl PyAgent {
     #[staticmethod]
-    #[pyo3(signature = (provider, model, cwd=None, tools=None, system=None, api_key=None, base_url=None, db=None, assume_mutating=None, mutating_tools=None, max_steps=None, max_prompt_bytes=None, execution_timeout_secs=None))]
+    #[pyo3(signature = (provider, model, cwd=None, tools=None, system=None, api_key=None, base_url=None, db=None, assume_mutating=None, mutating_tools=None, max_steps=None, max_prompt_bytes=None, execution_timeout_secs=None, worktrees=None))]
     fn single<'py>(
         py: Python<'py>,
         provider: String,
@@ -36,9 +56,15 @@ impl PyAgent {
         max_steps: Option<usize>,
         max_prompt_bytes: Option<usize>,
         execution_timeout_secs: Option<u64>,
+        worktrees: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        // Parsed eagerly so a bad argument raises ValueError at the call site.
+        let workspace = parse_worktrees(worktrees.as_ref())?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut builder = AgentHandle::single().provider(provider, model);
+            if let Some(settings) = workspace {
+                builder = builder.workspace(settings);
+            }
 
             if let Some(cwd) = cwd {
                 builder = builder.cwd(cwd);
@@ -111,10 +137,30 @@ impl PyAgent {
         })
     }
 
-    fn chat_session<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Create a session. With no arguments this is a plain local session.
+    ///
+    /// `workspace="worktree"` requests an isolated checkout; `name`,
+    /// `base_ref` and `include_local_changes` refine the request. Requested
+    /// isolation fails closed with `WorktreeError` (never a shared fallback).
+    #[pyo3(signature = (workspace=None, name=None, base_ref=None, include_local_changes=None))]
+    fn chat_session<'py>(
+        &self,
+        py: Python<'py>,
+        workspace: Option<String>,
+        name: Option<String>,
+        base_ref: Option<String>,
+        include_local_changes: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = session_options(workspace, name, base_ref, include_local_changes)?;
         let agent = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let session = agent.chat_session().await.map_err(into_py_err)?;
+            let session = match options {
+                Some(options) => agent
+                    .chat_session_with(options)
+                    .await
+                    .map_err(worktree_err)?,
+                None => agent.chat_session().await.map_err(into_py_err)?,
+            };
             Python::attach(|py| {
                 Py::new(
                     py,
@@ -124,6 +170,12 @@ impl PyAgent {
                 )
             })
         })
+    }
+
+    /// Managed-worktree operations, or `None` when worktrees are not enabled.
+    #[getter]
+    fn worktrees(&self) -> Option<PyWorktrees> {
+        self.inner.worktrees().map(|inner| PyWorktrees { inner })
     }
 
     fn list_sessions<'py>(
@@ -215,6 +267,16 @@ impl PyAgentSession {
         self.inner.id().to_owned()
     }
 
+    /// The managed-workspace binding (execution cwd, workspace id, branch,
+    /// baseline) as a dict, or `None` for a local session.
+    #[getter]
+    fn workspace(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .workspace()
+            .map(|value| json_to_py(py, value))
+            .transpose()
+    }
+
     fn chat<'py>(&self, py: Python<'py>, prompt: String) -> PyResult<Bound<'py, PyAny>> {
         let session = Arc::clone(&self.inner);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -240,12 +302,173 @@ impl PyAgentSession {
     }
 }
 
+/// Await a typed worktree operation and render its response as a dict.
+macro_rules! worktree_future {
+    ($py:expr, $ops:expr, |$w:ident| $call:expr) => {{
+        let $w = $ops.clone();
+        pyo3_async_runtimes::tokio::future_into_py($py, async move {
+            let response = $call.await.map_err(worktree_err)?;
+            Python::attach(|py| serialize_to_py(py, &response))
+        })
+    }};
+}
+
+#[pymethods]
+impl PyWorktrees {
+    /// Create a new isolated session with its own checkout. `cwd` defaults to
+    /// the agent's working directory. Never moves an existing session.
+    #[pyo3(signature = (cwd=None, name=None, base_ref=None, include_local_changes=None))]
+    fn create<'py>(
+        &self,
+        py: Python<'py>,
+        cwd: Option<String>,
+        name: Option<String>,
+        base_ref: Option<String>,
+        include_local_changes: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let request = WorktreeCreateRequest {
+            cwd: cwd.unwrap_or_default(),
+            include_local_changes,
+            base_ref,
+            name,
+        };
+        worktree_future!(py, self.inner, |w| w.create(request))
+    }
+
+    fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        worktree_future!(py, self.inner, |w| w.list())
+    }
+
+    fn status<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
+        worktree_future!(py, self.inner, |w| w.status(&workspace_id))
+    }
+
+    fn result<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
+        worktree_future!(py, self.inner, |w| w.result(&workspace_id))
+    }
+
+    /// Publish a workspace's current working state as an immutable result.
+    /// Provide exactly one of `workspace_id` or `session_id`.
+    #[pyo3(signature = (workspace_id=None, session_id=None))]
+    fn publish<'py>(
+        &self,
+        py: Python<'py>,
+        workspace_id: Option<String>,
+        session_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = WorkspaceTarget::from_parts(workspace_id, session_id).map_err(worktree_err)?;
+        worktree_future!(py, self.inner, |w| w.publish(target))
+    }
+
+    fn archive<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
+        worktree_future!(py, self.inner, |w| w.archive(&workspace_id))
+    }
+
+    /// Conservative removal; there is no force option.
+    fn remove<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
+        worktree_future!(py, self.inner, |w| w.remove(&workspace_id))
+    }
+
+    fn recover<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
+        worktree_future!(py, self.inner, |w| w.recover(&workspace_id))
+    }
+}
+
 #[pymodule]
-fn querymt_agent(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+fn querymt_agent(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyAgent>()?;
     module.add_class::<PyAgentSession>()?;
-    module.add("__all__", vec!["Agent", "AgentSession"])?;
+    module.add_class::<PyWorktrees>()?;
+    module.add("WorktreeError", py.get_type::<WorktreeError>())?;
+    module.add(
+        "__all__",
+        vec!["Agent", "AgentSession", "Worktrees", "WorktreeError"],
+    )?;
     Ok(())
+}
+
+/// Translate `worktrees=` (`True`/`False`/`None` or a settings dict) into
+/// workspace settings. Unknown keys raise `ValueError`.
+fn parse_worktrees(arg: Option<&Bound<'_, PyAny>>) -> PyResult<Option<WorkspaceSettings>> {
+    let Some(arg) = arg.filter(|a| !a.is_none()) else {
+        return Ok(None);
+    };
+    if let Ok(flag) = arg.extract::<bool>() {
+        return Ok(flag.then(WorkspaceSettings::enabled));
+    }
+    let dict = arg.cast::<PyDict>().map_err(|_| {
+        PyValueError::new_err("worktrees must be a bool or a dict with `storage_root`/`baseline`")
+    })?;
+    let mut settings = WorkspaceSettings::enabled();
+    for (key, value) in dict.iter() {
+        let key: String = key.extract()?;
+        match key.as_str() {
+            "storage_root" => settings.storage_root = Some(value.extract::<String>()?.into()),
+            "baseline" => {
+                settings.baseline = value
+                    .extract::<String>()?
+                    .parse::<BaselineMode>()
+                    .map_err(PyValueError::new_err)?;
+            }
+            other => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown worktrees option `{other}` (expected `storage_root` or `baseline`)"
+                )));
+            }
+        }
+    }
+    Ok(Some(settings))
+}
+
+/// `None` means a plain local session (the legacy path, unchanged).
+fn session_options(
+    workspace: Option<String>,
+    name: Option<String>,
+    base_ref: Option<String>,
+    include_local_changes: Option<bool>,
+) -> PyResult<Option<SessionOptions>> {
+    let mut options = match workspace.as_deref() {
+        None | Some("local") => SessionOptions::local(),
+        Some("worktree") => SessionOptions::worktree(),
+        Some(other) => {
+            return Err(PyValueError::new_err(format!(
+                "invalid workspace `{other}` (expected \"local\" or \"worktree\")"
+            )));
+        }
+    };
+    let refined = name.is_some() || base_ref.is_some() || include_local_changes.is_some();
+    if let Some(name) = name {
+        options = options.name(name);
+    }
+    if let Some(base_ref) = base_ref {
+        options = options.base_ref(base_ref);
+    }
+    if let Some(include) = include_local_changes {
+        options = options.include_local_changes(include);
+    }
+    Ok((workspace.is_some() || refined).then_some(options))
+}
+
+/// Raise `WorktreeError` carrying the stable `.code`.
+fn worktree_err(err: WorktreeOpError) -> PyErr {
+    Python::attach(|py| {
+        let py_err = WorktreeError::new_err(err.to_string());
+        match py_err.value(py).setattr("code", err.code()) {
+            Ok(()) => py_err,
+            Err(set_err) => set_err,
+        }
+    })
+}
+
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    Ok(py
+        .import("json")?
+        .call_method1("loads", (value.to_string(),))?
+        .unbind())
+}
+
+fn serialize_to_py<T: serde::Serialize>(py: Python<'_>, value: &T) -> PyResult<Py<PyAny>> {
+    json_to_py(py, &serde_json::to_value(value).map_err(into_py_err)?)
 }
 
 #[cfg(test)]

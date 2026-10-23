@@ -1323,3 +1323,187 @@ enabled = false
     assert!(config.mesh.lan.is_none());
     assert!(config.mesh.iroh.is_empty());
 }
+
+// ── [agent.workspace] / [quorum.workspace] / delegate isolation ──────────
+
+#[test]
+fn workspace_settings_default_to_disabled_and_absent_section_is_unchanged() {
+    let single: SingleAgentConfig = toml::from_str(
+        r#"
+[agent]
+provider = "p"
+model = "m"
+"#,
+    )
+    .unwrap();
+    assert_eq!(single.agent.workspace, WorkspaceSettings::default());
+    assert!(!single.agent.workspace.enabled);
+    assert_eq!(
+        single.agent.workspace.baseline,
+        crate::worktree::BaselineMode::Commit
+    );
+}
+
+#[test]
+fn workspace_settings_round_trip_and_reject_unknown_keys() {
+    let parsed: WorkspaceSettings = toml::from_str(
+        "enabled = true\nstorage_root = \"/data/wt\"\nbaseline = \"current_working_tree\"\n",
+    )
+    .unwrap();
+    assert!(parsed.enabled);
+    assert_eq!(parsed.storage_root.as_deref(), Some(Path::new("/data/wt")));
+    assert_eq!(
+        parsed.baseline,
+        crate::worktree::BaselineMode::CurrentWorkingTree
+    );
+    let back: WorkspaceSettings = toml::from_str(&toml::to_string(&parsed).unwrap()).unwrap();
+    assert_eq!(back, parsed);
+
+    let err = toml::from_str::<WorkspaceSettings>("enabled = true\nmode = \"always\"\n")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unknown field"), "{err}");
+}
+
+#[test]
+fn workspace_storage_root_resolves_against_config_dir() {
+    let rel = WorkspaceSettings {
+        storage_root: Some("wt".into()),
+        ..WorkspaceSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(rel.storage_root.as_deref(), Some(Path::new("/etc/qmt/wt")));
+
+    let abs = WorkspaceSettings {
+        storage_root: Some("/abs/wt".into()),
+        ..WorkspaceSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(abs.storage_root.as_deref(), Some(Path::new("/abs/wt")));
+
+    // `~/` is left for tilde expansion, never anchored to the config dir.
+    let tilde = WorkspaceSettings {
+        storage_root: Some("~/wt".into()),
+        ..WorkspaceSettings::enabled()
+    }
+    .anchored_at(Path::new("/etc/qmt"));
+    assert_eq!(tilde.storage_root.as_deref(), Some(Path::new("~/wt")));
+}
+
+#[test]
+fn workspace_schema_is_generated_for_both_config_roots() {
+    for schema in [
+        serde_json::to_value(schemars::schema_for!(SingleAgentConfig)).unwrap(),
+        serde_json::to_value(schemars::schema_for!(QuorumConfig)).unwrap(),
+    ] {
+        let props = schema
+            .pointer("/$defs/WorkspaceSettings/properties")
+            .and_then(|v| v.as_object())
+            .expect("WorkspaceSettings must be in the schema");
+        for key in ["enabled", "storage_root", "baseline"] {
+            assert!(props.contains_key(key), "missing {key}");
+        }
+    }
+}
+
+fn quorum_toml(extra_quorum: &str, delegate_isolation: &str) -> String {
+    format!(
+        r#"
+[quorum]
+cwd = "."
+{extra_quorum}
+
+[planner]
+provider = "p"
+model = "m"
+
+[[delegates]]
+id = "coder"
+provider = "p"
+model = "m"
+{delegate_isolation}
+"#
+    )
+}
+
+#[tokio::test]
+async fn delegate_isolation_defaults_to_inherit_and_isolated_requires_the_service() {
+    let ok = load_config(ConfigSource::Toml(quorum_toml("", "")))
+        .await
+        .unwrap();
+    let Config::Multi(ok) = ok else {
+        panic!("quorum")
+    };
+    assert_eq!(
+        ok.delegates[0].isolation,
+        crate::worktree::DelegationIsolation::Inherit
+    );
+
+    let err = load_config(ConfigSource::Toml(quorum_toml(
+        "",
+        "isolation = \"isolated\"",
+    )))
+    .await
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("coder"), "{err:#}");
+
+    let enabled = quorum_toml("workspace = { enabled = true }", "isolation = \"isolated\"");
+    // `workspace` must be a table below [quorum]; the inline form above is valid TOML.
+    load_config(ConfigSource::Toml(enabled)).await.unwrap();
+
+    // `shared` never needs the service.
+    load_config(ConfigSource::Toml(quorum_toml(
+        "",
+        "isolation = \"shared\"",
+    )))
+    .await
+    .unwrap();
+}
+
+/// 21.12: the shipped example/embedded profiles only gain commented-out
+/// workspace blocks, so they still parse with the service disabled and every
+/// delegate on the default `inherit` isolation.
+#[tokio::test]
+async fn example_profiles_keep_workspace_disabled_and_delegates_inheriting() {
+    let single = include_str!("../../examples/confs/single_coder.toml");
+    // `coder_agent.toml` has been invalid TOML since before this change (a
+    // commented-out `[delegates.parameters]` header leaves duplicate keys), so
+    // it can only be checked textually.
+    let coder_agent = include_str!("../../examples/confs/coder_agent.toml");
+    assert!(
+        coder_agent
+            .lines()
+            .filter(|l| l.contains("workspace") || l.contains("isolation"))
+            .all(|l| l.trim_start().starts_with('#')),
+        "workspace/isolation blocks in coder_agent.toml must stay commented out"
+    );
+    let quorums = [include_str!("../../examples/confs/coder_delegate.toml")];
+    // File-relative prompt references need a real path; only the sections
+    // under test matter, so parse them as raw TOML tables first.
+    let mut table: toml::Value = toml::from_str(single).unwrap();
+    assert!(
+        table["agent"].get("workspace").is_none(),
+        "block stays commented out"
+    );
+    table.as_table_mut().unwrap().remove("profile");
+    let single: SingleAgentConfig = table.try_into().unwrap();
+    assert_eq!(single.agent.workspace, WorkspaceSettings::default());
+
+    for raw in quorums {
+        let table: toml::Value = toml::from_str(raw).unwrap();
+        assert!(
+            table["quorum"].get("workspace").is_none(),
+            "block stays commented out"
+        );
+        let mut table = table;
+        table.as_table_mut().unwrap().remove("profile");
+        let quorum: QuorumConfig = table.try_into().unwrap();
+        assert!(!quorum.quorum.workspace.enabled);
+        assert!(
+            quorum
+                .delegates
+                .iter()
+                .all(|d| d.isolation == crate::worktree::DelegationIsolation::Inherit)
+        );
+    }
+}

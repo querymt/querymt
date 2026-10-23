@@ -1,3 +1,4 @@
+pub mod accept_delegation_result;
 pub mod browse;
 pub mod create_task;
 pub mod delegate;
@@ -36,6 +37,7 @@ pub mod use_remote_provider;
 pub use route_delegation_to_peer::RouteDelegationToPeerTool;
 pub use use_remote_provider::UseRemoteProviderTool;
 
+pub use accept_delegation_result::AcceptDelegationResultTool;
 pub use browse::BrowseTool;
 pub use create_task::CreateTaskTool;
 pub use delegate::DelegateTool;
@@ -74,6 +76,7 @@ use std::sync::Arc;
 /// Used for capability inference and tool registration.
 pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
     vec![
+        Arc::new(AcceptDelegationResultTool::new()),
         Arc::new(BrowseTool::new()),
         Arc::new(CreateTaskTool::new()),
         Arc::new(ReadTaskTool::new()),

@@ -119,6 +119,11 @@ pub struct QuorumSettings {
     /// Maximum number of delegates that can run in parallel. Default: `5`.
     #[serde(default = "default_max_parallel_delegations")]
     pub max_parallel_delegations: usize,
+
+    /// Managed Git worktree workspaces (`[quorum.workspace]`). One service is
+    /// shared by the planner and every delegate. Disabled by default.
+    #[serde(default)]
+    pub workspace: WorkspaceSettings,
 }
 
 fn default_true() -> bool {
@@ -258,4 +263,12 @@ pub struct DelegateConfig {
     /// Requires `[mesh] enabled = true`. Validated at startup.
     #[serde(default)]
     pub peer: Option<String>,
+
+    /// Workspace isolation for tasks delegated to this delegate.
+    ///
+    /// Precedence: an explicit non-`inherit` value on the `delegate` tool call,
+    /// then this value, then the parent's execution mode. `isolated` requires
+    /// `[quorum.workspace] enabled = true`.
+    #[serde(default)]
+    pub isolation: crate::worktree::DelegationIsolation,
 }

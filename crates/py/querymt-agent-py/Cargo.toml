@@ -17,6 +17,8 @@ extension-module = ["pyo3/extension-module"]
 anyhow = "1.0"
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
 pyo3-async-runtimes = { version = "0.29", features = ["attributes", "tokio-runtime"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 querymt-agent = { path = "../../agent", default-features = false, features = ["api", "plugin-loaders", "remote"] }
 tokio = { version = "1.0", features = ["rt-multi-thread", "sync"] }
 

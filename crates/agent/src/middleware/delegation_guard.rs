@@ -305,6 +305,7 @@ mod tests {
         let hash_clone = hash;
 
         let delegation = Delegation {
+            isolation: Default::default(),
             id: 1,
             public_id: "del-1".to_string(),
             session_id: 1,
@@ -343,6 +344,7 @@ mod tests {
         let hash_clone = hash;
 
         let delegation = Delegation {
+            isolation: Default::default(),
             id: 1,
             public_id: "del-failed".to_string(),
             session_id: 1,
@@ -381,6 +383,7 @@ mod tests {
         let hash_clone = hash;
 
         let delegation = Delegation {
+            isolation: Default::default(),
             id: 1,
             public_id: "del-done".to_string(),
             session_id: 1,

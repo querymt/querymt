@@ -90,24 +90,29 @@ impl ToolTrait for WriteFileTool {
 
         let path = context.resolve_path(path_arg)?;
 
-        if create_dirs && let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
+        // Mutating phase runs under the checkout mutation gate when the
+        // session has one (see `run_under_mutation_gate`).
+        crate::tools::run_under_mutation_gate(context, async {
+            if create_dirs && let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| ToolError::ProviderError(format!("mkdir failed: {}", e)))?;
+            }
+
+            tokio::fs::write(&path, content)
                 .await
-                .map_err(|e| ToolError::ProviderError(format!("mkdir failed: {}", e)))?;
-        }
+                .map_err(|e| ToolError::ProviderError(format!("write failed: {}", e)))?;
 
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| ToolError::ProviderError(format!("write failed: {}", e)))?;
+            let result = json!({
+                "path": path.display().to_string(),
+                "bytes": content.len()
+            });
 
-        let result = json!({
-            "path": path.display().to_string(),
-            "bytes": content.len()
-        });
-
-        serde_json::to_string(&result)
-            .map(|s| vec![ToolResultPart::text(s)])
-            .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+            serde_json::to_string(&result)
+                .map(|s| vec![ToolResultPart::text(s)])
+                .map_err(|e| ToolError::ProviderError(format!("serialize failed: {}", e)))
+        })
+        .await
     }
 }
 

@@ -284,6 +284,7 @@ async fn register_remote_agent(
     }
 
     let info = AgentInfo {
+        isolation: Default::default(),
         id: remote.id.clone(),
         name: remote.name.clone(),
         description: remote.description.clone(),

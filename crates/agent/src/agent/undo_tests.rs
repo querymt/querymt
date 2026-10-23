@@ -158,3 +158,173 @@ async fn test_git_backend_full_restore() {
 //
 // The tests above validate the core snapshot backend behavior which is the foundation
 // for undo/redo functionality.
+
+// ==================== Linked-worktree preservation ====================
+
+fn run_git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .expect("git must be available");
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn git_for_each_ref(dir: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .args(["for-each-ref"])
+        .current_dir(dir)
+        .output()
+        .expect("git must be available");
+    String::from_utf8(output.stdout).expect("utf8 refs")
+}
+
+/// Undo/redo operate inside a linked Git worktree — the shape of a managed
+/// workspace checkout — using only the configured `GitSnapshotBackend`.
+/// Restores must preserve sibling files, project refs, and Git's own
+/// administrative markers.
+#[tokio::test]
+async fn linked_worktree_undo_redo_preserves_siblings_refs_and_git_markers() {
+    let repo = TempDir::new().unwrap();
+    let linked = TempDir::new().unwrap();
+    run_git(repo.path(), &["init", "-q", "-b", "main"]);
+    run_git(repo.path(), &["config", "user.name", "Test"]);
+    run_git(repo.path(), &["config", "user.email", "test@example.com"]);
+    fs::write(repo.path().join("shared.txt"), "shared").unwrap();
+    fs::write(repo.path().join("sibling.txt"), "sibling").unwrap();
+    run_git(repo.path(), &["add", "."]);
+    run_git(repo.path(), &["commit", "-q", "-m", "init"]);
+    run_git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "undo-fixture",
+            linked.path().to_str().unwrap(),
+        ],
+    );
+
+    let refs_before = git_for_each_ref(repo.path());
+
+    // The single configured backend, with its snapshot base outside the
+    // repository: undo adds no second snapshot implementation and no
+    // project refs.
+    let base = TempDir::new().unwrap();
+    let backend = GitSnapshotBackend::with_snapshot_base(base.path().to_path_buf());
+
+    // Turn-style capture inside the linked worktree.
+    let snap_pre = backend.track(linked.path()).await.unwrap();
+    fs::write(linked.path().join("shared.txt"), "edited").unwrap();
+    fs::write(linked.path().join("new.txt"), "added").unwrap();
+    let snap_post = backend.track(linked.path()).await.unwrap();
+    let diff = backend
+        .diff(linked.path(), &snap_pre, &snap_post)
+        .await
+        .unwrap();
+    assert!(diff.contains(&PathBuf::from("shared.txt")));
+    assert!(diff.contains(&PathBuf::from("new.txt")));
+
+    // Undo: selective restore touches only the listed paths.
+    backend
+        .restore_paths(linked.path(), &snap_pre, &[PathBuf::from("shared.txt")])
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(linked.path().join("shared.txt")).unwrap(),
+        "shared"
+    );
+    assert_eq!(
+        fs::read_to_string(linked.path().join("sibling.txt")).unwrap(),
+        "sibling",
+        "sibling files are preserved by undo"
+    );
+    assert!(
+        linked.path().join("new.txt").exists(),
+        "unlisted files are not removed by a selective restore"
+    );
+
+    // Redo: whole-tree restore back to the post snapshot.
+    backend.restore(linked.path(), &snap_post).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(linked.path().join("shared.txt")).unwrap(),
+        "edited"
+    );
+    assert_eq!(
+        fs::read_to_string(linked.path().join("new.txt")).unwrap(),
+        "added"
+    );
+    assert_eq!(
+        fs::read_to_string(linked.path().join("sibling.txt")).unwrap(),
+        "sibling",
+        "sibling files are preserved by redo"
+    );
+
+    // Project refs are untouched: the backend stores its snapshots outside
+    // the repository and restores never register refs in the project.
+    assert_eq!(
+        git_for_each_ref(repo.path()),
+        refs_before,
+        "undo/redo must not modify project refs"
+    );
+
+    // Git administrative markers survive: the linked worktree's `.git`
+    // file still points at its gitdir and both trees remain usable.
+    let git_file = fs::read_to_string(linked.path().join(".git")).unwrap();
+    assert!(
+        git_file.starts_with("gitdir:"),
+        "linked worktree .git marker must remain a gitdir pointer"
+    );
+    assert!(repo.path().join(".git").is_dir());
+    run_git(linked.path(), &["status", "--porcelain"]);
+    run_git(repo.path(), &["status", "--porcelain"]);
+}
+
+// ==================== Workspace provenance ====================
+
+fn revert_frame(workspace_root: Option<&std::path::Path>) -> crate::session::domain::RevertState {
+    crate::session::domain::RevertState {
+        public_id: "rev-1".to_string(),
+        session_id: "sess-1".to_string(),
+        message_id: "msg-1".to_string(),
+        snapshot_id: "snap-1".to_string(),
+        backend_id: "git".to_string(),
+        workspace_root: workspace_root.map(std::path::Path::to_path_buf),
+        created_at: time::OffsetDateTime::now_utc(),
+    }
+}
+
+#[test]
+fn redo_rejects_cross_workspace_frames_without_restoring() {
+    let dir = TempDir::new().unwrap();
+    let other = TempDir::new().unwrap();
+
+    let err = crate::agent::undo::validate_revert_workspace(
+        &revert_frame(Some(other.path())),
+        dir.path(),
+    )
+    .expect_err("cross-workspace frame must be rejected");
+    assert!(
+        matches!(err, crate::agent::undo::UndoError::WorkspaceMismatch { .. }),
+        "error: {err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("refusing to restore across workspaces"),
+        "error: {err}"
+    );
+}
+
+#[test]
+fn redo_accepts_same_workspace_and_legacy_frames() {
+    let dir = TempDir::new().unwrap();
+
+    // Same-workspace frame (canonicalized: symlink prefixes must not
+    // cause rejection).
+    crate::agent::undo::validate_revert_workspace(&revert_frame(Some(dir.path())), dir.path())
+        .expect("same-workspace frame is accepted");
+
+    // Legacy frame recorded before provenance existed keeps undo history.
+    crate::agent::undo::validate_revert_workspace(&revert_frame(None), dir.path())
+        .expect("legacy frames keep working");
+}

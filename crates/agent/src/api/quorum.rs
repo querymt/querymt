@@ -54,6 +54,10 @@ pub struct QuorumBuilder {
     dotagents_manifest: Option<crate::dotagents::DotagentsManifest>,
     /// Optional host approval mechanism for workspace protocol tasks.
     dotagents_task_approver: Option<Arc<dyn crate::dotagents::DotagentsTaskApprover>>,
+    /// Workspace settings; one service is built and shared by every agent.
+    workspace: Option<crate::config::WorkspaceSettings>,
+    /// Prebuilt workspace service; wins over `workspace`.
+    workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     /// Pre-built registry entries to merge before building (Phase 7: remote agents).
     ///
     /// When `Some`, the entries in this registry are merged with the local delegate agents
@@ -109,6 +113,8 @@ impl QuorumBuilder {
             dotagents_options: None,
             dotagents_manifest: None,
             dotagents_task_approver: None,
+            workspace: None,
+            workspace_service: None,
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -177,6 +183,20 @@ impl QuorumBuilder {
     }
 
     /// Enable `.agents` loading with default discovery options.
+    /// Configure managed Git worktree workspaces for the whole quorum.
+    ///
+    /// A single service is built and shared by the planner and every delegate.
+    pub fn workspace(mut self, settings: crate::config::WorkspaceSettings) -> Self {
+        self.workspace = Some(settings);
+        self
+    }
+
+    /// Inject a prebuilt workspace service (wins over [`workspace`](Self::workspace)).
+    pub fn workspace_service(mut self, service: Arc<crate::worktree::WorkspaceService>) -> Self {
+        self.workspace_service = Some(service);
+        self
+    }
+
     pub fn enable_dotagents(mut self) -> Self {
         self.dotagents_options = Some(crate::dotagents::DotagentsLoadOptions::enabled());
         self
@@ -430,6 +450,31 @@ impl QuorumBuilder {
             }
         }
 
+        // Exactly one service for the whole quorum: delegate handles materialize
+        // isolated sessions themselves, so allocator, registry and lock ownership
+        // must not diverge between planner and delegates.
+        let workspace_service = match self.workspace_service.take() {
+            Some(service) => Some(service),
+            None => match &self.workspace {
+                Some(settings) => {
+                    crate::worktree::WorkspaceService::from_settings(settings, backend.as_ref())
+                        .map_err(|err| anyhow!("invalid workspace configuration: {err}"))?
+                }
+                None => None,
+            },
+        };
+        if workspace_service.is_none()
+            && let Some(delegate) = self
+                .delegates
+                .iter()
+                .find(|d| d.isolation == crate::worktree::DelegationIsolation::Isolated)
+        {
+            return Err(anyhow!(
+                "delegate '{}' is configured `isolated` but the workspace service is not enabled",
+                delegate.id
+            ));
+        }
+
         let mut builder = AgentQuorumBuilder::from_backend(backend.clone());
         if let Some(event_fanout) = event_fanout.as_ref() {
             builder = builder.with_event_fanout(event_fanout.clone());
@@ -487,6 +532,7 @@ impl QuorumBuilder {
             .collect();
         for delegate in self.delegates {
             let agent_info = AgentInfo {
+                isolation: delegate.isolation,
                 id: delegate.id.clone(),
                 name: delegate.id.clone(),
                 description: delegate.description.clone().unwrap_or_default(),
@@ -509,6 +555,7 @@ impl QuorumBuilder {
             let delegation_wait_policy_for_delegate = self.delegation_wait_policy.clone();
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
             let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
+            let workspace_for_delegate = workspace_service.clone();
             builder = builder.add_delegate_agent(agent_info, move |storage, event_fanout| {
                 let mut b =
                     AgentConfigBuilder::new(registry.clone(), storage.clone(), llm_config.clone())
@@ -566,6 +613,9 @@ impl QuorumBuilder {
                     b = b.with_assume_mutating(am);
                 }
                 apply_middleware_from_config(&mut b, &middleware_entries, auto_compact);
+                if let Some(service) = workspace_for_delegate.clone() {
+                    b = b.with_workspace_service(service);
+                }
 
                 let config = Arc::new(b.build());
                 Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
@@ -736,6 +786,7 @@ impl QuorumBuilder {
         let delegation_wait_policy_for_planner = self.delegation_wait_policy.clone();
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
+        let workspace_for_planner = workspace_service.clone();
         builder = builder.with_planner(move |storage, agent_registry, event_fanout| {
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
@@ -807,6 +858,10 @@ impl QuorumBuilder {
                 log::info!(
                     "Registered routing planner tools: route_delegation_to_peer, use_remote_provider"
                 );
+            }
+
+            if let Some(service) = workspace_for_planner.clone() {
+                b = b.with_workspace_service(service);
             }
 
             // Wire schedule repository and knowledge store into the planner config.
@@ -1161,6 +1216,7 @@ impl super::agent::Agent {
             delegate_config.assume_mutating = Some(delegate.assume_mutating);
             delegate_config.mutating_tools = Some(delegate.mutating_tools);
             delegate_config.hooks = crate::config::HooksConfig::default();
+            delegate_config.isolation = delegate.isolation;
 
             // Register peer delegate for mesh routing resolution in build()
             #[cfg(feature = "remote")]
@@ -1173,6 +1229,9 @@ impl super::agent::Agent {
             builder.delegates.push(delegate_config);
         }
 
+        if config.quorum.workspace.enabled {
+            builder.workspace = Some(config.quorum.workspace);
+        }
         builder.snapshot_policy = snapshot_policy;
         builder.initial_registry = initial_registry;
         #[cfg(feature = "remote")]
@@ -2109,6 +2168,152 @@ tools = ["read_tool", "stdio-tool.fetch"]
             vec!["read_tool".to_string(), "stdio-tool.fetch".to_string()],
             "delegate keeps local tools and the qualified specific selection"
         );
+    }
+
+    fn workspace_quorum_config(
+        storage_root: &std::path::Path,
+        delegate_isolation: &str,
+    ) -> QuorumConfig {
+        let toml = format!(
+            r#"
+[quorum]
+cwd = "/tmp"
+
+[quorum.workspace]
+enabled = true
+storage_root = {storage_root:?}
+
+[planner]
+provider = "openai"
+model = "gpt-4"
+tools = ["delegate"]
+
+[[delegates]]
+id = "coder"
+provider = "openai"
+model = "gpt-4"
+{delegate_isolation}
+
+[[delegates]]
+id = "reviewer"
+provider = "openai"
+model = "gpt-4"
+"#
+        );
+        toml::from_str(&toml).expect("parse workspace quorum config")
+    }
+
+    async fn quorum_infra() -> (super::super::agent::AgentInfra, tempfile::TempDir) {
+        let (plugin_registry, registry_dir) = empty_plugin_registry().expect("empty registry");
+        let storage = Arc::new(
+            SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("in-memory storage"),
+        );
+        (
+            super::super::agent::AgentInfra {
+                plugin_registry: Arc::new(plugin_registry),
+                storage: Some(storage),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+            registry_dir,
+        )
+    }
+
+    /// 21.8: one `Arc<WorkspaceService>` is shared by the planner and every
+    /// delegate, and a delegate's configured isolation reaches the registry
+    /// the orchestrator consults (21.6).
+    #[tokio::test]
+    async fn quorum_shares_one_workspace_service_and_carries_delegate_isolation() {
+        let root = tempfile::TempDir::new().unwrap();
+        let (infra, _registry_dir) = quorum_infra().await;
+        let agent = crate::api::agent::Agent::builder_from_quorum_config(
+            workspace_quorum_config(root.path(), "isolation = \"isolated\""),
+            None,
+        )
+        .expect("builder_from_quorum_config")
+        .infra(infra)
+        .build()
+        .await
+        .expect("quorum should build");
+
+        let service_of = |handle: Arc<dyn AgentHandleTrait>| {
+            handle
+                .as_any()
+                .downcast_ref::<AgentHandle>()
+                .expect("local handle")
+                .config
+                .workspace_service()
+                .expect("every agent in the quorum has the service")
+        };
+        let planner = service_of(agent.planner().expect("planner"));
+        let coder = service_of(agent.delegate("coder").expect("coder"));
+        let reviewer = service_of(agent.delegate("reviewer").expect("reviewer"));
+        assert!(
+            Arc::ptr_eq(&planner, &coder),
+            "planner and coder must share"
+        );
+        assert!(Arc::ptr_eq(&planner, &reviewer), "all delegates must share");
+        assert_eq!(planner.storage_root(), root.path());
+
+        let registry = agent.planner().unwrap();
+        let registry = registry
+            .as_any()
+            .downcast_ref::<AgentHandle>()
+            .unwrap()
+            .config
+            .agent_registry();
+        let isolation = |id: &str| registry.get_agent(id).expect("registered").isolation;
+        assert_eq!(
+            isolation("coder"),
+            crate::worktree::DelegationIsolation::Isolated
+        );
+        assert_eq!(
+            isolation("reviewer"),
+            crate::worktree::DelegationIsolation::Inherit
+        );
+    }
+
+    /// 21.6/21.8: a quorum without workspace settings builds without a
+    /// service, and an `isolated` delegate then fails the build.
+    #[tokio::test]
+    async fn quorum_without_workspace_settings_has_no_service_and_rejects_isolated_delegates() {
+        let (infra, _registry_dir) = quorum_infra().await;
+        let mut config = workspace_quorum_config(std::path::Path::new("/unused"), "");
+        config.quorum.workspace = crate::config::WorkspaceSettings::default();
+        let agent = crate::api::agent::Agent::builder_from_quorum_config(config, None)
+            .unwrap()
+            .infra(infra)
+            .build()
+            .await
+            .expect("builds without a service");
+        let planner = agent.planner().unwrap();
+        assert!(
+            planner
+                .as_any()
+                .downcast_ref::<AgentHandle>()
+                .unwrap()
+                .config
+                .workspace_service()
+                .is_none()
+        );
+
+        // Programmatic builders enforce the same rule as the TOML loader.
+        let (infra, _registry_dir) = quorum_infra().await;
+        let err = QuorumBuilder::new()
+            .cwd("/tmp")
+            .planner(|p| p.provider("openai", "gpt-4").tools(["delegate"]))
+            .delegate("coder", |d| {
+                d.provider("openai", "gpt-4")
+                    .isolation(crate::worktree::DelegationIsolation::Isolated)
+            })
+            .infra(infra)
+            .build()
+            .await
+            .err()
+            .expect("isolated delegate needs the service");
+        assert!(err.to_string().contains("coder"), "{err}");
     }
 
     #[tokio::test]
