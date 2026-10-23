@@ -8,6 +8,267 @@ use crate::agent::remote::scope::{MeshScopeId, scoped_node_manager_for_peer};
 use kameo::actor::Spawn;
 
 #[cfg(feature = "remote")]
+async fn owner_profiles_fixture(active: &str) -> (RealStorageHandleFixture, tempfile::TempDir) {
+    use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
+    let remote = RealStorageHandleFixture::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    write_profile(
+        dir.path(),
+        "alpha.toml",
+        "[agent]\nprovider = 'mock'\nmodel = 'mock-model'\nsystem = 'owner default'\n",
+    );
+    write_profile(
+        dir.path(),
+        "cdr.toml",
+        &QUORUM_PROFILE_TOML
+            .replace("\"test\"", "\"mock\"")
+            .replace("\"test-model\"", "\"mock-model\""),
+    );
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(dir.path())
+            .build(),
+    );
+    remote
+        .handle
+        .set_profiles(Arc::new(ProfileRuntimeManager::with_infra_boxed(
+            catalog,
+            active,
+            AgentInfra {
+                plugin_registry: remote.handle.config.provider.plugin_registry(),
+                storage: Some(remote.storage.clone()),
+                session_mcp_attachment_source: None,
+                event_fanout: None,
+            },
+        )));
+    (remote, dir)
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn remote_create_keeps_explicit_owner_profile_and_rejects_invalid_selection() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer.handle.set_mesh(mesh.clone());
+    let (owner, _dir) = owner_profiles_fixture("alpha").await;
+    let (node_id, _) = register_remote_node(mesh, &owner, "profile-probe", true).await;
+    let created = ext_method_json(
+        &viewer.handle,
+        "querymt/remote/createSession",
+        serde_json::json!({
+            "node_id": node_id, "profile_id": "cdr", "attach": false,
+        }),
+    )
+    .await;
+    let binding = owner
+        .storage
+        .session_store()
+        .get_session_runtime_binding(created["session_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.profile_id, "cdr",
+        "explicit selection must reach B, not select its active alpha profile"
+    );
+    assert_eq!(
+        owner.handle.profiles().unwrap().active_profile_id().await,
+        "alpha"
+    );
+    let listed = ext_method_json(
+        &viewer.handle,
+        "querymt/profiles",
+        serde_json::json!({"node_id": node_id}),
+    )
+    .await;
+    assert_eq!(listed["node_id"], node_id);
+    assert!(
+        listed["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|profile| profile["id"] == "cdr")
+    );
+    assert!(
+        viewer.handle.profiles().is_none(),
+        "catalog is not borrowed from A"
+    );
+    let id = created["session_id"].as_str().unwrap();
+    let loaded = owner
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            id.to_owned(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        config_option_value(&loaded.config_options.unwrap(), "profile").as_deref(),
+        Some("cdr")
+    );
+    let attached = ext_method_json(
+        &viewer.handle,
+        "querymt/remote/attachSession",
+        serde_json::json!({"node_id": node_id, "session_id": id}),
+    )
+    .await;
+    assert_eq!(attached["profile_id"], "cdr");
+    for bad in ["missing", " "] {
+        assert!(viewer.handle.ext_method(crate::acp::protocol::ExtRequest::new("querymt/remote/createSession",
+            raw_params(&serde_json::json!({"node_id": node_id, "profile_id": bad, "attach": false}).to_string()))).await.is_err());
+    }
+    assert_eq!(
+        owner
+            .storage
+            .session_store()
+            .list_sessions()
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "invalid selection must not create a default session"
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
+async fn remote_delegate_controls_reach_owner_and_preserve_revision_errors() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer.handle.set_mesh(mesh.clone());
+    assert!(
+        crate::control::capabilities::get_capabilities(&viewer.handle)
+            .methods
+            .iter()
+            .any(|method| method == "querymt/session/delegateModels")
+    );
+    let (owner, _dir) = owner_profiles_fixture("cdr").await;
+    owner.handle.set_mesh(mesh.clone());
+    let (node_id, _) = register_remote_node(mesh, &owner, "delegate-probe", true).await;
+    let created = ext_method_json(
+        &viewer.handle,
+        "querymt/remote/createSession",
+        serde_json::json!({
+            "node_id": node_id, "attach": true,
+        }),
+    )
+    .await;
+    let session_id = created["session_id"].as_str().unwrap();
+    let params = serde_json::json!({"session_id": session_id});
+    let direct = ext_method_json(
+        &owner.handle,
+        "querymt/session/delegateModels",
+        params.clone(),
+    )
+    .await;
+    assert_eq!(
+        direct["assignments"].as_array().unwrap().len(),
+        2,
+        "owner has coder and reviewer"
+    );
+    let result = viewer
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/session/delegateModels",
+            raw_params(&params.to_string()),
+        ))
+        .await;
+    assert!(
+        result.is_ok(),
+        "A must read B's delegate roles, got {result:?}"
+    );
+    let proxied: serde_json::Value = serde_json::from_str(result.unwrap().0.get()).unwrap();
+    assert_eq!(proxied, direct);
+    let mut events = viewer.handle.subscribe_events();
+    let request = serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": "mock/mock-model", "node_id": node_id, "reasoning_effort": "high", "expected_revision": direct["revision"]});
+    let set = ext_method_json(
+        &viewer.handle,
+        "querymt/session/setDelegateModel",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(set["model"]["node_id"], node_id);
+    assert_eq!(set["reasoning_effort"], "high");
+    let notified = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(event.kind(), AgentEventKind::DelegateModelsChanged { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("owner change must reach A through the existing relay");
+    assert_eq!(notified.session_id(), session_id);
+    let read = ext_method_json(
+        &owner.handle,
+        "querymt/session/delegateModels",
+        params.clone(),
+    )
+    .await;
+    let coder = read["assignments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|role| role["agent_id"] == "coder")
+        .unwrap();
+    assert!(
+        coder["model"]["node_id"].is_null(),
+        "B-local model persists owner-local, not A-local"
+    );
+    async fn get_error(
+        handle: &LocalAgentHandle,
+        request: serde_json::Value,
+    ) -> agent_client_protocol::Error {
+        handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/session/setDelegateModel",
+                raw_params(&request.to_string()),
+            ))
+            .await
+            .unwrap_err()
+    }
+    let owner_error = get_error(&owner.handle, request.clone()).await;
+    let proxy_error = get_error(&viewer.handle, request).await;
+    assert_eq!(
+        serde_json::to_value(owner_error).unwrap(),
+        serde_json::to_value(proxy_error).unwrap(),
+        "revision conflicts must survive proxying unchanged"
+    );
+    let clear = ext_method_json(&viewer.handle, "querymt/session/setDelegateModel", serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": null, "expected_revision": set["revision"]})).await;
+    assert!(clear["model"].is_null());
+    assert_eq!(
+        clear["reasoning_effort"], "high",
+        "omitted reasoning survives mesh serialization"
+    );
+    let reset = ext_method_json(&viewer.handle, "querymt/session/setDelegateModel", serde_json::json!({"session_id": session_id, "agent_id": "coder", "model_id": null, "reasoning_effort": null, "expected_revision": clear["revision"]})).await;
+    assert!(reset["reasoning_effort"].is_null());
+    assert!(
+        viewer
+            .storage
+            .session_store()
+            .get_session(session_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "A cannot persist shadow routing"
+    );
+    viewer.handle.clear_mesh();
+    assert!(
+        viewer
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/session/delegateModels",
+                raw_params(&params.to_string())
+            ))
+            .await
+            .is_err(),
+        "offline owner cannot fall back to A"
+    );
+}
+
+#[cfg(feature = "remote")]
 async fn register_remote_node(
     mesh: &crate::agent::remote::mesh::MeshHandle,
     remote: &RealStorageHandleFixture,

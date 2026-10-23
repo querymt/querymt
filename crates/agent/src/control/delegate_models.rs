@@ -62,7 +62,20 @@ where
     }
 }
 
+impl<T: Serialize> Serialize for OptionalNullable<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Value(value) => value.serialize(serializer),
+            Self::Missing | Self::Null => serializer.serialize_none(),
+        }
+    }
+}
+
 impl<T> OptionalNullable<T> {
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+
     pub fn as_update(&self) -> Option<Option<T>>
     where
         T: Clone,
@@ -76,14 +89,14 @@ impl<T> OptionalNullable<T> {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateModelsRequest {
     #[serde(alias = "sessionId")]
     pub session_id: String,
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetDelegateModelRequest {
     #[serde(alias = "sessionId")]
     pub session_id: String,
@@ -97,7 +110,11 @@ pub struct SetDelegateModelRequest {
     #[typeshare(typescript(type = "string | null"))]
     pub node_id: Option<String>,
     /// Omitted preserves the current setting; null restores parent-session inheritance.
-    #[serde(default, alias = "reasoningEffort")]
+    #[serde(
+        default,
+        alias = "reasoningEffort",
+        skip_serializing_if = "OptionalNullable::is_missing"
+    )]
     #[typeshare(typescript(type = "DelegateReasoningEffort | null"))]
     pub reasoning_effort: OptionalNullable<DelegateReasoningEffort>,
     #[serde(default, alias = "expectedRevision")]
@@ -107,7 +124,7 @@ pub struct SetDelegateModelRequest {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DelegateAssignmentSource {
     Override,
@@ -115,7 +132,7 @@ pub enum DelegateAssignmentSource {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateAssignmentInfo {
     pub agent_id: String,
     pub name: String,
@@ -130,7 +147,7 @@ pub struct DelegateAssignmentInfo {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrphanedDelegateAssignment {
     pub agent_id: String,
     #[typeshare(typescript(type = "DelegateModelOverride | null"))]
@@ -140,7 +157,7 @@ pub struct OrphanedDelegateAssignment {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateAssignmentsInfo {
     pub version: u32,
     pub reasoning_effort_supported: bool,
@@ -156,7 +173,7 @@ pub struct DelegateAssignmentsInfo {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetDelegateModelResponse {
     pub version: u32,
     pub reasoning_effort_supported: bool,
@@ -173,7 +190,7 @@ pub struct SetDelegateModelResponse {
 }
 
 #[typeshare]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateModelsChangedNotification {
     pub version: u32,
     pub session_id: String,

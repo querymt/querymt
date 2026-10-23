@@ -86,12 +86,14 @@ pub struct NodeInfo {
 #[cfg(feature = "remote")]
 pub use remote_impl::{
     AdmissionRequest, AdmissionResponse, CreateRemoteSchedule, CreateRemoteScheduleResponse,
-    CreateRemoteSession, CreateRemoteSessionResponse, DeleteRemoteSchedule, ForkRemoteSession,
-    ForkRemoteSessionResponse, GetNodeInfo, GetRemoteSessionLifecycle, GetRemoteSessionProfile,
-    ListRemoteSchedules, ListRemoteSchedulesResponse, ListRemoteSessions,
+    CreateRemoteSession, CreateRemoteSessionResponse, CreateRemoteSessionWithProfile,
+    DeleteRemoteSchedule, ForkRemoteSession, ForkRemoteSessionResponse, GetNodeInfo,
+    GetRemoteDelegateModels, GetRemoteSessionLifecycle, GetRemoteSessionProfile,
+    ListRemoteProfiles, ListRemoteSchedules, ListRemoteSchedulesResponse, ListRemoteSessions,
     ListRemoteSessionsWithLifecycle, PauseRemoteSchedule, RemoteNodeManager,
     RemoteNodeManagerState, RemoteSessionProfile, ResumeRemoteSchedule, ResumeRemoteSession,
-    SessionHandoff, SetRemoteSessionLifecycle, StopRemoteSessionRuntime, TriggerRemoteSchedule,
+    SessionHandoff, SetRemoteDelegateModel, SetRemoteSessionLifecycle, StopRemoteSessionRuntime,
+    TriggerRemoteSchedule,
 };
 
 #[cfg(feature = "remote")]
@@ -126,6 +128,22 @@ mod remote_impl {
         /// Working directory on the remote machine (optional; string for cross-OS)
         pub cwd: Option<String>,
     }
+
+    /// An older owner must not silently ignore an explicit profile selection.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CreateRemoteSessionWithProfile {
+        pub cwd: Option<String>,
+        pub profile_id: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ListRemoteProfiles;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct GetRemoteDelegateModels(pub crate::control::delegate_models::DelegateModelsRequest);
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SetRemoteDelegateModel(pub crate::control::delegate_models::SetDelegateModelRequest);
 
     /// Wire-safe handoff returned from remote create/fork lifecycle RPCs.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -976,6 +994,89 @@ mod remote_impl {
 
     // ── Message handlers ──────────────────────────────────────────────────────
 
+    impl RemoteNodeManagerState {
+        async fn create_session(
+            &self,
+            cwd: Option<String>,
+            profile_id: Option<String>,
+        ) -> Result<CreateRemoteSessionResponse, AgentError> {
+            let cwd_path = cwd.as_ref().map(PathBuf::from);
+            if let Some(ref path) = cwd_path
+                && !path.is_absolute()
+            {
+                return Err(AgentError::Internal(format!(
+                    "cwd must be an absolute path, got: {}",
+                    path.display()
+                )));
+            }
+
+            // Explicit profile IDs belong to this owner; never fall back on failure.
+            let profiles = self.profiles.load_full();
+            let owner_runtime = match profiles.as_ref().as_ref() {
+                Some(profiles) => Some(match profile_id.as_deref() {
+                    Some(id) if id.trim().is_empty() => {
+                        return Err(AgentError::Internal("profile_id must be nonempty".into()));
+                    }
+                    Some(id) => profiles.runtime_for_profile(id).await?,
+                    None => profiles.active_runtime().await?,
+                }),
+                None if profile_id.is_some() => {
+                    return Err(AgentError::Internal(
+                        "owner profiles are not configured".into(),
+                    ));
+                }
+                None => None,
+            };
+            let config = owner_runtime
+                .as_ref()
+                .map(|runtime| runtime.agent().handle().config.clone())
+                .unwrap_or_else(|| self.config.clone());
+            let session_context = config
+                .provider
+                .create_session(cwd_path.clone(), None, &config.execution_config_snapshot())
+                .await
+                .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+            let session = session_context.session();
+            let session_id = session.public_id.clone();
+            if let (Some(profiles), Some(runtime)) = (profiles.as_ref().as_ref(), &owner_runtime) {
+                profiles
+                    .bind_session_to_runtime(&session_id, runtime)
+                    .await?;
+            }
+            let title = session.name.clone();
+            let created_at = session
+                .created_at
+                .map(|ts| ts.unix_timestamp())
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0)
+                });
+
+            tracing::Span::current().record("session_id", &session_id);
+
+            let handoff = self
+                .materialize_remote_session(
+                    session_id.clone(),
+                    cwd_path,
+                    cwd.clone(),
+                    title.clone(),
+                    created_at,
+                )
+                .await?;
+
+            Ok(CreateRemoteSessionResponse {
+                session_id,
+                handoff,
+                cwd,
+                title,
+                created_at,
+            })
+        }
+    }
+
     impl Message<CreateRemoteSession> for RemoteNodeManager {
         type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
 
@@ -993,80 +1094,11 @@ mod remote_impl {
             msg: CreateRemoteSession,
             ctx: &mut Context<Self, Self::Reply>,
         ) -> Self::Reply {
-            let cwd_path: Option<PathBuf> = msg.cwd.as_ref().map(PathBuf::from);
-
             // Capture shared state for the spawned task
             let shared_state = self.shared_state.clone();
 
             // Spawn the work as a background task
-            ctx.spawn(async move {
-                if let Some(ref path) = cwd_path
-                    && !path.is_absolute()
-                {
-                    return Err(AgentError::Internal(format!(
-                        "cwd must be an absolute path, got: {}",
-                        path.display()
-                    )));
-                }
-
-                // Remote creation uses the owner's active profile, never a profile
-                // inferred from the requesting machine. Persist the binding before
-                // exporting the actor so direct owner loads select the same runtime.
-                let profiles = shared_state.profiles.load_full();
-                let owner_runtime = match profiles.as_ref().as_ref() {
-                    Some(profiles) => Some(profiles.active_runtime().await?),
-                    None => None,
-                };
-                let config = owner_runtime
-                    .as_ref()
-                    .map(|runtime| runtime.agent().handle().config.clone())
-                    .unwrap_or_else(|| shared_state.config.clone());
-                let session_context = config
-                    .provider
-                    .create_session(cwd_path.clone(), None, &config.execution_config_snapshot())
-                    .await
-                    .map_err(|e| AgentError::Internal(e.to_string()))?;
-
-                let session = session_context.session();
-                let session_id = session.public_id.clone();
-                if let (Some(profiles), Some(runtime)) =
-                    (profiles.as_ref().as_ref(), &owner_runtime)
-                {
-                    profiles
-                        .bind_session_to_runtime(&session_id, runtime)
-                        .await?;
-                }
-                let title = session.name.clone();
-                let created_at = session
-                    .created_at
-                    .map(|ts| ts.unix_timestamp())
-                    .unwrap_or_else(|| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0)
-                    });
-
-                tracing::Span::current().record("session_id", &session_id);
-
-                let handoff = shared_state
-                    .materialize_remote_session(
-                        session_id.clone(),
-                        cwd_path,
-                        msg.cwd.clone(),
-                        title.clone(),
-                        created_at,
-                    )
-                    .await?;
-
-                Ok(CreateRemoteSessionResponse {
-                    session_id,
-                    handoff,
-                    cwd: msg.cwd,
-                    title,
-                    created_at,
-                })
-            })
+            ctx.spawn(async move { shared_state.create_session(msg.cwd, None).await })
         }
     }
 
@@ -1202,6 +1234,82 @@ mod remote_impl {
                     title,
                     created_at,
                 })
+            })
+        }
+    }
+
+    impl Message<CreateRemoteSessionWithProfile> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<Result<CreateRemoteSessionResponse, AgentError>>;
+        async fn handle(
+            &mut self,
+            msg: CreateRemoteSessionWithProfile,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let state = self.shared_state.clone();
+            ctx.spawn(async move { state.create_session(msg.cwd, Some(msg.profile_id)).await })
+        }
+    }
+
+    impl Message<ListRemoteProfiles> for RemoteNodeManager {
+        type Reply =
+            kameo::reply::DelegatedReply<Result<serde_json::Value, agent_client_protocol::Error>>;
+        async fn handle(
+            &mut self,
+            _: ListRemoteProfiles,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let profiles = self.shared_state.profiles.load_full();
+            ctx.spawn(async move {
+                crate::LocalAgentHandle::owner_profiles(profiles.as_ref().as_ref()).await
+            })
+        }
+    }
+
+    impl Message<GetRemoteDelegateModels> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<
+            Result<
+                crate::control::delegate_models::DelegateAssignmentsInfo,
+                agent_client_protocol::Error,
+            >,
+        >;
+        async fn handle(
+            &mut self,
+            msg: GetRemoteDelegateModels,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let profiles = self.shared_state.profiles.load_full();
+            ctx.spawn(async move {
+                crate::LocalAgentHandle::owner_delegate_models(profiles.as_ref().as_ref(), msg.0)
+                    .await
+            })
+        }
+    }
+
+    impl Message<SetRemoteDelegateModel> for RemoteNodeManager {
+        type Reply = kameo::reply::DelegatedReply<
+            Result<
+                crate::control::delegate_models::SetDelegateModelResponse,
+                agent_client_protocol::Error,
+            >,
+        >;
+        async fn handle(
+            &mut self,
+            msg: SetRemoteDelegateModel,
+            ctx: &mut Context<Self, Self::Reply>,
+        ) -> Self::Reply {
+            let profiles = self.shared_state.profiles.load_full();
+            let node_id = self
+                .shared_state
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.peer_id().to_string());
+            ctx.spawn(async move {
+                crate::LocalAgentHandle::owner_set_delegate_model(
+                    profiles.as_ref().as_ref(),
+                    node_id,
+                    msg.0,
+                )
+                .await
             })
         }
     }
@@ -2241,6 +2349,26 @@ mod remote_impl {
         ResumeRemoteSession,
         "querymt::ResumeRemoteSession",
         REG_RESUME_REMOTE_SESSION
+    );
+    remote_node_msg_impl!(
+        CreateRemoteSessionWithProfile,
+        "querymt::CreateRemoteSessionWithProfile",
+        REG_CREATE_REMOTE_SESSION_WITH_PROFILE
+    );
+    remote_node_msg_impl!(
+        ListRemoteProfiles,
+        "querymt::ListRemoteProfiles",
+        REG_LIST_REMOTE_PROFILES
+    );
+    remote_node_msg_impl!(
+        GetRemoteDelegateModels,
+        "querymt::GetRemoteDelegateModels",
+        REG_GET_REMOTE_DELEGATE_MODELS
+    );
+    remote_node_msg_impl!(
+        SetRemoteDelegateModel,
+        "querymt::SetRemoteDelegateModel",
+        REG_SET_REMOTE_DELEGATE_MODEL
     );
     remote_node_msg_impl!(GetNodeInfo, "querymt::GetNodeInfo", REG_GET_NODE_INFO);
     remote_node_msg_impl!(

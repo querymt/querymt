@@ -2,7 +2,24 @@ use super::utils::{ext_json_response, format_prefixed_error_chain};
 use super::*;
 
 impl LocalAgentHandle {
-    pub(super) async fn handle_ext_profiles(&self) -> Result<ExtResponse, Error> {
+    pub(super) async fn handle_ext_profiles(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
+        #[derive(serde::Deserialize, Default)]
+        struct Request {
+            node_id: Option<String>,
+        }
+        let parsed: Option<Request> = serde_json::from_str(req.params.get())
+            .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+        if let Some(node_id) = parsed.and_then(|request| request.node_id) {
+            #[cfg(feature = "remote")]
+            {
+                return ext_json_response(&self.remote_profiles(&node_id).await?);
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                let _ = node_id;
+                return Err(Error::method_not_found());
+            }
+        }
         ext_json_response(&self.profiles_response().await?)
     }
 
@@ -116,18 +133,27 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        use crate::control::delegate_models::{
-            DELEGATE_MODELS_VERSION, DelegateAssignmentInfo, DelegateAssignmentSource,
-            DelegateAssignmentsInfo, DelegateModelsRequest, OrphanedDelegateAssignment,
-        };
+        use crate::control::delegate_models::DelegateModelsRequest;
 
         let parsed: DelegateModelsRequest = serde_json::from_str(req.params.get())
             .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+        #[cfg(feature = "remote")]
+        if let Some(node_id) = self.delegate_session_owner(&parsed.session_id).await? {
+            return ext_json_response(&self.remote_delegate_models(&node_id, parsed).await?);
+        }
+        ext_json_response(&Self::owner_delegate_models(self.profiles().as_ref(), parsed).await?)
+    }
+
+    pub(crate) async fn owner_delegate_models(
+        profiles: Option<&ProfileRuntime>,
+        parsed: crate::control::delegate_models::DelegateModelsRequest,
+    ) -> Result<crate::control::delegate_models::DelegateAssignmentsInfo, Error> {
+        use crate::control::delegate_models::*;
         let session_id = parsed.session_id.trim();
         if session_id.is_empty() {
             return Err(Error::invalid_params().data("session_id must be nonempty"));
         }
-        let profiles = self.profiles().ok_or_else(Error::invalid_params)?;
+        let profiles = profiles.ok_or_else(Error::invalid_params)?;
         let binding = profiles.session_binding(session_id).await.ok_or_else(|| {
             Error::invalid_params().data("session is not bound to an available profile")
         })?;
@@ -230,7 +256,7 @@ impl LocalAgentHandle {
                 agent_id,
             })
             .collect();
-        ext_json_response(&DelegateAssignmentsInfo {
+        Ok(DelegateAssignmentsInfo {
             version: DELEGATE_MODELS_VERSION,
             reasoning_effort_supported: true,
             session_id: session_id.to_owned(),
@@ -259,9 +285,7 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        use crate::control::delegate_models::{
-            DELEGATE_MODELS_VERSION, SetDelegateModelRequest, SetDelegateModelResponse,
-        };
+        use crate::control::delegate_models::SetDelegateModelRequest;
 
         let parsed: SetDelegateModelRequest =
             serde_json::from_str(req.params.get()).map_err(|e| {
@@ -269,6 +293,22 @@ impl LocalAgentHandle {
                     "message": format!("invalid setDelegateModel params: {e}"),
                 }))
             })?;
+        #[cfg(feature = "remote")]
+        if let Some(node_id) = self.delegate_session_owner(&parsed.session_id).await? {
+            return ext_json_response(&self.remote_set_delegate_model(&node_id, parsed).await?);
+        }
+        ext_json_response(
+            &Self::owner_set_delegate_model(self.profiles().as_ref(), self.mesh_node_id(), parsed)
+                .await?,
+        )
+    }
+
+    pub(crate) async fn owner_set_delegate_model(
+        profiles: Option<&ProfileRuntime>,
+        owner_node_id: Option<String>,
+        parsed: crate::control::delegate_models::SetDelegateModelRequest,
+    ) -> Result<crate::control::delegate_models::SetDelegateModelResponse, Error> {
+        use crate::control::delegate_models::*;
         let session_id = parsed.session_id.trim();
         let agent_id = parsed.agent_id.trim();
         if session_id.is_empty() || agent_id.is_empty() {
@@ -277,7 +317,7 @@ impl LocalAgentHandle {
             })));
         }
 
-        let profiles = self.profiles().ok_or_else(|| {
+        let profiles = profiles.ok_or_else(|| {
             Error::invalid_params().data(serde_json::json!({
                 "message": "profiles are not configured",
             }))
@@ -366,6 +406,7 @@ impl LocalAgentHandle {
                     })));
                 }
                 let node_id = parsed.node_id.as_deref().map(str::trim).map(str::to_string);
+                let node_id = node_id.filter(|node| Some(node) != owner_node_id.as_ref());
                 if node_id.as_ref().is_some_and(String::is_empty) {
                     return Err(
                         Error::invalid_params().data("node_id must be null or a non-empty string")
@@ -481,7 +522,7 @@ impl LocalAgentHandle {
                 AgentEventKind::DelegateModelsChanged { revision },
             );
         }
-        ext_json_response(&SetDelegateModelResponse {
+        Ok(SetDelegateModelResponse {
             version: DELEGATE_MODELS_VERSION,
             reasoning_effort_supported: true,
             session_id: session_id.to_owned(),
@@ -493,8 +534,25 @@ impl LocalAgentHandle {
         })
     }
 
+    fn mesh_node_id(&self) -> Option<String> {
+        #[cfg(feature = "remote")]
+        {
+            self.mesh().map(|mesh| mesh.peer_id().to_string())
+        }
+        #[cfg(not(feature = "remote"))]
+        {
+            None
+        }
+    }
+
     async fn profiles_response(&self) -> Result<serde_json::Value, Error> {
-        let Some(profiles) = self.profiles() else {
+        Self::owner_profiles(self.profiles().as_ref()).await
+    }
+
+    pub(crate) async fn owner_profiles(
+        profiles: Option<&ProfileRuntime>,
+    ) -> Result<serde_json::Value, Error> {
+        let Some(profiles) = profiles else {
             return Ok(serde_json::json!({
                 "profiles": [],
                 "active_profile_id": serde_json::Value::Null,

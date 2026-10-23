@@ -15,6 +15,123 @@ impl LocalAgentHandle {
         }
     }
 
+    #[cfg(feature = "remote")]
+    fn map_remote_control_error(
+        error: kameo::error::RemoteSendError<agent_client_protocol::Error>,
+    ) -> agent_client_protocol::Error {
+        match querymt_remote::classify_remote_send_error(error) {
+            Ok(failure) => crate::error::AgentError::from_transport_failure(failure).into(),
+            Err(error) => error,
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn delegate_session_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, Error> {
+        let store = self.config.provider.history_store();
+        match crate::session::location::resolve_session_location(store.as_ref(), session_id.trim())
+            .await
+            .map_err(Error::into_internal_error)?
+        {
+            crate::session::location::SessionLocation::Remote { bookmark } => {
+                Ok(Some(bookmark.node_id))
+            }
+            crate::session::location::SessionLocation::Conflict { .. } => {
+                Err(Error::invalid_params().data("session location conflict"))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn remote_profiles(&self, node_id: &str) -> Result<serde_json::Value, Error> {
+        let manager = self.find_node_manager(node_id).await?;
+        let mut response = querymt_remote::ask_remote_with_timeout(
+            &manager,
+            &crate::agent::remote::node_manager::ListRemoteProfiles,
+            Self::remote_request_timeout(),
+        )
+        .await
+        .map_err(Self::map_remote_control_error)?;
+        response["node_id"] = node_id.into();
+        Ok(response)
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn remote_delegate_models(
+        &self,
+        node_id: &str,
+        request: crate::control::delegate_models::DelegateModelsRequest,
+    ) -> Result<crate::control::delegate_models::DelegateAssignmentsInfo, Error> {
+        let manager = self.find_node_manager(node_id).await?;
+        let mut result = querymt_remote::ask_remote_with_timeout(
+            &manager,
+            &crate::agent::remote::node_manager::GetRemoteDelegateModels(request),
+            Self::remote_request_timeout(),
+        )
+        .await
+        .map_err(Self::map_remote_control_error)?;
+        let viewer = self.mesh().map(|mesh| mesh.peer_id().to_string());
+        for assignment in &mut result.assignments {
+            Self::qualify_owner_model(&mut assignment.model.0, node_id, viewer.as_deref());
+        }
+        for assignment in &mut result.orphaned_overrides {
+            Self::qualify_owner_model(&mut assignment.model.0, node_id, viewer.as_deref());
+        }
+        Ok(result)
+    }
+
+    #[cfg(feature = "remote")]
+    fn qualify_owner_model(
+        model: &mut Option<crate::delegation::DelegateModelOverride>,
+        node_id: &str,
+        viewer: Option<&str>,
+    ) {
+        if let Some(model) = model {
+            model.node_id = match model.node_id.as_deref() {
+                None => Some(node_id.to_owned()),
+                Some(node) if Some(node) == viewer => None,
+                _ => model.node_id.clone(),
+            };
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) async fn remote_set_delegate_model(
+        &self,
+        node_id: &str,
+        mut request: crate::control::delegate_models::SetDelegateModelRequest,
+    ) -> Result<crate::control::delegate_models::SetDelegateModelResponse, Error> {
+        // In the client catalog an unqualified model is local to this viewer,
+        // not to the owner receiving the forwarded request.
+        if request.model_id.0.is_some() && request.node_id.is_none() {
+            request.node_id = Some(
+                self.mesh()
+                    .ok_or_else(Error::method_not_found)?
+                    .peer_id()
+                    .to_string(),
+            );
+        }
+        let manager = self.find_node_manager(node_id).await?;
+        let mut result = querymt_remote::ask_remote_with_timeout(
+            &manager,
+            &crate::agent::remote::node_manager::SetRemoteDelegateModel(request),
+            Self::remote_request_timeout(),
+        )
+        .await
+        .map_err(Self::map_remote_control_error)?;
+        Self::qualify_owner_model(
+            &mut result.model.0,
+            node_id,
+            self.mesh()
+                .map(|mesh| mesh.peer_id().to_string())
+                .as_deref(),
+        );
+        Ok(result)
+    }
+
     /// Typed failure for the attachment health-check timeout: ReplyTimeout with
     /// Unknown delivery, so recovery decisions can consult `transport_failure()`
     /// instead of parsing error strings.
@@ -338,8 +455,31 @@ impl LocalAgentHandle {
         cwd: Option<String>,
     ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
     {
-        use crate::agent::remote::CreateRemoteSession;
+        self.create_remote_session_with_profile(node_manager_ref, cwd, None)
+            .await
+    }
 
+    #[cfg(feature = "remote")]
+    pub async fn create_remote_session_with_profile(
+        &self,
+        node_manager_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        cwd: Option<String>,
+        profile_id: Option<String>,
+    ) -> Result<crate::agent::remote::CreateRemoteSessionResponse, agent_client_protocol::Error>
+    {
+        use crate::agent::remote::CreateRemoteSession;
+        if let Some(profile_id) = profile_id {
+            return querymt_remote::ask_remote_with_timeout(
+                node_manager_ref,
+                &crate::agent::remote::node_manager::CreateRemoteSessionWithProfile {
+                    cwd,
+                    profile_id,
+                },
+                Self::remote_request_timeout(),
+            )
+            .await
+            .map_err(Self::map_remote_node_manager_error);
+        }
         let timeout = Self::remote_request_timeout();
         querymt_remote::ask_remote_with_timeout(
             node_manager_ref,
@@ -559,6 +699,26 @@ impl LocalAgentHandle {
 #[cfg(all(test, feature = "remote"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegate_models_preserve_physical_provider_nodes_across_owner_and_viewer() {
+        for (reported, expected) in [
+            (None, Some("B")),
+            (Some("A"), None),
+            (Some("B"), Some("B")),
+            (Some("C"), Some("C")),
+        ] {
+            let mut model = Some(crate::delegation::DelegateModelOverride {
+                model_id: "provider/model".into(),
+                node_id: reported.map(str::to_owned),
+            });
+            LocalAgentHandle::qualify_owner_model(&mut model, "B", Some("A"));
+            assert_eq!(model.unwrap().node_id.as_deref(), expected);
+        }
+        let mut inherited = None;
+        LocalAgentHandle::qualify_owner_model(&mut inherited, "B", Some("A"));
+        assert!(inherited.is_none());
+    }
 
     /// Regression test: the remote attachment health-check timeout must
     /// surface as a typed `RemoteTransport` failure (ReplyTimeout kind, Unknown
