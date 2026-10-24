@@ -520,6 +520,9 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
             "thinking_signature",
             serde_json::json!({ "signature": signature }),
         ),
+        StreamChunk::RedactedThinking(data) => {
+            ("redacted_thinking", serde_json::json!({ "data": data }))
+        }
         StreamChunk::ToolUseStart { index, id, name } => (
             "tool_use_start",
             serde_json::json!({ "index": index, "id": id, "name": name }),

@@ -176,7 +176,10 @@ fn default_temperature(model: &str) -> Option<f32> {
     if id.contains("qwen") {
         return Some(0.55);
     }
-    // Claude: let Anthropic's API use its own default
+    // Claude: leave unset. The Anthropic provider omits `temperature` (and
+    // `top_p`/`top_k`) whenever the model rejects them (Opus 4.7+, Claude 5+,
+    // Fable, Mythos) or when thinking is sent, so a default here would only be
+    // dropped or risk a rejected request.
     if id.contains("claude") {
         return None;
     }
@@ -260,6 +263,12 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
     if provider == "openrouter" {
         opts.insert("usage".into(), json!({"include": true}));
     }
+
+    // Claude is intentionally absent here: session effort "auto" stays unset
+    // and the Anthropic provider resolves it per model class (default-on
+    // adaptive models keep API defaults, opt-in adaptive models get adaptive
+    // thinking, budget models get none). Inserting an effort would turn "auto"
+    // into an explicit effort in stored configs and the session UI.
 
     // Default reasoning effort for model families that benefit from it.
     if id.contains("gemini-3") {
@@ -427,6 +436,28 @@ mod tests {
     fn test_anthropic_max_tokens() {
         let d = ModelDefaults::for_model("anthropic", "claude-sonnet-4-20250514");
         assert_eq!(d.max_tokens, Some(32_000));
+    }
+
+    #[test]
+    fn test_anthropic_defaults_never_insert_reasoning_effort() {
+        for model in [
+            "claude-sonnet-4-20250514",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-6",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-mythos-preview",
+            "us.anthropic.claude-opus-4-7-v1:0",
+        ] {
+            let d = ModelDefaults::for_model("anthropic", model);
+            assert!(
+                !d.provider_options.contains_key("reasoning_effort"),
+                "{model}: auto must be resolved by the provider"
+            );
+            assert_eq!(d.temperature, None, "{model}");
+        }
     }
 
     #[test]
