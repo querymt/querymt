@@ -358,7 +358,7 @@ async fn profile_config_options(
     session_id: Option<&str>,
 ) -> Vec<SessionConfigOption> {
     f.handle
-        .session_config_options(
+        .session_profile_config_options(
             session_id,
             AgentMode::Build,
             **f.handle.config.default_reasoning_effort.load(),
