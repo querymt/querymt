@@ -640,6 +640,24 @@ impl LocalAgentHandle {
                 .prepare_new_session(req)
                 .await?;
             let session_id = prepared.session_id.clone();
+            if let Err(error) = profiles
+                .bind_session_to_runtime(session_id.clone(), &runtime)
+                .await
+            {
+                prepared.actor_ref.kill();
+                let cleanup = profile_handle
+                    .config
+                    .provider
+                    .history_store()
+                    .delete_session(&session_id)
+                    .await;
+                return Err(Error::internal_error().data(serde_json::json!({
+                    "message": format_prefixed_error_chain("Failed to bind session to profile", &error),
+                    "profileId": profile_id,
+                    "sessionId": session_id,
+                    "cleanupError": cleanup.err().map(|error| error.to_string()),
+                })));
+            }
             let session_ref = crate::agent::session_registry::register_prepared_session(
                 &profile_handle.registry,
                 &prepared,
@@ -649,32 +667,13 @@ impl LocalAgentHandle {
                 .session_materializer
                 .finalize_session(&prepared)
                 .await?;
-            profiles
-                .bind_session_to_runtime(session_id.clone(), &runtime)
-                .await
-                .map_err(|err| {
-                    Error::internal_error().data(serde_json::json!({
-                        "message": format_prefixed_error_chain("Failed to bind session to profile", &err),
-                        "profileId": profile_id,
-                        "sessionId": session_id,
-                    }))
-                })?;
-
             let current_mode = session_ref.get_mode().await.map_err(Error::from)?;
             let reasoning_effort = profile_handle
                 .session_reasoning_effort(&session_ref, &session_id)
                 .await;
-            let profile_list = profiles.list_profiles().await.map_err(|err| {
-                Error::internal_error().data(serde_json::json!({
-                    "message": format_prefixed_error_chain("Failed to list profiles", &err),
-                }))
-            })?;
-            let config_options = crate::agent::session_registry::config_options_with_profiles(
-                current_mode,
-                reasoning_effort,
-                Some(profile_id.as_str()),
-                &profile_list,
-            );
+            let config_options = self
+                .session_config_options(Some(&session_id), current_mode, reasoning_effort)
+                .await?;
             let mut meta = serde_json::Map::new();
             meta.insert(
                 "querymt".to_string(),

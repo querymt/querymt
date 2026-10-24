@@ -297,13 +297,7 @@ pub fn try_setup_telemetry_with_layers(
         // Two separate instances because EnvFilter is not Clone.
         let telemetry_level =
             std::env::var("QMT_TELEMETRY_LEVEL").unwrap_or_else(|_| "info".into());
-        // Suppress iroh's per-datagram spans by default without filtering OTLP logs.
-        let trace_level = if telemetry_level.contains("iroh") {
-            telemetry_level.clone()
-        } else {
-            format!("{telemetry_level},iroh=warn")
-        };
-        let trace_filter = EnvFilter::new(&trace_level);
+        let trace_filter = telemetry_trace_filter(&telemetry_level);
         let log_filter = EnvFilter::new(&telemetry_level);
 
         let endpoint = config.resolve_endpoint();
@@ -345,6 +339,29 @@ pub fn try_setup_telemetry_with_layers(
         .map_err(|_| TelemetryInitError::Subscriber)?;
 
     Ok(None)
+}
+
+fn telemetry_trace_filter(level: &str) -> EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+
+    let explicit_iroh = level.split(',').map(str::trim).any(|directive| {
+        let target = directive
+            .split(['=', '['])
+            .next()
+            .unwrap_or_default()
+            .trim();
+        target == "iroh" || target.starts_with("iroh::")
+    });
+    let global_level = level
+        .split(',')
+        .filter_map(|directive| directive.trim().parse::<LevelFilter>().ok())
+        .next_back();
+    // Default suppression must not enable spans disabled by a stricter global level.
+    if explicit_iroh || global_level.is_some_and(|level| level <= LevelFilter::WARN) {
+        EnvFilter::new(level)
+    } else {
+        EnvFilter::new(format!("iroh=warn,{level}"))
+    }
 }
 
 // ─── Convenience wrapper (panics on failure) ───────────────────────────────────
@@ -419,6 +436,66 @@ mod tests {
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
     use opentelemetry_sdk::logs::InMemoryLogExporter;
+
+    #[test]
+    fn trace_filter_preserves_strict_global_levels_and_explicit_iroh_directives() {
+        for level in [
+            "off",
+            "OFF",
+            "off,my_adapter=debug",
+            "error",
+            "error,my_adapter=trace",
+            "warn",
+            "info,iroh=trace",
+            "off,iroh=trace",
+            "info,iroh::endpoint=debug",
+            "info,iroh[transport]=trace",
+        ] {
+            assert_eq!(
+                telemetry_trace_filter(level).to_string(),
+                EnvFilter::new(level).to_string(),
+                "{level}"
+            );
+        }
+        let subscriber =
+            tracing_subscriber::registry().with(telemetry_trace_filter("off,my_adapter=debug"));
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(target: "iroh::transport", tracing::Level::WARN));
+            assert!(!tracing::enabled!(target: "other", tracing::Level::ERROR));
+            assert!(tracing::enabled!(target: "my_adapter", tracing::Level::DEBUG));
+        });
+    }
+
+    #[test]
+    fn trace_filter_does_not_mistake_unrelated_iroh_text_for_a_target() {
+        for level in [
+            "info",
+            "info,my_iroh_adapter=debug",
+            "info,other=trace",
+            "off,info",
+        ] {
+            let subscriber = tracing_subscriber::registry().with(telemetry_trace_filter(level));
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    !tracing::enabled!(target: "iroh::transport", tracing::Level::INFO),
+                    "{level}"
+                );
+                assert!(
+                    tracing::enabled!(target: "iroh::transport", tracing::Level::WARN),
+                    "{level}"
+                );
+                assert!(
+                    tracing::enabled!(target: "other", tracing::Level::INFO),
+                    "{level}"
+                );
+            });
+        }
+        let level = "info,other[span{field=iroh}]=debug";
+        assert_eq!(
+            telemetry_trace_filter(level).to_string(),
+            EnvFilter::new(format!("iroh=warn,{level}")).to_string()
+        );
+    }
 
     #[test]
     fn traces_and_logs_share_stable_process_identity() {

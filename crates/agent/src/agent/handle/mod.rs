@@ -272,7 +272,7 @@ pub struct LocalAgentHandle {
 }
 
 type SharedProfileCatalog = Arc<dyn ProfileCatalog>;
-type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
+pub(crate) type ProfileRuntime = Arc<ProfileRuntimeManager<SharedProfileCatalog>>;
 pub(crate) type ProfileRuntimeSlot = Arc<ArcSwap<Option<ProfileRuntime>>>;
 pub(crate) type SchedulerHandleSlot = Arc<ParkingMutex<Option<crate::scheduler::SchedulerHandle>>>;
 

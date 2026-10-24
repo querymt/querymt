@@ -638,12 +638,28 @@ async fn test_new_session_binds_requested_profile_from_querymt_meta() {
         .expect("session binding");
 
     assert_eq!(binding.profile_id, "beta");
+    let options = response.config_options.expect("config options");
+    assert_eq!(options[0].id.0.as_ref(), "profile");
+    let model = options
+        .iter()
+        .find(|option| option.id.0.as_ref() == "model")
+        .expect("profile creation includes the effective model");
+    let loaded = f
+        .handle
+        .load_session(LoadSessionRequest::new(
+            session_id,
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("reload profile session");
+    let loaded_options = loaded.config_options.expect("loaded config options");
+    let loaded_model = loaded_options
+        .iter()
+        .find(|option| option.id.0.as_ref() == "model")
+        .expect("profile reload includes model");
     assert_eq!(
-        response.config_options.expect("config options")[0]
-            .id
-            .0
-            .as_ref(),
-        "profile"
+        serde_json::to_value(model).unwrap(),
+        serde_json::to_value(loaded_model).unwrap()
     );
 }
 
@@ -714,7 +730,8 @@ async fn register_profile_bound_delegate_session(
         .profiles()
         .expect("profiles configured")
         .set_session_binding(session_id, binding)
-        .await;
+        .await
+        .expect("bind delegate session");
     (delegate_handle, actor_ref)
 }
 
@@ -1193,7 +1210,8 @@ paths = ["{}"]
             "ghost",
             test_profile_metadata("ghost", "ghost", None).session_binding(),
         )
-        .await;
+        .await
+        .expect("bind missing profile");
     assert!(
         fixture
             .handle
