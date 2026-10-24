@@ -271,6 +271,27 @@ impl TestHarness {
         );
     }
 
+    /// Rebuild the config with one extra middleware and a stop-recovery limit.
+    fn install_stop_recovery(
+        &mut self,
+        middleware: impl crate::middleware::MiddlewareDriver + 'static,
+        max_stop_recoveries: u8,
+    ) {
+        let mut policy = self.config.execution_policy.clone();
+        policy.max_stop_recoveries = max_stop_recoveries;
+        self.config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                self.config.storage.clone(),
+                self.config.provider.clone(),
+                self.config.event_sink.journal().clone(),
+            )
+            .with_tool_policy(ToolPolicy::ProviderOnly)
+            .with_execution_policy(policy)
+            .with_middleware(middleware)
+            .build(),
+        );
+    }
+
     fn set_task(&mut self, status: TaskStatus, kind: TaskKind) {
         let now = OffsetDateTime::now_utc();
         self.exec_ctx.state.active_task = Some(Task {
@@ -393,6 +414,182 @@ fn provider_tool(name: &str) -> Tool {
             parameters: json!({"type": "object", "properties": {}}),
             strict: None,
         },
+    }
+}
+
+/// Stops at step start (for the first `stop_steps` steps) with a model token
+/// limit, and recovers every stop it is offered.
+struct StopThenRecover {
+    stop_steps: usize,
+    steps: AtomicUsize,
+    recoveries_offered: AtomicUsize,
+}
+
+impl StopThenRecover {
+    fn new(stop_steps: usize) -> Self {
+        Self {
+            stop_steps,
+            steps: AtomicUsize::new(0),
+            recoveries_offered: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::middleware::MiddlewareDriver for StopThenRecover {
+    async fn on_step_start(
+        &self,
+        state: crate::middleware::ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
+        let step = self.steps.fetch_add(1, Ordering::SeqCst);
+        match state {
+            crate::middleware::ExecutionState::BeforeLlmCall { context }
+                if step < self.stop_steps =>
+            {
+                Ok(crate::middleware::ExecutionState::Stopped {
+                    message: "cut off".into(),
+                    stop_type: crate::events::StopType::ModelTokenLimit,
+                    context: Some(context),
+                })
+            }
+            other => Ok(other),
+        }
+    }
+
+    async fn on_stopped(
+        &self,
+        state: crate::middleware::ExecutionState,
+        _runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
+        self.recoveries_offered.fetch_add(1, Ordering::SeqCst);
+        match state {
+            crate::middleware::ExecutionState::Stopped {
+                context: Some(context),
+                ..
+            } => Ok(crate::middleware::ExecutionState::BeforeLlmCall { context }),
+            other => Ok(other),
+        }
+    }
+
+    fn reset(&self) {}
+
+    fn name(&self) -> &'static str {
+        "StopThenRecover"
+    }
+}
+
+/// Count `MiddlewareStopped` events currently buffered on `events`.
+async fn drain_middleware_stopped(
+    events: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+) -> usize {
+    let mut stopped = 0;
+    while let Ok(Ok(envelope)) =
+        tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+    {
+        stopped += usize::from(matches!(
+            envelope.kind(),
+            AgentEventKind::MiddlewareStopped { .. }
+        ));
+    }
+    stopped
+}
+
+#[tokio::test]
+async fn recovering_middleware_suppresses_the_stop_and_the_run_continues() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let middleware = Arc::new(StopThenRecover::new(1));
+    harness.install_stop_recovery(SharedDriver(middleware.clone()), 5);
+    harness
+        .provider_mut()
+        .await
+        .expect_chat()
+        .returning(|_| Ok(MockChatResponse::text_only("done").into()))
+        .times(1);
+    harness
+        .provider_mut()
+        .await
+        .expect_tools()
+        .return_const(None)
+        .times(0..);
+    let mut events = harness.config.subscribe_events();
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Completed);
+    assert_eq!(middleware.recoveries_offered.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        drain_middleware_stopped(&mut events).await,
+        0,
+        "a recovered stop must not be published"
+    );
+}
+
+#[tokio::test]
+async fn recovery_guard_publishes_the_stop_after_the_limit() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    // Stops on every step and recovers every time it is asked.
+    let middleware = Arc::new(StopThenRecover::new(usize::MAX));
+    harness.install_stop_recovery(SharedDriver(middleware.clone()), 2);
+    let mut events = harness.config.subscribe_events();
+
+    let outcome = harness.run().await;
+
+    assert_eq!(outcome, CycleOutcome::Stopped(StopReason::MaxTokens));
+    assert_eq!(
+        middleware.recoveries_offered.load(Ordering::SeqCst),
+        2,
+        "middleware is consulted at most max_stop_recoveries times"
+    );
+    assert_eq!(
+        middleware.steps.load(Ordering::SeqCst),
+        3,
+        "the initial attempt plus one per recovery"
+    );
+    assert_eq!(drain_middleware_stopped(&mut events).await, 1);
+}
+
+#[tokio::test]
+async fn stop_without_a_recovering_middleware_is_published_immediately() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    harness.install_stop_recovery(StopOnBeforeLlmCall, 5);
+    let mut events = harness.config.subscribe_events();
+
+    let outcome = harness.run().await;
+
+    assert!(matches!(outcome, CycleOutcome::Stopped(_)));
+    assert_eq!(drain_middleware_stopped(&mut events).await, 1);
+}
+
+/// Lets a test keep a handle on a middleware installed by value.
+struct SharedDriver<T>(Arc<T>);
+
+#[async_trait]
+impl<T: crate::middleware::MiddlewareDriver> crate::middleware::MiddlewareDriver
+    for SharedDriver<T>
+{
+    async fn on_step_start(
+        &self,
+        state: crate::middleware::ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
+        self.0.on_step_start(state, runtime).await
+    }
+
+    async fn on_stopped(
+        &self,
+        state: crate::middleware::ExecutionState,
+        runtime: Option<&Arc<crate::agent::core::SessionRuntime>>,
+    ) -> crate::middleware::Result<crate::middleware::ExecutionState> {
+        self.0.on_stopped(state, runtime).await
+    }
+
+    fn reset(&self) {
+        self.0.reset();
+    }
+
+    fn name(&self) -> &'static str {
+        self.0.name()
     }
 }
 

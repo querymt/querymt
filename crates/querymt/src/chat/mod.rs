@@ -36,8 +36,8 @@ pub use output::{
 };
 pub use streaming::{
     ANTHROPIC_BLOCK_EXTENSION, ANTHROPIC_REDACTED_THINKING, ChatMessagePartDelta,
-    ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, ReasoningPartKind,
-    StructuredStreamEvent,
+    ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, LENGTH_CUTOFF_DETAIL,
+    ReasoningPartKind, StructuredStreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -174,6 +174,103 @@ pub enum ReasoningEffort {
     High,
     /// Maximum reasoning effort — deepest thinking, highest budget
     Max,
+}
+
+/// Per-request overrides for generation settings.
+///
+/// A set field overrides the provider's configured value for a single chat
+/// request; an unset field leaves the configured value in effect. Providers
+/// report which fields they honour via
+/// [`ChatProvider::supported_generation_options`] and ignore the rest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GenerationOptions {
+    /// Output-token cap for this request.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Reasoning effort for this request.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl GenerationOptions {
+    /// Options that override nothing.
+    pub const NONE: Self = Self {
+        max_tokens: None,
+        reasoning_effort: None,
+    };
+
+    /// Returns `true` when no override is set.
+    pub const fn is_empty(&self) -> bool {
+        self.max_tokens.is_none() && self.reasoning_effort.is_none()
+    }
+
+    /// Returns `Some(self)` when at least one override is set, else `None`.
+    ///
+    /// Transports use this to omit empty options from the wire.
+    pub const fn non_empty(self) -> Option<Self> {
+        if self.is_empty() { None } else { Some(self) }
+    }
+
+    /// Sets the output-token cap override.
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Sets the reasoning-effort override.
+    #[must_use]
+    pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
+    }
+}
+
+/// Which [`GenerationOptions`] fields a provider honours per request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GenerationOptionSupport {
+    /// The provider honours a per-request `max_tokens` override.
+    #[serde(default)]
+    pub max_tokens: bool,
+    /// The provider honours a per-request `reasoning_effort` override.
+    #[serde(default)]
+    pub reasoning_effort: bool,
+}
+
+impl GenerationOptionSupport {
+    /// No per-request option is honoured.
+    pub const NONE: Self = Self {
+        max_tokens: false,
+        reasoning_effort: false,
+    };
+
+    /// Every per-request option is honoured.
+    pub const ALL: Self = Self {
+        max_tokens: true,
+        reasoning_effort: true,
+    };
+
+    /// Returns `true` when at least one option is honoured.
+    pub const fn any(&self) -> bool {
+        self.max_tokens || self.reasoning_effort
+    }
+
+    /// Keeps only the overrides in `options` that this support set honours.
+    #[must_use]
+    pub const fn retain_supported(&self, options: GenerationOptions) -> GenerationOptions {
+        GenerationOptions {
+            max_tokens: if self.max_tokens {
+                options.max_tokens
+            } else {
+                None
+            },
+            reasoning_effort: if self.reasoning_effort {
+                options.reasoning_effort
+            } else {
+                None
+            },
+        }
+    }
 }
 
 /// A single message in a chat conversation.
@@ -756,6 +853,45 @@ pub trait ChatProvider: Send + Sync {
             "Streaming with tools not supported by this provider".into(),
         ))
     }
+
+    /// Reports which per-request [`GenerationOptions`] this provider honours.
+    ///
+    /// Defaults to none: options passed to the `*_and_options` methods are
+    /// ignored and the configured values stay in effect.
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        GenerationOptionSupport::NONE
+    }
+
+    /// Chat interaction with tools and per-request generation options.
+    ///
+    /// Set options override the provider's configured values for this request
+    /// only. The default implementation ignores `options` and delegates to
+    /// [`ChatProvider::chat_with_tools`]; providers that honour options should
+    /// override it and report them in
+    /// [`ChatProvider::supported_generation_options`].
+    async fn chat_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
+        let _ = options;
+        self.chat_with_tools(messages, tools).await
+    }
+
+    /// Streaming chat interaction with tools and per-request generation options.
+    ///
+    /// The default implementation ignores `options` and delegates to
+    /// [`ChatProvider::chat_stream_with_tools`].
+    async fn chat_stream_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        let _ = options;
+        self.chat_stream_with_tools(messages, tools).await
+    }
 }
 
 /// Whether a stream chunk is a semantic terminal.
@@ -1284,6 +1420,120 @@ impl ChatMessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Implements only the required method, as pre-existing providers do.
+    /// Records which entry point was called.
+    #[derive(Default)]
+    struct LegacyProvider {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl ChatProvider for LegacyProvider {
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+        ) -> Result<ChatOutput, LLMError> {
+            self.calls.lock().unwrap().push("chat_with_tools");
+            Ok(ChatOutput::default())
+        }
+
+        async fn chat_stream_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
+        {
+            self.calls.lock().unwrap().push("chat_stream_with_tools");
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[test]
+    fn generation_options_default_is_empty() {
+        assert!(GenerationOptions::default().is_empty());
+        assert_eq!(GenerationOptions::default(), GenerationOptions::NONE);
+        assert!(!GenerationOptions::default().with_max_tokens(1).is_empty());
+        assert!(
+            !GenerationOptions::default()
+                .with_reasoning_effort(ReasoningEffort::Low)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn generation_options_deserialize_with_missing_fields() {
+        let options: GenerationOptions = serde_json::from_str("{}").unwrap();
+        assert!(options.is_empty());
+
+        let options: GenerationOptions =
+            serde_json::from_str(r#"{"max_tokens":64000,"reasoning_effort":"low"}"#).unwrap();
+        assert_eq!(options.max_tokens, Some(64_000));
+        assert_eq!(options.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn retain_supported_drops_unsupported_overrides() {
+        let options = GenerationOptions::default()
+            .with_max_tokens(128_000)
+            .with_reasoning_effort(ReasoningEffort::Low);
+
+        assert_eq!(
+            GenerationOptionSupport::NONE.retain_supported(options),
+            GenerationOptions::NONE
+        );
+        assert_eq!(
+            GenerationOptionSupport::ALL.retain_supported(options),
+            options
+        );
+
+        let only_tokens = GenerationOptionSupport {
+            max_tokens: true,
+            ..GenerationOptionSupport::NONE
+        };
+        assert_eq!(
+            only_tokens.retain_supported(options),
+            GenerationOptions::default().with_max_tokens(128_000)
+        );
+    }
+
+    #[test]
+    fn legacy_provider_reports_no_generation_option_support() {
+        let provider = LegacyProvider::default();
+        assert_eq!(
+            provider.supported_generation_options(),
+            GenerationOptionSupport::NONE
+        );
+        assert!(!provider.supported_generation_options().any());
+    }
+
+    #[tokio::test]
+    async fn default_chat_with_options_delegates_to_chat_with_tools() {
+        let provider = LegacyProvider::default();
+        let options = GenerationOptions::default().with_max_tokens(128_000);
+
+        provider
+            .chat_with_tools_and_options(&[], None, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(*provider.calls.lock().unwrap(), ["chat_with_tools"]);
+    }
+
+    #[tokio::test]
+    async fn default_stream_with_options_delegates_to_stream_with_tools() {
+        let provider = LegacyProvider::default();
+        let options = GenerationOptions::default().with_max_tokens(128_000);
+
+        let _stream = provider
+            .chat_stream_with_tools_and_options(&[], None, &options)
+            .await
+            .unwrap();
+
+        assert_eq!(*provider.calls.lock().unwrap(), ["chat_stream_with_tools"]);
+    }
 
     #[test]
     fn extract_thinking_handles_multiple_blocks() {

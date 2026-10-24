@@ -193,6 +193,69 @@ the files (or directories) they read, so they never observe a half-written file.
 `search_text` and `glob` only wait for writes their filter could see: a
 `search_text` with `include = "*.md"` runs alongside an `edit` of `src/a.rs`.
 
+### OutputLimitRecoveryMiddleware
+
+Recovers when a model reply is cut off by the output-token limit, instead of ending
+the run with a "model hit token limit" stop. It is active for every agent by default.
+
+**Configuration:**
+```toml
+[[middleware]]
+type = "output_limit_recovery"
+enabled = true                        # default
+escalate = true                       # default
+max_continuations = 3                 # default
+lower_effort_on_thinking_only = true  # default
+instruction = "..."                   # default shown below
+```
+
+**Recovery steps**, in order, per turn:
+
+1. **Escalate** (`escalate`): when a request sent below the model's output ceiling is
+   cut off, the reply is discarded and the same request is retried once with
+   `max_tokens` set to the ceiling. The discarded reply never reaches history, but its
+   token usage and cost are counted. Escalation needs a provider that honours a
+   per-request `max_tokens` (currently Anthropic). It never goes past an explicit
+   `max_tokens` from your configuration, which is its own ceiling, and it is capped by
+   the room left in the context window.
+2. **Continue** (`max_continuations`): when the reply is cut off again (or escalation
+   is not possible), the run continues with a temporary instruction. The instruction
+   is removed after the next reply that is not cut off. A cut-off that contained only
+   reasoning is not stored in history, and, when `lower_effort_on_thinking_only` is
+   set and the provider honours it, the continuation uses a lower reasoning effort
+   (one step down, `medium` when none was configured, never below `low`).
+
+After `max_continuations` continuations in one turn the run stops as before, with stop
+type `model_token_limit`. A reply that is cut off in the middle of a tool call never
+runs that call; the model is told to split the write into smaller calls.
+
+**Initial cap and ceiling.** With no `max_tokens` configured, Anthropic requests start at
+`min(32000, model output limit)` and the model's output limit is the ceiling. If the
+limit is unknown, 32,000 is used for both.
+
+**Default instruction.** `{cap}` expands to the cap that was hit:
+
+```text
+Your previous response was cut off by the output-token limit ({cap} tokens). Continue
+directly from where you stopped without repeating or summarising earlier output. Split
+large file writes or edits into several smaller tool calls, and keep reasoning brief.
+```
+
+**Events.** Each escalation or continuation publishes a durable `output_limit_recovery`
+event with the turn, attempt number, action (`escalate` or `continue`), the cap before
+and after, whether the reply was thinking-only, and, for an escalation, the id of the
+discarded streamed message so clients can drop it.
+
+**Disable:**
+```toml
+[[middleware]]
+type = "output_limit_recovery"
+enabled = false
+```
+
+Adding an `output_limit_recovery` entry replaces the default instance. See
+`crates/agent/examples/confs/output_limit_recovery.toml` for a complete example.
+
 ### ContextFactory Middleware
 
 Legacy context management middleware.

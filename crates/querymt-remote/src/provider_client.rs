@@ -2,7 +2,7 @@ use crate::{
     ITEM_AWARE_CHAT_CONTRACT_VERSION, ProviderChatRequest, ProviderStreamRequest,
     messages_require_item_aware_contract,
 };
-use querymt::chat::{ChatMessage, Tool};
+use querymt::chat::{ChatMessage, GenerationOptions, Tool};
 
 #[derive(Clone, Debug)]
 pub struct RemoteProviderClientConfig {
@@ -65,6 +65,15 @@ impl RemoteProviderClientConfig {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> ProviderChatRequest {
+        self.build_chat_request_with_options(messages, tools, &GenerationOptions::NONE)
+    }
+
+    pub fn build_chat_request_with_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> ProviderChatRequest {
         ProviderChatRequest {
             provider: self.provider_name.clone(),
             model: self.model.clone(),
@@ -73,6 +82,7 @@ impl RemoteProviderClientConfig {
             params: self.params.clone(),
             item_aware_contract_version: messages_require_item_aware_contract(messages)
                 .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            options: options.non_empty(),
         }
     }
 
@@ -80,6 +90,28 @@ impl RemoteProviderClientConfig {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
+        session_id: String,
+        request_id: String,
+        stream_router_ref: TRouterRef,
+        reconnect_grace_secs: u64,
+    ) -> ProviderStreamRequest<TRouterRef> {
+        self.build_stream_request_with_options(
+            messages,
+            tools,
+            &GenerationOptions::NONE,
+            session_id,
+            request_id,
+            stream_router_ref,
+            reconnect_grace_secs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_stream_request_with_options<TRouterRef>(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
         session_id: String,
         request_id: String,
         stream_router_ref: TRouterRef,
@@ -99,6 +131,7 @@ impl RemoteProviderClientConfig {
             params: self.params.clone(),
             item_aware_contract_version: messages_require_item_aware_contract(messages)
                 .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            options: options.non_empty(),
         }
     }
 }

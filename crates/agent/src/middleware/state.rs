@@ -1,4 +1,4 @@
-use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason};
+use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, GenerationOptions};
 use std::sync::Arc;
 
 use crate::events::StopType;
@@ -69,6 +69,31 @@ impl AgentStats {
     }
 }
 
+/// Fold one request's token usage (and cost, when pricing is known) into `stats`.
+///
+/// Shared by the normal reply path and by discarded attempts (for example an
+/// escalated retry), so every request that was billed is counted exactly once.
+/// Does not touch `steps`; callers decide whether the attempt counts as a step.
+pub fn apply_usage_to_stats(
+    stats: &mut AgentStats,
+    usage: Option<&querymt::Usage>,
+    pricing: Option<&querymt::providers::ModelPricing>,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    stats.total_input_tokens += u64::from(usage.input_tokens);
+    stats.total_output_tokens += u64::from(usage.output_tokens);
+    stats.reasoning_tokens += u64::from(usage.reasoning_tokens);
+    stats.cache_read_tokens += u64::from(usage.cache_read);
+    stats.cache_write_tokens += u64::from(usage.cache_write);
+    stats.context_tokens = calculate_context_tokens(Some(usage)) as usize;
+
+    if let Some(pricing) = pricing {
+        stats.update_costs(pricing);
+    }
+}
+
 /// Calculate current context size from usage.
 /// Single source of truth for context token calculation.
 /// Returns the sum of input, output, reasoning, cache_read and cache_write tokens, or 0 if no usage provided.
@@ -113,6 +138,9 @@ pub struct PreparedModelRequest {
     pub messages: Arc<[ChatMessage]>,
     pub tools: Arc<[querymt::chat::Tool]>,
     pub estimated_tokens: usize,
+    /// Per-request generation overrides copied from
+    /// [`ConversationContext::request_overrides`].
+    pub options: GenerationOptions,
 }
 
 /// Context passed to middleware during state transitions
@@ -130,6 +158,12 @@ pub struct ConversationContext {
     /// Used by `AgentModeMiddleware` to inject mode-specific reminders.
     /// Defaults to `Build` for backward compatibility.
     pub session_mode: crate::agent::core::AgentMode,
+    /// Generation overrides for the next model request only.
+    ///
+    /// Middleware sets these when it returns to `BeforeLlmCall` (e.g. to raise
+    /// `max_tokens`). They are consumed by exactly one request: the context built
+    /// after that request does not carry them forward.
+    pub request_overrides: GenerationOptions,
 }
 
 impl ConversationContext {
@@ -148,6 +182,7 @@ impl ConversationContext {
             provider,
             model,
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: GenerationOptions::NONE,
         }
     }
 
@@ -175,6 +210,7 @@ impl ConversationContext {
             provider: self.provider.clone(),
             model: self.model.clone(),
             session_mode: self.session_mode,
+            request_overrides: self.request_overrides,
         }
     }
 
@@ -261,6 +297,20 @@ impl ConversationContext {
         self
     }
 
+    /// Set the overrides applied to the next model request (builder-style).
+    #[must_use]
+    pub fn with_request_overrides(mut self, overrides: GenerationOptions) -> Self {
+        self.request_overrides = overrides;
+        self
+    }
+
+    /// Returns a copy of this context whose overrides are cleared, so a
+    /// consumed override never leaks into a later request.
+    #[must_use]
+    pub fn without_request_overrides(&self) -> Self {
+        self.clone().with_request_overrides(GenerationOptions::NONE)
+    }
+
     /// Returns true if this is the first user turn
     pub fn is_first_turn(&self) -> bool {
         self.stats.turns <= 1
@@ -338,6 +388,23 @@ impl LlmResponse {
 
     pub fn is_stop(&self) -> bool {
         self.finish_reason.unwrap_or(FinishReason::Unknown) == FinishReason::Stop
+    }
+
+    /// A reply cut off by the output token limit that produced no visible text
+    /// and no tool calls, only reasoning (or nothing at all).
+    ///
+    /// Such a reply carries nothing worth keeping in history, and replaying it
+    /// would only burn the next request's budget on the same reasoning.
+    pub fn is_thinking_only_length_cutoff(&self) -> bool {
+        self.finish_reason == Some(FinishReason::Length)
+            && self.content.trim().is_empty()
+            && self.tool_calls.is_empty()
+            && self.output.as_ref().is_none_or(|output| {
+                output
+                    .items
+                    .iter()
+                    .all(|item| matches!(item, querymt::chat::ChatOutputItem::Reasoning(_)))
+            })
     }
 }
 

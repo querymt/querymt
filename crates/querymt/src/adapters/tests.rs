@@ -569,6 +569,241 @@ async fn http_adapter_returns_private_context_to_non_streaming_decoder() {
         .expect("context-aware decode");
 }
 
+/// Minimal HTTP provider whose options-aware preparation records what it saw.
+struct OptionsRecordingProvider {
+    uri: String,
+    seen: Arc<std::sync::Mutex<Vec<(bool, GenerationOptions)>>>,
+}
+
+impl OptionsRecordingProvider {
+    fn request(&self) -> Result<Request<Vec<u8>>, LLMError> {
+        Request::builder()
+            .method("POST")
+            .uri(&self.uri)
+            .body(Vec::new())
+            .map_err(|e| LLMError::InvalidRequest(e.to_string()))
+    }
+}
+
+impl HTTPChatProvider for OptionsRecordingProvider {
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        GenerationOptionSupport::ALL
+    }
+
+    fn prepare_chat_request_with_options(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+        stream: bool,
+        options: &GenerationOptions,
+    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
+        self.seen.lock().unwrap().push((stream, *options));
+        Ok(crate::chat::http::PreparedChatRequest {
+            request: self.request()?,
+            context: serde_json::Value::Null,
+        })
+    }
+
+    fn chat_request(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        self.request()
+    }
+
+    fn chat_stream_request(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        self.request()
+    }
+
+    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        Ok(ChatOutput::default())
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(StreamTestParser {
+            mode: StreamTestParserMode::Unused,
+        }))
+    }
+}
+
+impl HTTPCompletionProvider for OptionsRecordingProvider {
+    fn complete_request(&self, _req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+
+    fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+}
+
+impl HTTPEmbeddingProvider for OptionsRecordingProvider {
+    fn embed_request(&self, _inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+
+    fn parse_embed(&self, _resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+}
+
+impl HTTPLLMProvider for OptionsRecordingProvider {}
+
+#[tokio::test]
+async fn http_adapter_forwards_options_to_prepare_chat_request() {
+    let uri = serve_once("HTTP/1.1 200 OK", &[], b"{}").await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
+        uri,
+        seen: Arc::clone(&seen),
+    }));
+    let options = GenerationOptions::default()
+        .with_max_tokens(128_000)
+        .with_reasoning_effort(crate::chat::ReasoningEffort::Low);
+
+    assert_eq!(
+        adapter.supported_generation_options(),
+        GenerationOptionSupport::ALL
+    );
+    adapter
+        .chat_with_tools_and_options(&[], None, &options)
+        .await
+        .expect("chat with options");
+
+    assert_eq!(*seen.lock().unwrap(), [(false, options)]);
+}
+
+#[tokio::test]
+async fn http_adapter_forwards_options_on_streaming_requests() {
+    let uri = serve_chunks_once(
+        "HTTP/1.1 200 OK",
+        &[("Content-Type", "text/event-stream")],
+        vec![b"\n".to_vec()],
+    )
+    .await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
+        uri,
+        seen: Arc::clone(&seen),
+    }));
+    let options = GenerationOptions::default().with_max_tokens(64_000);
+
+    let _events: Vec<_> = adapter
+        .chat_stream_with_tools_and_options(&[], None, &options)
+        .await
+        .expect("stream open")
+        .collect()
+        .await;
+
+    assert_eq!(*seen.lock().unwrap(), [(true, options)]);
+}
+
+#[tokio::test]
+async fn http_adapter_without_options_prepares_with_empty_options() {
+    let uri = serve_once("HTTP/1.1 200 OK", &[], b"{}").await;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let adapter = LLMProviderFromHTTP::new(Box::new(OptionsRecordingProvider {
+        uri,
+        seen: Arc::clone(&seen),
+    }));
+
+    adapter
+        .chat_with_tools(&[], None)
+        .await
+        .expect("chat without options");
+
+    assert_eq!(*seen.lock().unwrap(), [(false, GenerationOptions::NONE)]);
+}
+
+/// Provider written before options existed: overrides only `prepare_chat_request`.
+struct LegacyPrepareProvider {
+    uri: String,
+    prepare_calls: Arc<AtomicUsize>,
+}
+
+impl HTTPChatProvider for LegacyPrepareProvider {
+    fn prepare_chat_request(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+        _stream: bool,
+    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
+        self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(crate::chat::http::PreparedChatRequest {
+            request: Request::builder()
+                .method("POST")
+                .uri(&self.uri)
+                .body(b"legacy-body".to_vec())
+                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
+            context: serde_json::Value::Null,
+        })
+    }
+
+    fn chat_request(
+        &self,
+        _messages: &[ChatMessage],
+        _tools: Option<&[Tool]>,
+    ) -> Result<Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+
+    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        Ok(ChatOutput::default())
+    }
+}
+
+impl HTTPCompletionProvider for LegacyPrepareProvider {
+    fn complete_request(&self, _req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+
+    fn parse_complete(&self, _resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+}
+
+impl HTTPEmbeddingProvider for LegacyPrepareProvider {
+    fn embed_request(&self, _inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+
+    fn parse_embed(&self, _resp: Response<Vec<u8>>) -> Result<Vec<Vec<f32>>, LLMError> {
+        Err(LLMError::NotImplemented("unused".into()))
+    }
+}
+
+impl HTTPLLMProvider for LegacyPrepareProvider {}
+
+#[tokio::test]
+async fn http_adapter_default_options_path_uses_legacy_prepare_chat_request() {
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+    let adapter = LLMProviderFromHTTP::new(Box::new(LegacyPrepareProvider {
+        uri: serve_once("HTTP/1.1 200 OK", &[], b"{}").await,
+        prepare_calls: Arc::clone(&prepare_calls),
+    }));
+    assert_eq!(
+        adapter.supported_generation_options(),
+        GenerationOptionSupport::NONE
+    );
+
+    // Options are ignored by a provider that does not honour them, and the
+    // legacy preparation hook still builds the request.
+    let options = GenerationOptions::default().with_max_tokens(128_000);
+    adapter
+        .chat_with_tools_and_options(&[], None, &options)
+        .await
+        .expect("options ignored");
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn http_adapter_frames_split_utf8_json_and_sse_once() {
     let body = "data: {\"text\":\"héllo 🌍\"}\n\ndata: [DONE]\n\n".as_bytes();

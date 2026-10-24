@@ -1442,6 +1442,17 @@ fn apply_middleware_from_config(
         )));
     }
 
+    // Output-limit recovery is on by default; any `output_limit_recovery` entry
+    // (including a disabled one) or an explicit driver replaces it.
+    let has_recovery_entry = entries
+        .iter()
+        .any(|e| e.middleware_type == "output_limit_recovery");
+    if !has_recovery_entry && !builder.has_middleware_named("OutputLimitRecoveryMiddleware") {
+        builder.push_middleware(Arc::new(
+            crate::middleware::OutputLimitRecoveryMiddleware::default(),
+        ));
+    }
+
     // The guard goes last (same order as `AgentBuilder::build`) so its note is
     // the final message of the request, after any compaction.
     // Auto-add ParallelEditGuard (warn mode) unless a driver or any

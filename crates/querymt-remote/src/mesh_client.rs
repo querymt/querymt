@@ -11,7 +11,10 @@ use async_trait::async_trait;
 use kameo::actor::Spawn;
 use libp2p::PeerId;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool};
+use querymt::chat::{
+    ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions, StreamChunk,
+    Tool,
+};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -430,6 +433,35 @@ impl ChatProvider for MeshChatProvider {
         LLMError,
     > {
         self.inner.chat_stream_with_tools(messages, tools).await
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        self.inner.supported_generation_options()
+    }
+
+    async fn chat_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
+        self.inner
+            .chat_with_tools_and_options(messages, tools, options)
+            .await
+    }
+
+    async fn chat_stream_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<
+        Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
+        self.inner
+            .chat_stream_with_tools_and_options(messages, tools, options)
+            .await
     }
 }
 

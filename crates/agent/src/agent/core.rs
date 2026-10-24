@@ -164,6 +164,25 @@ impl McpToolState {
     }
 }
 
+/// What the most recent model request of a session was sent with.
+///
+/// Recorded by the execution loop just before each request so middleware, which
+/// only sees [`SessionRuntime`], can reason about output caps without holding a
+/// provider handle.
+#[derive(Debug, Clone, Default)]
+pub struct LastLlmRequest {
+    /// Output-token cap the request was sent with, when known.
+    pub max_tokens: Option<u32>,
+    /// The session's initial cap and escalation ceiling, when known.
+    pub caps: Option<crate::model_heuristics::OutputCaps>,
+    /// Per-request options the session's provider honours.
+    pub supported: querymt::chat::GenerationOptionSupport,
+    /// Reasoning effort the session's provider is configured with, when known.
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+    /// Pricing used to account for this session's usage, when billable.
+    pub pricing: Option<querymt::providers::ModelPricing>,
+}
+
 /// Type alias for the in-flight pre-turn snapshot task handle.
 type PreTurnSnapshotTask =
     ParkingMutex<Option<tokio::task::JoinHandle<(String, Result<String, String>)>>>;
@@ -210,6 +229,8 @@ pub struct SessionRuntime {
     /// Managed checkout context is independent of cooperative locking.
     pub managed_checkout: OnceCell<bool>,
     pub(crate) workspace_activity: OnceCell<crate::worktree::gate::CheckoutActivityLease>,
+    /// Settings of the most recent model request (see [`LastLlmRequest`]).
+    pub last_llm_request: ParkingMutex<LastLlmRequest>,
 }
 
 impl SessionRuntime {
@@ -238,6 +259,7 @@ impl SessionRuntime {
             slash_registry: OnceCell::new(),
             managed_checkout: OnceCell::new(),
             workspace_activity: OnceCell::new(),
+            last_llm_request: ParkingMutex::new(LastLlmRequest::default()),
         })
     }
 }

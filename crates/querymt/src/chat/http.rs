@@ -1,6 +1,6 @@
 use crate::{
     Tool,
-    chat::{ChatMessage, ChatOutput, StreamChunk},
+    chat::{ChatMessage, ChatOutput, GenerationOptionSupport, GenerationOptions, StreamChunk},
     error::{LLMError, classify_status_only},
 };
 use http::{Request, Response};
@@ -42,6 +42,29 @@ pub trait HTTPChatProvider: Send + Sync {
             request,
             context: serde_json::Value::Null,
         })
+    }
+
+    /// Which per-request [`GenerationOptions`] this provider honours in
+    /// [`Self::prepare_chat_request_with_options`]. Defaults to none.
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        GenerationOptionSupport::NONE
+    }
+
+    /// Options-aware sibling of [`Self::prepare_chat_request`].
+    ///
+    /// Set options override the provider's configured values for this request
+    /// only. The default ignores `options` and delegates to
+    /// [`Self::prepare_chat_request`], so requests without overrides are
+    /// byte-identical to before.
+    fn prepare_chat_request_with_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        stream: bool,
+        options: &GenerationOptions,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let _ = options;
+        self.prepare_chat_request(messages, tools, stream)
     }
 
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {

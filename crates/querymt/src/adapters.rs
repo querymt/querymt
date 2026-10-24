@@ -1,6 +1,9 @@
 use crate::{
     HTTPLLMProvider, LLMProvider, Tool,
-    chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk},
+    chat::{
+        ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions,
+        StreamChunk,
+    },
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -39,10 +42,13 @@ impl LLMProviderFromHTTP {
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
+        options: &GenerationOptions,
     ) -> Result<ChatOutput, LLMError> {
         self.ensure_credential_fresh().await?;
 
-        let prepared = self.inner.prepare_chat_request(messages, tools, false)?;
+        let prepared = self
+            .inner
+            .prepare_chat_request_with_options(messages, tools, false, options)?;
 
         let resp = call_outbound_raw(prepared.request).await?;
         if !resp.status().is_success() {
@@ -68,7 +74,25 @@ impl ChatProvider for LLMProviderFromHTTP {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<ChatOutput, LLMError> {
-        self.do_chat(messages, tools).await
+        self.do_chat(messages, tools, &GenerationOptions::NONE)
+            .await
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        self.inner.supported_generation_options()
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.chat_with_tools_and_options", skip_all)
+    )]
+    async fn chat_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
+        self.do_chat(messages, tools, options).await
     }
 
     #[cfg_attr(
@@ -81,6 +105,21 @@ impl ChatProvider for LLMProviderFromHTTP {
         tools: Option<&[Tool]>,
     ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
     {
+        self.chat_stream_with_tools_and_options(messages, tools, &GenerationOptions::NONE)
+            .await
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "http_adapter.chat_stream_with_tools_and_options", skip_all)
+    )]
+    async fn chat_stream_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
+    {
         if !self.inner.supports_streaming() {
             return Err(LLMError::NotImplemented(
                 "Streaming not supported by underlying HTTP provider".into(),
@@ -89,7 +128,9 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         self.ensure_credential_fresh().await?;
 
-        let prepared = self.inner.prepare_chat_request(messages, tools, true)?;
+        let prepared = self
+            .inner
+            .prepare_chat_request_with_options(messages, tools, true, options)?;
 
         let stream = match call_outbound_stream_raw(prepared.request).await? {
             OutboundStreamResult::Failure { response } => {

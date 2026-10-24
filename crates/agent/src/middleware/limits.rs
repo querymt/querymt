@@ -528,6 +528,7 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: Default::default(),
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
@@ -557,6 +558,7 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: Default::default(),
         });
 
         let state = ExecutionState::BeforeLlmCall { context };

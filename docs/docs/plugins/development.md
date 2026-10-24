@@ -126,6 +126,45 @@ pub unsafe extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactor
 }
 ```
 
+#### Honouring per-request generation options (optional)
+
+Callers can override `max_tokens` and `reasoning_effort` for one request (see [Chat Interactions](../core/chat.md#per-request-generation-options)). A plugin opts in by overriding two `HTTPChatProvider` methods. Both have defaults, so existing plugins keep working unchanged and simply report no support.
+
+```rust
+use querymt::chat::{ChatMessage, GenerationOptionSupport, GenerationOptions, Tool};
+use querymt::chat::http::{HTTPChatProvider, PreparedChatRequest};
+
+impl HTTPChatProvider for MyProvider {
+    // ... chat_request() and parse_chat() as above ...
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        GenerationOptionSupport::ALL // or set only the fields you honour
+    }
+
+    fn prepare_chat_request_with_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        stream: bool,
+        options: &GenerationOptions,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        // Apply the overrides to a copy of the config, then build the request
+        // as usual, so configured and per-request values share one code path.
+        let mut cfg = self.clone();
+        if let Some(max_tokens) = options.max_tokens {
+            cfg.max_tokens = max_tokens;
+        }
+        cfg.prepare_chat_request(messages, tools, stream)
+    }
+}
+```
+
+Guidelines:
+
+*   Do not mutate `self`. An override must never leak into the next request.
+*   Re-derive anything that depends on an overridden value. For example, Anthropic fits its thinking budget to `max_tokens`, so it recomputes the budget after applying the override.
+*   Requests built without options must stay byte-identical to before.
+
 ### 4. Building the Plugin
 
 Compile your Rust library into a shared object:

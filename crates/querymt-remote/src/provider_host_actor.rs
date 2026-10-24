@@ -179,6 +179,9 @@ impl Message<GetProviderContractInfo> for ProviderHostActor {
         Ok(ProviderContractInfo {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
+            // The host forwards options to whichever provider it builds for the
+            // request; providers that do not honour an option ignore it.
+            generation_options: querymt::chat::GenerationOptionSupport::ALL,
         })
     }
 }
@@ -219,8 +222,9 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
             .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
             let tools_slice = msg.tools.as_deref();
+            let options = msg.options.unwrap_or_default();
             let response = provider
-                .chat_with_tools(&msg.messages, tools_slice)
+                .chat_with_tools_and_options(&msg.messages, tools_slice, &options)
                 .await
                 .map_err(|e| RemoteProviderHostError::provider_chat("chat_with_tools", &e))?;
 
@@ -320,8 +324,9 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                 .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
                 let tools_slice = msg.tools.as_deref();
+                let options = msg.options.unwrap_or_default();
                 let stream = provider
-                    .chat_stream_with_tools(&msg.messages, tools_slice)
+                    .chat_stream_with_tools_and_options(&msg.messages, tools_slice, &options)
                     .await
                     .map_err(|e| {
                         RemoteProviderHostError::provider_chat("chat_stream_with_tools", &e)
@@ -847,3 +852,142 @@ remote_provider_msg_impl!(
     "querymt::GetProviderStreamStatus",
     REG_GET_PROVIDER_STREAM_STATUS
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use kameo::actor::Spawn;
+    use querymt::LLMProvider;
+    use querymt::chat::{
+        ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions, Tool,
+    };
+    use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
+    use querymt::embedding::EmbeddingProvider;
+    use querymt::error::LLMError;
+
+    use crate::{ProviderBuildRequest, RemoteProviderBackend};
+
+    /// Provider that records the per-request options it receives.
+    #[derive(Default)]
+    struct RecordingProvider {
+        seen: Arc<Mutex<Vec<GenerationOptions>>>,
+    }
+
+    #[async_trait]
+    impl ChatProvider for RecordingProvider {
+        async fn chat_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+        ) -> Result<ChatOutput, LLMError> {
+            self.seen.lock().push(GenerationOptions::NONE);
+            Ok(ChatOutput::default())
+        }
+
+        fn supported_generation_options(&self) -> GenerationOptionSupport {
+            GenerationOptionSupport::ALL
+        }
+
+        async fn chat_with_tools_and_options(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&[Tool]>,
+            options: &GenerationOptions,
+        ) -> Result<ChatOutput, LLMError> {
+            self.seen.lock().push(*options);
+            Ok(ChatOutput::default())
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for RecordingProvider {
+        async fn complete(&self, _req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+            Err(LLMError::NotImplemented("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RecordingProvider {
+        async fn embed(&self, _input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Err(LLMError::NotImplemented("unused".into()))
+        }
+    }
+
+    impl LLMProvider for RecordingProvider {}
+
+    struct RecordingBackend {
+        seen: Arc<Mutex<Vec<GenerationOptions>>>,
+    }
+
+    #[async_trait]
+    impl RemoteProviderBackend for RecordingBackend {
+        type Error = RemoteProviderHostError;
+
+        async fn build_provider(
+            &self,
+            _request: ProviderBuildRequest,
+        ) -> Result<Arc<dyn LLMProvider>, Self::Error> {
+            Ok(Arc::new(RecordingProvider {
+                seen: Arc::clone(&self.seen),
+            }))
+        }
+    }
+
+    fn chat_request(options: Option<GenerationOptions>) -> ProviderChatRequest {
+        ProviderChatRequest {
+            provider: "demo".into(),
+            model: "m1".into(),
+            messages: Vec::new(),
+            tools: None,
+            params: None,
+            item_aware_contract_version: None,
+            options,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_request_options_reach_the_backend_provider() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: Arc::clone(&seen),
+        })));
+        let options = GenerationOptions::default().with_max_tokens(64_000);
+
+        actor
+            .ask(chat_request(Some(options)))
+            .await
+            .expect("chat with options");
+
+        assert_eq!(*seen.lock(), [options]);
+    }
+
+    #[tokio::test]
+    async fn chat_request_without_options_keeps_configured_values() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor = ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend {
+            seen: Arc::clone(&seen),
+        })));
+
+        actor
+            .ask(chat_request(None))
+            .await
+            .expect("chat without options");
+
+        assert_eq!(*seen.lock(), [GenerationOptions::NONE]);
+    }
+
+    #[tokio::test]
+    async fn contract_info_advertises_generation_option_support() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let actor =
+            ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend { seen })));
+
+        let info = actor
+            .ask(GetProviderContractInfo)
+            .await
+            .expect("contract info");
+
+        assert_eq!(info.generation_options, GenerationOptionSupport::ALL);
+    }
+}

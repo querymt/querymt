@@ -349,6 +349,8 @@ pub(crate) async fn execute_cycle_state_machine(
     let mut event_rx = config.event_sink.fanout().subscribe();
     let mut stop_hook_continuations = 0u8;
     let mut task_completion_guard_continuations = 0u8;
+    // Times middleware has turned a stop into a continuation this turn.
+    let mut stop_recoveries = 0u8;
     let mut task_completion_tool_available = false;
     let mut llm_request_count = 0u32;
     let mut last_compaction_request_count = None;
@@ -788,6 +790,58 @@ pub(crate) async fn execute_cycle_state_machine(
                         }
                     }
                 }
+
+                // Give middleware the chance to replace the stop with a
+                // continuation. The per-turn guard bounds any recovery loop.
+                if state.context().is_some() {
+                    let max_recoveries = config.execution_policy.max_stop_recoveries;
+                    if stop_recoveries >= max_recoveries {
+                        warn!(
+                            "Session {}: stop recovery limit ({}) reached; publishing stop",
+                            exec_ctx.session_id, max_recoveries
+                        );
+                    } else {
+                        let stopped = std::mem::replace(&mut state, ExecutionState::Cancelled);
+                        let recovered = driver
+                            .run_stopped_cancellable(
+                                stopped,
+                                Some(&exec_ctx.runtime),
+                                &exec_ctx.cancellation_token,
+                            )
+                            .instrument(info_span!(
+                                "agent.execution.middleware.stopped",
+                                session_id = %exec_ctx.session_id
+                            ))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                        match recovered {
+                            ExecutionState::BeforeLlmCall { .. } => {
+                                stop_recoveries += 1;
+                                debug!(
+                                    "Session {}: stop recovered by middleware ({}/{})",
+                                    exec_ctx.session_id, stop_recoveries, max_recoveries
+                                );
+                                state = recovered;
+                                continue;
+                            }
+                            ExecutionState::Cancelled => return Ok(CycleOutcome::Cancelled),
+                            ExecutionState::Stopped { .. } => state = recovered,
+                            other => {
+                                // Not a documented outcome; let the state machine handle it.
+                                state = other;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let ExecutionState::Stopped {
+                    ref message,
+                    stop_type,
+                    ..
+                } = state
+                else {
+                    unreachable!("stop recovery only returns Stopped or diverts above");
+                };
 
                 let metrics = state
                     .context()

@@ -68,7 +68,7 @@ async fn plain_file_and_inline_sections_receive_runtime_cache_defaults() {
         .await
         .unwrap();
     let mut config = serde_json::json!({"system": resolved, "api_mode": "responses"});
-    crate::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6")
+    crate::model_heuristics::ModelDefaults::for_model("openai", "gpt-5.6", None)
         .apply_to(&mut config, "session");
     assert_eq!(config["system"][0]["text"], "stable instructions");
     assert_eq!(
@@ -1458,6 +1458,31 @@ async fn delegate_isolation_defaults_to_inherit_and_isolated_requires_the_servic
     )))
     .await
     .unwrap();
+}
+
+/// The shipped `output_limit_recovery` example loads, and its middleware entry
+/// decodes into the middleware's own config with the documented defaults.
+#[tokio::test]
+async fn output_limit_recovery_example_loads_with_the_documented_defaults() {
+    use crate::middleware::OutputLimitConfig;
+
+    let config = load_config(ConfigSource::Toml(
+        include_str!("../../examples/confs/output_limit_recovery.toml").into(),
+    ))
+    .await
+    .unwrap();
+    let Config::Single(config) = config else {
+        panic!("single config");
+    };
+    let entry = config
+        .middleware
+        .iter()
+        .find(|entry| entry.middleware_type == "output_limit_recovery")
+        .expect("example declares the middleware");
+
+    let cfg: OutputLimitConfig = serde_json::from_value(entry.config.clone()).unwrap();
+    // The example spells out every default, so it must equal them.
+    assert_eq!(cfg, OutputLimitConfig::default());
 }
 
 /// 21.12: the shipped example/embedded profiles only gain commented-out

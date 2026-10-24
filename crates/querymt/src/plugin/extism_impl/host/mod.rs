@@ -5,7 +5,8 @@ use crate::{
     adapters::LLMProviderFromHTTP,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool,
+        ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions,
+        StreamChunk, Tool,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{
@@ -692,6 +693,25 @@ impl ExtismProvider {
         Ok(cfg)
     }
 
+    /// Asks the plugin which per-request options it honours.
+    ///
+    /// Plugins built before per-request options do not export the function and
+    /// report no support, so options are never sent to them.
+    fn plugin_generation_option_support(&self) -> GenerationOptionSupport {
+        let Ok(mut plug) = self.plugin.lock() else {
+            return GenerationOptionSupport::NONE;
+        };
+        if !plug.function_exists("supported_generation_options") {
+            return GenerationOptionSupport::NONE;
+        }
+        plug.call::<_, Json<GenerationOptionSupport>>(
+            "supported_generation_options",
+            Json(self.config.clone()),
+        )
+        .map(|Json(support)| support)
+        .unwrap_or(GenerationOptionSupport::NONE)
+    }
+
     fn call_short_blocking<T, F>(&self, op: &'static str, f: F) -> Result<T, LLMError>
     where
         F: FnOnce(&mut Plugin) -> Result<T, LLMError>,
@@ -814,6 +834,25 @@ impl ChatProvider for ExtismProvider {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<ChatOutput, LLMError> {
+        self.chat_with_tools_and_options(messages, tools, &GenerationOptions::NONE)
+            .await
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        self.plugin_generation_option_support()
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "extism_provider.chat_with_tools_and_options", skip_all)
+    )]
+    async fn chat_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
+        let options = options.non_empty();
         let mut cfg = self.config.clone();
 
         // Refresh OAuth token if resolver is present
@@ -843,6 +882,7 @@ impl ChatProvider for ExtismProvider {
                     messages,
                     tools,
                     item_aware_contract_version,
+                    options,
                 };
                 let out: Json<ExtismChatResponse> = plug
                     .call_get_error_code("chat", Json(arg))
@@ -866,6 +906,24 @@ impl ChatProvider for ExtismProvider {
         std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
         LLMError,
     > {
+        self.chat_stream_with_tools_and_options(messages, tools, &GenerationOptions::NONE)
+            .await
+    }
+
+    #[cfg_attr(
+        feature = "tracing",
+        instrument(name = "extism_provider.chat_stream_with_tools_and_options", skip_all)
+    )]
+    async fn chat_stream_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
+        let options = options.non_empty();
         if !ChatProvider::supports_streaming(self) {
             return Err(LLMError::NotImplemented(
                 "Streaming not supported by this plugin".into(),
@@ -924,6 +982,7 @@ impl ChatProvider for ExtismProvider {
                     messages,
                     tools,
                     item_aware_contract_version,
+                    options,
                 },
                 Err(error) => {
                     log::error!("chat_stream contract probe failed: {:#}", error);
@@ -1297,6 +1356,20 @@ impl HTTPChatProvider for ExtismProvider {
         tools: Option<&[Tool]>,
         stream: bool,
     ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
+        self.prepare_chat_request_with_options(messages, tools, stream, &GenerationOptions::NONE)
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        self.plugin_generation_option_support()
+    }
+
+    fn prepare_chat_request_with_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        stream: bool,
+        options: &GenerationOptions,
+    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
         let item_aware_contract_version = self.validate_item_aware_messages(messages)?;
         let cfg = self.effective_config()?;
         let chat = ExtismChatRequest {
@@ -1304,6 +1377,7 @@ impl HTTPChatProvider for ExtismProvider {
             messages: messages.to_vec(),
             tools: tools.map(<[Tool]>::to_vec),
             item_aware_contract_version,
+            options: options.non_empty(),
         };
         self.call_short_blocking("prepare_chat_request", move |plug| {
             if !plug.function_exists("prepared_chat_contract_version") {
@@ -1396,6 +1470,7 @@ impl HTTPChatProvider for ExtismProvider {
                         messages: messages.to_vec(),
                         tools: tools.map(|v| v.to_vec()),
                         item_aware_contract_version,
+                        options: None,
                     }),
                 )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;
@@ -1433,6 +1508,7 @@ impl HTTPChatProvider for ExtismProvider {
                         messages: messages.to_vec(),
                         tools: tools.map(|v| v.to_vec()),
                         item_aware_contract_version,
+                        options: None,
                     }),
                 )
                 .map_err(|(e, code)| decode_plugin_error(e, code))?;

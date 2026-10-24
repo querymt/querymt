@@ -255,6 +255,15 @@ macro_rules! impl_extism_http_plugin {
             Ok(Json(models))
         }
 
+        // Optional export: hosts only send per-request options to plugins that
+        // advertise support here.
+        #[plugin_fn]
+        pub fn supported_generation_options(
+            Json(cfg): Json<$Config>,
+        ) -> FnResult<Json<querymt::chat::GenerationOptionSupport>> {
+            Ok(Json(HTTPChatProvider::supported_generation_options(&cfg)))
+        }
+
         #[plugin_fn]
         pub fn prepared_chat_contract_version() -> FnResult<Json<u32>> {
             Ok(Json(querymt::plugin::extism_impl::PREPARED_CHAT_CONTRACT_VERSION))
@@ -264,10 +273,12 @@ macro_rules! impl_extism_http_plugin {
         pub fn prepare_chat_request(
             Json(input): Json<querymt::plugin::extism_impl::ExtismChatPrepareRequest<$Config>>,
         ) -> FnResult<Json<querymt::plugin::extism_impl::ExtismPreparedChatRequest>> {
-            let prepared = input.chat.cfg.prepare_chat_request(
+            let options = input.chat.options.unwrap_or_default();
+            let prepared = input.chat.cfg.prepare_chat_request_with_options(
                 &input.chat.messages,
                 input.chat.tools.as_deref(),
                 input.stream,
+                &options,
             ).map_err(llm_err_to_pdk)?;
             Ok(Json(querymt::plugin::extism_impl::ExtismPreparedChatRequest {
                 request: querymt::plugin::extism_impl::SerializableHttpRequest { req: prepared.request },

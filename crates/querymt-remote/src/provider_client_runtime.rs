@@ -4,6 +4,7 @@ use crate::{
     ProviderStreamStatus, RemoteProviderClientConfig, StreamRelayMessage,
 };
 use async_trait::async_trait;
+use querymt::chat::{GenerationOptionSupport, GenerationOptions};
 use querymt::error::{LLMError, TransportErrorKind};
 use std::future::Future;
 use std::pin::Pin;
@@ -238,13 +239,37 @@ where
         self.config.build_chat_request(messages, tools)
     }
 
+    /// Per-request generation options the remote peer forwards to its provider.
+    ///
+    /// Known only after the contract handshake. Until then this is optimistic
+    /// (all options): a peer that predates options ignores the unknown wire
+    /// field, and the handshake then downgrades this to none.
+    pub fn generation_option_support(&self) -> GenerationOptionSupport {
+        self.contract_info
+            .get()
+            .map_or(GenerationOptionSupport::ALL, |info| info.generation_options)
+    }
+
     pub async fn chat_with_tools(
         &self,
         messages: &[querymt::chat::ChatMessage],
         tools: Option<&[querymt::chat::Tool]>,
         should_retry: impl Fn(&LLMError) -> bool,
     ) -> Result<ProviderChatResponse, LLMError> {
-        let request = self.build_chat_request(messages, tools);
+        self.chat_with_tools_and_options(messages, tools, &GenerationOptions::NONE, should_retry)
+            .await
+    }
+
+    pub async fn chat_with_tools_and_options(
+        &self,
+        messages: &[querymt::chat::ChatMessage],
+        tools: Option<&[querymt::chat::Tool]>,
+        options: &GenerationOptions,
+        should_retry: impl Fn(&LLMError) -> bool,
+    ) -> Result<ProviderChatResponse, LLMError> {
+        let request = self
+            .config
+            .build_chat_request_with_options(messages, tools, options);
         let host = self.lookup_host().await?;
         self.validate_contract(&host, request.item_aware_contract_version)
             .await?;
@@ -261,9 +286,32 @@ where
         remote_router_ref: TTransport::RemoteRouterRef,
         reconnect_grace_secs: u64,
     ) -> ProviderStreamRequest<TTransport::RemoteRouterRef> {
-        self.config.build_stream_request(
+        self.build_stream_request_with_options(
             messages,
             tools,
+            &GenerationOptions::NONE,
+            session_id,
+            request_id,
+            remote_router_ref,
+            reconnect_grace_secs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_stream_request_with_options(
+        &self,
+        messages: &[querymt::chat::ChatMessage],
+        tools: Option<&[querymt::chat::Tool]>,
+        options: &GenerationOptions,
+        session_id: String,
+        request_id: String,
+        remote_router_ref: TTransport::RemoteRouterRef,
+        reconnect_grace_secs: u64,
+    ) -> ProviderStreamRequest<TTransport::RemoteRouterRef> {
+        self.config.build_stream_request_with_options(
+            messages,
+            tools,
+            options,
             session_id,
             request_id,
             remote_router_ref,
@@ -737,6 +785,7 @@ mod tests {
         let (transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION),
+            generation_options: Default::default(),
         });
 
         core.validate_contract(&(), None).await.unwrap();
@@ -750,6 +799,7 @@ mod tests {
         let (_transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: None,
+            generation_options: Default::default(),
         });
 
         let error = core.validate_contract(&(), None).await.unwrap_err();
@@ -768,6 +818,7 @@ mod tests {
             ProviderContractInfo {
                 item_aware_chat_version: None,
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
+                generation_options: Default::default(),
             },
             Some(transport_error),
         );
@@ -790,6 +841,7 @@ mod tests {
             ProviderContractInfo {
                 item_aware_chat_version: None,
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
+                generation_options: Default::default(),
             },
             Some(TransportErrorKind::Timeout),
         );
@@ -808,6 +860,7 @@ mod tests {
         let (transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION + 1),
+            generation_options: Default::default(),
         });
 
         let error = core.validate_contract(&(), None).await.unwrap_err();
@@ -824,6 +877,7 @@ mod tests {
         *transport.contract_info.lock().unwrap() = ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION),
+            generation_options: Default::default(),
         };
         core.validate_contract(&(), None).await.unwrap();
         assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);

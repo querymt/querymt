@@ -17,7 +17,7 @@ use crate::events::{
 };
 use crate::middleware::{
     ExecutionState, LlmResponse, PreparedModelRequest, ToolCall as MiddlewareToolCall,
-    ToolFunction, ToolResult, calculate_context_tokens,
+    ToolFunction, ToolResult, apply_usage_to_stats, calculate_context_tokens,
 };
 use crate::model::{AgentMessage, MessagePart};
 use anyhow::Context as _;
@@ -191,6 +191,7 @@ pub(super) async fn transition_before_llm_call(
             messages: Arc::from(messages.into_boxed_slice()),
             tools: Arc::from(tools.into_boxed_slice()),
             estimated_tokens,
+            options: context.request_overrides,
         }),
     })
 }
@@ -269,6 +270,44 @@ fn validate_stream_terminal(
     }
 
     Ok(finish_reason)
+}
+
+/// Result text for a tool call that was not executed because the reply was incomplete.
+///
+/// A length cut-off tells the model how to avoid it next time; any other
+/// incomplete cause keeps the generic wording.
+fn skipped_call_text(finish_reason: Option<FinishReason>, detail: &str) -> String {
+    match finish_reason {
+        Some(FinishReason::Length) => {
+            "Error: tool call skipped because the response was truncated \
+by the output token limit; split the write into smaller calls."
+                .to_string()
+        }
+        _ => format!("Error: tool call skipped because the response was incomplete. {detail}"),
+    }
+}
+
+/// Persist synthesized tool results, then stop the run on the output token limit.
+///
+/// A length cut-off must end in `Stopped` (so stop recovery can act on it), but
+/// the skipped results still have to be stored to keep the
+/// tool_use/tool_result history invariant.
+async fn store_results_then_stop_on_length(
+    config: &AgentConfig,
+    results: Arc<[ToolResult]>,
+    context: Arc<crate::middleware::ConversationContext>,
+    exec_ctx: &mut ExecutionContext,
+) -> Result<ExecutionState, anyhow::Error> {
+    let next =
+        super::tool_calls::store_all_tool_results(config, &results, &context, exec_ctx).await?;
+    Ok(match next {
+        ExecutionState::BeforeLlmCall { context } => ExecutionState::Stopped {
+            message: "Model hit token limit".into(),
+            stop_type: StopType::ModelTokenLimit,
+            context: Some(context),
+        },
+        other => other,
+    })
 }
 
 /// Wrap an accumulator violation as a transient provider stream failure.
@@ -603,6 +642,22 @@ pub(super) async fn transition_call_llm(
         return Ok(ExecutionState::Cancelled);
     }
 
+    // Overrides last for exactly this request; unsupported ones are dropped (and
+    // logged) so the event reports the cap that was really requested.
+    let options = exec_ctx
+        .session_handle
+        .honoured_overrides(request.options)
+        .await;
+    let caps = exec_ctx.output_caps().await;
+    let max_tokens = options.max_tokens.or(caps.map(|caps| caps.initial));
+    // Middleware only sees the runtime; give it what this request was sent with.
+    *exec_ctx.runtime.last_llm_request.lock() = crate::agent::core::LastLlmRequest {
+        max_tokens,
+        caps,
+        supported: exec_ctx.session_handle.generation_option_support().await,
+        reasoning_effort: exec_ctx.session_handle.configured_reasoning_effort(),
+        pricing: exec_ctx.session_handle.get_pricing(),
+    };
     config.emit_event(
         session_id,
         AgentEventKind::LlmRequestStart {
@@ -611,6 +666,7 @@ pub(super) async fn transition_call_llm(
                 "request_messages.len",
                 Some(session_id),
             ),
+            max_tokens,
         },
     );
 
@@ -636,7 +692,7 @@ pub(super) async fn transition_call_llm(
                 let cancel = cancel.clone();
                 async move {
                     tokio::select! {
-                        result = session_handle.submit_request(messages_with_cache) => {
+                        result = session_handle.submit_request_with_options(messages_with_cache, options) => {
                             result
                         }
                         _ = cancel.cancelled() => {
@@ -812,7 +868,11 @@ pub(super) async fn transition_call_llm(
 
                 first_chunk.start();
                 let mut stream = match provider
-                    .chat_stream_with_tools(messages_with_cache, Some(tools.as_ref()))
+                    .chat_stream_with_tools_and_options(
+                        messages_with_cache,
+                        Some(tools.as_ref()),
+                        &options,
+                    )
                     .await
                 {
                     Ok(stream) => stream,
@@ -1185,10 +1245,11 @@ pub(super) async fn transition_call_llm(
                     let provider = &provider;
                     let messages_with_cache = &messages_with_cache;
                     let tools = tools.as_ref();
+                    let options = &options;
                     let cancel = cancel.clone();
                     async move {
                         tokio::select! {
-                            result = provider.chat_with_tools(messages_with_cache, Some(tools)) => {
+                            result = provider.chat_with_tools_and_options(messages_with_cache, Some(tools), options) => {
                                 result
                             }
                             _ = cancel.cancelled() => {
@@ -1286,9 +1347,16 @@ pub(super) async fn transition_call_llm(
         llm_response = llm_response.with_message_id(mid);
     }
 
+    // The overrides were consumed by this request; later states must not see them.
+    let context = if context.request_overrides.is_empty() {
+        context.clone()
+    } else {
+        Arc::new(context.without_request_overrides())
+    };
+
     Ok(ExecutionState::AfterLlm {
         response: Arc::new(llm_response),
-        context: context.clone(),
+        context,
     })
 }
 
@@ -1415,53 +1483,62 @@ pub(super) async fn transition_after_llm(
         source_model: Some(context.model.to_string()),
     };
 
-    exec_ctx
-        .add_message(assistant_msg.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
+    // A thinking-only reply cut off by the output limit is not history: it is
+    // neither persisted nor announced, but its usage below is still counted.
+    let store_reply = !response.is_thinking_only_length_cutoff();
+    if store_reply {
+        exec_ctx
+            .add_message(assistant_msg.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to store assistant message: {}", e))?;
 
-    let reasoning_parts = response
-        .output
-        .as_ref()
-        .map(reasoning_parts_from_output)
-        .unwrap_or_default();
-    config.emit_event(
-        &exec_ctx.session_id,
-        AgentEventKind::AssistantMessageStored {
-            content: response.content.clone(),
-            thinking: response.thinking.clone(),
-            reasoning_parts,
-            message_id: Some(assistant_msg.id.clone()),
-        },
-    );
+        let reasoning_parts = response
+            .output
+            .as_ref()
+            .map(reasoning_parts_from_output)
+            .unwrap_or_default();
+        config.emit_event(
+            &exec_ctx.session_id,
+            AgentEventKind::AssistantMessageStored {
+                content: response.content.clone(),
+                thinking: response.thinking.clone(),
+                reasoning_parts,
+                message_id: Some(assistant_msg.id.clone()),
+            },
+        );
+    } else {
+        debug!(
+            "Not storing thinking-only reply cut off by the output limit: session={}",
+            exec_ctx.session_id
+        );
+    }
 
     let mut messages = (*context.messages).to_vec();
-    // Same-turn continuation is still talking to the provider that just
-    // produced this output. Re-converting through `to_chat_message()` with no
-    // target treats the destination as unknown and portable-projects encrypted
-    // reasoning away before the tool result is appended.
-    messages.push(if let Some(output) = structured_output.clone() {
-        ChatMessage::from_assistant_output(output)
-    } else {
-        assistant_msg
-            .to_chat_message()
-            .map_err(|error| anyhow::anyhow!("Invalid stored assistant content: {error}"))?
-    });
+    if store_reply {
+        // Same-turn continuation is still talking to the provider that just
+        // produced this output. Re-converting through `to_chat_message()` with no
+        // target treats the destination as unknown and portable-projects encrypted
+        // reasoning away before the tool result is appended.
+        messages.push(if let Some(output) = structured_output.clone() {
+            ChatMessage::from_assistant_output(output)
+        } else {
+            assistant_msg
+                .to_chat_message()
+                .map_err(|error| anyhow::anyhow!("Invalid stored assistant content: {error}"))?
+        });
+    }
 
     let mut updated_stats = (*context.stats).clone();
     updated_stats.steps += 1;
-    if let Some(token_usage) = &response.usage {
-        updated_stats.total_input_tokens += token_usage.input_tokens as u64;
-        updated_stats.total_output_tokens += token_usage.output_tokens as u64;
-        updated_stats.reasoning_tokens += token_usage.reasoning_tokens as u64;
-        updated_stats.cache_read_tokens += token_usage.cache_read as u64;
-        updated_stats.cache_write_tokens += token_usage.cache_write as u64;
-        updated_stats.context_tokens = calculate_context_tokens(Some(token_usage)) as usize;
-
-        if let Some(pricing) = exec_ctx.session_handle.get_pricing() {
-            updated_stats.update_costs(&pricing);
-        }
-    }
+    let pricing = response
+        .usage
+        .as_ref()
+        .and_then(|_| exec_ctx.session_handle.get_pricing());
+    apply_usage_to_stats(
+        &mut updated_stats,
+        response.usage.as_ref(),
+        pricing.as_ref(),
+    );
 
     let new_context = Arc::new(
         crate::middleware::ConversationContext::new(
@@ -1500,22 +1577,29 @@ pub(super) async fn transition_after_llm(
             .as_ref()
             .map(|_| "response is incomplete".to_string())
             .unwrap_or_default();
-        let skipped: Vec<ToolResult> =
+        let skipped_text = skipped_call_text(response.finish_reason, &detail);
+        let is_length_cutoff = response.finish_reason == Some(FinishReason::Length);
+        // A call cut off mid-arguments fails JSON gating; for a length cut-off
+        // every call gets the split-the-write guidance instead of the generic
+        // "invalid arguments" text. (`tool_calls` is already de-duplicated.)
+        let to_skip: Vec<MiddlewareToolCall> = if is_length_cutoff {
+            gated_results.clear();
+            executable_calls.clear();
+            response.tool_calls.clone()
+        } else {
             std::mem::take(&mut executable_calls)
-                .into_iter()
-                .map(|call| {
-                    ToolResult::new(
-                        call.id.clone(),
-                        vec![querymt::chat::ToolResultPart::Text { text: format!(
-                        "Error: tool call skipped because the response was incomplete. {detail}"
-                    ).to_string() }],
-                        true,
-                        Some(call.function.name.clone()),
-                        Some(call.function.arguments.clone()),
-                    )
-                })
-                .collect();
-        gated_results.extend(skipped);
+        };
+        gated_results.extend(to_skip.into_iter().map(|call| {
+            ToolResult::new(
+                call.id,
+                vec![querymt::chat::ToolResultPart::Text {
+                    text: skipped_text.clone(),
+                }],
+                true,
+                Some(call.function.name),
+                Some(call.function.arguments),
+            )
+        }));
 
         if gated_results.is_empty() {
             let (message, stop_type) = match response.finish_reason {
@@ -1536,11 +1620,17 @@ pub(super) async fn transition_after_llm(
             });
         }
 
-        // Store the synthesized results (no execution) before stopping by
-        // routing through the tool-result storage step with no remaining calls.
+        let results: Arc<[ToolResult]> = Arc::from(gated_results.into_boxed_slice());
+
+        if response.finish_reason == Some(FinishReason::Length) {
+            return store_results_then_stop_on_length(config, results, new_context, exec_ctx).await;
+        }
+
+        // Store the synthesized results (no execution) by routing through the
+        // tool-result storage step with no remaining calls.
         return Ok(ExecutionState::ProcessingToolCalls {
             remaining_calls: Arc::from(Vec::new().into_boxed_slice()),
-            results: Arc::from(gated_results.into_boxed_slice()),
+            results,
             context: new_context,
         });
     }
@@ -1946,6 +2036,7 @@ mod tests {
                 messages: vec![ChatMessage::user().text("SECRET_PROMPT").build()].into(),
                 tools: Arc::from([]),
                 estimated_tokens: 1,
+                options: Default::default(),
             })
         }
 
@@ -2098,6 +2189,7 @@ mod tests {
                             messages: Arc::from(messages),
                             tools: Arc::from([]),
                             estimated_tokens: 1,
+                            options: Default::default(),
                         })
                     };
                     transition_call_llm(&config, &context, &request, &exec).await
@@ -2130,12 +2222,38 @@ mod tests {
             attempts: Arc<std::sync::Mutex<std::collections::VecDeque<TimedChunks>>>,
             clock: Arc<std::sync::Mutex<(Option<Instant>, Option<f64>)>>,
             streaming: bool,
+            /// Per-request options each physical request was sent with.
+            options_seen: Arc<std::sync::Mutex<Vec<querymt::chat::GenerationOptions>>>,
+            /// Options the provider claims to honour.
+            support: Arc<std::sync::Mutex<querymt::chat::GenerationOptionSupport>>,
         }
 
         #[async_trait::async_trait]
         impl querymt::chat::ChatProvider for TimedProvider {
             fn supports_streaming(&self) -> bool {
                 self.streaming
+            }
+            fn supported_generation_options(&self) -> querymt::chat::GenerationOptionSupport {
+                *self.support.lock().unwrap()
+            }
+            async fn chat_with_tools_and_options(
+                &self,
+                messages: &[ChatMessage],
+                tools: Option<&[querymt::chat::Tool]>,
+                options: &querymt::chat::GenerationOptions,
+            ) -> Result<ChatOutput, LLMError> {
+                self.options_seen.lock().unwrap().push(*options);
+                self.chat_with_tools(messages, tools).await
+            }
+            async fn chat_stream_with_tools_and_options(
+                &self,
+                messages: &[ChatMessage],
+                tools: Option<&[querymt::chat::Tool]>,
+                options: &querymt::chat::GenerationOptions,
+            ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
+            {
+                self.options_seen.lock().unwrap().push(*options);
+                self.chat_stream_with_tools(messages, tools).await
             }
             async fn chat_with_tools(
                 &self,
@@ -2273,6 +2391,8 @@ mod tests {
                     streaming,
                     attempts: Arc::new(std::sync::Mutex::new(attempts.into())),
                     clock: Default::default(),
+                    options_seen: Default::default(),
+                    support: Default::default(),
                 },
                 binding: std::sync::Mutex::new(
                     serde_json::json!({"temperature":0.25, "max_tokens":123, "top_p":0.75}),
@@ -2309,6 +2429,684 @@ mod tests {
                 fixture.config.clone(),
             ));
             (fixture, factory)
+        }
+
+        /// Run one streamed reply through `transition_call_llm` and
+        /// `transition_after_llm`, returning the final state and every event
+        /// that was emitted meanwhile.
+        async fn run_streamed_reply(
+            chunks: Vec<StreamChunk>,
+        ) -> (
+            ExecutionState,
+            Vec<crate::events::AgentEventKind>,
+            Arc<TimedFactory>,
+        ) {
+            let attempts = vec![Ok(chunks.into_iter().map(|chunk| (0, Ok(chunk))).collect())];
+            let (fixture, factory) = timed_fixture(true, attempts, "openai", None).await;
+            let mut events = fixture.config.subscribe_events();
+            let mut exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+
+            // Tools must be present: a tool-less request takes the non-streaming path.
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![serde_json::from_value(serde_json::json!({
+                "type": "function",
+                "function": {"name": "write_file", "description": "", "parameters": {"type": "object"}}
+            }))
+            .unwrap()]
+            .into();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
+                .await
+                .expect("call llm");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after llm");
+
+            let mut seen = Vec::new();
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                seen.push(envelope.kind().clone());
+            }
+            (state, seen, factory)
+        }
+
+        #[tokio::test]
+        async fn length_cutoff_inside_tool_call_skips_the_call_and_stops_without_retry() {
+            // One call completes, a second is cut off mid-arguments. The
+            // incomplete reply must not execute the completed call either.
+            let (state, events, factory) = run_streamed_reply(vec![
+                StreamChunk::ToolUseStart {
+                    index: 0,
+                    id: "call_0".into(),
+                    name: "write_file".into(),
+                },
+                StreamChunk::ToolUseComplete {
+                    index: 0,
+                    tool_call: ToolCall {
+                        id: "call_0".into(),
+                        call_type: "function".into(),
+                        function: querymt::FunctionCall {
+                            name: "write_file".into(),
+                            arguments: "{\"path\":\"a.rs\"}".into(),
+                        },
+                    },
+                    extensions: Default::default(),
+                },
+                StreamChunk::ToolUseStart {
+                    index: 1,
+                    id: "call_1".into(),
+                    name: "write_file".into(),
+                },
+                StreamChunk::ToolUseInputDelta {
+                    index: 1,
+                    partial_json: "{\"path\":\"b.rs\",\"content\":\"fn main() {".into(),
+                },
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Length,
+                },
+            ])
+            .await;
+
+            assert!(
+                !events
+                    .iter()
+                    .any(|kind| matches!(kind, crate::events::AgentEventKind::LlmRetryWait { .. })),
+                "a length cut-off must not be retried as a transient stream failure"
+            );
+            assert!(
+                factory.provider.attempts.lock().unwrap().is_empty(),
+                "exactly one physical attempt is expected"
+            );
+
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+
+            let context = context.expect("stopped state keeps its context");
+            let result_text = context
+                .messages
+                .iter()
+                .filter(|message| message.has_tool_result())
+                .map(|message| format!("{message:?}"))
+                .collect::<String>();
+            assert!(
+                result_text.contains("split the write into smaller calls"),
+                "skipped result must tell the model to split the write: {result_text}"
+            );
+        }
+
+        fn write_file_tool() -> querymt::chat::Tool {
+            serde_json::from_value(serde_json::json!({
+                "type": "function",
+                "function": {"name": "write_file", "description": "", "parameters": {"type": "object"}}
+            }))
+            .unwrap()
+        }
+
+        fn stop_chunks() -> Vec<(u64, Result<StreamChunk, LLMError>)> {
+            vec![(
+                0,
+                Ok(StreamChunk::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
+            )]
+        }
+
+        #[tokio::test]
+        async fn before_llm_call_copies_context_overrides_into_the_request() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let context = Arc::new(
+                (*crate::test_utils::test_context(&exec.session_id, 0))
+                    .clone()
+                    .with_request_overrides(overrides),
+            );
+
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { request, .. } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            assert_eq!(request.options, overrides);
+        }
+
+        #[tokio::test]
+        async fn override_applies_to_exactly_one_request() {
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![Ok(stop_chunks()), Ok(stop_chunks())],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let mut events = fixture.config.subscribe_events();
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let context = Arc::new(
+                (*crate::test_utils::test_context(&exec.session_id, 0))
+                    .clone()
+                    .with_request_overrides(overrides),
+            );
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            prepared.options = overrides;
+
+            let state = transition_call_llm(
+                &fixture.config,
+                &context,
+                &Arc::new(prepared.clone()),
+                &exec,
+            )
+            .await
+            .expect("first request");
+            let ExecutionState::AfterLlm { context: next, .. } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            assert!(
+                next.request_overrides.is_empty(),
+                "the consumed override must not carry into the next state"
+            );
+
+            // The follow-up request is prepared from the cleared context.
+            prepared.options = next.request_overrides;
+            transition_call_llm(&fixture.config, &next, &Arc::new(prepared), &exec)
+                .await
+                .expect("second request");
+
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![overrides, querymt::chat::GenerationOptions::NONE]
+            );
+
+            let mut caps = Vec::new();
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                if let crate::events::AgentEventKind::LlmRequestStart { max_tokens, .. } =
+                    envelope.kind()
+                {
+                    caps.push(*max_tokens);
+                }
+            }
+            assert_eq!(caps.first(), Some(&Some(64_000)));
+            assert_ne!(caps.get(1), Some(&Some(64_000)));
+        }
+
+        #[tokio::test]
+        async fn override_is_skipped_for_providers_that_do_not_support_it() {
+            let (fixture, factory) =
+                timed_fixture(true, vec![Ok(stop_chunks())], "openai", None).await;
+            // `support` defaults to none.
+            let mut events = fixture.config.subscribe_events();
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            prepared.options = overrides;
+
+            transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
+                .await
+                .expect("request");
+
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![querymt::chat::GenerationOptions::NONE],
+                "unsupported overrides must not reach the provider"
+            );
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                if let crate::events::AgentEventKind::LlmRequestStart { max_tokens, .. } =
+                    envelope.kind()
+                {
+                    assert_ne!(
+                        *max_tokens,
+                        Some(64_000),
+                        "event reports the cap really sent"
+                    );
+                }
+            }
+        }
+
+        fn text_reply(text: &str, finish_reason: FinishReason) -> TimedChunks {
+            Ok(vec![
+                (0, Ok(StreamChunk::Text(text.into()))),
+                (0, Ok(StreamChunk::Done { finish_reason })),
+            ])
+        }
+
+        #[tokio::test]
+        async fn escalated_request_uses_the_ceiling_and_history_keeps_only_the_second_reply() {
+            use crate::middleware::MiddlewareDriver;
+
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![
+                    text_reply("first, cut off", FinishReason::Length),
+                    text_reply("second, complete", FinishReason::Stop),
+                ],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let mut events = fixture.config.subscribe_events();
+            let mut exec = fixture.execution_context().await;
+            exec.session_handle
+                .override_output_caps(crate::model_heuristics::OutputCaps {
+                    initial: 32_000,
+                    ceiling: 128_000,
+                })
+                .await;
+            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+
+            // First request: cut off at the initial cap.
+            let state = transition_call_llm(
+                &fixture.config,
+                &context,
+                &Arc::new(prepared.clone()),
+                &exec,
+            )
+            .await
+            .expect("first request");
+            assert_eq!(state.name(), "AfterLlm");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware");
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected escalation to BeforeLlmCall, got {}", state.name());
+            };
+            assert_eq!(context.request_overrides.max_tokens, Some(128_000));
+
+            // Retry: same request at the ceiling.
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            // The fixture config has no tools; restore the first request's so the
+            // retry takes the same streaming path.
+            let mut retry = (*request).clone();
+            retry.tools = prepared.tools.clone();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec)
+                .await
+                .expect("second request");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after llm");
+
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![
+                    querymt::chat::GenerationOptions::NONE,
+                    querymt::chat::GenerationOptions::NONE.with_max_tokens(128_000),
+                ]
+            );
+            let history = state
+                .context()
+                .expect("final state keeps its context")
+                .messages
+                .iter()
+                .map(|message| format!("{message:?}"))
+                .collect::<String>();
+            assert!(history.contains("second, complete"), "{history}");
+            assert!(
+                !history.contains("first, cut off"),
+                "the discarded reply must not reach history: {history}"
+            );
+
+            let mut caps = Vec::new();
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                if let crate::events::AgentEventKind::LlmRequestStart { max_tokens, .. } =
+                    envelope.kind()
+                {
+                    caps.push(*max_tokens);
+                }
+            }
+            assert_eq!(caps, vec![Some(32_000), Some(128_000)]);
+        }
+
+        fn thinking_reply(finish_reason: FinishReason) -> TimedChunks {
+            Ok(vec![
+                (0, Ok(StreamChunk::Thinking("pondering the file".into()))),
+                (0, Ok(StreamChunk::Done { finish_reason })),
+            ])
+        }
+
+        /// Replays the sequence that motivated output-limit recovery: a
+        /// thinking-only cut-off, an escalation, another cut-off at the
+        /// ceiling, a continuation, and finally a normal reply.
+        #[tokio::test]
+        async fn thinking_only_cutoff_escalates_then_continues_then_succeeds() {
+            use crate::middleware::MiddlewareDriver;
+            use querymt::chat::{GenerationOptions, ReasoningEffort};
+
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![
+                    thinking_reply(FinishReason::Length),
+                    thinking_reply(FinishReason::Length),
+                    text_reply("done", FinishReason::Stop),
+                ],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let mut exec = fixture.execution_context().await;
+            exec.session_handle
+                .override_output_caps(crate::model_heuristics::OutputCaps {
+                    initial: 32_000,
+                    ceiling: 128_000,
+                })
+                .await;
+            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
+            let instruction_marker = "cut off by the output-token limit";
+
+            // Request 1: initial cap, thinking only, cut off -> escalate.
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let mut prepared = (*request()).clone();
+            prepared.tools = tools.clone();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
+                .await
+                .expect("request 1");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware 1");
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected escalation, got {}", state.name());
+            };
+            assert_eq!(context.request_overrides.max_tokens, Some(128_000));
+
+            // Request 2: ceiling, thinking only again -> not escalated twice, stops.
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before 2");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            let mut retry = (*request).clone();
+            retry.tools = tools.clone();
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(retry), &exec)
+                .await
+                .expect("request 2");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware 2");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after 2");
+            assert!(
+                matches!(
+                    state,
+                    ExecutionState::Stopped {
+                        stop_type: StopType::ModelTokenLimit,
+                        ..
+                    }
+                ),
+                "got {}",
+                state.name()
+            );
+
+            // Stop -> continuation with instruction, ceiling and lowered effort.
+            let state = middleware
+                .on_stopped(state, Some(&exec.runtime))
+                .await
+                .expect("on_stopped");
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected continuation, got {}", state.name());
+            };
+            assert_eq!(
+                context.request_overrides,
+                GenerationOptions::NONE
+                    .with_max_tokens(128_000)
+                    .with_reasoning_effort(ReasoningEffort::Medium)
+            );
+
+            // Request 3: carries the instruction and succeeds.
+            let state = transition_before_llm_call(&fixture.config, &context, &exec)
+                .await
+                .expect("before 3");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| format!("{message:?}").contains(instruction_marker)),
+                "continuation request must include the instruction"
+            );
+            let mut last = (*request).clone();
+            last.tools = tools;
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(last), &exec)
+                .await
+                .expect("request 3");
+            let state = middleware
+                .on_after_llm(state, Some(&exec.runtime))
+                .await
+                .expect("middleware 3");
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            assert!(
+                context
+                    .fragments
+                    .iter()
+                    .all(|f| f.key != "output_limit_recovery"),
+                "instruction must be gone after the normal reply"
+            );
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after 3");
+
+            assert_eq!(state.name(), "Complete");
+            assert_eq!(
+                *factory.provider.options_seen.lock().unwrap(),
+                vec![
+                    GenerationOptions::NONE,
+                    GenerationOptions::NONE.with_max_tokens(128_000),
+                    GenerationOptions::NONE
+                        .with_max_tokens(128_000)
+                        .with_reasoning_effort(ReasoningEffort::Medium),
+                ]
+            );
+            let history = state
+                .context()
+                .expect("final context")
+                .messages
+                .iter()
+                .map(|message| format!("{message:?}"))
+                .collect::<String>();
+            assert!(history.contains("done"), "{history}");
+            assert!(
+                !history.contains("pondering the file"),
+                "thinking-only replies must not be stored: {history}"
+            );
+        }
+
+        fn reasoning_item(text: &str) -> ChatOutputItem {
+            ChatOutputItem::Reasoning(querymt::chat::ChatReasoningItem {
+                id: None,
+                summary: Vec::new(),
+                content: vec![querymt::chat::ChatReasoningPart::text(text.to_string())],
+                encrypted_content: None,
+                signature: None,
+                status: None,
+                extensions: Default::default(),
+            })
+        }
+
+        /// Feed a `Length` reply with the given items through `transition_after_llm`.
+        /// Returns the resulting state and whether `AssistantMessageStored` was emitted.
+        async fn after_length_reply(
+            items: Vec<ChatOutputItem>,
+            content: &str,
+            thinking: Option<&str>,
+        ) -> (ExecutionState, bool) {
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(
+                MockLlmProvider::new(),
+                vec![],
+            ))
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            let mut exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let usage = Usage {
+                input_tokens: 10,
+                output_tokens: 32_000,
+                ..Usage::default()
+            };
+            let output = ChatOutput {
+                items,
+                usage: Some(usage.clone()),
+                finish_reason: Some(FinishReason::Length),
+                ..ChatOutput::default()
+            };
+            let response = Arc::new(
+                LlmResponse::new(
+                    content.to_string(),
+                    Vec::new(),
+                    Some(usage),
+                    Some(FinishReason::Length),
+                )
+                .with_thinking(thinking.map(str::to_owned))
+                .with_output(Some(output)),
+            );
+
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .expect("after llm");
+
+            let mut stored = false;
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                stored |= matches!(
+                    envelope.kind(),
+                    crate::events::AgentEventKind::AssistantMessageStored { .. }
+                );
+            }
+            (state, stored)
+        }
+
+        #[tokio::test]
+        async fn thinking_only_length_reply_is_not_stored_but_is_counted() {
+            let (state, stored) =
+                after_length_reply(vec![reasoning_item("pondering")], "", Some("pondering")).await;
+
+            assert!(
+                !stored,
+                "no AssistantMessageStored for a thinking-only cut-off"
+            );
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+            let context = context.expect("context kept");
+            assert!(
+                context.messages.is_empty(),
+                "the reply must not enter history"
+            );
+            assert_eq!(context.stats.steps, 1);
+            assert_eq!(context.stats.total_output_tokens, 32_000);
+            assert_eq!(context.stats.total_input_tokens, 10);
+        }
+
+        #[tokio::test]
+        async fn mixed_length_reply_with_text_is_still_stored() {
+            let message = ChatOutputItem::Message(querymt::chat::ChatMessageItem {
+                id: None,
+                role: ChatRole::Assistant,
+                phase: None,
+                status: None,
+                parts: vec![querymt::chat::ChatMessagePart::Text {
+                    text: "partial".into(),
+                    annotations: Vec::new(),
+                    extensions: Default::default(),
+                }],
+                extensions: Default::default(),
+            });
+            let (state, stored) = after_length_reply(
+                vec![reasoning_item("pondering"), message],
+                "partial",
+                Some("pondering"),
+            )
+            .await;
+
+            assert!(stored, "a reply with visible text is kept");
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+            assert_eq!(context.expect("context kept").messages.len(), 1);
+        }
+
+        #[test]
+        fn thinking_only_classification_requires_length_and_no_visible_output() {
+            let reasoning_only = ChatOutput {
+                items: vec![reasoning_item("x")],
+                ..ChatOutput::default()
+            };
+            let cut = |finish| {
+                LlmResponse::new(String::new(), Vec::new(), None, Some(finish))
+                    .with_output(Some(reasoning_only.clone()))
+            };
+            assert!(cut(FinishReason::Length).is_thinking_only_length_cutoff());
+            assert!(!cut(FinishReason::Stop).is_thinking_only_length_cutoff());
+
+            let with_call = LlmResponse::new(
+                String::new(),
+                vec![middleware_call("call_1", "{}")],
+                None,
+                Some(FinishReason::Length),
+            );
+            assert!(!with_call.is_thinking_only_length_cutoff());
+        }
+
+        #[tokio::test]
+        async fn non_length_incomplete_tool_call_keeps_the_generic_skip_text() {
+            let text = skipped_call_text(Some(FinishReason::ContentFilter), "detail");
+            assert!(text.contains("response was incomplete"));
+            assert!(!text.contains("split the write"));
         }
 
         #[tokio::test]

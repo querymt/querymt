@@ -307,7 +307,14 @@ mod tests {
                     message_id: None,
                 },
             ),
-            make_event(2, 101, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                2,
+                101,
+                AgentEventKind::LlmRequestStart {
+                    message_count: 1,
+                    max_tokens: None,
+                },
+            ),
             make_event(
                 3,
                 102,
@@ -358,7 +365,14 @@ mod tests {
                     message_id: None,
                 },
             ),
-            make_event(2, 101, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                2,
+                101,
+                AgentEventKind::LlmRequestStart {
+                    message_count: 1,
+                    max_tokens: None,
+                },
+            ),
             make_event(
                 3,
                 102,
@@ -429,7 +443,14 @@ mod tests {
                     message_id: None,
                 },
             ),
-            make_event(2, 101, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                2,
+                101,
+                AgentEventKind::LlmRequestStart {
+                    message_count: 1,
+                    max_tokens: None,
+                },
+            ),
             make_event(
                 3,
                 102,
@@ -563,7 +584,14 @@ mod tests {
                     message_id: None,
                 },
             ),
-            make_event(3, 102, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                3,
+                102,
+                AgentEventKind::LlmRequestStart {
+                    message_count: 1,
+                    max_tokens: None,
+                },
+            ),
             make_event(
                 4,
                 103,
@@ -607,7 +635,14 @@ mod tests {
                     message_id: None,
                 },
             ),
-            make_event(8, 202, AgentEventKind::LlmRequestStart { message_count: 2 }),
+            make_event(
+                8,
+                202,
+                AgentEventKind::LlmRequestStart {
+                    message_count: 2,
+                    max_tokens: None,
+                },
+            ),
             make_event(
                 9,
                 203,
@@ -643,7 +678,14 @@ mod tests {
     #[test]
     fn materialize_thinking_content() {
         let events = vec![
-            make_event(1, 100, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                1,
+                100,
+                AgentEventKind::LlmRequestStart {
+                    message_count: 1,
+                    max_tokens: None,
+                },
+            ),
             make_event(
                 2,
                 101,
@@ -680,7 +722,14 @@ mod tests {
     #[test]
     fn materialize_thinking_from_reasoning_parts() {
         let events = vec![
-            make_event(1, 100, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            make_event(
+                1,
+                100,
+                AgentEventKind::LlmRequestStart {
+                    message_count: 1,
+                    max_tokens: None,
+                },
+            ),
             make_event(
                 2,
                 101,

@@ -26,7 +26,10 @@
 
 use async_trait::async_trait;
 
-use crate::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool, ToolResultPart};
+use crate::chat::{
+    ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions, StreamChunk,
+    Tool, ToolResultPart,
+};
 use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use crate::embedding::EmbeddingProvider;
 use crate::error::LLMError;
@@ -125,11 +128,31 @@ impl ChatProvider for ValidatedLLM {
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<ChatOutput, LLMError> {
+        self.chat_with_tools_and_options(messages, tools, &GenerationOptions::NONE)
+            .await
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        self.inner.supported_generation_options()
+    }
+
+    /// Like [`ChatProvider::chat_with_tools`], applying `options` to every
+    /// attempt, including validation retries.
+    async fn chat_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
         let mut local_messages = messages.to_vec();
         let mut remaining_attempts = self.attempts;
 
         loop {
-            let response = match self.inner.chat_with_tools(&local_messages, tools).await {
+            let response = match self
+                .inner
+                .chat_with_tools_and_options(&local_messages, tools, options)
+                .await
+            {
                 Ok(resp) => resp,
                 Err(e) => return Err(e),
             };
@@ -170,6 +193,20 @@ impl ChatProvider for ValidatedLLM {
         LLMError,
     > {
         self.inner.chat_stream_with_tools(messages, tools).await
+    }
+
+    async fn chat_stream_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
+        self.inner
+            .chat_stream_with_tools_and_options(messages, tools, options)
+            .await
     }
 }
 

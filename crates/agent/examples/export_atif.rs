@@ -36,7 +36,10 @@ fn main() {
             session_id: "example-session-123".to_string(),
             origin: EventOrigin::Local,
             source_node: None,
-            kind: AgentEventKind::LlmRequestStart { message_count: 2 },
+            kind: AgentEventKind::LlmRequestStart {
+                message_count: 2,
+                max_tokens: None,
+            },
         },
         AgentEvent {
             session_seq: 0,
@@ -107,7 +110,10 @@ fn main() {
             session_id: "example-session-123".to_string(),
             origin: EventOrigin::Local,
             source_node: None,
-            kind: AgentEventKind::LlmRequestStart { message_count: 4 },
+            kind: AgentEventKind::LlmRequestStart {
+                message_count: 4,
+                max_tokens: None,
+            },
         },
         AgentEvent {
             session_seq: 0,

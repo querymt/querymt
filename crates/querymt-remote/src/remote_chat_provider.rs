@@ -1,7 +1,10 @@
 use crate::{RemoteProviderClientCore, RemoteProviderClientTransport, RemoteProviderStreamState};
 use futures_util::StreamExt;
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool};
+use querymt::chat::{
+    ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions, StreamChunk,
+    Tool,
+};
 use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use querymt::embedding::EmbeddingProvider;
 use querymt::error::LLMError;
@@ -69,12 +72,26 @@ where
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
     ) -> Result<ChatOutput, LLMError> {
+        self.chat_with_tools_and_options(messages, tools, &GenerationOptions::NONE)
+            .await
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        self.core.generation_option_support()
+    }
+
+    async fn chat_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
         let provider_name = self.core.config().provider_name.clone();
         let model_name = self.core.config().model.clone();
         let target_locator = self.core.config().target_locator.clone();
         let result = self
             .core
-            .chat_with_tools(messages, tools, |error| {
+            .chat_with_tools_and_options(messages, tools, options, |error| {
                 matches!(
                     error,
                     LLMError::Transport {
@@ -109,6 +126,19 @@ where
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
+    ) -> Result<
+        Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
+        LLMError,
+    > {
+        self.chat_stream_with_tools_and_options(messages, tools, &GenerationOptions::NONE)
+            .await
+    }
+
+    async fn chat_stream_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
     ) -> Result<
         Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
         LLMError,
@@ -177,9 +207,10 @@ where
             "stream router consumer attached"
         );
 
-        let stream_request = self.core.build_stream_request(
+        let stream_request = self.core.build_stream_request_with_options(
             messages,
             tools,
+            options,
             session_id.clone(),
             request_id.clone(),
             remote_router_ref,

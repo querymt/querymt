@@ -1,6 +1,9 @@
 use crate::{
     LLMProvider, Tool,
-    chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, ToolResultPart},
+    chat::{
+        ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions,
+        StreamChunk, ToolResultPart,
+    },
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -139,6 +142,34 @@ impl ChatProvider for ToolEnabledProvider {
         let to_send = tools.unwrap_or(&self.tool_list);
         self.inner
             .chat_stream_with_tools(messages, Some(to_send))
+            .await
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        self.inner.supported_generation_options()
+    }
+
+    async fn chat_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
+        let to_send = tools.unwrap_or(&self.tool_list);
+        self.inner
+            .chat_with_tools_and_options(messages, Some(to_send), options)
+            .await
+    }
+
+    async fn chat_stream_with_tools_and_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        options: &GenerationOptions,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
+        let to_send = tools.unwrap_or(&self.tool_list);
+        self.inner
+            .chat_stream_with_tools_and_options(messages, Some(to_send), options)
             .await
     }
 }

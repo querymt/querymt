@@ -1,6 +1,9 @@
 use querymt::ToolCall;
 use querymt::Usage;
-use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
+use querymt::chat::{
+    ChatMessage, ChatOutput, FinishReason, GenerationOptionSupport, GenerationOptions, StreamChunk,
+    Tool,
+};
 pub use querymt::chat::{ITEM_AWARE_CHAT_CONTRACT_VERSION, messages_require_item_aware_contract};
 use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
@@ -26,6 +29,11 @@ pub struct ProviderContractInfo {
     /// before protocol versioning; the client treats that as a mismatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+    /// Per-request generation options the peer forwards to its provider.
+    /// Absent on peers built before per-request options, which decode as
+    /// "none" so callers never rely on an override an old peer would drop.
+    #[serde(default)]
+    pub generation_options: GenerationOptionSupport,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +176,10 @@ pub struct ProviderChatRequest {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, and
+    /// ignored by peers that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 pub type GenericProviderStreamRequest<TRouterRef> = ProviderStreamRequest<TRouterRef>;
@@ -190,6 +202,10 @@ pub struct ProviderStreamRequest<TRouterRef> {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, and
+    /// ignored by peers that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 pub fn default_stream_heartbeat_secs() -> u64 {
@@ -608,6 +624,7 @@ mod rmp_wire_tests {
             tools: None,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         }
     }
 
@@ -694,6 +711,7 @@ mod rmp_wire_tests {
             lease_ttl_secs: 60,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         };
         assert_rmp_round_trip_equal(&request);
     }
@@ -703,6 +721,7 @@ mod rmp_wire_tests {
         let current = ProviderContractInfo {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             protocol_version: Some(MESH_PROTOCOL_VERSION),
+            generation_options: Default::default(),
         };
         assert_rmp_round_trip_equal(&current);
 
@@ -711,6 +730,39 @@ mod rmp_wire_tests {
         }))
         .expect("legacy contract info");
         assert_eq!(legacy.protocol_version, None);
+    }
+
+    #[test]
+    fn requests_without_options_decode_and_omit_options_on_the_wire() {
+        // A peer that predates per-request options sends no `options` field.
+        let legacy: ProviderChatRequest = serde_json::from_value(serde_json::json!({
+            "provider": "demo",
+            "model": "m1",
+            "messages": [],
+            "tools": null
+        }))
+        .expect("legacy chat request");
+        assert_eq!(legacy.options, None);
+
+        // And unset options are never sent to older peers.
+        let encoded = serde_json::to_value(chat_request(Vec::new())).unwrap();
+        assert!(encoded.get("options").is_none());
+    }
+
+    #[test]
+    fn requests_with_options_round_trip_over_rmp() {
+        let mut request = chat_request(Vec::new());
+        request.options = Some(GenerationOptions::default().with_max_tokens(64_000));
+        assert_rmp_round_trip_equal(&request);
+    }
+
+    #[test]
+    fn legacy_contract_info_reports_no_generation_option_support() {
+        let legacy: ProviderContractInfo = serde_json::from_value(serde_json::json!({
+            "protocol_version": MESH_PROTOCOL_VERSION
+        }))
+        .expect("legacy contract info");
+        assert_eq!(legacy.generation_options, GenerationOptionSupport::NONE);
     }
 
     #[test]

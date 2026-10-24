@@ -111,4 +111,32 @@ async fn handle_tool_calling_loop(
 }
 ```
 
+## Per-request generation options
+
+Some settings, such as the output-token cap or the reasoning effort, are normally fixed when a provider is built. `querymt::chat::GenerationOptions` overrides them for a **single** chat request, without rebuilding the provider:
+
+```rust
+use querymt::chat::{GenerationOptions, ReasoningEffort};
+
+let options = GenerationOptions::default()
+    .with_max_tokens(128_000)
+    .with_reasoning_effort(ReasoningEffort::Low);
+
+// Streaming has an equivalent: `chat_stream_with_tools_and_options`.
+let output = provider
+    .chat_with_tools_and_options(&messages, Some(&tools), &options)
+    .await?;
+
+// The next call, made without options, uses the configured values again.
+let output = provider.chat_with_tools(&messages, Some(&tools)).await?;
+```
+
+*   A set field overrides the configured value for that request only. An unset field leaves the configured value in effect.
+*   Providers report what they honour through `ChatProvider::supported_generation_options()`, which returns a `GenerationOptionSupport`. Query it before relying on an override. Options a provider does not honour are ignored and the request still succeeds. `GenerationOptionSupport::retain_supported` drops the unsupported overrides from a `GenerationOptions` value.
+*   The existing methods (`chat`, `chat_with_tools`, `chat_stream_with_tools`) are unchanged, and their requests are identical to before.
+*   Options travel unchanged through the HTTP adapter, the tool and validation decorators, Extism plugins and remote (mesh) providers. Older plugins and remote peers ignore the field. A remote peer reports its support in the contract handshake, and a peer that predates options is treated as supporting none.
+*   Today the Anthropic provider honours both fields. Other providers report no support until they are updated.
+
+Source: `crates/querymt/src/chat/mod.rs`
+
 QueryMT's chat system is designed to be flexible, supporting simple Q&A, complex multi-turn dialogues, and sophisticated interactions involving external tools. The `Tool` and `ToolChoice` mechanisms provide fine-grained control over how LLMs can utilize functions.

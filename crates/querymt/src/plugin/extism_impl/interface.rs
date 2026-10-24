@@ -1,7 +1,7 @@
 pub use crate::chat::{ITEM_AWARE_CHAT_CONTRACT_VERSION, messages_require_item_aware_contract};
 use crate::{
     ToolCall, Usage,
-    chat::{ChatMessage, ChatOutput, FinishReason, Tool},
+    chat::{ChatMessage, ChatOutput, FinishReason, GenerationOptions, Tool},
     completion::CompletionRequest,
     error::{LLMError, LLMErrorPayload},
     plugin::extism_impl::{SerializableHttpRequest, SerializableHttpResponse},
@@ -163,6 +163,10 @@ pub struct ExtismChatRequest<C> {
     pub tools: Option<Vec<Tool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, so
+    /// older plugins never see the field; older hosts simply never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -523,6 +527,7 @@ mod item_aware_tests {
         }))
         .expect("legacy request");
         assert_eq!(request.item_aware_contract_version, None);
+        assert_eq!(request.options, None);
 
         let response: ExtismChatResponse = serde_json::from_value(json!({
             "text": "legacy",
@@ -548,6 +553,67 @@ mod item_aware_tests {
         assert!(message.get("content").is_none());
         assert_eq!(message["input"][0]["type"], "text");
         assert_eq!(message["input"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn extism_chat_request_options_round_trip() {
+        use crate::chat::ReasoningEffort;
+
+        let options = GenerationOptions::default()
+            .with_max_tokens(128_000)
+            .with_reasoning_effort(ReasoningEffort::Low);
+        let request = ExtismChatRequest {
+            cfg: json!({}),
+            messages: Vec::new(),
+            tools: None,
+            item_aware_contract_version: None,
+            options: Some(options),
+        };
+
+        let encoded = serde_json::to_vec(&request).expect("serialize request");
+        let decoded: ExtismChatRequest<serde_json::Value> =
+            serde_json::from_slice(&encoded).expect("deserialize request");
+
+        assert_eq!(decoded.options, Some(options));
+    }
+
+    #[test]
+    fn extism_chat_request_omits_unset_options_from_wire() {
+        let request = ExtismChatRequest {
+            cfg: json!({}),
+            messages: Vec::new(),
+            tools: None,
+            item_aware_contract_version: None,
+            options: None,
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize request");
+
+        // Older plugins must see byte-identical requests when no override is set.
+        assert!(value.get("options").is_none());
+    }
+
+    #[test]
+    fn extism_prepare_request_carries_options_to_plugin() {
+        let prepare = ExtismChatPrepareRequest {
+            chat: ExtismChatRequest {
+                cfg: json!({}),
+                messages: Vec::new(),
+                tools: None,
+                item_aware_contract_version: None,
+                options: Some(GenerationOptions::default().with_max_tokens(64_000)),
+            },
+            stream: true,
+        };
+
+        let decoded: ExtismChatPrepareRequest<serde_json::Value> =
+            serde_json::from_slice(&serde_json::to_vec(&prepare).unwrap()).unwrap();
+
+        assert!(decoded.stream);
+        assert_eq!(
+            decoded.chat.options.and_then(|o| o.max_tokens),
+            Some(64_000)
+        );
     }
 
     #[test]
@@ -660,6 +726,7 @@ mod item_aware_tests {
             ],
             tools: None,
             item_aware_contract_version: None,
+            options: None,
         };
         assert!(
             messages_require_item_aware_contract(&request.messages),

@@ -1,6 +1,7 @@
 #[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
 use crate::model::{AgentMessage, MessagePart, OutputTarget};
+use crate::model_heuristics::OutputCaps;
 use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
@@ -11,7 +12,7 @@ use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatOutput, ChatRole},
+    chat::{ChatMessage, ChatOutput, ChatRole, GenerationOptionSupport, GenerationOptions},
     error::LLMError,
 };
 use std::sync::Arc;
@@ -29,6 +30,27 @@ type ProviderCacheEntry = (i64, Option<String>, bool, Arc<dyn LLMProvider>);
 /// Lock-free single-entry provider cache.  Reads (every turn) use `ArcSwap::load`,
 /// writes (model switch, mesh fallback toggle) use `ArcSwap::store`.
 type ProviderCache = Arc<ArcSwap<Option<ProviderCacheEntry>>>;
+
+/// Keeps the requested per-request overrides the provider honours.
+///
+/// Dropped overrides are logged at debug level; the request then runs with the
+/// provider's configured values.
+pub(crate) fn supported_overrides(
+    provider: &dyn LLMProvider,
+    requested: GenerationOptions,
+) -> GenerationOptions {
+    let supported = provider
+        .supported_generation_options()
+        .retain_supported(requested);
+    if supported != requested {
+        tracing::debug!(
+            ?requested,
+            ?supported,
+            "provider does not honour some per-request generation options; skipping them"
+        );
+    }
+    supported
+}
 
 fn is_non_billable_oauth_provider(provider: &str) -> bool {
     matches!(provider, "codex" | "kimi-code")
@@ -583,6 +605,8 @@ impl SessionProvider {
         .await?;
 
         let settings = resolved_cfg.generation_settings;
+        let output_caps = resolved_cfg.output_caps;
+        let reasoning_effort = resolved_cfg.reasoning_effort;
 
         #[cfg(feature = "oauth")]
         let builder_config = resolved_cfg.builder_config;
@@ -642,6 +666,8 @@ impl SessionProvider {
                 return Ok(ProviderSnapshot {
                     provider: Arc::from(provider),
                     settings,
+                    output_caps,
+                    reasoning_effort,
                 });
             }
 
@@ -661,6 +687,8 @@ impl SessionProvider {
                 return Ok(ProviderSnapshot {
                     provider: Arc::from(Box::new(adapter) as Box<dyn LLMProvider>),
                     settings,
+                    output_caps,
+                    reasoning_effort,
                 });
             }
 
@@ -673,6 +701,8 @@ impl SessionProvider {
             return Ok(ProviderSnapshot {
                 provider: Arc::from(provider),
                 settings,
+                output_caps,
+                reasoning_effort,
             });
         }
 
@@ -680,6 +710,8 @@ impl SessionProvider {
         Ok(ProviderSnapshot {
             provider: Arc::from(provider),
             settings,
+            output_caps,
+            reasoning_effort,
         })
     }
 }
@@ -705,6 +737,10 @@ impl Clone for SessionProvider {
 struct ProviderSnapshot {
     provider: Arc<dyn LLMProvider>,
     settings: crate::agent::utils::genai::GenerationSettings,
+    /// Output caps resolved with the provider; `None` when unknown (e.g. remote).
+    output_caps: Option<OutputCaps>,
+    /// Reasoning effort the provider was configured with, when any.
+    reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 }
 
 impl ProviderSnapshot {
@@ -713,6 +749,8 @@ impl ProviderSnapshot {
         Self {
             provider,
             settings: Default::default(),
+            output_caps: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -831,6 +869,36 @@ impl SessionHandle {
             .map(|built| Arc::clone(&built.provider))
     }
 
+    /// Output-token caps resolved when this turn's provider was built.
+    ///
+    /// Builds (and caches) the provider if needed. Returns `None` when the
+    /// provider cannot be built or no cap is known (e.g. remote providers);
+    /// build errors surface again at the real request.
+    pub(crate) async fn output_caps(&self) -> Option<OutputCaps> {
+        self.provider().await.ok()?;
+        self.cached_llm_provider
+            .get()
+            .and_then(|built| built.output_caps)
+    }
+
+    /// Test seam: pin the output caps of this turn's provider (model metadata
+    /// is not available to tests).
+    #[cfg(test)]
+    pub(crate) async fn override_output_caps(&mut self, caps: OutputCaps) {
+        self.provider().await.expect("provider builds");
+        self.cached_llm_provider
+            .get_mut()
+            .expect("provider snapshot cached")
+            .output_caps = Some(caps);
+    }
+
+    /// Reasoning effort this turn's provider was configured with, if known.
+    pub(crate) fn configured_reasoning_effort(&self) -> Option<querymt::chat::ReasoningEffort> {
+        self.cached_llm_provider
+            .get()
+            .and_then(|built| built.reasoning_effort)
+    }
+
     pub(crate) fn record_generation_settings(&self, span: &tracing::Span) {
         if let Some(built) = self.cached_llm_provider.get() {
             built.settings.record(span);
@@ -921,10 +989,58 @@ impl SessionHandle {
         provider.call_tool(name, args).await
     }
 
+    /// Which per-request generation options the session's provider honours.
+    ///
+    /// Reports none when the provider cannot be built; the real request
+    /// surfaces the error.
+    pub(crate) async fn generation_option_support(&self) -> GenerationOptionSupport {
+        self.provider()
+            .await
+            .map(|provider| provider.supported_generation_options())
+            .unwrap_or(GenerationOptionSupport::NONE)
+    }
+
+    /// The subset of `requested` the session's provider honours per request.
+    ///
+    /// Empty requests short-circuit without building the provider. A provider
+    /// build failure yields no overrides; the real request surfaces the error.
+    pub(crate) async fn honoured_overrides(
+        &self,
+        requested: GenerationOptions,
+    ) -> GenerationOptions {
+        if requested.is_empty() {
+            return requested;
+        }
+        match self.provider().await {
+            Ok(provider) => supported_overrides(provider.as_ref(), requested),
+            Err(_) => GenerationOptions::NONE,
+        }
+    }
+
     /// Submit messages to the LLM without auto-saving
     pub async fn submit_request(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
+        self.submit_request_with_options(messages, GenerationOptions::NONE)
+            .await
+    }
+
+    /// Submit messages with per-request generation overrides.
+    ///
+    /// Overrides the provider does not honour are dropped (see
+    /// [`supported_overrides`]).
+    pub async fn submit_request_with_options(
+        &self,
+        messages: &[ChatMessage],
+        requested: GenerationOptions,
+    ) -> Result<ChatOutput, LLMError> {
         let provider = self.provider().await?;
-        provider.chat(messages).await
+        let options = supported_overrides(provider.as_ref(), requested);
+        if options.is_empty() {
+            provider.chat(messages).await
+        } else {
+            provider
+                .chat_with_tools_and_options(messages, None, &options)
+                .await
+        }
     }
 
     /// Higher-level chat interface (used by CLI) that handles conversion and storage

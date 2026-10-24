@@ -247,6 +247,13 @@ fn default_task_completion_guard() -> bool {
     false
 }
 
+/// Default cap on middleware recoveries from a `Stopped` state per turn.
+pub const DEFAULT_MAX_STOP_RECOVERIES: u8 = 5;
+
+fn default_max_stop_recoveries() -> u8 {
+    DEFAULT_MAX_STOP_RECOVERIES
+}
+
 /// Configuration for rate limit retry behavior
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -532,7 +539,7 @@ impl Default for SnapshotBackendConfig {
 /// [agent.execution.snapshot]
 /// backend = "git"
 /// ```
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ExecutionPolicy {
     /// Tool output truncation settings (Layer 1)
@@ -548,17 +555,49 @@ pub struct ExecutionPolicy {
     /// Force one additional model request when a finite task remains active.
     #[serde(default = "default_task_completion_guard")]
     pub task_completion_guard: bool,
+    /// Maximum times middleware may turn a stop into a continuation within one
+    /// turn before the stop is published (default: 5).
+    #[serde(default = "default_max_stop_recoveries")]
+    pub max_stop_recoveries: u8,
+}
+
+impl Default for ExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            tool_output: ToolOutputConfig::default(),
+            pruning: PruningConfig::default(),
+            compaction: CompactionConfig::default(),
+            snapshot: SnapshotBackendConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            task_completion_guard: default_task_completion_guard(),
+            max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
+        }
+    }
 }
 
 /// Runtime execution policy — the configs that survive to `AgentConfig`
 /// (excludes `SnapshotBackendConfig` which is consumed at build time).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuntimeExecutionPolicy {
     pub tool_output: ToolOutputConfig,
     pub pruning: PruningConfig,
     pub compaction: CompactionConfig,
     pub rate_limit: RateLimitConfig,
     pub task_completion_guard: bool,
+    pub max_stop_recoveries: u8,
+}
+
+impl Default for RuntimeExecutionPolicy {
+    fn default() -> Self {
+        Self {
+            tool_output: ToolOutputConfig::default(),
+            pruning: PruningConfig::default(),
+            compaction: CompactionConfig::default(),
+            rate_limit: RateLimitConfig::default(),
+            task_completion_guard: default_task_completion_guard(),
+            max_stop_recoveries: DEFAULT_MAX_STOP_RECOVERIES,
+        }
+    }
 }
 
 impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
@@ -569,6 +608,7 @@ impl From<&ExecutionPolicy> for RuntimeExecutionPolicy {
             compaction: ep.compaction.clone(),
             rate_limit: ep.rate_limit.clone(),
             task_completion_guard: ep.task_completion_guard,
+            max_stop_recoveries: ep.max_stop_recoveries,
         }
     }
 }
@@ -591,6 +631,19 @@ mod tests {
         .expect("deserialize execution policy");
         assert!(policy.task_completion_guard);
         assert!(RuntimeExecutionPolicy::from(&policy).task_completion_guard);
+    }
+
+    #[test]
+    fn max_stop_recoveries_defaults_to_five_and_is_configurable() {
+        assert_eq!(ExecutionPolicy::default().max_stop_recoveries, 5);
+        assert_eq!(RuntimeExecutionPolicy::default().max_stop_recoveries, 5);
+
+        let omitted: ExecutionPolicy = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(omitted.max_stop_recoveries, 5);
+
+        let policy: ExecutionPolicy =
+            serde_json::from_value(json!({"max_stop_recoveries": 2})).unwrap();
+        assert_eq!(RuntimeExecutionPolicy::from(&policy).max_stop_recoveries, 2);
     }
 
     #[test]

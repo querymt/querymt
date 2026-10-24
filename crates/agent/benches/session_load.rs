@@ -295,6 +295,7 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
             &session_id,
             AgentEventKind::LlmRequestStart {
                 message_count: index as u32 + 1,
+                max_tokens: None,
             },
         )
         .await;

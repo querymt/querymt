@@ -28,8 +28,8 @@ use querymt::{
     chat::{
         ChatFunctionCallItem, ChatInputPart, ChatMessage, ChatMessageItem, ChatMessagePart,
         ChatOutput, ChatOutputItem, ChatOutputStatus, ChatReasoningItem, ChatReasoningPart,
-        ChatRole, FinishReason, MediaKind, MediaPart, MediaSource, ReasoningEffort, Tool,
-        ToolChoice, ToolResultPart,
+        ChatRole, FinishReason, GenerationOptionSupport, GenerationOptions, MediaKind, MediaPart,
+        MediaSource, ReasoningEffort, Tool, ToolChoice, ToolResultPart,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -1043,6 +1043,26 @@ impl Anthropic {
         }
     }
 
+    /// Copy of this config with per-request overrides applied.
+    ///
+    /// Every downstream decision (budget fitting against `max_tokens`, adaptive
+    /// effort, sampling restrictions) reads from the config, so applying the
+    /// overrides up front keeps one code path for configured and per-request
+    /// values. An effort override also discards a configured explicit
+    /// `reasoning_budget_tokens`; otherwise that budget would silently win over
+    /// the requested effort.
+    fn with_generation_options(&self, options: &GenerationOptions) -> Self {
+        let mut cfg = self.clone();
+        if let Some(max_tokens) = options.max_tokens {
+            cfg.max_tokens = max_tokens;
+        }
+        if let Some(effort) = options.reasoning_effort {
+            cfg.reasoning_effort = Some(effort);
+            cfg.reasoning_budget_tokens = None;
+        }
+        cfg
+    }
+
     /// Parsed Claude model, or `None` for IDs that aren't recognisable.
     fn parsed_model(&self) -> Option<ClaudeModel> {
         parse_claude_model(&self.model)
@@ -1315,6 +1335,24 @@ impl HTTPChatProvider for Anthropic {
             request,
             context: serde_json::to_value(names)?,
         })
+    }
+
+    fn supported_generation_options(&self) -> GenerationOptionSupport {
+        GenerationOptionSupport::ALL
+    }
+
+    fn prepare_chat_request_with_options(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        stream: bool,
+        options: &GenerationOptions,
+    ) -> Result<querymt::chat::http::PreparedChatRequest, LLMError> {
+        if options.is_empty() {
+            return self.prepare_chat_request(messages, tools, stream);
+        }
+        self.with_generation_options(options)
+            .prepare_chat_request(messages, tools, stream)
     }
 
     fn chat_request(
@@ -3123,6 +3161,121 @@ mod tests {
     fn body_of(a: &Anthropic, messages: &[ChatMessage]) -> Value {
         let req = a.chat_request(messages, None).expect("request builds");
         serde_json::from_slice(req.body()).expect("valid JSON")
+    }
+
+    fn options_body(a: &Anthropic, options: &GenerationOptions, stream: bool) -> Value {
+        let prepared = a
+            .prepare_chat_request_with_options(&user_msgs(), None, stream, options)
+            .expect("request builds");
+        serde_json::from_slice(prepared.request.body()).expect("valid JSON")
+    }
+
+    #[test]
+    fn provider_reports_per_request_option_support() {
+        let a = anthropic_for("claude-sonnet-4-5", None, 32_000);
+        assert_eq!(
+            a.supported_generation_options(),
+            GenerationOptionSupport::ALL
+        );
+    }
+
+    #[test]
+    fn max_tokens_override_applies_to_one_request_only() {
+        let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+        let options = GenerationOptions::default().with_max_tokens(128_000);
+
+        assert_eq!(options_body(&a, &options, false)["max_tokens"], 128_000);
+        assert_eq!(options_body(&a, &options, true)["max_tokens"], 128_000);
+        // The next request, made without options, uses the configured value.
+        assert_eq!(
+            options_body(&a, &GenerationOptions::NONE, false)["max_tokens"],
+            32_000
+        );
+        assert_eq!(a.max_tokens, 32_000);
+    }
+
+    #[test]
+    fn empty_options_produce_an_identical_request() {
+        let a = anthropic_for("claude-opus-4-8", Some(ReasoningEffort::High), 32_000);
+        let plain = a
+            .prepare_chat_request(&user_msgs(), None, false)
+            .unwrap()
+            .request;
+        let with_none = a
+            .prepare_chat_request_with_options(&user_msgs(), None, false, &GenerationOptions::NONE)
+            .unwrap()
+            .request;
+        assert_eq!(plain.body(), with_none.body());
+    }
+
+    #[test]
+    fn effort_override_changes_adaptive_output_config() {
+        let a = anthropic_for("claude-sonnet-5-5", Some(ReasoningEffort::High), 32_000);
+        let low = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Low);
+
+        let b = options_body(&a, &low, false);
+        assert_eq!(b["thinking"]["type"], "adaptive");
+        assert_eq!(b["output_config"]["effort"], "low");
+        assert_eq!(body(&a)["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn effort_override_enables_thinking_when_none_configured() {
+        let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+        assert!(body(&a).get("thinking").is_none());
+
+        let options = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Medium);
+        let b = options_body(&a, &options, false);
+        assert_eq!(b["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn effort_override_replaces_budget_for_budget_models() {
+        let a = anthropic_for("claude-sonnet-4-5", Some(ReasoningEffort::High), 32_000);
+        assert_eq!(body(&a)["thinking"]["budget_tokens"], 16_000);
+
+        let low = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Low);
+        assert_eq!(
+            options_body(&a, &low, false)["thinking"]["budget_tokens"],
+            1_024
+        );
+    }
+
+    #[test]
+    fn effort_override_beats_configured_explicit_budget() {
+        let mut a = anthropic_for("claude-sonnet-4-5", Some(ReasoningEffort::High), 32_000);
+        a.reasoning_budget_tokens = Some(12_000);
+        assert_eq!(body(&a)["thinking"]["budget_tokens"], 12_000);
+
+        let low = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Low);
+        assert_eq!(
+            options_body(&a, &low, false)["thinking"]["budget_tokens"],
+            1_024
+        );
+        // Without an effort override the configured budget still applies.
+        let tokens = GenerationOptions::default().with_max_tokens(64_000);
+        assert_eq!(
+            options_body(&a, &tokens, false)["thinking"]["budget_tokens"],
+            12_000
+        );
+    }
+
+    #[test]
+    fn max_tokens_override_refits_the_thinking_budget() {
+        let a = anthropic_for("claude-sonnet-4-5", Some(ReasoningEffort::High), 20_000);
+        assert_eq!(body(&a)["thinking"]["budget_tokens"], 10_000);
+
+        let larger = GenerationOptions::default().with_max_tokens(64_000);
+        assert_eq!(
+            options_body(&a, &larger, false)["thinking"]["budget_tokens"],
+            16_000
+        );
+
+        // A cap too small for the minimum budget omits thinking entirely.
+        let tiny = GenerationOptions::default().with_max_tokens(1_500);
+        let b = options_body(&a, &tiny, false);
+        assert!(b.get("thinking").is_none());
+        assert_eq!(b["max_tokens"], 1_500);
     }
 
     fn user_msgs() -> Vec<ChatMessage> {
