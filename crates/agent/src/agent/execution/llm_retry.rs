@@ -258,7 +258,7 @@ pub(super) fn stream_chunk_commits_output(chunk: &StreamChunk) -> bool {
     match chunk {
         StreamChunk::Structured(_) => true,
         StreamChunk::Text(text) | StreamChunk::Thinking(text) => !text.is_empty(),
-        StreamChunk::ThinkingSignature(_) => true,
+        StreamChunk::ThinkingSignature(_) | StreamChunk::RedactedThinking(_) => true,
         StreamChunk::ToolUseStart { .. } | StreamChunk::ToolUseComplete { .. } => true,
         StreamChunk::ToolUseInputDelta { partial_json, .. } => !partial_json.is_empty(),
         StreamChunk::Usage(_) | StreamChunk::Done { .. } => false,
