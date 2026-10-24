@@ -43,6 +43,20 @@ impl MeshRuntimeHandle {
         self.inner.peer_id()
     }
 
+    /// Version of catalog refresh work, shared by every handle to this mesh.
+    pub fn catalog_refresh_generation(&self) -> u64 {
+        self.inner
+            .catalog_refresh_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Prevent subsequent catalog refreshes from reusing pre-invalidation work.
+    pub fn invalidate_catalog_refreshes(&self) {
+        self.inner
+            .catalog_refresh_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn local_hostname(&self) -> &str {
         self.inner.local_hostname()
     }
@@ -461,6 +475,20 @@ mod tests {
             runtime.peer_id()
         );
         assert_eq!(runtime.as_ref().peer_id(), runtime.peer_id());
+    }
+
+    #[test]
+    fn catalog_invalidation_is_shared_across_runtime_and_mesh_handle_clones() {
+        let (runtime, _swarm_cmd_rx) = test_runtime(MeshTransportMode::Composite);
+        let clone = runtime.clone();
+        let wrapped = MeshRuntimeHandle::new(runtime.as_mesh_handle().clone());
+        let before = runtime.catalog_refresh_generation();
+        wrapped.invalidate_catalog_refreshes();
+        assert_ne!(runtime.catalog_refresh_generation(), before);
+        assert_eq!(
+            clone.catalog_refresh_generation(),
+            wrapped.catalog_refresh_generation()
+        );
     }
 
     #[test]

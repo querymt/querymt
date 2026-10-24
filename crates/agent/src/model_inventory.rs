@@ -4,7 +4,8 @@
 //! immediately and refreshing data in the background.
 
 use arc_swap::ArcSwap;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+#[cfg(feature = "remote")]
+use futures_util::stream::StreamExt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast, watch};
@@ -25,7 +26,7 @@ pub struct SnapshotMeta {
     pub refresh_in_progress: bool,
     /// Whether the data is potentially stale
     pub is_stale: bool,
-    /// Number of remote nodes that timed out during last refresh
+    /// Number of remote queries (including discovery) that timed out during last refresh
     pub remote_timeout_count: usize,
     /// Total number of remote nodes attempted
     pub remote_node_count: usize,
@@ -178,6 +179,10 @@ struct ModelInventoryInner {
     /// Optional mesh handle for remote operations
     #[cfg(feature = "remote")]
     mesh: parking_lot::RwLock<Option<MeshRuntimeHandle>>,
+    #[cfg(feature = "remote")]
+    remote_catalogs: parking_lot::Mutex<RemoteCatalogCache>,
+    #[cfg(feature = "remote")]
+    remote_epoch: std::sync::atomic::AtomicU64,
     /// Inventory configuration
     inv_config: ModelInventoryConfig,
     /// Broadcast a monotonically-increasing version after every successful refresh cycle.
@@ -193,6 +198,149 @@ struct ModelInventoryInner {
 /// refreshing a clone doesn't update the original instance.
 pub struct ModelInventory {
     inner: Arc<ModelInventoryInner>,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Default)]
+struct RemoteRefreshResult {
+    catalogs: std::collections::HashMap<libp2p::PeerId, Vec<ModelEntry>>,
+    timeout_count: usize,
+    node_count: usize,
+    incomplete: bool,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Clone, Copy)]
+enum RemoteCatalogFailure {
+    TimedOut,
+    Unavailable,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Default)]
+struct RemoteSnapshotUpdate {
+    models: Vec<ModelEntry>,
+    timeout_count: usize,
+    node_count: usize,
+    incomplete: bool,
+    epoch: u64,
+}
+
+#[cfg(feature = "remote")]
+#[derive(Default)]
+struct RemoteCatalogCache {
+    scopes: Vec<querymt_remote::MeshScopeId>,
+    peers: std::collections::HashMap<libp2p::PeerId, (Instant, Vec<ModelEntry>)>,
+}
+
+#[cfg(feature = "remote")]
+impl RemoteCatalogCache {
+    fn merge(
+        &mut self,
+        scopes: &[querymt_remote::MeshScopeId],
+        result: &RemoteRefreshResult,
+        now: Instant,
+    ) -> Vec<ModelEntry> {
+        if self.scopes != scopes {
+            self.peers.clear();
+            self.scopes = scopes.to_vec();
+        }
+        // A successful empty catalog withdraws that peer's models. Missing or failed
+        // queries retain the last good catalog for a bounded five-minute grace period.
+        self.peers.retain(|_, (updated, _)| {
+            now.saturating_duration_since(*updated) < Duration::from_secs(300)
+        });
+        for (peer, models) in &result.catalogs {
+            self.peers.insert(*peer, (now, models.clone()));
+        }
+        let mut peers: Vec<_> = self.peers.iter().collect();
+        peers.sort_by_key(|(peer, _)| **peer);
+        peers
+            .into_iter()
+            .flat_map(|(_, (_, models))| models.clone())
+            .collect()
+    }
+}
+
+#[cfg(feature = "remote")]
+type RemoteRefreshKey = (
+    libp2p::PeerId,
+    Vec<querymt_remote::MeshScopeId>,
+    Duration,
+    Duration,
+    usize,
+    u64,
+);
+
+#[cfg(feature = "remote")]
+fn shared_remote_refreshes()
+-> &'static moka::future::Cache<RemoteRefreshKey, Arc<RemoteRefreshResult>> {
+    static CACHE: std::sync::OnceLock<
+        moka::future::Cache<RemoteRefreshKey, Arc<RemoteRefreshResult>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(64)
+            .time_to_live(Duration::from_secs(1))
+            .build()
+    })
+}
+
+#[cfg(feature = "remote")]
+async fn collect_remote_catalogs<S, T, Q, F>(
+    discoveries: S,
+    query: Q,
+    concurrency: usize,
+    deadline: tokio::time::Instant,
+) -> RemoteRefreshResult
+where
+    S: futures_util::Stream<Item = Result<(libp2p::PeerId, T), RemoteCatalogFailure>>,
+    Q: Fn(libp2p::PeerId, T) -> F,
+    F: std::future::Future<Output = Result<Vec<ModelEntry>, RemoteCatalogFailure>>,
+{
+    futures_util::pin_mut!(discoveries);
+    let mut queries = futures_util::stream::FuturesUnordered::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut discovery_done = false;
+    let mut result = RemoteRefreshResult::default();
+    while !discovery_done || !queries.is_empty() {
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                result.timeout_count += queries.len() + usize::from(!discovery_done);
+                result.incomplete = true;
+                tracing::warn!(pending_nodes = queries.len(), discovery_incomplete = !discovery_done,
+                    "Remote model refresh reached its global deadline");
+                break;
+            }
+            Some((peer_id, outcome)) = queries.next(), if !queries.is_empty() => {
+                match outcome {
+                    Ok(models) => { result.catalogs.insert(peer_id, models); }
+                    Err(failure) => {
+                        result.incomplete = true;
+                        result.timeout_count += usize::from(matches!(failure, RemoteCatalogFailure::TimedOut));
+                    }
+                }
+            }
+            node = discoveries.next(), if !discovery_done && queries.len() < concurrency.max(1) => {
+                match node {
+                    Some(Ok((peer_id, node))) if seen.insert(peer_id) => {
+                        result.node_count += 1;
+                        let future = query(peer_id, node);
+                        queries.push(async move { (peer_id, future.await) });
+                    }
+                    Some(Err(failure)) => {
+                        result.incomplete = true;
+                        result.timeout_count += usize::from(matches!(failure, RemoteCatalogFailure::TimedOut));
+                    }
+                    Some(Ok(_)) => {}
+                    None => { discovery_done = true; }
+                }
+            }
+        }
+    }
+    // Dropping the owned stream and query futures cancels outstanding work.
+    result
 }
 
 impl Clone for ModelInventory {
@@ -230,6 +378,10 @@ impl ModelInventory {
                 config,
                 #[cfg(feature = "remote")]
                 mesh: parking_lot::RwLock::new(None),
+                #[cfg(feature = "remote")]
+                remote_catalogs: parking_lot::Mutex::new(RemoteCatalogCache::default()),
+                #[cfg(feature = "remote")]
+                remote_epoch: std::sync::atomic::AtomicU64::new(0),
                 inv_config,
                 update_version_tx,
                 update_version: std::sync::atomic::AtomicU64::new(0),
@@ -243,12 +395,30 @@ impl ModelInventory {
     where
         M: Into<MeshRuntimeHandle>,
     {
-        *self.inner.mesh.write() = Some(mesh.into());
+        let mesh = mesh.into();
+        let mut current = self.inner.mesh.write();
+        if current
+            .as_ref()
+            .is_some_and(|previous| previous.peer_id() != mesh.peer_id())
+        {
+            self.inner.remote_catalogs.lock().peers.clear();
+            self.inner.remote_snapshot.store(Arc::new(Vec::new()));
+        }
+        self.inner
+            .remote_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *current = Some(mesh);
     }
 
     #[cfg(feature = "remote")]
     pub fn clear_mesh(&self) {
-        *self.inner.mesh.write() = None;
+        let mut current = self.inner.mesh.write();
+        self.inner
+            .remote_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *current = None;
+        self.inner.remote_catalogs.lock().peers.clear();
+        self.inner.remote_snapshot.store(Arc::new(Vec::new()));
     }
 
     pub fn local_snapshot_entries_blocking(&self) -> Vec<ModelEntry> {
@@ -443,9 +613,12 @@ impl ModelInventory {
         self.trigger_refresh().await;
     }
 
-    /// Invalidate remote cache and trigger refresh
+    /// Mark remote data stale and refresh without hiding last-known-good catalogs.
     pub async fn invalidate_remote(&self) {
-        self.inner.remote_snapshot.store(Arc::new(Vec::new()));
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh() {
+            mesh.invalidate_catalog_refreshes();
+        }
         {
             let mut state = self.inner.refresh_state.lock().await;
             state.remote_updated_at = None;
@@ -460,6 +633,10 @@ impl ModelInventory {
 
     /// Invalidate all caches and trigger refresh
     pub async fn invalidate_all(&self) {
+        #[cfg(feature = "remote")]
+        if let Some(mesh) = self.mesh() {
+            mesh.invalidate_catalog_refreshes();
+        }
         self.inner.local_snapshot.store(Arc::new(Vec::new()));
         self.inner.remote_snapshot.store(Arc::new(Vec::new()));
         {
@@ -531,16 +708,34 @@ impl ModelInventory {
             }
 
             // Update remote snapshot
-            if let Ok((remote_models, timeout_count, node_count)) = remote_result {
+            if let Some(RemoteSnapshotUpdate {
+                models: remote_models,
+                timeout_count,
+                node_count,
+                incomplete,
+                epoch,
+            }) = remote_result
+            {
                 tracing::Span::current().record("remote_model_count", remote_models.len());
                 tracing::Span::current().record("remote_timeout_count", timeout_count);
                 tracing::Span::current().record("remote_node_count", node_count);
-                self.inner.remote_snapshot.store(Arc::new(remote_models));
-
                 let mut state = self.inner.refresh_state.lock().await;
-                state.remote_timeout_count = timeout_count;
-                state.remote_node_count = node_count;
-                state.remote_updated_at = Some(Instant::now());
+                let _mesh_guard = self.inner.mesh.read();
+                if self
+                    .inner
+                    .remote_epoch
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == epoch
+                {
+                    self.inner.remote_snapshot.store(Arc::new(remote_models));
+                    state.remote_timeout_count = timeout_count;
+                    state.remote_node_count = node_count;
+                    state.remote_updated_at = if incomplete {
+                        None
+                    } else {
+                        Some(Instant::now())
+                    };
+                }
             }
         }
 
@@ -627,6 +822,12 @@ impl ModelInventory {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                 + 1;
             let _ = self.inner.update_version_tx.send(next_version);
+            if rerun {
+                state.last_triggered_at = Some(Instant::now());
+                state.local_refreshing = true;
+                state.remote_refreshing = true;
+                state.refresh_done_tx = watch::channel(false).0;
+            }
             drop(state);
 
             if rerun {
@@ -651,235 +852,207 @@ impl ModelInventory {
             duration_ms = tracing::field::Empty,
         )
     )]
-    async fn refresh_remote(&self) -> Result<(Vec<ModelEntry>, usize, usize), ()> {
-        use crate::agent::remote::{GetNodeInfo, RemoteNodeManager};
+    async fn refresh_remote(&self) -> Option<RemoteSnapshotUpdate> {
+        let start = Instant::now();
+        let epoch = self
+            .inner
+            .remote_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let Some(mesh) = self.mesh() else {
+            return Some(RemoteSnapshotUpdate {
+                epoch,
+                ..Default::default()
+            });
+        };
+        let scopes = mesh.active_scopes();
+        let key = self.remote_refresh_key(&mesh, scopes.clone());
+        // All local agents share one in-flight network pass and its short-lived result.
+        let result = shared_remote_refreshes()
+            .get_with(key, async {
+                Arc::new(self.query_remote_catalogs(&mesh, &scopes).await)
+            })
+            .await;
+        let current = self.inner.mesh.read();
+        if self
+            .inner
+            .remote_epoch
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != epoch
+            || current
+                .as_ref()
+                .is_none_or(|current| current.active_scopes() != scopes)
+        {
+            return None;
+        }
+        let mut cache = self.inner.remote_catalogs.lock();
+        let models = cache.merge(&scopes, &result, Instant::now());
+        let retained = cache
+            .peers
+            .keys()
+            .any(|peer| !result.catalogs.contains_key(peer));
+        tracing::Span::current().record("timeout_count", result.timeout_count);
+        tracing::Span::current().record("node_count", result.node_count);
+        tracing::Span::current().record("model_count", models.len());
+        tracing::Span::current().record("duration_ms", start.elapsed().as_millis());
+        Some(RemoteSnapshotUpdate {
+            models,
+            timeout_count: result.timeout_count,
+            node_count: result.node_count,
+            incomplete: result.incomplete || retained,
+            epoch,
+        })
+    }
+
+    #[cfg(feature = "remote")]
+    fn remote_refresh_key(
+        &self,
+        mesh: &MeshRuntimeHandle,
+        scopes: Vec<querymt_remote::MeshScopeId>,
+    ) -> RemoteRefreshKey {
+        (
+            *mesh.peer_id(),
+            scopes,
+            self.inner.inv_config.remote_node_timeout,
+            self.inner.inv_config.remote_refresh_timeout,
+            self.inner.inv_config.remote_concurrency,
+            mesh.catalog_refresh_generation(),
+        )
+    }
+
+    #[cfg(feature = "remote")]
+    async fn query_remote_catalogs(
+        &self,
+        mesh: &MeshRuntimeHandle,
+        scopes: &[querymt_remote::MeshScopeId],
+    ) -> RemoteRefreshResult {
+        use crate::agent::remote::RemoteNodeManager;
+        let deadline = tokio::time::Instant::now() + self.inner.inv_config.remote_refresh_timeout;
+        let local_peer = *mesh.peer_id();
+        // Poll scopes concurrently and start bounded catalog queries as soon as a
+        // node is yielded, without waiting for DHT provider discovery to finish.
+        let discoveries = futures_util::stream::select_all(scopes.iter().map(|scope| {
+            let scope = scope.clone();
+            mesh.lookup_all_actors_scoped::<RemoteNodeManager>(&scope, "node_manager")
+                .filter_map(move |entry| {
+                    let node = match entry {
+                        Ok(node_ref) => node_ref
+                            .id()
+                            .peer_id()
+                            .copied()
+                            .filter(|peer| *peer != local_peer)
+                            .map(|peer| Ok((peer, (node_ref, scope.clone())))),
+                        Err(error) => {
+                            tracing::debug!(%scope, %error, "Remote node discovery failed");
+                            Some(Err(RemoteCatalogFailure::Unavailable))
+                        }
+                    };
+                    futures_util::future::ready(node)
+                })
+        }));
+        let node_timeout = self.inner.inv_config.remote_node_timeout;
+        collect_remote_catalogs(discoveries, |peer_id, (node_ref, discovered_scope)| async move {
+            // Query the scope that actually advertised this node before trying
+            // other active scopes, so an unrelated DHT miss cannot consume its budget.
+            let peer_scopes: Vec<_> = std::iter::once(discovered_scope.clone())
+                .chain(scopes.iter().filter(|scope| **scope != discovered_scope).cloned()).collect();
+            let query = Self::query_peer_catalog(mesh, &node_ref, peer_id, &peer_scopes, node_timeout);
+            match tokio::time::timeout(node_timeout, query).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    tracing::warn!(%peer_id, timeout_ms = node_timeout.as_millis(), "Remote catalog query timed out");
+                    Err(RemoteCatalogFailure::TimedOut)
+                }
+            }
+        }, self.inner.inv_config.remote_concurrency, deadline).await
+    }
+
+    #[cfg(feature = "remote")]
+    async fn query_peer_catalog(
+        mesh: &MeshRuntimeHandle,
+        node_ref: &kameo::actor::RemoteActorRef<crate::agent::remote::RemoteNodeManager>,
+        peer_id: libp2p::PeerId,
+        scopes: &[querymt_remote::MeshScopeId],
+        node_timeout: Duration,
+    ) -> Result<Vec<ModelEntry>, RemoteCatalogFailure> {
+        use crate::agent::remote::GetNodeInfo;
         use querymt_remote::{
             GetProviderCatalog, ProviderCatalogActor, ask_remote_with_timeout,
             scoped_provider_catalog,
         };
-
-        let start = Instant::now();
-        let mesh = match self.mesh() {
-            Some(mesh) => mesh,
-            None => return Ok((Vec::new(), 0, 0)),
-        };
-
-        let local_peer_id = *mesh.peer_id();
-        let scopes = mesh.active_scopes();
-        let mut node_refs = Vec::new();
-
-        for scope in &scopes {
-            let mut stream =
-                mesh.lookup_all_actors_scoped::<RemoteNodeManager>(scope, "node_manager");
-
-            while let Some(result) = stream.next().await {
-                if let Ok(node_ref) = result
-                    && node_ref.id().peer_id() != Some(&local_peer_id)
-                {
-                    node_refs.push(node_ref);
+        let node_info = ask_remote_with_timeout(node_ref, &GetNodeInfo, node_timeout)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%peer_id, %error, "GetNodeInfo failed during model refresh");
+                if matches!(error, kameo::error::RemoteSendError::ReplyTimeout) {
+                    RemoteCatalogFailure::TimedOut
+                } else {
+                    RemoteCatalogFailure::Unavailable
                 }
-            }
-        }
-
-        node_refs.sort_by_key(|node_ref| node_ref.id().peer_id().copied());
-        node_refs.dedup_by(|a, b| a.id().peer_id() == b.id().peer_id());
-
-        let mut all_remote = Vec::new();
-        let mut timeout_count = 0usize;
-
-        let node_count = node_refs.len();
-        tracing::Span::current().record("node_count", node_count);
-
-        // Query nodes with bounded concurrency and timeouts
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(
-            self.inner.inv_config.remote_concurrency,
-        ));
-        let mut handles = Vec::new();
-
-        for node_ref in node_refs {
-            let semaphore = semaphore.clone();
-            let node_timeout = self.inner.inv_config.remote_node_timeout;
-            let mesh = mesh.clone();
-            let scopes = scopes.clone();
-
-            let handle = tokio::spawn(async move {
-                let _permit = semaphore.acquire().await.unwrap();
-
-                let node_info =
-                    match ask_remote_with_timeout(&node_ref, &GetNodeInfo, node_timeout).await {
-                        Ok(info) => info,
-                        Err(kameo::error::RemoteSendError::ReplyTimeout) => {
-                            tracing::warn!(
-                                "GetNodeInfo timed out for node (timeout: {:?})",
-                                node_timeout
-                            );
-                            return Some(Err(()));
+            })?;
+        let mut failure = RemoteCatalogFailure::Unavailable;
+        for scope in scopes {
+            let name = scoped_provider_catalog(scope, &peer_id);
+            let catalog = match mesh
+                .lookup_actor_no_retry_with_timeout::<ProviderCatalogActor>(name, node_timeout)
+                .await
+            {
+                Ok(Some(catalog)) => catalog,
+                Ok(None) => continue,
+                Err(error) => {
+                    if matches!(error, querymt_remote::RemoteLookupError::Timeout { .. }) {
+                        failure = RemoteCatalogFailure::TimedOut;
+                    }
+                    tracing::warn!(%peer_id, %scope, %error, "ProviderCatalog lookup failed");
+                    continue;
+                }
+            };
+            let snapshot =
+                match ask_remote_with_timeout(&catalog, &GetProviderCatalog, node_timeout).await {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        if matches!(error, kameo::error::RemoteSendError::ReplyTimeout) {
+                            failure = RemoteCatalogFailure::TimedOut;
                         }
-                        Err(e) => {
-                            tracing::warn!("GetNodeInfo failed: {}", e);
-                            return None;
-                        }
-                    };
-
-                let peer_id = node_ref.id().peer_id().copied()?;
-
-                for scope in &scopes {
-                    let catalog_name = scoped_provider_catalog(scope, &peer_id);
-                    match mesh
-                        .lookup_actor_with_timeout::<ProviderCatalogActor>(
-                            catalog_name,
-                            node_timeout,
-                        )
-                        .await
-                    {
-                        Ok(Some(catalog_ref)) => {
-                            match ask_remote_with_timeout(
-                                &catalog_ref,
-                                &GetProviderCatalog,
-                                node_timeout,
-                            )
-                            .await
-                            {
-                                Ok(snapshot) => {
-                                    let fallback_node_id = node_info.node_id.to_string();
-                                    let resolved_node_id =
-                                        crate::agent::remote::NodeId::parse(&snapshot.node.node_id)
-                                            .ok()
-                                            .map(|id| id.to_string())
-                                            .unwrap_or(fallback_node_id);
-                                    let resolved_label = snapshot
-                                        .node
-                                        .node_label
-                                        .clone()
-                                        .unwrap_or_else(|| node_info.hostname.clone());
-                                    let entries: Vec<ModelEntry> = snapshot
-                                        .providers
-                                        .into_iter()
-                                        .map(|m| {
-                                            let model = m.model.unwrap_or_else(|| "*".to_string());
-                                            let provider = m.provider;
-                                            ModelEntry {
-                                                id: format!("{}/{}", provider, model),
-                                                label: m.label.unwrap_or_else(|| {
-                                                    if model == "*" {
-                                                        format!("{} (all models)", provider)
-                                                    } else {
-                                                        model.clone()
-                                                    }
-                                                }),
-                                                source: "catalog".to_string(),
-                                                provider,
-                                                model,
-                                                node_id: Some(resolved_node_id.clone()),
-                                                node_label: Some(resolved_label.clone()),
-                                                family: m.family,
-                                                quant: m.quant,
-                                            }
-                                        })
-                                        .collect();
-                                    return Some(Ok(entries));
-                                }
-                                Err(kameo::error::RemoteSendError::ReplyTimeout) => {
-                                    tracing::warn!(
-                                        "GetProviderCatalog timed out for node (timeout: {:?})",
-                                        node_timeout
-                                    );
-                                    return Some(Err(()));
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        "GetProviderCatalog failed for peer {}: {}",
-                                        peer_id,
-                                        e
-                                    );
-                                }
+                        tracing::warn!(%peer_id, %scope, %error, "GetProviderCatalog failed");
+                        continue;
+                    }
+                };
+            let node_id = crate::agent::remote::NodeId::parse(&snapshot.node.node_id)
+                .ok()
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| node_info.node_id.to_string());
+            let label = snapshot
+                .node
+                .node_label
+                .unwrap_or_else(|| node_info.hostname.clone());
+            return Ok(snapshot
+                .providers
+                .into_iter()
+                .map(|entry| {
+                    let model = entry.model.unwrap_or_else(|| "*".to_string());
+                    let provider = entry.provider;
+                    ModelEntry {
+                        id: format!("{provider}/{model}"),
+                        label: entry.label.unwrap_or_else(|| {
+                            if model == "*" {
+                                format!("{provider} (all models)")
+                            } else {
+                                model.clone()
                             }
-                        }
-                        Ok(None) => {}
-                        Err(querymt_remote::RemoteLookupError::Timeout { .. }) => {
-                            tracing::warn!(
-                                "ProviderCatalog lookup timed out for node (timeout: {:?})",
-                                node_timeout
-                            );
-                            return Some(Err(()));
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                "ProviderCatalog lookup failed for peer {}: {}",
-                                peer_id,
-                                e
-                            );
-                        }
+                        }),
+                        source: "catalog".into(),
+                        provider,
+                        model,
+                        node_id: Some(node_id.clone()),
+                        node_label: Some(label.clone()),
+                        family: entry.family,
+                        quant: entry.quant,
                     }
-                }
-
-                tracing::debug!(
-                    peer_id = %peer_id,
-                    "remote node has no provider catalog registration; skipping model enumeration"
-                );
-                Some(Ok(Vec::new()))
-            });
-
-            handles.push(handle);
+                })
+                .collect());
         }
-
-        // Use FuturesUnordered for partial results with deadline polling.
-        let mut futures = FuturesUnordered::new();
-        for handle in handles {
-            futures.push(handle);
-        }
-
-        let global_timeout = self.inner.inv_config.remote_refresh_timeout;
-        let deadline = Instant::now() + global_timeout;
-
-        // Process results as they come in, respecting the global deadline
-        while !futures.is_empty() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!(
-                    "Remote model refresh timed out globally (timeout: {:?}), {} futures remaining",
-                    global_timeout,
-                    futures.len()
-                );
-                for handle in futures.iter() {
-                    handle.abort();
-                }
-                break;
-            }
-
-            match tokio::time::timeout(remaining, futures.next()).await {
-                Ok(Some(result)) => {
-                    match result {
-                        Ok(Some(Ok(models))) => {
-                            all_remote.extend(models);
-                        }
-                        Ok(Some(Err(()))) => {
-                            timeout_count += 1;
-                        }
-                        _ => {} // Task failed or returned None
-                    }
-                }
-                Ok(None) => break, // No more futures
-                Err(_) => {
-                    // Timeout waiting for next future.
-                    tracing::warn!(
-                        "Remote model refresh timed out globally (timeout: {:?}), {} futures remaining",
-                        global_timeout,
-                        futures.len()
-                    );
-                    for handle in futures.iter() {
-                        handle.abort();
-                    }
-                    break;
-                }
-            }
-        }
-
-        tracing::Span::current().record("timeout_count", timeout_count);
-        tracing::Span::current().record("model_count", all_remote.len());
-        tracing::Span::current().record("duration_ms", start.elapsed().as_millis());
-
-        Ok((all_remote, timeout_count, node_count))
+        // Missing registration is not an authoritative empty catalog.
+        Err(failure)
     }
 }
 
@@ -898,6 +1071,277 @@ mod tests {
         let llm = LLMParams::new().provider("mock").model("mock-model");
         let builder = AgentConfigBuilder::new(Arc::new(registry), storage.clone(), llm);
         Arc::new(builder.build())
+    }
+
+    #[cfg(feature = "remote")]
+    fn remote_model(name: &str) -> ModelEntry {
+        ModelEntry {
+            id: name.into(),
+            label: name.into(),
+            source: "catalog".into(),
+            provider: "test".into(),
+            model: name.into(),
+            node_id: Some("peer".into()),
+            node_label: None,
+            family: None,
+            quant: None,
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    fn test_peer() -> libp2p::PeerId {
+        libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_catalogs_preserve_failures_and_expire_withdrawals_per_peer() {
+        let mut cache = RemoteCatalogCache::default();
+        let a = test_peer();
+        let b = test_peer();
+        let scopes = vec![querymt_remote::MeshScopeId::lan_default()];
+        let now = Instant::now();
+        let first = RemoteRefreshResult {
+            catalogs: [(a, vec![remote_model("a")]), (b, vec![remote_model("b")])].into(),
+            ..Default::default()
+        };
+        assert_eq!(cache.merge(&scopes, &first, now).len(), 2);
+        let partial = RemoteRefreshResult {
+            catalogs: [(a, vec![remote_model("new-a")])].into(),
+            incomplete: true,
+            ..Default::default()
+        };
+        let models = cache.merge(&scopes, &partial, now + Duration::from_secs(10));
+        assert_eq!(models.len(), 2);
+        assert!(models.iter().any(|model| model.id == "new-a"));
+        assert!(models.iter().any(|model| model.id == "b"));
+        let empty = RemoteRefreshResult {
+            catalogs: [(a, Vec::new())].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cache
+                .merge(&scopes, &empty, now + Duration::from_secs(20))
+                .len(),
+            1
+        );
+        assert!(
+            cache
+                .merge(
+                    &scopes,
+                    &RemoteRefreshResult::default(),
+                    now + Duration::from_secs(301)
+                )
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn leaving_scope_drops_its_cached_catalogs() {
+        let mut cache = RemoteCatalogCache::default();
+        let scopes = vec![querymt_remote::MeshScopeId::Iroh {
+            mesh_id: "a".into(),
+        }];
+        let result = RemoteRefreshResult {
+            catalogs: [(test_peer(), vec![remote_model("a")])].into(),
+            ..Default::default()
+        };
+        assert_eq!(cache.merge(&scopes, &result, Instant::now()).len(), 1);
+        assert!(
+            cache
+                .merge(&[], &RemoteRefreshResult::default(), Instant::now())
+                .is_empty()
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn global_deadline_counts_pending_nodes_and_cancels_queries() {
+        let a = test_peer();
+        let b = test_peer();
+        let c = test_peer();
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let discoveries =
+            futures_util::stream::iter([Ok((a, Some(sender))), Ok((b, None)), Ok((c, None))]);
+        let result = collect_remote_catalogs(
+            discoveries,
+            move |peer, sender| async move {
+                let _sender = sender;
+                if peer == b {
+                    return Ok(vec![remote_model("b")]);
+                }
+                futures_util::future::pending().await
+            },
+            4,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(result.node_count, 3);
+        assert_eq!(result.catalogs.len(), 1);
+        assert_eq!(result.timeout_count, 2);
+        assert!(result.incomplete);
+        assert!(
+            receiver.await.is_err(),
+            "deadline must drop unfinished query futures"
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn slow_scope_discovery_does_not_starve_early_catalogs() {
+        let peer = test_peer();
+        // Each scope yields a healthy cached provider, then remains open until
+        // after the refresh deadline. They must not delay its catalog query.
+        let scopes = (0..4).map(|_| {
+            futures_util::stream::iter([Ok((peer, ()))]).chain(futures_util::stream::pending())
+        });
+        let discoveries = futures_util::stream::select_all(scopes);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = collect_remote_catalogs(
+            discoveries,
+            |_, ()| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                futures_util::future::ready(Ok(vec![remote_model("early")]))
+            },
+            2,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(result.node_count, 1);
+        assert_eq!(result.catalogs[&peer][0].id, "early");
+        assert_eq!(
+            result.timeout_count, 1,
+            "unfinished discovery must be reported"
+        );
+        assert!(result.incomplete);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn catalog_pipeline_bounds_concurrency_and_deduplicates_peers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let peers: Vec<_> = (0..6).map(|_| test_peer()).collect();
+        let discoveries = futures_util::stream::iter(
+            peers.iter().chain(peers.iter()).map(|peer| Ok((*peer, ()))),
+        );
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let result = collect_remote_catalogs(
+            discoveries,
+            |_, ()| async {
+                let current = active.fetch_add(1, Ordering::Relaxed) + 1;
+                peak.fetch_max(current, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::Relaxed);
+                Ok(Vec::new())
+            },
+            2,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(result.node_count, peers.len());
+        assert_eq!(result.catalogs.len(), peers.len());
+        assert_eq!(peak.load(Ordering::Relaxed), 2);
+        assert!(!result.incomplete);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn remote_invalidation_keeps_snapshot_visible() {
+        let inventory = ModelInventory::new(make_test_config().await);
+        inventory
+            .inner
+            .remote_snapshot
+            .store(Arc::new(vec![remote_model("retained")]));
+        // Hold the refresh active so invalidation cannot finish a replacement pass.
+        inventory.inner.refresh_state.lock().await.remote_refreshing = true;
+        inventory.invalidate_remote().await;
+        let (models, meta) = inventory.get_snapshot().await;
+        assert_eq!(models[0].id, "retained");
+        assert!(meta.is_stale);
+        assert!(meta.refresh_in_progress);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn remote_refresh_is_single_flight_across_inventories() {
+        let key = (
+            test_peer(),
+            vec![],
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            10,
+            0,
+        );
+        let count = std::sync::atomic::AtomicUsize::new(0);
+        let jobs = (0..20).map(|_| {
+            shared_remote_refreshes().get_with(key.clone(), async {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Arc::new(RemoteRefreshResult::default())
+            })
+        });
+        join_all(jobs).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn invalidation_bypasses_completed_and_in_flight_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let config = make_test_config().await;
+        let first = ModelInventory::new(config.clone());
+        let second = ModelInventory::new(config);
+        first.set_mesh(mesh.clone());
+        second.set_mesh(mesh.clone());
+        let first_mesh = first.mesh().unwrap();
+        let second_mesh = second.mesh().unwrap();
+        // Exercise the real invalidation entry points without launching network I/O.
+        first.inner.refresh_state.lock().await.remote_refreshing = true;
+        let count = AtomicUsize::new(0);
+        for invalidate_while_running in [false, true] {
+            // Isolate each case from previous results and other process-wide mesh tests.
+            let scopes = vec![querymt_remote::MeshScopeId::Iroh {
+                mesh_id: uuid::Uuid::now_v7().to_string(),
+            }];
+            let old_key = first.remote_refresh_key(&first_mesh, scopes.clone());
+            let old = shared_remote_refreshes()
+                .get_with(old_key, async {
+                    if invalidate_while_running {
+                        first.invalidate_all().await;
+                    }
+                    Arc::new(RemoteRefreshResult::default())
+                })
+                .await;
+            if !invalidate_while_running {
+                first.invalidate_remote().await;
+            }
+            let second_key = second.remote_refresh_key(&second_mesh, scopes.clone());
+            let results = join_all((0..20).map(|_| {
+                shared_remote_refreshes().get_with(second_key.clone(), async {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Arc::new(RemoteRefreshResult::default())
+                })
+            }))
+            .await;
+            assert!(
+                results.iter().all(|result| !Arc::ptr_eq(result, &old)),
+                "invalidation must not reuse the completed pre-event result"
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|result| Arc::ptr_eq(result, &results[0]))
+            );
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1223,6 +1667,25 @@ mod tests {
             waited.is_ok(),
             "late waiters should observe retained completion state and return promptly"
         );
+    }
+
+    #[tokio::test]
+    async fn local_refresh_reserves_invalidated_follow_up_before_spawning() {
+        let inventory = ModelInventory::new(make_test_config().await);
+        {
+            let mut state = inventory.inner.refresh_state.lock().await;
+            state.local_refreshing = true;
+            state.refresh_requested_after_current = true;
+        }
+        inventory.run_local_refresh().await;
+        let handle = inventory.trigger_refresh().await;
+        assert_eq!(
+            handle.disposition(),
+            RefreshTriggerDisposition::AlreadyInProgress
+        );
+        tokio::time::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

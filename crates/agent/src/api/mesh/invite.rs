@@ -16,12 +16,12 @@ pub(crate) async fn admit_via_invite_on_runtime(
         invite.grant.mesh_name.as_deref(),
     );
 
-    let mesh_state_path = crate::agent::remote::mesh_state::default_mesh_state_path()?;
-    let mut mesh_state =
-        crate::agent::remote::mesh_state::MeshStateStore::load_or_create(&mesh_state_path)
-            .map_err(|e| anyhow!(e.to_string()))?;
+    let mesh_state = mesh
+        .mesh_state_store()
+        .cloned()
+        .ok_or_else(|| anyhow!("mesh state store unavailable"))?;
 
-    let (existing_token, fallback_peers) = match mesh_state.get(&mesh_id) {
+    let (existing_token, fallback_peers) = match mesh_state.read().get(&mesh_id) {
         Some(entry)
             if entry.status == crate::agent::remote::mesh_state::MeshStatus::Active
                 && entry
@@ -90,17 +90,25 @@ pub(crate) async fn admit_via_invite_on_runtime(
         } => {
             let known_peers = known_peers_from_strings(mesh, &mesh_id, &existing_peers);
             let admitted_peer_ids = peer_ids_from_strings(&existing_peers);
-            mesh_state
-                .upsert_joined_mesh(membership_token, known_peers)
-                .map_err(|e| anyhow!("failed to persist mesh state: {e}"))?;
+            crate::agent::remote::admission::persist_admission(
+                mesh_state.clone(),
+                mesh_id.clone(),
+                Some(membership_token),
+                known_peers,
+            )
+            .await?;
             mesh.join_iroh_scope(&mesh_id, admitted_peer_ids);
         }
         AdmissionResponse::Readmitted { existing_peers } => {
             let known_peers = known_peers_from_strings(mesh, &mesh_id, &existing_peers);
             let admitted_peer_ids = peer_ids_from_strings(&existing_peers);
-            mesh_state
-                .update_known_peers(&mesh_id, known_peers)
-                .map_err(|e| anyhow!("failed to update mesh state: {e}"))?;
+            crate::agent::remote::admission::persist_admission(
+                mesh_state.clone(),
+                mesh_id.clone(),
+                None,
+                known_peers,
+            )
+            .await?;
             mesh.join_iroh_scope(&mesh_id, admitted_peer_ids);
         }
         AdmissionResponse::Rejected { reason } => {
@@ -108,12 +116,6 @@ pub(crate) async fn admit_via_invite_on_runtime(
         }
     }
 
-    if let Some(store_arc) = mesh.mesh_state_store() {
-        let fresh =
-            crate::agent::remote::mesh_state::MeshStateStore::load_or_create(&mesh_state_path)
-                .map_err(|e| anyhow!(e.to_string()))?;
-        *store_arc.write() = fresh;
-    }
     mesh.ensure_scope(MeshScopeId::Iroh {
         mesh_id: mesh_id.clone(),
     });
@@ -158,4 +160,79 @@ fn known_peers_from_strings(
             addrs: vec![format!("/p2p/{pid}")],
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::remote::test_helpers::fixtures::{AgentConfigFixture, get_test_mesh};
+    use kameo::actor::Spawn;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn admission_on_custom_runtime_preserves_selected_store_and_reuses_token() {
+        use crate::agent::remote::{RemoteNodeManager, scope::scoped_node_manager_for_peer};
+        let mut mesh = get_test_mesh().await.clone();
+        let config = AgentConfigFixture::new().await;
+        let registry = Arc::new(tokio::sync::Mutex::new(
+            crate::agent::session_registry::SessionRegistry::new(config.config.clone()),
+        ));
+        let actor = RemoteNodeManager::spawn(RemoteNodeManager::new(
+            config.config.clone(),
+            registry,
+            Some(mesh.clone()),
+            Arc::new(parking_lot::Mutex::new(None)),
+        ));
+        let name = format!("selected-store-{}", uuid::Uuid::now_v7());
+        let invite = mesh
+            .create_invite(Some(name), None, Some(1), false)
+            .unwrap();
+        let mesh_id = crate::agent::remote::invite::mesh_id_for(
+            &invite.grant.inviter_peer_id,
+            invite.grant.mesh_name.as_deref(),
+        );
+        let selected_store = mesh.mesh_state_store().unwrap().clone();
+        let preserved = format!("preserved-{}", uuid::Uuid::now_v7());
+        selected_store
+            .write()
+            .upsert_hosted_mesh(preserved.clone(), None, None)
+            .unwrap();
+        let actor_name = scoped_node_manager_for_peer(
+            &MeshScopeId::Iroh {
+                mesh_id: mesh_id.clone(),
+            },
+            &mesh.peer_id().to_string(),
+        );
+        mesh.register_actor(actor, actor_name.clone()).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admit_via_invite_on_runtime(&mut mesh, &invite),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            selected_store.read().get(&preserved).is_some(),
+            "admission must not replace the selected store with the default file"
+        );
+        assert!(
+            selected_store
+                .read()
+                .get(&mesh_id)
+                .unwrap()
+                .membership_token
+                .is_some()
+        );
+        // The single-use invite is consumed. A second admission must load the
+        // saved token from the same identity-selected store, not consume it again.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            admit_via_invite_on_runtime(&mut mesh, &invite),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(selected_store.read().get(&preserved).is_some());
+        mesh.deregister_actor(&actor_name);
+    }
 }

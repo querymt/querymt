@@ -342,16 +342,16 @@ async fn test_querymt_capabilities_advertises_profile_methods_when_configured() 
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn test_querymt_capabilities_lan_mesh_reports_no_invites_and_lan_transport() {
+async fn test_querymt_capabilities_composite_mesh_reports_invites_and_multi_transport() {
     let f = HandleFixture::new().await;
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     f.handle.set_mesh(mesh.clone());
 
     let result = ext_method_json(&f.handle, "querymt/capabilities", serde_json::json!({})).await;
 
-    assert_eq!(result["transport"]["mesh_transport"], "lan");
+    assert_eq!(result["transport"]["mesh_transport"], "multi");
     assert_eq!(result["features"]["mesh"], true);
-    assert_eq!(result["features"]["mesh_invites"], false);
+    assert_eq!(result["features"]["mesh_invites"], true);
     assert!(
         result["notifications"]
             .as_array()

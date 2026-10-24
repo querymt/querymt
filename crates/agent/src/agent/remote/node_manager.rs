@@ -1840,6 +1840,14 @@ mod remote_impl {
                         });
                     };
 
+                    let parsed_peer = match peer_id.parse::<libp2p::PeerId>() {
+                        Ok(peer) => peer,
+                        Err(_) => {
+                            return Ok(AdmissionResponse::Rejected {
+                                reason: "invalid peer id".into(),
+                            });
+                        }
+                    };
                     let keypair = mesh.keypair().clone();
 
                     let result = store_arc.write().admit_peer(
@@ -1875,6 +1883,9 @@ mod remote_impl {
                                 }
                             }
 
+                            // Transport acceptance alone is not scope authorization.
+                            // Associate only after the invite has been validated.
+                            mesh.join_iroh_scope(&token.mesh_id, vec![parsed_peer]);
                             let existing_peers: Vec<String> = mesh
                                 .known_peer_ids()
                                 .iter()
@@ -1919,7 +1930,28 @@ mod remote_impl {
                         });
                     }
 
-                    // Pure crypto — any mesh node can verify, no store access needed.
+                    let Some(mesh) = self.shared_state.mesh.as_ref() else {
+                        return Ok(AdmissionResponse::Rejected {
+                            reason: "host has no mesh handle".into(),
+                        });
+                    };
+                    let parsed_peer = match peer_id.parse::<libp2p::PeerId>() {
+                        Ok(peer) => peer,
+                        Err(_) => {
+                            return Ok(AdmissionResponse::Rejected {
+                                reason: "invalid peer id".into(),
+                            });
+                        }
+                    };
+                    let scope = crate::agent::remote::MeshScopeId::Iroh {
+                        mesh_id: membership_token.mesh_id.clone(),
+                    };
+                    if !mesh.active_scopes().contains(&scope) {
+                        return Ok(AdmissionResponse::Rejected {
+                            reason: "host is not a member of this mesh".into(),
+                        });
+                    }
+                    // Any member of this scope can verify the self-contained token.
                     match InviteStore::verify_membership_token(&membership_token) {
                         Ok(()) => {
                             log::info!(
@@ -1927,18 +1959,13 @@ mod remote_impl {
                                 peer_id,
                                 membership_token.admitted_by
                             );
-                            let existing_peers: Vec<String> = self
-                                .shared_state
-                                .mesh
-                                .as_ref()
-                                .map(|m| {
-                                    m.known_peer_ids()
-                                        .iter()
-                                        .filter(|pid| pid.to_string() != peer_id)
-                                        .map(|pid| pid.to_string())
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                            mesh.join_iroh_scope(&membership_token.mesh_id, vec![parsed_peer]);
+                            let existing_peers: Vec<String> = mesh
+                                .known_peer_ids()
+                                .iter()
+                                .filter(|pid| pid.to_string() != peer_id)
+                                .map(|pid| pid.to_string())
+                                .collect();
                             Ok(AdmissionResponse::Readmitted { existing_peers })
                         }
                         Err(e) => {

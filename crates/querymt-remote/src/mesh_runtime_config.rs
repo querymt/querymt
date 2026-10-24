@@ -13,6 +13,8 @@ pub struct MeshRuntimeConfig {
     /// None preserves iroh's default DNS policy.
     pub iroh_dns: Option<crate::IrohDnsConfig>,
     pub iroh_scopes: Vec<IrohMeshConfig>,
+    /// Custom identities use `<identity_file>.invites.json` and
+    /// `<identity_file>.mesh_state.json` rather than the default QueryMT stores.
     pub identity_file: Option<PathBuf>,
     pub request_timeout: Duration,
     pub stream_reconnect_grace: Duration,

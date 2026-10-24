@@ -45,6 +45,7 @@ pub struct MeshHandle {
     shutdown_lock: Arc<tokio::sync::Mutex<()>>,
     stream_reconnect_grace: std::time::Duration,
     config_scopes: Arc<RwLock<Vec<MeshScopeId>>>,
+    pub(crate) catalog_refresh_generation: Arc<std::sync::atomic::AtomicU64>,
     peer_node_resolver: Option<PeerNodeResolver>,
     pub(crate) iroh_diagnostics: crate::iroh_diagnostics::IrohDiagnostics,
 }
@@ -91,6 +92,7 @@ impl MeshHandle {
             shutdown_lock: Arc::new(tokio::sync::Mutex::new(())),
             stream_reconnect_grace,
             config_scopes: Arc::new(RwLock::new(Vec::new())),
+            catalog_refresh_generation: Default::default(),
             peer_node_resolver: None,
             iroh_diagnostics: Default::default(),
         }
