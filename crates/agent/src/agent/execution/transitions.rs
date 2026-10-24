@@ -1004,6 +1004,15 @@ pub(super) async fn transition_call_llm(
                             );
                             let _ = signature;
                         }
+                        StreamChunk::RedactedThinking(data) => {
+                            // Opaque provider state: no UI output, never logged.
+                            trace!(
+                                "stream chunk: session={} message_id={} type=redacted_thinking len={}",
+                                session_id,
+                                message_id,
+                                data.len()
+                            );
+                        }
                         StreamChunk::ToolUseComplete { tool_call, .. } => {
                             // Flush before tool use so UI sees final text before tool starts
                             trace!(

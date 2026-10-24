@@ -239,6 +239,64 @@ What OS are you on?
 
 ## Provider reference
 
+### anthropic
+
+Claude models through the Anthropic Messages API. Requests are shaped per model, so the same session settings are valid on every Claude generation.
+
+#### Model classes and "auto" effort
+
+The model ID (including Bedrock, Vertex and router forms such as `us.anthropic.claude-opus-4-7-v1:0`, `claude-sonnet-4-6@20260101` or `anthropic/claude-sonnet-5-5`) is parsed into family and version and falls into one class:
+
+| Class | Models | "auto" (no effort set) | Explicit effort (`low`, `medium`, `high`, `max`) |
+|---|---|---|---|
+| Default-on adaptive | Claude 5 or later, Fable, Mythos (including Mythos Preview) | No `thinking`, no effort: the API defaults apply | `thinking: {type: "adaptive"}` + `output_config.effort` |
+| Opt-in adaptive | Opus and Sonnet 4.6 to 4.8 | `thinking: {type: "adaptive"}` | `thinking: {type: "adaptive"}` + `output_config.effort` |
+| Budget | Everything older, and IDs that can't be parsed | No `thinking` | `thinking: {type: "enabled", budget_tokens}` |
+
+!!! warning "Behaviour change for Opus 4.6-4.8 and Sonnet 4.6"
+    "auto" now turns adaptive thinking **on** for these models. This raises cost and latency, and responses may contain thinking blocks. There is no "off" reasoning level yet.
+
+!!! note "\"auto\" on Claude 5.x does not bound thinking"
+    Default-on models keep their API default effort (`high` on most models), and nothing in the request limits how much they think. The documented controls are `max_tokens` and `effort`. Thinking spend is reported as `reasoning_tokens` in usage so it is visible, but it is not capped by this provider.
+
+#### Effort and budget fitting
+
+On adaptive models the effort is sent unchanged as `output_config.effort`. On budget models the budget is `reasoning_budget_tokens` when configured, otherwise a default per effort (low 1,024, medium 8,000, high 16,000, max 31,999). It is then fitted to the request: at least 1,024 and at most half of `max_tokens`. When `max_tokens` is below 2,048 thinking is omitted. Budget models never receive `output_config`.
+
+#### Sampling parameters
+
+- On Opus 4.7 or later and on every Claude 5 or later, Fable or Mythos model, `temperature`, `top_p` and `top_k` are **never sent**.
+- On other models, whenever thinking is sent, `temperature` and `top_k` are omitted and `top_p` is sent only if it is between 0.95 and 1.
+- Otherwise the configured values are sent.
+
+Each dropped value is logged at debug level.
+
+#### Forced tool choice
+
+A forced `tool_choice` is `any` or a named tool.
+
+- Budget models: thinking is dropped from that request.
+- Opus 5.5 or later, Sonnet 5.5 or later, Fable 5.1 or later, Mythos 5.1 or later: the API rejects forced tool choice, so the request fails locally with an invalid-request error.
+- Other adaptive models: sent unchanged.
+
+#### Thinking replay, usage and stop reasons
+
+Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default `display: "omitted"` on Opus 4.7+ and Claude 5). `redacted_thinking` blocks are kept and replayed with their opaque data. `output_tokens_details.thinking_tokens` is reported as `reasoning_tokens`. Stop reasons map as: `end_turn`/`stop_sequence` to stop, `tool_use` to tool calls, `max_tokens`/`model_context_window_exceeded` to length, `refusal` to content filter, `pause_turn` to other.
+
+#### `adaptive_thinking` override
+
+An optional provider config field overrides the class derived from the model ID:
+
+```toml
+[providers.anthropic]
+adaptive_thinking = true   # force opt-in adaptive thinking
+```
+
+- `true` sends adaptive thinking explicitly. This is the right choice for a proxy or custom model ID that can't be parsed but fronts an adaptive model.
+- `false` forces budget thinking. The API **rejects** budget thinking on Opus 4.7+ and every Claude 5 or later model.
+
+The sampling and forced-tool-choice rules always use the parsed model ID and ignore this override.
+
 ### llama-cpp
 
 Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models, vision/multimodal models, and streaming. Broadest hardware support of the three native providers.

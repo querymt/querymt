@@ -280,6 +280,10 @@ impl ChatStreamAccumulator {
                 self.select_legacy();
                 append_legacy_signature(&mut self.output.items, signature);
             }
+            StreamChunk::RedactedThinking(data) => {
+                self.select_legacy();
+                append_legacy_redacted(&mut self.output.items, data);
+            }
             StreamChunk::ToolUseComplete {
                 index,
                 tool_call,
@@ -658,8 +662,15 @@ fn append_legacy_message_text(items: &mut Vec<ChatOutputItem>, delta: &str) {
     }));
 }
 
+/// Whether a reasoning item is still open for text/signature deltas: it has
+/// neither a signature nor opaque (redacted) content yet.
+fn is_open_reasoning(reasoning: &super::ChatReasoningItem) -> bool {
+    reasoning.signature.is_none() && reasoning.encrypted_content.is_none()
+}
+
 fn append_legacy_reasoning(items: &mut Vec<ChatOutputItem>, delta: &str) {
     if let Some(ChatOutputItem::Reasoning(reasoning)) = items.last_mut()
+        && is_open_reasoning(reasoning)
         && let Some(part) = reasoning.content.last_mut()
     {
         part.text.push_str(delta);
@@ -676,13 +687,47 @@ fn append_legacy_reasoning(items: &mut Vec<ChatOutputItem>, delta: &str) {
     }));
 }
 
-fn append_legacy_signature(items: &mut [ChatOutputItem], signature: &str) {
-    if let Some(reasoning) = items.iter_mut().rev().find_map(|item| match item {
-        ChatOutputItem::Reasoning(reasoning) => Some(reasoning),
-        _ => None,
-    }) {
+/// Attach a signature to the open reasoning item at the end of the output.
+/// When there is none (an empty thinking block, e.g. omitted display), create
+/// an empty reasoning item that carries the signature so blocks map one-to-one.
+fn append_legacy_signature(items: &mut Vec<ChatOutputItem>, signature: &str) {
+    if let Some(ChatOutputItem::Reasoning(reasoning)) = items.last_mut()
+        && is_open_reasoning(reasoning)
+    {
         reasoning.signature = Some(signature.to_string());
+        return;
     }
+    items.push(ChatOutputItem::Reasoning(super::ChatReasoningItem {
+        id: None,
+        summary: Vec::new(),
+        content: Vec::new(),
+        encrypted_content: None,
+        signature: Some(signature.to_string()),
+        status: None,
+        extensions: Default::default(),
+    }));
+}
+
+/// Marker extension identifying redacted Anthropic thinking blocks.
+pub const ANTHROPIC_BLOCK_EXTENSION: &str = "anthropic_block";
+/// Value of [`ANTHROPIC_BLOCK_EXTENSION`] for `redacted_thinking` blocks.
+pub const ANTHROPIC_REDACTED_THINKING: &str = "redacted_thinking";
+
+fn append_legacy_redacted(items: &mut Vec<ChatOutputItem>, data: &str) {
+    let mut extensions = super::Extensions::new();
+    extensions.insert(
+        ANTHROPIC_BLOCK_EXTENSION.to_string(),
+        serde_json::Value::String(ANTHROPIC_REDACTED_THINKING.to_string()),
+    );
+    items.push(ChatOutputItem::Reasoning(super::ChatReasoningItem {
+        id: None,
+        summary: Vec::new(),
+        content: Vec::new(),
+        encrypted_content: Some(data.to_string()),
+        signature: None,
+        status: None,
+        extensions,
+    }));
 }
 
 #[cfg(test)]
@@ -873,6 +918,121 @@ mod tests {
             vec!["full thought"]
         );
         assert_eq!(output.thinking().as_deref(), Some("full thought"));
+    }
+
+    fn reasoning_items(output: &ChatOutput) -> Vec<&super::super::ChatReasoningItem> {
+        output
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ChatOutputItem::Reasoning(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_consecutive_signed_blocks_stay_separate() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::Thinking("one".into()),
+            StreamChunk::ThinkingSignature("S1".into()),
+            StreamChunk::Text("progress".into()),
+            StreamChunk::Thinking("two".into()),
+            StreamChunk::ThinkingSignature("S2".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].signature.as_deref(), Some("S1"));
+        assert_eq!(items[0].content[0].text, "one");
+        assert_eq!(items[1].signature.as_deref(), Some("S2"));
+        assert_eq!(items[1].content[0].text, "two");
+
+        // Back-to-back blocks with no text between them must not merge either.
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::Thinking("a".into()),
+            StreamChunk::ThinkingSignature("A".into()),
+            StreamChunk::Thinking("b".into()),
+            StreamChunk::ThinkingSignature("B".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].signature.as_deref(), Some("A"));
+        assert_eq!(items[1].signature.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn legacy_empty_signed_block_creates_empty_signed_item() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        accumulator
+            .push(&StreamChunk::ThinkingSignature("S".into()))
+            .unwrap();
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].signature.as_deref(), Some("S"));
+        assert!(items[0].visible_text().is_empty());
+    }
+
+    #[test]
+    fn legacy_single_block_is_unchanged() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::Thinking("full ".into()),
+            StreamChunk::Thinking("thought".into()),
+            StreamChunk::ThinkingSignature("S".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content[0].text, "full thought");
+        assert_eq!(items[0].signature.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn redacted_thinking_becomes_marked_encrypted_item() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::RedactedThinking("DATA".into()),
+            StreamChunk::Thinking("next".into()),
+            StreamChunk::ThinkingSignature("S".into()),
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        let output = accumulator.output();
+        let items = reasoning_items(&output);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].encrypted_content.as_deref(), Some("DATA"));
+        assert!(items[0].signature.is_none());
+        assert!(items[0].visible_text().is_empty());
+        assert_eq!(
+            items[0]
+                .extensions
+                .get(super::ANTHROPIC_BLOCK_EXTENSION)
+                .and_then(|v| v.as_str()),
+            Some(super::ANTHROPIC_REDACTED_THINKING)
+        );
+        // Following thinking text must not be appended onto the redacted item.
+        assert_eq!(items[1].content[0].text, "next");
+        assert_eq!(items[1].signature.as_deref(), Some("S"));
+    }
+
+    #[test]
+    fn redacted_thinking_chunk_debug_redacts_and_round_trips() {
+        let chunk = StreamChunk::RedactedThinking("SECRET-DATA".into());
+        assert!(!format!("{chunk:?}").contains("SECRET-DATA"));
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: StreamChunk = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, StreamChunk::RedactedThinking(d) if d == "SECRET-DATA"));
     }
 
     #[test]

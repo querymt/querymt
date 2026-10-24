@@ -35,8 +35,9 @@ pub use output::{
     ToolResult, ToolResultPart, empty_message_part,
 };
 pub use streaming::{
-    ChatMessagePartDelta, ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish,
-    ReasoningPartKind, StructuredStreamEvent,
+    ANTHROPIC_BLOCK_EXTENSION, ANTHROPIC_REDACTED_THINKING, ChatMessagePartDelta,
+    ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, ReasoningPartKind,
+    StructuredStreamEvent,
 };
 
 // ---------------------------------------------------------------------------
@@ -555,7 +556,7 @@ pub enum FinishReason {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamChunk {
     /// Item-aware response metadata, lifecycle, delta, or snapshot event.
@@ -572,6 +573,11 @@ pub enum StreamChunk {
     /// Signature for the current thinking block (providers that require
     /// signed thinking replay emit this once the block is complete).
     ThinkingSignature(String),
+
+    /// Opaque redacted thinking block (e.g. Anthropic `redacted_thinking`).
+    /// The payload is provider state that must be replayed unchanged; it is
+    /// never shown to users and is redacted from `Debug` output.
+    RedactedThinking(String),
 
     /// Tool use block started (contains tool id and name)
     ToolUseStart {
@@ -612,6 +618,52 @@ pub enum StreamChunk {
         /// using the same logic as the canonical output finish reason.
         finish_reason: FinishReason,
     },
+}
+
+impl fmt::Debug for StreamChunk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamChunk::Structured(event) => f.debug_tuple("Structured").field(event).finish(),
+            StreamChunk::Text(text) => f.debug_tuple("Text").field(text).finish(),
+            StreamChunk::Thinking(text) => f.debug_tuple("Thinking").field(text).finish(),
+            StreamChunk::ThinkingSignature(signature) => {
+                f.debug_tuple("ThinkingSignature").field(signature).finish()
+            }
+            StreamChunk::RedactedThinking(_) => f
+                .debug_tuple("RedactedThinking")
+                .field(&"[REDACTED]")
+                .finish(),
+            StreamChunk::ToolUseStart { index, id, name } => f
+                .debug_struct("ToolUseStart")
+                .field("index", index)
+                .field("id", id)
+                .field("name", name)
+                .finish(),
+            StreamChunk::ToolUseInputDelta {
+                index,
+                partial_json,
+            } => f
+                .debug_struct("ToolUseInputDelta")
+                .field("index", index)
+                .field("partial_json", partial_json)
+                .finish(),
+            StreamChunk::ToolUseComplete {
+                index,
+                tool_call,
+                extensions,
+            } => f
+                .debug_struct("ToolUseComplete")
+                .field("index", index)
+                .field("tool_call", tool_call)
+                .field("extensions", extensions)
+                .finish(),
+            StreamChunk::Usage(usage) => f.debug_tuple("Usage").field(usage).finish(),
+            StreamChunk::Done { finish_reason } => f
+                .debug_struct("Done")
+                .field("finish_reason", finish_reason)
+                .finish(),
+        }
+    }
 }
 
 /// Unified ChatProvider trait that combines all chat capabilities.
