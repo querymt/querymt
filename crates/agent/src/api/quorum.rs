@@ -58,6 +58,8 @@ pub struct QuorumBuilder {
     workspace: Option<crate::config::WorkspaceSettings>,
     /// Prebuilt workspace service; wins over `workspace`.
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Portable repository knowledge settings; disabled when omitted.
+    repository_knowledge: Option<crate::config::RepositoryKnowledgeSettings>,
     /// Pre-built registry entries to merge before building (Phase 7: remote agents).
     ///
     /// When `Some`, the entries in this registry are merged with the local delegate agents
@@ -115,6 +117,7 @@ impl QuorumBuilder {
             dotagents_task_approver: None,
             workspace: None,
             workspace_service: None,
+            repository_knowledge: None,
             initial_registry: None,
             #[cfg(feature = "remote")]
             mesh: None,
@@ -182,7 +185,23 @@ impl QuorumBuilder {
         self
     }
 
-    /// Enable `.agents` loading with default discovery options.
+    /// Configure portable repository knowledge for the whole quorum
+    /// (disabled unless `enabled`). Performs no repository reads or writes.
+    pub fn repository_knowledge(
+        mut self,
+        settings: crate::config::RepositoryKnowledgeSettings,
+    ) -> Self {
+        self.repository_knowledge = Some(settings);
+        self
+    }
+
+    /// Inspect the configured repository knowledge settings, if any.
+    pub fn configured_repository_knowledge(
+        &self,
+    ) -> Option<&crate::config::RepositoryKnowledgeSettings> {
+        self.repository_knowledge.as_ref()
+    }
+
     /// Configure managed Git worktree workspaces for the whole quorum.
     ///
     /// A single service is built and shared by the planner and every delegate.
@@ -197,6 +216,7 @@ impl QuorumBuilder {
         self
     }
 
+    /// Enable `.agents` loading with default discovery options.
     pub fn enable_dotagents(mut self) -> Self {
         self.dotagents_options = Some(crate::dotagents::DotagentsLoadOptions::enabled());
         self
@@ -1231,6 +1251,9 @@ impl super::agent::Agent {
 
         if config.quorum.workspace.enabled {
             builder.workspace = Some(config.quorum.workspace);
+        }
+        if config.quorum.repository_knowledge.enabled {
+            builder.repository_knowledge = Some(config.quorum.repository_knowledge);
         }
         builder.snapshot_policy = snapshot_policy;
         builder.initial_registry = initial_registry;

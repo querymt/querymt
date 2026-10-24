@@ -124,6 +124,8 @@ pub struct AgentBuilder {
     workspace: Option<crate::config::WorkspaceSettings>,
     /// Prebuilt workspace service; wins over `workspace`.
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Portable repository knowledge settings; disabled when omitted.
+    repository_knowledge: Option<crate::config::RepositoryKnowledgeSettings>,
     /// MCP servers from TOML `[[mcp]]` config, attached to every new session.
     mcp_servers: Vec<McpServerConfig>,
     /// Runtime MCP attachment source (e.g., mobile in-process MCP peers).
@@ -169,6 +171,7 @@ impl AgentBuilder {
             dotagents_task_approver: None,
             workspace: None,
             workspace_service: None,
+            repository_knowledge: None,
             mcp_servers: Vec::new(),
             session_mcp_attachment_source: None,
             agent_registry: None,
@@ -311,6 +314,25 @@ impl AgentBuilder {
     pub fn workspace_service(mut self, service: Arc<crate::worktree::WorkspaceService>) -> Self {
         self.workspace_service = Some(service);
         self
+    }
+
+    /// Configure portable repository knowledge (disabled unless `enabled`).
+    ///
+    /// Only host configuration can enable the feature. Setting this performs
+    /// no repository reads or writes; discovery happens lazily per session.
+    pub fn repository_knowledge(
+        mut self,
+        settings: crate::config::RepositoryKnowledgeSettings,
+    ) -> Self {
+        self.repository_knowledge = Some(settings);
+        self
+    }
+
+    /// Inspect the configured repository knowledge settings, if any.
+    pub fn configured_repository_knowledge(
+        &self,
+    ) -> Option<&crate::config::RepositoryKnowledgeSettings> {
+        self.repository_knowledge.as_ref()
     }
 
     /// Enable `.agents` loading with default discovery options.
@@ -1609,6 +1631,9 @@ impl Agent {
         builder.hooks_config = Some(config.agent.hooks);
         if config.agent.workspace.enabled {
             builder.workspace = Some(config.agent.workspace);
+        }
+        if config.agent.repository_knowledge.enabled {
+            builder.repository_knowledge = Some(config.agent.repository_knowledge);
         }
 
         // Wire MCP servers from TOML `[[mcp]]` config.
