@@ -76,20 +76,25 @@ async fn remote_create_keeps_explicit_owner_profile_and_rejects_invalid_selectio
         owner.handle.profiles().unwrap().active_profile_id().await,
         "alpha"
     );
-    let listed = ext_method_json(
-        &viewer.handle,
-        "querymt/profiles",
-        serde_json::json!({"node_id": node_id}),
-    )
-    .await;
-    assert_eq!(listed["node_id"], node_id);
-    assert!(
-        listed["profiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|profile| profile["id"] == "cdr")
-    );
+    for key in ["node_id", "nodeId"] {
+        let listed = ext_method_json(
+            &viewer.handle,
+            "querymt/profiles",
+            serde_json::json!({ (key): node_id }),
+        )
+        .await;
+        assert_eq!(
+            listed["node_id"], node_id,
+            "owner catalog requested via {key}"
+        );
+        assert!(
+            listed["profiles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|profile| profile["id"] == "cdr")
+        );
+    }
     assert!(
         viewer.handle.profiles().is_none(),
         "catalog is not borrowed from A"

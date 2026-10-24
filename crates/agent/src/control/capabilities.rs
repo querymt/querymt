@@ -171,7 +171,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_COMPLETED_NOTIFICATION
             .to_string(),
     ];
-    if agent.profiles().is_some() {
+    if agent.profiles().is_some() || mesh_enabled {
         notifications
             .push(crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED.to_string());
     }

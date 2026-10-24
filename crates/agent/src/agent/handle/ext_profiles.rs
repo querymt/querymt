@@ -5,6 +5,7 @@ impl LocalAgentHandle {
     pub(super) async fn handle_ext_profiles(&self, req: ExtRequest) -> Result<ExtResponse, Error> {
         #[derive(serde::Deserialize, Default)]
         struct Request {
+            #[serde(alias = "nodeId")]
             node_id: Option<String>,
         }
         let parsed: Option<Request> = serde_json::from_str(req.params.get())
