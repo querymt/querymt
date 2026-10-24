@@ -2,17 +2,17 @@
 
 ## 1. M1a: Portable document contract and safe discovery
 
-- [ ] 1.1 Add disabled-by-default `repository_knowledge` host settings and builder plumbing (explicit root, source/output limits, forced-hash option, independently disabled delivery controls); verify configuration round trips and that disabled standalone/quorum configurations cause no repository reads, writes, or prompt changes.
-- [ ] 1.2 Implement `.qmt/knowledge.toml` v1 (`[documents]`, `[code]`, optional `[orientation] entrypoints`); verify excludes, ignore policy, missing manifest, unsupported version, unknown top-level table rejection, duplicate selection, and that `.agents/knowledge.toml` is never read.
-- [ ] 1.3 Implement effective-checkout root resolution and cache identity under the shared QueryMT config directory; verify repository-root/crate-cwd equivalence, nested repositories, explicit non-Git roots, linked worktrees, and denied/unmounted roots.
-- [ ] 1.4 Implement confined regular-file discovery with file/count/byte budgets; verify traversal, external symlinks, ignored secrets, selected hidden `.agents/memories`, and incomplete-coverage diagnostics.
-- [ ] 1.5 Add plain-Markdown and legacy-memory adapters using the existing dotagents frontmatter conventions; verify no-frontmatter documents, unknown-key retention, malformed frontmatter isolation, recognized optional keys (`id`, `title`, `description`, `tags`, `status`, `knowledge_sources`, `knowledge_paths`), and unchanged legacy parsing/enabled semantics.
-- [ ] 1.6 Normalize explicit and path-derived identities, sections, and original coordinates; verify moves, duplicate IDs/headings, and mixed inputs.
-- [ ] 1.7 Implement document-relative reference resolution with confinement; verify escape rejection, inert URLs, and that links never select extra inputs or grant access.
+- [x] 1.1 Add disabled-by-default `repository_knowledge` host settings and builder plumbing (explicit root, source/output limits, forced-hash option, independently disabled delivery controls); verify configuration round trips and that disabled standalone/quorum configurations cause no repository reads, writes, or prompt changes.
+- [x] 1.2 Implement `.qmt/knowledge.toml` v1 (`[documents]`, `[code]`, optional `[orientation] entrypoints`); verify excludes, ignore policy, missing manifest, unsupported version, unknown top-level table rejection, duplicate selection, and that `.agents/knowledge.toml` is never read.
+- [x] 1.3 Implement effective-checkout root resolution and cache identity under the shared QueryMT config directory; verify repository-root/crate-cwd equivalence, nested repositories, explicit non-Git roots, linked worktrees, and denied/unmounted roots.
+- [x] 1.4 Implement confined regular-file discovery with file/count/byte budgets; verify traversal, external symlinks, ignored secrets, selected hidden `.agents/memories`, and incomplete-coverage diagnostics.
+- [x] 1.5 Add plain-Markdown and legacy-memory adapters using the existing dotagents frontmatter conventions; verify no-frontmatter documents, unknown-key retention, malformed frontmatter isolation, recognized optional keys (`id`, `title`, `description`, `tags`, `status`, `knowledge_sources`, `knowledge_paths`), and unchanged legacy parsing/enabled semantics.
+- [x] 1.6 Normalize explicit and path-derived identities, sections, and original coordinates; verify moves, duplicate IDs/headings, and mixed inputs.
+- [x] 1.7 Implement document-relative reference resolution with confinement; verify escape rejection, inert URLs, and that links never select extra inputs or grant access.
 
 ## 2. M1b: Checkout-local projection and pull retrieval
 
-- [ ] 2.1 Implement the separate repository service/store and versioned SQLite/FTS schema with transactional generations; verify create/reopen, corruption/incompatible-cache rebuild, portable logical keys, and no session DB migrations.
+- [x] 2.1 Implement the separate repository service/store and versioned SQLite/FTS schema with transactional generations; verify create/reopen, corruption/incompatible-cache rebuild, portable logical keys, and no session DB migrations.
 - [ ] 2.2 Implement reconciliation with the metadata fast path (size, mtime, file identity, racy-timestamp rule) and hash-on-mismatch reparsing; verify warm queries read no unchanged content, same-size edits in the racy window are detected, mtime-only changes reuse records, forced hashing, external edits without watcher events, manifest changes, additions/deletions, disabled/malformed sources, and branch switches.
 - [ ] 2.3 Implement serialized refresh, process-safe transactions/busy handling, pre-emission source revalidation, and bounded unavailable/retry behavior; verify concurrent readers/processes and injected failures never expose partial generations.
 - [ ] 2.4 Bind an optional repository service through standalone/quorum materialization, execution context, and tool context using the effective session checkout; verify same-checkout reuse, different-checkout isolation, resume, and no builder-time discovery.

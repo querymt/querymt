@@ -196,4 +196,9 @@ pub struct AgentSettings {
     /// default; enabling never isolates an option-less session.
     #[serde(default)]
     pub workspace: WorkspaceSettings,
+
+    /// Portable repository knowledge (`[agent.repository_knowledge]`).
+    /// Disabled by default; repository content can never enable it.
+    #[serde(default)]
+    pub repository_knowledge: RepositoryKnowledgeSettings,
 }

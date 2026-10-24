@@ -15,6 +15,7 @@
 //! This module contains the store trait, domain types, and SQLite
 //! implementation — no embedded AI logic.
 
+pub mod repository;
 pub mod sqlite;
 pub mod text_processing;
 

@@ -124,6 +124,11 @@ pub struct QuorumSettings {
     /// shared by the planner and every delegate. Disabled by default.
     #[serde(default)]
     pub workspace: WorkspaceSettings,
+
+    /// Portable repository knowledge (`[quorum.repository_knowledge]`). One
+    /// service is shared across the quorum. Disabled by default.
+    #[serde(default)]
+    pub repository_knowledge: RepositoryKnowledgeSettings,
 }
 
 fn default_true() -> bool {

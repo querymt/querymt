@@ -113,6 +113,8 @@ async fn build_config_from_toml_value(
             config.agent.workspace =
                 std::mem::take(&mut config.agent.workspace).anchored_at(base_path);
             config.agent.hooks.base_dir = std::path::absolute(base_path).ok();
+            config.agent.repository_knowledge =
+                std::mem::take(&mut config.agent.repository_knowledge).anchored_at(base_path);
         }
 
         Config::Single(Box::new(config))
@@ -168,6 +170,8 @@ async fn build_config_from_toml_value(
         if let PromptResolution::ResolveFiles { base_path } = &resolution {
             config.quorum.workspace =
                 std::mem::take(&mut config.quorum.workspace).anchored_at(base_path);
+            config.quorum.repository_knowledge =
+                std::mem::take(&mut config.quorum.repository_knowledge).anchored_at(base_path);
         }
         validate_delegate_isolation(&config)?;
 
