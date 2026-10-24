@@ -138,6 +138,118 @@ async fn remote_create_keeps_explicit_owner_profile_and_rejects_invalid_selectio
 
 #[cfg(feature = "remote")]
 #[tokio::test]
+async fn remote_profile_creation_rejects_failed_binding_without_a_session_or_memory_binding() {
+    let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+    let viewer = RealStorageHandleFixture::new().await;
+    viewer.handle.set_mesh(mesh.clone());
+    let (owner, _dir) = owner_profiles_fixture("alpha").await;
+    let profiles = owner.handle.profiles().unwrap();
+    let runtime = profiles.runtime_for_profile("cdr").await.unwrap();
+    let (node_id, _) = register_remote_node(mesh, &owner, "binding-failure", true).await;
+    owner
+        .storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE rejected_binding_ids (id TEXT NOT NULL);
+         CREATE TRIGGER reject_profile_binding BEFORE INSERT ON profile_bindings
+         BEGIN SELECT RAISE(ABORT, 'binding persistence rejected'); END;
+         CREATE TRIGGER record_created_session AFTER INSERT ON sessions
+         BEGIN INSERT INTO rejected_binding_ids VALUES (NEW.public_id); END;",
+        )
+        .unwrap();
+    let error = viewer
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/remote/createSession",
+            raw_params(
+                &serde_json::json!({"node_id": node_id, "profile_id": "cdr", "attach": false})
+                    .to_string(),
+            ),
+        ))
+        .await
+        .expect_err("remote create must fail when binding cannot be persisted");
+    assert!(format!("{error:?}").contains("binding persistence rejected"));
+    let id: String = owner
+        .storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .query_row("SELECT id FROM rejected_binding_ids", [], |row| row.get(0))
+        .unwrap();
+    assert!(
+        owner
+            .storage
+            .session_store()
+            .list_sessions()
+            .await
+            .unwrap()
+            .is_empty(),
+        "failed creation must not leave an unbound session"
+    );
+    assert!(
+        profiles.session_binding(&id).await.is_none(),
+        "failed persistence must not install an in-memory binding"
+    );
+    assert!(
+        runtime.agent().handle().registry_lock().await.is_empty(),
+        "no session actor materialized"
+    );
+    let local_error = owner
+        .handle
+        .new_session(NewSessionRequest::new(std::path::PathBuf::new()))
+        .await
+        .expect_err("local profile create must fail too");
+    assert!(format!("{local_error:?}").contains("binding persistence rejected"));
+    assert!(
+        owner
+            .storage
+            .session_store()
+            .list_sessions()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        profiles
+            .runtime_for_profile("alpha")
+            .await
+            .unwrap()
+            .agent()
+            .handle()
+            .registry_lock()
+            .await
+            .is_empty()
+    );
+    owner
+        .storage
+        .conn_for_test()
+        .lock()
+        .unwrap()
+        .execute_batch("DROP TRIGGER reject_profile_binding")
+        .unwrap();
+    let created = ext_method_json(
+        &viewer.handle,
+        "querymt/remote/createSession",
+        serde_json::json!({"node_id": node_id, "profile_id": "cdr", "attach": false}),
+    )
+    .await;
+    assert_eq!(
+        owner
+            .storage
+            .session_store()
+            .get_session_runtime_binding(created["session_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .profile_id,
+        "cdr"
+    );
+}
+
+#[cfg(feature = "remote")]
+#[tokio::test]
 async fn remote_delegate_child_reuses_session_listing_attach_and_bookmarked_load() {
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let viewer = RealStorageHandleFixture::new().await;
@@ -158,7 +270,10 @@ async fn remote_delegate_child_reuses_session_listing_attach_and_bookmarked_load
         .unwrap();
     let mut binding = runtime.session_binding();
     binding.agent_id = Some("coder".into());
-    profiles.set_session_binding(&child_id, binding).await;
+    profiles
+        .set_session_binding(&child_id, binding)
+        .await
+        .unwrap();
     profiles.set_active_profile("alpha").await.unwrap();
     child_ref.set_mode(AgentMode::Review).await.unwrap();
     delegate

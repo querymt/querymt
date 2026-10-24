@@ -298,7 +298,10 @@ impl RemoteCatalogCache {
         let mut peers: Vec<_> = self.peers.iter().collect();
         peers.sort_by_key(|(peer, _)| **peer);
         let mut snapshot = RemoteModelSnapshot::default();
-        for (_, catalog) in peers {
+        for (peer, catalog) in peers {
+            snapshot
+                .availability
+                .insert(peer.to_string(), catalog.availability);
             for model in &catalog.models {
                 if let Some(node_id) = &model.node_id {
                     snapshot
@@ -1201,6 +1204,44 @@ mod tests {
                 )
                 .models
                 .is_empty()
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn empty_peer_catalog_retains_reachability_without_model_rows() {
+        let mut cache = RemoteCatalogCache::default();
+        let peer = test_peer();
+        let scopes = vec![querymt_remote::MeshScopeId::lan_default()];
+        let now = Instant::now();
+        let result = RemoteRefreshResult {
+            catalogs: [(peer, Vec::new())].into(),
+            ..Default::default()
+        };
+        let snapshot = cache.merge(&scopes, &result, now);
+        assert!(snapshot.models.is_empty());
+        assert_eq!(
+            snapshot.availability[&peer.to_string()],
+            RemoteModelAvailability::Available
+        );
+        let snapshot = cache.merge(
+            &scopes,
+            &RemoteRefreshResult {
+                unavailable: [peer].into(),
+                incomplete: true,
+                ..Default::default()
+            },
+            now + Duration::from_secs(1),
+        );
+        assert!(snapshot.models.is_empty());
+        assert_eq!(
+            snapshot.availability[&peer.to_string()],
+            RemoteModelAvailability::Unavailable
+        );
+        let snapshot = cache.merge(&scopes, &result, now + Duration::from_secs(2));
+        assert_eq!(
+            snapshot.availability[&peer.to_string()],
+            RemoteModelAvailability::Available
         );
     }
 

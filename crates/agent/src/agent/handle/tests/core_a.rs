@@ -730,7 +730,8 @@ async fn register_profile_bound_delegate_session(
         .profiles()
         .expect("profiles configured")
         .set_session_binding(session_id, binding)
-        .await;
+        .await
+        .expect("bind delegate session");
     (delegate_handle, actor_ref)
 }
 
@@ -1209,7 +1210,8 @@ paths = ["{}"]
             "ghost",
             test_profile_metadata("ghost", "ghost", None).session_binding(),
         )
-        .await;
+        .await
+        .expect("bind missing profile");
     assert!(
         fixture
             .handle

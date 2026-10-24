@@ -1512,7 +1512,8 @@ mod node_manager_tests {
                     provider_locks_json: None,
                 },
             )
-            .await;
+            .await
+            .expect("bind session for listing");
 
         let listed = node
             .ask(ListRemoteSessions {

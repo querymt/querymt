@@ -304,7 +304,8 @@ async fn bind_test_profile(f: &HandleFixture, session_id: &str, profile_id: &str
             session_id,
             test_profile_metadata(profile_id, profile_id, None).session_binding(),
         )
-        .await;
+        .await
+        .expect("bind test profile");
 }
 
 async fn register_bound_test_session(f: &HandleFixture, session_id: &str, profile_id: &str) {

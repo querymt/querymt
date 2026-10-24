@@ -1039,10 +1039,20 @@ mod remote_impl {
 
             let session = session_context.session();
             let session_id = session.public_id.clone();
-            if let (Some(profiles), Some(runtime)) = (profiles.as_ref().as_ref(), &owner_runtime) {
-                profiles
-                    .bind_session_to_runtime(&session_id, runtime)
-                    .await?;
+            if let (Some(profiles), Some(runtime)) = (profiles.as_ref().as_ref(), &owner_runtime)
+                && let Err(error) = profiles.bind_session_to_runtime(&session_id, runtime).await
+            {
+                config
+                    .provider
+                    .history_store()
+                    .delete_session(&session_id)
+                    .await
+                    .map_err(|cleanup| {
+                        AgentError::Internal(format!(
+                            "{error:#}; failed to remove unbound session '{session_id}': {cleanup}"
+                        ))
+                    })?;
+                return Err(AgentError::Internal(format!("{error:#}")));
             }
             let title = session.name.clone();
             let created_at = session
@@ -1187,9 +1197,12 @@ mod remote_impl {
                     binding.agent_id = source_binding
                         .as_ref()
                         .and_then(|binding| binding.agent_id.clone());
-                    profiles
-                        .set_session_binding(&forked_session_id, binding)
-                        .await;
+                    if let Err(error) = profiles.set_session_binding(&forked_session_id, binding).await {
+                        config.provider.history_store().delete_session(&forked_session_id).await.map_err(|cleanup| {
+                            AgentError::Internal(format!("{error:#}; failed to remove unbound fork '{forked_session_id}': {cleanup}"))
+                        })?;
+                        return Err(AgentError::Internal(format!("{error:#}")));
+                    }
                 }
 
                 let forked_session = config
