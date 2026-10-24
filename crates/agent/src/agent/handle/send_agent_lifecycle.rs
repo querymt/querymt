@@ -128,12 +128,10 @@ impl LocalAgentHandle {
         // Single-flight check: Check if session is already materialized
         // Clone the actor_ref out of the registry to avoid holding the lock
         // during the async ask(GetMode) call.
-        let existing_actor_ref = {
-            let registry = self.registry_lock().await;
-            registry.local_actor_ref(&session_id).cloned()
-        };
+        let existing_actor_ref =
+            crate::agent::session_registry::live_session(&self.registry, &session_id).await;
 
-        if let Some(existing_ref) = existing_actor_ref {
+        if let Some(SessionActorRef::Local(existing_ref)) = existing_actor_ref {
             // Registry lock is now dropped, safe to make async actor calls.
             let current_mode = existing_ref
                 .ask(crate::agent::messages::GetMode)
@@ -165,10 +163,11 @@ impl LocalAgentHandle {
             .await?
         {
             PreparedSessionResult::Prepared(prepared) => {
-                let session_ref = {
-                    let mut registry = self.registry_lock().await;
-                    registry.register_prepared_session(&prepared).await
-                };
+                let session_ref = crate::agent::session_registry::register_prepared_session(
+                    &self.registry,
+                    &prepared,
+                )
+                .await;
                 (Some(prepared), session_ref)
             }
             PreparedSessionResult::AlreadyRegistered(session_ref) => (None, session_ref),

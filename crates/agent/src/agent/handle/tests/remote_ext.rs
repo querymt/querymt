@@ -1063,6 +1063,45 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
             .id(),
         restored_actor.id()
     );
+    restored_actor.kill();
+    restored_actor.wait_for_shutdown().await;
+    restarted_manager
+        .ask(crate::agent::remote::ResumeRemoteSession {
+            session_id: created.session_id.clone(),
+        })
+        .await
+        .expect("dead profile-bound actor rematerializes in its owner runtime");
+    let replacement = restored_handle
+        .registry
+        .lock()
+        .await
+        .local_actor_ref(&created.session_id)
+        .cloned()
+        .unwrap();
+    assert!(replacement.is_alive());
+    assert_ne!(replacement.id(), restored_actor.id());
+    assert!(
+        restarted
+            .handle
+            .registry
+            .lock()
+            .await
+            .get(&created.session_id)
+            .is_none(),
+        "profile recovery must not populate the root registry"
+    );
+    let loaded = restarted
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            created.session_id.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        config_option_value(&loaded.config_options.unwrap(), "profile").as_deref(),
+        Some("alpha")
+    );
 }
 
 #[cfg(feature = "remote")]

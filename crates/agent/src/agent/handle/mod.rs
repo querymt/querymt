@@ -250,6 +250,8 @@ pub struct LocalAgentHandle {
     /// never holds registry state across network work (plan §2).
     #[cfg(feature = "remote")]
     pub(crate) remote_connect_gates: remote_connect::RemoteConnectGateMap,
+    #[cfg(feature = "remote")]
+    pub(crate) remote_connect_cooldowns: remote_connect::RemoteConnectCooldownMap,
 
     /// Non-blocking model inventory with snapshot-based reads and background refresh.
     /// This is the canonical public API for model listing and cache management.

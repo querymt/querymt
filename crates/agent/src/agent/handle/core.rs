@@ -79,6 +79,8 @@ impl LocalAgentHandle {
             remote_node_cache: Arc::new(RemoteNodeMetadataCache::new()),
             #[cfg(feature = "remote")]
             remote_connect_gates: Default::default(),
+            #[cfg(feature = "remote")]
+            remote_connect_cooldowns: Default::default(),
             model_inventory,
             oauth_service,
             profiles: Arc::new(ArcSwap::from_pointee(None)),
@@ -638,10 +640,11 @@ impl LocalAgentHandle {
                 .prepare_new_session(req)
                 .await?;
             let session_id = prepared.session_id.clone();
-            let session_ref = {
-                let mut registry = profile_handle.registry_lock().await;
-                registry.register_prepared_session(&prepared).await
-            };
+            let session_ref = crate::agent::session_registry::register_prepared_session(
+                &profile_handle.registry,
+                &prepared,
+            )
+            .await;
             profile_handle
                 .session_materializer
                 .finalize_session(&prepared)
@@ -692,10 +695,9 @@ impl LocalAgentHandle {
         let session_id = prepared.session_id.clone();
 
         // Phase 2: Register session (fast, registry lock held for microseconds only)
-        let session_ref = {
-            let mut registry = self.registry_lock().await;
-            registry.register_prepared_session(&prepared).await
-        };
+        let session_ref =
+            crate::agent::session_registry::register_prepared_session(&self.registry, &prepared)
+                .await;
 
         // Phase 3: Finalize session (post-registration work, NO registry lock held)
         self.session_materializer
@@ -859,10 +861,9 @@ impl LocalAgentHandle {
                 profile_handle.set_bridge(bridge).await;
             }
 
-            let existing_session_ref = {
-                let registry = profile_handle.registry_lock().await;
-                registry.get(&session_id).cloned()
-            };
+            let existing_session_ref =
+                crate::agent::session_registry::live_session(&profile_handle.registry, &session_id)
+                    .await;
             let session_ref = if let Some(session_ref) = existing_session_ref {
                 session_ref
             } else {
@@ -872,10 +873,12 @@ impl LocalAgentHandle {
                     .await?
                 {
                     PreparedSessionResult::Prepared(prepared) => {
-                        let session_ref = {
-                            let mut registry = profile_handle.registry_lock().await;
-                            registry.register_prepared_session(&prepared).await
-                        };
+                        let session_ref =
+                            crate::agent::session_registry::register_prepared_session(
+                                &profile_handle.registry,
+                                &prepared,
+                            )
+                            .await;
                         profile_handle
                             .session_materializer
                             .finalize_session(&prepared)
@@ -925,10 +928,8 @@ impl LocalAgentHandle {
         // Single-flight check: Check if session is already materialized
         // Clone the session_ref out of the registry to avoid holding the lock
         // during the async get_mode() call.
-        let existing_session_ref = {
-            let registry = self.registry_lock().await;
-            registry.get(&session_id).cloned()
-        };
+        let existing_session_ref =
+            crate::agent::session_registry::live_session(&self.registry, &session_id).await;
 
         if let Some(session_ref) = existing_session_ref {
             // Registry lock is now dropped, safe to make async actor calls.
@@ -958,10 +959,11 @@ impl LocalAgentHandle {
             .await?
         {
             PreparedSessionResult::Prepared(prepared) => {
-                let session_ref = {
-                    let mut registry = self.registry_lock().await;
-                    registry.register_prepared_session(&prepared).await
-                };
+                let session_ref = crate::agent::session_registry::register_prepared_session(
+                    &self.registry,
+                    &prepared,
+                )
+                .await;
                 (Some(prepared), session_ref)
             }
             PreparedSessionResult::AlreadyRegistered(session_ref) => (None, session_ref),

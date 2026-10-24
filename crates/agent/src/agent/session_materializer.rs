@@ -712,11 +712,11 @@ impl SessionMaterializer {
 
         let single_flight_guard = self.acquire_session_lock(&session_id).await;
 
-        if let Some(reg) = registry {
-            let registry_guard = reg.lock().await;
-            if let Some(existing) = registry_guard.get(&session_id).cloned() {
-                return Ok(PreparedSessionResult::AlreadyRegistered(existing));
-            }
+        if let Some(reg) = registry
+            && let Some(existing) =
+                crate::agent::session_registry::live_session(reg, &session_id).await
+        {
+            return Ok(PreparedSessionResult::AlreadyRegistered(existing));
         }
 
         // Validate session exists in DB (heavy I/O) and prefer its persisted cwd.
@@ -810,11 +810,11 @@ impl SessionMaterializer {
 
         let single_flight_guard = self.acquire_session_lock(&session_id).await;
 
-        if let Some(reg) = registry {
-            let registry_guard = reg.lock().await;
-            if let Some(existing) = registry_guard.get(&session_id).cloned() {
-                return Ok(PreparedSessionResult::AlreadyRegistered(existing));
-            }
+        if let Some(reg) = registry
+            && let Some(existing) =
+                crate::agent::session_registry::live_session(reg, &session_id).await
+        {
+            return Ok(PreparedSessionResult::AlreadyRegistered(existing));
         }
 
         // Validate session exists in DB (heavy I/O)

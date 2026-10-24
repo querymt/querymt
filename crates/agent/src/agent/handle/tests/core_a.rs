@@ -1,5 +1,89 @@
 use super::*;
 
+#[tokio::test]
+async fn local_load_and_resume_replace_stopped_actors() {
+    for resume in [false, true] {
+        let f = RealStorageHandleFixture::new().await;
+        let session_id = seed_session_with_reasoning(&f, None).await;
+        f.handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                SessionId::from(session_id.clone()),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let dead = f
+            .handle
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        let old_id = dead.id();
+        dead.kill();
+        dead.wait_for_shutdown().await;
+        if resume {
+            f.handle
+                .resume_session(crate::acp::protocol::ResumeSessionRequest::new(
+                    SessionId::from(session_id.clone()),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .expect("local resume rematerializes");
+        } else {
+            f.handle
+                .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                    SessionId::from(session_id.clone()),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .expect("local load rematerializes");
+        }
+        let fresh = f
+            .handle
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&session_id)
+            .cloned()
+            .unwrap();
+        assert!(fresh.is_alive());
+        assert_ne!(fresh.id(), old_id);
+        fresh.kill();
+    }
+}
+
+#[tokio::test]
+async fn stopped_actor_is_evicted_without_another_load() {
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    f.handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(session_id.clone()),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    let actor = f
+        .handle
+        .registry
+        .lock()
+        .await
+        .local_actor_ref(&session_id)
+        .cloned()
+        .unwrap();
+    actor.kill();
+    actor.wait_for_shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.handle.registry.lock().await.get(&session_id).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shared registration installs a stop watcher");
+}
+
 #[test]
 fn test_should_return_without_force_stop_only_for_idle() {
     assert!(LocalAgentHandle::should_return_without_force_stop(
