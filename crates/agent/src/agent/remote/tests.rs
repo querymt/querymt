@@ -1081,6 +1081,83 @@ mod node_manager_tests {
     }
 
     #[tokio::test]
+    async fn test_admission_readmits_valid_member_but_rejects_other_scopes_and_bad_signatures() {
+        use querymt_remote::{InvitePermissions, MembershipToken, MeshScopeId};
+        let mesh = get_test_mesh().await;
+        let (config, _td) = test_agent_config().await;
+        let registry = Arc::new(Mutex::new(SessionRegistry::new(config.clone())));
+        let nm = RemoteNodeManager::spawn(RemoteNodeManager::new(
+            config,
+            registry,
+            Some(mesh.clone()),
+            Arc::new(parking_lot::Mutex::new(None)),
+        ));
+        let name = format!("admission-{}", Uuid::now_v7());
+        let invite = mesh
+            .create_invite(Some(name), None, Some(1), false)
+            .unwrap();
+        let subject = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        let response = nm
+            .ask(AdmissionRequest::Invite {
+                invite_id: invite.grant.invite_id.clone(),
+                mesh_name: invite.grant.mesh_name.clone(),
+                peer_id: subject.clone(),
+            })
+            .await
+            .unwrap();
+        let AdmissionResponse::Admitted {
+            membership_token, ..
+        } = response
+        else {
+            panic!("expected admission");
+        };
+        let response = nm
+            .ask(AdmissionRequest::Token {
+                membership_token: membership_token.clone(),
+                peer_id: subject.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(response, AdmissionResponse::Readmitted { .. }));
+
+        let foreign_scope = format!("foreign-{}", Uuid::now_v7());
+        let foreign = MembershipToken::issue(
+            foreign_scope.clone(),
+            &subject,
+            mesh.keypair(),
+            "foreign".into(),
+            InvitePermissions::default(),
+            0,
+        )
+        .unwrap();
+        let response = nm
+            .ask(AdmissionRequest::Token {
+                membership_token: foreign,
+                peer_id: subject.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(response, AdmissionResponse::Rejected { .. }));
+        assert!(!mesh.active_scopes().contains(&MeshScopeId::Iroh {
+            mesh_id: foreign_scope
+        }));
+
+        let mut invalid = membership_token;
+        invalid.signature.clear();
+        let response = nm
+            .ask(AdmissionRequest::Token {
+                membership_token: invalid,
+                peer_id: subject,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(response, AdmissionResponse::Rejected { .. }));
+    }
+
+    #[tokio::test]
     async fn test_create_session_no_cwd() {
         let (nm_ref, _config, _td) = spawn_test_node_manager_with_mesh().await;
 

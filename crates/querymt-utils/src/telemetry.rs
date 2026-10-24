@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use opentelemetry::InstrumentationScope;
@@ -11,7 +11,7 @@ use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     logs::{LogExporter, LogProcessor, SdkLogRecord, SdkLoggerProvider},
-    trace::{RandomIdGenerator, SdkTracerProvider},
+    trace::{IdGenerator, RandomIdGenerator, SdkTracerProvider},
 };
 use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
 use tracing_log::LogTracer;
@@ -31,9 +31,36 @@ pub fn default_otlp_endpoint() -> &'static str {
     DEFAULT_OTLP_ENDPOINT
 }
 
-/// Build a resource with service name & version
+/// Build a resource identifying the service and the exporting process.
 pub fn resource(service_name: &str, service_version: &str) -> Resource {
+    static PROCESS_ATTRIBUTES: OnceLock<Vec<opentelemetry::KeyValue>> = OnceLock::new();
+    let process_attributes = PROCESS_ATTRIBUTES.get_or_init(|| {
+        let mut attributes = vec![
+            opentelemetry::KeyValue::new(
+                "service.instance.id",
+                RandomIdGenerator::default().new_trace_id().to_string(),
+            ),
+            opentelemetry::KeyValue::new("process.pid", i64::from(std::process::id())),
+        ];
+        let hostname = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                std::env::var("COMPUTERNAME")
+                    .ok()
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok());
+        if let Some(hostname) = hostname.filter(|name| !name.trim().is_empty()) {
+            attributes.push(opentelemetry::KeyValue::new(
+                "host.name",
+                hostname.trim().to_string(),
+            ));
+        }
+        attributes
+    });
     Resource::builder()
+        .with_attributes(process_attributes.clone())
         .with_service_name(service_name.to_string())
         .with_schema_url(
             [opentelemetry::KeyValue::new(
@@ -386,6 +413,26 @@ mod tests {
         SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
     };
     use opentelemetry_sdk::logs::InMemoryLogExporter;
+
+    #[test]
+    fn traces_and_logs_share_stable_process_identity() {
+        let traces = resource("test", "1");
+        let logs = resource("test", "1");
+        let instance = |resource: &Resource| {
+            resource
+                .iter()
+                .find(|(key, _)| key.as_str() == "service.instance.id")
+                .map(|(_, value)| value.clone())
+        };
+        assert!(instance(&traces).is_some());
+        assert_eq!(instance(&traces), instance(&logs));
+        assert!(
+            traces
+                .iter()
+                .any(|(key, value)| key.as_str() == "process.pid"
+                    && value == &opentelemetry::Value::I64(i64::from(std::process::id())))
+        );
+    }
 
     fn log_record() -> SdkLogRecord {
         SdkLoggerProvider::builder()
