@@ -152,6 +152,53 @@ pub(crate) fn model_config_option(
     )]))
 }
 
+/// Register through the shared boundary so local, profile and remote sessions
+/// all evict stopped actors without keeping either actor or registry alive.
+pub(crate) async fn register_prepared_session(
+    registry: &Arc<tokio::sync::Mutex<SessionRegistry>>,
+    prepared: &crate::agent::session_materializer::PreparedSession,
+) -> SessionActorRef {
+    let session_ref = registry
+        .lock()
+        .await
+        .register_prepared_session(prepared)
+        .await;
+    let registry = Arc::downgrade(registry);
+    let actor = prepared.actor_ref.downgrade();
+    let id = prepared.actor_ref.id();
+    let session_id = prepared.session_id.clone();
+    tokio::spawn(async move {
+        actor.wait_for_shutdown().await;
+        if let Some(registry) = registry.upgrade() {
+            registry
+                .lock()
+                .await
+                .remove_local_if_same_actor(&session_id, id);
+        }
+    });
+    session_ref
+}
+
+/// Wait out graceful draining outside the registry lock before replacing an actor.
+pub(crate) async fn live_session(
+    registry: &tokio::sync::Mutex<SessionRegistry>,
+    session_id: &str,
+) -> Option<SessionActorRef> {
+    loop {
+        let session = registry.lock().await.get(session_id).cloned()?;
+        match session {
+            SessionActorRef::Local(ref actor) if !actor.is_alive() => {
+                actor.wait_for_shutdown().await;
+                registry
+                    .lock()
+                    .await
+                    .remove_local_if_same_actor(session_id, actor.id());
+            }
+            _ => return Some(session),
+        }
+    }
+}
+
 /// Controls how a materialized session actor is integrated with remote infra.
 pub struct SessionMaterializationOptions {
     pub attach_mesh_handle: bool,
@@ -409,6 +456,21 @@ impl SessionRegistry {
 
     pub fn local_actor_ref(&self, session_id: &str) -> Option<&ActorRef<SessionActor>> {
         self.local_actor_refs.get(session_id)
+    }
+
+    pub(crate) fn remove_local_if_same_actor(
+        &mut self,
+        session_id: &str,
+        id: kameo::actor::ActorId,
+    ) -> bool {
+        let same = self
+            .local_actor_refs
+            .get(session_id)
+            .is_some_and(|actor| actor.id() == id);
+        if same {
+            self.remove(session_id);
+        }
+        same
     }
 
     pub async fn materialize_session_actor(
@@ -940,10 +1002,7 @@ pub(crate) async fn prepare_remote_attachment(
                 scoped_event_relay(scope, &candidate.session_id, mesh.peer_id()),
                 candidate.relay_actor_id
             );
-            candidate.registered_relay_names.push(name.clone());
-            runtime
-                .register_actor(candidate.relay_ref.clone(), name)
-                .await;
+            candidate.registered_relay_names.push(name);
         }
     } else {
         candidate.relay_dht_name = format!(
@@ -968,7 +1027,12 @@ pub(crate) async fn prepare_remote_attachment(
             candidate.relay_actor_id,
             error
         );
-        abort_prepared_remote_attachment(candidate).await;
+        let unavailable = error.data.as_ref().is_some_and(|data| {
+            data.get("category").and_then(serde_json::Value::as_str) == Some("remote_transport")
+                && data.get("kind").and_then(serde_json::Value::as_str) == Some("actor_unavailable")
+        });
+        cleanup_attachment_parts(candidate.cleanup_parts(), !unavailable).await;
+        candidate.armed = false;
         return Err(AgentError::RemoteActor(format!(
             "failed to subscribe remote session events: {error}"
         )));
@@ -983,6 +1047,15 @@ pub(crate) async fn prepare_remote_attachment(
         )));
     }
     candidate.linked = true;
+    // Direct subscription and linking must succeed before this candidate is discoverable.
+    if let Some(mesh) = candidate.mesh.clone() {
+        let runtime = MeshRuntimeHandle::from(mesh);
+        for name in &candidate.registered_relay_names {
+            runtime
+                .register_actor(candidate.relay_ref.clone(), name.clone())
+                .await;
+        }
+    }
     Ok(candidate)
 }
 
@@ -1069,10 +1142,14 @@ async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notif
         mesh,
     } = parts;
     if notify_remote {
+        let mut may_unsubscribe = true;
         if linked
             && let SessionActorRef::Remote { actor_ref, .. } = session_ref
             && let Err(error) = relay_ref.unlink_remote(actor_ref).await
         {
+            // Keep the owner's observer marker until the still-linked relay
+            // dies; unsubscribing now would misclassify it as an unrelated failure.
+            may_unsubscribe = false;
             log::warn!(
                 "remote attachment cleanup: unlink failed for {} (attachment_id={}): {}",
                 session_id,
@@ -1080,9 +1157,10 @@ async fn cleanup_attachment_parts(parts: RemoteAttachmentCleanupParts<'_>, notif
                 error
             );
         }
-        if let Err(error) = session_ref
-            .unsubscribe_events(attachment_id, relay_dht_name.to_string())
-            .await
+        if may_unsubscribe
+            && let Err(error) = session_ref
+                .unsubscribe_events(attachment_id, relay_dht_name.to_string())
+                .await
         {
             log::warn!(
                 "remote attachment cleanup: unsubscribe failed for {} (attachment_id={}): {}",
@@ -1216,6 +1294,33 @@ mod tests {
     }
 
     // ── Unit tests ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stopped_actor_cleanup_does_not_evict_replacement() {
+        let mut f = RegistryFixture::new().await;
+        let old = f.spawn_actor();
+        let fresh = f.spawn_actor();
+        f.registry
+            .sessions
+            .insert("test-session".into(), fresh.clone().into());
+        f.registry
+            .local_actor_refs
+            .insert("test-session".into(), fresh.clone());
+        assert!(
+            !f.registry
+                .remove_local_if_same_actor("test-session", old.id())
+        );
+        assert_eq!(
+            f.registry.local_actor_ref("test-session").unwrap().id(),
+            fresh.id()
+        );
+        assert!(
+            f.registry
+                .remove_local_if_same_actor("test-session", fresh.id())
+        );
+        old.kill();
+        fresh.kill();
+    }
 
     #[tokio::test]
     async fn test_new_registry_is_empty() {

@@ -898,6 +898,13 @@ mod tests {
     #[derive(Debug, Serialize, Deserialize)]
     struct EmptyResponse;
 
+    #[derive(kameo::Actor)]
+    struct RegistrationActor;
+
+    impl remote::RemoteActor for RegistrationActor {
+        const REMOTE_ID: &'static str = "test::RegistrationActor";
+    }
+
     #[tokio::test]
     async fn idle_mesh_drains_queued_unregister_commands() {
         let peer_id = PeerId::random();
@@ -927,9 +934,67 @@ mod tests {
             ),
         )
         .await;
-        driver.abort();
         let replies = result.expect("queued unregister commands must not stall an idle mesh");
         assert!(replies.into_iter().all(|reply| reply.is_ok()));
+
+        use kameo::actor::{ActorRef, Spawn};
+        let (runtime, _commands) = test_runtime_handle(MeshTransportMode::Lan);
+        let mesh = runtime.as_mesh_handle();
+        let old = RegistrationActor::spawn(RegistrationActor);
+        mesh.register_actor(old.clone(), "session-generation").await;
+        let stale = mesh.re_register_fns.read()["session-generation"].clone();
+        old.kill();
+        old.wait_for_shutdown().await;
+        let fresh = RegistrationActor::spawn(RegistrationActor);
+        mesh.register_actor(fresh.clone(), "session-generation")
+            .await;
+        stale().await;
+        assert!(
+            mesh.has_re_register_fn("session-generation"),
+            "stale callbacks cannot remove replacements"
+        );
+        let saved = mesh.re_register_fns.read()["session-generation"].clone();
+        mesh.deregister_actor("session-generation");
+        mesh.register_actor(fresh.clone(), "session-generation")
+            .await;
+        saved().await;
+        assert_eq!(
+            ActorRef::<RegistrationActor>::lookup("session-generation")
+                .await
+                .unwrap()
+                .unwrap()
+                .id(),
+            fresh.id(),
+            "delayed withdrawal cannot remove the replacement"
+        );
+        mesh.deregister_actor("session-generation");
+        saved().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while ActorRef::<RegistrationActor>::lookup("session-generation")
+                .await
+                .unwrap()
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deregistration must withdraw real DHT provider metadata");
+        assert!(!mesh.has_re_register_fn("session-generation"));
+        mesh.register_actor(fresh.clone(), "session-generation")
+            .await;
+        let stopped = mesh.re_register_fns.read()["session-generation"].clone();
+        fresh.kill();
+        fresh.wait_for_shutdown().await;
+        stopped().await;
+        assert!(!mesh.has_re_register_fn("session-generation"));
+        assert!(
+            ActorRef::<RegistrationActor>::lookup("session-generation")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        driver.abort();
     }
 
     #[tokio::test]
