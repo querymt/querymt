@@ -50,10 +50,10 @@ backend = "git"
 # `_meta.querymt.sessionWorkspace`, `/worktree create`, or the simple API /
 # Python `chat_session(workspace="worktree")`).
 #
-# [agent.workspace]
-# enabled = true
-# storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
-# baseline = "commit"                 # or "current_working_tree" (default for
+[agent.workspace]
+enabled = true
+storage_root = "~/.qmt/worktrees"   # relative paths resolve against this file
+baseline = "commit"                 # or "current_working_tree" (default for
 #                                     # explicit requests that don't choose one)
 # -----------------------------------------------------------------------------
 
