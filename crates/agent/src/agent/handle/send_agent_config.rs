@@ -227,7 +227,7 @@ impl LocalAgentHandle {
                     .session_reasoning_effort(&session_ref, &session_id)
                     .await;
                 let config_options = self
-                    .session_config_options(Some(&session_id), mode, effort)
+                    .session_profile_config_options(Some(&session_id), mode, effort)
                     .await?;
                 Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
                     config_options,
@@ -257,7 +257,7 @@ impl LocalAgentHandle {
                         .map_err(session_operation::SessionOperationError::into_acp_error)?;
                     if resolved.session_ref.is_remote() {
                         return Ok(crate::acp::protocol::SetSessionConfigOptionResponse::new(
-                            self.remote_session_mode_config_options(&session_id).await?,
+                            self.remote_session_config_options(&session_id).await?,
                         ));
                     }
                 }

@@ -642,65 +642,134 @@ async fn acp_remote_lifecycle_filter_uses_owner_before_page_and_includes_metadat
 #[cfg(feature = "remote")]
 #[tokio::test]
 async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load() {
-    use crate::profiles::{
-        LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager, SessionProfileBinding,
-    };
+    use crate::profiles::{LocalProfileCatalog, ProfileCatalog, ProfileRuntimeManager};
 
     let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
     let f = RealStorageHandleFixture::new().await;
     f.handle.set_mesh(mesh.clone());
-    let remote = RealStorageHandleFixture::new().await;
+    let mut remote = RealStorageHandleFixture::new().await;
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("owner.sqlite");
+    remote.storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(db_path.clone())
+            .await
+            .unwrap(),
+    );
+    remote.handle = LocalAgentHandle::from_config(Arc::new(
+        AgentConfigBuilder::new(
+            remote.handle.config.provider.plugin_registry(),
+            remote.storage.clone(),
+            LLMParams::new().provider("mock").model("raw-manager-model"),
+        )
+        .build(),
+    ));
     let (node_id, node_manager) = register_remote_node(mesh, &remote, "owner", true).await;
-    let created = node_manager
-        .ask(crate::agent::remote::CreateRemoteSession { cwd: None })
-        .await
-        .expect("create owner session");
-    let owner_ref = remote
-        .handle
-        .registry
-        .lock()
-        .await
-        .get(&created.session_id)
-        .cloned()
-        .expect("owner session actor");
-    owner_ref
-        .set_mode(AgentMode::Plan)
-        .await
-        .expect("set owner mode");
-
-    let catalog: Arc<dyn ProfileCatalog> = Arc::new(LocalProfileCatalog::builder().build());
-    let profile = catalog
-        .list_profiles()
-        .await
-        .expect("owner profiles")
-        .remove(0);
-    let (plugin_registry, _plugins_dir) = empty_plugin_registry().expect("plugins");
+    let profile_dir = tempfile::tempdir().unwrap();
+    write_profile(
+        profile_dir.path(),
+        "alpha.toml",
+        "[agent]\nprovider = 'mock'\nmodel = 'owner-model'\nsystem = 'owner alpha'\n",
+    );
+    write_profile(
+        profile_dir.path(),
+        "beta.toml",
+        "[agent]\nprovider = 'mock'\nmodel = 'different-model'\nsystem = 'owner beta'\n",
+    );
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(
+        LocalProfileCatalog::builder()
+            .include_embedded_default(false)
+            .local_dir(profile_dir.path())
+            .build(),
+    );
+    let plugins = remote.handle.config.provider.plugin_registry();
+    let mut mock = MockLlmProvider::new();
+    mock.expect_chat().returning(|_| {
+        Ok(crate::test_utils::MockChatResponse::text_only("completed on owner").into())
+    });
+    mock.expect_chat_with_tools().returning(|_, _| {
+        Ok(crate::test_utils::MockChatResponse::text_only("completed on owner").into())
+    });
+    plugins.register_static(Arc::new(TestProviderFactory::new(SharedLlmProvider {
+        inner: Arc::new(Mutex::new(mock)),
+        tools: vec![].into_boxed_slice(),
+    })));
     let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
-        catalog,
-        profile.id.clone(),
+        catalog.clone(),
+        "alpha",
         AgentInfra {
-            plugin_registry: Arc::new(plugin_registry),
+            plugin_registry: plugins.clone(),
             storage: Some(remote.storage.clone()),
             session_mcp_attachment_source: None,
             event_fanout: None,
         },
     ));
-    // The node manager was spawned before the owner installed its profile runtime.
+    // Installing profiles after mesh publication must still affect remote creation.
     remote.handle.set_profiles(profiles.clone());
-    profiles
-        .set_session_binding(
-            &created.session_id,
-            SessionProfileBinding {
-                profile_id: profile.id.clone(),
-                agent_id: None,
-                profile_fingerprint: None,
-                profile_source: None,
-                profile_config_kind: None,
-                provider_lock_digest: None,
-                provider_locks_json: None,
-            },
-        )
-        .await;
+    let created = node_manager
+        .ask(crate::agent::remote::CreateRemoteSession { cwd: None })
+        .await
+        .expect("create owner session");
+    remote
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            created.session_id.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("mesh-created session must load directly on its owner");
+    let runtime = profiles.active_runtime().await.unwrap();
+    let owner_handle = runtime.agent().handle();
+    let owner_ref = owner_handle
+        .registry
+        .lock()
+        .await
+        .get(&created.session_id)
+        .cloned()
+        .unwrap();
+    let profile = profiles
+        .list_profiles()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.id == "alpha")
+        .unwrap();
+    assert_eq!(
+        owner_ref
+            .get_session_control()
+            .await
+            .unwrap()
+            .effective_model
+            .model,
+        "owner-model"
+    );
+    let result = owner_ref
+        .prompt_agent(crate::acp::protocol::PromptRequest::new(
+            created.session_id.clone(),
+            vec!["finish on B".into()],
+        ))
+        .await
+        .expect("owner-only prompt completes");
+    assert_eq!(
+        result.stop_reason,
+        crate::acp::protocol::StopReason::EndTurn
+    );
+    let history_before = remote
+        .storage
+        .session_store()
+        .get_history(&created.session_id)
+        .await
+        .unwrap();
+    assert!(
+        history_before
+            .iter()
+            .any(|message| message.role == querymt::chat::ChatRole::Assistant)
+    );
+    profiles.set_active_profile("beta").await.unwrap();
+    owner_ref.set_mode(AgentMode::Plan).await.unwrap();
+    owner_ref
+        .set_reasoning_effort(Some(ReasoningEffort::High))
+        .await
+        .unwrap();
 
     let listed = ext_method_json(
         &f.handle,
@@ -721,7 +790,13 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     .await;
     assert_eq!(attached["profile_id"], profile.id);
     assert_eq!(attached["profile_label"], profile.name);
-    assert_eq!(attached["config_options"].as_array().map(Vec::len), Some(1));
+    assert_eq!(attached["config_options"].as_array().map(Vec::len), Some(3));
+    assert_eq!(attached["config_options"][1]["currentValue"], "high");
+    assert_eq!(attached["config_options"][2]["id"], "model");
+    assert_eq!(
+        attached["config_options"][2]["_meta"]["querymt"]["modelEntry"]["provider"],
+        "mock"
+    );
     assert_eq!(attached["config_options"][0]["id"], "mode");
     assert_eq!(attached["config_options"][0]["currentValue"], "plan");
     let attachment_id = f
@@ -744,7 +819,7 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     let json = serde_json::to_value(response).expect("serialize load response");
     assert_eq!(json["_meta"]["profileId"], profile.id);
     assert_eq!(json["_meta"]["profileLabel"], profile.name);
-    assert_eq!(json["configOptions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["configOptions"], attached["config_options"]);
     assert_eq!(json["configOptions"][0]["id"], "mode");
     assert_eq!(json["configOptions"][0]["currentValue"], "plan");
     assert_eq!(
@@ -771,7 +846,11 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         config_option_value(&changed.config_options, "mode").as_deref(),
         Some("review")
     );
-    assert_eq!(changed.config_options.len(), 1);
+    assert_eq!(
+        config_option_value(&changed.config_options, "reasoning_effort").as_deref(),
+        Some("high")
+    );
+    assert!(config_option_value(&changed.config_options, "model").is_some());
     assert_eq!(
         owner_ref.get_mode().await.expect("owner mode"),
         AgentMode::Review
@@ -813,6 +892,177 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
     )
     .await;
     assert_eq!(reattached["config_options"][0]["currentValue"], "review");
+
+    // A fork keeps its source profile even after the owner's active default changes.
+    let forked = node_manager
+        .ask(crate::agent::remote::ForkRemoteSession {
+            source_session_id: created.session_id.clone(),
+            message_id: history_before.last().unwrap().id.clone(),
+        })
+        .await
+        .expect("fork in the source runtime");
+    let fork_load = remote
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            forked.session_id.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("fork must load directly on its owner");
+    assert_eq!(
+        config_option_value(&fork_load.config_options.unwrap(), "profile").as_deref(),
+        Some("alpha")
+    );
+    assert!(
+        owner_handle
+            .registry
+            .lock()
+            .await
+            .get(&forked.session_id)
+            .is_some()
+    );
+    node_manager
+        .ask(crate::agent::remote::StopRemoteSessionRuntime {
+            session_id: forked.session_id,
+        })
+        .await
+        .unwrap();
+
+    // Rebuild the owner's profile manager with a different active default. The
+    // persisted binding must restore alpha, not silently switch this session to beta.
+    f.handle.registry.lock().await.remove(&created.session_id);
+    node_manager
+        .ask(crate::agent::remote::StopRemoteSessionRuntime {
+            session_id: created.session_id.clone(),
+        })
+        .await
+        .unwrap();
+    let mut restarted = RealStorageHandleFixture::new().await;
+    restarted.storage = Arc::new(
+        crate::session::sqlite_storage::SqliteStorage::connect(db_path)
+            .await
+            .unwrap(),
+    );
+    restarted.handle = LocalAgentHandle::from_config(Arc::new(
+        AgentConfigBuilder::new(
+            plugins.clone(),
+            restarted.storage.clone(),
+            LLMParams::new().provider("mock").model("raw-manager-model"),
+        )
+        .build(),
+    ));
+    let restarted_profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "beta",
+        AgentInfra {
+            plugin_registry: plugins,
+            storage: Some(restarted.storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    restarted.handle.set_profiles(restarted_profiles.clone());
+    let (_, restarted_manager) = register_remote_node(mesh, &restarted, "owner", true).await;
+    for lifecycle in [false, true] {
+        if lifecycle {
+            restarted_manager
+                .ask(crate::agent::remote::ListRemoteSessionsWithLifecycle {
+                    offset: None,
+                    limit: None,
+                    cwd: None,
+                    scope: crate::session::projection::SessionScope::All,
+                    lifecycle: Default::default(),
+                })
+                .await
+                .expect("cold lifecycle listing");
+        } else {
+            restarted_manager
+                .ask(crate::agent::remote::ListRemoteSessions {
+                    offset: None,
+                    limit: None,
+                })
+                .await
+                .expect("cold listing");
+        }
+        assert!(
+            restarted_profiles.materialized_runtimes().await.is_empty(),
+            "listing persisted sessions must not build profile runtimes"
+        );
+    }
+    let resumed = restarted_manager
+        .ask(crate::agent::remote::ResumeRemoteSession {
+            session_id: created.session_id.clone(),
+        })
+        .await
+        .expect("mesh resumes the original owner profile after reopening storage");
+    let runtime = restarted_profiles
+        .runtime_for_profile("alpha")
+        .await
+        .unwrap();
+    let restored_handle = runtime.agent().handle();
+    let restored_actor = restored_handle
+        .registry
+        .lock()
+        .await
+        .local_actor_ref(&created.session_id)
+        .cloned()
+        .unwrap();
+    let crate::agent::remote::node_manager::SessionHandoff::DirectRemote { session_ref } =
+        resumed.handoff
+    else {
+        panic!("direct handoff");
+    };
+    assert_eq!(
+        session_ref.id(),
+        restored_actor.id(),
+        "mesh and direct access must reuse one actor"
+    );
+    let loaded = restarted
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            created.session_id.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .expect("direct reload with empty runtime caches");
+    let options = loaded.config_options.unwrap();
+    assert_eq!(
+        config_option_value(&options, "profile").as_deref(),
+        Some("alpha")
+    );
+    assert_eq!(
+        config_option_value(&options, "model").as_deref(),
+        Some("mock/owner-model")
+    );
+    assert_eq!(
+        config_option_value(&options, "reasoning_effort").as_deref(),
+        Some("high")
+    );
+    assert_eq!(
+        config_option_value(&options, "mode").as_deref(),
+        Some("review")
+    );
+    assert_eq!(
+        restarted
+            .storage
+            .session_store()
+            .get_history(&created.session_id)
+            .await
+            .unwrap()
+            .len(),
+        history_before.len(),
+        "loading does not rerun the prompt or discard history"
+    );
+    assert_eq!(
+        restored_handle
+            .registry
+            .lock()
+            .await
+            .local_actor_ref(&created.session_id)
+            .unwrap()
+            .id(),
+        restored_actor.id()
+    );
 }
 
 #[cfg(feature = "remote")]

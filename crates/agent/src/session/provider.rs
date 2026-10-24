@@ -443,10 +443,20 @@ impl SessionProvider {
         let api_key_override = req.api_key_override;
         let session_id = req.session_id;
 
-        // ── Case 1: Explicit remote node requested ─────────────────────────────
+        #[cfg(feature = "remote")]
+        let explicitly_local = req.provider_node_id.is_some_and(|node| {
+            node == "local"
+                || self
+                    .mesh
+                    .load()
+                    .as_deref()
+                    .is_some_and(|mesh| mesh.peer_id().to_string() == node)
+        });
+        // An owner-local selection can arrive with an explicit node ID from a viewer.
+        // Resolve it locally, without falling back to another node on failure.
         #[cfg(feature = "remote")]
         if let Some(node_id) = req.provider_node_id
-            && node_id != "local"
+            && !explicitly_local
         {
             if !self.provider_resolver.allows_remote_fallback() {
                 return Err(SessionError::InvalidOperation(format!(
@@ -508,7 +518,8 @@ impl SessionProvider {
                 let mesh_guard = self.mesh.load();
                 let mesh_handle = mesh_guard.as_deref();
 
-                if self.provider_resolver.allows_remote_fallback()
+                if !explicitly_local
+                    && self.provider_resolver.allows_remote_fallback()
                     && allow_mesh_fallback
                     && let Some(mesh) = mesh_handle
                 {
@@ -1519,6 +1530,43 @@ pub mod tests {
             SessionError::ProviderError(LLMError::InvalidRequest(message))
                 if message == "bad provider config"
         ));
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn explicit_owner_node_uses_local_factory_not_mesh() {
+        use crate::session::sqlite_storage::SqliteStorage;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let registry = Arc::new(PluginRegistry::empty());
+        registry.register_static(Arc::new(InvalidConfigFactory));
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let provider =
+            SessionProvider::new(registry, storage, LLMParams::new()).with_mesh(Some(mesh.clone()));
+        let local_node = mesh.peer_id().to_string();
+        let result = provider
+            .build_provider(
+                ProviderRequest::new("invalid-config", "test-model")
+                    .with_provider_node_id(Some(&local_node)),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(SessionError::ProviderError(LLMError::InvalidRequest(_)))
+        ));
+        let other_node = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_string();
+        assert!(
+            provider
+                .build_provider(
+                    ProviderRequest::new("invalid-config", "test-model")
+                        .with_provider_node_id(Some(&other_node))
+                )
+                .await
+                .is_ok(),
+            "a different node must still create a remote provider"
+        );
     }
 
     // ── resolve_api_key_with_preference tests ─────────────────────────────────

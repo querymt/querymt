@@ -439,6 +439,26 @@ pub(crate) async fn restore_session_usage(
     session_id: &str,
     translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
 ) {
+    let needs_config = translator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .config
+        .get(session_id)
+        .is_none_or(|config| config.snapshot().is_none());
+    if needs_config {
+        match agent
+            .session_config_options(Some(session_id), crate::agent::core::AgentMode::Build, None)
+            .await
+        {
+            Ok(options) => translator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .seed_config_options(session_id, &options),
+            Err(error) => {
+                tracing::warn!(session.id = %session_id, %error, "failed to restore ACP configuration")
+            }
+        }
+    }
     if translator
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -851,14 +871,10 @@ where
             ))),
             &mut notifications,
         );
-        let effort = materialized
-            .reasoning_effort
-            .as_deref()
-            .and_then(parse_reasoning_effort);
+    }
+    if let Some(options) = materialized.config.snapshot() {
         push(
-            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(session_config_options(
-                mode, effort,
-            ))),
+            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
             &mut notifications,
         );
     }
@@ -972,17 +988,14 @@ fn materialize_replay_state(
 
     for event in events {
         state.usage.observe(event.seq, &event.kind);
+        state.config.observe(&event.kind);
         let envelope = EventEnvelope::from(event.clone());
         match event.kind.clone() {
             AgentEventKind::SessionModeChanged { mode } => {
                 state.mode = Some(mode);
             }
-            AgentEventKind::SessionConfigChanged {
-                mode,
-                reasoning_effort,
-            } => {
+            AgentEventKind::SessionConfigChanged { mode, .. } => {
                 state.mode = Some(mode);
-                state.reasoning_effort = reasoning_effort;
             }
             AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
                 state.metadata_touched = true;
@@ -1092,7 +1105,7 @@ fn materialize_replay_state(
 #[derive(Default)]
 struct MaterializedReplayState {
     mode: Option<crate::agent::core::AgentMode>,
-    reasoning_effort: Option<String>,
+    config: SessionConfigProjection,
     metadata_touched: bool,
     metadata_title: Option<Option<String>>,
     metadata_updated_at: Option<String>,
@@ -1306,12 +1319,79 @@ impl SessionUsageProjection {
     }
 }
 
+#[derive(Default)]
+struct SessionConfigProjection {
+    options: Vec<crate::acp::protocol::SessionConfigOption>,
+}
+
+impl SessionConfigProjection {
+    fn merge(
+        &mut self,
+        options: impl IntoIterator<Item = crate::acp::protocol::SessionConfigOption>,
+    ) {
+        for option in options {
+            if let Some(current) = self
+                .options
+                .iter_mut()
+                .find(|current| current.id == option.id)
+            {
+                *current = option;
+            } else {
+                self.options.push(option);
+            }
+        }
+    }
+
+    fn observe(&mut self, kind: &AgentEventKind) {
+        match kind {
+            AgentEventKind::SessionConfigChanged {
+                mode,
+                reasoning_effort,
+            } => {
+                self.merge(session_config_options(
+                    *mode,
+                    reasoning_effort.as_deref().and_then(parse_reasoning_effort),
+                ));
+            }
+            AgentEventKind::SessionModeChanged { mode } => {
+                self.merge(session_config_options(*mode, None).into_iter().take(1));
+            }
+            AgentEventKind::ProviderChanged {
+                provider,
+                model,
+                provider_node_id,
+                ..
+            } => {
+                self.merge([crate::agent::session_registry::model_config_option(
+                    provider,
+                    model,
+                    provider_node_id.as_deref(),
+                )]);
+            }
+            _ => {}
+        }
+    }
+
+    fn snapshot(&self) -> Option<Vec<crate::acp::protocol::SessionConfigOption>> {
+        // Do not replace client state with a partial snapshot or guessed defaults.
+        ["mode", "reasoning_effort", "model"]
+            .iter()
+            .all(|id| {
+                self.options
+                    .iter()
+                    .any(|option| option.id.0.as_ref() == *id)
+            })
+            .then(|| self.options.clone())
+    }
+}
+
 pub struct AcpLiveEventTranslator {
     streamed_assistant_messages: HashSet<(String, String)>,
     structured_user_messages: HashSet<(String, String)>,
     delegation_updates: crate::control::delegation_notifications::DelegationUpdateProjector,
     capabilities: AcpSessionUpdateCapabilities,
     usage: HashMap<String, SessionUsageProjection>,
+    config: HashMap<String, SessionConfigProjection>,
     /// Sessions whose deterministic todo plan is currently announced to a
     /// plan-operations client, so an empty snapshot removes it exactly once.
     announced_todo_plans: HashSet<String>,
@@ -1333,6 +1413,7 @@ impl AcpLiveEventTranslator {
                 ),
             capabilities: AcpSessionUpdateCapabilities::default(),
             usage: HashMap::new(),
+            config: HashMap::new(),
             announced_todo_plans: HashSet::new(),
         }
     }
@@ -1388,9 +1469,24 @@ impl AcpLiveEventTranslator {
         true
     }
 
+    /// Seed options that have not already been observed on the live stream.
+    pub(crate) fn seed_config_options(
+        &mut self,
+        session_id: &str,
+        options: &[crate::acp::protocol::SessionConfigOption],
+    ) {
+        let config = self.config.entry(session_id.to_owned()).or_default();
+        for option in options {
+            if !config.options.iter().any(|current| current.id == option.id) {
+                config.options.push(option.clone());
+            }
+        }
+    }
+
     /// Drops all per-session projection state for a closed session.
     pub fn forget_session(&mut self, session_id: &str) {
         self.usage.remove(session_id);
+        self.config.remove(session_id);
         self.announced_todo_plans.remove(session_id);
         self.streamed_assistant_messages
             .retain(|(session, _)| session != session_id);
@@ -1544,18 +1640,25 @@ impl AcpLiveEventTranslator {
         let session_id = event.session_id().to_owned();
         match event.kind() {
             AgentEventKind::SessionModeChanged { mode } => {
+                self.config
+                    .entry(session_id)
+                    .or_default()
+                    .observe(event.kind());
                 vec![SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(
                     SessionModeId::from(mode.as_str().to_string()),
                 ))]
             }
-            AgentEventKind::SessionConfigChanged {
-                mode,
-                reasoning_effort,
-            } => {
-                let effort = reasoning_effort.as_deref().and_then(parse_reasoning_effort);
-                vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
-                    session_config_options(*mode, effort),
-                ))]
+            AgentEventKind::SessionConfigChanged { .. } => {
+                let config = self.config.entry(session_id).or_default();
+                config.observe(event.kind());
+                config
+                    .snapshot()
+                    .map(|options| {
+                        vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                            options,
+                        ))]
+                    })
+                    .unwrap_or_default()
             }
             AgentEventKind::SessionMetadataUpdated { title, updated_at } => {
                 let mut update = SessionInfoUpdate::new();
@@ -1572,10 +1675,19 @@ impl AcpLiveEventTranslator {
             }
             AgentEventKind::ProviderChanged { .. } => {
                 self.usage
-                    .entry(session_id)
+                    .entry(session_id.clone())
                     .or_default()
                     .observe(event.seq(), event.kind());
-                Vec::new()
+                let config = self.config.entry(session_id).or_default();
+                config.observe(event.kind());
+                config
+                    .snapshot()
+                    .map(|options| {
+                        vec![SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(
+                            options,
+                        ))]
+                    })
+                    .unwrap_or_default()
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
                 let usage = self.usage.entry(session_id).or_default();
@@ -2116,6 +2228,9 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             match response {
                                 Ok(r) => {
                                     let session_id = r.session_id.to_string();
+                                    if let (Some(translator), Some(options)) = (context.translator.as_ref(), r.config_options.as_ref()) {
+                                        translator.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).seed_config_options(&session_id, options);
+                                    }
                                     attach_rpc_session(
                                         agent,
                                         session_owners,
@@ -2210,9 +2325,11 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                             match response {
                                 Ok(r) => {
                                     if let Some(translator) = context.translator.as_ref() {
-                                        translator.lock()
-                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                            .seed_usage_from_meta(&session_id, r.meta.as_ref());
+                                        let mut translator = translator.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                        if let Some(options) = r.config_options.as_ref() {
+                                            translator.seed_config_options(&session_id, options);
+                                        }
+                                        translator.seed_usage_from_meta(&session_id, r.meta.as_ref());
                                     }
                                     let request_lock =
                                         session_owners.request_lock(&session_id, conn_id).await;
@@ -4891,8 +5008,17 @@ mod tests {
                 .error
                 .is_none()
         );
-        assert_eq!(loaded.notifications.len(), 1);
-        assert_docs_catalog(&loaded.notifications[0], &session_id);
+        assert_eq!(loaded.notifications.len(), 2);
+        assert_docs_catalog(
+            loaded
+                .notifications
+                .iter()
+                .find(|notification| {
+                    notification["params"]["update"]["sessionUpdate"] == "available_commands_update"
+                })
+                .unwrap(),
+            &session_id,
+        );
 
         let resumed = dispatch_session_rpc(
             fixture.handle.as_ref(),
@@ -6364,11 +6490,113 @@ mod session_update_tests {
             },
         );
         for translator in [&mut full, &mut compaction_only, &mut legacy] {
+            translator.translate_updates(&provider_changed(0, None));
             assert!(matches!(
                 translator.translate_updates(&config).as_slice(),
                 [SessionUpdate::ConfigOptionUpdate(_)]
             ));
         }
+    }
+
+    #[test]
+    fn provider_change_projects_model_identity_to_all_clients() {
+        let event = envelope(
+            1,
+            AgentEventKind::ProviderChanged {
+                provider: "codex".into(),
+                model: "test-model".into(),
+                config_id: 1,
+                context_limit: None,
+                provider_node_id: Some("provider-node".into()),
+            },
+        );
+        let mut translator = AcpLiveEventTranslator::new();
+        let config = envelope(
+            0,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Plan,
+                reasoning_effort: Some("high".into()),
+            },
+        );
+        translator.translate_updates(&config);
+        let updates = translator.translate_updates(&event);
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+            panic!("model update");
+        };
+        let json = serde_json::to_value(update).unwrap();
+        let options = json["configOptions"].as_array().unwrap();
+        assert_eq!(options.len(), 3);
+        let model = options
+            .iter()
+            .find(|option| option["id"] == "model")
+            .unwrap();
+        assert_eq!(model["currentValue"], "codex/test-model");
+        assert_eq!(
+            model["_meta"]["querymt"]["modelEntry"]["node_id"],
+            "provider-node"
+        );
+        assert!(
+            options
+                .iter()
+                .any(|option| option["id"] == "mode" && option["currentValue"] == "plan")
+        );
+        let changed = envelope(
+            2,
+            AgentEventKind::SessionConfigChanged {
+                mode: AgentMode::Review,
+                reasoning_effort: None,
+            },
+        );
+        let updates = translator.translate_updates(&changed);
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+            panic!("config snapshot");
+        };
+        assert_eq!(
+            update.config_options.len(),
+            3,
+            "mode/reasoning changes keep the model selector"
+        );
+        let replay = replay_agent_events_materialized(
+            "s-1",
+            vec![
+                agent_event(0, config.kind().clone()),
+                agent_event(1, event.kind().clone()),
+                agent_event(2, changed.kind().clone()),
+            ],
+            &HashMap::new(),
+            &Default::default(),
+        );
+        let replay_config = replay
+            .iter()
+            .find_map(|notification| match &notification.update {
+                SessionUpdate::ConfigOptionUpdate(update) => Some(update),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replay_config).unwrap(),
+            serde_json::to_value(update).unwrap()
+        );
+        let mut seeded = AcpLiveEventTranslator::new();
+        let mut options = update.config_options.clone();
+        options.push(crate::acp::protocol::SessionConfigOption::select(
+            "profile",
+            "Profile",
+            "alpha",
+            vec![crate::acp::protocol::SessionConfigSelectOption::new(
+                "alpha", "Alpha",
+            )],
+        ));
+        seeded.seed_config_options("s-1", &options);
+        let updates = seeded.translate_updates(&event);
+        let SessionUpdate::ConfigOptionUpdate(update) = &updates[0] else {
+            panic!("seeded snapshot");
+        };
+        assert_eq!(
+            update.config_options.len(),
+            4,
+            "live snapshots retain the profile selector too"
+        );
     }
 
     // ── 1.3 Zero-to-many ordering ──────────────────────────────────────────
@@ -6407,6 +6635,7 @@ mod session_update_tests {
             [SessionUpdate::CurrentModeUpdate(_)]
         ));
 
+        translator.translate_updates(&provider_changed(1, None));
         let updates = translator.translate_updates(&envelope(
             2,
             AgentEventKind::SessionConfigChanged {
@@ -6448,6 +6677,7 @@ mod session_update_tests {
         .unwrap();
         assert_eq!(mode_json["sessionUpdate"], "current_mode_update");
         assert_eq!(mode_json["currentModeId"], "build");
+        translator.translate_updates(&provider_changed(1, None));
 
         let config_json = serde_json::to_value(
             translator
@@ -7340,6 +7570,7 @@ mod session_update_tests {
     #[test]
     fn replay_excludes_unsupported_preview_variants() {
         let events = vec![
+            agent_event(0, provider_changed(0, None).kind().clone()),
             agent_event(
                 1,
                 AgentEventKind::SessionConfigChanged {

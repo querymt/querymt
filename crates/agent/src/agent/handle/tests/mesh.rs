@@ -15,6 +15,14 @@ async fn test_querymt_mesh_status_without_mesh_is_disabled() {
     assert_eq!(result["has_mesh_state_store"], false);
     assert_eq!(result["scopes"], serde_json::json!([]));
     assert!(result["iroh"].is_null());
+    assert!(result["hostname"].is_null());
+    let mut legacy = result;
+    legacy.as_object_mut().unwrap().remove("hostname");
+    let status: crate::control::mesh::MeshStatusInfo = serde_json::from_value(legacy).unwrap();
+    assert!(
+        status.hostname.is_none(),
+        "older status responses remain compatible"
+    );
 }
 
 #[cfg(feature = "remote")]
@@ -41,6 +49,7 @@ async fn test_querymt_mesh_status_with_composite_mesh_reports_runtime_details() 
 
     assert_eq!(result["enabled"], true);
     assert_eq!(result["peer_id"], mesh.peer_id().to_string());
+    assert_eq!(result["hostname"], mesh.local_hostname());
     assert_eq!(result["has_invite_store"], true);
     assert_eq!(result["has_mesh_state_store"], true);
     assert!(result["scopes"].is_array());

@@ -238,7 +238,45 @@ impl LocalAgentHandle {
         )
     }
 
-    pub(super) async fn session_config_options(
+    pub(crate) async fn session_config_options(
+        &self,
+        session_id: Option<&str>,
+        mode: AgentMode,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Vec<SessionConfigOption>, Error> {
+        if let Some(session_id) = session_id {
+            let session_ref = self.session_ref_for_agent_session(session_id).await?;
+            let state = session_ref
+                .get_session_control()
+                .await
+                .map_err(Error::from)?;
+            // Remote profiles belong to the owner, not this viewing node.
+            let mut options = if session_ref.is_remote() {
+                crate::agent::session_registry::config_options(
+                    state.active_mode,
+                    state.reasoning_effort,
+                )
+            } else {
+                self.session_profile_config_options(
+                    Some(session_id),
+                    state.active_mode,
+                    state.reasoning_effort,
+                )
+                .await?
+            };
+            let binding = state.effective_model;
+            options.push(crate::agent::session_registry::model_config_option(
+                &binding.provider,
+                &binding.model,
+                binding.provider_node_id.as_deref(),
+            ));
+            return Ok(options);
+        }
+        self.session_profile_config_options(None, mode, reasoning_effort)
+            .await
+    }
+
+    pub(super) async fn session_profile_config_options(
         &self,
         session_id: Option<&str>,
         mode: AgentMode,
@@ -281,9 +319,9 @@ impl LocalAgentHandle {
         )
     }
 
-    /// Mode is read from the attached owner, never inferred from this node's profile.
+    /// Configuration is read from the attached owner, never this node's profile.
     #[cfg(feature = "remote")]
-    pub(crate) async fn remote_session_mode_config_options(
+    pub(crate) async fn remote_session_config_options(
         &self,
         session_id: &str,
     ) -> Result<Vec<SessionConfigOption>, Error> {
@@ -299,11 +337,21 @@ impl LocalAgentHandle {
                     "sessionId": session_id,
                 }))
             })?;
-        let mode = session_ref.get_mode().await.map_err(Error::from)?;
-        Ok(crate::agent::session_registry::config_options(mode, None)
-            .into_iter()
-            .filter(|option| option.id.0.as_ref() == "mode")
-            .collect())
+        let state = session_ref
+            .get_session_control()
+            .await
+            .map_err(Error::from)?;
+        let mut options = crate::agent::session_registry::config_options(
+            state.active_mode,
+            state.reasoning_effort,
+        );
+        let binding = state.effective_model;
+        options.push(crate::agent::session_registry::model_config_option(
+            &binding.provider,
+            &binding.model,
+            binding.provider_node_id.as_deref(),
+        ));
+        Ok(options)
     }
 
     /// Acquire the registry lock with tracing for wait and hold durations.
@@ -762,10 +810,10 @@ impl LocalAgentHandle {
                 );
             }
             let config_options = self
-                .remote_session_mode_config_options(&session_id)
+                .remote_session_config_options(&session_id)
                 .await
                 .unwrap_or_else(|error| {
-                    tracing::warn!(session_id, error = %error, "remote mode unavailable during session load");
+                    tracing::warn!(session_id, error = %error, "remote configuration unavailable during session load");
                     Vec::new()
                 });
             return Ok(LoadSessionResponse::new()
@@ -846,12 +894,22 @@ impl LocalAgentHandle {
                     "message": format_prefixed_error_chain("Failed to list profiles", &err),
                 }))
             })?;
-            let config_options = crate::agent::session_registry::config_options_with_profiles(
+            let mut config_options = crate::agent::session_registry::config_options_with_profiles(
                 current_mode,
                 reasoning_effort,
                 Some(binding.profile_id.as_str()),
                 &profile_list,
             );
+            let state = session_ref
+                .get_session_control()
+                .await
+                .map_err(Error::from)?;
+            let model = state.effective_model;
+            config_options.push(crate::agent::session_registry::model_config_option(
+                &model.provider,
+                &model.model,
+                model.provider_node_id.as_deref(),
+            ));
             let mut response = LoadSessionResponse::new()
                 .modes(crate::agent::session_registry::mode_state(current_mode))
                 .config_options(config_options);
