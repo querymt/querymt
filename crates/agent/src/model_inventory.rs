@@ -30,6 +30,23 @@ pub struct SnapshotMeta {
     pub remote_timeout_count: usize,
     /// Total number of remote nodes attempted
     pub remote_node_count: usize,
+    /// Reachability of nodes whose catalogs are present in the snapshot.
+    pub remote_node_availability: std::collections::BTreeMap<String, RemoteModelAvailability>,
+}
+
+/// Latest catalog reachability, not provider credentials or inference health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteModelAvailability {
+    Available,
+    Unavailable,
+    Unknown,
+}
+
+#[derive(Default)]
+struct RemoteModelSnapshot {
+    models: Vec<ModelEntry>,
+    availability: std::collections::BTreeMap<String, RemoteModelAvailability>,
 }
 
 /// Tracks ongoing refresh operations
@@ -171,7 +188,7 @@ struct ModelInventoryInner {
     /// Current local model snapshot (fast reads via arc-swap)
     local_snapshot: ArcSwap<Vec<ModelEntry>>,
     /// Current remote model snapshot (fast reads via arc-swap)
-    remote_snapshot: ArcSwap<Vec<ModelEntry>>,
+    remote_snapshot: ArcSwap<RemoteModelSnapshot>,
     /// Mutable refresh state (protected by mutex)
     refresh_state: Mutex<RefreshState>,
     /// Agent configuration
@@ -204,6 +221,7 @@ pub struct ModelInventory {
 #[derive(Clone, Default)]
 struct RemoteRefreshResult {
     catalogs: std::collections::HashMap<libp2p::PeerId, Vec<ModelEntry>>,
+    unavailable: std::collections::HashSet<libp2p::PeerId>,
     timeout_count: usize,
     node_count: usize,
     incomplete: bool,
@@ -219,7 +237,7 @@ enum RemoteCatalogFailure {
 #[cfg(feature = "remote")]
 #[derive(Default)]
 struct RemoteSnapshotUpdate {
-    models: Vec<ModelEntry>,
+    snapshot: RemoteModelSnapshot,
     timeout_count: usize,
     node_count: usize,
     incomplete: bool,
@@ -230,7 +248,14 @@ struct RemoteSnapshotUpdate {
 #[derive(Default)]
 struct RemoteCatalogCache {
     scopes: Vec<querymt_remote::MeshScopeId>,
-    peers: std::collections::HashMap<libp2p::PeerId, (Instant, Vec<ModelEntry>)>,
+    peers: std::collections::HashMap<libp2p::PeerId, CachedRemoteCatalog>,
+}
+
+#[cfg(feature = "remote")]
+struct CachedRemoteCatalog {
+    updated_at: Instant,
+    models: Vec<ModelEntry>,
+    availability: RemoteModelAvailability,
 }
 
 #[cfg(feature = "remote")]
@@ -240,25 +265,53 @@ impl RemoteCatalogCache {
         scopes: &[querymt_remote::MeshScopeId],
         result: &RemoteRefreshResult,
         now: Instant,
-    ) -> Vec<ModelEntry> {
+    ) -> RemoteModelSnapshot {
         if self.scopes != scopes {
             self.peers.clear();
             self.scopes = scopes.to_vec();
         }
         // A successful empty catalog withdraws that peer's models. Missing or failed
         // queries retain the last good catalog for a bounded five-minute grace period.
-        self.peers.retain(|_, (updated, _)| {
-            now.saturating_duration_since(*updated) < Duration::from_secs(300)
+        self.peers.retain(|_, catalog| {
+            now.saturating_duration_since(catalog.updated_at) < Duration::from_secs(300)
         });
+        for (peer, catalog) in &mut self.peers {
+            if result.unavailable.contains(peer)
+                || (!result.incomplete && !result.catalogs.contains_key(peer))
+            {
+                catalog.availability = RemoteModelAvailability::Unavailable;
+            } else if catalog.availability != RemoteModelAvailability::Unavailable {
+                // Incomplete discovery is not proof that an unqueried peer is down.
+                catalog.availability = RemoteModelAvailability::Unknown;
+            }
+        }
         for (peer, models) in &result.catalogs {
-            self.peers.insert(*peer, (now, models.clone()));
+            self.peers.insert(
+                *peer,
+                CachedRemoteCatalog {
+                    updated_at: now,
+                    models: models.clone(),
+                    availability: RemoteModelAvailability::Available,
+                },
+            );
         }
         let mut peers: Vec<_> = self.peers.iter().collect();
         peers.sort_by_key(|(peer, _)| **peer);
-        peers
-            .into_iter()
-            .flat_map(|(_, (_, models))| models.clone())
-            .collect()
+        let mut snapshot = RemoteModelSnapshot::default();
+        for (peer, catalog) in peers {
+            snapshot
+                .availability
+                .insert(peer.to_string(), catalog.availability);
+            for model in &catalog.models {
+                if let Some(node_id) = &model.node_id {
+                    snapshot
+                        .availability
+                        .insert(node_id.clone(), catalog.availability);
+                }
+                snapshot.models.push(model.clone());
+            }
+        }
+        snapshot
     }
 }
 
@@ -315,7 +368,10 @@ where
             }
             Some((peer_id, outcome)) = queries.next(), if !queries.is_empty() => {
                 match outcome {
-                    Ok(models) => { result.catalogs.insert(peer_id, models); }
+                    Ok(models) => {
+                        result.unavailable.remove(&peer_id);
+                        result.catalogs.insert(peer_id, models);
+                    }
                     Err(failure) => {
                         result.incomplete = true;
                         result.timeout_count += usize::from(matches!(failure, RemoteCatalogFailure::TimedOut));
@@ -326,6 +382,8 @@ where
                 match node {
                     Some(Ok((peer_id, node))) if seen.insert(peer_id) => {
                         result.node_count += 1;
+                        // Failed or deadline-cancelled probes identify this peer, unlike discovery errors.
+                        result.unavailable.insert(peer_id);
                         let future = query(peer_id, node);
                         queries.push(async move { (peer_id, future.await) });
                     }
@@ -363,7 +421,7 @@ impl ModelInventory {
         Self {
             inner: Arc::new(ModelInventoryInner {
                 local_snapshot: ArcSwap::from(Arc::new(Vec::new())),
-                remote_snapshot: ArcSwap::from(Arc::new(Vec::new())),
+                remote_snapshot: ArcSwap::from_pointee(RemoteModelSnapshot::default()),
                 refresh_state: Mutex::new(RefreshState {
                     local_refreshing: false,
                     remote_refreshing: false,
@@ -402,7 +460,9 @@ impl ModelInventory {
             .is_some_and(|previous| previous.peer_id() != mesh.peer_id())
         {
             self.inner.remote_catalogs.lock().peers.clear();
-            self.inner.remote_snapshot.store(Arc::new(Vec::new()));
+            self.inner
+                .remote_snapshot
+                .store(Arc::new(RemoteModelSnapshot::default()));
         }
         self.inner
             .remote_epoch
@@ -418,7 +478,9 @@ impl ModelInventory {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *current = None;
         self.inner.remote_catalogs.lock().peers.clear();
-        self.inner.remote_snapshot.store(Arc::new(Vec::new()));
+        self.inner
+            .remote_snapshot
+            .store(Arc::new(RemoteModelSnapshot::default()));
     }
 
     pub fn local_snapshot_entries_blocking(&self) -> Vec<ModelEntry> {
@@ -442,7 +504,7 @@ impl ModelInventory {
         let remote = self.inner.remote_snapshot.load_full();
 
         let mut all = (*local).clone();
-        all.extend((*remote).clone());
+        all.extend(remote.models.iter().cloned());
 
         let state = self.inner.refresh_state.lock().await;
         let meta = SnapshotMeta {
@@ -452,6 +514,7 @@ impl ModelInventory {
             is_stale: self.is_stale(&state),
             remote_timeout_count: state.remote_timeout_count,
             remote_node_count: state.remote_node_count,
+            remote_node_availability: remote.availability.clone(),
         };
 
         tracing::Span::current().record("model_count", all.len());
@@ -638,7 +701,9 @@ impl ModelInventory {
             mesh.invalidate_catalog_refreshes();
         }
         self.inner.local_snapshot.store(Arc::new(Vec::new()));
-        self.inner.remote_snapshot.store(Arc::new(Vec::new()));
+        self.inner
+            .remote_snapshot
+            .store(Arc::new(RemoteModelSnapshot::default()));
         {
             let mut state = self.inner.refresh_state.lock().await;
             state.local_updated_at = None;
@@ -709,14 +774,14 @@ impl ModelInventory {
 
             // Update remote snapshot
             if let Some(RemoteSnapshotUpdate {
-                models: remote_models,
+                snapshot,
                 timeout_count,
                 node_count,
                 incomplete,
                 epoch,
             }) = remote_result
             {
-                tracing::Span::current().record("remote_model_count", remote_models.len());
+                tracing::Span::current().record("remote_model_count", snapshot.models.len());
                 tracing::Span::current().record("remote_timeout_count", timeout_count);
                 tracing::Span::current().record("remote_node_count", node_count);
                 let mut state = self.inner.refresh_state.lock().await;
@@ -727,7 +792,7 @@ impl ModelInventory {
                     .load(std::sync::atomic::Ordering::SeqCst)
                     == epoch
                 {
-                    self.inner.remote_snapshot.store(Arc::new(remote_models));
+                    self.inner.remote_snapshot.store(Arc::new(snapshot));
                     state.remote_timeout_count = timeout_count;
                     state.remote_node_count = node_count;
                     state.remote_updated_at = if incomplete {
@@ -885,17 +950,17 @@ impl ModelInventory {
             return None;
         }
         let mut cache = self.inner.remote_catalogs.lock();
-        let models = cache.merge(&scopes, &result, Instant::now());
+        let snapshot = cache.merge(&scopes, &result, Instant::now());
         let retained = cache
             .peers
             .keys()
             .any(|peer| !result.catalogs.contains_key(peer));
         tracing::Span::current().record("timeout_count", result.timeout_count);
         tracing::Span::current().record("node_count", result.node_count);
-        tracing::Span::current().record("model_count", models.len());
+        tracing::Span::current().record("model_count", snapshot.models.len());
         tracing::Span::current().record("duration_ms", start.elapsed().as_millis());
         Some(RemoteSnapshotUpdate {
-            models,
+            snapshot,
             timeout_count: result.timeout_count,
             node_count: result.node_count,
             incomplete: result.incomplete || retained,
@@ -1107,13 +1172,15 @@ mod tests {
             catalogs: [(a, vec![remote_model("a")]), (b, vec![remote_model("b")])].into(),
             ..Default::default()
         };
-        assert_eq!(cache.merge(&scopes, &first, now).len(), 2);
+        assert_eq!(cache.merge(&scopes, &first, now).models.len(), 2);
         let partial = RemoteRefreshResult {
             catalogs: [(a, vec![remote_model("new-a")])].into(),
             incomplete: true,
             ..Default::default()
         };
-        let models = cache.merge(&scopes, &partial, now + Duration::from_secs(10));
+        let models = cache
+            .merge(&scopes, &partial, now + Duration::from_secs(10))
+            .models;
         assert_eq!(models.len(), 2);
         assert!(models.iter().any(|model| model.id == "new-a"));
         assert!(models.iter().any(|model| model.id == "b"));
@@ -1124,6 +1191,7 @@ mod tests {
         assert_eq!(
             cache
                 .merge(&scopes, &empty, now + Duration::from_secs(20))
+                .models
                 .len(),
             1
         );
@@ -1134,7 +1202,144 @@ mod tests {
                     &RemoteRefreshResult::default(),
                     now + Duration::from_secs(301)
                 )
+                .models
                 .is_empty()
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn empty_peer_catalog_retains_reachability_without_model_rows() {
+        let mut cache = RemoteCatalogCache::default();
+        let peer = test_peer();
+        let scopes = vec![querymt_remote::MeshScopeId::lan_default()];
+        let now = Instant::now();
+        let result = RemoteRefreshResult {
+            catalogs: [(peer, Vec::new())].into(),
+            ..Default::default()
+        };
+        let snapshot = cache.merge(&scopes, &result, now);
+        assert!(snapshot.models.is_empty());
+        assert_eq!(
+            snapshot.availability[&peer.to_string()],
+            RemoteModelAvailability::Available
+        );
+        let snapshot = cache.merge(
+            &scopes,
+            &RemoteRefreshResult {
+                unavailable: [peer].into(),
+                incomplete: true,
+                ..Default::default()
+            },
+            now + Duration::from_secs(1),
+        );
+        assert!(snapshot.models.is_empty());
+        assert_eq!(
+            snapshot.availability[&peer.to_string()],
+            RemoteModelAvailability::Unavailable
+        );
+        let snapshot = cache.merge(&scopes, &result, now + Duration::from_secs(2));
+        assert_eq!(
+            snapshot.availability[&peer.to_string()],
+            RemoteModelAvailability::Available
+        );
+    }
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn cached_availability_tracks_failure_partial_discovery_and_recovery_per_node() {
+        let mut cache = RemoteCatalogCache::default();
+        let a = test_peer();
+        let b = test_peer();
+        let scopes = vec![querymt_remote::MeshScopeId::lan_default()];
+        let now = Instant::now();
+        let model = |peer: libp2p::PeerId| ModelEntry {
+            node_id: Some(peer.to_string()),
+            ..remote_model("same-model")
+        };
+        let success = RemoteRefreshResult {
+            catalogs: [(a, vec![model(a)]), (b, vec![model(b)])].into(),
+            ..Default::default()
+        };
+        let snapshot = cache.merge(&scopes, &success, now);
+        assert!(
+            snapshot
+                .availability
+                .values()
+                .all(|status| *status == RemoteModelAvailability::Available)
+        );
+        let partial = RemoteRefreshResult {
+            catalogs: [(a, vec![model(a)])].into(),
+            incomplete: true,
+            ..Default::default()
+        };
+        let snapshot = cache.merge(&scopes, &partial, now + Duration::from_secs(1));
+        assert_eq!(
+            snapshot.availability[&a.to_string()],
+            RemoteModelAvailability::Available
+        );
+        assert_eq!(
+            snapshot.availability[&b.to_string()],
+            RemoteModelAvailability::Unknown
+        );
+        let failed = RemoteRefreshResult {
+            unavailable: [b].into(),
+            ..partial
+        };
+        let snapshot = cache.merge(&scopes, &failed, now + Duration::from_secs(2));
+        assert_eq!(snapshot.models.len(), 2, "failure retains the catalog");
+        assert_eq!(
+            snapshot.availability[&a.to_string()],
+            RemoteModelAvailability::Available
+        );
+        assert_eq!(
+            snapshot.availability[&b.to_string()],
+            RemoteModelAvailability::Unavailable
+        );
+        let snapshot = cache.merge(
+            &scopes,
+            &RemoteRefreshResult {
+                incomplete: true,
+                ..Default::default()
+            },
+            now + Duration::from_secs(3),
+        );
+        assert_eq!(
+            snapshot.availability[&b.to_string()],
+            RemoteModelAvailability::Unavailable,
+            "only a successful check restores a failed node"
+        );
+        let snapshot = cache.merge(&scopes, &success, now + Duration::from_secs(4));
+        assert_eq!(
+            snapshot.availability[&b.to_string()],
+            RemoteModelAvailability::Available
+        );
+        let snapshot = cache.merge(
+            &scopes,
+            &RemoteRefreshResult::default(),
+            now + Duration::from_secs(5),
+        );
+        assert_eq!(
+            snapshot.availability[&b.to_string()],
+            RemoteModelAvailability::Unavailable,
+            "complete discovery no longer finds the node"
+        );
+        let snapshot = cache.merge(
+            &scopes,
+            &RemoteRefreshResult::default(),
+            now + Duration::from_secs(305),
+        );
+        assert!(snapshot.models.is_empty());
+        assert!(snapshot.availability.is_empty());
+        cache.merge(&scopes, &success, now + Duration::from_secs(306));
+        let snapshot = cache.merge(
+            &[],
+            &RemoteRefreshResult::default(),
+            now + Duration::from_secs(307),
+        );
+        assert!(
+            snapshot.availability.is_empty(),
+            "leaving scopes drops availability too"
         );
     }
 
@@ -1149,10 +1354,14 @@ mod tests {
             catalogs: [(test_peer(), vec![remote_model("a")])].into(),
             ..Default::default()
         };
-        assert_eq!(cache.merge(&scopes, &result, Instant::now()).len(), 1);
+        assert_eq!(
+            cache.merge(&scopes, &result, Instant::now()).models.len(),
+            1
+        );
         assert!(
             cache
                 .merge(&[], &RemoteRefreshResult::default(), Instant::now())
+                .models
                 .is_empty()
         );
     }
@@ -1182,11 +1391,39 @@ mod tests {
         assert_eq!(result.node_count, 3);
         assert_eq!(result.catalogs.len(), 1);
         assert_eq!(result.timeout_count, 2);
+        assert_eq!(result.unavailable, [a, c].into());
         assert!(result.incomplete);
         assert!(
             receiver.await.is_err(),
             "deadline must drop unfinished query futures"
         );
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn catalog_failures_identify_only_queried_peers() {
+        let a = test_peer();
+        let b = test_peer();
+        let result = collect_remote_catalogs(
+            futures_util::stream::iter([
+                Ok((a, ())),
+                Err(RemoteCatalogFailure::Unavailable),
+                Ok((b, ())),
+            ]),
+            |peer, ()| async move {
+                if peer == a {
+                    Ok(vec![remote_model("healthy")])
+                } else {
+                    Err(RemoteCatalogFailure::Unavailable)
+                }
+            },
+            2,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(result.unavailable, [b].into());
+        assert!(result.catalogs.contains_key(&a));
+        assert!(result.incomplete);
     }
 
     #[cfg(feature = "remote")]
@@ -1256,14 +1493,58 @@ mod tests {
         inventory
             .inner
             .remote_snapshot
-            .store(Arc::new(vec![remote_model("retained")]));
+            .store(Arc::new(RemoteModelSnapshot {
+                models: vec![remote_model("retained")],
+                availability: [("peer".into(), RemoteModelAvailability::Unavailable)].into(),
+            }));
         // Hold the refresh active so invalidation cannot finish a replacement pass.
         inventory.inner.refresh_state.lock().await.remote_refreshing = true;
         inventory.invalidate_remote().await;
         let (models, meta) = inventory.get_snapshot().await;
         assert_eq!(models[0].id, "retained");
+        assert_eq!(
+            meta.remote_node_availability["peer"],
+            RemoteModelAvailability::Unavailable
+        );
         assert!(meta.is_stale);
         assert!(meta.refresh_in_progress);
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn model_endpoints_publish_availability_with_the_same_snapshot_and_clear_it_with_mesh() {
+        use crate::send_agent::SendAgent;
+        let handle = crate::LocalAgentHandle::from_config(make_test_config().await);
+        let inventory = &handle.model_inventory;
+        inventory
+            .inner
+            .remote_snapshot
+            .store(Arc::new(RemoteModelSnapshot {
+                models: vec![remote_model("retained")],
+                availability: [("peer".into(), RemoteModelAvailability::Unavailable)].into(),
+            }));
+        // Keep the refresh in-flight so both nonblocking endpoints read this exact snapshot.
+        inventory.inner.refresh_state.lock().await.remote_refreshing = true;
+        for method in ["querymt/models", "querymt/refreshModels"] {
+            let params = serde_json::value::RawValue::from_string("{}".into()).unwrap();
+            let response = handle
+                .ext_method(crate::acp::protocol::ExtRequest::new(
+                    method,
+                    Arc::from(params),
+                ))
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+            assert_eq!(value["models"][0]["node_id"], "peer");
+            assert_eq!(
+                value["meta"]["remote_node_availability"]["peer"],
+                "unavailable"
+            );
+        }
+        inventory.clear_mesh();
+        let (models, meta) = inventory.get_snapshot().await;
+        assert!(models.is_empty());
+        assert!(meta.remote_node_availability.is_empty());
     }
 
     #[cfg(feature = "remote")]

@@ -352,6 +352,17 @@ async fn test_querymt_capabilities_composite_mesh_reports_invites_and_multi_tran
     assert_eq!(result["transport"]["mesh_transport"], "multi");
     assert_eq!(result["features"]["mesh"], true);
     assert_eq!(result["features"]["mesh_invites"], true);
+    assert_eq!(result["features"]["profiles"], false);
+    assert!(
+        result["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| {
+                method == crate::acp::shared::QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED
+            }),
+        "mesh-only viewers advertise relayed delegate-model changes"
+    );
     assert!(
         result["notifications"]
             .as_array()

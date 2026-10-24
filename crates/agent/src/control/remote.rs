@@ -52,6 +52,8 @@ pub struct RemoteSessionsRequest {
 pub struct CreateRemoteSessionRequest {
     pub node_id: String,
     #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default = "default_attach")]
     pub attach: bool,
@@ -210,7 +212,11 @@ pub async fn create_remote_session(
     {
         let nm_ref = agent.find_node_manager(&request.node_id).await?;
         let response = agent
-            .create_remote_session(&nm_ref, request.cwd.clone())
+            .create_remote_session_with_profile(
+                &nm_ref,
+                request.cwd.clone(),
+                request.profile_id.clone(),
+            )
             .await?;
 
         if !request.attach {
