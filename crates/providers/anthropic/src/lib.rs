@@ -547,7 +547,8 @@ struct AnthropicOutputTokensDetails {
 /// Anthropic nests the thinking-token count under
 /// `output_tokens_details.thinking_tokens`, which the shared `querymt::Usage`
 /// cannot deserialize directly. `thinking_tokens` are already included in
-/// `output_tokens`.
+/// `output_tokens`; the `Usage` conversion subtracts them so the shared
+/// output and reasoning categories stay exclusive.
 #[derive(Deserialize, Debug, Clone, Default)]
 struct AnthropicUsage {
     #[serde(default)]
@@ -564,13 +565,17 @@ struct AnthropicUsage {
 
 impl From<AnthropicUsage> for Usage {
     fn from(usage: AnthropicUsage) -> Self {
+        // Anthropic's `output_tokens` includes thinking tokens, while QueryMT's
+        // output and reasoning categories are exclusive (shared cost code adds
+        // them back together), so subtract here to avoid double counting.
+        let reasoning = usage
+            .output_tokens_details
+            .and_then(|d| d.thinking_tokens)
+            .unwrap_or(0);
         Usage {
             input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            reasoning_tokens: usage
-                .output_tokens_details
-                .and_then(|d| d.thinking_tokens)
-                .unwrap_or(0),
+            output_tokens: usage.output_tokens.saturating_sub(reasoning),
+            reasoning_tokens: reasoning,
             cache_read: usage.cache_read_input_tokens,
             cache_write: usage.cache_creation_input_tokens,
         }
@@ -3570,7 +3575,7 @@ mod tests {
         assert_eq!(output.text().as_deref(), Some("answer"));
         assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
         let usage = output.usage.unwrap();
-        assert_eq!(usage.output_tokens, 600);
+        assert_eq!(usage.output_tokens, 100);
         assert_eq!(usage.reasoning_tokens, 500);
     }
 
@@ -3612,7 +3617,7 @@ mod tests {
         ]);
         let usage = output.usage.unwrap();
         assert_eq!(usage.input_tokens, 7);
-        assert_eq!(usage.output_tokens, 32_000);
+        assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.reasoning_tokens, 31_950);
         assert_eq!(output.finish_reason, Some(FinishReason::Length));
     }
