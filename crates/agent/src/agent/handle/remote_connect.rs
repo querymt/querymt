@@ -609,7 +609,7 @@ impl LocalAgentHandle {
     ) {
         let mut cooldowns = self.remote_connect_cooldowns.lock();
         match result {
-            Ok(_) => {
+            Ok(connected) if connected.outcome != RemoteConnectOutcome::Reused => {
                 cooldowns.remove(session_id);
             }
             Err(error) if error.counts_toward_cooldown() => {
@@ -625,7 +625,7 @@ impl LocalAgentHandle {
                     },
                 );
             }
-            Err(_) => {}
+            _ => {}
         }
     }
 
@@ -1648,6 +1648,48 @@ mod tests {
                 .check_connect_cooldown("s1", RemoteConnectReason::ExplicitReconnect)
                 .is_ok()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reused_attachment_preserves_failure_cooldown() {
+        let (handle, _storage, _tmp) = handle_with_real_storage().await;
+        handle.record_connect_outcome("s1", &node_unavailable());
+        let before = handle.remote_connect_cooldowns.lock()["s1"];
+        let actor = SessionActor::spawn(SessionActor::new(
+            handle.config.clone(),
+            "s1".into(),
+            SessionRuntime::new(
+                None,
+                std::collections::HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        ));
+        let mut result = Ok(ConnectedRemoteSession {
+            session_ref: SessionActorRef::from(actor.clone()),
+            attachment_id: 1,
+            bookmark: None,
+            outcome: RemoteConnectOutcome::Reused,
+        });
+        handle.record_connect_outcome("s1", &result);
+        let after = handle.remote_connect_cooldowns.lock()["s1"];
+        assert_eq!(after.failures, before.failures);
+        assert_eq!(after.failed_at, before.failed_at);
+        assert_eq!(after.wait, before.wait);
+        assert!(
+            handle
+                .check_connect_cooldown("s1", RemoteConnectReason::OperationRecovery)
+                .is_err()
+        );
+        for outcome in [
+            RemoteConnectOutcome::Resumed,
+            RemoteConnectOutcome::Reattached,
+        ] {
+            handle.record_connect_outcome("s1", &node_unavailable());
+            result.as_mut().unwrap().outcome = outcome;
+            handle.record_connect_outcome("s1", &result);
+            assert!(handle.remote_connect_cooldowns.lock().is_empty());
+        }
+        actor.kill();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

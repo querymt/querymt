@@ -1626,6 +1626,17 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
             use crate::agent::remote::event_forwarder::EventForwarder;
             use crate::agent::remote::event_relay::EventRelayActor;
 
+            // Unsubscribe identifies a relay by sequence ID and peer-scoped name.
+            let relay_name = msg
+                .relay_dht_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    AgentError::RemoteActor(
+                        "SubscribeEvents requires a non-empty relay_dht_name for unsubscribe identity"
+                            .to_string(),
+                    )
+                })?;
             let relay_source = if msg.relay_ref.is_some() {
                 "direct"
             } else {
@@ -1634,11 +1645,6 @@ impl Message<crate::agent::messages::SubscribeEvents> for SessionActor {
             let relay_ref = if let Some(relay_ref) = msg.relay_ref {
                 relay_ref
             } else {
-                let relay_name = msg.relay_dht_name.as_deref().ok_or_else(|| {
-                    AgentError::RemoteActor(
-                        "SubscribeEvents requires relay_ref or relay_dht_name".to_string(),
-                    )
-                })?;
                 let mesh = self.mesh.as_ref().ok_or(AgentError::MeshNotBootstrapped)?;
                 mesh.lookup_actor::<EventRelayActor>(relay_name.to_string())
                     .await
@@ -3583,6 +3589,61 @@ mod tests {
 
     #[cfg(feature = "remote")]
     #[tokio::test]
+    async fn event_subscriptions_require_a_name_even_with_direct_capability() {
+        use crate::agent::remote::event_relay::EventRelayActor;
+        crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let fixture = ActorFixture::new().await;
+        let relay = EventRelayActor::spawn(EventRelayActor::new(
+            fixture.config.event_sink.clone(),
+            "test-session".into(),
+            "viewer".into(),
+            None,
+            None,
+        ));
+        let relay_ref = relay.clone().into_remote_ref().await;
+        for direct in [false, true] {
+            for name in [None, Some(String::new()), Some("  ".into())] {
+                let error = fixture
+                    .actor_ref
+                    .ask(crate::agent::messages::SubscribeEvents {
+                        relay_actor_id: relay.id().sequence_id(),
+                        relay_ref: direct.then(|| relay_ref.clone()),
+                        relay_dht_name: name,
+                        after_source_seq: None,
+                    })
+                    .await
+                    .expect_err("unremovable subscription rejected");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires a non-empty relay_dht_name")
+                );
+            }
+        }
+        fixture
+            .actor_ref
+            .ask(crate::agent::messages::SubscribeEvents {
+                relay_actor_id: relay.id().sequence_id(),
+                relay_ref: Some(relay_ref),
+                relay_dht_name: Some("relay/viewer".into()),
+                after_source_seq: None,
+            })
+            .await
+            .expect("named direct subscription");
+        fixture
+            .actor_ref
+            .ask(crate::agent::messages::UnsubscribeEvents {
+                relay_actor_id: relay.id().sequence_id(),
+                relay_dht_name: "relay/viewer".into(),
+            })
+            .await
+            .expect("named unsubscribe");
+        relay.kill();
+        fixture.actor_ref.kill();
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
     async fn only_observer_link_failures_are_isolated() {
         use crate::agent::remote::event_relay::EventRelayActor;
         crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
@@ -3599,7 +3660,7 @@ mod tests {
             .ask(SubscribeEvents {
                 relay_actor_id: relay.id().sequence_id(),
                 relay_ref: Some(relay.clone().into_remote_ref().await),
-                relay_dht_name: None,
+                relay_dht_name: Some("relay/observer".into()),
                 after_source_seq: None,
             })
             .await

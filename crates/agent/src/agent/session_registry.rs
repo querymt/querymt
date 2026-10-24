@@ -463,10 +463,10 @@ impl SessionRegistry {
         session_id: &str,
         id: kameo::actor::ActorId,
     ) -> bool {
-        let same = self
-            .local_actor_refs
-            .get(session_id)
-            .is_some_and(|actor| actor.id() == id);
+        let same = matches!(
+            self.sessions.get(session_id),
+            Some(SessionActorRef::Local(actor)) if actor.id() == id
+        );
         if same {
             self.remove(session_id);
         }
@@ -1318,6 +1318,47 @@ mod tests {
             f.registry
                 .remove_local_if_same_actor("test-session", fresh.id())
         );
+        old.kill();
+        fresh.kill();
+    }
+
+    #[tokio::test]
+    async fn stopped_actor_inserted_without_side_index_is_removed() {
+        let mut f = RegistryFixture::new().await;
+        let actor = f.spawn_actor();
+        f.registry.insert("test-session".into(), actor.clone());
+        assert!(f.registry.local_actor_ref("test-session").is_none());
+        actor.kill();
+        actor.wait_for_shutdown().await;
+        let registry = Mutex::new(f.registry);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            live_session(&registry, "test-session"),
+        )
+        .await
+        .expect("stopped actor cleanup must terminate");
+        assert!(result.is_none());
+        assert!(registry.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unindexed_actor_cleanup_does_not_evict_replacement() {
+        let mut f = RegistryFixture::new().await;
+        let old = f.spawn_actor();
+        let fresh = f.spawn_actor();
+        f.registry.insert("test-session".into(), fresh.clone());
+        assert!(
+            !f.registry
+                .remove_local_if_same_actor("test-session", old.id())
+        );
+        assert!(
+            matches!(f.registry.get("test-session"), Some(SessionActorRef::Local(actor)) if actor.id() == fresh.id())
+        );
+        assert!(
+            f.registry
+                .remove_local_if_same_actor("test-session", fresh.id())
+        );
+        assert!(f.registry.is_empty());
         old.kill();
         fresh.kill();
     }
