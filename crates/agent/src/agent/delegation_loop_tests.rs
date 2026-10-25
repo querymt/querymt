@@ -758,9 +758,12 @@ impl TestHarness {
         // resolves correctly when creating delegation sessions.
         let mut agent_registry = DefaultAgentRegistry::new();
         for id in ["agent", "agent1", "agent2"] {
-            let delegate_handle =
-                build_delegate_handle(behavior.clone(), store.clone(), delegate_reasoning_effort)
-                    .await;
+            let delegate_handle = build_delegate_handle(
+                behavior.clone(),
+                shared_storage.clone(),
+                delegate_reasoning_effort,
+            )
+            .await;
             agent_registry.register_handle(
                 agent_info(id),
                 delegate_handle as Arc<dyn crate::agent::handle::AgentHandle>,
@@ -1002,7 +1005,7 @@ impl TestHarness {
 /// orchestrator, ensuring parent_session_id resolves correctly.
 async fn build_delegate_handle(
     behavior: DelegateBehavior,
-    shared_store: Arc<dyn SessionStore>,
+    shared_storage: Arc<SqliteStorage>,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Arc<crate::agent::LocalAgentHandle> {
     let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
@@ -1104,21 +1107,15 @@ async fn build_delegate_handle(
     let delegate_session_provider = Arc::new(
         crate::session::provider::SessionProvider::new(
             delegate_plugin_registry,
-            shared_store,
+            shared_storage.clone(),
             delegate_params,
         )
         .with_agent_id(Some("reader".into())),
     );
-    let delegate_event_storage = Arc::new(
-        SqliteStorage::connect(":memory:".into())
-            .await
-            .expect("create delegate event journal storage"),
-    );
-
     let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
-        delegate_event_storage.clone(),
+        shared_storage.clone(),
         delegate_session_provider,
-        delegate_event_storage.event_journal(),
+        shared_storage.event_journal(),
     )
     .with_tool_policy(ToolPolicy::ProviderOnly)
     .with_max_steps(1)

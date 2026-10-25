@@ -36,6 +36,61 @@ use std::collections::{HashMap, HashSet};
 use super::SqliteStorage;
 use super::row_parsers::{parse_llm_config_row, parse_llm_params};
 
+/// Insert history using the caller's transaction, including prompt admission.
+pub(super) fn insert_message(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    message: &AgentMessage,
+) -> SessionResult<()> {
+    let session_internal_id: i64 = conn
+        .query_row(
+            "SELECT id FROM sessions WHERE public_id = ?",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| SessionError::SessionNotFound(session_id.to_string()))?;
+    let parent_internal_id: Option<i64> = message
+        .parent_message_id
+        .as_ref()
+        .map(|parent| {
+            conn.query_row(
+                "SELECT id FROM messages WHERE public_id = ?",
+                params![parent],
+                |row| row.get(0),
+            )
+        })
+        .transpose()?;
+    let role = match message.role {
+        ChatRole::User => "User",
+        ChatRole::Assistant => "Assistant",
+    };
+    conn.execute(
+        "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id, source_provider, source_model) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        params![message.id, session_internal_id, role, message.created_at, parent_internal_id, message.source_provider, message.source_model],
+    )?;
+    let message_internal_id = conn.last_insert_rowid();
+    for (index, part) in message.parts.iter().enumerate() {
+        let content = serde_json::to_string(part).map_err(|error| {
+            SessionError::from(rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+        })?;
+        conn.execute(
+            "INSERT INTO message_parts (message_id, part_type, content_json, sort_order) VALUES (?, ?, ?, ?)",
+            params![message_internal_id, part.type_name(), content, index as i64],
+        )?;
+    }
+    conn.execute(
+        "UPDATE sessions SET updated_at = ? WHERE id = ?",
+        params![
+            OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            session_internal_id
+        ],
+    )?;
+    Ok(())
+}
+
 fn read_delegate_assignments(
     conn: &rusqlite::Connection,
     session_id: &str,
@@ -603,61 +658,10 @@ impl SessionStore for SqliteStorage {
     }
 
     async fn add_message(&self, session_id: &str, message: AgentMessage) -> SessionResult<()> {
-        // Resolve session public_id → internal i64
-        let session_internal_id = self.resolve_session_internal_id(session_id).await?;
-
-        // Resolve parent message public_id → internal i64 if present
-        let parent_internal_id = if let Some(ref parent_public_id) = message.parent_message_id {
-            Some(self.resolve_message_internal_id(parent_public_id).await?)
-        } else {
-            None
-        };
-
-        let msg = message.clone();
-
-        self.run_blocking(move |conn| {
+        let session_id = session_id.to_string();
+        self.run_blocking_session(move |conn| {
             let tx = conn.transaction()?;
-
-            let role_str = match msg.role {
-                ChatRole::User => "User",
-                ChatRole::Assistant => "Assistant",
-            };
-
-            // Insert message with public_id and internal session_id/parent_message_id
-            tx.execute(
-                "INSERT INTO messages (public_id, session_id, role, created_at, parent_message_id, source_provider, source_model) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                params![
-                    msg.id,
-                    session_internal_id,
-                    role_str,
-                    msg.created_at,
-                    parent_internal_id,
-                    msg.source_provider,
-                    msg.source_model
-                ],
-            )?;
-
-            // Get the internal message_id that was just inserted
-            let message_internal_id: i64 = tx.last_insert_rowid();
-
-            for (idx, part) in msg.parts.iter().enumerate() {
-                let content_json = serde_json::to_string(part).map_err(|e| {
-                    rusqlite::Error::ToSqlConversionFailure(Box::new(e))
-                })?;
-
-                // Use internal message_id for FK
-                tx.execute(
-                    "INSERT INTO message_parts (message_id, part_type, content_json, sort_order) VALUES (?, ?, ?, ?)",
-                    params![message_internal_id, part.type_name(), content_json, idx as i32],
-                )?;
-            }
-
-            // Update session with internal ID
-            tx.execute(
-                "UPDATE sessions SET updated_at = ? WHERE id = ?",
-                params![OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(), session_internal_id],
-            )?;
-
+            insert_message(&tx, &session_id, &message)?;
             tx.commit()?;
             Ok(())
         })
