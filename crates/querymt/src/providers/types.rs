@@ -82,11 +82,43 @@ pub struct ModelPricing {
     pub output: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_read: Option<f64>,
+    /// Aggregate cache-write rate (USD per million tokens).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_write: Option<f64>,
+    /// Rate for five-minute cache writes, when the catalog states it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_5m: Option<f64>,
+    /// Rate for one-hour cache writes, when the catalog states it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_1h: Option<f64>,
+    /// True only when authoritative pricing says `cache_write` covers writes of
+    /// every duration. Never inferred from the presence of `cache_write`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cache_write_covers_all_durations: bool,
+    /// Known pricing modifiers or non-token charges that valuation cannot
+    /// apply. Any entry prevents a complete total.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unsupported_dimensions: Vec<String>,
 }
 
 impl ModelPricing {
+    /// Whether any cache-write rate (aggregate or per-duration) is present.
+    pub fn has_write_rate(&self) -> bool {
+        self.cache_write.is_some() || self.cache_write_5m.is_some() || self.cache_write_1h.is_some()
+    }
+
+    /// True when input and output rates are present and every present rate is
+    /// explicitly zero (a priced-at-zero model, not an unknown price).
+    pub fn is_explicit_zero(&self) -> bool {
+        let is_zero = |r: Option<f64>| r.is_none_or(|v| v == 0.0);
+        self.input == Some(0.0)
+            && self.output == Some(0.0)
+            && is_zero(self.cache_read)
+            && is_zero(self.cache_write)
+            && is_zero(self.cache_write_5m)
+            && is_zero(self.cache_write_1h)
+    }
+
     /// Calculate total cost from token usage
     ///
     /// Returns cost in USD, or None if pricing information is incomplete
@@ -192,8 +224,7 @@ mod tests {
         let pricing = ModelPricing {
             input: Some(3.0),
             output: Some(15.0),
-            cache_read: None,
-            cache_write: None,
+            ..Default::default()
         };
 
         let cost = pricing.calculate_cost(1_000_000, 500_000);
@@ -205,8 +236,7 @@ mod tests {
         let pricing = ModelPricing {
             input: None,
             output: Some(15.0),
-            cache_read: None,
-            cache_write: None,
+            ..Default::default()
         };
 
         let cost = pricing.calculate_cost(1_000_000, 500_000);
@@ -220,6 +250,7 @@ mod tests {
             output: Some(15.0),
             cache_read: Some(0.3),
             cache_write: Some(3.75),
+            ..Default::default()
         };
 
         let (read, write) = pricing.calculate_cache_cost(1_000_000, 500_000);

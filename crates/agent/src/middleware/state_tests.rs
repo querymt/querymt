@@ -250,7 +250,7 @@ fn test_update_costs_includes_reasoning_tokens_in_output_cost() {
         input: Some(0.14),
         output: Some(0.28),
         cache_read: Some(0.0028),
-        cache_write: None,
+        ..Default::default()
     };
 
     let mut stats = AgentStats {
@@ -280,8 +280,7 @@ fn test_update_costs_without_reasoning_tokens_unchanged() {
     let pricing = querymt::providers::ModelPricing {
         input: Some(3.0),
         output: Some(15.0),
-        cache_read: None,
-        cache_write: None,
+        ..Default::default()
     };
 
     let mut stats = AgentStats {

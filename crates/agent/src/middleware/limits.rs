@@ -134,8 +134,7 @@ impl LimitsMiddleware {
                 let pricing = ModelPricing {
                     input: Some(input),
                     output: Some(output),
-                    cache_read: None,
-                    cache_write: None,
+                    ..Default::default()
                 };
                 pricing.calculate_cost(stats.total_input_tokens, billable_output)
             }
