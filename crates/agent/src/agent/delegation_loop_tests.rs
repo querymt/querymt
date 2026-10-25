@@ -2068,21 +2068,22 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
                 .await
                 .expect("retry delegation lookup")
                 .expect("retry delegation");
-            if current.status == DelegationStatus::Complete {
+            // The terminal claim precedes the asynchronous child lifecycle patch.
+            if current.status == DelegationStatus::Complete
+                && let Some(retry_child_id) = harness
+                    .child_sessions()
+                    .await
+                    .into_iter()
+                    .find(|session_id| session_id != &child_session_id)
+                && harness.session_lifecycle(&retry_child_id).await.resolved
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("new delegation attempt timed out");
-    let retry_child_id = harness
-        .child_sessions()
-        .await
-        .into_iter()
-        .find(|session_id| session_id != &child_session_id)
-        .expect("fresh retry child session");
-    assert!(harness.session_lifecycle(&retry_child_id).await.resolved);
+    .expect("new delegation attempt did not resolve its child");
     assert!(
         !harness.session_lifecycle(&child_session_id).await.resolved,
         "replaying a completed attempt must not undo an explicit reopen"
