@@ -29,6 +29,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 querymt = { path = "../querymt", default-features = false, features = ["runtime"] }
 querymt-agent = { path = "../agent", default-features = false }
 querymt-utils = { path = "../querymt-utils", features = ["providers", "serde", "secret-store"] }
+keyring-core = "1.0"
 
 # Provider crates for static registration
 qmt-anthropic = { path = "../providers/anthropic", optional = true, default-features = false, features = ["api"] }

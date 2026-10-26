@@ -231,6 +231,7 @@ pub enum AgentEventKind {
     SessionCreated,
     SessionWorkspaceBound {
         workspace: crate::session::projection::SessionWorkspaceView,
+        #[typeshare(serialized_as = "Option<string>")]
         cwd: Option<PathBuf>,
     },
     PromptReceived {

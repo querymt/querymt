@@ -128,16 +128,16 @@ pub(crate) async fn resolve_provider_config(
                     log::debug!(
                         "Resolving API key for provider '{}' (preferred: {:?}, env_var: {:?})",
                         provider_name,
-                        preferred_method,
+                        preferred_method.as_ref().ok().and_then(Option::as_ref),
                         env_var_name
                     );
                     crate::session::provider::resolve_api_key_with_preference(
                         provider_name,
                         env_var_name.as_deref(),
-                        preferred_method.as_ref(),
+                        preferred_method,
                         &mut use_oauth_resolver,
                     )
-                    .await
+                    .await?
                 };
 
                 if let Some(key) = api_key {
@@ -162,10 +162,10 @@ pub(crate) async fn resolve_provider_config(
                 let api_key = crate::session::provider::resolve_api_key_with_preference(
                     provider_name,
                     env_var_name.as_deref(),
-                    preferred_method.as_ref(),
+                    preferred_method,
                     &mut use_oauth_resolver,
                 )
-                .await;
+                .await?;
 
                 if let Some(key) = api_key {
                     builder.set("api_key", key.into());

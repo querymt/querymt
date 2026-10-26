@@ -28,6 +28,7 @@ pub mod types;
 
 mod agent;
 mod mcp;
+mod storage;
 
 use async_trait::async_trait;
 use ffi_helpers::{set_last_error, take_last_error_code, take_last_error_message};
@@ -38,6 +39,8 @@ use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex as StdMutex};
+use std::thread::{self, JoinHandle, ThreadId};
 use tokio::sync::Mutex;
 use types::FfiErrorCode;
 
@@ -49,11 +52,181 @@ pub type AcpMessageHandlerFn = unsafe extern "C" fn(
 
 struct AcpConnection {
     agent_handle: u64,
-    conn_id: String,
-    pending_elicitations: querymt_agent::acp::shared::PendingElicitationMap,
-    session_owners: querymt_agent::acp::shared::SessionOwnerMap,
-    outbox: Arc<Mutex<VecDeque<String>>>,
+    adapter: Option<querymt_agent::acp::websocket::EmbeddedAcpConnection>,
+    outbox: Arc<StdMutex<VecDeque<String>>>,
+    callbacks: Arc<AcpCallbackWorker>,
+    output_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AcpConnection {
+    async fn close(&mut self) {
+        if let Some(mut adapter) = self.adapter.take() {
+            adapter.close().await;
+        }
+        if let Some(task) = self.output_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+struct CallbackState {
     handler: Option<(AcpMessageHandlerFn, usize)>,
+    in_flight: usize,
+    closed: bool,
+    worker_id: Option<ThreadId>,
+}
+
+struct CallbackControl {
+    state: StdMutex<CallbackState>,
+    idle: Condvar,
+}
+
+enum CallbackMessage {
+    Json(String),
+    Stop,
+}
+
+struct AcpCallbackWorker {
+    sender: std::sync::mpsc::Sender<CallbackMessage>,
+    control: Arc<CallbackControl>,
+    worker: StdMutex<Option<JoinHandle<()>>>,
+}
+
+impl AcpCallbackWorker {
+    fn new(
+        connection_handle: u64,
+        outbox: Arc<StdMutex<VecDeque<String>>>,
+    ) -> std::io::Result<Arc<Self>> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let control = Arc::new(CallbackControl {
+            state: StdMutex::new(CallbackState {
+                handler: None,
+                in_flight: 0,
+                closed: false,
+                worker_id: None,
+            }),
+            idle: Condvar::new(),
+        });
+        let worker_control = control.clone();
+        let worker = thread::Builder::new()
+            .name(format!("qmt-acp-callback-{connection_handle}"))
+            .spawn(move || {
+                worker_control
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .worker_id = Some(thread::current().id());
+                while let Ok(message) = receiver.recv() {
+                    let CallbackMessage::Json(json) = message else {
+                        break;
+                    };
+                    let handler = {
+                        let mut state = worker_control
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if state.closed {
+                            break;
+                        }
+                        if let Some(handler) = state.handler {
+                            state.in_flight += 1;
+                            Some(handler)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((handler, user_data)) = handler {
+                        if let Ok(c_json) = std::ffi::CString::new(json) {
+                            unsafe {
+                                handler(
+                                    connection_handle,
+                                    c_json.as_ptr(),
+                                    user_data as *mut std::ffi::c_void,
+                                );
+                            }
+                        }
+                        let mut state = worker_control
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.in_flight -= 1;
+                        worker_control.idle.notify_all();
+                    } else {
+                        outbox
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push_back(json);
+                    }
+                }
+            })?;
+        Ok(Arc::new(Self {
+            sender,
+            control,
+            worker: StdMutex::new(Some(worker)),
+        }))
+    }
+
+    fn send(&self, json: String) -> bool {
+        self.sender.send(CallbackMessage::Json(json)).is_ok()
+    }
+
+    fn set_handler(&self, handler: Option<AcpMessageHandlerFn>, user_data: usize) -> bool {
+        let current_thread = thread::current().id();
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return false;
+        }
+        state.handler = handler.map(|handler| (handler, user_data));
+        if state.worker_id != Some(current_thread) {
+            while state.in_flight != 0 {
+                state = self
+                    .control
+                    .idle
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+        true
+    }
+
+    fn close(&self) {
+        let current_thread = thread::current().id();
+        let caller_is_worker = {
+            let mut state = self
+                .control
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.closed = true;
+            state.handler = None;
+            let is_worker = state.worker_id == Some(current_thread);
+            if !is_worker {
+                while state.in_flight != 0 {
+                    state = self
+                        .control
+                        .idle
+                        .wait(state)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            }
+            is_worker
+        };
+        let _ = self.sender.send(CallbackMessage::Stop);
+        if !caller_is_worker
+            && let Some(worker) = self
+                .worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        {
+            let _ = worker.join();
+        }
+    }
 }
 
 struct MobileAcpSessionHooks {
@@ -267,80 +440,80 @@ fn normalize_load_session_params(mut params: serde_json::Value) -> serde_json::V
 }
 
 static NEXT_ACP_CONNECTION_HANDLE: AtomicU64 = AtomicU64::new(1);
-static ACP_CONNECTIONS: once_cell::sync::Lazy<Mutex<HashMap<u64, AcpConnection>>> =
+static ACP_CONNECTIONS: once_cell::sync::Lazy<Mutex<HashMap<u64, Arc<Mutex<AcpConnection>>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
 
-async fn push_acp_message(
-    connection_handle: u64,
-    outbox: &Arc<Mutex<VecDeque<String>>>,
-    json: String,
-) {
-    let handler = {
-        let guard = ACP_CONNECTIONS.lock().await;
-        guard.get(&connection_handle).and_then(|conn| conn.handler)
-    };
-
-    if let Some((handler_fn, user_data_bits)) = handler
-        && let Ok(c_json) = std::ffi::CString::new(json.as_str())
-    {
-        unsafe {
-            handler_fn(
-                connection_handle,
-                c_json.as_ptr(),
-                user_data_bits as *mut std::ffi::c_void,
-            );
+async fn close_acp_connections_for_agent(agent_handle: u64) {
+    let candidates = ACP_CONNECTIONS
+        .lock()
+        .await
+        .iter()
+        .map(|(handle, connection)| (*handle, connection.clone()))
+        .collect::<Vec<_>>();
+    let mut connections = Vec::new();
+    for (handle, connection) in candidates {
+        if connection.lock().await.agent_handle != agent_handle {
+            continue;
         }
-        return;
+        let removed = ACP_CONNECTIONS.lock().await.remove(&handle);
+        if removed.is_some_and(|removed| Arc::ptr_eq(&removed, &connection)) {
+            connections.push(connection);
+        }
     }
-
-    outbox.lock().await.push_back(json);
-}
-
-#[cfg(feature = "remote")]
-fn spawn_mesh_peer_event_forwarder(
-    inner: std::sync::Arc<querymt_agent::agent::LocalAgentHandle>,
-    connection_handle: u64,
-    outbox: Arc<Mutex<VecDeque<String>>>,
-) {
-    let Some(mesh) = inner.mesh() else {
-        return;
-    };
-
-    let model_inventory = inner.model_inventory.clone();
-    let mut rx = mesh.subscribe_peer_events();
-    runtime::global_runtime().spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(querymt_agent::agent::remote::mesh::PeerEvent::Discovered(peer_id)) => {
-                    model_inventory.invalidate_remote().await;
-                    let notification = querymt_agent::acp::shared::mesh_nodes_changed_notification(
-                        &peer_id.to_string(),
-                        "discovered",
-                    );
-                    if let Ok(json) = serde_json::to_string(&notification) {
-                        push_acp_message(connection_handle, &outbox, json).await;
-                    }
-                }
-                Ok(querymt_agent::agent::remote::mesh::PeerEvent::Expired(peer_id)) => {
-                    model_inventory.invalidate_remote().await;
-                    let notification = querymt_agent::acp::shared::mesh_peer_expired_notification(
-                        &peer_id.to_string(),
-                    );
-                    if let Ok(json) = serde_json::to_string(&notification) {
-                        push_acp_message(connection_handle, &outbox, json).await;
-                    }
-                }
-                Ok(_) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
+    for connection in connections {
+        let callbacks = {
+            let mut connection = connection.lock().await;
+            let callbacks = connection.callbacks.clone();
+            connection.close().await;
+            callbacks
+        };
+        // A callback may reenter the connection while close drains it.
+        callbacks.close();
+    }
 }
 
 // ============================================================================
 // Lifecycle
 // ============================================================================
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_ffi_storage_register(
+    callbacks: *const storage::FfiStorageCallbacks,
+) -> i32 {
+    match unsafe { storage::register_from_ptr(callbacks) } {
+        Ok(()) => {
+            ffi_helpers::clear_last_error();
+            FfiErrorCode::Ok as i32
+        }
+        Err(code) => {
+            let message = match code {
+                FfiErrorCode::Busy => "Storage callbacks are in use",
+                FfiErrorCode::AlreadyExists => "Storage callbacks are already registered",
+                _ => "Invalid storage callback table",
+            };
+            set_last_error(code, message.into());
+            code as i32
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn qmt_ffi_storage_unregister() -> i32 {
+    match storage::unregister() {
+        Ok(()) => {
+            ffi_helpers::clear_last_error();
+            FfiErrorCode::Ok as i32
+        }
+        Err(code) => {
+            let message = match code {
+                FfiErrorCode::Busy => "Storage callbacks are in use",
+                _ => "Storage callbacks are not registered",
+            };
+            set_last_error(code, message.into());
+            code as i32
+        }
+    }
+}
 
 /// Initialize Android's rustls platform verifier bridge.
 ///
@@ -374,24 +547,28 @@ unsafe fn qmt_internal_init_agent(
     config_toml: *const std::ffi::c_char,
     out_agent: *mut u64,
 ) -> i32 {
+    let _init_reservation = match storage::reserve_init() {
+        Ok(reservation) => reservation,
+        Err(code) => {
+            set_last_error(
+                code,
+                "Storage callbacks must be registered before initialization".into(),
+            );
+            return code as i32;
+        }
+    };
     ffi_panic_boundary("qmt_internal_init_agent", || {
         log::info!("ffi.agent.init: requested attach/init");
-        // Parse config using the shared querymt-agent parser.
         let config_result = agent::parse_config(config_toml);
         let config = match config_result {
-            Ok(c) => c,
+            Ok(config) => config,
             Err(code) => return code as i32,
         };
+        storage::install_android_default_store();
 
-        // Enter the Tokio runtime context so that telemetry init (hyper-util,
-        // gRPC) and agent startup can find a reactor on this thread.
         let _rt_guard = runtime::global_runtime().enter();
-
-        // Initialize telemetry from the explicit mobile config (idempotent).
         events::setup_mobile_telemetry();
-
-        let result = agent::init_agent_from_config(config, out_agent);
-        match result {
+        match agent::init_agent_from_config(config, out_agent) {
             Ok(()) => {
                 ffi_helpers::clear_last_error();
                 FfiErrorCode::Ok as i32
@@ -412,7 +589,9 @@ unsafe fn qmt_internal_init_agent(
 ///
 /// - `agent_handle` must be a valid handle returned by `qmt_internal_init_agent`.
 unsafe fn qmt_internal_shutdown(agent_handle: u64) -> i32 {
+    let _shutdown_reservation = storage::reserve_shutdown();
     log::info!("ffi.agent.shutdown: requested detach (agent_handle={agent_handle})");
+    runtime::global_runtime().block_on(close_acp_connections_for_agent(agent_handle));
     let result = agent::shutdown_agent_inner(agent_handle);
     match result {
         Ok(()) => {
@@ -504,64 +683,54 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
         );
         return FfiErrorCode::InvalidArgument as i32;
     }
-    let inner = match state::with_agent_read(agent_handle, |r| Ok(r.agent.inner())) {
-        Ok(inner) => inner,
+    let (acp_server, view_store) = match state::with_agent_read(agent_handle, |record| {
+        let view_store = record
+            .view_store
+            .clone()
+            .ok_or(FfiErrorCode::RuntimeError)?;
+        Ok((record.acp_server.clone(), view_store))
+    }) {
+        Ok(result) => result,
         Err(code) => return code as i32,
     };
 
     let connection_handle = NEXT_ACP_CONNECTION_HANDLE.fetch_add(1, Ordering::Relaxed);
-    let conn_id = format!("ffi-{connection_handle}");
-    let pending_elicitations = inner.pending_elicitations();
-    let session_owners = querymt_agent::acp::shared::SessionOwnerMap::default();
-    let outbox = Arc::new(Mutex::new(VecDeque::new()));
-
-    let event_sources = querymt_agent::acp::shared::collect_event_sources(&inner);
-    for source in event_sources {
-        let mut rx = source.subscribe();
-        let outbox_cloned = outbox.clone();
-        let conn_id_cloned = conn_id.clone();
-        let owners_cloned = session_owners.clone();
-        runtime::global_runtime().spawn(async move {
-            let mut translator = querymt_agent::acp::shared::AcpLiveEventTranslator::new();
-            while let Ok(event) = rx.recv().await {
-                if !querymt_agent::acp::shared::is_event_owned(
-                    &owners_cloned,
-                    &conn_id_cloned,
-                    &event,
-                )
-                .await
-                {
-                    continue;
-                }
-                if let Some(notification) = translator.translate_notification(&event)
-                    && let Ok(json) = serde_json::to_string(&notification)
-                {
-                    push_acp_message(connection_handle, &outbox_cloned, json).await;
-                }
+    let outbox = Arc::new(StdMutex::new(VecDeque::new()));
+    let callbacks = match AcpCallbackWorker::new(connection_handle, outbox.clone()) {
+        Ok(callbacks) => callbacks,
+        Err(error) => {
+            set_last_error(
+                FfiErrorCode::RuntimeError,
+                format!("Failed to start ACP callback worker: {error}"),
+            );
+            return FfiErrorCode::RuntimeError as i32;
+        }
+    };
+    let hooks: Arc<dyn querymt_agent::acp::shared::AcpSessionHooks> =
+        Arc::new(MobileAcpSessionHooks { view_store });
+    let (adapter, mut outgoing) = runtime::global_runtime().block_on(acp_server.open(Some(hooks)));
+    let callback_sender = callbacks.clone();
+    let output_task = runtime::global_runtime().spawn(async move {
+        while let Some(json) = outgoing.recv().await {
+            if !callback_sender.send(json) {
+                break;
             }
-        });
-    }
-
-    #[cfg(feature = "remote")]
-    spawn_mesh_peer_event_forwarder(inner.clone(), connection_handle, outbox.clone());
-
-    runtime::global_runtime().block_on(async {
-        ACP_CONNECTIONS.lock().await.insert(
-            connection_handle,
-            AcpConnection {
-                agent_handle,
-                conn_id,
-                pending_elicitations,
-                session_owners,
-                outbox,
-                handler: None,
-            },
-        );
+        }
     });
-
-    unsafe {
-        *out_connection = connection_handle;
-    }
+    let connection = Arc::new(Mutex::new(AcpConnection {
+        agent_handle,
+        adapter: Some(adapter),
+        outbox,
+        callbacks,
+        output_task: Some(output_task),
+    }));
+    runtime::global_runtime().block_on(async {
+        ACP_CONNECTIONS
+            .lock()
+            .await
+            .insert(connection_handle, connection);
+    });
+    unsafe { *out_connection = connection_handle };
     FfiErrorCode::Ok as i32
 }
 
@@ -569,10 +738,18 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
 pub unsafe extern "C" fn qmt_ffi_acp_close(connection_handle: u64) -> i32 {
     let removed = runtime::global_runtime()
         .block_on(async { ACP_CONNECTIONS.lock().await.remove(&connection_handle) });
-    if removed.is_some() {
-        FfiErrorCode::Ok as i32
-    } else {
-        FfiErrorCode::NotFound as i32
+    match removed {
+        Some(connection) => {
+            let callbacks = runtime::global_runtime().block_on(async {
+                let mut connection = connection.lock().await;
+                let callbacks = connection.callbacks.clone();
+                connection.close().await;
+                callbacks
+            });
+            callbacks.close();
+            FfiErrorCode::Ok as i32
+        }
+        None => FfiErrorCode::NotFound as i32,
     }
 }
 
@@ -586,7 +763,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
         return FfiErrorCode::InvalidArgument as i32;
     }
     let message = match unsafe { std::ffi::CStr::from_ptr(message_json).to_str() } {
-        Ok(v) => v.to_string(),
+        Ok(message) => message.to_string(),
         Err(_) => {
             set_last_error(
                 FfiErrorCode::InvalidArgument,
@@ -597,214 +774,132 @@ pub unsafe extern "C" fn qmt_ffi_acp_send(
     };
 
     let result = runtime::block_on_ffi(async move {
-        let (
-            agent,
-            agent_handle,
-            conn_id,
-            session_owners,
-            pending_elicitations,
-            outbox,
-            view_store,
-        ) = {
-            let guard = ACP_CONNECTIONS.lock().await;
-            let conn = guard
-                .get(&connection_handle)
-                .ok_or(FfiErrorCode::NotFound)?;
-            let (agent, view_store) = state::with_agent_read(conn.agent_handle, |r| {
-                let view_store = r.view_store.clone().ok_or(FfiErrorCode::RuntimeError)?;
-                Ok((r.agent.inner(), view_store))
-            })
-            .map_err(|_| FfiErrorCode::NotFound)?;
-            (
-                agent,
-                conn.agent_handle,
-                conn.conn_id.clone(),
-                conn.session_owners.clone(),
-                conn.pending_elicitations.clone(),
-                conn.outbox.clone(),
-                view_store,
-            )
-        };
-
         let value: serde_json::Value =
             serde_json::from_str(&message).map_err(|_| FfiErrorCode::InvalidArgument)?;
-        let method = value
-            .get("method")
-            .and_then(|v| v.as_str())
-            .ok_or(FfiErrorCode::InvalidArgument)?
-            .to_string();
+        let connection = ACP_CONNECTIONS
+            .lock()
+            .await
+            .get(&connection_handle)
+            .cloned()
+            .ok_or(FfiErrorCode::NotFound)?;
+        let mut connection = connection.lock().await;
+        let adapter = connection.adapter.as_ref().ok_or(FfiErrorCode::NotFound)?;
+        let Some(method) = value.get("method").and_then(serde_json::Value::as_str) else {
+            adapter
+                .receive_json(&message)
+                .await
+                .map_err(|_| FfiErrorCode::InvalidArgument)?;
+            return Ok::<(), FfiErrorCode>(());
+        };
         let params = value
             .get("params")
             .cloned()
             .unwrap_or(serde_json::Value::Null);
-        let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
-        let req = querymt_agent::acp::shared::RpcRequest {
-            jsonrpc: "2.0".to_string(),
-            method,
-            params,
-            id,
-        };
-        let req_method = req.method.clone();
-        log::debug!("ffi acp send: method={}", req_method);
+        let request_id = value.get("id").cloned();
+        log::debug!("ffi acp send: method={method}");
 
-        let resp = if req.method == "querymt/mcp/registerInprocPipe" {
-            let parsed: Result<RegisterInprocMcpPipeParams, _> =
-                serde_json::from_value(req.params.clone());
-            match parsed {
-                Ok(p) => {
-                    let c_server_name = std::ffi::CString::new(p.server_name)
-                        .map_err(|_| FfiErrorCode::InvalidArgument)?;
-                    let mut read_fd: i32 = -1;
-                    let mut write_fd: i32 = -1;
-                    let code = mcp::register_inproc_mcp_pipe_inner(
-                        agent_handle,
-                        c_server_name.as_ptr(),
-                        &mut read_fd,
-                        &mut write_fd,
-                    );
-                    match code {
-                        Ok(()) => querymt_agent::acp::shared::RpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            result: Some(
-                                serde_json::json!({ "read_fd": read_fd, "write_fd": write_fd }),
-                            ),
-                            error: None,
-                            id: req.id,
-                        },
-                        Err(e) => querymt_agent::acp::shared::RpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            result: None,
-                            error: Some(serde_json::json!({
-                                "code": -32000,
-                                "message": "querymt/mcp/registerInprocPipe failed",
-                                "data": { "ffiCode": e as i32 }
-                            })),
-                            id: req.id,
-                        },
-                    }
-                }
-                Err(e) => querymt_agent::acp::shared::RpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    result: None,
-                    error: Some(serde_json::json!({
+        if method == "querymt/mcp/registerInprocPipe" || method == "querymt/mcp/unregister" {
+            let response = if method == "querymt/mcp/registerInprocPipe" {
+                match serde_json::from_value::<RegisterInprocMcpPipeParams>(params) {
+                    Ok(params) => match std::ffi::CString::new(params.server_name) {
+                        Ok(server_name) => {
+                            let mut read_fd = -1;
+                            let mut write_fd = -1;
+                            match mcp::register_inproc_mcp_pipe_inner(
+                                connection.agent_handle,
+                                server_name.as_ptr(),
+                                &mut read_fd,
+                                &mut write_fd,
+                            ) {
+                                Ok(()) => Ok(serde_json::json!({
+                                    "read_fd": read_fd,
+                                    "write_fd": write_fd
+                                })),
+                                Err(error) => Err(serde_json::json!({
+                                    "code": -32000,
+                                    "message": "querymt/mcp/registerInprocPipe failed",
+                                    "data": { "ffiCode": error as i32 }
+                                })),
+                            }
+                        }
+                        Err(_) => Err(serde_json::json!({
+                            "code": -32602,
+                            "message": "invalid params"
+                        })),
+                    },
+                    Err(error) => Err(serde_json::json!({
                         "code": -32602,
                         "message": "invalid params",
-                        "data": { "detail": e.to_string() }
+                        "data": { "detail": error.to_string() }
                     })),
-                    id: req.id,
-                },
-            }
-        } else if req.method == "querymt/mcp/unregister" {
-            let parsed: Result<UnregisterInprocMcpParams, _> =
-                serde_json::from_value(req.params.clone());
-            match parsed {
-                Ok(p) => {
-                    let c_server_name = std::ffi::CString::new(p.server_name)
-                        .map_err(|_| FfiErrorCode::InvalidArgument)?;
-                    let code =
-                        mcp::unregister_inproc_mcp_inner(agent_handle, c_server_name.as_ptr());
-                    match code {
-                        Ok(()) => querymt_agent::acp::shared::RpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            result: Some(serde_json::Value::Null),
-                            error: None,
-                            id: req.id,
-                        },
-                        Err(e) => querymt_agent::acp::shared::RpcResponse {
-                            jsonrpc: "2.0".to_string(),
-                            result: None,
-                            error: Some(serde_json::json!({
+                }
+            } else {
+                match serde_json::from_value::<UnregisterInprocMcpParams>(params) {
+                    Ok(params) => match std::ffi::CString::new(params.server_name) {
+                        Ok(server_name) => match mcp::unregister_inproc_mcp_inner(
+                            connection.agent_handle,
+                            server_name.as_ptr(),
+                        ) {
+                            Ok(()) => Ok(serde_json::Value::Null),
+                            Err(error) => Err(serde_json::json!({
                                 "code": -32000,
                                 "message": "querymt/mcp/unregister failed",
-                                "data": { "ffiCode": e as i32 }
+                                "data": { "ffiCode": error as i32 }
                             })),
-                            id: req.id,
                         },
-                    }
-                }
-                Err(e) => querymt_agent::acp::shared::RpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    result: None,
-                    error: Some(serde_json::json!({
+                        Err(_) => Err(serde_json::json!({
+                            "code": -32602,
+                            "message": "invalid params"
+                        })),
+                    },
+                    Err(error) => Err(serde_json::json!({
                         "code": -32602,
                         "message": "invalid params",
-                        "data": { "detail": e.to_string() }
+                        "data": { "detail": error.to_string() }
                     })),
-                    id: req.id,
-                },
-            }
-        } else {
-            let req = match req.method.as_str() {
-                "session/new" => querymt_agent::acp::shared::RpcRequest {
-                    jsonrpc: req.jsonrpc,
-                    method: req.method,
-                    params: normalize_new_session_params(req.params),
-                    id: req.id,
-                },
-                "session/load" => {
-                    let normalized = normalize_load_session_params(req.params);
-                    querymt_agent::acp::shared::RpcRequest {
-                        jsonrpc: req.jsonrpc,
-                        method: req.method,
-                        params: normalized,
-                        id: req.id,
-                    }
                 }
-                _ => req,
             };
-            let hooks: Arc<dyn querymt_agent::acp::shared::AcpSessionHooks> =
-                Arc::new(MobileAcpSessionHooks {
-                    view_store: view_store.clone(),
-                });
-            let output = querymt_agent::acp::shared::handle_rpc_message_with_context(
-                agent.as_ref(),
-                &session_owners,
-                &pending_elicitations,
-                &conn_id,
-                req,
-                querymt_agent::acp::shared::RpcDispatchContext {
-                    session_hooks: Some(hooks),
-                },
-            )
-            .await;
-            for notification in output.notifications {
-                if let Ok(json) = serde_json::to_string(&notification) {
-                    push_acp_message(connection_handle, &outbox, json).await;
-                }
+            if let Some(id) = request_id {
+                let response = match response {
+                    Ok(result) => querymt_agent::acp::shared::RpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: Some(result),
+                        error: None,
+                        id,
+                    },
+                    Err(error) => querymt_agent::acp::shared::RpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        result: None,
+                        error: Some(error),
+                        id,
+                    },
+                };
+                let json =
+                    serde_json::to_string(&response).map_err(|_| FfiErrorCode::RuntimeError)?;
+                adapter
+                    .send_json(json)
+                    .await
+                    .map_err(|_| FfiErrorCode::RuntimeError)?;
             }
-            output.response
+            return Ok::<(), FfiErrorCode>(());
+        }
+
+        let params = match method {
+            "session/new" => normalize_new_session_params(params),
+            "session/load" => normalize_load_session_params(params),
+            _ => params,
         };
-        let resp_json = serde_json::to_string(&resp).map_err(|_| FfiErrorCode::RuntimeError)?;
-        log::debug!(
-            "ffi acp response: method={}, response={}",
-            req_method,
-            resp_json
-        );
-        push_acp_message(connection_handle, &outbox, resp_json).await;
-
-        if req_method == "querymt/mesh/join"
-            && resp.error.is_none()
-            && let Some(peer_id) = resp
-                .result
-                .as_ref()
-                .and_then(|result| result.get("peer_id"))
-                .and_then(serde_json::Value::as_str)
-        {
-            let notification =
-                querymt_agent::acp::shared::mesh_joined_notification(peer_id, "unknown");
-            if let Ok(json) = serde_json::to_string(&notification) {
-                push_acp_message(connection_handle, &outbox, json).await;
-            }
+        let mut request = serde_json::Map::new();
+        request.insert("jsonrpc".into(), serde_json::json!("2.0"));
+        request.insert("method".into(), serde_json::json!(method));
+        request.insert("params".into(), params);
+        if let Some(id) = request_id {
+            request.insert("id".into(), id);
         }
-
-        if req_method == "querymt/refreshModels" && resp.error.is_none() {
-            let notification =
-                querymt_agent::acp::shared::models_changed_notification("manual_refresh");
-            if let Ok(json) = serde_json::to_string(&notification) {
-                push_acp_message(connection_handle, &outbox, json).await;
-            }
-        }
-
+        adapter
+            .receive_json(&serde_json::Value::Object(request).to_string())
+            .await
+            .map_err(|_| FfiErrorCode::InvalidArgument)?;
         Ok::<(), FfiErrorCode>(())
     });
 
@@ -827,31 +922,33 @@ pub unsafe extern "C" fn qmt_ffi_acp_next_message(
         );
         return FfiErrorCode::InvalidArgument as i32;
     }
-
+    let outbox = match runtime::global_runtime().block_on(async {
+        ACP_CONNECTIONS
+            .lock()
+            .await
+            .get(&connection_handle)
+            .map(|connection| connection.clone())
+            .ok_or(FfiErrorCode::NotFound)
+    }) {
+        Ok(connection) => connection,
+        Err(code) => return code as i32,
+    };
+    let outbox = runtime::global_runtime().block_on(async { outbox.lock().await.outbox.clone() });
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
     loop {
-        let popped = runtime::global_runtime().block_on(async {
-            let mut guard = ACP_CONNECTIONS.lock().await;
-            let conn = guard
-                .get_mut(&connection_handle)
-                .ok_or(FfiErrorCode::NotFound)?;
-            Ok::<Option<String>, FfiErrorCode>(conn.outbox.lock().await.pop_front())
-        });
-
-        match popped {
-            Ok(Some(msg)) => {
-                unsafe { *out_message_json = alloc_string(&msg) };
-                return FfiErrorCode::Ok as i32;
-            }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    return FfiErrorCode::NotFound as i32;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            Err(code) => return code as i32,
+        let message = outbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front();
+        if let Some(message) = message {
+            unsafe { *out_message_json = alloc_string(&message) };
+            return FfiErrorCode::Ok as i32;
         }
+        if std::time::Instant::now() >= deadline {
+            return FfiErrorCode::NotFound as i32;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -861,17 +958,23 @@ pub unsafe extern "C" fn qmt_ffi_acp_set_message_handler(
     handler: Option<AcpMessageHandlerFn>,
     user_data: *mut std::ffi::c_void,
 ) -> i32 {
-    let result = runtime::global_runtime().block_on(async {
-        let mut guard = ACP_CONNECTIONS.lock().await;
-        let conn = guard
-            .get_mut(&connection_handle)
-            .ok_or(FfiErrorCode::NotFound)?;
-        conn.handler = handler.map(|h| (h, user_data as usize));
-        Ok::<(), FfiErrorCode>(())
-    });
-    match result {
-        Ok(()) => FfiErrorCode::Ok as i32,
-        Err(code) => code as i32,
+    let callbacks = match runtime::global_runtime().block_on(async {
+        ACP_CONNECTIONS
+            .lock()
+            .await
+            .get(&connection_handle)
+            .map(|connection| connection.clone())
+            .ok_or(FfiErrorCode::NotFound)
+    }) {
+        Ok(connection) => {
+            runtime::global_runtime().block_on(async { connection.lock().await.callbacks.clone() })
+        }
+        Err(code) => return code as i32,
+    };
+    if callbacks.set_handler(handler, user_data as usize) {
+        FfiErrorCode::Ok as i32
+    } else {
+        FfiErrorCode::NotFound as i32
     }
 }
 
@@ -949,6 +1052,7 @@ pub unsafe extern "C" fn qmt_ffi_set_lifecycle_state(_agent_handle: u64, backgro
 /// succeeds when no logical agents are attached.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn qmt_ffi_shutdown_runtime_if_idle() -> i32 {
+    let _shutdown_reservation = storage::reserve_shutdown();
     ffi_panic_boundary(
         "qmt_ffi_shutdown_runtime_if_idle",
         || match state::shutdown_runtime_if_idle() {
@@ -1133,49 +1237,215 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    static ACP_TEST_MESSAGES: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+    struct FfiTestProvider;
 
-    unsafe extern "C" fn acp_test_handler(
-        _connection_handle: u64,
-        message_json: *const std::ffi::c_char,
-        _user_data: *mut std::ffi::c_void,
-    ) {
-        let msg = unsafe { std::ffi::CStr::from_ptr(message_json) }
-            .to_string_lossy()
-            .to_string();
-        ACP_TEST_MESSAGES.lock().expect("lock poisoned").push(msg);
+    #[async_trait]
+    impl querymt::chat::ChatProvider for FfiTestProvider {
+        async fn chat_with_tools(
+            &self,
+            _messages: &[querymt::chat::ChatMessage],
+            _tools: Option<&[querymt::chat::Tool]>,
+        ) -> Result<querymt::chat::ChatOutput, querymt::error::LLMError> {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Ok(querymt::chat::ChatOutput::from_projections(
+                None,
+                Some("deterministic reply".to_string()),
+                None,
+                None,
+                None,
+            ))
+        }
     }
 
-    fn make_test_connection(
-        handler: Option<(AcpMessageHandlerFn, usize)>,
-    ) -> (u64, Arc<Mutex<VecDeque<String>>>) {
-        let connection_handle = NEXT_ACP_CONNECTION_HANDLE.fetch_add(1, Ordering::Relaxed);
-        let outbox = Arc::new(Mutex::new(VecDeque::new()));
-        let pending_elicitations: querymt_agent::acp::shared::PendingElicitationMap =
-            Arc::new(Mutex::new(HashMap::new()));
-        let session_owners = querymt_agent::acp::shared::SessionOwnerMap::default();
+    #[async_trait]
+    impl querymt::completion::CompletionProvider for FfiTestProvider {
+        async fn complete(
+            &self,
+            _request: &querymt::completion::CompletionRequest,
+        ) -> Result<querymt::completion::CompletionResponse, querymt::error::LLMError> {
+            Err(querymt::error::LLMError::NotImplemented(
+                "test provider".into(),
+            ))
+        }
+    }
 
-        runtime::global_runtime().block_on(async {
-            ACP_CONNECTIONS.lock().await.insert(
+    #[async_trait]
+    impl querymt::embedding::EmbeddingProvider for FfiTestProvider {
+        async fn embed(
+            &self,
+            _input: Vec<String>,
+        ) -> Result<Vec<Vec<f32>>, querymt::error::LLMError> {
+            Err(querymt::error::LLMError::NotImplemented(
+                "test provider".into(),
+            ))
+        }
+    }
+
+    impl querymt::LLMProvider for FfiTestProvider {}
+
+    struct FfiTestProviderFactory;
+
+    impl querymt::plugin::LLMProviderFactory for FfiTestProviderFactory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        fn config_schema(&self) -> String {
+            "{}".to_string()
+        }
+
+        fn from_config(
+            &self,
+            _config: &str,
+        ) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
+            Ok(Box::new(FfiTestProvider))
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _config: &str,
+        ) -> querymt::plugin::Fut<'a, Result<Vec<String>, querymt::error::LLMError>> {
+            Box::pin(async { Ok(vec!["mock-model".to_string()]) })
+        }
+    }
+
+    async fn make_ffi_test_agent() -> u64 {
+        let registry = Arc::new(querymt::plugin::host::PluginRegistry::empty());
+        registry.register_static(Arc::new(FfiTestProviderFactory));
+        let storage = Arc::new(
+            querymt_agent::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+                .await
+                .expect("create isolated test storage"),
+        );
+        let infra = querymt_agent::api::AgentInfra {
+            plugin_registry: registry,
+            storage: Some(storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: Some(Arc::new(querymt_agent::event_fanout::EventFanout::new())),
+        };
+        let agent = querymt_agent::api::Agent::single()
+            .provider("mock", "mock-model")
+            .infra(infra)
+            .build()
+            .await
+            .expect("build deterministic test agent");
+        state::attach_or_insert_runtime_agent(agent, storage).0
+    }
+
+    async fn ffi_acp_open(agent_handle: u64) -> (i32, u64) {
+        tokio::task::spawn_blocking(move || {
+            let mut connection_handle = 0;
+            let code = unsafe { qmt_ffi_acp_open(agent_handle, &mut connection_handle) };
+            (code, connection_handle)
+        })
+        .await
+        .expect("open FFI ACP connection")
+    }
+
+    async fn ffi_acp_send(connection_handle: u64, message: String) -> i32 {
+        tokio::task::spawn_blocking(move || {
+            let message = std::ffi::CString::new(message).expect("test JSON has no NUL");
+            unsafe { qmt_ffi_acp_send(connection_handle, message.as_ptr()) }
+        })
+        .await
+        .expect("send FFI ACP message")
+    }
+
+    async fn ffi_acp_poll(
+        connection_handle: u64,
+        timeout_ms: i32,
+    ) -> (i32, Option<serde_json::Value>) {
+        tokio::task::spawn_blocking(move || {
+            let mut message = std::ptr::null_mut();
+            let code =
+                unsafe { qmt_ffi_acp_next_message(connection_handle, timeout_ms, &mut message) };
+            if code != FfiErrorCode::Ok as i32 {
+                return (code, None);
+            }
+            let json = unsafe { std::ffi::CStr::from_ptr(message) }
+                .to_string_lossy()
+                .into_owned();
+            unsafe { qmt_ffi_free_string(message) };
+            (
+                code,
+                Some(serde_json::from_str(&json).expect("valid ACP JSON")),
+            )
+        })
+        .await
+        .expect("poll FFI ACP message")
+    }
+
+    async fn ffi_poll_until(
+        connection_handle: u64,
+        timeout: std::time::Duration,
+        mut predicate: impl FnMut(&serde_json::Value) -> bool,
+    ) -> Vec<serde_json::Value> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut messages = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(!remaining.is_zero(), "timed out waiting for ACP output");
+            let (code, message) = ffi_acp_poll(
                 connection_handle,
-                AcpConnection {
-                    agent_handle: 1,
-                    conn_id: format!("test-{connection_handle}"),
-                    pending_elicitations,
-                    session_owners,
-                    outbox: outbox.clone(),
-                    handler,
-                },
-            );
-        });
-
-        (connection_handle, outbox)
+                remaining.as_millis().clamp(1, 100) as i32,
+            )
+            .await;
+            if code == FfiErrorCode::Ok as i32 {
+                let message = message.expect("successful poll returns message");
+                let matched = predicate(&message);
+                messages.push(message);
+                if matched {
+                    return messages;
+                }
+            }
+        }
     }
 
-    fn remove_test_connection(connection_handle: u64) {
-        runtime::global_runtime().block_on(async {
-            ACP_CONNECTIONS.lock().await.remove(&connection_handle);
-        });
+    struct BlockingCallbackState {
+        entered: std::sync::mpsc::Sender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    unsafe extern "C" fn blocking_acp_handler(
+        _connection_handle: u64,
+        _message_json: *const std::ffi::c_char,
+        user_data: *mut std::ffi::c_void,
+    ) {
+        let state = unsafe { &*(user_data as *const BlockingCallbackState) };
+        let _ = state.entered.send(());
+        let _ = state.release.lock().expect("callback release lock").recv();
+    }
+
+    unsafe extern "C" fn self_closing_acp_handler(
+        connection_handle: u64,
+        _message_json: *const std::ffi::c_char,
+        user_data: *mut std::ffi::c_void,
+    ) {
+        let result = unsafe { qmt_ffi_acp_close(connection_handle) };
+        let completion = unsafe { &*(user_data as *const std::sync::mpsc::Sender<i32>) };
+        let _ = completion.send(result);
+    }
+
+    async fn ffi_acp_set_handler(
+        connection_handle: u64,
+        handler: Option<AcpMessageHandlerFn>,
+        user_data: usize,
+    ) -> i32 {
+        tokio::task::spawn_blocking(move || unsafe {
+            qmt_ffi_acp_set_message_handler(
+                connection_handle,
+                handler,
+                user_data as *mut std::ffi::c_void,
+            )
+        })
+        .await
+        .expect("set FFI ACP callback")
+    }
+
+    async fn ffi_acp_close(connection_handle: u64) -> i32 {
+        tokio::task::spawn_blocking(move || unsafe { qmt_ffi_acp_close(connection_handle) })
+            .await
+            .expect("close FFI ACP connection")
     }
 
     #[test]
@@ -1215,44 +1485,6 @@ mod tests {
         assert_eq!(code, FfiErrorCode::Unsupported as i32);
         assert_eq!(take_last_error_code(), FfiErrorCode::Ok);
         assert_eq!(take_last_error_message(), "");
-    }
-
-    #[test]
-    fn push_acp_message_invokes_handler_when_registered() {
-        ACP_TEST_MESSAGES.lock().expect("lock poisoned").clear();
-        let (connection_handle, outbox) = make_test_connection(Some((acp_test_handler, 0)));
-
-        runtime::global_runtime().block_on(async {
-            push_acp_message(
-                connection_handle,
-                &outbox,
-                "{\"jsonrpc\":\"2.0\"}".to_string(),
-            )
-            .await;
-        });
-
-        let messages = ACP_TEST_MESSAGES.lock().expect("lock poisoned").clone();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0], "{\"jsonrpc\":\"2.0\"}");
-
-        let queued = runtime::global_runtime().block_on(async { outbox.lock().await.pop_front() });
-        assert!(queued.is_none());
-
-        remove_test_connection(connection_handle);
-    }
-
-    #[test]
-    fn push_acp_message_queues_when_handler_missing() {
-        let (connection_handle, outbox) = make_test_connection(None);
-
-        runtime::global_runtime().block_on(async {
-            push_acp_message(connection_handle, &outbox, "queued-message".to_string()).await;
-        });
-
-        let queued = runtime::global_runtime().block_on(async { outbox.lock().await.pop_front() });
-        assert_eq!(queued.as_deref(), Some("queued-message"));
-
-        remove_test_connection(connection_handle);
     }
 
     #[test]
@@ -1374,6 +1606,464 @@ mod tests {
         assert!(
             normalized.get("mcpServers").is_some(),
             "mcpServers should be filled in"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exported_acp_transport_dispatches_interactions_and_waits_for_callbacks() {
+        let agent_handle = make_ffi_test_agent().await;
+        let (code, connection) = ffi_acp_open(agent_handle).await;
+        assert_eq!(code, FfiErrorCode::Ok as i32);
+
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "initialize",
+            "method": "initialize",
+            "params": {
+                "protocolVersion": 1,
+                "clientCapabilities": {"elicitation": {"form": {}}},
+                "clientInfo": {"name": "ffi-test", "version": "1"}
+            }
+        });
+        assert_eq!(
+            ffi_acp_send(connection, initialize.to_string()).await,
+            FfiErrorCode::Ok as i32
+        );
+        let initialized =
+            ffi_poll_until(connection, std::time::Duration::from_secs(5), |message| {
+                message["id"] == "initialize"
+            })
+            .await;
+        let initialized = initialized.last().expect("initialize response");
+        assert!(initialized["error"].is_null(), "{initialized}");
+
+        let new_session = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "new",
+            "method": "session/new",
+            "params": {"cwd": "/tmp", "mcpServers": []}
+        });
+        assert_eq!(
+            ffi_acp_send(connection, new_session.to_string()).await,
+            FfiErrorCode::Ok as i32
+        );
+        let created = ffi_poll_until(connection, std::time::Duration::from_secs(5), |message| {
+            message["id"] == "new"
+        })
+        .await;
+        let created = created.last().expect("session/new response");
+        assert!(created["error"].is_null(), "{created}");
+        let session_id = created["result"]["sessionId"]
+            .as_str()
+            .expect("new session id")
+            .to_string();
+        let config_options = created["result"]["configOptions"]
+            .as_array()
+            .expect("model/config options retained");
+        assert!(config_options.iter().any(|option| option["id"] == "model"));
+
+        let reused_handle = make_ffi_test_agent().await;
+        let attached_handle =
+            state::attach_existing_runtime_agent().expect("attach shared runtime");
+        let server = state::with_agent_read(agent_handle, |record| Ok(record.acp_server.clone()))
+            .expect("original runtime server");
+        for handle in [reused_handle, attached_handle] {
+            let shared = state::with_agent_read(handle, |record| Ok(record.acp_server.clone()))
+                .expect("attached runtime server");
+            assert!(Arc::ptr_eq(&server, &shared));
+            let (code, other_connection) = ffi_acp_open(handle).await;
+            assert_eq!(code, FfiErrorCode::Ok as i32);
+            assert_ne!(connection, other_connection);
+            assert_eq!(
+                ffi_acp_send(
+                    other_connection,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": "shared-load", "method": "session/load",
+                        "params": {"sessionId": session_id}
+                    })
+                    .to_string()
+                )
+                .await,
+                FfiErrorCode::Ok as i32
+            );
+            let loaded = ffi_poll_until(
+                other_connection,
+                std::time::Duration::from_secs(5),
+                |message| message["id"] == "shared-load",
+            )
+            .await;
+            assert!(loaded.last().expect("shared session loaded")["error"].is_null());
+            assert_eq!(
+                ffi_acp_close(other_connection).await,
+                FfiErrorCode::Ok as i32
+            );
+            assert_eq!(
+                ffi_acp_close(other_connection).await,
+                FfiErrorCode::NotFound as i32
+            );
+            assert_eq!(
+                tokio::task::spawn_blocking(move || unsafe { qmt_ffi_shutdown(handle) })
+                    .await
+                    .expect("detach additional logical handle"),
+                FfiErrorCode::Ok as i32
+            );
+        }
+        drop(server);
+
+        let prompt = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "prompt",
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "reply deterministically"}]
+            }
+        });
+        assert_eq!(
+            ffi_acp_send(connection, prompt.to_string()).await,
+            FfiErrorCode::Ok as i32
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            ffi_acp_send(
+                connection,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "cancel",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id}
+                })
+                .to_string(),
+            )
+            .await,
+            FfiErrorCode::Ok as i32
+        );
+        let mut saw_update = false;
+        let mut saw_prompt_response = false;
+        let mut saw_cancel_response = false;
+        ffi_poll_until(connection, std::time::Duration::from_secs(10), |message| {
+            saw_update |= message["method"] == "session/update";
+            saw_prompt_response |= message["id"] == "prompt";
+            saw_cancel_response |= message["id"] == "cancel";
+            saw_prompt_response && saw_cancel_response
+        })
+        .await;
+        assert!(
+            saw_update,
+            "prompt events must stream through the FFI outbox"
+        );
+
+        while ffi_acp_poll(connection, 0).await.0 == FfiErrorCode::Ok as i32 {}
+        let mut notification = initialize.clone();
+        notification
+            .as_object_mut()
+            .expect("initialize is a JSON object")
+            .remove("id");
+        assert_eq!(
+            ffi_acp_send(connection, notification.to_string()).await,
+            FfiErrorCode::Ok as i32
+        );
+        let notification_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        while tokio::time::Instant::now() < notification_deadline {
+            let remaining =
+                notification_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (poll_code, message) =
+                ffi_acp_poll(connection, remaining.as_millis().clamp(1, 50) as i32).await;
+            if poll_code == FfiErrorCode::NotFound as i32 {
+                continue;
+            }
+            assert_eq!(poll_code, FfiErrorCode::Ok as i32);
+            assert!(
+                message.expect("successful poll returns JSON")["id"].is_null(),
+                "a notification must not receive a JSON-RPC response"
+            );
+        }
+
+        let inner = state::with_agent_read(agent_handle, |record| Ok(record.agent.inner().clone()))
+            .expect("agent remains attached");
+        let pending = inner.pending_elicitations();
+        let (permission_tx, permission_rx) = tokio::sync::oneshot::channel();
+        let permission_request = querymt_agent::acp::protocol::RequestPermissionRequest::new(
+            querymt_agent::acp::protocol::SessionId::from(session_id.clone()),
+            querymt_agent::acp::protocol::ToolCallUpdate::new(
+                querymt_agent::acp::protocol::ToolCallId::from("ffi-tool-call"),
+                querymt_agent::acp::protocol::ToolCallUpdateFields::new()
+                    .status(querymt_agent::acp::protocol::ToolCallStatus::Pending),
+            ),
+            vec![querymt_agent::acp::protocol::PermissionOption::new(
+                querymt_agent::acp::protocol::PermissionOptionId::from("allow_once"),
+                "Allow once",
+                querymt_agent::acp::protocol::PermissionOptionKind::AllowOnce,
+            )],
+        );
+        querymt_agent::elicitation::register_pending_permission(
+            &pending,
+            "ffi-permission".to_string(),
+            session_id.clone(),
+            permission_request,
+            Some("ffi-run".to_string()),
+            Some("ffi-tool-call".to_string()),
+            permission_tx,
+        )
+        .await;
+        assert_eq!(
+            ffi_acp_send(
+                connection,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "load",
+                    "method": "session/load",
+                    "params": {
+                        "sessionId": session_id,
+                        "_meta": {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"}
+                    }
+                })
+                .to_string(),
+            )
+            .await,
+            FfiErrorCode::Ok as i32
+        );
+        let permission_messages =
+            ffi_poll_until(connection, std::time::Duration::from_secs(10), |message| {
+                message["method"] == "session/request_permission"
+            })
+            .await;
+        let load_response = permission_messages
+            .iter()
+            .find(|message| message["id"] == "load")
+            .expect("session/load response precedes attached permission");
+        assert!(
+            load_response["result"]["_meta"]["querymt/sessionLoadSnapshot.v1"].is_object(),
+            "mobile snapshot is carried in the session-load metadata"
+        );
+        assert!(load_response["result"]["configOptions"].is_array());
+        let permission_message = permission_messages
+            .last()
+            .expect("outgoing permission request");
+        let permission_result = serde_json::to_value(
+            querymt_agent::acp::protocol::RequestPermissionResponse::new(
+                querymt_agent::acp::protocol::RequestPermissionOutcome::Selected(
+                    querymt_agent::acp::protocol::SelectedPermissionOutcome::new("allow_once"),
+                ),
+            ),
+        )
+        .expect("permission result serializes");
+        assert_eq!(
+            ffi_acp_send(
+                connection,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": permission_message["id"],
+                    "result": permission_result
+                })
+                .to_string(),
+            )
+            .await,
+            FfiErrorCode::Ok as i32
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), permission_rx)
+            .await
+            .expect("permission answer reaches pending interaction")
+            .expect("permission waiter remains connected");
+
+        let (form_tx, form_rx) = tokio::sync::oneshot::channel();
+        querymt_agent::elicitation::insert_pending_elicitation(
+            &pending,
+            "ffi-form".to_string(),
+            session_id.clone(),
+            form_tx,
+        )
+        .await;
+        inner
+            .config
+            .event_sink
+            .fanout()
+            .publish(querymt_agent::events::EventEnvelope::Ephemeral(
+                querymt_agent::events::EphemeralEvent {
+                    session_seq: 0,
+                    session_id: session_id.clone(),
+                    timestamp: 1,
+                    origin: querymt_agent::events::EventOrigin::Local,
+                    source_node: None,
+                    kind: querymt_agent::events::AgentEventKind::ElicitationRequested {
+                        elicitation_id: "ffi-form".to_string(),
+                        session_id: session_id.clone(),
+                        message: "Choose one".to_string(),
+                        requested_schema: serde_json::json!({"type": "object"}),
+                        source: "builtin:question".to_string(),
+                    },
+                },
+            ));
+        let form_request =
+            ffi_poll_until(connection, std::time::Duration::from_secs(5), |message| {
+                message["method"] == "elicitation/create"
+            })
+            .await;
+        assert_eq!(
+            ffi_acp_send(
+                connection,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "form-answer",
+                    "method": "elicitation_result",
+                    "params": {
+                        "elicitation_id": "ffi-form",
+                        "session_id": session_id,
+                        "action": "decline"
+                    }
+                })
+                .to_string(),
+            )
+            .await,
+            FfiErrorCode::Ok as i32
+        );
+        ffi_poll_until(connection, std::time::Duration::from_secs(5), |message| {
+            message["id"] == "form-answer"
+        })
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), form_rx)
+            .await
+            .expect("form answer reaches pending interaction")
+            .expect("form waiter remains connected");
+        assert_eq!(form_request.last().unwrap()["method"], "elicitation/create");
+        assert_eq!(ffi_acp_close(connection).await, FfiErrorCode::Ok as i32);
+
+        let (unregister_code, unregister_connection) = ffi_acp_open(agent_handle).await;
+        assert_eq!(unregister_code, FfiErrorCode::Ok as i32);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let unregister_state = Box::new(BlockingCallbackState {
+            entered: entered_tx,
+            release: StdMutex::new(release_rx),
+        });
+        let unregister_data = (&*unregister_state as *const BlockingCallbackState) as usize;
+        assert_eq!(
+            ffi_acp_set_handler(
+                unregister_connection,
+                Some(blocking_acp_handler),
+                unregister_data,
+            )
+            .await,
+            FfiErrorCode::Ok as i32
+        );
+        assert_eq!(
+            ffi_acp_send(unregister_connection, initialize.to_string()).await,
+            FfiErrorCode::Ok as i32
+        );
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .expect("callback entry task")
+        .expect("callback started");
+        let mut unregister = tokio::task::spawn_blocking(move || unsafe {
+            qmt_ffi_acp_set_message_handler(unregister_connection, None, std::ptr::null_mut())
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut unregister)
+                .await
+                .is_err()
+        );
+        release_tx
+            .send(())
+            .expect("release callback before userdata expires");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), unregister)
+                .await
+                .expect("unregister waits for callback")
+                .expect("unregister task"),
+            FfiErrorCode::Ok as i32
+        );
+        drop(unregister_state);
+        assert_eq!(
+            ffi_acp_close(unregister_connection).await,
+            FfiErrorCode::Ok as i32
+        );
+
+        let (close_code, close_connection) = ffi_acp_open(agent_handle).await;
+        assert_eq!(close_code, FfiErrorCode::Ok as i32);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let close_state = Box::new(BlockingCallbackState {
+            entered: entered_tx,
+            release: StdMutex::new(release_rx),
+        });
+        let close_data = (&*close_state as *const BlockingCallbackState) as usize;
+        assert_eq!(
+            ffi_acp_set_handler(close_connection, Some(blocking_acp_handler), close_data).await,
+            FfiErrorCode::Ok as i32
+        );
+        assert_eq!(
+            ffi_acp_send(close_connection, initialize.to_string()).await,
+            FfiErrorCode::Ok as i32
+        );
+        tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(std::time::Duration::from_secs(5))
+        })
+        .await
+        .expect("callback entry task")
+        .expect("callback started");
+        let mut close =
+            tokio::task::spawn_blocking(move || unsafe { qmt_ffi_acp_close(close_connection) });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut close)
+                .await
+                .is_err()
+        );
+        release_tx
+            .send(())
+            .expect("release callback before userdata expires");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), close)
+                .await
+                .expect("close waits for callback")
+                .expect("close task"),
+            FfiErrorCode::Ok as i32
+        );
+        drop(close_state);
+
+        let (self_close_code, self_close_connection) = ffi_acp_open(agent_handle).await;
+        assert_eq!(self_close_code, FfiErrorCode::Ok as i32);
+        let (self_close_tx, self_close_rx) = std::sync::mpsc::channel();
+        let self_close_data = Box::new(self_close_tx);
+        let self_close_pointer =
+            (&*self_close_data as *const std::sync::mpsc::Sender<i32>) as usize;
+        assert_eq!(
+            ffi_acp_set_handler(
+                self_close_connection,
+                Some(self_closing_acp_handler),
+                self_close_pointer,
+            )
+            .await,
+            FfiErrorCode::Ok as i32
+        );
+        assert_eq!(
+            ffi_acp_send(self_close_connection, initialize.to_string()).await,
+            FfiErrorCode::Ok as i32
+        );
+        assert_eq!(
+            tokio::task::spawn_blocking(move || {
+                self_close_rx.recv_timeout(std::time::Duration::from_secs(5))
+            })
+            .await
+            .expect("self-close callback completion")
+            .expect("self-close callback returned"),
+            FfiErrorCode::Ok as i32
+        );
+        drop(self_close_data);
+
+        assert_eq!(
+            tokio::task::spawn_blocking(move || unsafe { qmt_ffi_shutdown(agent_handle) })
+                .await
+                .expect("shutdown test agent"),
+            FfiErrorCode::Ok as i32
+        );
+        assert_eq!(
+            tokio::task::spawn_blocking(move || unsafe { qmt_ffi_shutdown_runtime_if_idle() })
+                .await
+                .expect("shutdown idle test runtime"),
+            FfiErrorCode::Ok as i32
         );
     }
 }
