@@ -247,8 +247,8 @@ impl EmbeddedAcpConnection {
     }
 
     /// Enqueue a transport-level response or notification produced by an embedding hook.
-    pub async fn send_json(&self, json: String) -> Result<(), ()> {
-        self.connection.tx.send(json).await.map_err(|_| ())
+    pub async fn send_json(&self, json: String) -> Result<(), mpsc::error::SendError<String>> {
+        self.connection.tx.send(json).await
     }
 
     /// Close the connection and run the same bridge, pending-request, and session cleanup as WebSocket.
