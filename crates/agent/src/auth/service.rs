@@ -1300,6 +1300,137 @@ mod tests {
         );
     }
 
+    struct NamedStaticFactory {
+        name: String,
+        inner: crate::test_utils::TestProviderFactory,
+    }
+
+    impl querymt::plugin::LLMProviderFactory for NamedStaticFactory {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn config_schema(&self) -> String {
+            self.inner.config_schema()
+        }
+        fn from_config(
+            &self,
+            cfg: &str,
+        ) -> Result<Box<dyn querymt::LLMProvider>, querymt::error::LLMError> {
+            self.inner.from_config(cfg)
+        }
+        fn list_models<'a>(
+            &'a self,
+            cfg: &str,
+        ) -> querymt::plugin::Fut<'a, Result<Vec<String>, querymt::error::LLMError>> {
+            self.inner.list_models(cfg)
+        }
+        fn as_http(&self) -> Option<&dyn querymt::plugin::http::HTTPLLMProviderFactory> {
+            self.inner.as_http()
+        }
+    }
+
+    struct OwnedAuthKeys {
+        store: crate::auth::SecretStore,
+        keys: [String; 2],
+    }
+
+    impl Drop for OwnedAuthKeys {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                let _ = self.store.delete(key);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn static_auth_status_and_mutations_use_only_test_owned_credentials() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let name = format!("qmt_test_{}", uuid::Uuid::new_v4().as_simple());
+        let key = format!("QMT_TEST_KEY_{name}");
+        let preference = format!("auth_method_{name}");
+        let owned = OwnedAuthKeys {
+            store: crate::auth::SecretStore::new().expect("native store initialization"),
+            keys: [key.clone(), preference.clone()],
+        };
+        let registry = fixture.config.provider.plugin_registry();
+        let shared = crate::test_utils::SharedLlmProvider::new(
+            crate::test_utils::MockLlmProvider::new(),
+            vec![],
+        );
+        registry.register_static(Arc::new(NamedStaticFactory {
+            name: name.clone(),
+            inner: crate::test_utils::TestProviderFactory::new(shared).with_api_key_name(&key),
+        }));
+        assert!(registry.config.providers.is_empty(), "static-only fixture");
+        let service = OAuthService::new(
+            fixture.config.clone(),
+            ModelInventory::new(fixture.config.clone()),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(None)),
+        );
+        assert!(
+            service
+                .auth_status(Some("not-this-test-provider"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!service.set_auth_method(&name, "password").await.success);
+        assert!(
+            !service
+                .clear_api_token("not-this-test-provider")
+                .await
+                .success
+        );
+        let stored = service.set_api_token(&name, "test-owned-token").await;
+        assert!(!stored.message.contains("test-owned-token"));
+        if !stored.success {
+            assert!(
+                stored.message.contains("Failed to store API key"),
+                "{stored:?}"
+            );
+            let status = service.auth_status(Some(&name)).await;
+            match status {
+                Ok(providers) => assert!(!providers[0].has_stored_api_key),
+                Err(error) => assert!(error.contains("Failed to read"), "{error}"),
+            }
+            eprintln!(
+                "native keyring unavailable; static persistence/cache assertions not exercised"
+            );
+            return;
+        }
+        assert_eq!(
+            owned.store.try_get(&key).unwrap().as_deref(),
+            Some("test-owned-token")
+        );
+        let providers = service.auth_status(Some(&name)).await.unwrap();
+        assert_eq!(providers.len(), 1);
+        let provider = &providers[0];
+        assert_eq!(provider.provider, name);
+        assert_eq!(provider.env_var_name.as_deref(), Some(key.as_str()));
+        assert!(provider.has_stored_api_key);
+        assert!(!provider.has_env_api_key);
+        assert!(!provider.supports_oauth);
+        assert!(provider.oauth_status.is_none());
+        assert!(provider.preferred_method.is_none());
+        assert!(provider.display_name.starts_with("Qmt_test_"));
+        assert!(service.set_auth_method(&name, "api_key").await.success);
+        assert_eq!(
+            owned.store.try_get(&preference).unwrap().as_deref(),
+            Some("api_key")
+        );
+        assert_eq!(
+            service.auth_status(Some(&name)).await.unwrap()[0]
+                .preferred_method
+                .as_deref(),
+            Some("api_key")
+        );
+        assert!(service.clear_api_token(&name).await.success);
+        assert!(owned.store.try_get(&key).unwrap().is_none());
+        assert!(!service.auth_status(Some(&name)).await.unwrap()[0].has_stored_api_key);
+        assert!(service.clear_api_token(&name).await.success);
+    }
+
     #[tokio::test]
     async fn auth_provider_names_include_registered_static_factories() {
         let registry = querymt::plugin::host::PluginRegistry::empty();

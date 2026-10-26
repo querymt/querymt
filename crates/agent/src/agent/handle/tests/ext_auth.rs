@@ -246,3 +246,47 @@ async fn set_and_clear_api_token_roundtrip() {
     .await;
     assert_eq!(clear_again["success"], true);
 }
+
+#[tokio::test]
+async fn static_auth_extensions_filter_status_and_validate_without_credentials() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let shared = SharedLlmProvider::new(MockLlmProvider::new(), vec![]);
+    fixture
+        .config
+        .provider
+        .plugin_registry()
+        .register_static(Arc::new(TestProviderFactory::new(shared)));
+    let status = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/status",
+        serde_json::json!({"provider": "not-registered-test-provider"}),
+    )
+    .await;
+    assert_eq!(status["providers"], serde_json::json!([]));
+    let clear = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/clearApiToken",
+        serde_json::json!({"provider": "mock"}),
+    )
+    .await;
+    assert_eq!(clear["success"], false);
+    assert!(
+        clear["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not have a known API key name")
+    );
+    let preference = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/setMethod",
+        serde_json::json!({"provider": "mock", "method": "password"}),
+    )
+    .await;
+    assert_eq!(preference["success"], false);
+    assert!(
+        preference["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown auth method")
+    );
+}

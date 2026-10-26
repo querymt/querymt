@@ -2856,3 +2856,213 @@ pub(crate) async fn attach_test_connection(
     );
     (wire_tx, wire_rx, delivery, cancel)
 }
+
+async fn embedded_messages_until(
+    rx: &mut mpsc::Receiver<String>,
+    mut matches: impl FnMut(&serde_json::Value) -> bool,
+) -> Vec<serde_json::Value> {
+    timeout(Duration::from_secs(5), async {
+        let mut messages = Vec::new();
+        loop {
+            let raw = rx.recv().await.expect("embedded output remains open");
+            let message = serde_json::from_str(&raw).expect("valid embedded JSON");
+            let done = matches(&message);
+            messages.push(message);
+            if done {
+                return messages;
+            }
+        }
+    })
+    .await
+    .expect("expected embedded message arrives")
+}
+
+#[tokio::test]
+async fn embedded_connection_dispatches_sessions_and_streams_before_prompt_response() {
+    let (fixture, _) = prompt_fixture().await;
+    let (mut connection, mut rx) =
+        super::websocket::EmbeddedAcpConnection::open(fixture.handle.clone(), None).await;
+    assert!(connection.receive_json("not JSON").await.is_err());
+    connection
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": "init", "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let initialized = embedded_messages_until(&mut rx, |m| m["id"] == "init").await;
+    assert_eq!(initialized.last().unwrap()["result"]["protocolVersion"], 1);
+    connection
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": "new", "method": "session/new",
+                "params": {"cwd": fixture._tempdir.path(), "mcpServers": []}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let created = embedded_messages_until(&mut rx, |m| m["id"] == "new").await;
+    let result = &created.last().unwrap()["result"];
+    let session_id = result["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert!(
+        result["configOptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|o| o["id"] == "model")
+    );
+
+    connection
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": "prompt", "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "hello"}]}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let messages = embedded_messages_until(&mut rx, |m| m["id"] == "prompt").await;
+    assert!(messages.last().unwrap()["error"].is_null(), "{messages:?}");
+    let text: String = messages
+        .iter()
+        .filter_map(|m| {
+            (m["method"] == "session/update"
+                && m["params"]["update"]["sessionUpdate"] == "agent_message_chunk")
+                .then(|| m["params"]["update"]["content"]["text"].as_str())
+                .flatten()
+        })
+        .collect();
+    assert_eq!(
+        text, "held reply",
+        "assistant text precedes prompt completion"
+    );
+    for method in ["session/load", "session/resume"] {
+        connection
+            .receive_json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": method, "method": method,
+                "params": {"sessionId": session_id, "cwd": fixture._tempdir.path(), "mcpServers": []}
+            }).to_string())
+            .await.unwrap();
+        let loaded = embedded_messages_until(&mut rx, |m| m["id"] == method).await;
+        let response = loaded.last().unwrap();
+        assert!(response["error"].is_null(), "{response}");
+        assert!(response["result"]["configOptions"].is_array());
+    }
+    let marker = serde_json::json!({"jsonrpc": "2.0", "method": "embedding/marker"});
+    connection.send_json(marker.to_string()).await.unwrap();
+    let sent = embedded_messages_until(&mut rx, |m| m["method"] == "embedding/marker").await;
+    assert_eq!(sent.last().unwrap(), &marker);
+    connection.close().await;
+    connection.close().await;
+    drop(connection);
+    timeout(Duration::from_secs(2), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await
+    .expect("close cancels owned forwarders and bridge");
+}
+
+#[tokio::test]
+async fn embedded_connection_routes_permission_and_form_response_envelopes() {
+    let (fixture, session_id) = prompt_fixture().await;
+    let (mut connection, mut rx) =
+        super::websocket::EmbeddedAcpConnection::open(fixture.handle.clone(), None).await;
+    connection.receive_json(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": 1, "clientCapabilities": {"elicitation": {"form": {}}}}
+    }).to_string()).await.unwrap();
+    embedded_messages_until(&mut rx, |m| m["id"] == 1).await;
+    let permission =
+        register_permission_for_test(&fixture, &session_id, "embedded-permission").await;
+    connection.receive_json(&serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "session/load",
+        "params": {"sessionId": session_id, "cwd": fixture._tempdir.path(), "mcpServers": []}
+    }).to_string()).await.unwrap();
+    let messages =
+        embedded_messages_until(&mut rx, |m| m["method"] == "session/request_permission").await;
+    let request = messages.last().unwrap();
+    assert_eq!(request["params"]["sessionId"], session_id);
+    connection
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": selected("allow_once")
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let answer = timeout(Duration::from_secs(2), permission)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.action, ElicitationAction::Accept);
+
+    let (form_tx, form_rx) = oneshot::channel();
+    insert_pending_elicitation(
+        &fixture.handle.pending_elicitations(),
+        "embedded-form".into(),
+        session_id.clone(),
+        form_tx,
+    )
+    .await;
+    fixture
+        .config
+        .event_sink
+        .fanout()
+        .publish(elicitation_event(&session_id, "embedded-form"));
+    let messages = embedded_messages_until(&mut rx, |m| m["method"] == "elicitation/create").await;
+    let request = messages.last().unwrap();
+    assert_eq!(
+        request["params"]["_meta"]["querymt"]["elicitation_id"],
+        "embedded-form"
+    );
+    connection
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": request["id"],
+                "result": {"action": "accept", "content": {"selection": "A"}}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let answer = timeout(Duration::from_secs(2), form_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.action, ElicitationAction::Accept);
+    assert_eq!(answer.content, Some(serde_json::json!({"selection": "A"})));
+    connection.close().await;
+}
+
+#[tokio::test]
+async fn embedded_connection_returns_unsent_json_and_drop_stops_output() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let (mut connection, rx) =
+        super::websocket::EmbeddedAcpConnection::open(fixture.handle.clone(), None).await;
+    drop(rx);
+    let unsent = "host response".to_string();
+    assert_eq!(
+        connection.send_json(unsent.clone()).await.unwrap_err().0,
+        unsent
+    );
+    connection.close().await;
+    connection.close().await;
+    let (connection, mut rx) =
+        super::websocket::EmbeddedAcpConnection::open(fixture.handle.clone(), None).await;
+    drop(connection);
+    assert!(
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
