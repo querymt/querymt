@@ -1013,9 +1013,10 @@ impl AgentSessions {
             let same_scope = match scope {
                 SessionScope::All => true,
                 SessionScope::Root => entry.parent_session_id.is_none(),
-                SessionScope::Forks => {
-                    matches!(entry.fork_origin.as_deref(), Some("user" | "worktree"))
-                }
+                SessionScope::Forks => entry
+                    .fork_origin
+                    .as_deref()
+                    .is_some_and(crate::session::domain::ForkOrigin::is_visible_fork),
                 SessionScope::Delegates => entry.fork_origin.as_deref() == Some("delegation"),
                 SessionScope::Children => entry.parent_session_id.is_some(),
             };

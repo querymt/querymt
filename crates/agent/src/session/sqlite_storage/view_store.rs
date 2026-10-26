@@ -64,28 +64,53 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
 fn load_workspace_views(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<HashMap<String, crate::session::projection::SessionWorkspaceView>> {
-    let mut stmt = conn.prepare("SELECT owner_session_id, public_id, common_dir, project_name, checkout_path, branch, baseline_mode, baseline_commit, lifecycle, last_error, COALESCE(source_cwd, ''), handed_off_to FROM workspaces WHERE owner_session_id IS NOT NULL")?;
-    let views = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                crate::session::projection::SessionWorkspaceView {
-                    workspace_id: row.get(1)?,
-                    repository_id: row.get(2)?,
-                    source_cwd: row.get(10)?,
-                    project_name: row.get(3)?,
-                    checkout_path: row.get(4)?,
-                    branch: row.get(5)?,
-                    baseline_mode: row.get(6)?,
-                    baseline_commit: row.get(7)?,
-                    lifecycle: row.get(8)?,
-                    last_error: row.get(9)?,
-                    owner_session_id: row.get(0)?,
-                    handed_off_to: row.get(11)?,
-                },
-            ))
-        })?
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    // Current owners, then previous owners (via the durable handoff markers):
+    // a previous owner keeps its workspace view with `handedOffTo` naming the
+    // session it gave the checkout to, so it stays in its project group.
+    const COLUMNS: &str = "w.public_id, w.common_dir, w.project_name, w.checkout_path, w.branch, w.baseline_mode, w.baseline_commit, w.lifecycle, w.last_error, COALESCE(w.source_cwd, ''), w.owner_session_id";
+    let map_row = |row: &rusqlite::Row<'_>,
+                   handed_off_to: Option<String>|
+     -> rusqlite::Result<crate::session::projection::SessionWorkspaceView> {
+        Ok(crate::session::projection::SessionWorkspaceView {
+            workspace_id: row.get(0)?,
+            repository_id: row.get(1)?,
+            project_name: row.get(2)?,
+            checkout_path: row.get(3)?,
+            branch: row.get(4)?,
+            baseline_mode: row.get(5)?,
+            baseline_commit: row.get(6)?,
+            lifecycle: row.get(7)?,
+            last_error: row.get(8)?,
+            source_cwd: row.get(9)?,
+            owner_session_id: row.get(10)?,
+            handed_off_to,
+        })
+    };
+    let mut views = HashMap::new();
+    let mut owners = conn.prepare(&format!(
+        "SELECT {COLUMNS}, w.owner_session_id FROM workspaces w WHERE w.owner_session_id IS NOT NULL"
+    ))?;
+    let rows = owners.query_map([], |row| {
+        let owner: String = row.get(11)?;
+        Ok((owner, map_row(row, None)?))
+    })?;
+    for row in rows {
+        let (owner, view) = row?;
+        views.insert(owner, view);
+    }
+    let mut previous = conn.prepare(&format!(
+        "SELECT {COLUMNS}, h.from_session_id, h.to_session_id \
+         FROM workspace_handoffs h JOIN workspaces w ON w.public_id = h.workspace_public_id"
+    ))?;
+    let rows = previous.query_map([], |row| {
+        let from: String = row.get(11)?;
+        let to: String = row.get(12)?;
+        Ok((from, map_row(row, Some(to))?))
+    })?;
+    for row in rows {
+        let (from, view) = row?;
+        views.insert(from, view);
+    }
     Ok(views)
 }
 
@@ -158,7 +183,9 @@ fn parse_finish_reason(value: &str) -> Option<FinishReason> {
 /// search, counts and latest-activity queries in agreement.
 fn group_key_sql(alias: &str) -> String {
     format!(
-        "COALESCE((SELECT w.source_cwd FROM workspaces w WHERE w.owner_session_id = {alias}.public_id), {alias}.cwd)"
+        "COALESCE((SELECT w.source_cwd FROM workspaces w WHERE w.owner_session_id = {alias}.public_id), \
+         (SELECT w.source_cwd FROM workspace_handoffs h JOIN workspaces w ON w.public_id = h.workspace_public_id WHERE h.from_session_id = {alias}.public_id), \
+         {alias}.cwd)"
     )
 }
 

@@ -388,6 +388,21 @@ pub trait HandoffHost: Send + Sync {
     async fn discard_successor(&self, successor: &str);
 }
 
+/// Map a failed ownership compare-and-swap to the documented handoff codes.
+fn handoff_transfer_error(err: crate::session::error::SessionError) -> WorktreeOpError {
+    use crate::session::error::SessionError;
+    match err {
+        SessionError::WorkspaceAlreadyOwned { workspace, owner } => WorktreeOpError::rejected(
+            "not_owner",
+            format!("workspace {workspace} is owned by {owner}; the handoff owner changed"),
+        ),
+        SessionError::InvalidOperation(message) if message.contains("cannot change owner") => {
+            WorktreeOpError::rejected("workspace_not_ready", message)
+        }
+        other => other.into(),
+    }
+}
+
 // ── Session spawning (the one operation that needs the session layer) ────────
 
 /// Starts the isolated session for [`WorktreeOps::create`]. Implemented by the
@@ -520,13 +535,19 @@ impl WorktreeOps {
             return Ok(source_cwd);
         }
         let cwd = PathBuf::from(&request.cwd);
-        let same_repository = match (
-            crate::worktree::resolve_repository(&source_cwd),
-            crate::worktree::resolve_repository(&cwd),
-        ) {
-            (Ok(a), Ok(b)) => a.identity.common_dir == b.identity.common_dir,
-            _ => false,
-        };
+        // gix discovery blocks on the filesystem: keep it off the executor.
+        let (source_for_check, cwd_for_check) = (source_cwd.clone(), cwd.clone());
+        let same_repository = tokio::task::spawn_blocking(move || {
+            match (
+                crate::worktree::resolve_repository(&source_for_check),
+                crate::worktree::resolve_repository(&cwd_for_check),
+            ) {
+                (Ok(a), Ok(b)) => a.identity.common_dir == b.identity.common_dir,
+                _ => false,
+            }
+        })
+        .await
+        .map_err(|err| WorktreeOpError::Internal(err.to_string()))?;
         if same_repository {
             Ok(cwd)
         } else {
@@ -552,7 +573,12 @@ impl WorktreeOps {
             || (unpinned && self.service.default_baseline() == BaselineMode::CurrentWorkingTree);
 
         let ignored_files = if will_capture_working_tree {
-            let source = crate::worktree::resolve_repository(&cwd)?;
+            let cwd_for_resolve = cwd.clone();
+            let source = tokio::task::spawn_blocking(move || {
+                crate::worktree::resolve_repository(&cwd_for_resolve)
+            })
+            .await
+            .map_err(|err| WorktreeOpError::Internal(err.to_string()))??;
             self.service
                 .ops()
                 .checkout_status(&source.checkout.root)
@@ -611,7 +637,7 @@ impl WorktreeOps {
     /// window in which an just-unloaded actor is still dropping its shared
     /// lease. Anything still holding it after the grace period (a running
     /// turn, shared delegates, another process) is `owner_active`.
-    async fn acquire_exclusive_activity(
+    pub(crate) async fn acquire_exclusive_activity(
         &self,
         record: &WorkspaceRecord,
     ) -> Result<crate::worktree::gate::CheckoutActivityLease, WorktreeOpError> {
@@ -730,7 +756,7 @@ impl WorktreeOps {
             Ok(moved) => moved,
             Err(err) => {
                 host.discard_successor(&successor).await;
-                return Err(err.into());
+                return Err(handoff_transfer_error(err));
             }
         };
         drop(lease);
@@ -970,6 +996,22 @@ impl WorktreeOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review F8: a lost transfer race and a non-ready workspace map to the
+    /// documented handoff codes.
+    #[test]
+    fn handoff_transfer_failures_use_documented_codes() {
+        use crate::session::error::SessionError;
+        let race = handoff_transfer_error(SessionError::WorkspaceAlreadyOwned {
+            workspace: "ws".into(),
+            owner: "other".into(),
+        });
+        assert_eq!(race.code(), "not_owner");
+        let stale = handoff_transfer_error(SessionError::InvalidOperation(
+            "workspace ws is removing and cannot change owner".into(),
+        ));
+        assert_eq!(stale.code(), "workspace_not_ready");
+    }
 
     #[test]
     fn error_codes_are_stable() {

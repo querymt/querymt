@@ -145,7 +145,19 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0030_workspace_handoff",
         apply: migration_0030_workspace_handoff,
     },
+    Migration {
+        version: "0031_workspace_handoff_keeps_marker",
+        apply: migration_0031_workspace_handoff_keeps_marker,
+    },
 ];
+
+/// Drop the `to_session_id` cascade so deleting a successor keeps the
+/// read-only marker of its previous owners.
+fn migration_0031_workspace_handoff_keeps_marker(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_handoff_survives_successor_delete(conn)
+}
 
 /// Add `workspaces.handed_off_to` and the `workspace_handoffs` marker table.
 fn migration_0030_workspace_handoff(conn: &mut Connection) -> Result<(), rusqlite::Error> {

@@ -115,21 +115,26 @@ impl LocalAgentHandle {
     async fn unload_idle_in_runtime(&self, session_id: &str) -> Result<bool, Error> {
         use crate::agent::messages::SessionRuntimePhase;
 
-        let loaded = self.registry.lock().await.get(session_id).cloned();
-        let Some(session) = loaded else {
-            return Ok(false);
+        // The idle check and the removal happen under one registry lock, so a
+        // prompt cannot look the actor up between them: it either runs first
+        // (the session is then busy) or finds the session unloaded.
+        let removed = {
+            let mut registry = self.registry.lock().await;
+            let Some(session) = registry.get(session_id).cloned() else {
+                return Ok(false);
+            };
+            if session.is_remote() {
+                return Ok(true);
+            }
+            let status = session.get_runtime_status().await.map_err(Error::from)?;
+            if status.phase != SessionRuntimePhase::Idle
+                || status.queued_input_count > 0
+                || status.pending_steering_count > 0
+            {
+                return Ok(true);
+            }
+            registry.remove(session_id)
         };
-        if session.is_remote() {
-            return Ok(true);
-        }
-        let status = session.get_runtime_status().await.map_err(Error::from)?;
-        if status.phase != SessionRuntimePhase::Idle
-            || status.queued_input_count > 0
-            || status.pending_steering_count > 0
-        {
-            return Ok(true);
-        }
-        let removed = self.registry.lock().await.remove(session_id);
         if let Some(session) = removed
             && let Err(err) = session.shutdown().await
         {

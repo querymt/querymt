@@ -2428,3 +2428,185 @@ async fn load_with_replay_serves_a_previous_owner_without_an_actor() {
     assert!(handle.registry.lock().await.get(&previous).is_none());
     handle.shutdown().await;
 }
+
+/// Review F1 + F4: a previous owner stays in its project group with the
+/// workspace view disclosing `handedOffTo`, and deleting the successor does
+/// not erase the marker that keeps it read-only.
+#[tokio::test]
+async fn previous_owner_keeps_group_and_handoff_target_and_survives_successor_delete() {
+    use crate::session::projection::{SessionScope, ViewStore};
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let previous = isolated_session(&f, f.repo.path()).await;
+    let handed = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(previous.clone()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let (groups, _, total) = f
+        .storage
+        .browse_session_groups(None, 10, 10, SessionScope::All)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(groups.len(), 1, "both owners stay in the source group");
+    let (items, _, count) = f
+        .storage
+        .list_session_items(groups[0].cwd.clone(), None, 10, SessionScope::All)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    let old = items.iter().find(|i| i.session_id == previous).unwrap();
+    let old_view = old
+        .workspace
+        .as_ref()
+        .expect("previous owner keeps its view");
+    assert_eq!(
+        old_view.handed_off_to.as_deref(),
+        Some(handed.session_id.as_str())
+    );
+    let new = items
+        .iter()
+        .find(|i| i.session_id == handed.session_id)
+        .unwrap();
+    assert_eq!(
+        new.workspace.as_ref().unwrap().owner_session_id.as_deref(),
+        Some(handed.session_id.as_str())
+    );
+
+    // Deleting the successor keeps the previous owner read-only.
+    f.storage
+        .session_store()
+        .delete_session(&handed.session_id)
+        .await
+        .unwrap();
+    assert!(
+        f.service
+            .registry()
+            .transferred_to(&previous)
+            .await
+            .unwrap()
+            .is_some(),
+        "the handoff marker outlives the successor"
+    );
+    f.handle
+        .session_materializer
+        .ensure_not_transferred(&previous)
+        .await
+        .unwrap_err();
+}
+
+/// Review F3: recovering a handoff successor refuses while the previous
+/// owner's checkout has other activity, leaves ownership untouched, and
+/// announces the handoff once recovery completes the transfer.
+#[tokio::test]
+async fn recovery_of_a_pending_successor_respects_owner_activity_and_announces() {
+    use crate::events::AgentEventKind;
+    use crate::worktree::HandoffHost as _;
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&owner)
+        .await
+        .unwrap()
+        .unwrap();
+    let successor = f
+        .handle
+        .create_pending_successor(&owner, &record, None)
+        .await
+        .unwrap();
+
+    // Another process is active in the checkout: recovery must refuse.
+    let busy = crate::worktree::gate::CheckoutActivityLease::acquire(
+        f.service.storage_root(),
+        &record.checkout_path,
+        false,
+    )
+    .unwrap();
+    // Unload the owner so only the foreign lease can block.
+    f.handle.unload_session_if_idle(&owner).await.unwrap();
+    let err = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/worktree/recover",
+            raw_params(&serde_json::json!({ "session_id": successor }).to_string()),
+        ))
+        .await
+        .expect_err("recovery must not move ownership under activity");
+    assert_eq!(err.data.as_ref().unwrap()["code"], "owner_active");
+    let registry = f.service.registry();
+    assert_eq!(
+        registry
+            .get_workspace_by_session(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        record.id
+    );
+    drop(busy);
+
+    // Without the foreign activity, recovery completes and announces.
+    ext_method_json(
+        &f.handle,
+        "querymt/worktree/recover",
+        serde_json::json!({ "session_id": successor }),
+    )
+    .await;
+    assert!(
+        registry
+            .get_workspace_by_session(&successor)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let announced = f
+        .storage
+        .event_journal()
+        .load_session_stream(&owner, None, None)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| {
+            matches!(&event.kind, AgentEventKind::WorktreeOwnershipTransferred {
+                successor_session_id, ..
+            } if *successor_session_id == successor)
+        });
+    assert!(announced, "recovery records the missing announcement");
+    let bound = f
+        .storage
+        .event_journal()
+        .load_session_stream(&successor, None, None)
+        .await
+        .unwrap()
+        .iter()
+        .any(|event| matches!(event.kind, AgentEventKind::SessionWorkspaceBound { .. }));
+    assert!(bound, "the successor records its workspace binding");
+}
+
+/// Review F7: actor-less replay is reserved for transferred owners; any other
+/// session without a runtime ref still fails loudly.
+#[tokio::test]
+async fn actorless_replay_is_refused_for_sessions_that_never_handed_off() {
+    let f = worktree_fixture(true).await;
+    let session = isolated_session(&f, f.repo.path()).await;
+    f.handle.unload_session_if_idle(&session).await.unwrap();
+    assert!(f.handle.registry.lock().await.get(&session).is_none());
+    crate::acp::stdio::replay_loaded_session(
+        &f.handle,
+        &session,
+        &crate::acp::shared::AcpSessionUpdateCapabilities::default(),
+    )
+    .await
+    .expect_err("a non-transferred session must have a runtime ref");
+}

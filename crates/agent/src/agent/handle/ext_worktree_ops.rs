@@ -269,6 +269,25 @@ impl IsolatedSessionSpawner for LocalAgentHandle {
     }
 }
 
+/// State held while a handoff successor is recovered.
+struct HandoffRecoveryGuard {
+    previous: String,
+    workspace_id: String,
+    /// Exclusive activity lease, held until the transfer commits. `None` when
+    /// the transfer had already committed.
+    lease: Option<crate::worktree::gate::CheckoutActivityLease>,
+}
+
+impl HandoffRecoveryGuard {
+    fn committed(previous: String, workspace_id: String) -> Self {
+        Self {
+            previous,
+            workspace_id,
+            lease: None,
+        }
+    }
+}
+
 /// Session-layer steps of an ownership handoff (see [`HandoffHost`]).
 #[async_trait::async_trait]
 impl HandoffHost for LocalAgentHandle {
@@ -302,6 +321,121 @@ impl HandoffHost for LocalAgentHandle {
     }
 
     async fn summarize(&self, previous: &str) -> Result<Option<String>, WorktreeOpError> {
+        let hosted = self.hosting_handle(previous).await?;
+        self.runtime_of(&hosted)
+            .summarize_in_runtime(previous)
+            .await
+    }
+
+    async fn seed_summary(&self, successor: &str, summary: &str) -> Result<(), WorktreeOpError> {
+        let hosted = self.hosting_handle(successor).await?;
+        self.runtime_of(&hosted)
+            .seed_summary_in_runtime(successor, summary)
+            .await
+    }
+
+    /// The successor is created by the runtime hosting the previous owner (so
+    /// it carries that runtime's execution config) and bound to the same
+    /// profile/runtime before it can be published; otherwise it could never
+    /// load once ownership moved.
+    async fn create_pending_successor(
+        &self,
+        previous: &str,
+        record: &crate::worktree::WorkspaceRecord,
+        name: Option<String>,
+    ) -> Result<String, WorktreeOpError> {
+        let hosted = self.hosting_handle(previous).await?;
+        let successor = self
+            .runtime_of(&hosted)
+            .create_pending_successor_in_runtime(previous, record, name)
+            .await?;
+        if let Some(profiles) = self.profiles()
+            && let Some(binding) = profiles.session_binding(previous).await
+            && let Err(err) = profiles.set_session_binding(&successor, binding).await
+        {
+            self.runtime_of(&hosted)
+                .discard_successor_in_runtime(&successor)
+                .await;
+            return Err(WorktreeOpError::SessionStart(format!(
+                "failed to bind handoff successor to the owner's profile: {err}"
+            )));
+        }
+        Ok(successor)
+    }
+
+    async fn publish_successor(&self, successor: &str) -> Result<(), WorktreeOpError> {
+        let hosted = self.hosting_handle(successor).await?;
+        self.runtime_of(&hosted)
+            .publish_successor_in_runtime(successor)
+            .await
+    }
+
+    async fn announce_handoff(
+        &self,
+        previous: &str,
+        workspace_id: &str,
+        successor: &str,
+        summary_seeded: bool,
+    ) -> Option<i64> {
+        let config = self.hosting_config(previous).await?;
+        let event = config
+            .emit_event_persisted(
+                previous,
+                crate::events::AgentEventKind::WorktreeOwnershipTransferred {
+                    workspace_id: workspace_id.to_string(),
+                    successor_session_id: successor.to_string(),
+                    summary_seeded,
+                },
+            )
+            .await;
+        // No actor remains to retire the previous owner's stream.
+        config.event_sink.retire_session_stream(previous).await;
+        match event {
+            Ok(event) => Some(event.session_seq),
+            Err(err) => {
+                tracing::warn!(previous, error = %err, "failed to record handoff announcement");
+                None
+            }
+        }
+    }
+
+    async fn discard_successor(&self, successor: &str) {
+        let hosted = self.hosting_handle(successor).await.ok().flatten();
+        self.runtime_of(&hosted)
+            .discard_successor_in_runtime(successor)
+            .await;
+    }
+}
+
+impl LocalAgentHandle {
+    /// The profile runtime handle `session_id` is bound to (`None` when this
+    /// handle hosts it).
+    async fn hosting_handle(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<Arc<dyn crate::agent::handle::AgentHandle>>, WorktreeOpError> {
+        self.bound_session_handle(session_id)
+            .await
+            .map(|bound| bound.map(|(handle, _)| handle))
+            .map_err(|err| WorktreeOpError::from_acp(&err))
+    }
+
+    /// The local handle to run session-layer steps on: the hosting runtime
+    /// when the session is profile-bound, otherwise `self`.
+    fn runtime_of<'a>(
+        &'a self,
+        hosted: &'a Option<Arc<dyn crate::agent::handle::AgentHandle>>,
+    ) -> &'a LocalAgentHandle {
+        hosted
+            .as_ref()
+            .and_then(|handle| handle.as_any().downcast_ref::<LocalAgentHandle>())
+            .unwrap_or(self)
+    }
+
+    async fn summarize_in_runtime(
+        &self,
+        previous: &str,
+    ) -> Result<Option<String>, WorktreeOpError> {
         let failed = |message: String| WorktreeOpError::rejected("summary_failed", message);
         let handle = self
             .config
@@ -342,7 +476,11 @@ impl HandoffHost for LocalAgentHandle {
         Ok(Some(result.summary))
     }
 
-    async fn seed_summary(&self, successor: &str, summary: &str) -> Result<(), WorktreeOpError> {
+    async fn seed_summary_in_runtime(
+        &self,
+        successor: &str,
+        summary: &str,
+    ) -> Result<(), WorktreeOpError> {
         let (request, answer) =
             crate::session::compaction::SessionCompaction::create_compaction_messages(
                 successor,
@@ -359,7 +497,7 @@ impl HandoffHost for LocalAgentHandle {
         Ok(())
     }
 
-    async fn create_pending_successor(
+    async fn create_pending_successor_in_runtime(
         &self,
         previous: &str,
         record: &crate::worktree::WorkspaceRecord,
@@ -371,50 +509,19 @@ impl HandoffHost for LocalAgentHandle {
             .map_err(|err| WorktreeOpError::from_acp(&err))
     }
 
-    async fn publish_successor(&self, successor: &str) -> Result<(), WorktreeOpError> {
+    async fn publish_successor_in_runtime(&self, successor: &str) -> Result<(), WorktreeOpError> {
         self.session_materializer
             .publish_handoff_successor(successor)
             .await
             .map_err(|err| WorktreeOpError::from_acp(&err))
     }
 
-    async fn announce_handoff(
-        &self,
-        previous: &str,
-        workspace_id: &str,
-        successor: &str,
-        summary_seeded: bool,
-    ) -> Option<i64> {
-        let config = self.hosting_config(previous).await?;
-        let event = config
-            .emit_event_persisted(
-                previous,
-                crate::events::AgentEventKind::WorktreeOwnershipTransferred {
-                    workspace_id: workspace_id.to_string(),
-                    successor_session_id: successor.to_string(),
-                    summary_seeded,
-                },
-            )
-            .await;
-        // No actor remains to retire the previous owner's stream.
-        config.event_sink.retire_session_stream(previous).await;
-        match event {
-            Ok(event) => Some(event.session_seq),
-            Err(err) => {
-                tracing::warn!(previous, error = %err, "failed to record handoff announcement");
-                None
-            }
-        }
-    }
-
-    async fn discard_successor(&self, successor: &str) {
+    async fn discard_successor_in_runtime(&self, successor: &str) {
         self.session_materializer
             .discard_pending_handoff_successor(successor)
             .await;
     }
-}
 
-impl LocalAgentHandle {
     /// Config of the runtime hosting `session_id`. Each profile runtime owns
     /// its own event sink, so session events must go through this one.
     /// `None` (logged) when the runtime cannot be resolved.
@@ -432,6 +539,105 @@ impl LocalAgentHandle {
                 None
             }
         }
+    }
+
+    /// Preconditions for recovering a handoff successor whose previous owner
+    /// still owns the workspace (crash before the transfer): the owner must
+    /// be idle and unloaded, and the exclusive activity lease is held until
+    /// the transfer commits. `None` for non-handoff recovery or when the
+    /// transfer already committed.
+    async fn guard_handoff_recovery(
+        &self,
+        successor: &str,
+    ) -> Result<Option<HandoffRecoveryGuard>, WorktreeOpError> {
+        let Some(intent) = self
+            .config
+            .provider
+            .history_store()
+            .get_pending_fork_isolation(successor)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(workspace_id) = intent.handoff_workspace_id.clone() else {
+            return Ok(None);
+        };
+        let previous = intent.source_session_id;
+        let ops = self.worktree_ops()?;
+        let record = ops.lookup(&workspace_id).await?;
+        let owner = record.ownership.owner_session_id.as_deref();
+        if owner == Some(successor) {
+            // Transfer already committed; only the barrier and (possibly) the
+            // announcement are missing.
+            return Ok(Some(HandoffRecoveryGuard::committed(
+                previous,
+                workspace_id,
+            )));
+        }
+        if owner != Some(previous.as_str()) {
+            // Let the service produce its stable refusal.
+            return Ok(None);
+        }
+        self.quiesce_owner(&previous).await?;
+        let lease = ops.acquire_exclusive_activity(&record).await?;
+        // The owner may have changed while it was being unloaded.
+        let record = ops.lookup(&workspace_id).await?;
+        if record.ownership.owner_session_id.as_deref() != Some(previous.as_str()) {
+            return Err(WorktreeOpError::rejected(
+                "not_owner",
+                "workspace ownership changed while recovery was starting",
+            ));
+        }
+        Ok(Some(HandoffRecoveryGuard {
+            previous,
+            workspace_id,
+            lease: Some(lease),
+        }))
+    }
+
+    /// Record the handoff announcement on the previous owner's stream when
+    /// recovery completed a transfer that never announced it. Best effort.
+    async fn announce_recovered_handoff(
+        &self,
+        previous: &str,
+        successor: &str,
+        workspace_id: &str,
+    ) {
+        let Some(config) = self.hosting_config(previous).await else {
+            return;
+        };
+        let already = match config
+            .event_sink
+            .journal()
+            .load_session_stream(previous, None, None)
+            .await
+        {
+            Ok(events) => events.into_iter().any(|event| {
+                matches!(
+                    crate::events::AgentEvent::from(event).kind,
+                    AgentEventKind::WorktreeOwnershipTransferred {
+                        successor_session_id: ref s, ..
+                    } if s == successor
+                )
+            }),
+            Err(err) => {
+                tracing::warn!(previous, error = %err, "handoff recovery: journal unreadable");
+                return;
+            }
+        };
+        if already {
+            return;
+        }
+        let seeded = self
+            .config
+            .provider
+            .history_store()
+            .get_history(successor)
+            .await
+            .map(|history| !history.is_empty())
+            .unwrap_or(false);
+        self.announce_handoff(previous, workspace_id, successor, seeded)
+            .await;
     }
 
     fn worktree_ops(&self) -> Result<WorktreeOps, WorktreeOpError> {
@@ -673,10 +879,27 @@ impl LocalAgentHandle {
                 // Session-scoped recovery: complete a pending isolated fork's
                 // provisioning (reusing its bound workspace when a previous
                 // attempt already attached it) and release the startup barrier.
+                //
+                // A handoff successor may still be waiting on the previous
+                // owner: quiesce it and hold the exclusive lease around the
+                // ownership transfer, exactly like a live handoff.
+                let guard = self
+                    .guard_handoff_recovery(&session_id)
+                    .await
+                    .map_err(op_error_to_acp)?;
                 let response = self
                     .session_materializer
                     .recover_pending_fork(&session_id)
                     .await?;
+                if let Some(guard) = guard {
+                    drop(guard.lease);
+                    self.announce_recovered_handoff(
+                        &guard.previous,
+                        &session_id,
+                        &guard.workspace_id,
+                    )
+                    .await;
+                }
                 let workspace = response
                     .meta
                     .as_ref()

@@ -638,19 +638,52 @@ pub fn ensure_workspace_handoff(conn: &mut Connection) -> Result<(), rusqlite::E
     if !has_column {
         conn.execute("ALTER TABLE workspaces ADD COLUMN handed_off_to TEXT", [])?;
     }
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS workspace_handoffs (
-            from_session_id TEXT PRIMARY KEY,
-            workspace_public_id TEXT NOT NULL,
-            to_session_id TEXT NOT NULL,
-            transferred_at TEXT NOT NULL,
-            FOREIGN KEY(from_session_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
-            FOREIGN KEY(to_session_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
-            FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
-        );
-        CREATE INDEX IF NOT EXISTS idx_workspace_handoffs_workspace
-            ON workspace_handoffs(workspace_public_id);",
-    )
+    conn.execute_batch(WORKSPACE_HANDOFFS_DDL)
+}
+
+/// `to_session_id` deliberately has no foreign key: deleting a successor must
+/// not erase the marker that keeps its predecessors read-only previous owners.
+const WORKSPACE_HANDOFFS_DDL: &str = "CREATE TABLE IF NOT EXISTS workspace_handoffs (
+        from_session_id TEXT PRIMARY KEY,
+        workspace_public_id TEXT NOT NULL,
+        to_session_id TEXT NOT NULL,
+        transferred_at TEXT NOT NULL,
+        FOREIGN KEY(from_session_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
+        FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_handoffs_workspace
+        ON workspace_handoffs(workspace_public_id);";
+
+/// Rebuild `workspace_handoffs` without the `to_session_id` foreign key that
+/// the first revision of the table carried. Idempotent.
+pub fn ensure_workspace_handoff_survives_successor_delete(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    ensure_workspace_handoff(conn)?;
+    let has_to_fk = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_list(workspace_handoffs)")?;
+        stmt.query_map([], |row| row.get::<_, String>(3))?
+            .try_fold(false, |found, from| {
+                from.map(|from| found || from == "to_session_id")
+            })?
+    };
+    if !has_to_fk {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE workspace_handoffs RENAME TO workspace_handoffs_old;
+         DROP INDEX IF EXISTS idx_workspace_handoffs_workspace;",
+    )?;
+    tx.execute_batch(WORKSPACE_HANDOFFS_DDL)?;
+    tx.execute_batch(
+        "INSERT INTO workspace_handoffs
+            (from_session_id, workspace_public_id, to_session_id, transferred_at)
+         SELECT from_session_id, workspace_public_id, to_session_id, transferred_at
+         FROM workspace_handoffs_old;
+         DROP TABLE workspace_handoffs_old;",
+    )?;
+    tx.commit()
 }
 
 /// Add `workspaces.source_cwd` and backfill existing rows.

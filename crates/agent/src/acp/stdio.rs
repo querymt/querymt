@@ -180,16 +180,30 @@ pub(crate) async fn replay_loaded_session(
         },
         // A read-only previous owner has no actor: read the journal and the
         // history store directly, as the actor handlers do.
-        None => match actorless_replay_sources(agent, session_id).await? {
-            Some(sources) => sources,
-            None => {
-                tracing::warn!(session.id = %session_id, "loaded session has no runtime ref for ACP replay");
-                return Err(acp::Error::internal_error().data(serde_json::json!({
-                    "message": "Loaded session has no runtime ref for ACP replay",
-                    "sessionId": session_id,
-                })));
+        // Only a transferred owner may replay without an actor; for any other
+        // session a missing ref is a real materialization bug.
+        None => {
+            let sources = if agent
+                .session_materializer
+                .transferred_owner(session_id)
+                .await?
+                .is_some()
+            {
+                actorless_replay_sources(agent, session_id).await?
+            } else {
+                None
+            };
+            match sources {
+                Some(sources) => sources,
+                None => {
+                    tracing::warn!(session.id = %session_id, "loaded session has no runtime ref for ACP replay");
+                    return Err(acp::Error::internal_error().data(serde_json::json!({
+                        "message": "Loaded session has no runtime ref for ACP replay",
+                        "sessionId": session_id,
+                    })));
+                }
             }
-        },
+        }
     };
     let actorless = session_ref_missing;
     let event_count = events.len();

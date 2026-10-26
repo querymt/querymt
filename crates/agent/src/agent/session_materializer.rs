@@ -318,6 +318,8 @@ impl SessionMaterializer {
         // Lineage is validated before anything is allocated.
         if let Some(source) = options.source_session_id.as_deref() {
             self.ensure_lineage_source(source).await?;
+            self.ensure_lineage_same_repository(source, requested_cwd.as_deref())
+                .await?;
         }
 
         let Some(service) = self.workspace_service() else {
@@ -347,6 +349,53 @@ impl SessionMaterializer {
             .allocate_for_new_session(source_cwd, &options)
             .await
             .map_err(worktree_error_to_acp)
+    }
+
+    /// A lineage source must live in the same repository as the requested
+    /// cwd, so direct `session/new` cannot nest a session under an unrelated
+    /// project (the `WorktreeOps` surfaces enforce the same rule).
+    async fn ensure_lineage_same_repository(
+        &self,
+        source_session_id: &str,
+        requested_cwd: Option<&std::path::Path>,
+    ) -> Result<(), Error> {
+        let (Some(service), Some(requested)) = (self.workspace_service(), requested_cwd) else {
+            return Ok(());
+        };
+        let persisted = self
+            .config
+            .provider
+            .history_store()
+            .get_session(source_session_id)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?
+            .and_then(|session| session.cwd);
+        let Some(source_cwd) = service
+            .resolve_session_cwd(source_session_id, persisted)
+            .await
+            .map_err(worktree_error_to_acp)?
+        else {
+            return Ok(());
+        };
+        let requested = requested.to_path_buf();
+        let same = tokio::task::spawn_blocking(move || {
+            match (
+                crate::worktree::resolve_repository(&source_cwd),
+                crate::worktree::resolve_repository(&requested),
+            ) {
+                (Ok(a), Ok(b)) => a.identity.common_dir == b.identity.common_dir,
+                _ => false,
+            }
+        })
+        .await
+        .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        if same {
+            Ok(())
+        } else {
+            Err(invalid_workspace_request(&format!(
+                "cwd is outside the repository of source session {source_session_id}"
+            )))
+        }
     }
 
     /// The session a worktree session descends from must exist in this
@@ -1245,7 +1294,11 @@ impl SessionMaterializer {
             .recover_fork_isolation(session_id, &intent)
             .await
             .map_err(worktree_error_to_acp)?;
-        self.finalize_fork_isolation(session_id, &binding).await
+        let response = self.finalize_fork_isolation(session_id, &binding).await?;
+        if intent.handoff_workspace_id.is_some() {
+            self.record_handoff_workspace_binding(session_id).await;
+        }
+        Ok(response)
     }
 
     /// Persist the successor of an ownership handoff behind a durable
@@ -1306,7 +1359,34 @@ impl SessionMaterializer {
             .history_store()
             .complete_fork_isolation(successor)
             .await
-            .map_err(|err| Error::internal_error().data(err.to_string()))
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        self.record_handoff_workspace_binding(successor).await;
+        Ok(())
+    }
+
+    /// Record the successor's `SessionWorkspaceBound` event, like every
+    /// managed session. Best effort: the registry is authoritative.
+    async fn record_handoff_workspace_binding(&self, successor: &str) {
+        let Some(service) = self.workspace_service() else {
+            return;
+        };
+        let Ok(Some(record)) = service.registry().get_workspace_by_session(successor).await else {
+            return;
+        };
+        let cwd = Some(record.session_cwd());
+        if let Err(err) = self
+            .config
+            .emit_event_persisted(
+                successor,
+                AgentEventKind::SessionWorkspaceBound {
+                    workspace: workspace_view(&record),
+                    cwd,
+                },
+            )
+            .await
+        {
+            tracing::warn!(successor, error = %err, "failed to record handoff workspace binding");
+        }
     }
 
     /// Delete a successor that never became the owner (best effort: a
@@ -1419,24 +1499,7 @@ impl SessionMaterializer {
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?
         {
-            let workspace = crate::session::projection::SessionWorkspaceView {
-                workspace_id: record.id.to_string(),
-                repository_id: record.repository.common_dir.display().to_string(),
-                source_cwd: record.source_cwd.clone(),
-                project_name: record.repository.project_name.clone(),
-                checkout_path: record.checkout_path.display().to_string(),
-                branch: record.branch.as_str().to_string(),
-                baseline_mode: record
-                    .baseline
-                    .as_ref()
-                    .map(|b| b.mode.to_string())
-                    .unwrap_or_else(|| "commit".to_string()),
-                baseline_commit: record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
-                lifecycle: record.lifecycle.to_string(),
-                last_error: record.last_error.clone(),
-                owner_session_id: record.ownership.owner_session_id.clone(),
-                handed_off_to: record.ownership.handed_off_to.clone(),
-            };
+            let workspace = workspace_view(&record);
             self.config
                 .emit_event_persisted(
                     &prepared.session_id,
@@ -1813,6 +1876,30 @@ fn worktree_error_to_acp(err: crate::worktree::WorktreeError) -> Error {
             "code": code,
             "message": message,
         })),
+    }
+}
+
+/// Disclosure view of a managed workspace record.
+fn workspace_view(
+    record: &crate::worktree::WorkspaceRecord,
+) -> crate::session::projection::SessionWorkspaceView {
+    crate::session::projection::SessionWorkspaceView {
+        workspace_id: record.id.to_string(),
+        repository_id: record.repository.common_dir.display().to_string(),
+        source_cwd: record.source_cwd.clone(),
+        project_name: record.repository.project_name.clone(),
+        checkout_path: record.checkout_path.display().to_string(),
+        branch: record.branch.as_str().to_string(),
+        baseline_mode: record
+            .baseline
+            .as_ref()
+            .map(|b| b.mode.to_string())
+            .unwrap_or_else(|| "commit".to_string()),
+        baseline_commit: record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
+        lifecycle: record.lifecycle.to_string(),
+        last_error: record.last_error.clone(),
+        owner_session_id: record.ownership.owner_session_id.clone(),
+        handed_off_to: record.ownership.handed_off_to.clone(),
     }
 }
 

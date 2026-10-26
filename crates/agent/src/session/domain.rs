@@ -274,6 +274,14 @@ pub enum ForkOrigin {
     Worktree,
 }
 
+impl ForkOrigin {
+    /// Origins listed as visible forks/children (delegates are hidden). The
+    /// SQL twin is `VISIBLE_FORK_ORIGINS` in the view store.
+    pub fn is_visible_fork(origin: &str) -> bool {
+        matches!(origin, "user" | "worktree")
+    }
+}
+
 impl std::fmt::Display for ForkOrigin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
