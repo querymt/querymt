@@ -2877,6 +2877,135 @@ async fn embedded_messages_until(
     .expect("expected embedded message arrives")
 }
 
+async fn load_embedded_session(
+    connection: &super::websocket::EmbeddedAcpConnection,
+    rx: &mut mpsc::Receiver<String>,
+    session_id: &str,
+) {
+    connection
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": "load", "method": "session/load",
+                "params": {"sessionId": session_id, "cwd": "/tmp", "mcpServers": []}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let loaded = embedded_messages_until(rx, |m| m["id"] == "load").await;
+    assert!(loaded.last().unwrap()["error"].is_null(), "{loaded:?}");
+}
+
+#[tokio::test]
+async fn embedded_connections_restore_surviving_bridge_after_close() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let session_id = fixture
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new("/tmp"))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let server = super::websocket::EmbeddedAcpServer::new(fixture.handle.clone());
+    let ((mut first, mut first_rx), (mut second, mut second_rx)) =
+        tokio::join!(server.open(None), server.open(None));
+    drop(server);
+    load_embedded_session(&first, &mut first_rx, &session_id).await;
+    let first_bridge = fixture.config.session_bridges.lock().unwrap()[&session_id]
+        .bridge
+        .clone();
+    load_embedded_session(&second, &mut second_rx, &session_id).await;
+    let second_bridge = fixture.config.session_bridges.lock().unwrap()[&session_id]
+        .bridge
+        .clone();
+    assert_ne!(first_bridge.connection_id(), second_bridge.connection_id());
+
+    second.close().await;
+    second.close().await;
+    let restored = fixture
+        .config
+        .session_bridges
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .expect("surviving embedded connection must regain the session bridge")
+        .bridge
+        .clone();
+    assert!(Arc::ptr_eq(
+        &restored.connection_state().unwrap(),
+        &first_bridge.connection_state().unwrap(),
+    ));
+    let request = permission_request_for_test(&session_id, "after-close");
+    let permission = tokio::spawn(async move { restored.request_permission(request).await });
+    let messages = embedded_messages_until(&mut first_rx, |m| {
+        m["method"] == "session/request_permission"
+    })
+    .await;
+    first
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": messages.last().unwrap()["id"],
+                "result": selected("allow_once")
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let response = timeout(Duration::from_secs(2), permission)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0.as_ref() == "allow_once"
+    ));
+    first.close().await;
+    first.close().await;
+    assert!(
+        !fixture
+            .config
+            .session_bridges
+            .lock()
+            .unwrap()
+            .contains_key(&session_id)
+    );
+}
+
+#[tokio::test]
+async fn embedded_concurrent_closes_restore_third_connection_bridge() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let session_id = fixture
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new("/tmp"))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let server = super::websocket::EmbeddedAcpServer::new(fixture.handle.clone());
+    let (mut first, mut first_rx) = server.open(None).await;
+    let (mut survivor, mut survivor_rx) = server.open(None).await;
+    let (mut last, mut last_rx) = server.open(None).await;
+    load_embedded_session(&first, &mut first_rx, &session_id).await;
+    load_embedded_session(&survivor, &mut survivor_rx, &session_id).await;
+    let survivor_bridge = fixture.config.session_bridges.lock().unwrap()[&session_id]
+        .bridge
+        .clone();
+    load_embedded_session(&last, &mut last_rx, &session_id).await;
+
+    tokio::join!(first.close(), last.close());
+    let restored = fixture.config.session_bridges.lock().unwrap()[&session_id]
+        .bridge
+        .clone();
+    assert!(Arc::ptr_eq(
+        &restored.connection_state().unwrap(),
+        &survivor_bridge.connection_state().unwrap(),
+    ));
+    first.close().await;
+    last.close().await;
+    survivor.close().await;
+}
+
 #[tokio::test]
 async fn embedded_connection_dispatches_sessions_and_streams_before_prompt_response() {
     let (fixture, _) = prompt_fixture().await;

@@ -80,6 +80,15 @@ impl WsServerState {
     }
 }
 
+/// Shared ACP server state for embedders that provide their own byte transport.
+///
+/// Reuse one server for connections sharing an agent so disconnect cleanup can
+/// restore a surviving connection's session bridge. Connections retain this state
+/// independently; dropping the server does not close them.
+pub struct EmbeddedAcpServer {
+    state: WsServerState,
+}
+
 /// Opaque ACP connection adapter for embedders that provide their own byte transport.
 pub struct EmbeddedAcpConnection {
     state: WsServerState,
@@ -92,13 +101,20 @@ pub struct EmbeddedAcpConnection {
     closed: bool,
 }
 
-impl EmbeddedAcpConnection {
-    /// Open an embedded connection and return the sole receiver for server output.
+impl EmbeddedAcpServer {
+    /// Create a server that shares session ownership across its connections.
+    pub fn new(agent: Arc<crate::agent::LocalAgentHandle>) -> Self {
+        Self {
+            state: WsServerState::new(agent),
+        }
+    }
+
+    /// Open a connection and return the sole receiver for its server output.
     pub async fn open(
-        agent: Arc<crate::agent::LocalAgentHandle>,
+        &self,
         session_hooks: Option<Arc<dyn crate::acp::shared::AcpSessionHooks>>,
-    ) -> (Self, mpsc::Receiver<String>) {
-        let state = WsServerState::new(agent);
+    ) -> (EmbeddedAcpConnection, mpsc::Receiver<String>) {
+        let state = self.state.clone();
         let conn_id = Uuid::new_v4().to_string();
         state
             .elicitation_recovery
@@ -143,7 +159,7 @@ impl EmbeddedAcpConnection {
         ));
 
         (
-            Self {
+            EmbeddedAcpConnection {
                 state,
                 connection,
                 bridge_task: Some(bridge_task),
@@ -155,6 +171,19 @@ impl EmbeddedAcpConnection {
             },
             rx,
         )
+    }
+}
+
+impl EmbeddedAcpConnection {
+    /// Open a standalone connection with its own server state.
+    ///
+    /// For multiple connections sharing an agent, reuse [`EmbeddedAcpServer`]
+    /// instead so session bridge fallback can find surviving connections.
+    pub async fn open(
+        agent: Arc<crate::agent::LocalAgentHandle>,
+        session_hooks: Option<Arc<dyn crate::acp::shared::AcpSessionHooks>>,
+    ) -> (Self, mpsc::Receiver<String>) {
+        EmbeddedAcpServer::new(agent).open(session_hooks).await
     }
 
     /// Route a client request or response into the existing ACP WebSocket engine.

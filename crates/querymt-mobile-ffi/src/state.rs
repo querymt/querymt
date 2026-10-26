@@ -8,6 +8,7 @@ use crate::events::EventCallbacks;
 use crate::ffi_helpers::{ActiveCallTracker, new_agent_handle, new_session_handle};
 use crate::types::{AgentHandle, FfiErrorCode, SessionHandle};
 use parking_lot::Mutex;
+use querymt_agent::acp::websocket::EmbeddedAcpServer;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ impl HandleMap {
 
 struct RuntimeRecord {
     agent: Arc<querymt_agent::api::Agent>,
+    acp_server: Arc<EmbeddedAcpServer>,
     storage: Arc<dyn querymt_agent::session::backend::StorageBackend>,
     attached_agents: usize,
 }
@@ -40,6 +42,9 @@ struct RuntimeRecord {
 pub struct AgentRecord {
     /// Shared process-wide QueryMT Agent runtime.
     pub agent: Arc<querymt_agent::api::Agent>,
+
+    /// ACP server shared by every logical handle attached to this runtime.
+    pub(crate) acp_server: Arc<EmbeddedAcpServer>,
 
     /// View store shared from the process runtime storage.
     pub view_store: Option<Arc<dyn querymt_agent::session::projection::ViewStore>>,
@@ -82,18 +87,21 @@ pub fn attach_or_insert_runtime_agent(
     let mut state = HANDLE_STATE.lock();
 
     if state.runtime.is_none() {
+        let acp_server = Arc::new(EmbeddedAcpServer::new(agent.inner()));
         state.runtime = Some(RuntimeRecord {
             agent: Arc::new(agent),
+            acp_server,
             storage,
             attached_agents: 0,
         });
     }
 
-    let (agent_arc, view_store, reused) = {
+    let (agent_arc, acp_server, view_store, reused) = {
         let runtime = state.runtime.as_mut().expect("runtime initialized above");
         runtime.attached_agents = runtime.attached_agents.saturating_add(1);
         (
             Arc::clone(&runtime.agent),
+            Arc::clone(&runtime.acp_server),
             runtime.storage.view_store(),
             runtime.attached_agents > 1,
         )
@@ -103,6 +111,7 @@ pub fn attach_or_insert_runtime_agent(
         handle,
         AgentRecord {
             agent: agent_arc,
+            acp_server,
             view_store,
             mesh_listen: None,
             mesh_discovery: None,
@@ -120,16 +129,21 @@ pub fn attach_or_insert_runtime_agent(
 pub fn attach_existing_runtime_agent() -> Option<AgentHandle> {
     let handle = new_agent_handle();
     let mut state = HANDLE_STATE.lock();
-    let (agent_arc, view_store) = {
+    let (agent_arc, acp_server, view_store) = {
         let runtime = state.runtime.as_mut()?;
         runtime.attached_agents = runtime.attached_agents.saturating_add(1);
-        (Arc::clone(&runtime.agent), runtime.storage.view_store())
+        (
+            Arc::clone(&runtime.agent),
+            Arc::clone(&runtime.acp_server),
+            runtime.storage.view_store(),
+        )
     };
 
     state.agents.insert(
         handle,
         AgentRecord {
             agent: agent_arc,
+            acp_server,
             view_store,
             mesh_listen: None,
             mesh_discovery: None,

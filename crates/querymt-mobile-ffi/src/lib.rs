@@ -683,12 +683,12 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
         );
         return FfiErrorCode::InvalidArgument as i32;
     }
-    let (inner, view_store) = match state::with_agent_read(agent_handle, |record| {
+    let (acp_server, view_store) = match state::with_agent_read(agent_handle, |record| {
         let view_store = record
             .view_store
             .clone()
             .ok_or(FfiErrorCode::RuntimeError)?;
-        Ok((record.agent.inner(), view_store))
+        Ok((record.acp_server.clone(), view_store))
     }) {
         Ok(result) => result,
         Err(code) => return code as i32,
@@ -708,9 +708,7 @@ pub unsafe extern "C" fn qmt_ffi_acp_open(agent_handle: u64, out_connection: *mu
     };
     let hooks: Arc<dyn querymt_agent::acp::shared::AcpSessionHooks> =
         Arc::new(MobileAcpSessionHooks { view_store });
-    let (adapter, mut outgoing) = runtime::global_runtime().block_on(
-        querymt_agent::acp::websocket::EmbeddedAcpConnection::open(inner, Some(hooks)),
-    );
+    let (adapter, mut outgoing) = runtime::global_runtime().block_on(acp_server.open(Some(hooks)));
     let callback_sender = callbacks.clone();
     let output_task = runtime::global_runtime().spawn(async move {
         while let Some(json) = outgoing.recv().await {
@@ -1663,6 +1661,54 @@ mod tests {
             .as_array()
             .expect("model/config options retained");
         assert!(config_options.iter().any(|option| option["id"] == "model"));
+
+        let reused_handle = make_ffi_test_agent().await;
+        let attached_handle =
+            state::attach_existing_runtime_agent().expect("attach shared runtime");
+        let server = state::with_agent_read(agent_handle, |record| Ok(record.acp_server.clone()))
+            .expect("original runtime server");
+        for handle in [reused_handle, attached_handle] {
+            let shared = state::with_agent_read(handle, |record| Ok(record.acp_server.clone()))
+                .expect("attached runtime server");
+            assert!(Arc::ptr_eq(&server, &shared));
+            let (code, other_connection) = ffi_acp_open(handle).await;
+            assert_eq!(code, FfiErrorCode::Ok as i32);
+            assert_ne!(connection, other_connection);
+            assert_eq!(
+                ffi_acp_send(
+                    other_connection,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": "shared-load", "method": "session/load",
+                        "params": {"sessionId": session_id}
+                    })
+                    .to_string()
+                )
+                .await,
+                FfiErrorCode::Ok as i32
+            );
+            let loaded = ffi_poll_until(
+                other_connection,
+                std::time::Duration::from_secs(5),
+                |message| message["id"] == "shared-load",
+            )
+            .await;
+            assert!(loaded.last().expect("shared session loaded")["error"].is_null());
+            assert_eq!(
+                ffi_acp_close(other_connection).await,
+                FfiErrorCode::Ok as i32
+            );
+            assert_eq!(
+                ffi_acp_close(other_connection).await,
+                FfiErrorCode::NotFound as i32
+            );
+            assert_eq!(
+                tokio::task::spawn_blocking(move || unsafe { qmt_ffi_shutdown(handle) })
+                    .await
+                    .expect("detach additional logical handle"),
+                FfiErrorCode::Ok as i32
+            );
+        }
+        drop(server);
 
         let prompt = serde_json::json!({
             "jsonrpc": "2.0",
