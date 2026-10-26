@@ -210,6 +210,12 @@ impl SessionEventStream {
 
     /// Publish an ephemeral event with the next sequence number.
     pub fn emit_ephemeral(&self, kind: AgentEventKind) {
+        self.emit_ephemeral_seq(kind);
+    }
+
+    /// Like [`Self::emit_ephemeral`], returning the assigned `session_seq` so
+    /// a prompt response can wait for the event (`with_event_tip`).
+    pub fn emit_ephemeral_seq(&self, kind: AgentEventKind) -> i64 {
         let mut state = self.shared.state.lock();
         let seq = state.next_seq;
         state.next_seq += 1;
@@ -226,6 +232,7 @@ impl SessionEventStream {
             Slot::Publish(Box::new((envelope, None))),
             &self.shared.fanout,
         );
+        seq
     }
 
     fn enqueue(

@@ -33,7 +33,7 @@ The system SHALL support local and isolated-worktree session creation without re
 - **THEN** the session executes locally in the requested cwd and no managed worktree is created
 
 ### Requirement: Durable workspace identity and binding
-The system SHALL persist workspace ownership, repository/project identity, execution path, baseline, branch, and relative cwd independently of conversation contents. Load and resume SHALL use the persisted isolated workspace binding and SHALL reject conflicting cwd requests or unavailable workspaces rather than silently falling back. A managed workspace SHALL NOT be attached to a second writable session.
+The system SHALL persist workspace ownership, repository/project identity, execution path, baseline, branch, relative cwd, and source cwd independently of conversation contents. Load and resume SHALL use the persisted isolated workspace binding and SHALL reject conflicting cwd requests or unavailable workspaces rather than silently falling back. A managed workspace SHALL NOT be attached to a second writable session; its single owner MAY change only through an explicit ownership handoff.
 
 #### Scenario: Resume after restart
 - **WHEN** an isolated session is resumed after process restart
@@ -51,7 +51,18 @@ The system SHALL persist workspace ownership, repository/project identity, execu
 
 #### Scenario: Second writable owner
 - **WHEN** another session attempts to attach to an owned managed checkout
-- **THEN** the system rejects the attachment or creates a distinct workspace through an explicit creation request
+- **THEN** the system rejects the attachment, creates a distinct workspace through an explicit creation request, or transfers ownership through an explicit handoff
+
+### Requirement: Workspace source cwd
+Each managed workspace SHALL record the cwd of the session or request it was isolated from, normalized like session cwds. When that source is inside a managed checkout, the source cwd SHALL be inherited from that checkout's workspace. The source cwd SHALL be retained after archival and removal.
+
+#### Scenario: Nested isolation keeps the original source
+- **WHEN** a workspace is created from a session that already runs in a managed checkout whose source cwd is `/p/app`
+- **THEN** the new workspace's source cwd is `/p/app`, not the parent checkout path
+
+#### Scenario: Path aliases match session rows
+- **WHEN** a workspace is isolated from a session whose cwd is a symlinked or aliased path
+- **THEN** the recorded source cwd equals that session's stored cwd
 
 ### Requirement: Workspace-consistent execution
 The system SHALL initialize filesystem tools, indexes, workspace-dependent configuration, and execution-related hooks using the effective session workspace. It SHALL disclose the execution path and SHALL NOT silently use an editor or external tool integration bound to another checkout. Isolation SHALL NOT be represented as filesystem sandboxing.
@@ -103,13 +114,118 @@ An isolated fork SHALL remain non-runnable until its independent workspace is du
 The system SHALL provide creation, listing, status, result inspection, and removal through agent operations and a worktree command surface. Creating through that surface SHALL return a new session identity without moving the current session. Workspace views SHALL distinguish project identity from execution path and SHALL expose ownership, branch, baseline mode, live change status, and lifecycle errors.
 
 #### Scenario: Project has several managed checkouts
-- **WHEN** the user lists sessions and workspaces for a project
-- **THEN** related isolated sessions can be grouped under the same repository identity while retaining their distinct execution paths
+- **WHEN** the user lists sessions for a project with local and isolated sessions started from `/p/app`
+- **THEN** all of them appear in the `/p/app` group, isolated sessions are marked with their workspace, and each keeps its distinct execution path
 
 #### Scenario: Create from an existing conversation
 - **WHEN** a user requests worktree creation through the current conversation's command surface
 - **THEN** the result identifies the new isolated session and path
 - **AND** the current conversation keeps its existing workspace
+
+### Requirement: Source-cwd session grouping
+Session listing SHALL group a managed session under its workspace's source cwd and an unassociated local session under its cwd. Filtering by `cwd` SHALL use the same key, so browse, search, and per-group paging agree. A session's listed cwd SHALL remain its execution path. Listing SHALL disclose on each managed session its workspace identity, branch, checkout path, source cwd, baseline mode, lifecycle, owner, and handoff target if any.
+
+#### Scenario: Mixed local and isolated sessions
+- **WHEN** the user lists sessions with local and isolated sessions started from `/p/app`
+- **THEN** all of them appear in the `/p/app` group, isolated sessions carry workspace metadata, and each keeps its execution path
+
+#### Scenario: Search agrees with browse
+- **WHEN** a search matches an isolated session
+- **THEN** it is returned in the same group as browsing would place it
+
+### Requirement: Worktree session lineage
+A session created from a source session through the worktree surface, or by handoff, SHALL record that session as its parent with fork origin `worktree`, persisted atomically with the session row. Listing SHALL count and nest `worktree` children like user forks and return them for the forks and children scopes. Delegated children SHALL stay hidden.
+
+#### Scenario: Native create records lineage
+- **WHEN** `/worktree create` is issued from session S
+- **THEN** the new session is listed nested under S with fork origin `worktree`
+
+#### Scenario: Explicit source on other surfaces
+- **WHEN** creation through the ACP extension, simple API, or Python names a source session
+- **THEN** the new session records the same lineage as the native command
+- **AND** an empty cwd defaults to the source session's effective cwd, and a cwd outside the source's repository is rejected with `invalid_options`
+
+#### Scenario: Isolated root without a source session
+- **WHEN** an isolated session is created through `session/new` metadata without a source session
+- **THEN** it is a root session listed in its source cwd's group and marked with its workspace
+
+#### Scenario: Isolated fork stays with its parent
+- **WHEN** an isolated conversation fork is listed
+- **THEN** it appears in its parent's group, nested under the parent
+
+#### Scenario: Retired workspace does not move
+- **WHEN** a session's workspace is archived or removed
+- **THEN** the session stays in the same group and its listed workspace lifecycle reflects the retirement
+
+#### Scenario: Delegates remain hidden
+- **WHEN** an isolated or shared delegate exists for a listed session
+- **THEN** it is not listed as a fork or worktree child
+
+### Requirement: Ownership handoff
+The owner of a ready managed workspace SHALL be able to hand ownership to a new session in the same checkout on every management surface. The owner SHALL be local and idle, with no shared delegates. Ownership SHALL move atomically, leaving one owner or a recoverable intent. The new session SHALL start without history unless a summary is requested. Files, branch, index, and baseline SHALL be unchanged.
+
+#### Scenario: Clean handoff from an idle owner
+- **WHEN** the owner of a ready workspace requests a handoff without a summary
+- **THEN** a new session owns the same checkout and branch, has no copied history, and is listed nested under the previous owner
+- **AND** the response identifies the new session, previous session, workspace, and execution cwd
+
+#### Scenario: Handoff with a summary
+- **WHEN** a handoff explicitly requests a summary
+- **THEN** the new session starts with a summary of the previous conversation and the response reports that it was seeded
+
+#### Scenario: Owner still active
+- **WHEN** the owner has a running turn, shared delegates, or execution in another process
+- **THEN** the handoff is refused with `owner_active` and ownership is unchanged
+
+#### Scenario: Not the owner or not ready
+- **WHEN** a handoff targets a session that does not own a ready workspace, or a remote-hosted session
+- **THEN** it is refused with a stable code and nothing is created
+
+#### Scenario: Crash during handoff
+- **WHEN** the process stops after the new session row is written but before ownership is transferred
+- **THEN** recovery leaves the previous owner as the single owner or completes the transfer, and the new session never runs without ownership
+
+#### Scenario: Native command reply
+- **WHEN** `/worktree handoff` is issued from the owner session
+- **THEN** the requesting client receives the handoff result in the prompt response `_meta["querymt.worktree"]`
+- **AND** every client attached to the previous owner receives the ownership-transferred session update before that response, although the previous owner's actor was unloaded to complete the handoff
+- **AND** no client bridge route is used to deliver either
+
+#### Scenario: Handoff announced on every surface
+- **WHEN** a handoff completes through the ACP extension, the simple API, or Python
+- **THEN** a durable ownership-transferred event is recorded on the previous owner's session stream, naming the workspace, the successor session, and whether a summary was seeded
+- **AND** a failure to record that event is logged and does not fail or undo the committed handoff
+
+### Requirement: Previous owners are read-only
+After a handoff, the previous owner SHALL remain listable and loadable. Loading it SHALL replay its history and disclose read-only access with reason `owner_transferred` and the current owner session. Prompts, queued or steered input, undo/redo, forks, and worktree operations that would run or mutate it SHALL be refused with `owner_transferred`. It SHALL never reload as a local or shared session in the checkout, and its snapshots SHALL be context-only.
+
+#### Scenario: Load a previous owner
+- **WHEN** a client loads a session whose workspace was handed off
+- **THEN** the history is replayed and the load response discloses `sessionAccess.mode = "read_only"` with the current owner
+
+#### Scenario: Standard ACP client loads a previous owner
+- **WHEN** a client that does not use the load snapshot loads a previous owner over stdio or WebSocket
+- **THEN** the load succeeds without materializing an actor, and replayed `session/update` notifications contain its history followed by the ownership-transferred update
+- **AND** the replay contains no configuration-option update for the read-only session
+
+#### Scenario: Prompt a previous owner
+- **WHEN** a client prompts a previous owner
+- **THEN** the prompt is refused with `owner_transferred` and no tool executes
+
+### Requirement: Native command output is delivered through the session event stream
+Native `/worktree` output SHALL reach clients only through the prompt response and the issuing session's ordered event stream, never a client bridge route. The update SHALL reach every attached connection before the prompt response. A failed delivery SHALL NOT fail a completed operation.
+
+#### Scenario: Output reaches attached clients before the response
+- **WHEN** any native `/worktree` command succeeds on a session attached to one or more connections
+- **THEN** each connection receives the output as an agent message update before the prompt response, on stdio and WebSocket alike
+
+#### Scenario: Output is not replayed
+- **WHEN** a session that ran a native command is loaded later
+- **THEN** the command's output update is not replayed, except for the durable ownership-transferred update of a handoff
+
+#### Scenario: No bridge route registered
+- **WHEN** a native command runs and no client bridge route exists for the session
+- **THEN** output delivery and the prompt response are unchanged
 
 ### Requirement: Baseline-relative workspace result inspection
 Result publication and inspection SHALL support top-level workspaces as well as delegates. Review SHALL identify the immutable baseline and result, baseline-relative changed paths and change kinds, verification state, and captured HEAD. Live HEAD/dirty state SHALL be labeled separately. Dirty-parent baselines SHALL carry a warning against directly merging inherited baseline edits.
@@ -226,7 +342,7 @@ Configuration MAY set a default baseline mode for top-level isolated creation. I
 - **THEN** the session starts from that commit and reports that local changes are excluded
 
 ### Requirement: One operation core for all management surfaces
-Creation, listing, status, result, publication, archival, removal, and recovery SHALL share one typed implementation across ACP extensions, native `/worktree`, the simple API, and Python. Failures SHALL carry stable machine-readable error codes on every surface alongside human-readable diagnostics.
+Creation, handoff, listing, status, result, publication, archival, removal, and recovery SHALL share one typed implementation across ACP extensions, native `/worktree`, the simple API, and Python. Failures SHALL carry stable machine-readable error codes on every surface alongside human-readable diagnostics.
 
 #### Scenario: Equivalent results across surfaces
 - **WHEN** the same create or result operation is performed through native `/worktree` and through Python
@@ -241,7 +357,7 @@ Creation, listing, status, result, publication, archival, removal, and recovery 
 - **THEN** ACP error data and the Python exception expose the corresponding stable code
 
 ### Requirement: Workspace capability discoverability
-Agents with a workspace service SHALL advertise workspace support and the default baseline through additive capability metadata. Isolated session creation SHALL disclose the resolved execution cwd, workspace identity, branch, baseline mode, and excluded content.
+Agents with a workspace service SHALL advertise workspace support, the default baseline, and the `sourceSession`, `handoff`, and `handoffSummary` features through additive capability metadata. Isolated session creation and managed session load SHALL disclose the resolved execution cwd, workspace identity, branch, baseline mode, and excluded content.
 
 #### Scenario: Client offers an explicit choice
 - **WHEN** a client initializes against an agent with the service enabled
@@ -250,6 +366,10 @@ Agents with a workspace service SHALL advertise workspace support and the defaul
 #### Scenario: Binding disclosed at creation
 - **WHEN** a worktree session is created through ACP
 - **THEN** the creation response identifies the execution cwd, workspace ID, branch, and baseline mode
+
+#### Scenario: Handoff capability advertised
+- **WHEN** a client initializes against an agent whose workspace service supports handoff with summaries
+- **THEN** the workspace capability metadata includes `sourceSession`, `handoff`, and `handoffSummary` set to true
 
 ### Requirement: Requested isolation fails closed
 When a usable repository/base, supported repository layout, durable storage, or local filesystem execution is unavailable, requested isolation SHALL fail with an actionable error before agent execution. The system SHALL NOT downgrade to shared execution. Concurrent administration SHALL prevent duplicate allocation and ownership across processes.

@@ -822,6 +822,33 @@ impl LocalAgentHandle {
                 .meta(meta));
         }
 
+        // A previous owner replays its history but never materializes: no
+        // actor, no lease, no cwd inside the checkout it handed away.
+        if let Some(owner) = self
+            .session_materializer
+            .transferred_owner(&session_id)
+            .await?
+        {
+            let mut meta = self
+                .session_load_snapshot_meta(&session_id)
+                .await?
+                .unwrap_or_default();
+            let namespace = meta
+                .entry(crate::acp::shared::QUERYMT_META_NAMESPACE.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            if let Some(namespace) = namespace.as_object_mut() {
+                namespace.insert(
+                    "sessionAccess".to_string(),
+                    serde_json::json!({
+                        "mode": "read_only",
+                        "reason": "owner_transferred",
+                        "ownerSessionId": owner,
+                    }),
+                );
+            }
+            return Ok(LoadSessionResponse::new().meta(meta));
+        }
+
         if let Some(profiles) = self.profiles() {
             let binding = profiles.session_binding(&session_id).await.ok_or_else(|| {
                 Error::invalid_params().data(serde_json::json!({
@@ -993,30 +1020,47 @@ impl LocalAgentHandle {
         Ok(response)
     }
 
+    /// `_meta` for a `session/load` response: the history snapshot (when a
+    /// view store exists) plus, for managed sessions only, the
+    /// `querymt.sessionWorkspace` disclosure. Local sessions carry no
+    /// workspace entry.
     async fn session_load_snapshot_meta(
         &self,
         session_id: &str,
     ) -> std::result::Result<Option<serde_json::Map<String, serde_json::Value>>, Error> {
-        let Some(view_store) = self.config.storage.view_store() else {
-            return Ok(None);
-        };
-        let snapshot = crate::session::load_session_snapshot(self, view_store, session_id)
-            .await
-            .map_err(|error| {
+        let mut meta = serde_json::Map::new();
+        if let Some(view_store) = self.config.storage.view_store() {
+            let snapshot = crate::session::load_session_snapshot(self, view_store, session_id)
+                .await
+                .map_err(|error| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": format!("Failed to build session load snapshot: {error}"),
+                        "sessionId": session_id,
+                    }))
+                })?;
+            let snapshot = serde_json::to_value(snapshot).map_err(|error| {
                 Error::internal_error().data(serde_json::json!({
-                    "message": format!("Failed to build session load snapshot: {error}"),
+                    "message": format!("Failed to serialize session load snapshot: {error}"),
                     "sessionId": session_id,
                 }))
             })?;
-        let snapshot = serde_json::to_value(snapshot).map_err(|error| {
-            Error::internal_error().data(serde_json::json!({
-                "message": format!("Failed to serialize session load snapshot: {error}"),
-                "sessionId": session_id,
-            }))
-        })?;
-        let mut meta = serde_json::Map::new();
-        meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
-        Ok(Some(meta))
+            meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
+        }
+
+        if let Some(service) = self.config.workspace_service()
+            && let Some(binding) = service
+                .resolve_existing_session(session_id, None)
+                .await
+                .map_err(|err| Error::internal_error().data(err.to_string()))?
+        {
+            meta.insert(
+                crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::json!({
+                    crate::worktree::SESSION_WORKSPACE_META_KEY: binding.disclosure(),
+                }),
+            );
+        }
+        Ok((!meta.is_empty()).then_some(meta))
     }
 
     /// Gracefully shutdown the agent and all background tasks.

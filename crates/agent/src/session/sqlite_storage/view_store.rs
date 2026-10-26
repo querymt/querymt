@@ -64,7 +64,7 @@ fn map_session_list_item_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
 fn load_workspace_views(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<HashMap<String, crate::session::projection::SessionWorkspaceView>> {
-    let mut stmt = conn.prepare("SELECT owner_session_id, public_id, common_dir, project_name, checkout_path, branch, baseline_mode, baseline_commit, lifecycle, last_error FROM workspaces WHERE owner_session_id IS NOT NULL")?;
+    let mut stmt = conn.prepare("SELECT owner_session_id, public_id, common_dir, project_name, checkout_path, branch, baseline_mode, baseline_commit, lifecycle, last_error, COALESCE(source_cwd, ''), handed_off_to FROM workspaces WHERE owner_session_id IS NOT NULL")?;
     let views = stmt
         .query_map([], |row| {
             Ok((
@@ -72,6 +72,7 @@ fn load_workspace_views(
                 crate::session::projection::SessionWorkspaceView {
                     workspace_id: row.get(1)?,
                     repository_id: row.get(2)?,
+                    source_cwd: row.get(10)?,
                     project_name: row.get(3)?,
                     checkout_path: row.get(4)?,
                     branch: row.get(5)?,
@@ -79,6 +80,8 @@ fn load_workspace_views(
                     baseline_commit: row.get(7)?,
                     lifecycle: row.get(8)?,
                     last_error: row.get(9)?,
+                    owner_session_id: row.get(0)?,
+                    handed_off_to: row.get(11)?,
                 },
             ))
         })?
@@ -147,15 +150,31 @@ fn parse_finish_reason(value: &str) -> Option<FinishReason> {
     }
 }
 
+/// SQL expression yielding the project grouping key of session alias `alias`.
+///
+/// Managed sessions group under the cwd their workspace was created from
+/// (`workspaces.source_cwd`, kept after archive and removal); every other
+/// session groups under its own cwd. One definition keeps browse, list,
+/// search, counts and latest-activity queries in agreement.
+fn group_key_sql(alias: &str) -> String {
+    format!(
+        "COALESCE((SELECT w.source_cwd FROM workspaces w WHERE w.owner_session_id = {alias}.public_id), {alias}.cwd)"
+    )
+}
+
+/// Fork origins listed as visible children (forks and worktree siblings).
+/// Delegates are deliberately absent. Every fork scope, `fork_count`
+/// subquery and children listing interpolates this one constant.
+pub(super) const VISIBLE_FORK_ORIGINS: &str = "('user', 'worktree')";
+
 fn session_scope_where(scope: SessionScope, alias: &str) -> String {
     match scope {
         SessionScope::All => "1 = 1".to_string(),
-        SessionScope::Root => format!("{}.parent_session_id IS NULL", alias),
+        SessionScope::Root => format!("{alias}.parent_session_id IS NULL"),
         SessionScope::Forks => format!(
-            "{}.parent_session_id IS NOT NULL AND {}.fork_origin = 'user'",
-            alias, alias
+            "{alias}.parent_session_id IS NOT NULL AND {alias}.fork_origin IN {VISIBLE_FORK_ORIGINS}"
         ),
-        SessionScope::Children => format!("{}.parent_session_id IS NOT NULL", alias),
+        SessionScope::Children => format!("{alias}.parent_session_id IS NOT NULL"),
         SessionScope::Delegates => format!(
             "{}.parent_session_id IS NOT NULL AND {}.fork_origin = 'delegation'",
             alias, alias
@@ -470,7 +489,7 @@ impl ViewStore for SqliteStorage {
                                 WHERE t.session_id = s.id AND t.kind = 'recurring'
                             )                                            AS is_recurring,
                             (SELECT COUNT(*) FROM sessions c
-                                WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'
+                                WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}
                             )                                            AS fork_count
                         FROM sessions s
                         LEFT JOIN intent_snapshots i
@@ -504,7 +523,7 @@ impl ViewStore for SqliteStorage {
                             WHERE t.session_id = s.id AND t.kind = 'recurring'
                         )                                            AS is_recurring,
                         (SELECT COUNT(*) FROM sessions c
-                            WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'
+                            WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}
                         )                                            AS fork_count
                     FROM sessions s
                     LEFT JOIN intent_snapshots i
@@ -813,6 +832,7 @@ impl ViewStore for SqliteStorage {
         let preview_limit = session_limit_per_group.clamp(1, 100);
 
         self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
             let scope_where = format!(
                 "{} AND {}",
                 session_scope_where(session_scope, "s"),
@@ -827,13 +847,13 @@ impl ViewStore for SqliteStorage {
             let mut summary_stmt = conn.prepare(&format!(
                 r#"
                 SELECT
-                    COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd),
+                    {group_key},
                     COUNT(*) as total_count,
                     MAX(s.updated_at) as latest_activity
                 FROM sessions s
                 WHERE {}
-                GROUP BY COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd)
-                ORDER BY (COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) IS NOT NULL), MAX(s.updated_at) DESC
+                GROUP BY {group_key}
+                ORDER BY ({group_key} IS NOT NULL), MAX(s.updated_at) DESC
                 LIMIT ?1 OFFSET ?2
                 "#,
                 scope_where
@@ -851,7 +871,7 @@ impl ViewStore for SqliteStorage {
 
             let total_groups: usize = conn.query_row(
                 &format!(
-                    "SELECT COUNT(DISTINCT COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd, '__none__')) FROM sessions s WHERE {}",
+                    "SELECT COUNT(DISTINCT COALESCE({group_key}, '__none__')) FROM sessions s WHERE {}",
                     scope_where
                 ),
                 [],
@@ -874,13 +894,13 @@ impl ViewStore for SqliteStorage {
                             p.public_id,
                             s.fork_origin,
                             s.session_kind,
-                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                             i.summary
                         FROM sessions s
                         LEFT JOIN sessions p ON p.id = s.parent_session_id
                         LEFT JOIN intent_snapshots i
                             ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                        WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}
+                        WHERE {group_key} = ?1 AND {}
                         ORDER BY s.updated_at DESC
                         LIMIT ?2
                         "#,
@@ -898,7 +918,7 @@ impl ViewStore for SqliteStorage {
                             p.public_id,
                             s.fork_origin,
                             s.session_kind,
-                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                            (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                             i.summary
                         FROM sessions s
                         LEFT JOIN sessions p ON p.id = s.parent_session_id
@@ -981,6 +1001,7 @@ impl ViewStore for SqliteStorage {
         let limit = limit.clamp(1, 200);
 
         self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
             let scope_where = format!(
                 "{} AND {}",
                 session_scope_where(session_scope, "s"),
@@ -989,7 +1010,7 @@ impl ViewStore for SqliteStorage {
             let total_count: usize = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
                     &format!(
-                        "SELECT COUNT(*) FROM sessions s WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}",
+                        "SELECT COUNT(*) FROM sessions s WHERE {group_key} = ?1 AND {}",
                         scope_where
                     ),
                     params![cwd_value],
@@ -1009,7 +1030,7 @@ impl ViewStore for SqliteStorage {
             let latest_raw: Option<String> = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
                     &format!(
-                        "SELECT MAX(s.updated_at) FROM sessions s WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}",
+                        "SELECT MAX(s.updated_at) FROM sessions s WHERE {group_key} = ?1 AND {}",
                         scope_where
                     ),
                     params![cwd_value],
@@ -1040,13 +1061,13 @@ impl ViewStore for SqliteStorage {
                         p.public_id,
                         s.fork_origin,
                         s.session_kind,
-                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                         i.summary
                     FROM sessions s
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                    WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}
+                    WHERE {group_key} = ?1 AND {}
                     ORDER BY s.updated_at DESC
                     LIMIT ?2 OFFSET ?3
                     "#,
@@ -1064,7 +1085,7 @@ impl ViewStore for SqliteStorage {
                         p.public_id,
                         s.fork_origin,
                         s.session_kind,
-                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                         i.summary
                     FROM sessions s
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
@@ -1160,13 +1181,13 @@ impl ViewStore for SqliteStorage {
             };
 
             let total_count: usize = conn.query_row(
-                &format!("SELECT COUNT(*) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user' AND {lifecycle_where}"),
+                &format!("SELECT COUNT(*) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin IN {VISIBLE_FORK_ORIGINS} AND {lifecycle_where}"),
                 params![parent_db_id],
                 |row| row.get::<_, i64>(0).map(|v| v as usize),
             )?;
 
             let latest_raw: Option<String> = conn.query_row(
-                &format!("SELECT MAX(s.updated_at) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user' AND {lifecycle_where}"),
+                &format!("SELECT MAX(s.updated_at) FROM sessions s WHERE s.parent_session_id = ?1 AND s.fork_origin IN {VISIBLE_FORK_ORIGINS} AND {lifecycle_where}"),
                 params![parent_db_id],
                 |row| row.get(0),
             )?;
@@ -1184,13 +1205,13 @@ impl ViewStore for SqliteStorage {
                     p.public_id,
                     s.fork_origin,
                     s.session_kind,
-                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                     i.summary
                 FROM sessions s
                 LEFT JOIN sessions p ON p.id = s.parent_session_id
                 LEFT JOIN intent_snapshots i
                     ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                WHERE s.parent_session_id = ?1 AND s.fork_origin = 'user' AND {lifecycle_where}
+                WHERE s.parent_session_id = ?1 AND s.fork_origin IN {VISIBLE_FORK_ORIGINS} AND {lifecycle_where}
                 ORDER BY s.updated_at DESC
                 LIMIT ?2 OFFSET ?3
                 "#
@@ -1278,9 +1299,10 @@ impl ViewStore for SqliteStorage {
         };
 
         self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
             let total_count: usize = if let Some(ref cwd_value) = cwd {
                 conn.query_row(
-                    &format!("SELECT COUNT(*) FROM sessions s LEFT JOIN session_pins sp ON sp.session_id = s.id WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}", scope_where),
+                    &format!("SELECT COUNT(*) FROM sessions s LEFT JOIN session_pins sp ON sp.session_id = s.id WHERE {group_key} = ?1 AND {}", scope_where),
                     params![cwd_value],
                     |row| row.get::<_, i64>(0).map(|v| v as usize),
                 )?
@@ -1307,14 +1329,14 @@ impl ViewStore for SqliteStorage {
                             SELECT 1 FROM tasks t
                             WHERE t.session_id = s.id AND t.kind = 'recurring'
                         ) THEN 'recurring' ELSE s.session_kind END,
-                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                         i.summary
                     FROM sessions s
                     LEFT JOIN session_pins sp ON sp.session_id = s.id
                     LEFT JOIN sessions p ON p.id = s.parent_session_id
                     LEFT JOIN intent_snapshots i
                         ON i.id = (SELECT MIN(id) FROM intent_snapshots WHERE session_id = s.id)
-                    WHERE COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd) = ?1 AND {}
+                    WHERE {group_key} = ?1 AND {}
                     ORDER BY {}
                     LIMIT ?2 OFFSET ?3
                     "#,
@@ -1336,7 +1358,7 @@ impl ViewStore for SqliteStorage {
                             SELECT 1 FROM tasks t
                             WHERE t.session_id = s.id AND t.kind = 'recurring'
                         ) THEN 'recurring' ELSE s.session_kind END,
-                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                        (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                         i.summary
                     FROM sessions s
                     LEFT JOIN session_pins sp ON sp.session_id = s.id
@@ -1482,6 +1504,7 @@ impl ViewStore for SqliteStorage {
         }
 
         self.run_blocking(move |conn| {
+            let group_key = group_key_sql("s");
             let scope_where = format!(
                 "{} AND {}",
                 session_scope_where(session_scope, "s"),
@@ -1503,11 +1526,11 @@ impl ViewStore for SqliteStorage {
 
             let mut group_counts_stmt = conn.prepare(&format!(
                 r#"
-                SELECT COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd), COUNT(*), MAX(s.updated_at)
+                SELECT {group_key}, COUNT(*), MAX(s.updated_at)
                 FROM sessions_fts f
                 JOIN sessions s ON s.id = f.rowid
                 WHERE sessions_fts MATCH ?1 AND {}
-                GROUP BY COALESCE((SELECT 'repository:' || w.common_dir FROM workspaces w WHERE w.owner_session_id = s.public_id), s.cwd)
+                GROUP BY {group_key}
                 "#,
                 scope_where
             ))?;
@@ -1539,7 +1562,7 @@ impl ViewStore for SqliteStorage {
                     p.public_id,
                     s.fork_origin,
                     s.session_kind,
-                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin = 'user'),
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = s.id AND c.fork_origin IN {VISIBLE_FORK_ORIGINS}),
                     i.summary
                 FROM sessions_fts f
                 JOIN sessions s ON s.id = f.rowid

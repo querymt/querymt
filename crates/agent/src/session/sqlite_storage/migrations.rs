@@ -137,7 +137,25 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0028_workspace_result_captured_head",
         apply: migration_0028_workspace_result_captured_head,
     },
+    Migration {
+        version: "0029_workspace_source_cwd",
+        apply: migration_0029_workspace_source_cwd,
+    },
+    Migration {
+        version: "0030_workspace_handoff",
+        apply: migration_0030_workspace_handoff,
+    },
 ];
+
+/// Add `workspaces.handed_off_to` and the `workspace_handoffs` marker table.
+fn migration_0030_workspace_handoff(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_handoff(conn)
+}
+
+/// Add and backfill `workspaces.source_cwd` (project grouping key).
+fn migration_0029_workspace_source_cwd(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    schema::ensure_workspace_source_cwd(conn)
+}
 
 fn migration_0026_pending_fork_isolation(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(

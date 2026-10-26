@@ -3064,6 +3064,7 @@ mod tests {
                     &crate::worktree::WorkspaceId::from_raw("ws-retain"),
                 ),
                 relative_cwd: std::path::PathBuf::from(""),
+                source_cwd: String::new(),
                 execution: crate::worktree::ExecutionMode::Worktree,
                 baseline: None,
                 lifecycle: crate::worktree::WorkspaceLifecycle::Ready,

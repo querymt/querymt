@@ -99,6 +99,45 @@ impl LocalAgentHandle {
         self.stop_session_in_runtime(session_id).await
     }
 
+    /// Unload `session_id`'s actor when it is loaded and idle, without
+    /// cancelling anything. Returns `Ok(true)` when the session is busy (a
+    /// running turn, queued or steered input, or a remote host) and was left
+    /// untouched, `Ok(false)` when it is now unloaded or never was loaded.
+    pub(crate) async fn unload_session_if_idle(&self, session_id: &str) -> Result<bool, Error> {
+        if let Some((session_handle, _)) = self.bound_session_handle(session_id).await?
+            && let Some(local) = session_handle.as_any().downcast_ref::<LocalAgentHandle>()
+        {
+            return Box::pin(local.unload_idle_in_runtime(session_id)).await;
+        }
+        self.unload_idle_in_runtime(session_id).await
+    }
+
+    async fn unload_idle_in_runtime(&self, session_id: &str) -> Result<bool, Error> {
+        use crate::agent::messages::SessionRuntimePhase;
+
+        let loaded = self.registry.lock().await.get(session_id).cloned();
+        let Some(session) = loaded else {
+            return Ok(false);
+        };
+        if session.is_remote() {
+            return Ok(true);
+        }
+        let status = session.get_runtime_status().await.map_err(Error::from)?;
+        if status.phase != SessionRuntimePhase::Idle
+            || status.queued_input_count > 0
+            || status.pending_steering_count > 0
+        {
+            return Ok(true);
+        }
+        let removed = self.registry.lock().await.remove(session_id);
+        if let Some(session) = removed
+            && let Err(err) = session.shutdown().await
+        {
+            tracing::warn!(session_id, error = %err, "failed to shut down idle session actor");
+        }
+        Ok(false)
+    }
+
     async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
 

@@ -138,6 +138,27 @@ impl LocalAgentHandle {
         self.config.build_delegation_meta()
     }
 
+    /// Refuse undo/redo for a previous owner: its snapshots are context-only
+    /// and must never touch the checkout it handed away.
+    async fn refuse_if_transferred(
+        &self,
+        session_id: &str,
+    ) -> Result<(), crate::agent::undo::UndoError> {
+        self.session_materializer
+            .ensure_not_transferred(session_id)
+            .await
+            .map_err(|err| {
+                crate::agent::undo::UndoError::Other(format!(
+                    "owner_transferred: {}",
+                    err.data
+                        .as_ref()
+                        .and_then(|d| d.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("session is read-only")
+                ))
+            })
+    }
+
     /// Undo: revert filesystem to state at the given message_id.
     ///
     /// Routes through the kameo session actor via `SessionActorRef`.
@@ -146,6 +167,7 @@ impl LocalAgentHandle {
         session_id: &str,
         message_id: &str,
     ) -> Result<crate::agent::undo::UndoResult, crate::agent::undo::UndoError> {
+        self.refuse_if_transferred(session_id).await?;
         let session_ref = {
             let registry = self.registry.lock().await;
             registry.get(session_id).cloned().ok_or_else(|| {
@@ -163,6 +185,7 @@ impl LocalAgentHandle {
         &self,
         session_id: &str,
     ) -> Result<crate::agent::undo::RedoResult, crate::agent::undo::UndoError> {
+        self.refuse_if_transferred(session_id).await?;
         let session_ref = {
             let registry = self.registry.lock().await;
             registry.get(session_id).cloned().ok_or_else(|| {

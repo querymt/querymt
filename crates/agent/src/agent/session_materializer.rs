@@ -315,6 +315,10 @@ impl SessionMaterializer {
         if !options.requests_isolation() {
             return Ok(None);
         }
+        // Lineage is validated before anything is allocated.
+        if let Some(source) = options.source_session_id.as_deref() {
+            self.ensure_lineage_source(source).await?;
+        }
 
         let Some(service) = self.workspace_service() else {
             return Err(Error::internal_error().data(serde_json::json!({
@@ -345,6 +349,27 @@ impl SessionMaterializer {
             .map_err(worktree_error_to_acp)
     }
 
+    /// The session a worktree session descends from must exist in this
+    /// node's store. Remote sources are not in the local store, so they are
+    /// rejected here (the handle layer additionally checks live placement).
+    async fn ensure_lineage_source(&self, source_session_id: &str) -> Result<(), Error> {
+        let exists = self
+            .config
+            .provider
+            .history_store()
+            .get_session(source_session_id)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?
+            .is_some();
+        if exists {
+            Ok(())
+        } else {
+            Err(invalid_workspace_request(&format!(
+                "source session {source_session_id} does not exist on this node"
+            )))
+        }
+    }
+
     /// Resolve the persisted workspace binding for load/resume ahead of any
     /// caller cwd. Bound sessions always use their persisted execution path;
     /// conflicting cwd requests and missing checkouts fail closed. Legacy
@@ -354,6 +379,9 @@ impl SessionMaterializer {
         session_id: &str,
         requested_cwd: Option<&std::path::Path>,
     ) -> Result<Option<WorkspaceBinding>, Error> {
+        // A previous owner never materializes again, so it cannot reload as a
+        // local or shared session inside the checkout it gave away.
+        self.ensure_not_transferred(session_id).await?;
         if self
             .config
             .provider
@@ -387,6 +415,34 @@ impl SessionMaterializer {
             .map_err(worktree_error_to_acp)
     }
 
+    /// Refuse any operation that would run or mutate a session whose
+    /// workspace was handed off. The marker is durable, so the answer is the
+    /// same after a restart and for every entry point.
+    ///
+    /// # Errors
+    /// `owner_transferred` (naming the current owner) for a previous owner;
+    /// an internal error when the registry cannot be read.
+    pub(crate) async fn ensure_not_transferred(&self, session_id: &str) -> Result<(), Error> {
+        match self.transferred_owner(session_id).await? {
+            Some(owner) => Err(owner_transferred_error(session_id, &owner)),
+            None => Ok(()),
+        }
+    }
+
+    /// The current owner of the workspace `session_id` handed off, if any.
+    pub(crate) async fn transferred_owner(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, Error> {
+        let Some(registry) = self.config.storage.workspace_repository() else {
+            return Ok(None);
+        };
+        registry
+            .current_owner_after_handoff(session_id)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))
+    }
+
     // ── Public materialization ─────────────────────────────────────────────
 
     /// Prepare a new session: create in DB, initialize MCP, spawn actor.
@@ -413,6 +469,17 @@ impl SessionMaterializer {
             .as_ref()
             .and_then(|m| m.get("parent_session_id"))
             .and_then(|v| v.as_str());
+
+        // Worktree lineage travels in its own key, never as the delegation
+        // parent: only delegation grants shared-checkout attachment.
+        let lineage_source = crate::worktree::session_creation_options_from_meta(req.meta.as_ref())
+            .map_err(|message| invalid_workspace_request(&message))?
+            .and_then(|options| options.source_session_id);
+        if lineage_source.is_some() && parent_session_id.is_some() {
+            return Err(invalid_workspace_request(
+                "a source session cannot be combined with a delegation parent",
+            ));
+        }
 
         // Resolve the workspace binding BEFORE creating the session row,
         // starting MCP, indexes, hooks, or the actor, so every consumer
@@ -513,6 +580,7 @@ impl SessionMaterializer {
                         baseline: binding.record.requested_baseline_mode,
                         base_ref: binding.record.requested_base_ref.clone(),
                     },
+                    handoff_workspace_id: None,
                 });
         let cwd = match &workspace {
             Some(binding) => Some(binding.effective_cwd.clone()),
@@ -526,7 +594,12 @@ impl SessionMaterializer {
             .provider
             .create_session_with_isolation_intent(
                 cwd.clone(),
-                parent_session_id,
+                parent_session_id.or(lineage_source.as_deref()),
+                match (parent_session_id, lineage_source.as_deref()) {
+                    (Some(_), _) => Some(crate::session::domain::ForkOrigin::Delegation),
+                    (None, Some(_)) => Some(crate::session::domain::ForkOrigin::Worktree),
+                    (None, None) => None,
+                },
                 &self.config.execution_config_snapshot(),
                 isolation_intent,
             )
@@ -968,6 +1041,7 @@ impl SessionMaterializer {
                     source_session_id: source_session_id.clone(),
                     source_cwd: plan.source_cwd.clone(),
                     options: plan.options.to_workspace_options(),
+                    handoff_workspace_id: None,
                 });
         let new_session_id = self
             .config
@@ -1174,6 +1248,81 @@ impl SessionMaterializer {
         self.finalize_fork_isolation(session_id, &binding).await
     }
 
+    /// Persist the successor of an ownership handoff behind a durable
+    /// startup barrier that names the workspace to adopt.
+    ///
+    /// The row's cwd is already the workspace's session cwd and its parent is
+    /// the previous owner (origin `worktree`, no history copied). Until
+    /// [`Self::publish_handoff_successor`] succeeds, load/resume refuse the
+    /// session, so it can never run without owning the workspace.
+    pub(crate) async fn create_pending_handoff_successor(
+        &self,
+        previous: &str,
+        record: &crate::worktree::WorkspaceRecord,
+        name: Option<String>,
+    ) -> Result<String, Error> {
+        let intent = crate::session::store::PendingForkIsolation {
+            source_session_id: previous.to_owned(),
+            source_cwd: record.session_cwd(),
+            options: crate::worktree::WorkspaceCreationOptions {
+                execution: crate::worktree::ExecutionMode::Worktree,
+                baseline: record.requested_baseline_mode,
+                base_ref: record.requested_base_ref.clone(),
+            },
+            handoff_workspace_id: Some(record.id.to_string()),
+        };
+        let context = self
+            .config
+            .provider
+            .create_session_with_isolation_intent(
+                Some(record.session_cwd()),
+                Some(previous),
+                Some(crate::session::domain::ForkOrigin::Worktree),
+                &self.config.execution_config_snapshot(),
+                Some(intent),
+            )
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))?;
+        let successor = context.session().public_id.clone();
+        if let Some(name) = name
+            && let Err(err) = self
+                .config
+                .provider
+                .history_store()
+                .set_session_name(&successor, Some(name))
+                .await
+        {
+            self.discard_pending_handoff_successor(&successor).await;
+            return Err(Error::internal_error().data(err.to_string()));
+        }
+        Ok(successor)
+    }
+
+    /// Release a handoff successor's barrier. SQLite validates in one
+    /// transaction that the session owns a ready workspace at its cwd.
+    pub(crate) async fn publish_handoff_successor(&self, successor: &str) -> Result<(), Error> {
+        self.config
+            .provider
+            .history_store()
+            .complete_fork_isolation(successor)
+            .await
+            .map_err(|err| Error::internal_error().data(err.to_string()))
+    }
+
+    /// Delete a successor that never became the owner (best effort: a
+    /// failure leaves a non-runnable barrier session, never a runnable one).
+    pub(crate) async fn discard_pending_handoff_successor(&self, successor: &str) {
+        if let Err(err) = self
+            .config
+            .provider
+            .history_store()
+            .delete_session(successor)
+            .await
+        {
+            tracing::warn!(successor, error = %err, "failed to discard handoff successor");
+        }
+    }
+
     /// Publish an isolated fork as runnable: persist the execution cwd,
     /// release the durable startup barrier, and build the disclosure
     /// response.
@@ -1273,6 +1422,7 @@ impl SessionMaterializer {
             let workspace = crate::session::projection::SessionWorkspaceView {
                 workspace_id: record.id.to_string(),
                 repository_id: record.repository.common_dir.display().to_string(),
+                source_cwd: record.source_cwd.clone(),
                 project_name: record.repository.project_name.clone(),
                 checkout_path: record.checkout_path.display().to_string(),
                 branch: record.branch.as_str().to_string(),
@@ -1284,6 +1434,8 @@ impl SessionMaterializer {
                 baseline_commit: record.baseline.as_ref().map(|b| b.baseline_commit.clone()),
                 lifecycle: record.lifecycle.to_string(),
                 last_error: record.last_error.clone(),
+                owner_session_id: record.ownership.owner_session_id.clone(),
+                handed_off_to: record.ownership.handed_off_to.clone(),
             };
             self.config
                 .emit_event_persisted(
@@ -1664,6 +1816,17 @@ fn worktree_error_to_acp(err: crate::worktree::WorktreeError) -> Error {
     }
 }
 
+/// Stable refusal for operations on a session that handed its workspace off.
+pub(crate) fn owner_transferred_error(session_id: &str, owner: &str) -> Error {
+    Error::invalid_request().data(serde_json::json!({
+        "code": "owner_transferred",
+        "message": format!(
+            "session {session_id} handed its workspace to {owner} and is read-only"
+        ),
+        "ownerSessionId": owner,
+    }))
+}
+
 /// A malformed workspace request (options or missing cwd) is invalid params.
 fn invalid_workspace_request(message: &str) -> Error {
     Error::invalid_params().data(serde_json::json!({
@@ -1986,6 +2149,22 @@ mod worktree_binding_tests {
             id: &crate::worktree::WorkspaceId,
         ) -> crate::session::error::SessionResult<crate::worktree::WorkspaceRecord> {
             self.inner.detach_owner(id).await
+        }
+
+        async fn transfer_owner(
+            &self,
+            id: &crate::worktree::WorkspaceId,
+            from: &str,
+            to: &str,
+        ) -> crate::session::error::SessionResult<crate::worktree::WorkspaceRecord> {
+            self.inner.transfer_owner(id, from, to).await
+        }
+
+        async fn transferred_to(
+            &self,
+            session_id: &str,
+        ) -> crate::session::error::SessionResult<Option<String>> {
+            self.inner.transferred_to(session_id).await
         }
 
         async fn bind_baseline(
@@ -3377,6 +3556,7 @@ mod worktree_binding_tests {
                 crate::worktree::BaselineMode::CurrentWorkingTree,
             )
             .to_workspace_options(),
+            handoff_workspace_id: None,
         };
         // Stop at the actual copy transaction boundary, before any workspace
         // exists. Both history and intent must already be durable here.
@@ -3550,6 +3730,111 @@ mod worktree_binding_tests {
     }
 
     #[tokio::test]
+    async fn unknown_lineage_source_is_rejected_before_allocation() {
+        let fx = worktree_fixture(true).await;
+        let meta = worktree_meta(serde_json::json!({
+            "execution": "worktree",
+            "sourceSessionId": "no-such-session",
+        }));
+        let err = match fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(meta))
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("an unknown source session must be rejected"),
+        };
+        assert!(format!("{err:?}").contains("does not exist"), "{err:?}");
+        let registry = fx.storage.workspace_repository().unwrap();
+        assert!(registry.list_workspaces().await.unwrap().is_empty());
+        assert!(fx.storage.list_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn lineage_source_nests_the_session_without_granting_checkout_sharing() {
+        let fx = worktree_fixture(true).await;
+        let source = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .unwrap();
+        let source_id = source.session_id.clone();
+        let meta = worktree_meta(serde_json::json!({
+            "execution": "worktree",
+            "sourceSessionId": source_id,
+        }));
+        let child = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(meta))
+            .await
+            .unwrap();
+        let row = fx
+            .storage
+            .get_session(&child.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.fork_origin,
+            Some(crate::session::domain::ForkOrigin::Worktree)
+        );
+        let record = fx
+            .storage
+            .workspace_repository()
+            .unwrap()
+            .get_workspace_by_session(&child.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record.ownership.parent_session_id.as_deref(),
+            Some(source_id.as_str())
+        );
+
+        // Lineage is not delegation: it cannot be combined with a parent.
+        let both = worktree_meta(serde_json::json!({
+            "execution": "worktree",
+            "sourceSessionId": source_id,
+        }));
+        let mut both = both;
+        both.insert("parent_session_id".into(), source_id.clone().into());
+        assert!(
+            fx.materializer
+                .prepare_new_session(
+                    NewSessionRequest::new(fx.repo.path().to_path_buf()).meta(both)
+                )
+                .await
+                .is_err()
+        );
+
+        // An isolated fork stays in its parent's project group.
+        seed_history(fx.storage.as_ref(), &source_id, &["msg-1"]).await;
+        let fork = fx
+            .materializer
+            .prepare_fork_session(
+                ForkSessionRequest::new(
+                    SessionId::from(source_id.clone()),
+                    fx.repo.path().to_path_buf(),
+                )
+                .meta(isolation_meta()),
+            )
+            .await
+            .unwrap();
+        let fork_record = fx
+            .storage
+            .workspace_repository()
+            .unwrap()
+            .get_workspace_by_session(&fork.session_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fork_record.source_cwd,
+            crate::worktree::normalize_cwd(fx.repo.path())
+        );
+    }
+
+    #[tokio::test]
     async fn successful_isolated_new_session_releases_its_barrier() {
         let fx = worktree_fixture(true).await;
         let prepared = fx
@@ -3686,6 +3971,7 @@ mod worktree_binding_tests {
                 crate::worktree::BaselineMode::CurrentWorkingTree,
             )
             .to_workspace_options(),
+            handoff_workspace_id: None,
         };
         let fork_id = fx
             .storage

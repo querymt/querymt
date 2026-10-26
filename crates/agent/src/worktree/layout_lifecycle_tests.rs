@@ -244,6 +244,7 @@ async fn assert_full_lifecycle(source_cwd: &Path, svc: &WorkspaceService, storag
         checkout_path: crate::worktree::checkout_path_for(storage, &common, &sibling_id),
         branch: ManagedBranch::for_workspace(&sibling_id),
         relative_cwd: PathBuf::new(),
+        source_cwd: String::new(),
         execution: ExecutionMode::Worktree,
         baseline: None,
         lifecycle: WorkspaceLifecycle::Provisioning,

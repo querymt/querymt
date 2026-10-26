@@ -59,6 +59,14 @@ pub enum WorktreeOpError {
 }
 
 impl WorktreeOpError {
+    /// A refusal carrying a stable `code` chosen by the operation itself.
+    pub fn rejected(code: &str, message: impl Into<String>) -> Self {
+        Self::Rejected {
+            code: code.to_owned(),
+            message: message.into(),
+        }
+    }
+
     /// Stable machine-readable error code.
     pub fn code(&self) -> &str {
         match self {
@@ -117,6 +125,11 @@ pub struct WorktreeCreateRequest {
     pub base_ref: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// Session the new worktree session descends from (lineage only: no
+    /// history is copied). When set, an empty `cwd` defaults to the source's
+    /// effective cwd and a `cwd` outside the source's repository is rejected.
+    #[serde(default, alias = "sourceSessionId")]
+    pub source_session_id: Option<String>,
 }
 
 /// Which workspace an operation targets.
@@ -296,6 +309,85 @@ pub enum WorktreeRecoverResponse {
     Removed(WorktreeRemoveResponse),
 }
 
+/// Result of an ownership handoff.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorktreeHandoffResponse {
+    /// The new owner session, started in the same checkout.
+    pub session_id: String,
+    pub previous_session_id: String,
+    pub workspace_id: String,
+    pub checkout_path: String,
+    pub session_cwd: String,
+    pub branch: String,
+    /// Whether the successor was seeded with a summary of the previous conversation.
+    pub summary_seeded: bool,
+}
+
+/// Optional inputs of [`WorktreeOps::handoff`]. The default is a clean,
+/// unnamed handoff with no history.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct HandoffOptions {
+    /// Display name for the successor session.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Seed the successor with a summary of the previous conversation.
+    #[serde(default)]
+    pub summary: bool,
+}
+
+/// The session-layer steps of an ownership handoff. Implemented by the agent
+/// handle; the ordering and the ownership transfer itself live in
+/// [`WorktreeOps::handoff`] so every surface shares them.
+#[async_trait::async_trait]
+pub trait HandoffHost: Send + Sync {
+    /// Whether `session_id` is hosted on this node's filesystem.
+    async fn is_local(&self, session_id: &str) -> Result<bool, WorktreeOpError>;
+
+    /// Unload `session_id`'s actor if it is loaded and idle, releasing its
+    /// shared activity lease. A running turn, queued or steered input is
+    /// refused with `owner_active` and the actor is left untouched.
+    async fn quiesce_owner(&self, session_id: &str) -> Result<(), WorktreeOpError>;
+
+    /// Summarize `previous`'s conversation with the compaction summarizer.
+    /// `None` when there is no history to summarize. Any failure is
+    /// `summary_failed` and aborts the handoff before anything is created.
+    async fn summarize(&self, previous: &str) -> Result<Option<String>, WorktreeOpError>;
+
+    /// Seed `successor` (still behind its startup barrier) with `summary` as
+    /// its initial context.
+    async fn seed_summary(&self, successor: &str, summary: &str) -> Result<(), WorktreeOpError>;
+
+    /// Persist the successor session (cwd = the workspace's session cwd,
+    /// parent = `previous`, origin `worktree`) behind a durable startup
+    /// barrier that records the handoff, so it cannot run before it owns the
+    /// workspace. Returns its id.
+    async fn create_pending_successor(
+        &self,
+        previous: &str,
+        record: &WorkspaceRecord,
+        name: Option<String>,
+    ) -> Result<String, WorktreeOpError>;
+
+    /// Release the successor's startup barrier once it owns the workspace.
+    async fn publish_successor(&self, successor: &str) -> Result<(), WorktreeOpError>;
+
+    /// Announce the committed handoff on the previous owner's event stream.
+    ///
+    /// Best effort: a failure is logged by the host and never fails the
+    /// handoff, which is already committed. Returns the announcement's
+    /// `session_seq` so a prompt response can wait for its delivery.
+    async fn announce_handoff(
+        &self,
+        previous: &str,
+        workspace_id: &str,
+        successor: &str,
+        summary_seeded: bool,
+    ) -> Option<i64>;
+
+    /// Delete a successor that never became the owner.
+    async fn discard_successor(&self, successor: &str);
+}
+
 // ── Session spawning (the one operation that needs the session layer) ────────
 
 /// Starts the isolated session for [`WorktreeOps::create`]. Implemented by the
@@ -311,6 +403,13 @@ pub trait IsolatedSessionSpawner: Send + Sync {
         session_workspace: serde_json::Value,
         name: Option<String>,
     ) -> Result<String, WorktreeOpError>;
+
+    /// Effective execution cwd of `session_id` (its bound checkout cwd when
+    /// managed), or `None` when the session is unknown or not local.
+    async fn source_session_cwd(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<PathBuf>, WorktreeOpError>;
 }
 
 // ── Operations ───────────────────────────────────────────────────────────────
@@ -382,14 +481,59 @@ impl WorktreeOps {
     async fn resolve(&self, target: &WorkspaceTarget) -> Result<WorkspaceRecord, WorktreeOpError> {
         match target {
             WorkspaceTarget::Workspace(id) => self.lookup(id).await,
-            WorkspaceTarget::Session(id) => self
-                .service
-                .registry()
-                .get_workspace_by_session(id)
-                .await?
-                .ok_or_else(|| {
-                    WorktreeOpError::InvalidOptions("session has no managed workspace".into())
-                }),
+            WorkspaceTarget::Session(id) => {
+                let registry = self.service.registry();
+                if let Some(record) = registry.get_workspace_by_session(id).await? {
+                    return Ok(record);
+                }
+                // A previous owner is read-only: say so instead of "no workspace".
+                Err(match registry.current_owner_after_handoff(id).await? {
+                    Some(owner) => WorktreeOpError::rejected(
+                        "owner_transferred",
+                        format!("session {id} handed its workspace to {owner} and is read-only"),
+                    ),
+                    None => {
+                        WorktreeOpError::InvalidOptions("session has no managed workspace".into())
+                    }
+                })
+            }
+        }
+    }
+
+    /// The cwd to isolate from. Without a source session it is the request's
+    /// cwd verbatim. With one, an empty cwd defaults to the source's
+    /// effective cwd, and any cwd must lie in the source's repository.
+    async fn resolve_create_cwd(
+        &self,
+        spawner: &dyn IsolatedSessionSpawner,
+        request: &WorktreeCreateRequest,
+    ) -> Result<PathBuf, WorktreeOpError> {
+        let Some(source) = request.source_session_id.as_deref() else {
+            return Ok(PathBuf::from(&request.cwd));
+        };
+        let source_cwd = spawner.source_session_cwd(source).await?.ok_or_else(|| {
+            WorktreeOpError::InvalidOptions(format!(
+                "source session {source} does not exist or is not hosted locally"
+            ))
+        })?;
+        if request.cwd.is_empty() {
+            return Ok(source_cwd);
+        }
+        let cwd = PathBuf::from(&request.cwd);
+        let same_repository = match (
+            crate::worktree::resolve_repository(&source_cwd),
+            crate::worktree::resolve_repository(&cwd),
+        ) {
+            (Ok(a), Ok(b)) => a.identity.common_dir == b.identity.common_dir,
+            _ => false,
+        };
+        if same_repository {
+            Ok(cwd)
+        } else {
+            Err(WorktreeOpError::InvalidOptions(format!(
+                "cwd {} is outside the repository of source session {source}",
+                cwd.display()
+            )))
         }
     }
 
@@ -402,7 +546,7 @@ impl WorktreeOps {
         spawner: &dyn IsolatedSessionSpawner,
         request: WorktreeCreateRequest,
     ) -> Result<WorktreeCreateResponse, WorktreeOpError> {
-        let cwd = PathBuf::from(&request.cwd);
+        let cwd = self.resolve_create_cwd(spawner, &request).await?;
         let unpinned = request.include_local_changes.is_none() && request.base_ref.is_none();
         let will_capture_working_tree = request.include_local_changes == Some(true)
             || (unpinned && self.service.default_baseline() == BaselineMode::CurrentWorkingTree);
@@ -426,6 +570,9 @@ impl WorktreeOps {
         }
         if let Some(base_ref) = &request.base_ref {
             session_workspace["baseRef"] = base_ref.clone().into();
+        }
+        if let Some(source) = &request.source_session_id {
+            session_workspace["sourceSessionId"] = source.clone().into();
         }
 
         let session_id = spawner.spawn(cwd, session_workspace, request.name).await?;
@@ -458,6 +605,161 @@ impl WorktreeOps {
             local_changes_excluded: baseline_mode == BaselineMode::Commit,
             ignored_untracked_files_excluded: true,
         })
+    }
+
+    /// Take the checkout's exclusive activity lease, tolerating the short
+    /// window in which an just-unloaded actor is still dropping its shared
+    /// lease. Anything still holding it after the grace period (a running
+    /// turn, shared delegates, another process) is `owner_active`.
+    async fn acquire_exclusive_activity(
+        &self,
+        record: &WorkspaceRecord,
+    ) -> Result<crate::worktree::gate::CheckoutActivityLease, WorktreeOpError> {
+        const ATTEMPTS: u32 = 40;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+        let mut attempt = 1;
+        loop {
+            match crate::worktree::gate::CheckoutActivityLease::acquire(
+                self.service.storage_root(),
+                &record.checkout_path,
+                true,
+            ) {
+                Ok(lease) => return Ok(lease),
+                Err(err) if attempt == ATTEMPTS => {
+                    return Err(WorktreeOpError::rejected("owner_active", err.to_string()));
+                }
+                Err(_) => {
+                    attempt += 1;
+                    tokio::time::sleep(PAUSE).await;
+                }
+            }
+        }
+    }
+
+    /// Hand ownership of a ready workspace to a new session in the same
+    /// checkout. Files, branch, index and baseline are untouched.
+    ///
+    /// Order: resolve the owner, require a local ready workspace, unload the
+    /// idle owner actor, take the exclusive activity lease (else
+    /// `owner_active`), persist the successor behind its startup barrier,
+    /// transfer ownership with one compare-and-swap, then release the
+    /// barrier. A crash before the transfer leaves the previous owner in
+    /// place; a crash after it leaves a successor that owns the workspace but
+    /// stays non-runnable until `recover` releases the barrier.
+    ///
+    /// # Errors
+    /// `not_owner`, `workspace_not_ready`, `owner_not_local`, `owner_transferred`
+    /// and `owner_active` refusals create nothing.
+    pub async fn handoff(
+        &self,
+        host: &dyn HandoffHost,
+        target: &WorkspaceTarget,
+        options: HandoffOptions,
+    ) -> Result<WorktreeHandoffResponse, WorktreeOpError> {
+        self.handoff_announced(host, target, options)
+            .await
+            .map(|(response, _tip)| response)
+    }
+
+    /// [`Self::handoff`], additionally returning the `session_seq` of the
+    /// durable announcement (`None` when it could not be recorded). The
+    /// native command uses it as the response's event tip; it is deliberately
+    /// not part of [`WorktreeHandoffResponse`].
+    ///
+    /// # Errors
+    /// Same as [`Self::handoff`].
+    pub async fn handoff_announced(
+        &self,
+        host: &dyn HandoffHost,
+        target: &WorkspaceTarget,
+        options: HandoffOptions,
+    ) -> Result<(WorktreeHandoffResponse, Option<i64>), WorktreeOpError> {
+        let HandoffOptions { name, summary } = options;
+        let registry = self.service.registry();
+        let record = self.resolve(target).await?;
+        let previous = record.ownership.owner_session_id.clone().ok_or_else(|| {
+            WorktreeOpError::rejected("not_owner", "workspace has no owner session to hand off")
+        })?;
+        if record.lifecycle != WorkspaceLifecycle::Ready {
+            return Err(WorktreeOpError::rejected(
+                "workspace_not_ready",
+                format!("workspace {} is {}", record.id, record.lifecycle),
+            ));
+        }
+        if !host.is_local(&previous).await? {
+            return Err(WorktreeOpError::rejected(
+                "owner_not_local",
+                format!("owner session {previous} is not hosted on this node"),
+            ));
+        }
+
+        host.quiesce_owner(&previous).await?;
+        let lease = self.acquire_exclusive_activity(&record).await?;
+
+        // The record may have moved while the owner was being unloaded.
+        let record = self.lookup(record.id.as_str()).await?;
+        if record.ownership.owner_session_id.as_deref() != Some(previous.as_str())
+            || record.lifecycle != WorkspaceLifecycle::Ready
+        {
+            return Err(WorktreeOpError::rejected(
+                "not_owner",
+                "workspace ownership changed while the handoff was starting",
+            ));
+        }
+
+        // Summarize before creating anything: a failure here leaves no trace.
+        let summary = if summary {
+            host.summarize(&previous).await?
+        } else {
+            None
+        };
+
+        let successor = host
+            .create_pending_successor(&previous, &record, name)
+            .await?;
+        if let Some(summary) = &summary
+            && let Err(err) = host.seed_summary(&successor, summary).await
+        {
+            host.discard_successor(&successor).await;
+            return Err(err);
+        }
+        let moved = match registry
+            .transfer_owner(&record.id, &previous, &successor)
+            .await
+        {
+            Ok(moved) => moved,
+            Err(err) => {
+                host.discard_successor(&successor).await;
+                return Err(err.into());
+            }
+        };
+        drop(lease);
+        host.publish_successor(&successor).await.map_err(|err| {
+            WorktreeOpError::rejected(
+                "handoff_incomplete",
+                format!(
+                    "session {successor} owns workspace {} but is not yet runnable ({err}); \
+                     run recover for session {successor}",
+                    moved.id
+                ),
+            )
+        })?;
+
+        let summary_seeded = summary.is_some();
+        let tip = host
+            .announce_handoff(&previous, moved.id.as_str(), &successor, summary_seeded)
+            .await;
+
+        let response = WorktreeHandoffResponse {
+            session_id: successor,
+            previous_session_id: previous,
+            workspace_id: moved.id.to_string(),
+            checkout_path: moved.checkout_path.display().to_string(),
+            session_cwd: moved.session_cwd().display().to_string(),
+            branch: moved.branch.as_str().to_string(),
+            summary_seeded,
+        };
+        Ok((response, tip))
     }
 
     /// All managed workspaces, newest first.

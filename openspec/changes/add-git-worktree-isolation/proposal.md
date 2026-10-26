@@ -19,6 +19,9 @@ Concurrent coding sessions and parallel delegates currently share writable check
 - Add a per-delegate `isolation` setting in quorum configuration (`inherit` | `isolated` | `shared`), with precedence explicit tool-call value, then delegate configuration, then inheritance from the parent.
 - Expose create/list/status/result/publish/archive/remove/recover through the simple API and Python, backed by one typed operations core shared with the ACP extensions and native `/worktree` so no surface duplicates semantics. Errors carry stable machine-readable codes on every surface, and agents advertise workspace support so clients can offer an explicit Local/Worktree choice.
 
+- List isolated sessions under the cwd they were started from and nest them under their source session (fork origin `worktree`), disclosing their workspace on list and load, instead of grouping by repository identity.
+- Add an explicit ownership handoff that starts a fresh conversation in an existing managed checkout (clean by default, optionally seeded with a summary); the previous owner stays loadable read-only.
+
 ## Capabilities
 
 ### New Capabilities

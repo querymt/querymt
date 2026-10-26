@@ -133,21 +133,27 @@ async fn managed_session_views_group_repository_without_losing_execution_paths()
         .await
         .unwrap();
     let view = f.storage.get_session_list_view(None).await.unwrap();
-    assert_eq!(view.groups.len(), 2);
-    let managed = view
-        .groups
+    // Managed sessions group under the cwd they were created from, i.e.
+    // together with their source session, not in a repository group.
+    let source_group = crate::worktree::normalize_cwd(f.repo.path());
+    assert_eq!(view.groups.len(), 1);
+    let group = &view.groups[0];
+    assert_eq!(group.cwd.as_deref(), Some(source_group.as_str()));
+    assert_eq!(group.sessions.len(), 3);
+    let managed: Vec<_> = group
+        .sessions
         .iter()
-        .find(|g| {
-            g.cwd
-                .as_deref()
-                .is_some_and(|key| key.starts_with("repository:"))
-        })
-        .unwrap();
-    assert_eq!(managed.sessions.len(), 2);
-    assert_ne!(managed.sessions[0].cwd, managed.sessions[1].cwd);
-    let a = managed.sessions[0].workspace.as_ref().unwrap();
-    let b = managed.sessions[1].workspace.as_ref().unwrap();
+        .filter(|s| s.workspace.is_some())
+        .collect();
+    assert_eq!(managed.len(), 2);
+    assert_ne!(
+        managed[0].cwd, managed[1].cwd,
+        "execution paths stay distinct"
+    );
+    let a = managed[0].workspace.as_ref().unwrap();
+    let b = managed[1].workspace.as_ref().unwrap();
     assert_eq!(a.repository_id, b.repository_id);
+    assert_eq!(a.source_cwd, source_group);
     assert_ne!(a.workspace_id, b.workspace_id);
     let (groups, _, total) = f
         .storage
@@ -155,22 +161,22 @@ async fn managed_session_views_group_repository_without_losing_execution_paths()
         .await
         .unwrap();
     assert_eq!(total, 3);
-    assert_eq!(groups.len(), 2);
-    let group_key = managed.cwd.clone();
+    assert_eq!(groups.len(), 1);
+    let group_key = group.cwd.clone();
     let (page, count) = f
         .storage
-        .list_group_sessions(group_key.clone(), None, 1, SessionScope::All)
+        .list_group_sessions(group_key.clone(), None, 10, SessionScope::All)
         .await
         .unwrap();
-    assert_eq!(count, 2);
-    assert!(page.sessions[0].workspace.is_some());
+    assert_eq!(count, 3);
+    assert_eq!(page.sessions.len(), 3);
     let (items, _, count) = f
         .storage
         .list_session_items(group_key, None, 10, SessionScope::All)
         .await
         .unwrap();
-    assert_eq!(count, 2);
-    assert!(items.iter().all(|item| item.workspace.is_some()));
+    assert_eq!(count, 3);
+    assert_eq!(items.iter().filter(|i| i.workspace.is_some()).count(), 2);
     for created in [first, second] {
         let id = created["session_id"].as_str().unwrap();
         let events = f
@@ -189,6 +195,7 @@ struct WorktreeExtFixture {
     service: std::sync::Arc<crate::worktree::WorkspaceService>,
     storage: std::sync::Arc<crate::session::sqlite_storage::SqliteStorage>,
     repo: tempfile::TempDir,
+    llm: Arc<Mutex<MockLlmProvider>>,
     _storage_root: tempfile::TempDir,
     _plugin_dir: tempfile::TempDir,
 }
@@ -201,7 +208,129 @@ async fn worktree_fixture_with(
     configure_service: bool,
     default_baseline: crate::worktree::BaselineMode,
 ) -> WorktreeExtFixture {
+    worktree_fixture_inner(configure_service, default_baseline, false).await
+}
+
+/// Journal that delegates to the real one but rejects the handoff
+/// announcement, to prove a committed handoff survives an emit failure.
+struct AnnouncementRejectingJournal(Arc<dyn crate::session::projection::EventJournal>);
+
+/// Storage whose journal rejects handoff announcements; everything else is the
+/// real SQLite backend.
+struct AnnouncementRejectingStorage(Arc<crate::session::sqlite_storage::SqliteStorage>);
+
+impl StorageBackend for AnnouncementRejectingStorage {
+    fn session_store(&self) -> Arc<dyn SessionStore> {
+        self.0.session_store()
+    }
+    fn event_journal(&self) -> Arc<dyn crate::session::projection::EventJournal> {
+        Arc::new(AnnouncementRejectingJournal(self.0.event_journal()))
+    }
+    fn view_store(&self) -> Option<Arc<dyn crate::session::projection::ViewStore>> {
+        self.0.view_store()
+    }
+    fn workspace_repository(&self) -> Option<Arc<dyn crate::worktree::WorkspaceRepository>> {
+        self.0.workspace_repository()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::session::projection::EventJournal for AnnouncementRejectingJournal {
+    async fn append_durable(
+        &self,
+        event: &crate::session::projection::NewDurableEvent,
+    ) -> crate::session::error::SessionResult<crate::events::DurableEvent> {
+        if matches!(
+            event.kind,
+            crate::events::AgentEventKind::WorktreeOwnershipTransferred { .. }
+        ) {
+            return Err(crate::session::error::SessionError::DatabaseError(
+                "simulated announcement failure".into(),
+            ));
+        }
+        self.0.append_durable(event).await
+    }
+    fn max_session_seq_blocking(&self, session_id: &str) -> i64 {
+        self.0.max_session_seq_blocking(session_id)
+    }
+    async fn load_session_stream(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+        self.0
+            .load_session_stream(session_id, after_seq, limit)
+            .await
+    }
+    async fn load_global_stream(
+        &self,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+        self.0.load_global_stream(after_seq, limit).await
+    }
+    async fn delete_session_events_from(
+        &self,
+        session_id: &str,
+        from_seq: i64,
+    ) -> crate::session::error::SessionResult<usize> {
+        self.0
+            .delete_session_events_from(session_id, from_seq)
+            .await
+    }
+    async fn append_durable_from_source(
+        &self,
+        event: &crate::session::projection::NewDurableEvent,
+    ) -> crate::session::error::SessionResult<Option<crate::events::DurableEvent>> {
+        self.0.append_durable_from_source(event).await
+    }
+    async fn latest_source_seq(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> crate::session::error::SessionResult<Option<i64>> {
+        self.0.latest_source_seq(session_id, source_node_id).await
+    }
+    async fn remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> crate::session::error::SessionResult<Option<i64>> {
+        self.0.remote_sync_cursor(session_id, source_node_id).await
+    }
+    async fn advance_remote_sync_cursor(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+        source_seq: i64,
+        complete: bool,
+    ) -> crate::session::error::SessionResult<()> {
+        self.0
+            .advance_remote_sync_cursor(session_id, source_node_id, source_seq, complete)
+            .await
+    }
+    async fn load_remote_session_stream(
+        &self,
+        session_id: &str,
+        source_node_id: &str,
+    ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+        self.0
+            .load_remote_session_stream(session_id, source_node_id)
+            .await
+    }
+    async fn max_stream_seq(&self, session_id: &str) -> crate::session::error::SessionResult<i64> {
+        self.0.max_stream_seq(session_id).await
+    }
+}
+
+async fn worktree_fixture_inner(
+    configure_service: bool,
+    default_baseline: crate::worktree::BaselineMode,
+    reject_announcements: bool,
+) -> WorktreeExtFixture {
     let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+    let llm = provider.clone();
     let shared = SharedLlmProvider {
         inner: provider,
         tools: vec![].into_boxed_slice(),
@@ -214,9 +343,14 @@ async fn worktree_fixture_with(
             .await
             .expect("create sqlite storage"),
     );
+    let builder_storage: Arc<dyn StorageBackend> = if reject_announcements {
+        Arc::new(AnnouncementRejectingStorage(storage.clone()))
+    } else {
+        storage.clone()
+    };
     let mut builder = AgentConfigBuilder::new(
         Arc::new(plugin_registry),
-        storage.clone(),
+        builder_storage,
         LLMParams::new().provider("mock").model("mock-model"),
     )
     .with_tool_policy(ToolPolicy::ProviderOnly);
@@ -249,6 +383,7 @@ async fn worktree_fixture_with(
         service,
         storage,
         repo,
+        llm,
         _storage_root: storage_root,
         _plugin_dir: plugin_dir,
     }
@@ -298,6 +433,7 @@ async fn initialize_advertises_workspace_support_only_with_a_service() {
     let advertised = workspace_meta(resp).expect("service configured");
     assert_eq!(advertised["supported"], true);
     assert_eq!(advertised["defaultBaseline"], "current_working_tree");
+    assert_eq!(advertised["sourceSession"], true);
     assert_eq!(
         advertised["executionModes"],
         serde_json::json!(["local", "worktree"])
@@ -835,6 +971,7 @@ async fn ext_recover_releases_a_pending_fork_barrier_by_session_id() {
             baseline: crate::worktree::BaselineMode::CurrentWorkingTree,
             base_ref: None,
         },
+        handoff_workspace_id: None,
     };
     let fork_id = f
         .storage
@@ -913,4 +1050,1381 @@ async fn ext_recover_releases_a_pending_fork_barrier_by_session_id() {
     // Source row was never moved.
     let source_row = f.storage.get_session(&source_id).await.unwrap().unwrap();
     assert_eq!(source_row.cwd.as_deref(), Some(f.repo.path()));
+}
+
+#[tokio::test]
+async fn worktree_create_child_is_nested_under_its_source_in_the_same_group() {
+    use crate::session::projection::{SessionScope, ViewStore};
+    let f = worktree_fixture(true).await;
+    let source = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    let source_id = source.session_id.to_string();
+    let created = native_command(&f.handle, &source_id, "/worktree create")
+        .await
+        .unwrap();
+    let child_id = created["session_id"].as_str().unwrap().to_string();
+
+    // Lineage is persisted with the session row; it is not delegation.
+    let child = f
+        .storage
+        .session_store()
+        .get_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child.fork_origin,
+        Some(crate::session::domain::ForkOrigin::Worktree)
+    );
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.ownership.parent_session_id.as_deref(),
+        Some(source_id.as_str())
+    );
+    assert_eq!(
+        record.source_cwd,
+        crate::worktree::normalize_cwd(f.repo.path())
+    );
+
+    // Same group as the source, nested and counted, with workspace metadata.
+    let view = f.storage.get_session_list_view(None).await.unwrap();
+    assert_eq!(view.groups.len(), 1);
+    let listed = view.groups[0]
+        .sessions
+        .iter()
+        .find(|s| s.session_id == child_id)
+        .unwrap();
+    assert_eq!(
+        listed.parent_session_id.as_deref(),
+        Some(source_id.as_str())
+    );
+    assert!(listed.workspace.is_some());
+    let parent = view.groups[0]
+        .sessions
+        .iter()
+        .find(|s| s.session_id == source_id)
+        .unwrap();
+    assert_eq!(parent.fork_count, 1);
+    assert!(parent.has_children);
+
+    // Scoped listings: forks include it, delegates do not, children page it.
+    let (forks, _, _) = f
+        .storage
+        .list_session_items(None, None, 10, SessionScope::Forks)
+        .await
+        .unwrap();
+    assert!(forks.iter().any(|s| s.session_id == child_id));
+    let (delegates, _, _) = f
+        .storage
+        .list_session_items(None, None, 10, SessionScope::Delegates)
+        .await
+        .unwrap();
+    assert!(delegates.is_empty());
+    let (children, total) = f
+        .storage
+        .list_session_children(source_id.clone(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(children.sessions[0].session_id, child_id);
+
+    // Shared-checkout permission is not granted by lineage.
+    let shared = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            std::path::PathBuf::from(created["session_cwd"].as_str().unwrap()),
+        ))
+        .await;
+    assert!(shared.is_err(), "lineage must not grant checkout sharing");
+    f.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn worktree_create_rejects_unknown_source_before_allocating() {
+    let f = worktree_fixture(true).await;
+    let err = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/worktree/create",
+            raw_params(&format!(
+                r#"{{"cwd":"{}","source_session_id":"no-such-session"}}"#,
+                f.repo.path().display()
+            )),
+        ))
+        .await
+        .expect_err("unknown source");
+    let code = err
+        .data
+        .and_then(|d| d.get("code").and_then(|c| c.as_str().map(str::to_owned)));
+    assert_eq!(code.as_deref(), Some("invalid_options"));
+    assert!(
+        f.service
+            .registry()
+            .list_workspaces()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    f.handle.shutdown().await;
+}
+
+async fn isolated_session(f: &WorktreeExtFixture, cwd: &std::path::Path) -> String {
+    let mut meta = serde_json::Map::new();
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "sessionWorkspace": { "execution": "worktree" } }),
+    );
+    f.handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(cwd.to_path_buf()).meta(meta))
+        .await
+        .unwrap()
+        .session_id
+        .to_string()
+}
+
+/// Groups, children, disclosure and search agree across the lineage cases:
+/// worktree child nested, isolated root in the source group, nested isolation
+/// staying in the original group, archived/removed workspaces not moving,
+/// delegates hidden, and local sessions carrying no workspace metadata.
+#[tokio::test]
+async fn source_cwd_grouping_lineage_and_disclosure_agree_across_views() {
+    use crate::session::projection::{SessionScope, ViewStore};
+    use crate::worktree::WorkspaceLifecycle as L;
+
+    let f = worktree_fixture(true).await;
+    let group = crate::worktree::normalize_cwd(f.repo.path());
+    let source_id = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+
+    // Isolated root without a source sits in the source cwd group.
+    let root_id = isolated_session(&f, f.repo.path()).await;
+    let registry = f.service.registry();
+    let root = registry
+        .get_workspace_by_session(&root_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.source_cwd, group);
+    assert_eq!(root.ownership.parent_session_id, None);
+
+    // Nested isolation (from inside the managed checkout) keeps the group.
+    let nested_id = isolated_session(&f, &root.session_cwd()).await;
+    let nested = registry
+        .get_workspace_by_session(&nested_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(nested.source_cwd, group);
+
+    // A worktree child of the source nests under it.
+    let created = native_command(&f.handle, &source_id, "/worktree create")
+        .await
+        .unwrap();
+    let child_id = created["session_id"].as_str().unwrap().to_string();
+
+    // A delegate stays hidden from fork/children views.
+    let delegate = f
+        .storage
+        .session_store()
+        .create_session(
+            None,
+            Some(f.repo.path().to_path_buf()),
+            Some(source_id.clone()),
+            Some(crate::session::domain::ForkOrigin::Delegation),
+        )
+        .await
+        .unwrap();
+
+    let view = f.storage.get_session_list_view(None).await.unwrap();
+    assert_eq!(view.groups.len(), 1, "one project group: {view:?}");
+    assert_eq!(view.groups[0].cwd.as_deref(), Some(group.as_str()));
+    let (children, total) = f
+        .storage
+        .list_session_children(source_id.clone(), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(children.sessions[0].session_id, child_id);
+    assert!(
+        children
+            .sessions
+            .iter()
+            .all(|s| s.session_id != delegate.public_id)
+    );
+    let (delegates, _, _) = f
+        .storage
+        .list_session_items(None, None, 20, SessionScope::Delegates)
+        .await
+        .unwrap();
+    assert_eq!(delegates.len(), 1);
+
+    // ACP list: `children` + parentSessionId pages one parent's children;
+    // managed entries carry `querymt.workspace`, local ones do not.
+    let view_store: std::sync::Arc<dyn ViewStore> = f.storage.clone();
+    let mut meta = serde_json::Map::new();
+    meta.insert("sessionScope".into(), "children".into());
+    meta.insert(
+        "querymt".into(),
+        serde_json::json!({ "parentSessionId": source_id }),
+    );
+    let page = crate::api::AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        crate::acp::protocol::ListSessionsRequest::new().meta(meta),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.sessions.len(), 1);
+    let ws = &page.sessions[0].meta.as_ref().unwrap()["querymt"]["workspace"];
+    assert_eq!(ws["sourceCwd"], group.as_str());
+    assert_eq!(ws["lifecycle"], "ready");
+    assert_eq!(ws["ownerSessionId"], child_id.as_str());
+    assert_eq!(ws["baselineMode"], "commit");
+    assert!(ws["workspaceId"].is_string() && ws["branch"].is_string());
+    let all = crate::api::AgentSessions::list_for_acp_from_view_store(
+        view_store.clone(),
+        crate::acp::protocol::ListSessionsRequest::new(),
+    )
+    .await
+    .unwrap();
+    let local = all
+        .sessions
+        .iter()
+        .find(|s| s.session_id.to_string() == source_id)
+        .unwrap();
+    assert!(
+        local
+            .meta
+            .as_ref()
+            .is_none_or(|m| m.get("querymt").is_none()),
+        "local sessions carry no workspace metadata"
+    );
+
+    // Managed `session/load` discloses the binding; a local load does not.
+    let loaded = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            child_id.clone(),
+            std::path::PathBuf::from(created["session_cwd"].as_str().unwrap()),
+        ))
+        .await
+        .unwrap();
+    let disclosed = &loaded.meta.as_ref().unwrap()["querymt"]["sessionWorkspace"];
+    assert_eq!(disclosed["workspaceId"], created["workspace_id"]);
+    assert_eq!(disclosed["checkoutPath"], created["checkout_path"]);
+    let local_load = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            source_id.clone(),
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        local_load
+            .meta
+            .as_ref()
+            .is_none_or(|m| m.get("querymt").is_none())
+    );
+
+    // Search groups match browse groups.
+    for id in [&source_id, &root_id, &nested_id, &child_id] {
+        f.storage
+            .session_store()
+            .set_session_name(id, Some("grpneedle".into()))
+            .await
+            .unwrap();
+    }
+    let (found, _, _) = f
+        .storage
+        .search_sessions("grpneedle".into(), None, 10, SessionScope::All)
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].cwd.as_deref(), Some(group.as_str()));
+    let (browsed, _, _) = f
+        .storage
+        .browse_session_groups(None, 10, 10, SessionScope::All)
+        .await
+        .unwrap();
+    assert_eq!(browsed.len(), 1);
+    assert_eq!(browsed[0].cwd, found[0].cwd);
+
+    // Archived and removed workspaces keep their group.
+    for (from, to) in [
+        (L::Ready, L::Archived),
+        (L::Archived, L::Removing),
+        (L::Removing, L::Removed),
+    ] {
+        assert!(
+            registry
+                .transition_lifecycle(&root.id, from, to)
+                .await
+                .unwrap()
+        );
+        let (groups, _, _) = f
+            .storage
+            .browse_session_groups(None, 10, 10, SessionScope::All)
+            .await
+            .unwrap();
+        assert_eq!(groups.len(), 1, "{to} must not move the session");
+        let (_, count) = f
+            .storage
+            .list_group_sessions(Some(group.clone()), None, 20, SessionScope::All)
+            .await
+            .unwrap();
+        assert_eq!(count, 5);
+    }
+    let kept = registry.get_workspace(&root.id).await.unwrap().unwrap();
+    assert_eq!(kept.source_cwd, group);
+    f.handle.shutdown().await;
+}
+
+/// 24.2: handoff moves ownership to a fresh session in the same checkout and
+/// leaves files, branch and baseline untouched; refusals create nothing.
+#[tokio::test]
+async fn handoff_moves_ownership_without_touching_the_checkout() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let previous = isolated_session(&f, f.repo.path()).await;
+    let before = f
+        .service
+        .registry()
+        .get_workspace_by_session(&previous)
+        .await
+        .unwrap()
+        .unwrap();
+    std::fs::write(before.session_cwd().join("README.md"), "owner edits\n").unwrap();
+
+    let sessions_before = f.storage.list_sessions().await.unwrap().len();
+    let response = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(previous.clone()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.previous_session_id, previous);
+    assert_eq!(response.workspace_id, before.id.to_string());
+    assert_eq!(
+        response.checkout_path,
+        before.checkout_path.display().to_string()
+    );
+    assert_eq!(response.branch, before.branch.as_str());
+    assert!(!response.summary_seeded);
+    assert_eq!(
+        std::fs::read_to_string(before.session_cwd().join("README.md")).unwrap(),
+        "owner edits\n",
+        "files are untouched"
+    );
+
+    let after = f
+        .service
+        .registry()
+        .get_workspace_by_session(&response.session_id)
+        .await
+        .unwrap()
+        .expect("successor owns the workspace");
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.baseline, before.baseline);
+    assert_eq!(after.branch, before.branch);
+    assert!(
+        f.service
+            .registry()
+            .get_workspace_by_session(&previous)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        f.service
+            .registry()
+            .transferred_to(&previous)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(response.session_id.as_str())
+    );
+
+    // Successor: parent = previous, origin worktree, no copied history, barrier released.
+    let row = f
+        .storage
+        .get_session(&response.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.fork_origin.map(|o| o.to_string()).as_deref(),
+        Some("worktree")
+    );
+    assert_eq!(row.cwd.as_deref(), Some(before.session_cwd().as_path()));
+    assert!(
+        f.storage
+            .get_pending_fork_isolation(&response.session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        f.storage
+            .get_history(&response.session_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        f.storage.list_sessions().await.unwrap().len(),
+        sessions_before + 1
+    );
+
+    // The previous owner no longer owns anything: a second handoff is refused
+    // with a stable code and creates nothing.
+    let err = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(previous),
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "owner_transferred");
+    assert_eq!(
+        f.storage.list_sessions().await.unwrap().len(),
+        sessions_before + 1
+    );
+}
+
+/// 24.2: a checkout with other live execution refuses the handoff and
+/// nothing is created or moved.
+#[tokio::test]
+async fn handoff_is_refused_while_the_checkout_has_other_activity() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&owner)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // A shared delegate (or another process) holds a shared activity lease.
+    let _delegate = crate::worktree::gate::CheckoutActivityLease::acquire(
+        f.service.storage_root(),
+        &record.checkout_path,
+        false,
+    )
+    .unwrap();
+    let sessions_before = f.storage.list_sessions().await.unwrap().len();
+
+    let err = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(owner.clone()),
+            Default::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "owner_active");
+    assert_eq!(
+        f.storage.list_sessions().await.unwrap().len(),
+        sessions_before
+    );
+    let unchanged = f
+        .service
+        .registry()
+        .get_workspace(&record.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        unchanged.ownership.owner_session_id.as_deref(),
+        Some(owner.as_str())
+    );
+    assert_eq!(
+        f.service.registry().transferred_to(&owner).await.unwrap(),
+        None
+    );
+}
+
+/// 24.3: crash after the successor row, before the transfer. The successor is
+/// non-runnable; recovery completes the transfer, leaving exactly one owner.
+#[tokio::test]
+async fn handoff_crash_before_transfer_is_completed_by_recovery() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::HandoffHost as _;
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&owner)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Interrupted right after the barrier session was written.
+    let successor = f
+        .handle
+        .create_pending_successor(&owner, &record, None)
+        .await
+        .unwrap();
+    assert!(
+        f.storage
+            .get_pending_fork_isolation(&successor)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let registry = f.service.registry();
+    assert_eq!(
+        registry
+            .get_workspace_by_session(&owner)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        record.id,
+        "the previous owner still owns the workspace"
+    );
+    assert!(
+        registry
+            .get_workspace_by_session(&successor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The successor never runs unowned: load is refused while pending.
+    let load = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            successor.clone(),
+            record.session_cwd(),
+        ))
+        .await;
+    assert!(load.is_err(), "a pending successor must not load");
+
+    // Explicit recovery completes the transfer.
+    f.handle
+        .session_materializer
+        .recover_pending_fork(&successor)
+        .await
+        .unwrap();
+    assert!(
+        f.storage
+            .get_pending_fork_isolation(&successor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        registry
+            .get_workspace_by_session(&successor)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        record.id
+    );
+    assert!(
+        registry
+            .get_workspace_by_session(&owner)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        registry.transferred_to(&owner).await.unwrap().as_deref(),
+        Some(successor.as_str())
+    );
+    // Recovery is idempotent: a retry changes nothing and creates no second owner.
+    f.handle
+        .session_materializer
+        .recover_pending_fork(&successor)
+        .await
+        .unwrap_err();
+    assert_eq!(registry.list_workspaces().await.unwrap().len(), 1);
+}
+
+/// 24.3: crash after the transfer, before the barrier release. The successor
+/// already owns the workspace but stays non-runnable until recovery.
+#[tokio::test]
+async fn handoff_crash_after_transfer_leaves_a_recoverable_non_runnable_successor() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::HandoffHost as _;
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let registry = f.service.registry();
+    let record = registry
+        .get_workspace_by_session(&owner)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let successor = f
+        .handle
+        .create_pending_successor(&owner, &record, None)
+        .await
+        .unwrap();
+    registry
+        .transfer_owner(&record.id, &owner, &successor)
+        .await
+        .unwrap();
+
+    assert!(
+        f.storage
+            .get_pending_fork_isolation(&successor)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        f.handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                successor.clone(),
+                record.session_cwd(),
+            ))
+            .await
+            .is_err(),
+        "an owning successor stays non-runnable until the barrier is released"
+    );
+
+    f.handle
+        .session_materializer
+        .recover_pending_fork(&successor)
+        .await
+        .unwrap();
+    assert!(
+        f.storage
+            .get_pending_fork_isolation(&successor)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        registry
+            .get_workspace_by_session(&successor)
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        record.id
+    );
+    assert_eq!(registry.list_workspaces().await.unwrap().len(), 1);
+}
+
+async fn seed_history(f: &WorktreeExtFixture, session_id: &str) {
+    f.storage
+        .session_store()
+        .add_message(
+            session_id,
+            crate::model::AgentMessage {
+                id: format!("seed-{session_id}"),
+                session_id: session_id.to_string(),
+                role: querymt::chat::ChatRole::User,
+                parts: vec![crate::model::MessagePart::Text {
+                    content: "please refactor the parser".to_string(),
+                }],
+                created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+                parent_message_id: None,
+                source_provider: None,
+                source_model: None,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// 24.4: the default handoff carries no history; `summary` seeds the
+/// successor with a summary of the previous conversation.
+#[tokio::test]
+async fn handoff_summary_is_opt_in_and_seeds_the_successor() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::{HandoffOptions, WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    f.llm.lock().await.expect_chat().returning(|_| {
+        Ok(crate::test_utils::MockChatResponse::text_only("parser refactor in progress").into())
+    });
+    let ops = WorktreeOps::new(f.service.clone());
+
+    let first = isolated_session(&f, f.repo.path()).await;
+    seed_history(&f, &first).await;
+    let clean = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(first),
+            HandoffOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(!clean.summary_seeded);
+    assert!(
+        f.storage
+            .get_history(&clean.session_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Hand off again from the successor, this time with a summary of the
+    // (seeded) conversation.
+    seed_history(&f, &clean.session_id).await;
+    let seeded = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(clean.session_id.clone()),
+            HandoffOptions {
+                name: Some("next".into()),
+                summary: true,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(seeded.summary_seeded);
+    let history = f.storage.get_history(&seeded.session_id).await.unwrap();
+    assert!(
+        history.iter().any(|m| m.parts.iter().any(|p| matches!(
+            p,
+            crate::model::MessagePart::Compaction { summary, .. }
+                if summary == "parser refactor in progress"
+        ))),
+        "the summary is the successor's initial context: {history:?}"
+    );
+}
+
+/// 24.4: a summarizer failure fails the handoff before the transfer.
+#[tokio::test]
+async fn handoff_summary_failure_creates_nothing_and_keeps_ownership() {
+    use crate::session::store::SessionStore as _;
+    use crate::worktree::{HandoffOptions, WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    f.llm
+        .lock()
+        .await
+        .expect_chat()
+        .returning(|_| Err(querymt::error::LLMError::GenericError("boom".into())));
+    let ops = WorktreeOps::new(f.service.clone());
+    let owner = isolated_session(&f, f.repo.path()).await;
+    seed_history(&f, &owner).await;
+    let sessions_before = f.storage.list_sessions().await.unwrap().len();
+
+    let err = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(owner.clone()),
+            HandoffOptions {
+                name: None,
+                summary: true,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "summary_failed");
+    assert_eq!(
+        f.storage.list_sessions().await.unwrap().len(),
+        sessions_before
+    );
+    assert!(
+        f.service
+            .registry()
+            .get_workspace_by_session(&owner)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        f.service.registry().transferred_to(&owner).await.unwrap(),
+        None
+    );
+}
+
+/// 24.5: native command, ext method and the typed core agree, with stable
+/// error codes and capability advertisement.
+#[tokio::test]
+async fn handoff_surfaces_agree_and_advertise_capabilities() {
+    let f = worktree_fixture(true).await;
+    let methods = ext_method_json(&f.handle, "querymt/capabilities", serde_json::json!({})).await;
+    assert!(
+        methods["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "querymt/worktree/handoff")
+    );
+    let meta = f.service.capability_meta();
+    assert_eq!(meta["handoff"], true);
+    assert_eq!(meta["handoffSummary"], true);
+
+    // Native command from the owner session.
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let via_native = native_command(&f.handle, &owner, "/worktree handoff next")
+        .await
+        .unwrap();
+    assert_eq!(via_native["previous_session_id"], owner.as_str());
+    assert_eq!(via_native["summary_seeded"], false);
+    let second = via_native["session_id"].as_str().unwrap().to_string();
+
+    // Ext method from the new owner, addressed by workspace id.
+    let ws = via_native["workspace_id"].as_str().unwrap();
+    let via_ext = ext_method_json(
+        &f.handle,
+        "querymt/worktree/handoff",
+        serde_json::json!({ "workspaceId": ws }),
+    )
+    .await;
+    assert_eq!(via_ext["previous_session_id"], second.as_str());
+    assert_eq!(via_ext["workspace_id"], ws);
+    assert_eq!(via_ext["checkout_path"], via_native["checkout_path"]);
+
+    // The first owner is no longer an owner: stable code on the ext surface.
+    let err = f
+        .handle
+        .ext_method(crate::acp::protocol::ExtRequest::new(
+            "querymt/worktree/handoff",
+            raw_params(&serde_json::json!({ "session_id": owner }).to_string()),
+        ))
+        .await
+        .expect_err("previous owner cannot hand off");
+    assert_eq!(err.data.unwrap()["code"], "owner_transferred");
+
+    // Malformed native usage is rejected.
+    assert!(
+        native_command(&f.handle, &second, "/worktree handoff a b")
+            .await
+            .is_err()
+    );
+}
+
+/// 24.6: a previous owner replays its history read-only, never materializes
+/// again, and every run/mutate entry point refuses with `owner_transferred`.
+#[tokio::test]
+async fn previous_owner_is_read_only_after_handoff() {
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let previous = isolated_session(&f, f.repo.path()).await;
+    seed_history(&f, &previous).await;
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&previous)
+        .await
+        .unwrap()
+        .unwrap();
+    let handed = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(previous.clone()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let code = |err: &crate::acp::protocol::Error| {
+        err.data
+            .as_ref()
+            .and_then(|d| d["code"].as_str())
+            .map(str::to_owned)
+    };
+
+    // Load replays and discloses read-only access with the current owner.
+    let loaded = f
+        .handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            previous.clone(),
+            record.session_cwd(),
+        ))
+        .await
+        .unwrap();
+    let access = &loaded.meta.as_ref().unwrap()["querymt"]["sessionAccess"];
+    assert_eq!(access["mode"], "read_only");
+    assert_eq!(access["reason"], "owner_transferred");
+    assert_eq!(access["ownerSessionId"], handed.session_id.as_str());
+    assert!(
+        loaded
+            .meta
+            .as_ref()
+            .unwrap()
+            .contains_key("querymt/sessionLoadSnapshot.v1")
+            || f.storage.view_store().is_none(),
+        "history is replayed through the load snapshot"
+    );
+    assert!(
+        f.handle.registry.lock().await.get(&previous).is_none(),
+        "the previous owner never materializes an actor"
+    );
+
+    // Prompt (including a native command), queue/steer, undo, redo, fork.
+    let prompt = SendAgent::prompt(
+        &f.handle,
+        crate::acp::protocol::PromptRequest::new(
+            previous.clone(),
+            vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new("edit a file"),
+            )],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code(&prompt).as_deref(), Some("owner_transferred"));
+    assert_eq!(
+        code(
+            &native_command(&f.handle, &previous, "/worktree list")
+                .await
+                .unwrap_err()
+        )
+        .as_deref(),
+        Some("owner_transferred")
+    );
+    for (method, params) in [
+        (
+            "querymt/session/queue",
+            serde_json::json!({"session_id": previous, "prompt": []}),
+        ),
+        (
+            "querymt/session/steer",
+            serde_json::json!({"session_id": previous, "prompt": []}),
+        ),
+        (
+            "querymt/session/undo",
+            serde_json::json!({"session_id": previous, "message_id": "m"}),
+        ),
+        (
+            "querymt/session/redo",
+            serde_json::json!({"session_id": previous}),
+        ),
+    ] {
+        let err = f
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                method,
+                raw_params(&params.to_string()),
+            ))
+            .await
+            .expect_err(method);
+        assert_eq!(code(&err).as_deref(), Some("owner_transferred"), "{method}");
+    }
+    let fork = f
+        .handle
+        .fork_session(crate::acp::protocol::ForkSessionRequest::new(
+            previous.clone(),
+            record.session_cwd(),
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&fork).as_deref(), Some("owner_transferred"));
+
+    // Nothing changed: still one workspace owned by the successor, no actor for the old session.
+    assert_eq!(
+        f.service.registry().list_workspaces().await.unwrap().len(),
+        1
+    );
+    assert!(
+        f.service
+            .registry()
+            .get_workspace_by_session(&previous)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.handle.registry.lock().await.get(&previous).is_none());
+
+    // The successor remains fully usable (loads as the owner).
+    f.handle
+        .load_session(crate::acp::protocol::LoadSessionRequest::new(
+            handed.session_id.clone(),
+            record.session_cwd(),
+        ))
+        .await
+        .unwrap();
+}
+
+/// 24.8: native command output is an ephemeral session update on the issuing
+/// session's ordered stream, and the response carries its event tip. No
+/// bridge route is involved.
+#[tokio::test]
+async fn native_command_output_is_a_session_update_covered_by_the_event_tip() {
+    use crate::events::{AgentEventKind, EventEnvelope};
+
+    let f = worktree_fixture(true).await;
+    let session = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    assert!(
+        f.handle.config.session_bridges.lock().unwrap().is_empty(),
+        "no bridge route is registered"
+    );
+    let mut events = f.handle.config.subscribe_events();
+
+    let response = SendAgent::prompt(
+        &f.handle,
+        crate::acp::protocol::PromptRequest::new(
+            session.clone(),
+            vec![crate::acp::protocol::ContentBlock::Text(
+                crate::acp::protocol::TextContent::new("/worktree list"),
+            )],
+        ),
+    )
+    .await
+    .unwrap();
+
+    let meta = response.meta.as_ref().unwrap();
+    assert!(meta.contains_key("querymt.worktree"));
+    let tip = meta["querymt"]["eventTip"].as_i64().expect("event tip");
+
+    let mut output_seq = None;
+    while let Ok(envelope) = events.try_recv() {
+        if let EventEnvelope::Ephemeral(event) = &envelope
+            && event.session_id == session
+            && matches!(event.kind, AgentEventKind::WorktreeCommandOutput { .. })
+        {
+            output_seq = Some(event.session_seq);
+        }
+    }
+    assert_eq!(output_seq, Some(tip), "the tip is the output event itself");
+
+    // Ephemeral: nothing about the command is journaled.
+    let journaled = f
+        .storage
+        .event_journal()
+        .load_session_stream(&session, None, None)
+        .await
+        .unwrap();
+    assert!(
+        !journaled
+            .iter()
+            .any(|event| matches!(event.kind, AgentEventKind::WorktreeCommandOutput { .. }))
+    );
+    f.handle.shutdown().await;
+}
+
+/// 24.9 + 24.10: the handoff is announced durably on the previous owner's
+/// stream, and a load of that actor-less session replays its history followed
+/// by the announcement, without a configuration update.
+#[tokio::test]
+async fn handoff_announcement_is_durable_and_replayed_without_an_actor() {
+    use crate::acp::protocol::SessionUpdate;
+    use crate::events::AgentEventKind;
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let previous = isolated_session(&f, f.repo.path()).await;
+    f.handle
+        .config
+        .emit_event_persisted(
+            &previous,
+            AgentEventKind::PromptReceived {
+                content: "earlier question".into(),
+                message_id: Some("m-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let (handed, tip) = ops
+        .handoff_announced(
+            &f.handle,
+            &WorkspaceTarget::Session(previous.clone()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    let tip = tip.expect("announcement recorded");
+
+    let journaled = f
+        .storage
+        .event_journal()
+        .load_session_stream(&previous, None, None)
+        .await
+        .unwrap();
+    let announced = journaled
+        .iter()
+        .find(|event| {
+            matches!(&event.kind, AgentEventKind::WorktreeOwnershipTransferred {
+                workspace_id, successor_session_id, summary_seeded: false,
+            } if *workspace_id == handed.workspace_id && *successor_session_id == handed.session_id)
+        })
+        .expect("durable announcement");
+    assert_eq!(announced.session_seq, tip);
+    assert!(f.handle.registry.lock().await.get(&previous).is_none());
+
+    let (notifications, count) = crate::acp::stdio::replay_loaded_session(
+        &f.handle,
+        &previous,
+        &crate::acp::shared::AcpSessionUpdateCapabilities::default(),
+    )
+    .await
+    .expect("actor-less replay");
+    assert!(count >= 2);
+    assert!(
+        !notifications
+            .iter()
+            .any(|n| matches!(n.update, SessionUpdate::ConfigOptionUpdate(_)))
+    );
+    let position =
+        |pred: &dyn Fn(&SessionUpdate) -> bool| notifications.iter().position(|n| pred(&n.update));
+    let history =
+        position(&|u| matches!(u, SessionUpdate::UserMessageChunk(_))).expect("history replayed");
+    let handoff = position(&|u| {
+        serde_json::to_value(u).is_ok_and(|v| {
+            v["_meta"]["querymt"]["worktreeHandoff"]["successorSessionId"]
+                == handed.session_id.as_str()
+        })
+    })
+    .expect("handoff update replayed");
+    assert!(history < handoff, "history precedes the handoff update");
+    f.handle.shutdown().await;
+}
+
+/// 24.8: through the real connection dispatcher (event forwarders plus the
+/// delivery hold, no bridge route), `/worktree list` output reaches the wire
+/// as a session update before the prompt response.
+#[tokio::test]
+async fn native_command_output_precedes_the_response_on_a_connection() {
+    let f = worktree_fixture(true).await;
+    let session = f
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            f.repo.path().to_path_buf(),
+        ))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let handle = Arc::new(f.handle);
+    assert!(handle.config.session_bridges.lock().unwrap().is_empty());
+    crate::acp::websocket_tests::assert_prompt_text_updates_precede_response(
+        handle.clone(),
+        &session,
+        "/worktree list",
+    )
+    .await;
+    handle.shutdown().await;
+}
+
+/// 24.9: a native `/worktree handoff` is announced to every connection
+/// attached to the previous owner, ahead of the issuing connection's response.
+#[tokio::test]
+async fn handoff_announcement_reaches_every_attached_connection_before_the_response() {
+    use crate::acp::websocket::WsServerState;
+    use crate::acp::websocket_tests::attach_test_connection;
+    use tokio::time::{Duration, timeout};
+
+    let f = worktree_fixture(true).await;
+    let owner = isolated_session(&f, f.repo.path()).await;
+    let agent = Arc::new(f.handle);
+    let state = WsServerState::new(agent.clone());
+
+    let (tx_a, mut rx_a, delivery_a, cancel_a) =
+        attach_test_connection(&state, "conn-a", &owner).await;
+    let (_tx_b, mut rx_b, _delivery_b, cancel_b) =
+        attach_test_connection(&state, "conn-b", &owner).await;
+
+    crate::acp::shared::dispatch_rpc_message_with_context(
+        crate::acp::shared::RpcDispatchState {
+            agent: agent.clone(),
+            session_owners: state.session_owners.clone(),
+            pending_elicitations: state.pending_elicitations.clone(),
+            conn_id: "conn-a".to_string(),
+            tx: tx_a,
+        },
+        crate::acp::shared::RpcMessage {
+            jsonrpc: "2.0".to_string(),
+            method: "session/prompt".to_string(),
+            params: serde_json::json!({
+                "sessionId": owner,
+                "prompt": [{"type": "text", "text": "/worktree handoff next"}]
+            }),
+            id: Some(serde_json::json!(7)),
+        },
+        crate::acp::shared::RpcDispatchContext {
+            delivery: Some(delivery_a),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let is_handoff = |message: &serde_json::Value| {
+        message["method"] == "session/update"
+            && message["params"]["update"]["_meta"]["querymt"]["worktreeHandoff"]["workspaceId"]
+                .is_string()
+    };
+
+    let mut saw_update = false;
+    loop {
+        let raw = timeout(Duration::from_secs(5), rx_a.recv())
+            .await
+            .expect("response arrives")
+            .expect("wire open");
+        let message: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if message["id"] == serde_json::json!(7) {
+            assert!(message["error"].is_null(), "handoff failed: {message}");
+            break;
+        }
+        saw_update |= is_handoff(&message);
+    }
+    assert!(saw_update, "handoff update precedes the response");
+
+    let mut other = false;
+    while let Ok(Some(raw)) = timeout(Duration::from_secs(2), rx_b.recv()).await {
+        let message: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if is_handoff(&message) {
+            other = true;
+            break;
+        }
+    }
+    assert!(other, "second connection receives the announcement");
+    cancel_a.cancel();
+    cancel_b.cancel();
+    agent.shutdown().await;
+}
+
+/// 24.9: an announcement that cannot be recorded never fails the committed
+/// handoff; ownership has moved and no tip is reported.
+#[tokio::test]
+async fn handoff_succeeds_when_the_announcement_cannot_be_recorded() {
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture_inner(true, crate::worktree::BaselineMode::Commit, true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let previous = isolated_session(&f, f.repo.path()).await;
+
+    let (handed, tip) = ops
+        .handoff_announced(
+            &f.handle,
+            &WorkspaceTarget::Session(previous.clone()),
+            Default::default(),
+        )
+        .await
+        .expect("handoff succeeds despite the emit failure");
+    assert_eq!(tip, None, "no announcement was recorded");
+
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&handed.session_id)
+        .await
+        .unwrap()
+        .expect("successor owns the workspace");
+    assert_eq!(record.id.as_str(), handed.workspace_id);
+    assert_eq!(
+        f.service
+            .registry()
+            .transferred_to(&previous)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(handed.session_id.as_str())
+    );
+    f.handle.shutdown().await;
+}
+
+/// 24.10: the public load-with-replay entry point works for a transferred
+/// previous owner (no actor): history first, then the handoff update, and no
+/// configuration update.
+#[tokio::test]
+async fn load_with_replay_serves_a_previous_owner_without_an_actor() {
+    use crate::acp::protocol::SessionUpdate;
+    use crate::worktree::{WorkspaceTarget, WorktreeOps};
+
+    let f = worktree_fixture(true).await;
+    let ops = WorktreeOps::new(f.service.clone());
+    let previous = isolated_session(&f, f.repo.path()).await;
+    f.handle
+        .config
+        .emit_event_persisted(
+            &previous,
+            crate::events::AgentEventKind::PromptReceived {
+                content: "earlier question".into(),
+                message_id: Some("m-1".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let record = f
+        .service
+        .registry()
+        .get_workspace_by_session(&previous)
+        .await
+        .unwrap()
+        .unwrap();
+    let handed = ops
+        .handoff(
+            &f.handle,
+            &WorkspaceTarget::Session(previous.clone()),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+    let cwd = record.session_cwd();
+    let handle = Arc::new(f.handle);
+    let outcome = crate::acp::load_session_with_replay(
+        &handle,
+        crate::acp::protocol::LoadSessionRequest::new(previous.clone(), cwd),
+    )
+    .await
+    .expect("read-only load with replay");
+
+    let updates: Vec<_> = outcome.notifications.iter().map(|n| &n.update).collect();
+    assert!(
+        !updates
+            .iter()
+            .any(|u| matches!(u, SessionUpdate::ConfigOptionUpdate(_)))
+    );
+    let history = updates
+        .iter()
+        .position(|u| matches!(u, SessionUpdate::UserMessageChunk(_)))
+        .expect("history replayed");
+    let handoff = updates
+        .iter()
+        .position(|u| {
+            serde_json::to_value(u).is_ok_and(|v| {
+                v["_meta"]["querymt"]["worktreeHandoff"]["successorSessionId"]
+                    == handed.session_id.as_str()
+            })
+        })
+        .expect("handoff update replayed");
+    assert!(history < handoff);
+    assert!(handle.registry.lock().await.get(&previous).is_none());
+    handle.shutdown().await;
 }

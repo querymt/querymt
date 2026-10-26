@@ -2733,6 +2733,16 @@ pub(crate) async fn assert_prompt_updates_precede_response(
     agent: Arc<crate::agent::LocalAgentHandle>,
     session_id: &str,
 ) {
+    assert_prompt_text_updates_precede_response(agent, session_id, "hello").await;
+}
+
+/// Same as [`assert_prompt_updates_precede_response`] for an arbitrary prompt
+/// text (for example a native `/worktree` command).
+pub(crate) async fn assert_prompt_text_updates_precede_response(
+    agent: Arc<crate::agent::LocalAgentHandle>,
+    session_id: &str,
+    text: &str,
+) {
     let state = WsServerState::new(agent.clone());
     let (wire_tx, mut wire_rx) = mpsc::channel::<String>(256);
     let cancel = CancellationToken::new();
@@ -2769,7 +2779,7 @@ pub(crate) async fn assert_prompt_updates_precede_response(
             method: "session/prompt".to_string(),
             params: serde_json::json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": "hello"}]
+                "prompt": [{"type": "text", "text": text}]
             }),
             id: Some(serde_json::json!(42)),
         },
@@ -2805,4 +2815,44 @@ pub(crate) async fn assert_prompt_updates_precede_response(
         saw_update,
         "assistant update must be on the wire before the prompt response"
     );
+}
+
+/// Attach a connection (forwarders plus delivery) that owns `session_id`.
+pub(crate) async fn attach_test_connection(
+    state: &WsServerState,
+    conn_id: &str,
+    session_id: &str,
+) -> (
+    mpsc::Sender<String>,
+    mpsc::Receiver<String>,
+    Arc<crate::acp::delivery::ConnectionDelivery>,
+    CancellationToken,
+) {
+    let (wire_tx, wire_rx) = mpsc::channel::<String>(256);
+    let cancel = CancellationToken::new();
+    let delivery = crate::acp::delivery::ConnectionDelivery::new(
+        Some(state.agent.config.event_sink.journal().clone()),
+        cancel.clone(),
+    );
+    state
+        .session_owners
+        .lock()
+        .await
+        .entry(session_id.to_string())
+        .or_default()
+        .insert(conn_id.to_string());
+    spawn_event_forwarders(
+        state.clone(),
+        ConnectionEventState {
+            conn_id: conn_id.to_string(),
+            tx: wire_tx.clone(),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: cancel.clone(),
+            delivery: delivery.clone(),
+        },
+        test_translator(),
+    );
+    (wire_tx, wire_rx, delivery, cancel)
 }

@@ -111,6 +111,9 @@ impl LocalAgentHandle {
         &self,
         req: ForkSessionRequest,
     ) -> Result<ForkSessionResponse, Error> {
+        self.session_materializer
+            .ensure_not_transferred(req.session_id.0.as_ref())
+            .await?;
         // Phase 1: Prepare fork (heavy DB work, NO registry lock held)
         let response = self.session_materializer.prepare_fork_session(req).await?;
 

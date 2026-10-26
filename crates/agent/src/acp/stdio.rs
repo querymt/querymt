@@ -89,6 +89,60 @@ fn session_load_span(req: &LoadSessionRequest) -> tracing::Span {
     span
 }
 
+/// Journal events and stored prompt blocks of a local session that has no
+/// loaded actor. `None` when the session is not stored on this node.
+async fn actorless_replay_sources(
+    agent: &crate::agent::LocalAgentHandle,
+    session_id: &str,
+) -> Result<
+    Option<(
+        Vec<crate::events::AgentEvent>,
+        HashMap<String, Vec<crate::acp::protocol::ContentBlock>>,
+    )>,
+    acp::Error,
+> {
+    let internal = |what: &str, err: &dyn std::fmt::Display| {
+        tracing::warn!(session.id = %session_id, error = %err, "failed to load actor-less ACP replay {what}");
+        acp::Error::internal_error().data(serde_json::json!({
+            "message": format!("Failed to replay session {what}: {err}"),
+            "sessionId": session_id,
+        }))
+    };
+    let stored = agent
+        .config
+        .storage
+        .session_store()
+        .get_session(session_id)
+        .await
+        .map_err(|err| internal("lookup", &err))?;
+    if stored.is_none() {
+        return Ok(None);
+    }
+    // The hosting runtime owns the journal this session's events went to.
+    let config = agent
+        .hosting_config(session_id)
+        .await
+        .unwrap_or_else(|| agent.config.clone());
+    let events = config
+        .event_sink
+        .journal()
+        .load_session_stream(session_id, None, None)
+        .instrument(info_span!("session.event_stream.load", session.id = %session_id))
+        .await
+        .map_err(|err| internal("events", &err))?
+        .into_iter()
+        .map(crate::events::AgentEvent::from)
+        .collect();
+    let history = config
+        .provider
+        .history_store()
+        .get_history(session_id)
+        .instrument(info_span!("session.history.load", session.id = %session_id))
+        .await
+        .map_err(|err| internal("history", &err))?;
+    Ok(Some((events, stored_user_prompt_blocks(history))))
+}
+
 pub(crate) async fn replay_loaded_session(
     agent: &crate::agent::LocalAgentHandle,
     session_id: &str,
@@ -98,6 +152,7 @@ pub(crate) async fn replay_loaded_session(
         let registry = agent.registry.lock().await;
         registry.get(session_id).cloned()
     };
+    let session_ref_missing = session_ref.is_none();
     let (events, prompt_blocks) = match session_ref {
         Some(session_ref) => match session_ref
             .get_event_stream()
@@ -123,14 +178,20 @@ pub(crate) async fn replay_loaded_session(
                 return Err(err);
             }
         },
-        None => {
-            tracing::warn!(session.id = %session_id, "loaded session has no runtime ref for ACP replay");
-            return Err(acp::Error::internal_error().data(serde_json::json!({
-                "message": "Loaded session has no runtime ref for ACP replay",
-                "sessionId": session_id,
-            })));
-        }
+        // A read-only previous owner has no actor: read the journal and the
+        // history store directly, as the actor handlers do.
+        None => match actorless_replay_sources(agent, session_id).await? {
+            Some(sources) => sources,
+            None => {
+                tracing::warn!(session.id = %session_id, "loaded session has no runtime ref for ACP replay");
+                return Err(acp::Error::internal_error().data(serde_json::json!({
+                    "message": "Loaded session has no runtime ref for ACP replay",
+                    "sessionId": session_id,
+                })));
+            }
+        },
     };
+    let actorless = session_ref_missing;
     let event_count = events.len();
     let mut notifications = async {
         crate::acp::shared::replay_agent_events_materialized(
@@ -142,6 +203,10 @@ pub(crate) async fn replay_loaded_session(
     }
     .instrument(info_span!("acp.replay.translate", session.id = %session_id))
     .await;
+    if actorless {
+        // No actor means no live configuration to report.
+        return Ok((notifications, event_count));
+    }
     // Historical events do not carry profile selectors. Replay the owner's full
     // current configuration, not a partial historical replacement.
     let options = agent

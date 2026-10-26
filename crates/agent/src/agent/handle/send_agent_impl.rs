@@ -20,7 +20,10 @@ impl SendAgent for LocalAgentHandle {
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
-        if let Some(response) = self.handle_native_worktree_prompt(&req, None).await? {
+        self.session_materializer
+            .ensure_not_transferred(&session_id)
+            .await?;
+        if let Some(response) = self.handle_native_worktree_prompt(&req).await? {
             return Ok(response);
         }
         #[cfg(feature = "remote")]

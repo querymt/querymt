@@ -59,8 +59,8 @@ print(isolated.workspace["sessionCwd"])   # the directory it actually runs in
 ```
 
 `agent.worktrees` is `None` when worktrees are not enabled; otherwise it
-exposes `create`, `list`, `status`, `result`, `publish`, `archive`, `remove`
-and `recover`, each returning a dict with the same shape as the ACP
+exposes `create`, `handoff`, `list`, `status`, `result`, `publish`, `archive`,
+`remove` and `recover`, each returning a dict with the same shape as the ACP
 `querymt/worktree/*` extensions. Removal is conservative and never forces.
 
 Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) with a stable

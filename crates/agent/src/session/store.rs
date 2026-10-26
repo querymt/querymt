@@ -86,6 +86,11 @@ pub struct PendingForkIsolation {
     pub source_session_id: String,
     pub source_cwd: std::path::PathBuf,
     pub options: crate::worktree::WorkspaceCreationOptions,
+    /// Set when the barrier belongs to an ownership handoff: the successor
+    /// must adopt this existing workspace (completing the transfer from
+    /// `source_session_id`) instead of allocating a fresh one on recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_workspace_id: Option<String>,
 }
 
 /// Represents the metadata for a session.

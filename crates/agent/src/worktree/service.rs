@@ -125,6 +125,9 @@ impl WorkspaceService {
             "defaultBaseline": self.default_baseline.to_string(),
             "executionModes": ["local", "worktree"],
             "baselines": ["commit", "current_working_tree"],
+            "sourceSession": true,
+            "handoff": true,
+            "handoffSummary": true,
         })
     }
 
@@ -205,6 +208,28 @@ impl WorkspaceService {
         )
     }
 
+    /// Project grouping cwd for a workspace created from `source_cwd`.
+    ///
+    /// A source inside a managed checkout inherits that checkout's recorded
+    /// `source_cwd`, so nested isolation stays in the original project group.
+    /// Otherwise the cwd is stored as given (normalized, not canonicalized).
+    async fn resolve_source_cwd(
+        &self,
+        checkout_root: &Path,
+        source_cwd: &Path,
+    ) -> WorktreeResult<String> {
+        Ok(
+            match self
+                .registry
+                .get_workspace_by_checkout(checkout_root)
+                .await?
+            {
+                Some(record) if !record.source_cwd.is_empty() => record.source_cwd,
+                _ => crate::worktree::normalize_cwd(source_cwd),
+            },
+        )
+    }
+
     /// Allocate (but do not yet own) a workspace for a new session.
     ///
     /// Returns `Ok(None)` for local execution — no managed workspace is
@@ -234,15 +259,24 @@ impl WorkspaceService {
         // source checkout (local sessions install this same gate at actor
         // startup), exactly as delegation does.
         let source_gate = CheckoutMutationGate::new(&self.storage_root, &resolved.checkout.root)?;
+        let group_cwd = self
+            .resolve_source_cwd(&resolved.checkout.root, source_cwd)
+            .await?;
         let record = self
             .allocator
-            .allocate_with_baseline(
-                &resolved,
-                &relative,
-                options.base_ref.as_deref(),
-                options.baseline,
-                Some(&source_gate),
-            )
+            .allocate_with(AllocationRequest {
+                source: &resolved,
+                relative_cwd: &relative,
+                base_ref: options.base_ref.as_deref(),
+                baseline_mode: options.baseline,
+                delegation_batch_id: None,
+                parent_workspace_id: None,
+                parent_session_id: options.source_session_id.clone(),
+                delegation_id: None,
+                preset_baseline: None,
+                mutation_gate: Some(&source_gate),
+                source_cwd: Some(group_cwd),
+            })
             .await?;
         Ok(Some(WorkspaceBinding::new(record, &self.storage_root)?))
     }
@@ -319,6 +353,11 @@ impl WorkspaceService {
         fork_session_id: &str,
         intent: &crate::session::store::PendingForkIsolation,
     ) -> WorktreeResult<WorkspaceBinding> {
+        if let Some(workspace_id) = intent.handoff_workspace_id.as_deref() {
+            return self
+                .recover_handoff(fork_session_id, &intent.source_session_id, workspace_id)
+                .await;
+        }
         let options = SessionCreationOptions::from_workspace_options(&intent.options);
         options
             .validate()
@@ -358,6 +397,47 @@ impl WorkspaceService {
             return Err(err);
         }
         Ok(binding)
+    }
+
+    /// Complete or confirm an interrupted ownership handoff for a pending
+    /// successor: it adopts the recorded workspace, never a fresh one.
+    ///
+    /// Already the owner: the transfer committed, only the barrier is left.
+    /// Still owned by the recorded previous owner: the transfer is completed
+    /// now (one compare-and-swap, so racing recoveries yield one owner).
+    /// Anyone else owns it: refused, and the successor stays non-runnable.
+    async fn recover_handoff(
+        &self,
+        successor: &str,
+        previous: &str,
+        workspace_id: &str,
+    ) -> WorktreeResult<WorkspaceBinding> {
+        let id = WorkspaceId::from_raw(workspace_id);
+        let record =
+            self.registry.get_workspace(&id).await?.ok_or_else(|| {
+                WorktreeError::InvalidOperation(format!("workspace {id} is gone"))
+            })?;
+        let record = match record.ownership.owner_session_id.as_deref() {
+            Some(owner) if owner == successor => record,
+            Some(owner) if owner == previous => {
+                self.registry
+                    .transfer_owner(&id, previous, successor)
+                    .await?
+            }
+            owner => {
+                return Err(WorktreeError::InvalidOperation(format!(
+                    "workspace {id} is owned by {}; handoff to {successor} cannot complete",
+                    owner.unwrap_or("nobody")
+                )));
+            }
+        };
+        if record.lifecycle != WorkspaceLifecycle::Ready {
+            return Err(WorktreeError::InvalidOperation(format!(
+                "workspace {id} is {} and cannot be adopted",
+                record.lifecycle
+            )));
+        }
+        WorkspaceBinding::new(record, &self.storage_root)
     }
 
     /// Allocate a fresh working-state workspace for an isolated
@@ -409,15 +489,24 @@ impl WorkspaceService {
                 &fallback_gate
             }
         };
+        let group_cwd = self
+            .resolve_source_cwd(&resolved.checkout.root, source_cwd)
+            .await?;
         let record = self
             .allocator
-            .allocate_with_baseline(
-                &resolved,
-                &relative,
-                options.base_ref.as_deref(),
-                options.baseline,
-                Some(source_gate),
-            )
+            .allocate_with(AllocationRequest {
+                source: &resolved,
+                relative_cwd: &relative,
+                base_ref: options.base_ref.as_deref(),
+                baseline_mode: options.baseline,
+                delegation_batch_id: None,
+                parent_workspace_id: None,
+                parent_session_id: None,
+                delegation_id: None,
+                preset_baseline: None,
+                mutation_gate: Some(source_gate),
+                source_cwd: Some(group_cwd),
+            })
             .await?;
         WorkspaceBinding::new(record, &self.storage_root)
     }
@@ -612,11 +701,19 @@ impl WorkspaceService {
                 }
             };
 
+            let group_cwd = match parent_record {
+                Some(parent) if !parent.source_cwd.is_empty() => parent.source_cwd.clone(),
+                _ => {
+                    self.resolve_source_cwd(&resolved.checkout.root, parent_cwd)
+                        .await?
+                }
+            };
             let record = self
                 .allocator
                 .allocate_with(AllocationRequest {
                     source: &resolved,
                     relative_cwd: &relative,
+                    source_cwd: Some(group_cwd),
                     base_ref: None,
                     baseline_mode: BaselineMode::CurrentWorkingTree,
                     delegation_batch_id,
@@ -1179,6 +1276,7 @@ mod tests {
             branch: ManagedBranch::for_workspace(&id),
             repository: resolved.identity.clone(),
             relative_cwd: PathBuf::new(),
+            source_cwd: String::new(),
             execution: crate::worktree::ExecutionMode::Worktree,
             baseline: None,
             lifecycle: WorkspaceLifecycle::Provisioning,
@@ -2524,6 +2622,61 @@ mod tests {
             fs::read_to_string(nested.effective_cwd.join("file.txt")).unwrap(),
             "parent edit"
         );
+    }
+
+    /// The source cwd is stored as given (not canonicalized) so it matches
+    /// the session row, and nested isolation inherits the original value.
+    #[tokio::test]
+    async fn source_cwd_matches_the_given_path_and_nests_through_isolation() {
+        let (repo, _storage, svc) = service().await;
+        let sub = repo.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("keep.txt"), "x").unwrap();
+        commit_files(repo.path(), "sub", &[("sub/keep.txt", "x")]);
+
+        // Reach the repository through a redundant, non-canonical spelling.
+        let given = repo.path().join(".").join("sub");
+        let options = SessionCreationOptions::isolated_worktree(BaselineMode::Commit);
+        let top = svc
+            .allocate_for_new_session(&given, &options)
+            .await
+            .unwrap()
+            .expect("isolation allocates")
+            .record;
+        assert_eq!(top.source_cwd, crate::worktree::normalize_cwd(&given));
+        assert!(!top.source_cwd.contains("/./"));
+        assert_eq!(top.relative_cwd, Path::new("sub"));
+
+        // A managed source supplies its own source cwd to nested isolation.
+        let managed_sub = top.session_cwd();
+        let nested = svc
+            .allocate_for_fork(&managed_sub, &options, None)
+            .await
+            .unwrap()
+            .record;
+        assert_eq!(nested.source_cwd, top.source_cwd);
+        assert_ne!(nested.checkout_path, top.checkout_path);
+
+        // Delegation inherits it too, and it survives archival.
+        let child = svc
+            .allocate_for_delegation(
+                "sess-owner",
+                Some(&nested),
+                &nested.session_cwd(),
+                None,
+                "delegation-sc",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.record.source_cwd, top.source_cwd);
+        let stored = svc
+            .registry()
+            .get_workspace(&child.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.source_cwd, top.source_cwd);
     }
 
     /// Result capture preserves the delegate's delta: inherited parent

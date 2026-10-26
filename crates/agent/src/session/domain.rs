@@ -269,6 +269,9 @@ pub enum ForkPointType {
 pub enum ForkOrigin {
     User,
     Delegation,
+    /// A sibling started from a source session with no history copied
+    /// (`/worktree create` children and handoff successors).
+    Worktree,
 }
 
 impl std::fmt::Display for ForkOrigin {
@@ -276,6 +279,7 @@ impl std::fmt::Display for ForkOrigin {
         match self {
             ForkOrigin::User => write!(f, "user"),
             ForkOrigin::Delegation => write!(f, "delegation"),
+            ForkOrigin::Worktree => write!(f, "worktree"),
         }
     }
 }
@@ -287,6 +291,7 @@ impl std::str::FromStr for ForkOrigin {
         match s {
             "user" => Ok(ForkOrigin::User),
             "delegation" => Ok(ForkOrigin::Delegation),
+            "worktree" => Ok(ForkOrigin::Worktree),
             _ => Err(format!("Unknown fork origin: {}", s)),
         }
     }
@@ -535,6 +540,11 @@ mod tests {
     fn test_fork_origin_display_and_parse() {
         assert_eq!(ForkOrigin::User.to_string(), "user");
         assert_eq!(ForkOrigin::Delegation.to_string(), "delegation");
+        assert_eq!(ForkOrigin::Worktree.to_string(), "worktree");
+        assert_eq!(
+            "worktree".parse::<ForkOrigin>().unwrap(),
+            ForkOrigin::Worktree
+        );
 
         let user: ForkOrigin = "user".parse().unwrap();
         assert_eq!(user, ForkOrigin::User);

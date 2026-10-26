@@ -204,6 +204,38 @@ def test_worktrees_facade_create_archive_remove(repo, tmp_path):
     run(scenario())
 
 
+def test_handoff_moves_ownership_to_a_new_session(repo, tmp_path):
+    async def scenario():
+        agent = await make_agent(
+            repo, tmp_path, worktrees={"storage_root": str(tmp_path / "wt")}
+        )
+        created = await agent.worktrees.create(name="owner")
+        checkout = Path(created["checkout_path"])
+        (Path(created["session_cwd"]) / "README.md").write_text("owner edits\n")
+
+        handed = await agent.worktrees.handoff(session_id=created["session_id"])
+        assert handed["previous_session_id"] == created["session_id"]
+        assert handed["session_id"] != created["session_id"]
+        assert handed["workspace_id"] == created["workspace_id"]
+        assert handed["checkout_path"] == str(checkout)
+        assert handed["summary_seeded"] is False
+        # Files are untouched and the successor is the single owner.
+        assert (Path(handed["session_cwd"]) / "README.md").read_text() == "owner edits\n"
+        listed = await agent.worktrees.list()
+        assert [w["owner_session_id"] for w in listed["workspaces"]] == [handed["session_id"]]
+
+        # The previous owner is no longer an owner: stable code, nothing created.
+        with pytest.raises(WorktreeError) as refused:
+            await agent.worktrees.handoff(session_id=created["session_id"])
+        assert refused.value.code == "owner_transferred"
+
+        with pytest.raises(WorktreeError) as bad:
+            await agent.worktrees.handoff()
+        assert bad.value.code == "invalid_options"
+
+    run(scenario())
+
+
 def test_invalid_arguments_raise_clear_errors(repo, tmp_path):
     async def scenario():
         with pytest.raises(ValueError, match="unknown worktrees option"):

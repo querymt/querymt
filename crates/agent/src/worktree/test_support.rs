@@ -270,6 +270,22 @@ impl WorkspaceRepository for FaultInjectingWorkspaceRepository {
         self.inner().detach_owner(id).await
     }
 
+    async fn transfer_owner(
+        &self,
+        id: &crate::worktree::domain::WorkspaceId,
+        from: &str,
+        to: &str,
+    ) -> crate::session::error::SessionResult<crate::worktree::domain::WorkspaceRecord> {
+        self.inner().transfer_owner(id, from, to).await
+    }
+
+    async fn transferred_to(
+        &self,
+        session_id: &str,
+    ) -> crate::session::error::SessionResult<Option<String>> {
+        self.inner().transferred_to(session_id).await
+    }
+
     async fn bind_baseline(
         &self,
         id: &crate::worktree::domain::WorkspaceId,

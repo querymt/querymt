@@ -93,6 +93,27 @@ impl RepositoryIdentity {
     }
 }
 
+/// Normalize a client-supplied cwd into the form stored on session rows and
+/// used as a project grouping key: absolute paths lose redundant components
+/// (`.`, trailing and doubled separators); everything else is kept verbatim.
+///
+/// The path is deliberately **not** canonicalized: session rows store client
+/// paths, and resolving symlinks (macOS `/tmp` -> `/private/tmp`) would
+/// stop managed sessions from matching their source project.
+pub fn normalize_cwd(cwd: &std::path::Path) -> String {
+    if cwd.is_absolute() {
+        cwd.components().collect::<PathBuf>().display().to_string()
+    } else {
+        cwd.display().to_string()
+    }
+}
+
+/// Reconstruct a source cwd from a repository origin path and a relative cwd.
+/// Used to backfill workspaces recorded before `source_cwd` existed.
+pub fn source_cwd_from(origin_path: &std::path::Path, relative_cwd: &std::path::Path) -> String {
+    normalize_cwd(&origin_path.join(relative_cwd))
+}
+
 /// Branch name assigned to a managed workspace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -512,6 +533,10 @@ pub struct WorkspaceOwnership {
     /// Parallel delegation batch this workspace belongs to. Delegates in one
     /// batch share one captured baseline.
     pub delegation_batch_id: Option<String>,
+    /// Session the workspace was most recently handed off to, if ownership
+    /// ever moved. After a handoff this equals the current owner.
+    #[serde(default)]
+    pub handed_off_to: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -705,6 +730,13 @@ pub struct WorkspaceRecord {
     /// Session cwd relative to the checkout root (preserves subdirectory
     /// sessions). Empty for checkout root.
     pub relative_cwd: PathBuf,
+    /// Cwd of the session or request this workspace was created from,
+    /// normalized like session cwds (see [`normalize_cwd`]). This is the
+    /// project grouping key for managed sessions: nested isolation inherits
+    /// it from the source's record, and it survives archive and removal.
+    /// Empty only for records serialized before the field existed.
+    #[serde(default)]
+    pub source_cwd: String,
     /// Execution mode this workspace serves (always `Worktree` for managed
     /// records; carried so local sessions can be modeled uniformly).
     pub execution: ExecutionMode,
@@ -1004,6 +1036,7 @@ mod tests {
             parent_session_id: Some("sess-0".into()),
             delegation_id: Some("del-9".into()),
             delegation_batch_id: Some("batch-2".into()),
+            handed_off_to: Some("sess-2".into()),
         };
         assert_eq!(roundtrip(&owned), owned);
     }
@@ -1126,6 +1159,7 @@ mod tests {
             checkout_path: PathBuf::from("/data/worktrees/ws-1"),
             branch: ManagedBranch::for_workspace(&WorkspaceId::from_raw("ws-1")),
             relative_cwd: PathBuf::from("crates/agent"),
+            source_cwd: "/repo/crates/agent".into(),
             execution: ExecutionMode::Worktree,
             baseline: Some(Baseline {
                 mode: BaselineMode::Commit,

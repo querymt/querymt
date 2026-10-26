@@ -22,6 +22,10 @@ pub struct SessionCreationOptions {
     pub baseline: BaselineMode,
     /// Explicit base ref (branch, tag, or commit). Absent = source HEAD.
     pub base_ref: Option<String>,
+    /// Session this worktree session is started from (lineage only: no
+    /// history is copied and no shared-checkout permission is granted).
+    /// Distinct from the delegation parent, which grants checkout sharing.
+    pub source_session_id: Option<String>,
 }
 
 impl Default for SessionCreationOptions {
@@ -30,6 +34,7 @@ impl Default for SessionCreationOptions {
             execution: ExecutionMode::Local,
             baseline: BaselineMode::Commit,
             base_ref: None,
+            source_session_id: None,
         }
     }
 }
@@ -46,7 +51,14 @@ impl SessionCreationOptions {
             execution: ExecutionMode::Worktree,
             baseline,
             base_ref: None,
+            source_session_id: None,
         }
+    }
+
+    /// Record the session this worktree session descends from.
+    pub fn with_source_session(mut self, session_id: impl Into<String>) -> Self {
+        self.source_session_id = Some(session_id.into());
+        self
     }
 
     /// Whether these options request an isolated worktree.
@@ -85,6 +97,13 @@ impl SessionCreationOptions {
                         .to_string(),
                 );
             }
+            if self.source_session_id.is_some() {
+                return Err(
+                    "a source session requires worktree execution; local sessions have no \
+                     worktree lineage"
+                        .to_string(),
+                );
+            }
             return Ok(());
         }
         if self.baseline == BaselineMode::CurrentWorkingTree && self.base_ref.is_some() {
@@ -114,6 +133,7 @@ impl SessionCreationOptions {
             execution: options.execution,
             baseline: options.baseline,
             base_ref: options.base_ref.clone(),
+            source_session_id: None,
         }
     }
 }
@@ -225,6 +245,21 @@ pub fn session_creation_options_from_meta(
         }
     }
 
+    for key in ["sourceSessionId", "source_session_id"] {
+        match object.get(key) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(raw)) if raw.trim().is_empty() => {}
+            Some(serde_json::Value::String(raw)) => {
+                options.source_session_id = Some(raw.clone());
+            }
+            Some(other) => {
+                return Err(format!(
+                    "sessionWorkspace.{key} must be a session id string, got {other}"
+                ));
+            }
+        }
+    }
+
     options.validate()?;
     Ok(Some(options))
 }
@@ -328,6 +363,7 @@ mod tests {
             execution: ExecutionMode::Local,
             baseline: BaselineMode::CurrentWorkingTree,
             base_ref: None,
+            source_session_id: None,
         }
         .validate()
         .unwrap_err();
@@ -337,6 +373,7 @@ mod tests {
             execution: ExecutionMode::Local,
             baseline: BaselineMode::Commit,
             base_ref: Some("main".into()),
+            source_session_id: None,
         }
         .validate()
         .unwrap_err();
@@ -562,6 +599,31 @@ mod tests {
         let local = apply(serde_json::json!({"execution": "local"}));
         assert!(!local.requests_isolation());
         assert_eq!(local.baseline, BaselineMode::Commit);
+    }
+
+    #[test]
+    fn source_session_is_parsed_and_requires_worktree_execution() {
+        let meta = meta_with_workspace(serde_json::json!({
+            "execution": "worktree",
+            "sourceSessionId": "sess-1",
+        }));
+        let opts = session_creation_options_from_meta(Some(&meta))
+            .unwrap()
+            .unwrap();
+        assert_eq!(opts.source_session_id.as_deref(), Some("sess-1"));
+        // Lineage never leaks into the durable creation options.
+        assert_eq!(opts.to_workspace_options().base_ref, None);
+
+        let local = meta_with_workspace(serde_json::json!({ "sourceSessionId": "sess-1" }));
+        let err = session_creation_options_from_meta(Some(&local)).unwrap_err();
+        assert!(err.contains("requires worktree execution"), "error: {err}");
+
+        let bad = meta_with_workspace(serde_json::json!({
+            "execution": "worktree",
+            "sourceSessionId": 4,
+        }));
+        let err = session_creation_options_from_meta(Some(&bad)).unwrap_err();
+        assert!(err.contains("must be a session id string"), "error: {err}");
     }
 
     #[test]

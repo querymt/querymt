@@ -140,6 +140,9 @@ pub struct SessionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_state: Option<RemoteSessionConnectionState>,
     pub runtime_state: Option<String>,
+    /// Managed-workspace view; absent for local sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::session::projection::SessionWorkspaceView>,
 }
 
 #[typeshare]
@@ -1010,7 +1013,9 @@ impl AgentSessions {
             let same_scope = match scope {
                 SessionScope::All => true,
                 SessionScope::Root => entry.parent_session_id.is_none(),
-                SessionScope::Forks => entry.fork_origin.as_deref() == Some("user"),
+                SessionScope::Forks => {
+                    matches!(entry.fork_origin.as_deref(), Some("user" | "worktree"))
+                }
                 SessionScope::Delegates => entry.fork_origin.as_deref() == Some("delegation"),
                 SessionScope::Children => entry.parent_session_id.is_some(),
             };
@@ -1105,6 +1110,34 @@ impl AgentSessions {
         let session_scope = acp_session_scope_from_meta(request.meta.as_ref());
         // ACP workspace requests load incrementally; global discovery remains a larger flat page.
         let limit = if requested_cwd.is_some() { 10 } else { 100 };
+
+        // `children` + `_meta.querymt.parentSessionId` pages one parent's
+        // direct children (forks and worktree siblings; delegates stay hidden).
+        if session_scope == SessionScope::Children
+            && let Some(parent) = acp_parent_session_id_from_meta(request.meta.as_ref())
+        {
+            if pinned.is_some() {
+                return Err(anyhow!("pin filters are unsupported for child listings").into());
+            }
+            let (group, total_count) = view_store
+                .list_session_children_with_lifecycle(
+                    parent,
+                    cursor.map(AcpSessionCursor::into_string),
+                    limit,
+                    lifecycle,
+                )
+                .await
+                .map_err(anyhow::Error::from)?;
+            return Ok(AcpSessionListPage {
+                sessions: group
+                    .sessions
+                    .into_iter()
+                    .map(session_list_item_to_acp_info)
+                    .collect(),
+                next_cursor: group.next_cursor,
+                total_count: total_count as u64,
+            });
+        }
 
         let (sessions, next_cursor, total_count) = view_store
             .list_session_items_with_pins(
@@ -1457,6 +1490,7 @@ impl AgentSessions {
                         attached: Some(true),
                         connection_state: Some(RemoteSessionConnectionState::Connected),
                         runtime_state: None,
+                        workspace: None,
                     };
                     push_group_session(groups, format!("remote::{}", peer_label), summary);
                 }
@@ -1496,6 +1530,7 @@ impl AgentSessions {
                             RemoteSessionConnectionState::Disconnected
                         }),
                         runtime_state: Some("stopped".to_string()),
+                        workspace: None,
                     };
                     push_group_session(groups, format!("remote::{}", bookmark.peer_label), summary);
                 }
@@ -1585,6 +1620,7 @@ impl AgentSessions {
                         attached: Some(false),
                         connection_state: Some(RemoteSessionConnectionState::Disconnected),
                         runtime_state: session_info.runtime_state,
+                        workspace: None,
                     };
                     push_group_session(groups, format!("remote::{}", peer_label), summary);
                 }
@@ -1722,6 +1758,18 @@ fn acp_session_scope_from_meta(meta: Option<&Meta>) -> SessionScope {
     }
 }
 
+/// `_meta.querymt.parentSessionId` (also accepted at the top level of the meta
+/// for symmetry with `sessionScope`), if a non-empty string.
+fn acp_parent_session_id_from_meta(meta: Option<&Meta>) -> Option<String> {
+    let meta = meta?;
+    meta.get(crate::acp::shared::QUERYMT_META_NAMESPACE)
+        .and_then(|querymt| querymt.get("parentSessionId"))
+        .or_else(|| meta.get("parentSessionId"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
 fn session_list_item_to_acp_info(item: SessionListItem) -> SessionInfo {
     let mut info = SessionInfo::new(
         SessionId::from(item.session_id),
@@ -1759,6 +1807,14 @@ fn session_list_item_to_acp_info(item: SessionListItem) -> SessionInfo {
         "forkCount".to_string(),
         serde_json::Value::from(item.fork_count),
     );
+    if let Some(workspace) = &item.workspace {
+        let mut querymt = serde_json::Map::new();
+        querymt.insert("workspace".to_string(), workspace.to_meta());
+        meta.insert(
+            crate::acp::shared::QUERYMT_META_NAMESPACE.to_string(),
+            querymt.into(),
+        );
+    }
     info.meta = Some(meta);
     info
 }
@@ -1782,6 +1838,7 @@ impl From<SessionListItem> for SessionSummary {
             attached: None,
             connection_state: None,
             runtime_state: None,
+            workspace: value.workspace,
         }
     }
 }
@@ -1904,6 +1961,7 @@ mod remote_page_tests {
             attached: None,
             connection_state: None,
             runtime_state: None,
+            workspace: None,
         }
     }
 

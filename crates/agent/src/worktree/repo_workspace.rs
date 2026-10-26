@@ -95,6 +95,44 @@ pub trait WorkspaceRepository: Send + Sync {
     /// Clear the session owner binding.
     async fn detach_owner(&self, id: &WorkspaceId) -> SessionResult<WorkspaceRecord>;
 
+    /// Atomically move ownership of a `ready` workspace from `from` to `to`.
+    ///
+    /// One conditional `UPDATE ... WHERE owner_session_id = from AND
+    /// lifecycle = 'ready'` plus the previous owner's transferred marker, in a
+    /// single transaction: there is never an ownerless window, and of two
+    /// racing handoffs exactly one wins. Fails with
+    /// [`SessionError::WorkspaceAlreadyOwned`] when `from` is not the current
+    /// owner and [`SessionError::InvalidOperation`] when the workspace is not
+    /// `ready`.
+    async fn transfer_owner(
+        &self,
+        id: &WorkspaceId,
+        from: &str,
+        to: &str,
+    ) -> SessionResult<WorkspaceRecord>;
+
+    /// The session `session_id` handed its workspace to, if it was
+    /// transferred. Marks the session as a read-only previous owner.
+    async fn transferred_to(&self, session_id: &str) -> SessionResult<Option<String>>;
+
+    /// The session that owns the workspace `session_id` handed off, following
+    /// repeated handoffs (A -> B -> C) to the current owner. `None` when the
+    /// session never handed anything off. Bounded, so a corrupt cycle cannot
+    /// loop forever.
+    async fn current_owner_after_handoff(&self, session_id: &str) -> SessionResult<Option<String>> {
+        let mut current = match self.transferred_to(session_id).await? {
+            Some(next) => next,
+            None => return Ok(None),
+        };
+        for _ in 0..32 {
+            match self.transferred_to(&current).await? {
+                Some(next) => current = next,
+                None => break,
+            }
+        }
+        Ok(Some(current))
+    }
+
     /// Persist the captured immutable baseline for a workspace.
     async fn bind_baseline(&self, id: &WorkspaceId, baseline: &Baseline) -> SessionResult<()>;
 
@@ -179,7 +217,7 @@ const SELECT_COLS: &str = "public_id, common_dir, origin_path, project_name, che
      branch, relative_cwd, execution, baseline_mode, source_head, baseline_commit, lifecycle, \
      owner_session_id, parent_workspace_id, parent_session_id, delegation_id, \
      delegation_batch_id, last_error, created_at, updated_at, \
-     requested_base_ref, operation_id, provisioning_phase";
+     requested_base_ref, operation_id, provisioning_phase, source_cwd, handed_off_to";
 
 fn select_by_id_sql() -> String {
     format!("SELECT {SELECT_COLS} FROM workspaces WHERE public_id = ?1")
@@ -213,6 +251,8 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<WorkspaceRecord, rusqlite
     let requested_base_ref: Option<String> = row.get("requested_base_ref")?;
     let operation_id: Option<String> = row.get("operation_id")?;
     let provisioning_phase: Option<String> = row.get("provisioning_phase")?;
+    let source_cwd: Option<String> = row.get("source_cwd")?;
+    let handed_off_to: Option<String> = row.get("handed_off_to")?;
 
     let mode = BaselineMode::from_str(&baseline_mode).map_err(|_| rusqlite::Error::InvalidQuery)?;
     let baseline = match (source_head, baseline_commit) {
@@ -229,11 +269,14 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<WorkspaceRecord, rusqlite
         id: WorkspaceId::from_raw(public_id),
         repository: RepositoryIdentity {
             common_dir: PathBuf::from(common_dir),
-            origin_path: PathBuf::from(origin_path),
+            origin_path: PathBuf::from(&origin_path),
             project_name,
         },
         checkout_path: PathBuf::from(checkout_path),
         branch: ManagedBranch::from_raw(branch),
+        source_cwd: source_cwd.unwrap_or_else(|| {
+            crate::worktree::source_cwd_from(Path::new(&origin_path), Path::new(&relative_cwd))
+        }),
         relative_cwd: PathBuf::from(relative_cwd),
         execution: ExecutionMode::from_str(&execution)
             .map_err(|_| rusqlite::Error::InvalidQuery)?,
@@ -246,6 +289,7 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<WorkspaceRecord, rusqlite
             parent_session_id,
             delegation_id,
             delegation_batch_id,
+            handed_off_to,
         },
         last_error,
         requested_baseline_mode: mode,
@@ -271,8 +315,8 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     baseline_commit, lifecycle, owner_session_id, parent_workspace_id,
                     parent_session_id, delegation_id, delegation_batch_id, last_error,
                     created_at, updated_at, requested_base_ref, operation_id,
-                    provisioning_phase
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                    provisioning_phase, source_cwd
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 params![
                     record.id.as_str(),
                     path_text(&record.repository.common_dir),
@@ -306,6 +350,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     record.requested_base_ref,
                     record.operation_id,
                     record.provisioning_phase.map(|p| p.to_string()),
+                    record.source_cwd,
                 ],
             )?;
             Ok(record)
@@ -439,7 +484,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                     parent_workspace_id = ?14, parent_session_id = ?15,
                     delegation_id = ?16, delegation_batch_id = ?17, last_error = ?18,
                     created_at = ?19, updated_at = ?20, requested_base_ref = ?21,
-                    operation_id = ?22, provisioning_phase = ?23
+                    operation_id = ?22, provisioning_phase = ?23, source_cwd = ?24
                  WHERE public_id = ?1",
                     params![
                         record.id.as_str(),
@@ -474,6 +519,7 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
                         record.requested_base_ref,
                         record.operation_id,
                         record.provisioning_phase.map(|p| p.to_string()),
+                        record.source_cwd,
                     ],
                 )?;
                 Ok(changed)
@@ -582,6 +628,78 @@ impl WorkspaceRepository for SqliteWorkspaceRepository {
             })
             .await?;
         updated.ok_or(SessionError::WorkspaceNotFound(id_for_err))
+    }
+
+    async fn transfer_owner(
+        &self,
+        id: &WorkspaceId,
+        from: &str,
+        to: &str,
+    ) -> SessionResult<WorkspaceRecord> {
+        let (workspace, from_owned, to_owned) =
+            (id.as_str().to_owned(), from.to_owned(), to.to_owned());
+        let moved = self
+            .run_blocking(move |conn| {
+                let tx = conn.transaction()?;
+                let now = format_dt(&OffsetDateTime::now_utc());
+                let changed = tx.execute(
+                    "UPDATE workspaces SET owner_session_id = ?3, handed_off_to = ?3, \
+                     updated_at = ?4 \
+                     WHERE public_id = ?1 AND lifecycle = 'ready' AND owner_session_id = ?2 \
+                     AND ?2 != ?3",
+                    params![workspace, from_owned, to_owned, now],
+                )?;
+                if changed == 0 {
+                    return Ok(None);
+                }
+                tx.execute(
+                    "INSERT INTO workspace_handoffs \
+                     (from_session_id, workspace_public_id, to_session_id, transferred_at) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![from_owned, workspace, to_owned, now],
+                )?;
+                let record =
+                    tx.query_row(&select_by_id_sql(), params![workspace], row_to_workspace)?;
+                tx.commit()?;
+                Ok(Some(record))
+            })
+            .await?;
+        if let Some(record) = moved {
+            return Ok(record);
+        }
+        // Nothing moved: report why, without having changed anything.
+        let record = self
+            .get_workspace(id)
+            .await?
+            .ok_or_else(|| SessionError::WorkspaceNotFound(id.to_string()))?;
+        if record.lifecycle != WorkspaceLifecycle::Ready {
+            return Err(SessionError::InvalidOperation(format!(
+                "workspace {id} is {} and cannot change owner",
+                record.lifecycle
+            )));
+        }
+        if from == to {
+            return Err(SessionError::InvalidOperation(
+                "a handoff needs a distinct successor session".to_string(),
+            ));
+        }
+        Err(SessionError::WorkspaceAlreadyOwned {
+            workspace: id.to_string(),
+            owner: record.ownership.owner_session_id.unwrap_or_default(),
+        })
+    }
+
+    async fn transferred_to(&self, session_id: &str) -> SessionResult<Option<String>> {
+        let session = session_id.to_owned();
+        self.run_blocking(move |conn| {
+            conn.query_row(
+                "SELECT to_session_id FROM workspace_handoffs WHERE from_session_id = ?1",
+                params![session],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .await
     }
 
     async fn bind_baseline(&self, id: &WorkspaceId, baseline: &Baseline) -> SessionResult<()> {
@@ -776,6 +894,7 @@ mod tests {
             checkout_path: PathBuf::from(checkout),
             branch: ManagedBranch::for_workspace(&WorkspaceId::from_raw(id)),
             relative_cwd: PathBuf::from("crates/agent"),
+            source_cwd: String::new(),
             execution: ExecutionMode::Worktree,
             baseline: None,
             lifecycle: WorkspaceLifecycle::Provisioning,
@@ -998,6 +1117,149 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SessionError::WorkspaceNotFound(_)));
+    }
+
+    async fn ready_owned(repo: &SqliteWorkspaceRepository, id: &str, owner: &str) -> WorkspaceId {
+        insert_session(repo, owner).await;
+        let ws = WorkspaceId::from_raw(id);
+        repo.insert_workspace(make_record(id, &format!("/store/wt/{id}")))
+            .await
+            .unwrap();
+        repo.transition_lifecycle(
+            &ws,
+            WorkspaceLifecycle::Provisioning,
+            WorkspaceLifecycle::Ready,
+        )
+        .await
+        .unwrap();
+        repo.attach_owner(&ws, owner).await.unwrap();
+        ws
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_moves_ownership_and_marks_the_previous_owner() {
+        let repo = repo();
+        let ws = ready_owned(&repo, "ws-1", "sess-a").await;
+        insert_session(&repo, "sess-b").await;
+
+        let moved = repo.transfer_owner(&ws, "sess-a", "sess-b").await.unwrap();
+        assert_eq!(moved.ownership.owner_session_id.as_deref(), Some("sess-b"));
+        assert_eq!(moved.ownership.handed_off_to.as_deref(), Some("sess-b"));
+
+        assert_eq!(
+            repo.transferred_to("sess-a").await.unwrap().as_deref(),
+            Some("sess-b")
+        );
+        assert_eq!(repo.transferred_to("sess-b").await.unwrap(), None);
+        // The previous owner no longer resolves to a workspace binding.
+        assert!(
+            repo.get_workspace_by_session("sess-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            repo.get_workspace_by_session("sess-b")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            ws
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_rejects_a_wrong_from_without_changes() {
+        let repo = repo();
+        let ws = ready_owned(&repo, "ws-1", "sess-a").await;
+        insert_session(&repo, "sess-b").await;
+        insert_session(&repo, "sess-c").await;
+
+        let err = repo
+            .transfer_owner(&ws, "sess-b", "sess-c")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SessionError::WorkspaceAlreadyOwned { ref owner, .. } if owner == "sess-a"),
+            "unexpected error: {err:?}"
+        );
+        let err = repo
+            .transfer_owner(&ws, "sess-a", "sess-a")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::InvalidOperation(_)), "{err:?}");
+        let err = repo
+            .transfer_owner(&WorkspaceId::from_raw("ghost"), "sess-a", "sess-b")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::WorkspaceNotFound(_)), "{err:?}");
+
+        let unchanged = repo.get_workspace(&ws).await.unwrap().unwrap();
+        assert_eq!(
+            unchanged.ownership.owner_session_id.as_deref(),
+            Some("sess-a")
+        );
+        assert_eq!(unchanged.ownership.handed_off_to, None);
+        assert_eq!(repo.transferred_to("sess-a").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn transfer_owner_requires_a_ready_workspace() {
+        let repo = repo();
+        let ws = ready_owned(&repo, "ws-1", "sess-a").await;
+        insert_session(&repo, "sess-b").await;
+        assert!(
+            repo.transition_lifecycle(&ws, WorkspaceLifecycle::Ready, WorkspaceLifecycle::Failed)
+                .await
+                .unwrap()
+        );
+
+        let err = repo
+            .transfer_owner(&ws, "sess-a", "sess-b")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::InvalidOperation(_)), "{err:?}");
+        let unchanged = repo.get_workspace(&ws).await.unwrap().unwrap();
+        assert_eq!(
+            unchanged.ownership.owner_session_id.as_deref(),
+            Some("sess-a")
+        );
+        assert_eq!(repo.transferred_to("sess-a").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_transfers_from_one_owner_have_exactly_one_winner() {
+        let repo = Arc::new(repo());
+        let ws = ready_owned(&repo, "ws-1", "sess-a").await;
+        let targets: Vec<String> = (0..8).map(|n| format!("sess-t{n}")).collect();
+        for target in &targets {
+            insert_session(&repo, target).await;
+        }
+
+        let handles: Vec<_> = targets
+            .iter()
+            .cloned()
+            .map(|target| {
+                let (repo, ws) = (repo.clone(), ws.clone());
+                tokio::spawn(async move { repo.transfer_owner(&ws, "sess-a", &target).await })
+            })
+            .collect();
+        let mut winners = Vec::new();
+        for handle in handles {
+            if let Ok(record) = handle.await.unwrap() {
+                winners.push(record.ownership.owner_session_id.unwrap());
+            }
+        }
+        assert_eq!(winners.len(), 1, "exactly one handoff wins: {winners:?}");
+        let current = repo.get_workspace(&ws).await.unwrap().unwrap();
+        assert_eq!(
+            current.ownership.owner_session_id.as_deref(),
+            Some(winners[0].as_str())
+        );
+        assert_eq!(
+            repo.transferred_to("sess-a").await.unwrap().as_deref(),
+            Some(winners[0].as_str())
+        );
     }
 
     #[tokio::test]

@@ -612,8 +612,88 @@ pub fn init_schema(conn: &mut Connection) -> Result<(), rusqlite::Error> {
 
     conn.execute_batch(WORKSPACE_TABLES_DDL)?;
     ensure_workspace_provisioning_columns(conn)?;
+    ensure_workspace_source_cwd(conn)?;
+    ensure_workspace_handoff(conn)?;
 
     Ok(())
+}
+
+/// Add the ownership-handoff schema: `workspaces.handed_off_to` and the
+/// `workspace_handoffs` marker table.
+///
+/// `handed_off_to` records the session the workspace was most recently handed
+/// to. Each row of `workspace_handoffs` marks one previous owner as
+/// transferred (`from_session_id` is the primary key, because a session can
+/// only be handed off once: afterwards it no longer owns anything). Kept out
+/// of [`WORKSPACE_TABLES_DDL`] for the same reason as the other additive
+/// workspace columns. Idempotent.
+pub fn ensure_workspace_handoff(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let has_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .try_fold(false, |found, name| {
+                name.map(|n| found || n == "handed_off_to")
+            })?
+    };
+    if !has_column {
+        conn.execute("ALTER TABLE workspaces ADD COLUMN handed_off_to TEXT", [])?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspace_handoffs (
+            from_session_id TEXT PRIMARY KEY,
+            workspace_public_id TEXT NOT NULL,
+            to_session_id TEXT NOT NULL,
+            transferred_at TEXT NOT NULL,
+            FOREIGN KEY(from_session_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
+            FOREIGN KEY(to_session_id) REFERENCES sessions(public_id) ON DELETE CASCADE,
+            FOREIGN KEY(workspace_public_id) REFERENCES workspaces(public_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_workspace_handoffs_workspace
+            ON workspace_handoffs(workspace_public_id);",
+    )
+}
+
+/// Add `workspaces.source_cwd` and backfill existing rows.
+///
+/// `source_cwd` is the cwd of the session (or request) a workspace was
+/// created from, normalized like session cwds. It is the project grouping key
+/// for managed sessions and survives archive and removal. Existing rows are
+/// backfilled from `origin_path` joined with `relative_cwd`, the best durable
+/// reconstruction of the source cwd. Idempotent: only NULL rows are touched.
+pub fn ensure_workspace_source_cwd(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+    let has_column = {
+        let mut stmt = conn.prepare("PRAGMA table_info(workspaces)")?;
+        let mut names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        names.try_fold(false, |found, name| {
+            name.map(|n| found || n == "source_cwd")
+        })?
+    };
+    if !has_column {
+        conn.execute("ALTER TABLE workspaces ADD COLUMN source_cwd TEXT", [])?;
+    }
+
+    let missing: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, origin_path, relative_cwd FROM workspaces WHERE source_cwd IS NULL",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<Result<_, _>>()?
+    };
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    {
+        let mut update = tx.prepare("UPDATE workspaces SET source_cwd = ?1 WHERE id = ?2")?;
+        for (id, origin, relative) in missing {
+            let source_cwd = crate::worktree::source_cwd_from(
+                std::path::Path::new(&origin),
+                std::path::Path::new(&relative),
+            );
+            update.execute(rusqlite::params![source_cwd, id])?;
+        }
+    }
+    tx.commit()
 }
 
 /// Additive provisioning-intent columns for the `workspaces` table.
