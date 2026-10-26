@@ -2973,6 +2973,123 @@ async fn embedded_connections_restore_surviving_bridge_after_close() {
 }
 
 #[tokio::test]
+async fn embedded_drop_restores_surviving_bridge() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let session_id = fixture
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new("/tmp"))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let server = super::websocket::EmbeddedAcpServer::new(fixture.handle.clone());
+    let (mut first, mut first_rx) = server.open(None).await;
+    let (second, mut second_rx) = server.open(None).await;
+    load_embedded_session(&first, &mut first_rx, &session_id).await;
+    let first_state = fixture.config.session_bridges.lock().unwrap()[&session_id]
+        .bridge
+        .connection_state()
+        .unwrap();
+    load_embedded_session(&second, &mut second_rx, &session_id).await;
+    let second_state = fixture.config.session_bridges.lock().unwrap()[&session_id]
+        .bridge
+        .connection_state()
+        .unwrap();
+
+    drop(second);
+    let restored = timeout(Duration::from_secs(2), async {
+        loop {
+            let bridge = fixture
+                .config
+                .session_bridges
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .map(|route| route.bridge.clone());
+            if let Some(bridge) = bridge
+                && bridge
+                    .connection_state()
+                    .is_some_and(|state| Arc::ptr_eq(&state, &first_state))
+            {
+                break bridge;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("drop cleanup restores the surviving bridge");
+    assert!(!second_state.is_active());
+
+    let request = permission_request_for_test(&session_id, "after-drop");
+    let permission = tokio::spawn(async move { restored.request_permission(request).await });
+    let messages = embedded_messages_until(&mut first_rx, |m| {
+        m["method"] == "session/request_permission"
+    })
+    .await;
+    first
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": messages.last().unwrap()["id"],
+                "result": selected("allow_once")
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let response = timeout(Duration::from_secs(2), permission)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        response.outcome,
+        RequestPermissionOutcome::Selected(selected) if selected.option_id.0.as_ref() == "allow_once"
+    ));
+    first.close().await;
+}
+
+#[tokio::test]
+async fn embedded_drop_unselected_then_close_active_leaves_no_dead_bridge() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let session_id = fixture
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new("/tmp"))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let server = super::websocket::EmbeddedAcpServer::new(fixture.handle.clone());
+    let (first, mut first_rx) = server.open(None).await;
+    let (mut second, mut second_rx) = server.open(None).await;
+    load_embedded_session(&first, &mut first_rx, &session_id).await;
+    let first_state = fixture.config.session_bridges.lock().unwrap()[&session_id]
+        .bridge
+        .connection_state()
+        .unwrap();
+    load_embedded_session(&second, &mut second_rx, &session_id).await;
+
+    drop(first);
+    second.close().await;
+    drop(second);
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let route_removed = !fixture
+                .config
+                .session_bridges
+                .lock()
+                .unwrap()
+                .contains_key(&session_id);
+            if route_removed && !first_state.is_active() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("drop cleanup prevents restoring a dead subscriber after active close");
+}
+
+#[tokio::test]
 async fn embedded_concurrent_closes_restore_third_connection_bridge() {
     let fixture = crate::test_utils::TestAgent::new().await;
     let session_id = fixture

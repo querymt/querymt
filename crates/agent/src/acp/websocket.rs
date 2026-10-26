@@ -90,6 +90,10 @@ pub struct EmbeddedAcpServer {
 }
 
 /// Opaque ACP connection adapter for embedders that provide their own byte transport.
+///
+/// Dropping immediately cancels the connection, but shared-state cleanup is
+/// best-effort. If no Tokio runtime is current or it shuts down, cleanup may not
+/// finish. Await [`Self::close`] to completion before dropping to guarantee cleanup.
 pub struct EmbeddedAcpConnection {
     state: WsServerState,
     connection: ConnectionEventState,
@@ -281,6 +285,8 @@ impl EmbeddedAcpConnection {
     }
 
     /// Close the connection and run the same bridge, pending-request, and session cleanup as WebSocket.
+    ///
+    /// This future must run to completion; cancellation can leave cleanup incomplete.
     pub async fn close(&mut self) {
         if self.closed {
             return;
@@ -304,6 +310,22 @@ impl Drop for EmbeddedAcpConnection {
         self.connection.connection_cancel.cancel();
         if let Some(task) = self.bridge_task.take() {
             task.abort();
+        }
+        if !self.closed
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            self.closed = true;
+            let state = self.state.clone();
+            let pending_requests = self.connection.pending_requests.clone();
+            let conn_id = self.connection.conn_id.clone();
+            runtime.spawn(async move {
+                cancel_pending_websocket_requests(&pending_requests).await;
+                state
+                    .elicitation_recovery
+                    .remove_connection(&conn_id, state.agent.as_ref())
+                    .await;
+                reconcile_websocket_disconnect(&state, &conn_id).await;
+            });
         }
     }
 }
