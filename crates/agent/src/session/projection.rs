@@ -157,18 +157,6 @@ pub trait EventJournal: Send + Sync {
         results
     }
 
-    /// Commit a user prompt and its acceptance event atomically. Implementations
-    /// must reject unsupported admission rather than partially persisting a turn.
-    async fn append_prompt(
-        &self,
-        _event: &NewDurableEvent,
-        _message: &crate::model::AgentMessage,
-    ) -> SessionResult<DurableEvent> {
-        Err(crate::session::error::SessionError::Other(
-            "atomic prompt admission is not supported by this journal".into(),
-        ))
-    }
-
     /// Highest producer `session_seq` persisted for a session (0 when none).
     /// Synchronous because a session's sequence counter is created at emit
     /// time, which is not async; it runs once per session per process.

@@ -665,6 +665,8 @@ async fn test_new_session_binds_requested_profile_from_querymt_meta() {
 
 #[tokio::test]
 async fn profile_reopen_preserves_the_owning_actor_and_event_sequence() {
+    use crate::session::projection::EventJournal;
+
     for (profile_id, agent_id) in [("alpha", None), ("quorum", Some("coder"))] {
         let f = RealStorageHandleFixture::new().await;
         let profile_dir = tempfile::tempdir().unwrap();
@@ -766,15 +768,58 @@ async fn profile_reopen_preserves_the_owning_actor_and_event_sequence() {
             .unwrap();
         stopped.kill();
         stopped.wait_for_shutdown().await;
-        SendAgent::resume_session(
-            &f.handle,
-            crate::acp::protocol::ResumeSessionRequest::new(
-                session_id.clone(),
-                std::path::PathBuf::new(),
+        stream.flush().await;
+        let count_materializations = |events: Vec<crate::events::DurableEvent>| {
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, crate::events::AgentEventKind::SessionCreated))
+                .count()
+        };
+        let before = count_materializations(
+            f.storage
+                .load_session_stream(&session_id, None, None)
+                .await
+                .unwrap(),
+        );
+        let (loaded, resumed, resumed_again) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    f.handle.load_session(LoadSessionRequest::new(
+                        session_id.clone(),
+                        std::path::PathBuf::new(),
+                    )),
+                    SendAgent::resume_session(
+                        &f.handle,
+                        crate::acp::protocol::ResumeSessionRequest::new(
+                            session_id.clone(),
+                            std::path::PathBuf::new(),
+                        ),
+                    ),
+                    SendAgent::resume_session(
+                        &f.handle,
+                        crate::acp::protocol::ResumeSessionRequest::new(
+                            session_id.clone(),
+                            std::path::PathBuf::new(),
+                        ),
+                    ),
+                )
+            })
+            .await
+            .expect("concurrent owner reopen must finish");
+        loaded.unwrap();
+        resumed.unwrap();
+        resumed_again.unwrap();
+        stream.flush().await;
+        assert_eq!(
+            count_materializations(
+                f.storage
+                    .load_session_stream(&session_id, None, None)
+                    .await
+                    .unwrap(),
             ),
-        )
-        .await
-        .unwrap();
+            before + 1,
+            "concurrent cold reopen must materialize exactly one actor"
+        );
         assert!(f.handle.registry.lock().await.get(&session_id).is_none());
         owner
             .config
@@ -1016,7 +1061,7 @@ async fn test_delete_profile_bound_delegate_session_releases_runtime() {
 }
 
 #[tokio::test]
-async fn test_profile_handle_rejects_unbound_session_load() {
+async fn test_profile_handle_rejects_unbound_session_load_and_resume() {
     let (f, _profile_dir) = profile_fixture_with_files(&[("alpha.toml", ALPHA_PROFILE_TOML)]).await;
     let session = f
         .handle
@@ -1027,7 +1072,7 @@ async fn test_profile_handle_rejects_unbound_session_load() {
         .await
         .expect("create unbound session");
     let req = crate::acp::protocol::LoadSessionRequest::new(
-        SessionId::from(session.public_id),
+        SessionId::from(session.public_id.clone()),
         std::path::PathBuf::new(),
     );
 
@@ -1037,6 +1082,24 @@ async fn test_profile_handle_rejects_unbound_session_load() {
         .await
         .expect_err("unbound load must fail");
     assert!(err.to_string().contains("profile binding"));
+    let err = SendAgent::resume_session(
+        &f.handle,
+        crate::acp::protocol::ResumeSessionRequest::new(
+            SessionId::from(session.public_id.clone()),
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await
+    .expect_err("unbound resume must fail");
+    assert!(err.to_string().contains("profile binding"));
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&session.public_id)
+            .is_none()
+    );
 }
 
 #[cfg(feature = "remote")]
@@ -1080,7 +1143,7 @@ async fn test_load_session_resolves_remote_bookmark_before_local_or_profile_load
 
 #[cfg(feature = "remote")]
 #[tokio::test]
-async fn test_load_session_rejects_conflicting_remote_and_local_identity() {
+async fn test_load_and_resume_reject_conflicting_remote_and_local_identity() {
     use crate::session::store::RemoteSessionBookmark;
 
     let f = HandleFixture::new().await;
@@ -1101,7 +1164,7 @@ async fn test_load_session_rejects_conflicting_remote_and_local_identity() {
         .await
         .expect("conflicting bookmark");
     let request = crate::acp::protocol::LoadSessionRequest::new(
-        SessionId::from(local.public_id),
+        SessionId::from(local.public_id.clone()),
         std::path::PathBuf::new(),
     );
     let error = f
@@ -1110,6 +1173,24 @@ async fn test_load_session_rejects_conflicting_remote_and_local_identity() {
         .await
         .expect_err("location conflict");
     assert!(error.to_string().contains("both locally and remotely"));
+    let error = SendAgent::resume_session(
+        &f.handle,
+        crate::acp::protocol::ResumeSessionRequest::new(
+            SessionId::from(local.public_id.clone()),
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await
+    .expect_err("resume location conflict");
+    assert!(error.to_string().contains("both locally and remotely"));
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&local.public_id)
+            .is_none()
+    );
 }
 
 #[tokio::test]

@@ -233,18 +233,6 @@ impl AgentConfig {
             .await
     }
 
-    pub(crate) async fn admit_prompt(
-        &self,
-        message: crate::model::AgentMessage,
-        content: String,
-        client_prompt_id: Option<String>,
-    ) -> crate::session::error::SessionResult<DurableEvent> {
-        self.event_sink
-            .session_stream(&message.session_id)
-            .admit_prompt(message, content, client_prompt_id)
-            .await
-    }
-
     /// Subscribes to agent events via the fanout (live stream).
     pub fn subscribe_events(
         &self,

@@ -758,12 +758,9 @@ impl TestHarness {
         // resolves correctly when creating delegation sessions.
         let mut agent_registry = DefaultAgentRegistry::new();
         for id in ["agent", "agent1", "agent2"] {
-            let delegate_handle = build_delegate_handle(
-                behavior.clone(),
-                shared_storage.clone(),
-                delegate_reasoning_effort,
-            )
-            .await;
+            let delegate_handle =
+                build_delegate_handle(behavior.clone(), store.clone(), delegate_reasoning_effort)
+                    .await;
             agent_registry.register_handle(
                 agent_info(id),
                 delegate_handle as Arc<dyn crate::agent::handle::AgentHandle>,
@@ -1005,7 +1002,7 @@ impl TestHarness {
 /// orchestrator, ensuring parent_session_id resolves correctly.
 async fn build_delegate_handle(
     behavior: DelegateBehavior,
-    shared_storage: Arc<SqliteStorage>,
+    shared_store: Arc<dyn SessionStore>,
     reasoning_effort: Option<ReasoningEffort>,
 ) -> Arc<crate::agent::LocalAgentHandle> {
     let delegate_provider = Arc::new(Mutex::new(MockLlmProvider::new()));
@@ -1107,15 +1104,21 @@ async fn build_delegate_handle(
     let delegate_session_provider = Arc::new(
         crate::session::provider::SessionProvider::new(
             delegate_plugin_registry,
-            shared_storage.clone(),
+            shared_store,
             delegate_params,
         )
         .with_agent_id(Some("reader".into())),
     );
+    let delegate_event_storage = Arc::new(
+        SqliteStorage::connect(":memory:".into())
+            .await
+            .expect("create delegate event journal storage"),
+    );
+
     let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
-        shared_storage.clone(),
+        delegate_event_storage.clone(),
         delegate_session_provider,
-        shared_storage.event_journal(),
+        delegate_event_storage.event_journal(),
     )
     .with_tool_policy(ToolPolicy::ProviderOnly)
     .with_max_steps(1)
@@ -2068,22 +2071,21 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
                 .await
                 .expect("retry delegation lookup")
                 .expect("retry delegation");
-            // The terminal claim precedes the asynchronous child lifecycle patch.
-            if current.status == DelegationStatus::Complete
-                && let Some(retry_child_id) = harness
-                    .child_sessions()
-                    .await
-                    .into_iter()
-                    .find(|session_id| session_id != &child_session_id)
-                && harness.session_lifecycle(&retry_child_id).await.resolved
-            {
+            if current.status == DelegationStatus::Complete {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("new delegation attempt did not resolve its child");
+    .expect("new delegation attempt timed out");
+    let retry_child_id = harness
+        .child_sessions()
+        .await
+        .into_iter()
+        .find(|session_id| session_id != &child_session_id)
+        .expect("fresh retry child session");
+    assert!(harness.session_lifecycle(&retry_child_id).await.resolved);
     assert!(
         !harness.session_lifecycle(&child_session_id).await.resolved,
         "replaying a completed attempt must not undo an explicit reopen"

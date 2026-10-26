@@ -90,8 +90,6 @@ enum WriterMsg {
 struct PendingWrite {
     seq: i64,
     event: NewDurableEvent,
-    message: Option<crate::model::AgentMessage>,
-    prompt_blocks: Vec<EphemeralEvent>,
     parent: Option<tracing::Span>,
     reply: Option<oneshot::Sender<SessionResult<DurableEvent>>>,
 }
@@ -186,7 +184,7 @@ impl SessionEventStream {
     /// durable events are published); durable events are queued to the writer.
     pub fn emit(&self, kind: AgentEventKind) {
         match classify_durability(&kind) {
-            Durability::Durable => self.enqueue(kind, EventOrigin::Local, None, None, None),
+            Durability::Durable => self.enqueue(kind, EventOrigin::Local, None, None),
             Durability::Ephemeral => self.emit_ephemeral(kind),
         }
     }
@@ -204,48 +202,9 @@ impl SessionEventStream {
         source_node: Option<String>,
     ) -> SessionResult<DurableEvent> {
         let (reply, receive) = oneshot::channel();
-        self.enqueue(kind, origin, source_node, Some(reply), None);
+        self.enqueue(kind, origin, source_node, Some(reply));
         receive.await.map_err(|_| {
             SessionError::Other("event writer stopped before persisting the event".into())
-        })?
-    }
-
-    /// Commit history and its acceptance event together. Structured blocks keep
-    /// their earlier sequence positions, but publish only after admission commits.
-    pub async fn admit_prompt(
-        &self,
-        message: crate::model::AgentMessage,
-        content: String,
-        client_prompt_id: Option<String>,
-    ) -> SessionResult<DurableEvent> {
-        if message.session_id != self.shared.session_id
-            || !matches!(message.role, querymt::chat::ChatRole::User)
-            || !message.parts.iter().any(|part| {
-                matches!(
-                    part,
-                    crate::model::MessagePart::Prompt { .. }
-                        | crate::model::MessagePart::Steering { .. }
-                )
-            })
-        {
-            return Err(SessionError::Other(
-                "invalid prompt admission message".into(),
-            ));
-        }
-        let kind = AgentEventKind::PromptReceived {
-            content,
-            message_id: Some(message.id.clone()),
-        };
-        let (reply, receive) = oneshot::channel();
-        self.enqueue(
-            kind,
-            EventOrigin::Local,
-            None,
-            Some(reply),
-            Some((message, client_prompt_id)),
-        );
-        receive.await.map_err(|_| {
-            SessionError::Other("event writer stopped before admitting the prompt".into())
         })?
     }
 
@@ -275,7 +234,6 @@ impl SessionEventStream {
         origin: EventOrigin,
         source_node: Option<String>,
         reply: Option<oneshot::Sender<SessionResult<DurableEvent>>>,
-        admission: Option<(crate::model::AgentMessage, Option<String>)>,
     ) {
         let parent = (origin == EventOrigin::Local && EventFanout::is_delegation_event(&kind))
             .then(tracing::Span::current);
@@ -283,33 +241,6 @@ impl SessionEventStream {
         // Assign the number and enqueue under one lock so the writer queue is
         // in sequence order.
         let mut state = self.shared.state.lock();
-        let mut prompt_blocks = Vec::new();
-        let message = admission.map(|(message, client_prompt_id)| {
-            for part in &message.parts {
-                let blocks = match part {
-                    crate::model::MessagePart::Prompt { blocks }
-                    | crate::model::MessagePart::Steering { blocks, .. } => blocks,
-                    _ => continue,
-                };
-                for block in blocks {
-                    let seq = state.next_seq;
-                    state.next_seq += 1;
-                    prompt_blocks.push(EphemeralEvent {
-                        session_id: self.shared.session_id.clone(),
-                        session_seq: seq,
-                        timestamp: message.created_at,
-                        origin: EventOrigin::Local,
-                        source_node: None,
-                        kind: AgentEventKind::UserPromptBlock {
-                            message_id: message.id.clone(),
-                            client_prompt_id: client_prompt_id.clone(),
-                            block: block.clone(),
-                        },
-                    });
-                }
-            }
-            message
-        });
         let seq = state.next_seq;
         state.next_seq += 1;
         let write = PendingWrite {
@@ -323,8 +254,6 @@ impl SessionEventStream {
                 session_seq: Some(seq),
                 kind,
             },
-            message,
-            prompt_blocks,
             parent,
             reply,
         };
@@ -332,9 +261,6 @@ impl SessionEventStream {
             self.writer.send(WriterMsg::Write(write))
         {
             // Writer task is gone: do not wedge later events behind this one.
-            for block in write.prompt_blocks {
-                state.complete(block.session_seq, Slot::Skip, &self.shared.fanout);
-            }
             state.complete(seq, Slot::Skip, &self.shared.fanout);
             if let Some(reply) = write.reply {
                 let _ = reply.send(Err(SessionError::Other(
@@ -368,42 +294,26 @@ async fn run_writer(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<WriterM
 
         let mut events = Vec::with_capacity(queue.len());
         let mut pending = Vec::with_capacity(queue.len());
-        let mut results = Vec::with_capacity(queue.len());
         for write in queue.drain(..) {
-            if let Some(message) = write.message {
-                if !events.is_empty() {
-                    results.extend(shared.journal.append_durable_batch(&events).await);
-                    events.clear();
-                }
-                results.push(shared.journal.append_prompt(&write.event, &message).await);
-            } else {
-                events.push(write.event);
-            }
-            pending.push((write.seq, write.prompt_blocks, write.parent, write.reply));
+            events.push(write.event);
+            pending.push((write.seq, write.parent, write.reply));
         }
-        if !events.is_empty() {
-            results.extend(shared.journal.append_durable_batch(&events).await);
-        }
-        let mut results = results.into_iter();
+
+        let mut results = shared
+            .journal
+            .append_durable_batch(&events)
+            .await
+            .into_iter();
 
         let mut outcomes = Vec::with_capacity(pending.len());
         {
             let mut state = shared.state.lock();
-            for (seq, prompt_blocks, parent, reply) in pending {
+            for (seq, parent, reply) in pending {
                 let result = results.next().unwrap_or_else(|| {
                     Err(SessionError::Other(
                         "journal returned fewer results than events".into(),
                     ))
                 });
-                for block in prompt_blocks {
-                    let seq = block.session_seq;
-                    let slot = if result.is_ok() {
-                        Slot::Publish(Box::new((EventEnvelope::Ephemeral(block), None)))
-                    } else {
-                        Slot::Skip
-                    };
-                    state.complete(seq, slot, &shared.fanout);
-                }
                 match &result {
                     Ok(persisted) => state.complete(
                         seq,
@@ -552,98 +462,6 @@ mod tests {
         assert_eq!(persisted.session_seq, 1);
         let envelope = rx.try_recv().expect("already published when awaited");
         assert_eq!(envelope.session_seq(), 1);
-    }
-
-    #[tokio::test]
-    async fn prompt_admission_rolls_back_history_and_events_before_publication() {
-        use crate::model::{AgentMessage, MessagePart};
-        use crate::session::store::SessionStore;
-        for (table, condition) in [
-            ("messages", "NEW.public_id = 'admission'"),
-            ("event_journal", "NEW.kind = 'prompt_received'"),
-        ] {
-            let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
-            let session = storage
-                .create_session(None, None, None, None)
-                .await
-                .unwrap();
-            let fanout = Arc::new(EventFanout::new());
-            let stream = SessionEventStream::new(
-                &session.public_id,
-                storage.event_journal(),
-                fanout.clone(),
-            );
-            stream
-                .emit_persisted(AgentEventKind::SessionCreated)
-                .await
-                .unwrap();
-            let mut receiver = fanout.subscribe();
-            let message = AgentMessage {
-                id: "admission".into(),
-                session_id: session.public_id.clone(),
-                role: querymt::chat::ChatRole::User,
-                parts: vec![MessagePart::Prompt {
-                    blocks: vec!["task".into()],
-                }],
-                created_at: 100,
-                parent_message_id: None,
-                source_provider: None,
-                source_model: None,
-            };
-            storage.conn().lock().unwrap().execute_batch(&format!(
-                "CREATE TEMP TRIGGER reject_admission BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT, 'injected admission failure'); END;"
-            )).unwrap();
-            let error = stream
-                .admit_prompt(message.clone(), "task".into(), Some("client".into()))
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains("injected admission failure"));
-            assert!(
-                storage
-                    .get_history(&session.public_id)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
-            assert_eq!(
-                storage
-                    .load_session_stream(&session.public_id, None, None)
-                    .await
-                    .unwrap()
-                    .len(),
-                1
-            );
-            assert!(
-                receiver.try_recv().is_err(),
-                "a rejected prompt must not publish blocks or acceptance"
-            );
-            storage
-                .conn()
-                .lock()
-                .unwrap()
-                .execute_batch("DROP TRIGGER reject_admission;")
-                .unwrap();
-            let accepted = stream
-                .admit_prompt(message, "task".into(), Some("client".into()))
-                .await
-                .unwrap();
-            let block = receiver.try_recv().unwrap();
-            let prompt = receiver.try_recv().unwrap();
-            assert!(
-                matches!(block.kind(), AgentEventKind::UserPromptBlock { client_prompt_id: Some(id), .. } if id == "client")
-            );
-            assert!(
-                matches!(prompt.kind(), AgentEventKind::PromptReceived { message_id: Some(id), .. } if id == "admission")
-            );
-            assert!(block.session_seq() < prompt.session_seq());
-            assert_eq!(prompt.session_seq(), accepted.session_seq);
-            let history = storage.get_history(&session.public_id).await.unwrap();
-            assert_eq!(history.len(), 1);
-            assert_eq!(history[0].id, "admission");
-            stream.emit(delta(1));
-            stream.flush().await;
-            assert!(receiver.try_recv().unwrap().session_seq() > accepted.session_seq);
-        }
     }
 
     #[tokio::test]

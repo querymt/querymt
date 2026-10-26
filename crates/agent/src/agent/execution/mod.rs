@@ -150,11 +150,29 @@ pub(crate) async fn apply_pending_steering(
         let chat_message = message
             .to_chat_message()
             .map_err(|error| anyhow::anyhow!("Invalid steering content: {error}"))?;
-        config
-            .admit_prompt(message, display.clone(), client_prompt_id)
-            .await
-            .map_err(|error| anyhow::anyhow!("Failed to admit steering prompt: {error}"))?;
+        exec_ctx.add_message(message).await?;
         messages.push(chat_message);
+
+        for block in blocks {
+            config.emit_event(
+                &exec_ctx.session_id,
+                AgentEventKind::UserPromptBlock {
+                    message_id: message_id.clone(),
+                    client_prompt_id: client_prompt_id.clone(),
+                    block,
+                },
+            );
+        }
+        config
+            .emit_event_persisted(
+                &exec_ctx.session_id,
+                AgentEventKind::PromptReceived {
+                    content: display.clone(),
+                    message_id: Some(message_id),
+                },
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to persist steering prompt event: {error}"))?;
         config.emit_event(
             &exec_ctx.session_id,
             AgentEventKind::UserMessageStored {
@@ -902,7 +920,7 @@ mod tests {
             crate::agent::core::ToolConfig::default(),
         )
         .with_turn_id("run-1")
-        .with_steering(steering.clone());
+        .with_steering(steering);
         let context = Arc::new(crate::middleware::ConversationContext::new(
             session_id.clone().into(),
             Arc::from([]),
@@ -911,42 +929,6 @@ mod tests {
             "mock".into(),
         ));
         let mut live_events = fixture.config.subscribe_events();
-        fixture.storage.conn().lock().unwrap().execute_batch(
-            "CREATE TEMP TRIGGER reject_steering BEFORE INSERT ON event_journal WHEN NEW.kind = 'prompt_received' BEGIN SELECT RAISE(ABORT, 'injected steering failure'); END;"
-        ).unwrap();
-        let rejected = apply_pending_steering(
-            &fixture.config,
-            &mut exec_ctx,
-            &context,
-            "before_model_request",
-            false,
-        )
-        .await
-        .unwrap_err();
-        assert!(rejected.to_string().contains("injected steering failure"));
-        assert!(context.messages.is_empty());
-        assert!(
-            fixture
-                .config
-                .provider
-                .history_store()
-                .get_history(&session_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(live_events.try_recv().is_err());
-        fixture
-            .storage
-            .conn()
-            .lock()
-            .unwrap()
-            .execute_batch("DROP TRIGGER reject_steering;")
-            .unwrap();
-        steering
-            .push("input-1".into(), Some("client-1".into()), blocks.clone())
-            .await
-            .unwrap();
 
         let next = apply_pending_steering(
             &fixture.config,

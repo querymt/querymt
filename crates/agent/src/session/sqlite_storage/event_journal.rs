@@ -58,35 +58,6 @@ impl EventJournal for SqliteStorage {
         }
     }
 
-    async fn append_prompt(
-        &self,
-        event: &NewDurableEvent,
-        message: &crate::model::AgentMessage,
-    ) -> SessionResult<DurableEvent> {
-        if event.session_id != message.session_id
-            || !matches!(message.role, querymt::chat::ChatRole::User)
-            || !matches!(&event.kind, AgentEventKind::PromptReceived { message_id: Some(id), .. } if id == &message.id)
-            || event.origin != EventOrigin::Local
-            || event.source_node_id.is_some()
-        {
-            return Err(SessionError::Other(
-                "invalid prompt admission identity".into(),
-            ));
-        }
-        let event = event.clone();
-        let message = message.clone();
-        self.run_blocking_session(move |conn| {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            super::session_store::insert_message(&tx, &event.session_id, &message)?;
-            let persisted = insert_journal_event(&tx, &event, None, None)?.ok_or_else(|| {
-                SessionError::DatabaseError("prompt event was not inserted".into())
-            })?;
-            tx.commit()?;
-            Ok(persisted)
-        })
-        .await
-    }
-
     fn max_session_seq_blocking(&self, session_id: &str) -> i64 {
         let conn = self.conn.lock().unwrap();
         conn.query_row(

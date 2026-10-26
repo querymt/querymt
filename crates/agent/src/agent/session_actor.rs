@@ -2741,8 +2741,34 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
         source_model: None,
     };
 
+    if let Err(e) = exec_ctx.add_message(agent_msg).await {
+        config.emit_event(
+            &session_id,
+            AgentEventKind::Error {
+                message: e.to_string(),
+            },
+        );
+        return Err(AgentError::Internal(e.to_string()));
+    }
+
+    for block in &req.prompt {
+        config.emit_event(
+            &session_id,
+            AgentEventKind::UserPromptBlock {
+                message_id: message_id.clone(),
+                client_prompt_id: client_prompt_id.clone(),
+                block: block.clone(),
+            },
+        );
+    }
     config
-        .admit_prompt(agent_msg, display_content.clone(), client_prompt_id)
+        .emit_event_persisted(
+            &session_id,
+            AgentEventKind::PromptReceived {
+                content: display_content.clone(),
+                message_id: Some(message_id.clone()),
+            },
+        )
         .await
         .map_err(|error| AgentError::Internal(error.to_string()))?;
     config.emit_event(
@@ -3214,79 +3240,6 @@ mod tests {
             );
             assert_private(&spans);
         }
-    }
-
-    #[tokio::test]
-    async fn rejected_prompt_leaves_no_history_or_live_prompt_and_never_calls_provider() {
-        use crate::send_agent::SendAgent;
-        let mut provider = MockLlmProvider::new();
-        provider.expect_chat_with_tools().times(0);
-        provider.expect_chat().times(0);
-        let fixture = crate::test_utils::TestAgent::with_mock_provider(SharedLlmProvider {
-            inner: Arc::new(Mutex::new(provider)),
-            tools: vec![].into_boxed_slice(),
-        })
-        .await;
-        let created = fixture
-            .handle
-            .new_session(crate::acp::protocol::NewSessionRequest::new(
-                std::path::PathBuf::new(),
-            ))
-            .await
-            .unwrap();
-        let session_id = created.session_id.to_string();
-        fixture
-            .config
-            .event_sink
-            .session_stream(&session_id)
-            .flush()
-            .await;
-        fixture.storage.conn().lock().unwrap().execute_batch(
-            "CREATE TEMP TRIGGER reject_prompt BEFORE INSERT ON event_journal WHEN NEW.kind = 'prompt_received' BEGIN SELECT RAISE(ABORT, 'injected prompt failure'); END;"
-        ).unwrap();
-        let mut events = fixture.config.subscribe_events();
-        let error = fixture
-            .handle
-            .prompt(crate::acp::protocol::PromptRequest::new(
-                session_id.clone(),
-                vec!["rejected handoff".into()],
-            ))
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("injected prompt failure"));
-        fixture
-            .config
-            .event_sink
-            .session_stream(&session_id)
-            .flush()
-            .await;
-        assert!(
-            fixture
-                .storage
-                .get_history(&session_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        while let Ok(event) = events.try_recv() {
-            assert!(!matches!(
-                event.kind(),
-                AgentEventKind::UserPromptBlock { .. } | AgentEventKind::PromptReceived { .. }
-            ));
-        }
-        assert!(
-            !fixture
-                .storage
-                .load_session_stream(&session_id, None, None)
-                .await
-                .unwrap()
-                .iter()
-                .any(|event| matches!(
-                    event.kind,
-                    AgentEventKind::PromptReceived { .. } | AgentEventKind::LlmRequestStart { .. }
-                ))
-        );
-        fixture.handle.shutdown().await;
     }
 
     // ── Shared fixture ───────────────────────────────────────────────────────
