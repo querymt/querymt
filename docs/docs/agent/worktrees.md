@@ -266,6 +266,7 @@ to run Git commands:
 /worktree create
 /worktree create HEAD review
 /worktree create --include-local-changes review
+/worktree handoff [name] [--summary]
 /worktree list
 /worktree status <workspace-id>
 /worktree result <workspace-id>
@@ -285,11 +286,20 @@ files are always excluded. `status`, `result`, and `publish` default to the
 current session's workspace when no ID is supplied; local sessions must supply
 an ID. Results are also returned in prompt response `_meta["querymt.worktree"]`.
 
+The command's output is also delivered as an `agent_message_chunk` session
+update on the issuing session (an ephemeral event, never journaled or replayed)
+before the prompt response, on stdio and WebSocket alike, so every client
+attached to the session sees it. No client bridge route is involved. The legacy
+`AcpServer::run_stdio` forwarder does not track per-connection delivery, so
+there the update is sent but its ordering against the response is not
+guaranteed.
+
 The same service backs additive ACP extension methods:
 
 | Method | Parameters |
 |--------|------------|
 | `querymt/worktree/create` | `{"cwd":"/path/to/repo", "include_local_changes":true, "name":"review"}` |
+| `querymt/worktree/handoff` | `{"session_id":"<owner>"}` or `{"workspace_id":"<id>"}`, optional `"name"`, `"summary":true` |
 | `querymt/worktree/list` | `{}` |
 | `querymt/worktree/status` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/result` | `{"workspace_id":"<id>"}` |
@@ -304,7 +314,8 @@ baseline-relative changed paths with change kinds, the verification state, and
 the **captured HEAD**; live HEAD and dirty status are reported separately. An
 empty result list does not imply integration. Session views include workspace
 provenance and distinct execution cwd values. Managed sessions group under
-`repository:<canonical-common-dir>`; local sessions retain cwd grouping. A
+their workspace's **source cwd** (the project they were isolated from, which
+survives archive and removal); local sessions group under their own cwd. A
 durable `session_workspace_bound` event exposes the same binding without
 changing existing ACP session updates.
 
@@ -370,6 +381,11 @@ readable messages may be reworded; codes do not change.
 | `workspace_missing` | the bound checkout is gone; there is no fallback to the source |
 | `conflicting_cwd` | load/resume with a cwd that contradicts the persisted binding |
 | `owner_conflict` | another session already owns the writable workspace |
+| `owner_active` | handoff refused: the owner has a running turn, queued input, shared delegates, or execution in another process |
+| `owner_transferred` | the session handed its workspace off and is read-only; the current owner is in `ownerSessionId` |
+| `not_owner`, `workspace_not_ready`, `owner_not_local` | handoff refused: the target does not own a ready, locally hosted workspace (nothing is created) |
+| `summary_failed` | handoff with `summary` failed before the transfer; ownership is unchanged |
+| `handoff_incomplete` | ownership moved but the successor is not runnable yet; run `recover` with its `session_id` |
 | `removal_refused` | removal refused (active owner, dirty/untracked/ignored content, unpreserved commits) |
 | `operation_refused` | another lifecycle operation was refused in the current state |
 | `repository_error`, `storage_error`, `session_start_failed`, `internal_error` | infrastructure failures |
@@ -579,6 +595,105 @@ and the execution cwd is published atomically in SQLite:
   records with interrupted provisioning/removal intents recover by id via
   `/worktree recover <workspace-id>` as before. A recovered fork runs in its
   own checkout; retries are refused once nothing is pending.
+
+## Ownership handoff
+
+A managed checkout has one writer, but a long conversation may want a fresh
+context without moving any files. **Handoff** starts a new session in the
+*same* checkout and moves ownership to it. No running session changes root:
+ownership moves to a new session. Files, branch, index and baseline are
+untouched.
+
+```text
+/worktree handoff            # clean successor, no history
+/worktree handoff next       # name the successor
+/worktree handoff --summary  # seed it with a summary of this conversation
+```
+
+=== "ACP"
+
+    ```json
+    {"method": "querymt/worktree/handoff",
+     "params": {"session_id": "<owner>", "name": "next", "summary": true}}
+    ```
+
+=== "Rust"
+
+    ```rust
+    use querymt_agent::worktree::{HandoffOptions, WorkspaceTarget};
+
+    let handed = agent.worktrees().expect("enabled")
+        .handoff(WorkspaceTarget::Session(owner), HandoffOptions::default())
+        .await?;
+    println!("{} now owns {}", handed.session_id, handed.checkout_path);
+    ```
+
+=== "Python"
+
+    ```python
+    handed = await agent.worktrees.handoff(session_id=owner, summary=True)
+    print(handed["session_id"], handed["summary_seeded"])
+    ```
+
+The response carries `session_id`, `previous_session_id`, `workspace_id`,
+`checkout_path`, `session_cwd`, `branch` and `summary_seeded`. The successor is
+listed nested under the previous owner (fork origin `worktree`).
+
+**Preconditions.** The workspace is `ready`, owned, and the owner is hosted
+locally. A loaded, idle owner is unloaded so it releases its shared activity
+lease, then the exclusive lease must be obtainable; a running turn, queued or
+steered input, shared delegates, or another process using the checkout refuse
+the handoff with `owner_active` and create nothing.
+
+**Atomicity.** The successor is persisted behind the same durable startup
+barrier as isolated forks, ownership moves with one conditional update
+(`owner = previous AND lifecycle = ready`, so racing handoffs have exactly one
+winner), and only then is the barrier released. A crash before the transfer
+leaves the previous owner in place; a crash after it leaves a successor that
+owns the workspace but stays non-runnable. In both cases
+`querymt/worktree/recover` with the successor's `session_id` completes the
+transfer (or confirms it) and releases the barrier; retries create no second
+owner and the successor never runs unowned.
+
+**Summary.** Clean by default. With `summary`, the compaction summarizer runs
+over the previous conversation *before anything is created* and the result
+seeds the successor as its initial context (`summary_seeded: true`). A
+summarizer failure returns `summary_failed` with ownership unchanged.
+
+### Read-only previous owners
+
+After a handoff the previous owner stays listable and loadable, but it never
+materializes again, so it cannot reload as a local or shared session inside
+the checkout it gave away:
+
+- `session/load` replays its history and discloses
+  `_meta.querymt.sessionAccess = {"mode": "read_only", "reason":
+  "owner_transferred", "ownerSessionId": "<current owner>"}`.
+- Prompts (including native commands), queued or steered input, undo/redo and
+  forks are refused with `owner_transferred` before any tool can run; worktree
+  operations addressed by that session id report the same code.
+- Its snapshots are context-only: undo and redo are refused, so they can never
+  touch the successor's files.
+- Loading it needs no actor: history and the event journal are read directly,
+  and no configuration update is sent because there is no live configuration.
+
+**Handoff announcement.** Committing a handoff records a durable
+`worktree_ownership_transferred` event on the previous owner's stream and sends
+it as an `agent_message_chunk` with the stable `message_id`
+`worktree-handoff-<workspace_id>-<successor>` and
+`_meta.querymt.worktreeHandoff = {workspaceId, successorSessionId,
+summarySeeded}`. Every client attached to the previous owner receives it before
+a native `/worktree handoff` response, and it is replayed after the history
+whenever the session is loaded. If the event cannot be recorded the failure is
+logged and the handoff still succeeds.
+
+**Compatibility.** The new durable event kind makes the journal of a session
+that has been handed off unreadable by binaries that predate it (the same
+precedent as `session_workspace_bound`); upgrade every node sharing a database
+before using handoff. Profile runtimes built from one `AgentInfra` share its
+event fanout and storage journal, so announcements reach connections served by
+the root agent; runtimes given separate fanouts are only forwarded if they are
+registered as event sources.
 
 ## Undo, snapshots, and workspace references
 

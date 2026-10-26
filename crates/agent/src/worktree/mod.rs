@@ -57,7 +57,7 @@ pub use domain::{
     IsolationSource, ManagedBranch, ProvisioningPhase, RepositoryIdentity, ResolvedIsolation,
     ResultProvenance, ResultReview, ResultVerificationStatus, WorkspaceCreationOptions,
     WorkspaceId, WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
-    resolve_delegation_isolation, resolve_delegation_policy,
+    normalize_cwd, resolve_delegation_isolation, resolve_delegation_policy, source_cwd_from,
 };
 pub use error::{WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;
@@ -77,10 +77,10 @@ pub use integrate::{
 pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
 pub use ops::{
-    IsolatedSessionSpawner, WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse,
-    WorktreeListResponse, WorktreeOpError, WorktreeOps, WorktreePublishResponse,
-    WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry, WorktreeResultResponse,
-    WorktreeStatusResponse, WorktreeSummary,
+    HandoffHost, HandoffOptions, IsolatedSessionSpawner, WorkspaceTarget, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeHandoffResponse, WorktreeListResponse, WorktreeOpError,
+    WorktreeOps, WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse,
+    WorktreeResultEntry, WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
 };
 pub use protect::IndexLock;
 pub use repo_ops::{

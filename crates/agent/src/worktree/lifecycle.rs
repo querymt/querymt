@@ -1851,6 +1851,7 @@ mod tests {
             ),
             branch: interrupted_branch.clone(),
             relative_cwd: PathBuf::new(),
+            source_cwd: String::new(),
             execution: ExecutionMode::Worktree,
             baseline: Some(Baseline {
                 mode: BaselineMode::Commit,

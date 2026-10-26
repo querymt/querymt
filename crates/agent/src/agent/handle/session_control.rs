@@ -1,6 +1,11 @@
 use super::utils::format_prefixed_error_chain;
 use super::*;
 
+/// Bounds for the runtime-status probe in `unload_idle_in_runtime`, which
+/// runs under the registry lock.
+const UNLOAD_STATUS_MAILBOX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const UNLOAD_STATUS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl LocalAgentHandle {
     pub(super) async fn bound_session_handle(
         &self,
@@ -97,6 +102,63 @@ impl LocalAgentHandle {
         }
 
         self.stop_session_in_runtime(session_id).await
+    }
+
+    /// Unload `session_id`'s actor when it is loaded and idle, without
+    /// cancelling anything. Returns `Ok(true)` when the session is busy (a
+    /// running turn, queued or steered input, or a remote host) and was left
+    /// untouched, `Ok(false)` when it is now unloaded or never was loaded.
+    pub(crate) async fn unload_session_if_idle(&self, session_id: &str) -> Result<bool, Error> {
+        if let Some((session_handle, _)) = self.bound_session_handle(session_id).await?
+            && let Some(local) = session_handle.as_any().downcast_ref::<LocalAgentHandle>()
+        {
+            return Box::pin(local.unload_idle_in_runtime(session_id)).await;
+        }
+        self.unload_idle_in_runtime(session_id).await
+    }
+
+    async fn unload_idle_in_runtime(&self, session_id: &str) -> Result<bool, Error> {
+        use crate::agent::messages::SessionRuntimePhase;
+
+        // The idle check and the removal happen under one registry lock, so a
+        // prompt cannot look the actor up between them: it either runs first
+        // (the session is then busy) or finds the session unloaded.
+        let removed = {
+            let mut registry = self.registry.lock().await;
+            let Some(session) = registry.get(session_id).cloned() else {
+                return Ok(false);
+            };
+            if session.is_remote() {
+                return Ok(true);
+            }
+            // Bounded: a stalled actor must not hold the registry lock
+            // forever. A timeout is treated as busy and the session is left
+            // loaded.
+            let status = match session
+                .get_runtime_status_with_timeout(
+                    UNLOAD_STATUS_MAILBOX_TIMEOUT,
+                    UNLOAD_STATUS_REPLY_TIMEOUT,
+                )
+                .await
+            {
+                Ok(status) => status,
+                Err(crate::error::AgentError::SessionTimeout { .. }) => return Ok(true),
+                Err(err) => return Err(Error::from(err)),
+            };
+            if status.phase != SessionRuntimePhase::Idle
+                || status.queued_input_count > 0
+                || status.pending_steering_count > 0
+            {
+                return Ok(true);
+            }
+            registry.remove(session_id)
+        };
+        if let Some(session) = removed
+            && let Err(err) = session.shutdown().await
+        {
+            tracing::warn!(session_id, error = %err, "failed to shut down idle session actor");
+        }
+        Ok(false)
     }
 
     async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {

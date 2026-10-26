@@ -1983,8 +1983,47 @@ fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
                     .raw_output(raw_output),
             ))]
         }
+        AgentEventKind::WorktreeCommandOutput { text } => vec![SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(text.clone()))),
+        )],
+        AgentEventKind::WorktreeOwnershipTransferred {
+            workspace_id,
+            successor_session_id,
+            summary_seeded,
+        } => vec![SessionUpdate::AgentMessageChunk(worktree_handoff_chunk(
+            workspace_id,
+            successor_session_id,
+            *summary_seeded,
+        ))],
         _ => Vec::new(),
     }
+}
+
+/// Announcement of an ownership handoff. The `message_id` is derived from the
+/// workspace and successor so live delivery and replay agree on identity.
+fn worktree_handoff_chunk(
+    workspace_id: &str,
+    successor_session_id: &str,
+    summary_seeded: bool,
+) -> ContentChunk {
+    let text = format!(
+        "This session's workspace {workspace_id} was handed off to session \
+         {successor_session_id}. This session is now read-only."
+    );
+    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+        .message_id(MessageId::from(format!(
+            "worktree-handoff-{workspace_id}-{successor_session_id}"
+        )))
+        .meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_string(),
+            serde_json::json!({
+                "worktreeHandoff": {
+                    "workspaceId": workspace_id,
+                    "successorSessionId": successor_session_id,
+                    "summarySeeded": summary_seeded,
+                }
+            }),
+        )]))
 }
 
 fn is_todo_write_tool(tool_name: &str) -> bool {

@@ -51,6 +51,7 @@ async fn fork_isolation_intent_is_atomic_and_survives_reopen() {
             crate::worktree::BaselineMode::CurrentWorkingTree,
         )
         .to_workspace_options(),
+        handoff_workspace_id: None,
     };
     storage
         .run_blocking(|conn| {
@@ -2510,6 +2511,83 @@ fn workspace_archival_migration_preserves_additive_columns() {
 }
 
 #[test]
+fn workspace_source_cwd_migration_backfills_existing_rows() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    // Model a database from before the column existed.
+    conn.execute_batch("ALTER TABLE workspaces DROP COLUMN source_cwd;")
+        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, created_at, updated_at)
+         VALUES('w-sub', '/repo/.git', '/repo/', 'repo', '/wt/w-sub', 'qmt/w-sub', 'crates/agent', 'worktree', 'commit', 'archived', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+                ('w-root', '/repo/.git', '/repo', 'repo', '/wt/w-root', 'qmt/w-root', '', 'worktree', 'commit', 'removed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0029_workspace_source_cwd")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+
+    fn source_cwd(conn: &Connection, id: &str) -> String {
+        conn.query_row(
+            "SELECT source_cwd FROM workspaces WHERE public_id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+    assert_eq!(source_cwd(&conn, "w-sub"), "/repo/crates/agent");
+    assert_eq!(source_cwd(&conn, "w-root"), "/repo");
+
+    // Re-running never overwrites a stored value.
+    conn.execute(
+        "UPDATE workspaces SET source_cwd = '/elsewhere' WHERE public_id = 'w-root'",
+        [],
+    )
+    .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    assert_eq!(source_cwd(&conn, "w-root"), "/elsewhere");
+}
+
+#[test]
+fn workspace_handoff_migration_upgrades_existing_database() {
+    let mut conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    apply_migrations(&mut conn).unwrap();
+    // Model a database from before handoff existed.
+    conn.execute_batch(
+        "DROP TABLE workspace_handoffs; ALTER TABLE workspaces DROP COLUMN handed_off_to;
+         INSERT INTO workspaces(public_id, common_dir, origin_path, project_name, checkout_path, branch, relative_cwd, execution, baseline_mode, lifecycle, created_at, updated_at, source_cwd)
+         VALUES('w-1', '/repo/.git', '/repo', 'repo', '/wt/w-1', 'qmt/w-1', '', 'worktree', 'commit', 'ready', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '/repo');",
+    )
+    .unwrap();
+
+    let migration = MIGRATIONS
+        .iter()
+        .find(|m| m.version == "0030_workspace_handoff")
+        .unwrap();
+    (migration.apply)(&mut conn).unwrap();
+    // Idempotent for fresh installs and reruns.
+    (migration.apply)(&mut conn).unwrap();
+
+    let handed_off: Option<String> = conn
+        .query_row(
+            "SELECT handed_off_to FROM workspaces WHERE public_id = 'w-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(handed_off, None, "existing rows keep no handoff target");
+    let markers: i64 = conn
+        .query_row("SELECT count(*) FROM workspace_handoffs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(markers, 0);
+}
+
+#[test]
 fn worktree_workspace_migration_upgrades_existing_database() {
     let mut conn = Connection::open_in_memory().unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
@@ -2536,6 +2614,8 @@ fn worktree_workspace_migration_upgrades_existing_database() {
     (migration.apply)(&mut conn).unwrap();
     // Idempotent on re-run.
     (migration.apply)(&mut conn).unwrap();
+    // The tables were recreated above, so re-apply the later column too.
+    schema_ensure_source_cwd(&mut conn);
 
     // Registry and result tables exist with the expected columns.
     for (table, expected_columns) in [
@@ -2566,6 +2646,8 @@ fn worktree_workspace_migration_upgrades_existing_database() {
                 "requested_base_ref",
                 "operation_id",
                 "provisioning_phase",
+                "source_cwd",
+                "handed_off_to",
             ],
         ),
         (
@@ -2680,6 +2762,9 @@ async fn provisioning_intent_migration_upgrades_existing_database() {
     (migration.apply)(&mut conn).unwrap();
     // Idempotent on re-run.
     (migration.apply)(&mut conn).unwrap();
+    // The tables were recreated from the shared DDL above, so bring in the
+    // later `source_cwd` column the repository now reads.
+    schema_ensure_source_cwd(&mut conn);
 
     {
         let mut stmt = conn.prepare("PRAGMA table_info(workspaces)").unwrap();
@@ -5054,4 +5139,9 @@ async fn remote_bookmark_point_lookup_missing_returns_none() {
     let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
     let got = storage.get_remote_session_bookmark("absent").await.unwrap();
     assert_eq!(got, None);
+}
+
+fn schema_ensure_source_cwd(conn: &mut Connection) {
+    crate::session::schema::ensure_workspace_source_cwd(conn).unwrap();
+    crate::session::schema::ensure_workspace_handoff(conn).unwrap();
 }

@@ -573,6 +573,19 @@ pub enum AgentEventKind {
         #[typeshare(serialized_as = "Option<number>")]
         revision: Option<u64>,
     },
+    /// Output of a native `/worktree` command, delivered to the issuing
+    /// session as an agent message. Transient: the authoritative state lives in
+    /// the workspace registry, so it is neither journaled nor replayed.
+    WorktreeCommandOutput {
+        text: String,
+    },
+    /// Ownership of the session's managed checkout moved to a successor
+    /// session. Emitted on the previous owner's stream and replayed on load.
+    WorktreeOwnershipTransferred {
+        workspace_id: String,
+        successor_session_id: String,
+        summary_seeded: bool,
+    },
     DelegationRequested {
         delegation: Delegation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1036,6 +1049,9 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // ACP invalidation hint, not a commit record, and must not pollute
         // the durable journal or break older journal loaders.
         AgentEventKind::DelegateModelsChanged { .. } => Durability::Ephemeral,
+        // Rationale: command output is a transient reply to one prompt; the
+        // registry is authoritative and the handoff has its own durable event.
+        AgentEventKind::WorktreeCommandOutput { .. } => Durability::Ephemeral,
 
         // Everything else is durable by default.
         _ => Durability::Durable,

@@ -126,6 +126,10 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         methods.push("querymt/session/setPinned".to_string());
     }
 
+    if agent.config.workspace_service().is_some() {
+        methods.push("querymt/worktree/handoff".to_string());
+    }
+
     if agent.profiles().is_some() {
         methods.extend([
             "querymt/profile/agents".to_string(),

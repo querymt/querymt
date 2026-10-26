@@ -53,6 +53,7 @@ impl LocalAgentHandle {
             "querymt/session/setLifecycle" => self.handle_ext_session_set_lifecycle(req).await,
             "querymt/session/setPinned" => self.handle_ext_session_set_pinned(req).await,
             "querymt/worktree/create" => self.handle_ext_worktree_create(req).await,
+            "querymt/worktree/handoff" => self.handle_ext_worktree_handoff(req).await,
             "querymt/worktree/list" => self.handle_ext_worktree_list().await,
             "querymt/worktree/status" => self.handle_ext_worktree_status(req).await,
             "querymt/worktree/result" => self.handle_ext_worktree_result(req).await,

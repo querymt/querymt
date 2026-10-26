@@ -156,6 +156,9 @@ impl LocalAgentHandle {
         delivery: crate::agent::messages::InputDelivery,
     ) -> Result<ExtResponse, Error> {
         let parsed: SubmitInputRequest = parse_session_op_request(req)?;
+        self.session_materializer
+            .ensure_not_transferred(&parsed.session_id)
+            .await?;
         if super::ext_worktree_ops::native_worktree_command(&parsed.prompt)?.is_some() {
             return Err(Error::invalid_request().data(
                 "native /worktree administration uses session/prompt, not queued or steering input",
@@ -245,6 +248,9 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: UndoSessionRequest = parse_session_op_request(req)?;
+        self.session_materializer
+            .ensure_not_transferred(&parsed.session_id)
+            .await?;
         let profile_handle = self.profile_session_op_handle(&parsed.session_id).await?;
         let session_handle = profile_handle.as_deref().unwrap_or(self);
         let result = session_handle
@@ -275,6 +281,9 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: SessionIdRequest = parse_session_op_request(req)?;
+        self.session_materializer
+            .ensure_not_transferred(&parsed.session_id)
+            .await?;
         let profile_handle = self.profile_session_op_handle(&parsed.session_id).await?;
         let session_handle = profile_handle.as_deref().unwrap_or(self);
         let result = session_handle.redo(&parsed.session_id).await;

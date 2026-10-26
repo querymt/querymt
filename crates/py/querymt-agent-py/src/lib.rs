@@ -7,7 +7,7 @@ use std::sync::Arc;
 use ::querymt_agent::api::{AgentWorktrees, SessionOptions};
 use ::querymt_agent::config::WorkspaceSettings;
 use ::querymt_agent::worktree::{
-    BaselineMode, WorkspaceTarget, WorktreeCreateRequest, WorktreeOpError,
+    BaselineMode, HandoffOptions, WorkspaceTarget, WorktreeCreateRequest, WorktreeOpError,
 };
 
 type AgentHandle = ::querymt_agent::api::Agent;
@@ -317,7 +317,10 @@ macro_rules! worktree_future {
 impl PyWorktrees {
     /// Create a new isolated session with its own checkout. `cwd` defaults to
     /// the agent's working directory. Never moves an existing session.
-    #[pyo3(signature = (cwd=None, name=None, base_ref=None, include_local_changes=None))]
+    ///
+    /// `source_session_id` records lineage (the new session nests under it, no
+    /// history is copied); an empty `cwd` then defaults to that session's cwd.
+    #[pyo3(signature = (cwd=None, name=None, base_ref=None, include_local_changes=None, source_session_id=None))]
     fn create<'py>(
         &self,
         py: Python<'py>,
@@ -325,14 +328,34 @@ impl PyWorktrees {
         name: Option<String>,
         base_ref: Option<String>,
         include_local_changes: Option<bool>,
+        source_session_id: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let request = WorktreeCreateRequest {
             cwd: cwd.unwrap_or_default(),
             include_local_changes,
             base_ref,
             name,
+            source_session_id,
         };
         worktree_future!(py, self.inner, |w| w.create(request))
+    }
+
+    /// Hand ownership of a ready workspace to a new session in the same
+    /// checkout. Provide exactly one of `workspace_id` or `session_id` (the
+    /// owner). `summary=True` seeds the new session with a summary of the
+    /// previous conversation. The owner must be local and idle.
+    #[pyo3(signature = (workspace_id=None, session_id=None, name=None, summary=false))]
+    fn handoff<'py>(
+        &self,
+        py: Python<'py>,
+        workspace_id: Option<String>,
+        session_id: Option<String>,
+        name: Option<String>,
+        summary: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = WorkspaceTarget::from_parts(workspace_id, session_id).map_err(worktree_err)?;
+        let options = HandoffOptions { name, summary };
+        worktree_future!(py, self.inner, |w| w.handoff(target, options))
     }
 
     fn list<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

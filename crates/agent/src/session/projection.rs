@@ -668,6 +668,10 @@ impl SessionScope {
 pub struct SessionWorkspaceView {
     pub workspace_id: String,
     pub repository_id: String,
+    /// Project grouping key: the cwd this workspace was created from.
+    /// Stable across archive and removal.
+    #[serde(default)]
+    pub source_cwd: String,
     pub project_name: String,
     pub checkout_path: String,
     pub branch: String,
@@ -675,6 +679,28 @@ pub struct SessionWorkspaceView {
     pub baseline_commit: Option<String>,
     pub lifecycle: String,
     pub last_error: Option<String>,
+    /// Session that currently owns (writes in) the checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_session_id: Option<String>,
+    /// Session ownership was handed off to, once handoff exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handed_off_to: Option<String>,
+}
+
+impl SessionWorkspaceView {
+    /// The `_meta.querymt.workspace` object disclosed on session listings.
+    pub fn to_meta(&self) -> serde_json::Value {
+        serde_json::json!({
+            "workspaceId": self.workspace_id,
+            "branch": self.branch,
+            "checkoutPath": self.checkout_path,
+            "sourceCwd": self.source_cwd,
+            "baselineMode": self.baseline_mode,
+            "lifecycle": self.lifecycle,
+            "ownerSessionId": self.owner_session_id,
+            "handedOffTo": self.handed_off_to,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,16 +734,19 @@ pub struct SessionListItem {
 }
 
 impl SessionListItem {
-    /// Managed sessions group by canonical repository identity, local ones by cwd.
+    /// Managed sessions group under the cwd their workspace was created
+    /// from, local ones under their own cwd.
     pub fn group_key(&self) -> Option<String> {
         self.workspace
             .as_ref()
-            .map(|w| format!("repository:{}", w.repository_id))
+            .map(|w| w.source_cwd.as_str())
+            .filter(|cwd| !cwd.is_empty())
+            .map(str::to_owned)
             .or_else(|| self.cwd.clone())
     }
 }
 
-/// Group of sessions by local cwd or `repository:<common-dir>` for managed sessions.
+/// Group of sessions by project cwd (the source cwd for managed sessions).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGroup {
     pub cwd: Option<String>,

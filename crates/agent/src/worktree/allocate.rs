@@ -87,6 +87,9 @@ pub struct AllocationRequest<'a> {
     /// Parent session's checkout mutation gate, held around
     /// current-working-tree capture so cooperating writes cannot interleave.
     pub mutation_gate: Option<&'a CheckoutMutationGate>,
+    /// Project grouping cwd (see [`WorkspaceRecord::source_cwd`]). `None`
+    /// reconstructs it from the source's origin path and `relative_cwd`.
+    pub source_cwd: Option<String>,
 }
 
 /// Provisions managed worktree workspaces under a durable storage root.
@@ -157,6 +160,7 @@ impl WorkspaceAllocator {
             delegation_id: None,
             preset_baseline: None,
             mutation_gate,
+            source_cwd: None,
         })
         .await
     }
@@ -181,6 +185,7 @@ impl WorkspaceAllocator {
             delegation_id,
             preset_baseline,
             mutation_gate,
+            source_cwd,
         } = request;
 
         if preset_baseline.is_some() && base_ref.is_some() {
@@ -208,12 +213,16 @@ impl WorkspaceAllocator {
         //    mutation: source identity, requested ref/policy, relative cwd,
         //    intended resources, operation id, and the initial phase. The
         //    baseline is deliberately absent — capture has not run yet.
+        let source_cwd = source_cwd.unwrap_or_else(|| {
+            crate::worktree::source_cwd_from(&source.identity.origin_path, relative_cwd)
+        });
         let record = WorkspaceRecord {
             id: id.clone(),
             repository: source.identity.clone(),
             checkout_path: checkout_path.clone(),
             branch: branch.clone(),
             relative_cwd: relative_cwd.to_path_buf(),
+            source_cwd,
             execution: ExecutionMode::Worktree,
             baseline: None,
             lifecycle: WorkspaceLifecycle::Provisioning,
@@ -1146,6 +1155,7 @@ mod tests {
             checkout_path: checkout_path_for(storage, &resolved.identity.common_dir, &wid),
             branch: ManagedBranch::for_workspace(&wid),
             relative_cwd: PathBuf::new(),
+            source_cwd: String::new(),
             execution: ExecutionMode::Worktree,
             baseline: None,
             lifecycle: WorkspaceLifecycle::Provisioning,
@@ -1860,6 +1870,7 @@ mod tests {
                 delegation_id: None,
                 preset_baseline: None,
                 mutation_gate: None,
+                source_cwd: None,
             })
             .await
             .unwrap_err();
@@ -2346,6 +2357,7 @@ mod tests {
                 delegation_id: None,
                 preset_baseline: None,
                 mutation_gate: None,
+                source_cwd: None,
             })
             .await
             .unwrap();
@@ -2368,6 +2380,7 @@ mod tests {
                 delegation_id: None,
                 preset_baseline: Some(&baseline_a),
                 mutation_gate: None,
+                source_cwd: None,
             })
             .await
             .unwrap();
@@ -2408,6 +2421,7 @@ mod tests {
                 delegation_id: None,
                 preset_baseline: None,
                 mutation_gate: None,
+                source_cwd: None,
             })
             .await
             .unwrap();
@@ -2451,6 +2465,7 @@ mod tests {
                 delegation_id: None,
                 preset_baseline: Some(&preset),
                 mutation_gate: None,
+                source_cwd: None,
             })
             .await
             .unwrap_err();

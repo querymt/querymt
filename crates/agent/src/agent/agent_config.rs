@@ -218,6 +218,14 @@ impl AgentConfig {
         self.event_sink.session_stream(session_id).emit(kind);
     }
 
+    /// Publishes an ephemeral event and returns its `session_seq`, so a prompt
+    /// response can be held until the event has been delivered.
+    pub fn emit_ephemeral_event(&self, session_id: &str, kind: AgentEventKind) -> i64 {
+        self.event_sink
+            .session_stream(session_id)
+            .emit_ephemeral_seq(kind)
+    }
+
     /// Persists and publishes a durable event, returning the `DurableEvent`.
     ///
     /// Use this path when caller-side ordering matters (awaited). The event is

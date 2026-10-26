@@ -12,10 +12,10 @@
 
 use crate::agent::LocalAgentHandle;
 use crate::worktree::{
-    BaselineMode, ExecutionMode, WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse,
-    WorktreeListResponse, WorktreeOpError, WorktreeOps, WorktreePublishResponse,
-    WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultResponse,
-    WorktreeStatusResponse, WorktreeSummary,
+    BaselineMode, ExecutionMode, HandoffOptions, WorkspaceTarget, WorktreeCreateRequest,
+    WorktreeCreateResponse, WorktreeHandoffResponse, WorktreeListResponse, WorktreeOpError,
+    WorktreeOps, WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse,
+    WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,6 +36,7 @@ pub struct SessionOptions {
     name: Option<String>,
     base_ref: Option<String>,
     include_local_changes: Option<bool>,
+    source_session_id: Option<String>,
 }
 
 impl SessionOptions {
@@ -76,6 +77,15 @@ impl SessionOptions {
         self
     }
 
+    /// Start the worktree session from `session_id`: records lineage (the
+    /// new session is nested under it) without copying history. Only valid
+    /// for worktree sessions.
+    #[must_use]
+    pub fn source_session(mut self, session_id: impl Into<String>) -> Self {
+        self.source_session_id = Some(session_id.into());
+        self
+    }
+
     /// Whether these options request an isolated worktree.
     pub fn requests_isolation(&self) -> bool {
         self.execution == ExecutionMode::Worktree
@@ -96,6 +106,7 @@ impl SessionOptions {
                 BaselineMode::Commit
             },
             base_ref: self.base_ref.clone(),
+            source_session_id: self.source_session_id.clone(),
         }
         .validate()
         .map_err(WorktreeOpError::InvalidOptions)
@@ -117,6 +128,9 @@ impl SessionOptions {
         }
         if let Some(base_ref) = &self.base_ref {
             value["baseRef"] = base_ref.clone().into();
+        }
+        if let Some(source) = &self.source_session_id {
+            value["sourceSessionId"] = source.clone().into();
         }
         Some(value)
     }
@@ -199,6 +213,19 @@ impl AgentWorktrees {
                 .to_string();
         }
         self.ops.create(self.handle.as_ref(), request).await
+    }
+
+    /// Hand ownership of a ready workspace to a new session in the same
+    /// checkout. The owner must be local and idle; files, branch, index and
+    /// baseline are unchanged.
+    pub async fn handoff(
+        &self,
+        target: WorkspaceTarget,
+        options: HandoffOptions,
+    ) -> Result<WorktreeHandoffResponse, WorktreeOpError> {
+        self.ops
+            .handoff(self.handle.as_ref(), &target, options)
+            .await
     }
 
     /// All managed workspaces, newest first.
