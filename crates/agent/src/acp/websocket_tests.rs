@@ -433,14 +433,22 @@ async fn websocket_event_forwarder_issues_authority_only_on_capable_loopback_con
 
 #[tokio::test]
 async fn unauthorized_subscriber_receives_no_elicitation_content() {
-    let fixture = crate::test_utils::TestAgent::new().await;
+    let (fixture, session) = prompt_fixture().await;
     let state = WsServerState::new(fixture.handle.clone());
-    let session_id = "protected-session";
+    let session_id = session.as_str();
     let elicitation_id = "protected-elicitation";
-    state.session_owners.lock().await.insert(
-        session_id.to_string(),
-        HashSet::from(["original".to_string(), "observer".to_string()]),
-    );
+    // Establish the original owner through attachment. A bare subscriber set
+    // elects a fallback and would make the observer a legitimate live owner.
+    for connection in ["original", "observer"] {
+        let output = super::shared::handle_rpc_message(
+            fixture.handle.as_ref(), &state.session_owners, &state.pending_elicitations,
+            connection, super::shared::RpcMessage {
+                jsonrpc: "2.0".into(), id: Some(serde_json::json!(1)), method: "session/load".into(),
+                params: serde_json::json!({"sessionId": session_id, "cwd": "/tmp", "mcpServers": []}),
+            },
+        ).await;
+        assert!(output.response.unwrap().error.is_none());
+    }
     for connection_id in ["original", "observer"] {
         state
             .elicitation_recovery
@@ -619,6 +627,157 @@ async fn observer_loaded_after_prompt_cannot_capture_the_question() {
         ElicitationAction::Accept
     );
     for (connection, _) in connections {
+        connection.connection_cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn pending_question_follows_explicit_and_fallback_owner_changes() {
+    for handoff in ["prompt", "disconnect", "lazy-fallback"] {
+        let (fixture, session_id) = prompt_fixture().await;
+        let state = WsServerState::new(fixture.handle.clone());
+        for connection in ["original", "next", "observer"] {
+            state
+                .elicitation_recovery
+                .register_connection(connection.into(), true)
+                .await;
+            state
+                .elicitation_recovery
+                .record_client_capabilities(connection, true)
+                .await;
+            let output = super::shared::handle_rpc_message(
+                fixture.handle.as_ref(), &state.session_owners, &state.pending_elicitations,
+                connection, super::shared::RpcMessage {
+                    jsonrpc: "2.0".into(), id: Some(serde_json::json!(1)), method: "session/load".into(),
+                    params: serde_json::json!({"sessionId": session_id, "cwd": "/tmp", "mcpServers": []}),
+                },
+            ).await;
+            assert!(output.response.unwrap().error.is_none());
+        }
+        let (sender, receiver) = oneshot::channel();
+        insert_pending_elicitation(
+            &state.pending_elicitations,
+            "pending".into(),
+            session_id.clone(),
+            sender,
+        )
+        .await;
+        let authority = state
+            .elicitation_recovery
+            .issue_for_session("original", &session_id, &fixture.handle)
+            .await
+            .expect("original authority");
+        let before =
+            crate::elicitation::snapshot_pending_elicitations(&state.pending_elicitations).await;
+        match handoff {
+            "prompt" => {
+                let output = super::shared::handle_rpc_message_with_context(
+                    fixture.handle.as_ref(), &state.session_owners, &state.pending_elicitations,
+                    "next", super::shared::RpcMessage {
+                        jsonrpc: "2.0".into(), id: Some(serde_json::json!(2)), method: "session/prompt".into(),
+                        params: serde_json::json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "hello"}]}),
+                    }, super::shared::RpcDispatchContext {
+                        elicitation_recovery: Some(state.elicitation_recovery.clone()), ..Default::default()
+                    },
+                ).await;
+                assert!(output.response.unwrap().error.is_none());
+            }
+            "disconnect" => {
+                state
+                    .elicitation_recovery
+                    .remove_connection("original", &fixture.handle)
+                    .await;
+                reconcile_websocket_disconnect(&state, "original").await;
+            }
+            _ => {
+                state
+                    .session_owners
+                    .lock()
+                    .await
+                    .get_mut(&session_id)
+                    .unwrap()
+                    .remove("original");
+            }
+        }
+        assert!(
+            state
+                .session_owners
+                .owns_interactions(&session_id, "next")
+                .await
+        );
+        if handoff != "lazy-fallback" {
+            assert!(
+                state
+                    .elicitation_recovery
+                    .claim_live_delivery("next", &session_id, "pending", &fixture.handle)
+                    .await
+                    .is_some(),
+                "{handoff}: ownership establishment must authorize the new connection"
+            );
+        }
+        let (tx, mut rx) = mpsc::channel(8);
+        let connection =
+            connection_state_for_test("next", tx, Default::default(), Arc::new(AtomicU64::new(1)));
+        assert!(
+            super::websocket::forward_session_event(
+                &state,
+                &connection,
+                &test_translator(),
+                elicitation_event(&session_id, "pending")
+            )
+            .await
+        );
+        let request: serde_json::Value = serde_json::from_str(
+            &timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("new owner receives the pending question")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            request["method"], "elicitation/create",
+            "{handoff}: do not rotate the authority"
+        );
+        let after =
+            crate::elicitation::snapshot_pending_elicitations(&state.pending_elicitations).await;
+        assert_eq!(after[0].owner_authority, before[0].owner_authority);
+        assert!(
+            state
+                .elicitation_recovery
+                .claim_live_delivery("observer", &session_id, "pending", &fixture.handle)
+                .await
+                .is_none()
+        );
+        let sessions = state
+            .elicitation_recovery
+            .list_pending_sessions(
+                "next",
+                &crate::control::elicitation_recovery::ListPendingElicitationSessionsRequest {
+                    version: 1,
+                    resume_authority: authority,
+                },
+                &fixture.handle,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sessions.session_ids, vec![session_id]);
+        assert!(
+            route_websocket_response(
+                &connection.pending_requests,
+                request["id"].clone(),
+                Some(serde_json::json!({"action": "accept", "content": {"selection": "A"}})),
+                None
+            )
+            .await
+        );
+        assert_eq!(
+            timeout(Duration::from_secs(2), receiver)
+                .await
+                .unwrap()
+                .unwrap()
+                .action,
+            ElicitationAction::Accept
+        );
         connection.connection_cancel.cancel();
     }
 }

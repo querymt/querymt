@@ -48,10 +48,12 @@ impl SessionOwnerMap {
 
     /// Live human-input requests follow the input submitter, not every observer.
     pub(crate) async fn owns_interactions(&self, session_id: &str, conn_id: &str) -> bool {
+        self.interaction_owner(session_id).await.as_deref() == Some(conn_id)
+    }
+
+    pub(crate) async fn interaction_owner(&self, session_id: &str) -> Option<String> {
         let owners = self.owners.lock().await;
-        let Some(subscribers) = owners.get(session_id) else {
-            return false;
-        };
+        let subscribers = owners.get(session_id)?;
         let mut interaction_owners = self.interaction_owners.lock().await;
         if interaction_owners
             .get(session_id)
@@ -59,13 +61,11 @@ impl SessionOwnerMap {
         {
             let Some(owner) = subscribers.iter().min() else {
                 interaction_owners.remove(session_id);
-                return false;
+                return None;
             };
             interaction_owners.insert(session_id.to_string(), owner.clone());
         }
-        interaction_owners
-            .get(session_id)
-            .is_some_and(|owner| owner == conn_id)
+        interaction_owners.get(session_id).cloned()
     }
 
     pub(crate) async fn forget_interaction_owner(&self, session_id: &str, conn_id: &str) {
@@ -492,6 +492,11 @@ async fn attach_rpc_session_locked<S: SendAgent>(
         session_owners
             .set_interaction_owner(session_id, conn_id)
             .await;
+        if let Some(recovery) = context.elicitation_recovery.as_ref() {
+            recovery
+                .authorize_live_owner(session_owners, conn_id, session_id, local_agent)
+                .await;
+        }
     }
     Ok(ownership_inserted)
 }

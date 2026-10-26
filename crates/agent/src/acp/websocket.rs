@@ -1518,6 +1518,17 @@ pub(crate) async fn reconcile_websocket_disconnect(state: &WsServerState, conn_i
             .session_owners
             .forget_interaction_owner(&session_id, conn_id)
             .await;
+        if let Some(owner) = state.session_owners.interaction_owner(&session_id).await {
+            state
+                .elicitation_recovery
+                .authorize_live_owner(
+                    &state.session_owners,
+                    &owner,
+                    &session_id,
+                    state.agent.as_ref(),
+                )
+                .await;
+        }
 
         let cleared = state
             .agent
@@ -1766,6 +1777,27 @@ pub(super) async fn forward_session_event(
         .await
     {
         return true;
+    }
+
+    if matches!(
+        event.kind(),
+        crate::events::AgentEventKind::ElicitationRequested { .. }
+            | crate::events::AgentEventKind::PermissionRequested {
+                request: Some(_),
+                ..
+            }
+    ) {
+        // The ownership check can elect a fallback. Keep its recovery access in
+        // sync before issue/claim, just as for an explicit input handoff.
+        state
+            .elicitation_recovery
+            .authorize_live_owner(
+                &state.session_owners,
+                &connection.conn_id,
+                event.session_id(),
+                state.agent.as_ref(),
+            )
+            .await;
     }
 
     if let crate::events::AgentEventKind::ElicitationRequested {

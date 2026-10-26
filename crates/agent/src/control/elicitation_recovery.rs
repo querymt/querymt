@@ -91,6 +91,54 @@ impl ElicitationRecoveryRegistry {
         }
     }
 
+    /// Authorize the selected live owner without rotating a pending authority.
+    /// Session observation alone is not sufficient to acquire this authorization.
+    pub(crate) async fn authorize_live_owner(
+        &self,
+        owners: &crate::acp::shared::SessionOwnerMap,
+        connection_id: &str,
+        session_id: &str,
+        agent: &crate::agent::LocalAgentHandle,
+    ) {
+        let session_lock = self.session_lock(session_id).await;
+        let _guard = session_lock.lock().await;
+        if !owners.owns_interactions(session_id, connection_id).await {
+            return;
+        }
+        let Ok(supports_forms) = self
+            .verify_connection(connection_id, ELICITATION_RECOVERY_VERSION)
+            .await
+        else {
+            return;
+        };
+        if !supports_forms
+            && !crate::elicitation::session_pending_is_permission_only(agent, session_id).await
+        {
+            return;
+        }
+        // Capability inspection can await an actor. Revalidate ownership and the
+        // connection before granting access to the existing verifier.
+        if !owners.owns_interactions(session_id, connection_id).await {
+            return;
+        }
+        let mut state = self.inner.lock().await;
+        if !state
+            .connections
+            .get(connection_id)
+            .is_some_and(|connection| {
+                connection.secure_transport
+                    && connection.supports_form_elicitation == supports_forms
+            })
+        {
+            return;
+        }
+        if let Some(authority) = state.sessions.get_mut(session_id) {
+            authority
+                .authorized_connections
+                .insert(connection_id.to_string());
+        }
+    }
+
     pub async fn issue_for_session(
         &self,
         connection_id: &str,
@@ -627,6 +675,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_owner_authorization_requires_ownership_secure_transport_and_form_support() {
+        let (registry, fixture, _secret) = authorized_fixture("session-a", "question").await;
+        for (connection, secure, forms, selected) in [
+            ("observer", true, true, false),
+            ("insecure", false, true, true),
+            ("no-forms", true, false, true),
+            ("controller", true, true, true),
+        ] {
+            registry
+                .register_connection(connection.into(), secure)
+                .await;
+            registry.record_client_capabilities(connection, forms).await;
+            let owners = crate::acp::shared::SessionOwnerMap::default();
+            owners.lock().await.insert(
+                "session-a".into(),
+                HashSet::from([if selected { connection } else { "original" }.to_string()]),
+            );
+            registry
+                .authorize_live_owner(&owners, connection, "session-a", &fixture.handle)
+                .await;
+            let claim = registry
+                .claim_live_delivery(connection, "session-a", "question", &fixture.handle)
+                .await;
+            assert_eq!(claim.is_some(), selected && secure && forms, "{connection}");
+        }
+    }
+
+    #[tokio::test]
     async fn authority_discovers_and_attaches_only_its_pending_session() {
         let (registry, fixture, secret) = authorized_fixture("session-a", "elicitation-a").await;
         registry
@@ -1076,6 +1152,20 @@ mod tests {
         registry
             .register_connection("replacement".to_string(), true)
             .await;
+        let owners = crate::acp::shared::SessionOwnerMap::default();
+        owners
+            .lock()
+            .await
+            .insert("session-p".into(), HashSet::from(["replacement".into()]));
+        registry
+            .authorize_live_owner(&owners, "replacement", "session-p", &fixture.handle)
+            .await;
+        assert!(
+            registry
+                .claim_live_delivery("replacement", "session-p", "perm-1", &fixture.handle)
+                .await
+                .is_some()
+        );
         let attached = registry
             .authorize_attach(
                 "replacement",
