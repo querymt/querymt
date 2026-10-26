@@ -250,10 +250,8 @@ impl EmbeddedAcpConnection {
                     if let Some(session_id) = permission_attach_session
                         && state
                             .session_owners
-                            .lock()
+                            .owns_interactions(&session_id, &connection.conn_id)
                             .await
-                            .get(&session_id)
-                            .is_some_and(|owners| owners.contains(&connection.conn_id))
                     {
                         redeliver_pending_permissions(&state.agent, &session_id, &connection).await;
                     }
@@ -1389,10 +1387,8 @@ async fn handle_websocket_connection(
                             if let Some(session_id) = permission_attach_session
                                 && state_dispatch
                                     .session_owners
-                                    .lock()
+                                    .owns_interactions(&session_id, &conn_id_dispatch)
                                     .await
-                                    .get(&session_id)
-                                    .is_some_and(|owners| owners.contains(&conn_id_dispatch))
                             {
                                 redeliver_pending_permissions(
                                     &state_dispatch.agent,
@@ -1518,6 +1514,10 @@ pub(crate) async fn reconcile_websocket_disconnect(state: &WsServerState, conn_i
             }
             fallback
         };
+        state
+            .session_owners
+            .forget_interaction_owner(&session_id, conn_id)
+            .await;
 
         let cleared = state
             .agent
@@ -1732,7 +1732,7 @@ async fn forward_admitted(
 ///
 /// Returns `false` when the connection can no longer be served and the
 /// forwarder should stop.
-async fn forward_session_event(
+pub(super) async fn forward_session_event(
     state: &WsServerState,
     connection: &ConnectionEventState,
     translator: &Arc<StdMutex<AcpLiveEventTranslator>>,
@@ -1753,6 +1753,21 @@ async fn forward_session_event(
         return true;
     }
 
+    if matches!(
+        event.kind(),
+        crate::events::AgentEventKind::ElicitationRequested { .. }
+            | crate::events::AgentEventKind::PermissionRequested {
+                request: Some(_),
+                ..
+            }
+    ) && !state
+        .session_owners
+        .owns_interactions(event.session_id(), &connection.conn_id)
+        .await
+    {
+        return true;
+    }
+
     if let crate::events::AgentEventKind::ElicitationRequested {
         elicitation_id,
         session_id,
@@ -1760,7 +1775,14 @@ async fn forward_session_event(
     } = event.kind()
     {
         let key = (session_id.clone(), elicitation_id.clone());
-        if !connection.forwarded_elicitations.lock().await.insert(key) {
+        // Reserve against concurrent forwarders; failed claims/deliveries must
+        // release the reservation so a later attempt is not suppressed.
+        if !connection
+            .forwarded_elicitations
+            .lock()
+            .await
+            .insert(key.clone())
+        {
             return true;
         }
 
@@ -1783,6 +1805,7 @@ async fn forward_session_event(
             .await
             .is_err()
             {
+                connection.forwarded_elicitations.lock().await.remove(&key);
                 return false;
             }
         }
@@ -1797,6 +1820,11 @@ async fn forward_session_event(
             )
             .await
         else {
+            connection.forwarded_elicitations.lock().await.remove(&key);
+            log::debug!(
+                "WebSocket elicitation not claimed: session_id={session_id} elicitation_id={elicitation_id} connection_id={}",
+                connection.conn_id
+            );
             return true;
         };
         if let Err(error) = deliver_claimed_websocket_elicitation(
@@ -1807,6 +1835,7 @@ async fn forward_session_event(
         )
         .await
         {
+            connection.forwarded_elicitations.lock().await.remove(&key);
             log::warn!(
                 "Failed to deliver WebSocket elicitation: session_id={} elicitation_id={} error={}",
                 session_id,
@@ -1826,7 +1855,14 @@ async fn forward_session_event(
     {
         let session_id = event.session_id().to_string();
         let key = (session_id.clone(), permission_id.clone());
-        if !connection.forwarded_elicitations.lock().await.insert(key) {
+        // Reserve against concurrent forwarders; failed claims/deliveries must
+        // release the reservation so a later attempt is not suppressed.
+        if !connection
+            .forwarded_elicitations
+            .lock()
+            .await
+            .insert(key.clone())
+        {
             return true;
         }
 
@@ -1851,24 +1887,33 @@ async fn forward_session_event(
             .await
             .is_err()
             {
+                connection.forwarded_elicitations.lock().await.remove(&key);
                 return false;
             }
         }
 
-        let Some(claim) = crate::elicitation::claim_live_elicitation_delivery(
-            state.agent.as_ref(),
-            &session_id,
-            permission_id,
-            &connection.conn_id,
-        )
-        .await
+        let Some(claim) = state
+            .elicitation_recovery
+            .claim_live_delivery(
+                &connection.conn_id,
+                &session_id,
+                permission_id,
+                state.agent.as_ref(),
+            )
+            .await
         else {
+            connection.forwarded_elicitations.lock().await.remove(&key);
+            log::debug!(
+                "WebSocket permission not claimed: session_id={session_id} permission_id={permission_id} connection_id={}",
+                connection.conn_id
+            );
             return true;
         };
         if let Err(error) =
             deliver_claimed_websocket_permission(state.agent.clone(), claim, connection.clone())
                 .await
         {
+            connection.forwarded_elicitations.lock().await.remove(&key);
             log::warn!(
                 "Failed to deliver WebSocket permission request: session_id={session_id} permission_id={permission_id} error={error}"
             );

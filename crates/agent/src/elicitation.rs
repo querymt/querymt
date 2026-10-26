@@ -540,7 +540,7 @@ async fn all_pending_maps(agent: &crate::agent::LocalAgentHandle) -> Vec<Pending
 }
 
 /// Adopt `authority_verifier` for unowned entries of `session_id` in one map.
-/// Returns whether the session has any pending entry in this map.
+/// Returns whether at least one entry is owned by that authority after assignment.
 pub async fn assign_authority_in_map(
     map: &PendingElicitationMap,
     session_id: &str,
@@ -555,7 +555,7 @@ pub async fn assign_authority_in_map(
         if entry.owner_authority.is_none() {
             entry.owner_authority = Some(authority_verifier.to_string());
         }
-        assigned = true;
+        assigned |= entry.owner_authority.as_deref() == Some(authority_verifier);
     }
     assigned
 }
@@ -672,7 +672,9 @@ pub async fn assign_pending_elicitation_authority(
             .list_pending_interactions(Some(authority_verifier.to_string()))
             .await
         {
-            Ok(pending) => !pending.is_empty(),
+            Ok(pending) => pending
+                .iter()
+                .any(|entry| entry.owner_authority.as_deref() == Some(authority_verifier)),
             Err(error) => {
                 warn_interaction_call("assign_authority", session_id, &error);
                 false
@@ -1662,6 +1664,38 @@ mod tests {
         assert_eq!(snapshot[0].run_id.as_deref(), Some("run-1"));
         assert_eq!(snapshot[0].tool_call_id.as_deref(), Some("tool-1"));
         assert_eq!(snapshot[0].delivery_generation, 0);
+    }
+
+    #[tokio::test]
+    async fn assigning_a_conflicting_authority_does_not_report_success() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let map = fixture.handle.pending_elicitations();
+        let materialized = fixture
+            .handle
+            .new_session(crate::acp::protocol::NewSessionRequest::new(
+                fixture._tempdir.path(),
+            ))
+            .await
+            .unwrap()
+            .session_id
+            .to_string();
+        for (id, session_id) in [
+            ("fallback-question", "unmaterialized"),
+            ("actor-question", materialized.as_str()),
+        ] {
+            let (sender, _receiver) = oneshot::channel();
+            insert_pending_elicitation(&map, id.into(), session_id.into(), sender).await;
+            assert!(
+                assign_pending_elicitation_authority(&fixture.handle, session_id, "first").await
+            );
+            assert!(
+                !assign_pending_elicitation_authority(&fixture.handle, session_id, "second").await
+            );
+            assert_eq!(
+                map.lock().await[id].owner_authority.as_deref(),
+                Some("first")
+            );
+        }
     }
 
     #[tokio::test]

@@ -467,13 +467,14 @@ async fn unauthorized_subscriber_receives_no_elicitation_content() {
 
     let (wire_tx, mut wire_rx) = mpsc::channel::<String>(4);
     let cancel = CancellationToken::new();
+    let forwarded = Arc::new(Mutex::new(HashSet::new()));
     spawn_event_forwarders(
         state,
         ConnectionEventState {
             conn_id: "observer".to_string(),
             tx: wire_tx,
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
-            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            forwarded_elicitations: forwarded.clone(),
             request_counter: Arc::new(AtomicU64::new(1)),
             connection_cancel: cancel.clone(),
             delivery: crate::acp::delivery::ConnectionDelivery::new(None, cancel.clone()),
@@ -491,7 +492,135 @@ async fn unauthorized_subscriber_receives_no_elicitation_content() {
             .await
             .is_err()
     );
+    assert!(
+        forwarded.lock().await.is_empty(),
+        "a denied claim must remain retryable"
+    );
     cancel.cancel();
+}
+
+#[tokio::test]
+async fn observer_loaded_after_prompt_cannot_capture_the_question() {
+    let (fixture, session_id) = prompt_fixture().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    for connection in ["observer", "controller"] {
+        state
+            .elicitation_recovery
+            .register_connection(connection.into(), true)
+            .await;
+        state
+            .elicitation_recovery
+            .record_client_capabilities(connection, true)
+            .await;
+    }
+    for (connection, method, params) in [
+        (
+            "observer",
+            "session/load",
+            serde_json::json!({"sessionId": session_id, "cwd": "/tmp", "mcpServers": []}),
+        ),
+        (
+            "controller",
+            "session/prompt",
+            serde_json::json!({"sessionId": session_id, "prompt": [{"type": "text", "text": "hello"}]}),
+        ),
+        (
+            "observer",
+            "session/load",
+            serde_json::json!({"sessionId": session_id, "cwd": "/tmp", "mcpServers": []}),
+        ),
+    ] {
+        let output = super::shared::handle_rpc_message(
+            fixture.handle.as_ref(),
+            &state.session_owners,
+            &state.pending_elicitations,
+            connection,
+            super::shared::RpcMessage {
+                jsonrpc: "2.0".into(),
+                id: Some(serde_json::json!(1)),
+                method: method.into(),
+                params,
+            },
+        )
+        .await;
+        assert!(
+            output.response.unwrap().error.is_none(),
+            "{method} must succeed"
+        );
+    }
+    let (sender, receiver) = oneshot::channel();
+    insert_pending_elicitation(
+        &state.pending_elicitations,
+        "question".into(),
+        session_id.clone(),
+        sender,
+    )
+    .await;
+    let mut connections = Vec::new();
+    for id in ["observer", "controller"] {
+        let (tx, rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        connections.push((
+            ConnectionEventState {
+                conn_id: id.into(),
+                tx,
+                pending_requests: Default::default(),
+                forwarded_elicitations: Default::default(),
+                request_counter: Arc::new(AtomicU64::new(1)),
+                connection_cancel: cancel.clone(),
+                delivery: crate::acp::delivery::ConnectionDelivery::new(None, cancel),
+            },
+            rx,
+        ));
+    }
+    let translator = test_translator();
+    // Force the observer to process the event first, instead of relying on task scheduling.
+    for (connection, rx) in &mut connections {
+        assert!(
+            super::websocket::forward_session_event(
+                &state,
+                connection,
+                &translator,
+                elicitation_event(&session_id, "question"),
+            )
+            .await
+        );
+        if connection.conn_id == "observer" {
+            assert!(
+                rx.try_recv().is_err(),
+                "an observer must not receive authority or question content"
+            );
+            assert!(connection.forwarded_elicitations.lock().await.is_empty());
+        }
+    }
+    let (controller, rx) = &mut connections[1];
+    let authority: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    assert_eq!(
+        authority["method"],
+        crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION
+    );
+    let request: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    assert_eq!(request["method"], "elicitation/create");
+    assert!(
+        route_websocket_response(
+            &controller.pending_requests,
+            request["id"].clone(),
+            Some(serde_json::json!({"action": "accept", "content": {"selection": "A"}})),
+            None,
+        )
+        .await
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), receiver)
+            .await
+            .unwrap()
+            .unwrap()
+            .action,
+        ElicitationAction::Accept
+    );
+    for (connection, _) in connections {
+        connection.connection_cancel.cancel();
+    }
 }
 
 #[tokio::test]
@@ -3214,6 +3343,124 @@ async fn embedded_connection_dispatches_sessions_and_streams_before_prompt_respo
     })
     .await
     .expect("close cancels owned forwarders and bridge");
+}
+
+#[tokio::test]
+async fn embedded_question_tool_round_trip_with_an_observer() {
+    use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut provider = MockLlmProvider::new();
+    let calls = AtomicUsize::new(0);
+    provider.expect_chat_with_tools().returning(move |_, _| {
+        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(MockChatResponse::with_tools(
+                "Choose an option",
+                vec![querymt::ToolCall {
+                    id: "question-tool".into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "question".into(),
+                        arguments: serde_json::json!({"questions": [{
+                            "question": "Which option?", "header": "Choice",
+                            "options": [{"label": "A", "description": "First option"}]
+                        }]})
+                        .to_string(),
+                    },
+                }],
+            )
+            .into())
+        } else {
+            Ok(MockChatResponse::text_only("Answer received").into())
+        }
+    });
+    let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(provider, vec![])).await;
+    let session_id = fixture
+        .handle
+        .new_session(crate::acp::protocol::NewSessionRequest::new(
+            fixture._tempdir.path(),
+        ))
+        .await
+        .unwrap()
+        .session_id
+        .to_string();
+    let server = super::websocket::EmbeddedAcpServer::new(fixture.handle.clone());
+    let (mut observer, mut observer_rx) = server.open(None).await;
+    let (mut controller, mut controller_rx) = server.open(None).await;
+    for (connection, rx) in [
+        (&observer, &mut observer_rx),
+        (&controller, &mut controller_rx),
+    ] {
+        connection.receive_json(&serde_json::json!({
+            "jsonrpc": "2.0", "id": "init", "method": "initialize",
+            "params": {"protocolVersion": 1, "clientCapabilities": {"elicitation": {"form": {}}}}
+        }).to_string()).await.unwrap();
+        embedded_messages_until(rx, |m| m["id"] == "init").await;
+    }
+    load_embedded_session(&observer, &mut observer_rx, &session_id).await;
+    controller
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": "prompt", "method": "session/prompt",
+                "params": {"sessionId": session_id, "prompt": [{"type": "text", "text": "Ask me"}]}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let messages =
+        embedded_messages_until(&mut controller_rx, |m| m["method"] == "elicitation/create").await;
+    let question = messages.last().unwrap();
+    assert_eq!(question["params"]["sessionId"], session_id);
+    assert_eq!(question["params"]["message"], "Which option?");
+    // Loading the busy session remains observation, not an interaction takeover.
+    observer.receive_json(&serde_json::json!({
+        "jsonrpc": "2.0", "id": "reload", "method": "session/load",
+        "params": {"sessionId": session_id, "cwd": fixture._tempdir.path(), "mcpServers": []}
+    }).to_string()).await.unwrap();
+    let observed = embedded_messages_until(&mut observer_rx, |m| m["id"] == "reload").await;
+    assert!(observed.last().unwrap()["error"].is_null());
+    assert!(observed.iter().all(|m| m["method"] != "elicitation/create"
+        && m["method"]
+            != crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION));
+    assert!(
+        observed
+            .iter()
+            .any(|m| m["params"]["update"]["sessionUpdate"] == "tool_call")
+    );
+    controller
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": question["id"],
+                "result": {"action": "accept", "content": {"selection": "A"}}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    let completed = embedded_messages_until(&mut controller_rx, |m| m["id"] == "prompt").await;
+    assert!(
+        completed.last().unwrap()["error"].is_null(),
+        "{completed:?}"
+    );
+    assert_eq!(
+        completed.last().unwrap()["result"]["stopReason"],
+        "end_turn"
+    );
+    assert!(completed.iter().any(
+        |m| m["params"]["update"]["sessionUpdate"] == "tool_call_update"
+            && m["params"]["update"]["status"] == "completed"
+    ));
+    assert!(
+        fixture
+            .handle
+            .pending_elicitations()
+            .lock()
+            .await
+            .is_empty()
+    );
+    controller.close().await;
+    observer.close().await;
 }
 
 #[tokio::test]
