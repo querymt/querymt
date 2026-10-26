@@ -172,41 +172,33 @@ impl OAuthService {
     ///
     /// This is the shared implementation for the ACP `_querymt/auth/status`
     /// extension method.
-    pub async fn auth_status(&self, provider_filter: Option<&str>) -> Vec<AuthProviderStatus> {
+    pub async fn auth_status(
+        &self,
+        provider_filter: Option<&str>,
+    ) -> Result<Vec<AuthProviderStatus>, String> {
         let registry = self.config.provider.plugin_registry();
-        let store = crate::auth::SecretStore::new().ok();
+        let store = crate::auth::SecretStore::new()
+            .map_err(|error| format!("Failed to open secret store: {error}"))?;
 
-        let mut seen = std::collections::HashSet::new();
+        let provider_names = auth_provider_names(&registry);
+
         let mut providers = Vec::new();
-
-        for cfg in &registry.config.providers {
-            if !seen.insert(cfg.name.clone()) {
-                continue;
-            }
-
-            let provider_name = cfg.name.clone();
-
-            // If a filter was given, skip non-matching providers.
-            if let Some(filter) = provider_filter
-                && provider_name != filter
-            {
+        for provider_name in provider_names {
+            if provider_filter.is_some_and(|filter| provider_name != filter) {
                 continue;
             }
 
             let factory = registry.get(&provider_name).await;
             let env_var_name = factory
                 .as_ref()
-                .and_then(|f| f.as_http())
-                .and_then(|h| h.api_key_name());
+                .and_then(|factory| factory.as_http())
+                .and_then(|factory| factory.api_key_name());
 
             #[cfg(feature = "oauth")]
             let (supports_oauth, oauth_status, display_name_from_oauth) = {
                 match crate::auth::get_oauth_provider(&provider_name, None) {
                     Ok(oauth_provider) => {
-                        let status = match store
-                            .as_ref()
-                            .and_then(|s| s.get_oauth_tokens(&provider_name))
-                        {
+                        let status = match store.get_oauth_tokens(&provider_name) {
                             Some(tokens) if tokens.is_expired() => Some(OAuthStatus::Expired),
                             Some(_) => Some(OAuthStatus::Connected),
                             None => Some(OAuthStatus::NotAuthenticated),
@@ -227,41 +219,47 @@ impl OAuthService {
                 Option<String>,
             ) = (false, None, None);
 
-            let has_stored_api_key = env_var_name
-                .as_ref()
-                .and_then(|name| store.as_ref().and_then(|s| s.get(name)))
-                .is_some();
-
+            let has_stored_api_key = match env_var_name.as_deref() {
+                Some(name) => store
+                    .try_get(name)
+                    .map_err(|error| {
+                        format!(
+                            "Failed to read stored API key for provider '{provider_name}': {error}"
+                        )
+                    })?
+                    .is_some(),
+                None => false,
+            };
             let has_env_api_key = env_var_name
                 .as_ref()
                 .is_some_and(|name| std::env::var(name).is_ok());
-
             let preferred_method = store
-                .as_ref()
-                .and_then(|s| s.get(&format!("auth_method_{}", provider_name)));
+                .try_get(&format!("auth_method_{provider_name}"))
+                .map_err(|error| {
+                    format!(
+                        "Failed to read auth preference for provider '{provider_name}': {error}"
+                    )
+                })?;
 
             let display_name = display_name_from_oauth.unwrap_or_else(|| {
                 let mut chars = provider_name.chars();
                 match chars.next() {
                     None => provider_name.clone(),
-                    Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+                    Some(character) => character.to_uppercase().to_string() + chars.as_str(),
                 }
             });
-
             providers.push(AuthProviderStatus {
                 provider: provider_name,
                 display_name,
                 oauth_status,
                 has_stored_api_key,
                 has_env_api_key,
-                env_var_name: env_var_name.map(|s| s.to_string()),
+                env_var_name,
                 supports_oauth,
                 preferred_method,
             });
         }
-
-        providers.sort_by(|a, b| a.provider.cmp(&b.provider));
-        providers
+        Ok(providers)
     }
 
     // ── start_flow ────────────────────────────────────────────────────────
@@ -881,17 +879,39 @@ pub(crate) async fn persist_oauth_credentials(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+fn auth_provider_names(registry: &querymt::plugin::host::PluginRegistry) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for provider in &registry.config.providers {
+        if seen.insert(provider.name.clone()) {
+            names.push(provider.name.clone());
+        }
+    }
+    for factory in registry.list() {
+        let name = factory.name().to_string();
+        if seen.insert(name.clone()) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names
+}
+
 fn validate_provider_configured(config: &AgentConfig, provider: &str) -> Result<(), String> {
     let registry = config.provider.plugin_registry();
-    let is_configured = registry
+    let is_known = registry
         .config
         .providers
         .iter()
-        .any(|cfg| cfg.name == provider);
-    if !is_configured {
-        Err(format!("Provider '{}' is not configured", provider))
-    } else {
+        .any(|configured| configured.name == provider)
+        || registry
+            .list()
+            .iter()
+            .any(|factory| factory.name() == provider);
+    if is_known {
         Ok(())
+    } else {
+        Err(format!("Provider '{}' is not configured", provider))
     }
 }
 
@@ -1278,5 +1298,18 @@ mod tests {
             callback_listener_port(kimi.flow_kind(), kimi.callback_port()),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn auth_provider_names_include_registered_static_factories() {
+        let registry = querymt::plugin::host::PluginRegistry::empty();
+        let shared = crate::test_utils::SharedLlmProvider::new(
+            crate::test_utils::MockLlmProvider::new(),
+            vec![],
+        );
+        registry.register_static(std::sync::Arc::new(
+            crate::test_utils::TestProviderFactory::new(shared),
+        ));
+        assert_eq!(auth_provider_names(&registry), vec!["mock"]);
     }
 }

@@ -84,6 +84,12 @@ fn init_native_store() {
     }
 }
 
+/// Install the Android host-backed keyring store before any secret operations.
+#[cfg(target_os = "android")]
+pub fn install_android_default_store(store: std::sync::Arc<keyring_core::CredentialStore>) {
+    keyring_core::set_default_store(store);
+}
+
 /// Key used to store the default provider in the secret store
 const DEFAULT_PROVIDER_KEY: &str = "default";
 
@@ -104,6 +110,13 @@ impl SecretStore {
     /// * `io::Result<Self>` - A new SecretStore instance or an IO error
     pub fn new() -> io::Result<Self> {
         ensure_store_initialized();
+        #[cfg(target_os = "android")]
+        if keyring_core::get_default_store().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Android credential store is not configured",
+            ));
+        }
         Ok(SecretStore {})
     }
 
@@ -138,8 +151,18 @@ impl SecretStore {
     ///
     /// * `Option<String>` - The secret value if found, or None
     pub fn get(&self, key: &str) -> Option<String> {
-        let entry = Entry::new(SERVICE_NAME, key).ok()?;
-        entry.get_password().ok()
+        self.try_get(key).ok().flatten()
+    }
+
+    /// Retrieves a secret while distinguishing a missing key from backend failure.
+    pub fn try_get(&self, key: &str) -> io::Result<Option<String>> {
+        let entry =
+            Entry::new(SERVICE_NAME, key).map_err(|error| io::Error::other(error.to_string()))?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(error) => Err(io::Error::other(error.to_string())),
+        }
     }
 
     /// Deletes a secret with the given key.

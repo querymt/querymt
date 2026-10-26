@@ -1119,11 +1119,15 @@ impl std::str::FromStr for AuthMethod {
 }
 
 /// Read the preferred auth method for a provider from SecretStore.
-pub(crate) fn preferred_auth_method(provider_name: &str) -> Option<AuthMethod> {
-    querymt_utils::secret_store::SecretStore::new()
-        .ok()
-        .and_then(|s| s.get(&format!("auth_method_{}", provider_name)))
-        .and_then(|v| v.parse::<AuthMethod>().ok())
+pub(crate) fn preferred_auth_method(provider_name: &str) -> SessionResult<Option<AuthMethod>> {
+    let key = format!("auth_method_{provider_name}");
+    let store = querymt_utils::secret_store::SecretStore::new().map_err(|error| {
+        SessionError::InvalidOperation(format!("Failed to open secret store: {error}"))
+    })?;
+    let value = store.try_get(&key).map_err(|error| {
+        SessionError::InvalidOperation(format!("Failed to read auth preference: {error}"))
+    })?;
+    Ok(value.and_then(|value| value.parse::<AuthMethod>().ok()))
 }
 
 /// Resolve an API key for a provider, respecting the user's preferred auth method.
@@ -1143,11 +1147,10 @@ pub(crate) async fn resolve_api_key_with_preference(
     env_var_name: Option<&str>,
     preferred: Option<&AuthMethod>,
     use_oauth_resolver: &mut bool,
-) -> Option<String> {
+) -> SessionResult<Option<String>> {
     #[cfg(not(feature = "oauth"))]
     let _ = use_oauth_resolver;
 
-    // Build the resolution order based on preference
     let order: Vec<AuthMethod> = match preferred {
         Some(AuthMethod::OAuth) | None => {
             vec![AuthMethod::OAuth, AuthMethod::ApiKey, AuthMethod::EnvVar]
@@ -1170,27 +1173,33 @@ pub(crate) async fn resolve_api_key_with_preference(
                         Ok(token) => {
                             log::debug!("Using OAuth token for provider: {}", provider_name);
                             *use_oauth_resolver = true;
-                            return Some(token);
+                            return Ok(Some(token));
                         }
-                        Err(e) => {
-                            log::debug!("OAuth unavailable for {}: {}", provider_name, e);
+                        Err(error) => {
+                            log::debug!("OAuth unavailable for {}: {}", provider_name, error);
                         }
                     }
                 }
             }
             AuthMethod::ApiKey => {
-                // Stored key requires an env_var_name (used as keyring key)
                 if let Some(name) = env_var_name {
-                    if let Some(key) = querymt_utils::secret_store::SecretStore::new()
-                        .ok()
-                        .and_then(|s| s.get(name))
-                    {
+                    let store =
+                        querymt_utils::secret_store::SecretStore::new().map_err(|error| {
+                            SessionError::InvalidOperation(format!(
+                                "Failed to open secret store: {error}"
+                            ))
+                        })?;
+                    if let Some(key) = store.try_get(name).map_err(|error| {
+                        SessionError::InvalidOperation(format!(
+                            "Failed to read stored API key for provider '{provider_name}': {error}"
+                        ))
+                    })? {
                         log::debug!(
                             "Using stored API key for provider: {} ({})",
                             provider_name,
                             name
                         );
-                        return Some(key);
+                        return Ok(Some(key));
                     }
                     log::debug!("No stored API key for {} ({})", provider_name, name);
                 }
@@ -1199,7 +1208,7 @@ pub(crate) async fn resolve_api_key_with_preference(
                 if let Some(name) = env_var_name {
                     if let Ok(key) = std::env::var(name) {
                         log::debug!("Using env var for provider: {} ({})", provider_name, name);
-                        return Some(key);
+                        return Ok(Some(key));
                     }
                     log::debug!("Env var {} not set", name);
                 }
@@ -1207,7 +1216,7 @@ pub(crate) async fn resolve_api_key_with_preference(
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// Per-call parameters for building an LLM provider via
@@ -1596,7 +1605,10 @@ pub mod tests {
         )
         .await;
 
-        assert_eq!(result.as_deref(), Some("key-from-env"));
+        assert_eq!(
+            result.expect("env preference should resolve").as_deref(),
+            Some("key-from-env")
+        );
         assert!(!use_oauth);
         unsafe { std::env::remove_var(&var) };
     }
@@ -1617,7 +1629,12 @@ pub mod tests {
         .await;
 
         // OAuth and stored key will fail, should fall back to env var
-        assert_eq!(result.as_deref(), Some("fallback-key"));
+        assert_eq!(
+            result
+                .expect("default resolver should find the env fallback")
+                .as_deref(),
+            Some("fallback-key")
+        );
         unsafe { std::env::remove_var(&var) };
     }
 
@@ -1636,7 +1653,11 @@ pub mod tests {
         )
         .await;
 
-        assert!(result.is_none());
+        assert!(
+            result
+                .expect("no credential source is not an error")
+                .is_none()
+        );
         assert!(!use_oauth);
     }
 
@@ -1653,7 +1674,11 @@ pub mod tests {
         )
         .await;
 
-        assert!(result.is_none());
+        assert!(
+            result
+                .expect("no credential source is not an error")
+                .is_none()
+        );
     }
 
     #[test]

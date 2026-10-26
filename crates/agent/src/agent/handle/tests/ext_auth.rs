@@ -1,6 +1,49 @@
 use super::*;
 
 #[tokio::test]
+async fn static_factory_is_accepted_before_auth_key_resolution() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let registry = fixture.config.provider.plugin_registry();
+    assert!(
+        !registry
+            .config
+            .providers
+            .iter()
+            .any(|provider| provider.name == "mock"),
+        "fixture precondition: mock is registered only as a static factory"
+    );
+    let shared = crate::test_utils::SharedLlmProvider::new(
+        crate::test_utils::MockLlmProvider::new(),
+        vec![],
+    );
+    registry.register_static(std::sync::Arc::new(
+        crate::test_utils::TestProviderFactory::new(shared),
+    ));
+
+    let result = ext_method_json(
+        &fixture.handle,
+        "querymt/auth/setApiToken",
+        serde_json::json!({ "provider": "mock", "api_key": "test-key-not-persisted" }),
+    )
+    .await;
+
+    assert_eq!(result["success"], false);
+    assert!(
+        result["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not have a known API key name")
+    );
+    assert!(
+        !result["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not configured")
+    );
+    assert!(!result.to_string().contains("test-key-not-persisted"));
+}
+
+#[tokio::test]
 async fn set_api_token_rejects_empty_key() {
     let f = HandleFixture::new().await;
     let result = ext_method_json(

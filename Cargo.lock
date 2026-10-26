@@ -11937,6 +11937,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "jni 0.22.4",
+ "keyring-core",
  "libc",
  "log",
  "ndk-context",

@@ -112,6 +112,8 @@ pub fn attach_or_insert_runtime_agent(
             shutdown: false,
         },
     );
+    crate::storage::runtime_started();
+    crate::storage::agent_attached();
     (handle, reused)
 }
 
@@ -137,6 +139,8 @@ pub fn attach_existing_runtime_agent() -> Option<AgentHandle> {
             shutdown: false,
         },
     );
+    crate::storage::runtime_started();
+    crate::storage::agent_attached();
     Some(handle)
 }
 
@@ -159,6 +163,7 @@ pub fn shutdown_runtime_if_idle() -> Result<bool, FfiErrorCode> {
     }
 
     state.runtime = None;
+    crate::storage::runtime_stopped();
     Ok(true)
 }
 
@@ -214,7 +219,8 @@ pub fn remove_agent(handle: AgentHandle) -> Result<AgentRecord, FfiErrorCode> {
     if let Some(runtime) = state.runtime.as_mut() {
         runtime.attached_agents = runtime.attached_agents.saturating_sub(1);
     }
-
+    drop(state);
+    crate::storage::agent_detached();
     Ok(record)
 }
 

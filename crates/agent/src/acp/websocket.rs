@@ -80,6 +80,205 @@ impl WsServerState {
     }
 }
 
+/// Opaque ACP connection adapter for embedders that provide their own byte transport.
+pub struct EmbeddedAcpConnection {
+    state: WsServerState,
+    connection: ConnectionEventState,
+    bridge_task: Option<tokio::task::JoinHandle<()>>,
+    session_bridge: ClientBridgeSender,
+    translator: Arc<StdMutex<AcpLiveEventTranslator>>,
+    session_load: Arc<StdMutex<crate::acp::shared::AcpSessionLoadPreferences>>,
+    session_hooks: Option<Arc<dyn crate::acp::shared::AcpSessionHooks>>,
+    closed: bool,
+}
+
+impl EmbeddedAcpConnection {
+    /// Open an embedded connection and return the sole receiver for server output.
+    pub async fn open(
+        agent: Arc<crate::agent::LocalAgentHandle>,
+        session_hooks: Option<Arc<dyn crate::acp::shared::AcpSessionHooks>>,
+    ) -> (Self, mpsc::Receiver<String>) {
+        let state = WsServerState::new(agent);
+        let conn_id = Uuid::new_v4().to_string();
+        state
+            .elicitation_recovery
+            .register_connection(conn_id.clone(), false)
+            .await;
+
+        let (tx, rx) = mpsc::channel::<String>(100);
+        let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+        let connection_cancel = CancellationToken::new();
+        let (bridge_tx, bridge_rx) = mpsc::channel::<ClientBridgeMessage>(100);
+        let session_bridge = ClientBridgeSender::for_connection(bridge_tx, conn_id.clone());
+        state
+            .connection_bridges
+            .lock()
+            .await
+            .insert(conn_id.clone(), session_bridge.clone());
+
+        let connection = ConnectionEventState {
+            conn_id: conn_id.clone(),
+            tx: tx.clone(),
+            pending_requests: pending_requests.clone(),
+            forwarded_elicitations: Arc::new(Mutex::new(HashSet::new())),
+            request_counter: Arc::new(AtomicU64::new(1)),
+            connection_cancel: connection_cancel.clone(),
+            delivery: crate::acp::delivery::ConnectionDelivery::new(
+                Some(state.agent.config.event_sink.journal().clone()),
+                connection_cancel,
+            ),
+        };
+        let translator = Arc::new(StdMutex::new(AcpLiveEventTranslator::new()));
+        let session_load = Arc::new(StdMutex::new(
+            crate::acp::shared::AcpSessionLoadPreferences::default(),
+        ));
+        spawn_event_forwarders(state.clone(), connection.clone(), translator.clone());
+        let bridge_task = tokio::spawn(run_websocket_bridge(
+            bridge_rx,
+            tx,
+            pending_requests,
+            connection.request_counter.clone(),
+            conn_id,
+            connection.connection_cancel.clone(),
+        ));
+
+        (
+            Self {
+                state,
+                connection,
+                bridge_task: Some(bridge_task),
+                session_bridge,
+                translator,
+                session_load,
+                session_hooks,
+                closed: false,
+            },
+            rx,
+        )
+    }
+
+    /// Route a client request or response into the existing ACP WebSocket engine.
+    pub async fn receive_json(&self, json: &str) -> Result<(), serde_json::Error> {
+        let inbound = serde_json::from_str::<InboundWsMessage>(json)?;
+        match inbound {
+            InboundWsMessage::Response { id, result, error } => {
+                route_websocket_response(&self.connection.pending_requests, id, result, error)
+                    .await;
+            }
+            InboundWsMessage::Request(request) => {
+                let attach_session = (request.method.trim_start_matches('_')
+                    == crate::control::elicitation_recovery::ELICITATION_RECOVERY_ATTACH_METHOD)
+                    .then(|| {
+                        serde_json::from_value::<crate::control::elicitation_recovery::AttachPendingElicitationSessionRequest>(
+                            request.params.clone(),
+                        )
+                        .ok()
+                        .map(|request| request.session_id)
+                    })
+                    .flatten();
+                let permission_attach_session = (request.method
+                    == crate::acp::protocol::AGENT_METHOD_NAMES.session_load
+                    || request.method == crate::acp::protocol::AGENT_METHOD_NAMES.session_resume)
+                    .then(|| {
+                        request
+                            .params
+                            .get("sessionId")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                    })
+                    .flatten()
+                    .or_else(|| attach_session.clone());
+                let state = self.state.clone();
+                let connection = self.connection.clone();
+                let bridge = self.session_bridge.clone();
+                let translator = self.translator.clone();
+                let session_load = self.session_load.clone();
+                let session_hooks = self.session_hooks.clone();
+                tokio::spawn(async move {
+                    dispatch_rpc_message_with_context(
+                        RpcDispatchState {
+                            agent: state.agent.clone(),
+                            session_owners: state.session_owners.clone(),
+                            pending_elicitations: state.pending_elicitations.clone(),
+                            conn_id: connection.conn_id.clone(),
+                            tx: connection.tx.clone(),
+                        },
+                        request,
+                        RpcDispatchContext {
+                            session_hooks,
+                            session_bridge: Some(bridge),
+                            elicitation_recovery: Some(state.elicitation_recovery.clone()),
+                            translator: Some(translator),
+                            session_load: Some(session_load),
+                            delivery: Some(connection.delivery.clone()),
+                        },
+                    )
+                    .await;
+                    if let Some(session_id) = permission_attach_session
+                        && state
+                            .session_owners
+                            .lock()
+                            .await
+                            .get(&session_id)
+                            .is_some_and(|owners| owners.contains(&connection.conn_id))
+                    {
+                        redeliver_pending_permissions(&state.agent, &session_id, &connection).await;
+                    }
+                    if let Some(session_id) = attach_session
+                        && state
+                            .session_owners
+                            .lock()
+                            .await
+                            .get(&session_id)
+                            .is_some_and(|owners| owners.contains(&connection.conn_id))
+                    {
+                        deliver_attached_interactions(
+                            &state.agent,
+                            &state.elicitation_recovery,
+                            &session_id,
+                            &connection,
+                        )
+                        .await;
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue a transport-level response or notification produced by an embedding hook.
+    pub async fn send_json(&self, json: String) -> Result<(), ()> {
+        self.connection.tx.send(json).await.map_err(|_| ())
+    }
+
+    /// Close the connection and run the same bridge, pending-request, and session cleanup as WebSocket.
+    pub async fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.connection.connection_cancel.cancel();
+        if let Some(task) = self.bridge_task.take() {
+            task.abort();
+        }
+        cancel_pending_websocket_requests(&self.connection.pending_requests).await;
+        self.state
+            .elicitation_recovery
+            .remove_connection(&self.connection.conn_id, self.state.agent.as_ref())
+            .await;
+        reconcile_websocket_disconnect(&self.state, &self.connection.conn_id).await;
+    }
+}
+
+impl Drop for EmbeddedAcpConnection {
+    fn drop(&mut self) {
+        self.connection.connection_cancel.cancel();
+        if let Some(task) = self.bridge_task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingWsRequest {
     pub(crate) method: &'static str,
