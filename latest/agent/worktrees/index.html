@@ -22,7 +22,7 @@
       
       
       <link rel="icon" href="../../assets/images/favicon.png">
-      <meta name="generator" content="zensical-0.0.72">
+      <meta name="generator" content="zensical-0.0.73">
     
     
       
@@ -1649,6 +1649,34 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#ownership-handoff" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Ownership handoff
+      </span>
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Ownership handoff">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#read-only-previous-owners" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Read-only previous owners
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#undo-snapshots-and-workspace-references" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2338,16 +2366,18 @@ to run Git commands:</p>
 <span class="normal"><a href="#__codelineno-5-7"> 7</a></span>
 <span class="normal"><a href="#__codelineno-5-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-5-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-5-10">10</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a>/worktree create
+<span class="normal"><a href="#__codelineno-5-10">10</a></span>
+<span class="normal"><a href="#__codelineno-5-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a>/worktree create
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a>/worktree create HEAD review
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a>/worktree create --include-local-changes review
-<a id="__codelineno-5-4" name="__codelineno-5-4"></a>/worktree list
-<a id="__codelineno-5-5" name="__codelineno-5-5"></a>/worktree status &lt;workspace-id&gt;
-<a id="__codelineno-5-6" name="__codelineno-5-6"></a>/worktree result &lt;workspace-id&gt;
-<a id="__codelineno-5-7" name="__codelineno-5-7"></a>/worktree publish [workspace-id]
-<a id="__codelineno-5-8" name="__codelineno-5-8"></a>/worktree archive &lt;workspace-id&gt;
-<a id="__codelineno-5-9" name="__codelineno-5-9"></a>/worktree remove &lt;workspace-id&gt;
-<a id="__codelineno-5-10" name="__codelineno-5-10"></a>/worktree recover &lt;workspace-id&gt;
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a>/worktree handoff [name] [--summary]
+<a id="__codelineno-5-5" name="__codelineno-5-5"></a>/worktree list
+<a id="__codelineno-5-6" name="__codelineno-5-6"></a>/worktree status &lt;workspace-id&gt;
+<a id="__codelineno-5-7" name="__codelineno-5-7"></a>/worktree result &lt;workspace-id&gt;
+<a id="__codelineno-5-8" name="__codelineno-5-8"></a>/worktree publish [workspace-id]
+<a id="__codelineno-5-9" name="__codelineno-5-9"></a>/worktree archive &lt;workspace-id&gt;
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a>/worktree remove &lt;workspace-id&gt;
+<a id="__codelineno-5-11" name="__codelineno-5-11"></a>/worktree recover &lt;workspace-id&gt;
 </code></pre></div></td></tr></table></div>
 <p><code>create</code> returns a <strong>new session ID</strong>, workspace ID, checkout path, branch,
 and baseline. Attach to that new session to work there: the conversation
@@ -2358,6 +2388,13 @@ ref is not. Without that flag local edits are excluded. Ignored untracked
 files are always excluded. <code>status</code>, <code>result</code>, and <code>publish</code> default to the
 current session's workspace when no ID is supplied; local sessions must supply
 an ID. Results are also returned in prompt response <code>_meta["querymt.worktree"]</code>.</p>
+<p>The command's output is also delivered as an <code>agent_message_chunk</code> session
+update on the issuing session (an ephemeral event, never journaled or replayed)
+before the prompt response, on stdio and WebSocket alike, so every client
+attached to the session sees it. No client bridge route is involved. The legacy
+<code>AcpServer::run_stdio</code> forwarder does not track per-connection delivery, so
+there the update is sent but its ordering against the response is not
+guaranteed.</p>
 <p>The same service backs additive ACP extension methods:</p>
 <table>
 <thead>
@@ -2370,6 +2407,10 @@ an ID. Results are also returned in prompt response <code>_meta["querymt.worktre
 <tr>
 <td><code>querymt/worktree/create</code></td>
 <td><code>{"cwd":"/path/to/repo", "include_local_changes":true, "name":"review"}</code></td>
+</tr>
+<tr>
+<td><code>querymt/worktree/handoff</code></td>
+<td><code>{"session_id":"&lt;owner&gt;"}</code> or <code>{"workspace_id":"&lt;id&gt;"}</code>, optional <code>"name"</code>, <code>"summary":true</code></td>
 </tr>
 <tr>
 <td><code>querymt/worktree/list</code></td>
@@ -2407,7 +2448,8 @@ baseline-relative changed paths with change kinds, the verification state, and
 the <strong>captured HEAD</strong>; live HEAD and dirty status are reported separately. An
 empty result list does not imply integration. Session views include workspace
 provenance and distinct execution cwd values. Managed sessions group under
-<code>repository:&lt;canonical-common-dir&gt;</code>; local sessions retain cwd grouping. A
+their workspace's <strong>source cwd</strong> (the project they were isolated from, which
+survives archive and removal); local sessions group under their own cwd. A
 durable <code>session_workspace_bound</code> event exposes the same binding without
 changing existing ACP session updates.</p>
 <p><code>publish</code> is the explicit top-level publication entry point. It captures the
@@ -2508,6 +2550,26 @@ readable messages may be reworded; codes do not change.</p>
 <tr>
 <td><code>owner_conflict</code></td>
 <td>another session already owns the writable workspace</td>
+</tr>
+<tr>
+<td><code>owner_active</code></td>
+<td>handoff refused: the owner has a running turn, queued input, shared delegates, or execution in another process</td>
+</tr>
+<tr>
+<td><code>owner_transferred</code></td>
+<td>the session handed its workspace off and is read-only; the current owner is in <code>ownerSessionId</code></td>
+</tr>
+<tr>
+<td><code>not_owner</code>, <code>workspace_not_ready</code>, <code>owner_not_local</code></td>
+<td>handoff refused: the target does not own a ready, locally hosted workspace (nothing is created)</td>
+</tr>
+<tr>
+<td><code>summary_failed</code></td>
+<td>handoff with <code>summary</code> failed before the transfer; ownership is unchanged</td>
+</tr>
+<tr>
+<td><code>handoff_incomplete</code></td>
+<td>ownership moved but the successor is not runnable yet; run <code>recover</code> with its <code>session_id</code></td>
 </tr>
 <tr>
 <td><code>removal_refused</code></td>
@@ -2722,6 +2784,101 @@ and the execution cwd is published atomically in SQLite:</p>
   <code>/worktree recover &lt;workspace-id&gt;</code> as before. A recovered fork runs in its
   own checkout; retries are refused once nothing is pending.</li>
 </ul>
+<h2 id="ownership-handoff">Ownership handoff</h2>
+<p>A managed checkout has one writer, but a long conversation may want a fresh
+context without moving any files. <strong>Handoff</strong> starts a new session in the
+<em>same</em> checkout and moves ownership to it. No running session changes root:
+ownership moves to a new session. Files, branch, index and baseline are
+untouched.</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
+<span class="normal"><a href="#__codelineno-9-2">2</a></span>
+<span class="normal"><a href="#__codelineno-9-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a>/worktree handoff            # clean successor, no history
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a>/worktree handoff next       # name the successor
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a>/worktree handoff --summary  # seed it with a summary of this conversation
+</code></pre></div></td></tr></table></div>
+<div class="tabbed-set tabbed-alternate" data-tabs="3:3"><input checked="checked" id="__tabbed_3_1" name="__tabbed_3" type="radio" /><input id="__tabbed_3_2" name="__tabbed_3" type="radio" /><input id="__tabbed_3_3" name="__tabbed_3" type="radio" /><div class="tabbed-labels"><label for="__tabbed_3_1">ACP</label><label for="__tabbed_3_2">Rust</label><label for="__tabbed_3_3">Python</label></div>
+<div class="tabbed-content">
+<div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
+<span class="normal"><a href="#__codelineno-10-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="p">{</span><span class="nt">"method"</span><span class="p">:</span><span class="w"> </span><span class="s2">"querymt/worktree/handoff"</span><span class="p">,</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="w"> </span><span class="nt">"params"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"session_id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"&lt;owner&gt;"</span><span class="p">,</span><span class="w"> </span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"next"</span><span class="p">,</span><span class="w"> </span><span class="nt">"summary"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}}</span>
+</code></pre></div></td></tr></table></div>
+</div>
+<div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1">1</a></span>
+<span class="normal"><a href="#__codelineno-11-2">2</a></span>
+<span class="normal"><a href="#__codelineno-11-3">3</a></span>
+<span class="normal"><a href="#__codelineno-11-4">4</a></span>
+<span class="normal"><a href="#__codelineno-11-5">5</a></span>
+<span class="normal"><a href="#__codelineno-11-6">6</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">worktree</span><span class="p">::{</span><span class="n">HandoffOptions</span><span class="p">,</span><span class="w"> </span><span class="n">WorkspaceTarget</span><span class="p">};</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2"></a>
+<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">handed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">agent</span><span class="p">.</span><span class="n">worktrees</span><span class="p">().</span><span class="n">expect</span><span class="p">(</span><span class="s">"enabled"</span><span class="p">)</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="w">    </span><span class="p">.</span><span class="n">handoff</span><span class="p">(</span><span class="n">WorkspaceTarget</span><span class="p">::</span><span class="n">Session</span><span class="p">(</span><span class="n">owner</span><span class="p">),</span><span class="w"> </span><span class="n">HandoffOptions</span><span class="p">::</span><span class="n">default</span><span class="p">())</span>
+<a id="__codelineno-11-5" name="__codelineno-11-5"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-11-6" name="__codelineno-11-6"></a><span class="fm">println!</span><span class="p">(</span><span class="s">"{} now owns {}"</span><span class="p">,</span><span class="w"> </span><span class="n">handed</span><span class="p">.</span><span class="n">session_id</span><span class="p">,</span><span class="w"> </span><span class="n">handed</span><span class="p">.</span><span class="n">checkout_path</span><span class="p">);</span>
+</code></pre></div></td></tr></table></div>
+</div>
+<div class="tabbed-block">
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1">1</a></span>
+<span class="normal"><a href="#__codelineno-12-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="n">handed</span> <span class="o">=</span> <span class="k">await</span> <span class="n">agent</span><span class="o">.</span><span class="n">worktrees</span><span class="o">.</span><span class="n">handoff</span><span class="p">(</span><span class="n">session_id</span><span class="o">=</span><span class="n">owner</span><span class="p">,</span> <span class="n">summary</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="nb">print</span><span class="p">(</span><span class="n">handed</span><span class="p">[</span><span class="s2">"session_id"</span><span class="p">],</span> <span class="n">handed</span><span class="p">[</span><span class="s2">"summary_seeded"</span><span class="p">])</span>
+</code></pre></div></td></tr></table></div>
+</div>
+</div>
+</div>
+<p>The response carries <code>session_id</code>, <code>previous_session_id</code>, <code>workspace_id</code>,
+<code>checkout_path</code>, <code>session_cwd</code>, <code>branch</code> and <code>summary_seeded</code>. The successor is
+listed nested under the previous owner (fork origin <code>worktree</code>).</p>
+<p><strong>Preconditions.</strong> The workspace is <code>ready</code>, owned, and the owner is hosted
+locally. A loaded, idle owner is unloaded so it releases its shared activity
+lease, then the exclusive lease must be obtainable; a running turn, queued or
+steered input, shared delegates, or another process using the checkout refuse
+the handoff with <code>owner_active</code> and create nothing.</p>
+<p><strong>Atomicity.</strong> The successor is persisted behind the same durable startup
+barrier as isolated forks, ownership moves with one conditional update
+(<code>owner = previous AND lifecycle = ready</code>, so racing handoffs have exactly one
+winner), and only then is the barrier released. A crash before the transfer
+leaves the previous owner in place; a crash after it leaves a successor that
+owns the workspace but stays non-runnable. In both cases
+<code>querymt/worktree/recover</code> with the successor's <code>session_id</code> completes the
+transfer (or confirms it) and releases the barrier; retries create no second
+owner and the successor never runs unowned.</p>
+<p><strong>Summary.</strong> Clean by default. With <code>summary</code>, the compaction summarizer runs
+over the previous conversation <em>before anything is created</em> and the result
+seeds the successor as its initial context (<code>summary_seeded: true</code>). A
+summarizer failure returns <code>summary_failed</code> with ownership unchanged.</p>
+<h3 id="read-only-previous-owners">Read-only previous owners</h3>
+<p>After a handoff the previous owner stays listable and loadable, but it never
+materializes again, so it cannot reload as a local or shared session inside
+the checkout it gave away:</p>
+<ul>
+<li><code>session/load</code> replays its history and discloses
+  <code>_meta.querymt.sessionAccess = {"mode": "read_only", "reason":
+  "owner_transferred", "ownerSessionId": "&lt;current owner&gt;"}</code>.</li>
+<li>Prompts (including native commands), queued or steered input, undo/redo and
+  forks are refused with <code>owner_transferred</code> before any tool can run; worktree
+  operations addressed by that session id report the same code.</li>
+<li>Its snapshots are context-only: undo and redo are refused, so they can never
+  touch the successor's files.</li>
+<li>Loading it needs no actor: history and the event journal are read directly,
+  and no configuration update is sent because there is no live configuration.</li>
+</ul>
+<p><strong>Handoff announcement.</strong> Committing a handoff records a durable
+<code>worktree_ownership_transferred</code> event on the previous owner's stream and sends
+it as an <code>agent_message_chunk</code> with the stable <code>message_id</code>
+<code>worktree-handoff-&lt;workspace_id&gt;-&lt;successor&gt;</code> and
+<code>_meta.querymt.worktreeHandoff = {workspaceId, successorSessionId,
+summarySeeded}</code>. Every client attached to the previous owner receives it before
+a native <code>/worktree handoff</code> response, and it is replayed after the history
+whenever the session is loaded. If the event cannot be recorded the failure is
+logged and the handoff still succeeds.</p>
+<p><strong>Compatibility.</strong> The new durable event kind makes the journal of a session
+that has been handed off unreadable by binaries that predate it (the same
+precedent as <code>session_workspace_bound</code>); upgrade every node sharing a database
+before using handoff. Profile runtimes built from one <code>AgentInfra</code> share its
+event fanout and storage journal, so announcements reach connections served by
+the root agent; runtimes given separate fanouts are only forwarded if they are
+registered as event sources.</p>
 <h2 id="undo-snapshots-and-workspace-references">Undo, snapshots, and workspace references</h2>
 <p>Undo and redo reuse the <strong>existing snapshot backend</strong>, unchanged. The
 backend is bound to the session's effective cwd, so each workspace keeps
@@ -2951,9 +3108,9 @@ consulting the live checkout:</p>
   create-only ref.</li>
 </ul>
 <p>You can also reproduce the delta with Git directly:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
-<span class="normal"><a href="#__codelineno-9-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span>
+<span class="normal"><a href="#__codelineno-13-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
 </code></pre></div></td></tr></table></div>
 <p>Example: a parent with uncommitted edits to <code>config.rs</code> dispatches an
 isolated delegate that changes <code>auth.rs</code> and leaves <code>notes.md</code> untracked.
@@ -2970,11 +3127,11 @@ workspace's changes since its baseline.</p>
 baseline, so <code>git merge &lt;managed-branch&gt;</code> (or cherry-picking its tip
 wholesale) can bring the parent's baseline edits along with the
 workspace's work. Integrate the delta deliberately instead:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
-<span class="normal"><a href="#__codelineno-10-2">2</a></span>
-<span class="normal"><a href="#__codelineno-10-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
-<a id="__codelineno-10-2" name="__codelineno-10-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
+<span class="normal"><a href="#__codelineno-14-2">2</a></span>
+<span class="normal"><a href="#__codelineno-14-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
 </code></pre></div></td></tr></table></div>
 <p>or, if the workspace produced real commits and the parent was clean,
 cherry-pick the commit range. If the parent was dirty, either commit the
@@ -3144,7 +3301,7 @@ been applied or accepted — review the delta and integrate it yourself.</p>
       <script id="__config" type="application/json">{"annotate":null,"base":"../..","features":["navigation.tabs","navigation.sections","navigation.tracking","toc.integrate","navigation.top","search.suggest","search.highlight","content.tabs.link","content.code.annotation","content.code.copy"],"redirect":null,"search":"../../assets/javascripts/workers/search.c47bb847.min.js","tags":null,"translations":{"clipboard.copied":"Copied to clipboard","clipboard.copy":"Copy to clipboard","clipboard.error":"Could not copy to clipboard","search.result.more.one":"1 more on this page","search.result.more.other":"# more on this page","search.result.none":"No matching documents","search.result.one":"1 matching document","search.result.other":"# matching documents","search.result.placeholder":"Type to start searching","search.result.term.missing":"Missing","select.version":"Select version"},"version":{"default":"stable","provider":"mike"}}</script>
     
     
-      <script src="../../assets/javascripts/bundle.10ee5ab6.min.js"></script>
+      <script src="../../assets/javascripts/bundle.77dd0ce9.min.js"></script>
       
     
   </body>
