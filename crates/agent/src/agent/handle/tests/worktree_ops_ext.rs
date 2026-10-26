@@ -2435,7 +2435,6 @@ async fn load_with_replay_serves_a_previous_owner_without_an_actor() {
 #[tokio::test]
 async fn previous_owner_keeps_group_and_handoff_target_and_survives_successor_delete() {
     use crate::session::projection::{SessionScope, ViewStore};
-    use crate::session::store::SessionStore as _;
     use crate::worktree::{WorkspaceTarget, WorktreeOps};
 
     let f = worktree_fixture(true).await;

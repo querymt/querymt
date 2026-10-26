@@ -183,8 +183,8 @@ fn parse_finish_reason(value: &str) -> Option<FinishReason> {
 /// search, counts and latest-activity queries in agreement.
 fn group_key_sql(alias: &str) -> String {
     format!(
-        "COALESCE((SELECT w.source_cwd FROM workspaces w WHERE w.owner_session_id = {alias}.public_id), \
-         (SELECT w.source_cwd FROM workspace_handoffs h JOIN workspaces w ON w.public_id = h.workspace_public_id WHERE h.from_session_id = {alias}.public_id), \
+        "COALESCE(NULLIF((SELECT w.source_cwd FROM workspaces w WHERE w.owner_session_id = {alias}.public_id), ''), \
+         NULLIF((SELECT w.source_cwd FROM workspace_handoffs h JOIN workspaces w ON w.public_id = h.workspace_public_id WHERE h.from_session_id = {alias}.public_id), ''), \
          {alias}.cwd)"
     )
 }

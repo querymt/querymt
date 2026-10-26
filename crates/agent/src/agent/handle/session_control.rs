@@ -1,6 +1,11 @@
 use super::utils::format_prefixed_error_chain;
 use super::*;
 
+/// Bounds for the runtime-status probe in `unload_idle_in_runtime`, which
+/// runs under the registry lock.
+const UNLOAD_STATUS_MAILBOX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const UNLOAD_STATUS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl LocalAgentHandle {
     pub(super) async fn bound_session_handle(
         &self,
@@ -126,7 +131,20 @@ impl LocalAgentHandle {
             if session.is_remote() {
                 return Ok(true);
             }
-            let status = session.get_runtime_status().await.map_err(Error::from)?;
+            // Bounded: a stalled actor must not hold the registry lock
+            // forever. A timeout is treated as busy and the session is left
+            // loaded.
+            let status = match session
+                .get_runtime_status_with_timeout(
+                    UNLOAD_STATUS_MAILBOX_TIMEOUT,
+                    UNLOAD_STATUS_REPLY_TIMEOUT,
+                )
+                .await
+            {
+                Ok(status) => status,
+                Err(crate::error::AgentError::SessionTimeout { .. }) => return Ok(true),
+                Err(err) => return Err(Error::from(err)),
+            };
             if status.phase != SessionRuntimePhase::Idle
                 || status.queued_input_count > 0
                 || status.pending_steering_count > 0

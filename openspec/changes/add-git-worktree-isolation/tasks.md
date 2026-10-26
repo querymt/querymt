@@ -372,7 +372,7 @@ Open.
   - add ephemeral `AgentEventKind::WorktreeCommandOutput { text }` (`Ephemeral` in `classify_durability`), map it to `AgentMessageChunk` in the live translator, emit it on the issuing session for every non-handoff command, and return the response with `with_event_tip(seq)`;
   - emission failure is logged and the response still returned.
 
-  Verify a crate search shows `session_bridges` read only by `workspace_query_bridge_for_session` and delegation route inheritance; and `/worktree list` output arrives before the response on stdio and WebSocket with no bridge route registered.
+  Verify a crate search shows `session_bridges` read only by `workspace_query_bridge_for_session` and delegation route inheritance; and `/worktree list` output arrives before the response on WebSocket and on stdio transports that enforce update-before-response ordering (`serve_stdio` via `ConnectionDelivery`), with no bridge route registered. Legacy `AcpServer::run_stdio` is excluded (see 24.11(b)).
 - [x] 24.9 Durable handoff announcement (design 11 "Announcement", "Translation"):
   - add `HandoffHost::announce_handoff`, called by `WorktreeOps::handoff` after `publish_successor`, returning `Option<i64>`;
   - emit durable `AgentEventKind::WorktreeOwnershipTransferred { workspace_id, successor_session_id, summary_seeded }` via the hosting runtime's `AgentConfig::emit_event_persisted`, then `retire_session_stream`; failure logs and never fails the handoff;
@@ -385,7 +385,7 @@ Open.
   - (a) Code trace only, no runtime test: `AgentInfra::default_shared` hands one `EventFanout` and one storage journal to every profile runtime built from it, and `Agent::build` applies both through `with_event_fanout`; `announce_handoff` emits through the hosting runtime's `AgentConfig` (`hosting_config`), whose journal is the shared storage journal that load reads. Connections subscribe via `collect_event_sources` (root agent plus registered agents), so a runtime built with `event_fanout: None` has its own fanout that is not subscribed. That is a pre-existing limitation, not changed here.
   - (b) `AcpServer::run_stdio` forwards through `spawn_event_forwarders` in `acp/mod.rs` with no `ConnectionDelivery`; the dispatcher strips the event tip and does not hold the response. Updates are sent but update-before-response is not guaranteed there. Recorded in the docs; not rerouted.
   - (c) Recorded in the docs' compatibility note: older binaries cannot parse the new durable kind (`parse_journal_row`), same precedent as `SessionWorkspaceBound`.
-- [x] 24.12 Docs: update `docs/docs/agent/worktrees.md` (native output delivered as session updates before the response; handoff update visible to all attached clients and replayed on load). Re-run the 24.7 checks and record results.
+- [x] 24.12 Docs: update `docs/docs/agent/worktrees.md` (native output delivered as session updates before the response on WebSocket and on stdio transports that enforce update-before-response ordering, excluding legacy `AcpServer::run_stdio`; handoff update visible to all attached clients and replayed on load). Re-run the 24.7 checks and record results.
 
 Section 24 notes:
 

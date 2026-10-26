@@ -829,7 +829,14 @@ impl LocalAgentHandle {
             .transferred_owner(&session_id)
             .await?
         {
-            let mut meta = self
+            // Snapshot and workspace disclosure come from the runtime that
+            // owns the session, not necessarily this handle.
+            let bound = self.bound_session_handle(&session_id).await?;
+            let meta_handle = bound
+                .as_ref()
+                .and_then(|(handle, _)| handle.as_any().downcast_ref::<LocalAgentHandle>())
+                .unwrap_or(self);
+            let mut meta = meta_handle
                 .session_load_snapshot_meta(&session_id)
                 .await?
                 .unwrap_or_default();
