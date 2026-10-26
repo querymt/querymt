@@ -1300,6 +1300,27 @@ async fn test_remote_profile_from_owner_reaches_list_attach_and_bookmarked_load(
         .expect("remote attachment")
         .attachment_id;
 
+    let resumed = SendAgent::resume_session(
+        &f.handle,
+        crate::acp::protocol::ResumeSessionRequest::new(
+            created.session_id.clone(),
+            std::path::PathBuf::new(),
+        ),
+    )
+    .await
+    .expect("bookmarked resume uses the remote owner");
+    assert_eq!(
+        serde_json::to_value(resumed).unwrap()["configOptions"],
+        attached["config_options"]
+    );
+    assert!(
+        f.storage
+            .session_store()
+            .get_session(&created.session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let response = f
         .handle
         .load_session(crate::acp::protocol::LoadSessionRequest::new(
