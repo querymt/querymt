@@ -1510,6 +1510,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Sessions Database">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#run-leases" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Run leases
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2869,6 +2886,27 @@ codes, and the Rust/Python APIs.</p>
 <li>Default <code>&lt;QMT_CONFIG_DIR or QMT_HOME or ~/.qmt&gt;/sessions.db</code></li>
 </ol>
 <p>Programmatic builders may still call <code>.db(...)</code> as an explicit runtime override.</p>
+<h3 id="run-leases">Run leases</h3>
+<p>While a local session run is in progress, the process holds an exclusive OS file lock (a <em>run lease</em>) on
+<code>&lt;db-dir&gt;/&lt;db-stem&gt;.run-leases/&lt;session-id&gt;.lock</code>, e.g. <code>~/.qmt/sessions.run-leases/</code>. The directory sits next to the
+sessions database, so a separate <code>--db</code> gets separate leases.</p>
+<ul>
+<li>The operating system releases the lease when the process exits, including a crash or kill. This works the same on
+  Linux, macOS and Windows.</li>
+<li>If a process dies mid-run, the session journal keeps a <code>run_started</code> without a <code>run_completed</code>. The next process that
+  loads, cancels or stops that session sees the free lease and records <code>run_completed</code> with outcome <code>interrupted</code>, so the
+  session no longer shows as running.</li>
+<li>A prompt sent to a session whose lease is held by another process fails with <code>session is running in another process</code>.
+  A lease held only for a moment (while another process reconciles or deletes the session) delays the prompt briefly
+  instead. Queued prompts of one process keep the lease between turns.</li>
+<li>Processes that take no lease (QueryMT versions before run leases, or a run that could not take one) are not
+  visible to others: loading such a session elsewhere marks its live run <code>interrupted</code>. Restart running instances when
+  upgrading.</li>
+<li>The lock files are empty and are kept after a run. Deleting a session removes its file when it is free.</li>
+<li>Leases are per machine. They are not reliable on network filesystems (NFS/SMB); keep the sessions database on a local
+  disk. If the lease cannot be taken for any other I/O reason, the run proceeds without one.</li>
+<li>Sessions hosted on a remote node are not reconciled locally; the host closes its own runs.</li>
+</ul>
 <h2 id="multi-agent-quorum-configuration">Multi-Agent (Quorum) Configuration</h2>
 <p>For planner-delegate workflows:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1"> 1</a></span>
