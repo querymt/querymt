@@ -4,7 +4,9 @@ use uuid::Uuid;
 
 use crate::events::{AgentEventKind, DurableEvent, EventOrigin};
 use crate::session::error::{SessionError, SessionResult};
-use crate::session::projection::{EventJournal, NewDurableEvent};
+use crate::session::projection::{
+    EventJournal, NewDurableEvent, RunLifecycle, last_unfinished_run_in,
+};
 
 use super::SqliteStorage;
 
@@ -106,6 +108,45 @@ impl EventJournal for SqliteStorage {
             restore_production_order(&mut events);
 
             Ok(events)
+        })
+        .await
+        .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?
+        .map_err(SessionError::from)
+    }
+
+    async fn last_unfinished_run(&self, session_id: &str) -> SessionResult<Option<String>> {
+        let session_id = session_id.to_string();
+        let conn_arc = self.conn.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<String>, rusqlite::Error> {
+            let conn = conn_arc.lock().unwrap();
+            // Only run lifecycle rows are decoded; the partial run lifecycle
+            // index bounds the scan to this session. Only this node's own
+            // events count: mirrored events of a remote host describe runs
+            // that host owns and closes, so they must never look orphaned
+            // here (even after the session's bookmark is gone).
+            let mut stmt = conn.prepare(
+                "SELECT kind, json_extract(payload_json, '$.data.run_id') \
+                 FROM event_journal \
+                 WHERE session_id = ? AND kind IN ('run_started', 'run_completed') \
+                 AND origin = 'local' \
+                 ORDER BY stream_seq ASC",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(last_unfinished_run_in(rows.into_iter().filter_map(
+                |(kind, run_id)| {
+                    let run_id = run_id?;
+                    match kind.as_str() {
+                        "run_started" => Some((RunLifecycle::Started, run_id)),
+                        "run_completed" => Some((RunLifecycle::Completed, run_id)),
+                        _ => None,
+                    }
+                },
+            )))
         })
         .await
         .map_err(|e| SessionError::Other(format!("Task execution failed: {}", e)))?

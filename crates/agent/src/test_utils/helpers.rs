@@ -258,23 +258,42 @@ pub fn register_mock_provider(registry: &PluginRegistry) {
     )));
 }
 
-pub fn mock_plugin_registry(
+/// Renders a filesystem path as a quoted TOML string value (including the
+/// surrounding quotes), escaping it correctly for the TOML grammar.
+///
+/// Interpolating `path.display()` into `"..."` is wrong on Windows: TOML basic
+/// strings treat `\` as an escape, so `C:\Users\...` fails to parse (`\U`).
+pub fn toml_path_value(path: &std::path::Path) -> String {
+    toml::Value::String(path.to_string_lossy().into_owned()).to_string()
+}
+
+/// Builds a [`PluginRegistry`] with a single `mock` provider backed by `factory`,
+/// writing its config into `dir`.
+pub fn mock_plugin_registry_in(
+    dir: &std::path::Path,
     factory: Arc<TestProviderFactory>,
-) -> Result<(PluginRegistry, TempDir)> {
-    let temp_dir = TempDir::new()?;
-    let wasm_path = temp_dir.path().join("mock.wasm");
+) -> Result<PluginRegistry> {
+    let wasm_path = dir.join("mock.wasm");
     std::fs::write(&wasm_path, "")?;
-    let config_path = temp_dir.path().join("providers.toml");
+    let config_path = dir.join("providers.toml");
     std::fs::write(
         &config_path,
         format!(
-            "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
-            wasm_path.display()
+            "[[providers]]\nname = \"mock\"\npath = {}\n",
+            toml_path_value(&wasm_path)
         ),
     )?;
 
     let mut registry = PluginRegistry::from_path(&config_path)?;
     registry.register_loader(Box::new(TestPluginLoader { factory }));
+    Ok(registry)
+}
+
+pub fn mock_plugin_registry(
+    factory: Arc<TestProviderFactory>,
+) -> Result<(PluginRegistry, TempDir)> {
+    let temp_dir = TempDir::new()?;
+    let registry = mock_plugin_registry_in(temp_dir.path(), factory)?;
     Ok((registry, temp_dir))
 }
 
@@ -653,5 +672,19 @@ impl DelegateTestFixture {
             delegate,
             delegate_storage,
         })
+    }
+}
+
+#[cfg(test)]
+mod toml_path_value_tests {
+    use super::toml_path_value;
+    use std::path::Path;
+
+    #[test]
+    fn toml_path_value_round_trips_windows_style_paths() {
+        let raw = r#"C:\Users\RUNNER~1\AppData\Local\Temp\.tmpfnisBA\it's "x"\mock.wasm"#;
+        let doc = format!("path = {}\n", toml_path_value(Path::new(raw)));
+        let parsed: toml::Table = toml::from_str(&doc).expect("valid TOML");
+        assert_eq!(parsed["path"].as_str(), Some(raw));
     }
 }

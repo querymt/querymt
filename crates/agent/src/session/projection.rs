@@ -130,6 +130,28 @@ pub struct NewDurableEvent {
     pub kind: AgentEventKind,
 }
 
+/// Run lifecycle marker used by [`last_unfinished_run_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunLifecycle {
+    Started,
+    Completed,
+}
+
+/// Fold run lifecycle events (in journal order) to the latest run that was
+/// started and never completed.
+pub(crate) fn last_unfinished_run_in(
+    events: impl IntoIterator<Item = (RunLifecycle, String)>,
+) -> Option<String> {
+    let mut open: Vec<String> = Vec::new();
+    for (lifecycle, run_id) in events {
+        match lifecycle {
+            RunLifecycle::Started => open.push(run_id),
+            RunLifecycle::Completed => open.retain(|id| *id != run_id),
+        }
+    }
+    open.pop()
+}
+
 /// Durable event journal — persistence and replay of a session's events.
 ///
 /// Ordering authority is split in two:
@@ -191,6 +213,29 @@ pub trait EventJournal: Send + Sync {
             .await?;
         events.sort_by_key(|event| event.stream_seq);
         Ok(events)
+    }
+
+    /// Run id of the most recent `run_started` that has no `run_completed`,
+    /// considering only events produced by this node (`EventOrigin::Local`).
+    /// Mirrored events of a remote host are ignored: that host owns and closes
+    /// its runs.
+    ///
+    /// The default scans the whole session stream; storage backends should
+    /// override it with an indexed query over run lifecycle rows only.
+    async fn last_unfinished_run(&self, session_id: &str) -> SessionResult<Option<String>> {
+        let events = self.load_session_stream(session_id, None, None).await?;
+        Ok(last_unfinished_run_in(events.into_iter().filter_map(
+            |event| match event.kind {
+                _ if event.origin != EventOrigin::Local => None,
+                crate::events::AgentEventKind::RunStarted { run_id, .. } => {
+                    Some((RunLifecycle::Started, run_id))
+                }
+                crate::events::AgentEventKind::RunCompleted { run_id, .. } => {
+                    Some((RunLifecycle::Completed, run_id))
+                }
+                _ => None,
+            },
+        )))
     }
 
     /// Load a session's durable events with `session_seq` in

@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 ///
 /// Contains everything needed to insert into the registry's in-memory maps,
 /// but hasn't been registered yet.
-struct SessionSingleFlightGuard {
+pub(crate) struct SessionSingleFlightGuard {
     session_id: String,
     lock: Arc<tokio::sync::Mutex<()>>,
     inflight: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -58,14 +58,18 @@ struct SessionSingleFlightGuard {
 impl Drop for SessionSingleFlightGuard {
     fn drop(&mut self) {
         // Remove the per-session lock once the last materialization waiter finishes.
-        if Arc::strong_count(&self.lock) == 3 {
-            let mut inflight = self.inflight.lock().unwrap();
-            if inflight
+        //
+        // The count check must happen while holding the `inflight` lock:
+        // `acquire_session_lock` clones the entry under that same lock, so the
+        // count cannot grow between the check and the removal.
+        // 3 = map entry + `self.lock` + the Arc held by `_guard`.
+        let mut inflight = self.inflight.lock().unwrap();
+        if Arc::strong_count(&self.lock) == 3
+            && inflight
                 .get(&self.session_id)
                 .is_some_and(|entry| Arc::ptr_eq(entry, &self.lock))
-            {
-                inflight.remove(&self.session_id);
-            }
+        {
+            inflight.remove(&self.session_id);
         }
     }
 }
@@ -165,6 +169,14 @@ impl SessionMaterializer {
     #[cfg(feature = "remote")]
     pub fn mesh(&self) -> Option<crate::agent::remote::MeshHandle> {
         self.mesh.read().clone()
+    }
+
+    /// Hold the per-session materialization lock for `session_id`.
+    ///
+    /// Delete uses this to serialize with load/resume of the same session only:
+    /// creating sessions and materializing other sessions never wait on it.
+    pub(crate) async fn lock_session(&self, session_id: &str) -> SessionSingleFlightGuard {
+        self.acquire_session_lock(session_id).await
     }
 
     /// Acquire a per-session single-flight lock.
@@ -1540,14 +1552,17 @@ impl SessionMaterializer {
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
             for notice in hook_result.notices {
-                self.config.emit_event(
-                    &prepared.session_id,
-                    crate::events::AgentEventKind::HookNotice {
-                        event_name: notice.event_name,
-                        message: notice.message,
-                        is_error: notice.is_error,
-                    },
-                );
+                self.config
+                    .emit_event_persisted(
+                        &prepared.session_id,
+                        crate::events::AgentEventKind::HookNotice {
+                            event_name: notice.event_name,
+                            message: notice.message,
+                            is_error: notice.is_error,
+                        },
+                    )
+                    .await
+                    .map_err(|e| Error::internal_error().data(e.to_string()))?;
             }
             if let Some(stop_reason) = hook_result.stop_reason {
                 log::warn!(
@@ -1569,16 +1584,19 @@ impl SessionMaterializer {
             let context_limit =
                 crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
                     .and_then(|m| m.context_limit());
-            self.config.emit_event(
-                &prepared.session_id,
-                crate::events::AgentEventKind::ProviderChanged {
-                    provider: llm_config.provider.clone(),
-                    model: llm_config.model.clone(),
-                    config_id: llm_config.id,
-                    context_limit,
-                    provider_node_id: None,
-                },
-            );
+            self.config
+                .emit_event_persisted(
+                    &prepared.session_id,
+                    crate::events::AgentEventKind::ProviderChanged {
+                        provider: llm_config.provider.clone(),
+                        model: llm_config.model.clone(),
+                        config_id: llm_config.id,
+                        context_limit,
+                        provider_node_id: None,
+                    },
+                )
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
         }
 
         // Background: initialize workspace index (only if the path exists on this machine)
@@ -1613,14 +1631,17 @@ impl SessionMaterializer {
             .map(crate::config::McpServerConfig::from_acp)
             .map(crate::events::McpServerInfo::from)
             .collect();
-        self.config.emit_event(
-            &prepared.session_id,
-            crate::events::AgentEventKind::SessionConfigured {
-                cwd: prepared.cwd.clone(),
-                mcp_servers,
-                limits: self.config.get_session_limits(),
-            },
-        );
+        self.config
+            .emit_event_persisted(
+                &prepared.session_id,
+                crate::events::AgentEventKind::SessionConfigured {
+                    cwd: prepared.cwd.clone(),
+                    mcp_servers,
+                    limits: self.config.get_session_limits(),
+                },
+            )
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         Ok(())
     }
@@ -1637,6 +1658,10 @@ impl SessionMaterializer {
         _options: &SessionMaterializationOptions,
         mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
     ) -> Result<SessionMaterialization, Error> {
+        // No run of this process can exist yet, so a free lease with an
+        // unmatched run_started means the previous owner died.
+        crate::session::run_reconcile::reconcile_orphaned_run(&self.config, &session_id).await;
+
         let mut mutation_gate = mutation_gate;
         let mut slash_registry: Option<Arc<crate::slash_commands::SlashCommandRegistry>> = None;
         let mut activity = None;
@@ -2301,10 +2326,12 @@ mod worktree_binding_tests {
         configure_service: bool,
         owner_failures: usize,
     ) -> WorktreeFixture {
+        let storage_root = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
             SqliteStorage::connect(":memory:".into())
                 .await
-                .expect("create sqlite storage"),
+                .expect("create sqlite storage")
+                .with_run_lease_root(storage_root.path().join("run-leases")),
         );
         let provider_inner = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared = SharedLlmProvider {
@@ -2323,7 +2350,6 @@ mod worktree_binding_tests {
         commit_files(repo.path(), "initial", &[("README.md", "hello\n")]);
         materialize(repo.path(), &[("README.md", "hello\n")]);
 
-        let storage_root = tempfile::TempDir::new().unwrap();
         let registry: Arc<dyn crate::worktree::WorkspaceRepository> = if owner_failures > 0 {
             Arc::new(FlakyOwnerBinding {
                 inner: storage
@@ -2456,6 +2482,81 @@ mod worktree_binding_tests {
         assert!(
             rendered.contains("no workspace service"),
             "diagnostic: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_reconciles_orphaned_run_before_registering_actor() {
+        use crate::session::projection::EventJournal;
+        let fx = worktree_fixture(true).await;
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf());
+        let session_id = fx
+            .materializer
+            .prepare_new_session(req)
+            .await
+            .expect("session prepares")
+            .session_id
+            .clone();
+        crate::session::run_reconcile::tests::seed(
+            &fx.storage,
+            &session_id,
+            crate::events::AgentEventKind::RunStarted {
+                run_id: "orphan".into(),
+                origin: "interactive".into(),
+            },
+        )
+        .await;
+
+        let load = LoadSessionRequest::new(SessionId::from(session_id.clone()), PathBuf::new());
+        let _prepared = fx
+            .materializer
+            .prepare_load_session(load, None)
+            .await
+            .unwrap();
+
+        let interrupted = fx
+            .storage
+            .load_session_stream(&session_id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome }
+                    if run_id == "orphan" && outcome == "interrupted")
+            })
+            .count();
+        assert_eq!(interrupted, 1);
+    }
+
+    #[tokio::test]
+    async fn finalize_session_persists_setup_events_before_returning() {
+        use crate::session::projection::EventJournal;
+        let fx = worktree_fixture(false).await;
+        let prepared = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .expect("session prepares");
+        fx.materializer
+            .finalize_session(&prepared)
+            .await
+            .expect("session finalizes");
+
+        // Read immediately, with no sleep: queued setup events must already be
+        // persisted when finalization returns.
+        let kinds = fx
+            .storage
+            .load_session_stream(&prepared.session_id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, crate::events::AgentEventKind::SessionConfigured { .. })),
+            "SessionConfigured must be persisted before finalize_session returns: {kinds:?}"
         );
     }
 

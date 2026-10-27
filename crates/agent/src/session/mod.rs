@@ -8,6 +8,8 @@ pub mod provider;
 pub mod provider_config;
 pub use provider::{SessionHandle, SessionProvider};
 pub mod repository;
+pub mod run_lease;
+pub mod run_reconcile;
 pub mod schema;
 pub mod sqlite_storage;
 pub use sqlite_storage::SqliteStorage;

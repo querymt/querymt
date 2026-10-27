@@ -19,9 +19,14 @@ use crate::agent::turn_control::{
 use crate::agent::undo::{RedoResult, UndoError, UndoResult};
 use crate::agent::utils::{format_prompt_user_text_only, genai, render_prompt_for_display};
 use crate::error::AgentError;
-use crate::events::{AgentEventKind, SessionLimits};
+use crate::events::{AgentEventKind, RunOutcome, SessionLimits};
 use crate::hooks::HookNotice;
 use crate::model::{AgentMessage, MessagePart, prompt_contains_images, validate_prompt_blocks};
+use crate::session::run_lease::{RunLease, RunLeaseRoot};
+
+/// How long a run start waits for a momentarily held run lease (a reconciler
+/// or session delete) before treating the session as running elsewhere.
+const RUN_LEASE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 use crate::session::runtime::RuntimeContext;
 use crate::session::store::LLMConfig;
 use kameo::Actor;
@@ -175,6 +180,11 @@ pub struct SessionActor {
     // ── Execution tracking ───────────────────────────────────────
     pub(crate) prompt_running: bool,
     pub(crate) active_run: Option<ActiveRun>,
+    /// Cross-process run lease, held from before `RunStarted` until the last
+    /// queued run's `RunCompleted` is persisted. Kept outside `ActiveRun` so
+    /// no clone of run state can extend it, and so it can be handed over to
+    /// the next queued prompt without a gap.
+    run_lease: Option<RunLease>,
     queued_prompts: VecDeque<QueuedPrompt>,
     submit_receipts: VecDeque<SubmitInputReceipt>,
 
@@ -252,6 +262,19 @@ impl Actor for SessionActor {
             }
             _ => warn!("SessionActor {} stopped: {}", self.session_id, reason),
         }
+        // A stopped actor must not leave work behind. Cancelling the current
+        // token ends a run that is still winding down, and dropping the queued
+        // prompts keeps a finished run from starting the next one. Releasing
+        // the lease here (kameo reports shutdown complete before the actor
+        // itself is dropped) means it is free once `shutdown()` returns; an
+        // unmatched `run_started` is then closed by reconciliation.
+        self.turn_state.token.cancel();
+        for queued in self.queued_prompts.drain(..) {
+            let _ = queued
+                .reply
+                .send(Ok(PromptResponse::new(StopReason::Cancelled)));
+        }
+        self.run_lease = None;
         self.config
             .event_sink
             .retire_session_stream(&self.session_id)
@@ -332,6 +355,7 @@ impl SessionActor {
             turn_state: TurnState::new(),
             prompt_running: false,
             active_run: None,
+            run_lease: None,
             queued_prompts: VecDeque::new(),
             submit_receipts: VecDeque::new(),
             #[cfg(feature = "remote")]
@@ -439,6 +463,68 @@ impl SessionActor {
             run_id,
             steering,
             phase_reporter,
+        }
+    }
+
+    /// Take this session's cross-process run lease before a run starts and
+    /// keep it in `self.run_lease`.
+    ///
+    /// `Ok(())` without a lease means leasing is unavailable (no lease root,
+    /// or an I/O failure, logged): the run proceeds unleased. A lease still
+    /// held by another owner after [`RUN_LEASE_GRACE`] rejects the run.
+    async fn acquire_run_lease(&mut self) -> Result<(), AgentError> {
+        // Already held: a queued prompt inherits the lease of the run that
+        // just finished, so no other owner can slip in between turns.
+        if self.run_lease.is_some() {
+            return Ok(());
+        }
+        let Some(root) = self.config.storage.run_lease_root() else {
+            return Ok(());
+        };
+        match RunLeaseRoot::new(root)
+            .acquire_with_grace(&self.session_id, RUN_LEASE_GRACE)
+            .await
+        {
+            Ok(Some(lease)) => {
+                // A delete may have completed while this acquisition waited
+                // out the grace period. Re-check under the lease so a deleted
+                // session never starts a run (and never recreates its lease
+                // file). Lookup failures are not treated as deletion.
+                if matches!(
+                    self.config
+                        .provider
+                        .history_store()
+                        .get_session(&self.session_id)
+                        .await,
+                    Ok(None)
+                ) {
+                    drop(lease);
+                    return Err(AgentError::SessionNotFound {
+                        session_id: self.session_id.clone(),
+                    });
+                }
+                self.run_lease = Some(lease);
+                Ok(())
+            }
+            Ok(None) => Err(AgentError::SessionRunningElsewhere {
+                session_id: self.session_id.clone(),
+            }),
+            // Session ids that are not file-name safe cannot be leased; that
+            // is a property of the id, not a fault worth warning about.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                debug!(
+                    "Session {}: run lease not applicable, running unleased: {}",
+                    self.session_id, error
+                );
+                Ok(())
+            }
+            Err(error) => {
+                warn!(
+                    "Session {}: run lease unavailable, running unleased: {}",
+                    self.session_id, error
+                );
+                Ok(())
+            }
         }
     }
 
@@ -591,6 +677,14 @@ impl Message<Cancel> for SessionActor {
                     },
                 );
             }
+        } else {
+            // No run in this process: an unmatched run_started can only be an
+            // orphan of a dead process. Reconcile off the mailbox.
+            let config = self.config.clone();
+            let session_id = self.session_id.clone();
+            tokio::spawn(async move {
+                crate::session::run_reconcile::reconcile_orphaned_run(&config, &session_id).await;
+            });
         }
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
@@ -637,17 +731,29 @@ impl Message<PromptFinished> for SessionActor {
         }
 
         let outcome = match msg.disposition {
-            RunCompletionDisposition::Completed => "completed",
-            RunCompletionDisposition::Failed => "failed",
-            RunCompletionDisposition::Cancelled => "cancelled",
+            RunCompletionDisposition::Completed => RunOutcome::Completed,
+            RunCompletionDisposition::Failed => RunOutcome::Failed,
+            RunCompletionDisposition::Cancelled => RunOutcome::Cancelled,
         };
-        self.config.emit_event(
-            &self.session_id,
-            AgentEventKind::RunCompleted {
-                run_id: msg.run_id,
-                outcome: outcome.to_string(),
-            },
-        );
+        // The run lease is released only after the completion is recorded, so
+        // a reconciler never sees a free lease with an unmatched run_started
+        // that this process is still about to close.
+        if let Err(error) = self
+            .config
+            .emit_event_persisted(
+                &self.session_id,
+                AgentEventKind::RunCompleted {
+                    run_id: msg.run_id,
+                    outcome: outcome.into(),
+                },
+            )
+            .await
+        {
+            warn!(
+                "Session {}: failed to persist run completion: {}",
+                self.session_id, error
+            );
+        }
 
         // The turn persisted messages, so the session's last-activity time
         // changed. Read the persisted row so the patch matches later
@@ -680,6 +786,10 @@ impl Message<PromptFinished> for SessionActor {
         self.prompt_running = false;
         self.turn_state.token = CancellationToken::new();
 
+        // Hand the lease over to the next queued prompt instead of releasing
+        // it, so no other owner can start a run between two queued turns.
+        // The completion above is already persisted, so a reconciler never
+        // sees a free lease with this run still open.
         if let Some(queued) = self.queued_prompts.pop_front() {
             self.launch_prompt(
                 queued.req,
@@ -687,6 +797,8 @@ impl Message<PromptFinished> for SessionActor {
                 ctx.actor_ref().clone(),
                 Some(queued.input_id),
             );
+        } else {
+            self.run_lease = None;
         }
     }
 }
@@ -2018,6 +2130,9 @@ impl Message<SubmitSessionInput> for SessionActor {
                 if self.active_run.is_some() && self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
                     return Err(queued_prompt_capacity_error(&self.session_id));
                 }
+                if self.active_run.is_none() {
+                    self.acquire_run_lease().await?;
+                }
                 let (reply, receiver) = oneshot::channel();
                 let log_session_id = self.session_id.clone();
                 let log_input_id = input_id.clone();
@@ -2122,6 +2237,11 @@ impl Message<Prompt> for SessionActor {
         if let Err(error) = validate_prompt_blocks(&msg.req.prompt) {
             return ctx.spawn(async move { Err(AgentError::from(error)) });
         }
+        if self.active_run.is_none()
+            && let Err(error) = self.acquire_run_lease().await
+        {
+            return ctx.spawn(async move { Err(error) });
+        }
         let (reply, receiver) = oneshot::channel();
         if self.active_run.is_some() {
             if self.queued_prompts.len() >= MAX_QUEUED_PROMPTS {
@@ -2191,6 +2311,24 @@ impl Message<ScheduledPrompt> for SessionActor {
                     ),
                 })
             });
+        }
+
+        // Rejected before any run state exists. The scheduler observes the
+        // failed cycle via `ScheduledExecutionFailed`. That event reaches the
+        // scheduler as a `ProcessEvent` message, which its mailbox handles only
+        // after `fire_schedule` has registered the cycle and its timeout, so the
+        // failure removes the cycle and aborts the timeout. Terminal handling is
+        // idempotent per (schedule, turn), so a racing timeout is dropped.
+        if let Err(error) = self.acquire_run_lease().await {
+            self.config.emit_event(
+                &self.session_id,
+                AgentEventKind::ScheduledExecutionFailed {
+                    schedule_public_id: msg.schedule_public_id.clone(),
+                    turn_id: None,
+                    error: error.to_string(),
+                },
+            );
+            return ctx.spawn(async move { Err(error) });
         }
 
         self.prompt_running = true;
@@ -3364,9 +3502,56 @@ mod tests {
         event_journal: Arc<FailNextAppendJournal>,
         intent_writes: Arc<AtomicUsize>,
         history_writes: Arc<AtomicUsize>,
+        lease_dir: tempfile::TempDir,
+        session_deleted: Arc<AtomicBool>,
     }
 
     impl ActorFixture {
+        fn lease_root(&self) -> RunLeaseRoot {
+            RunLeaseRoot::new(self.lease_dir.path().join("leases"))
+        }
+
+        /// `(event type, run_id)` of the durable run lifecycle events.
+        async fn run_lifecycle(&self) -> Vec<(&'static str, String, Option<String>)> {
+            self.config
+                .storage
+                .event_journal()
+                .load_session_stream(&self._session_id, None, None)
+                .await
+                .expect("load journal")
+                .into_iter()
+                .filter_map(|event| match event.kind {
+                    AgentEventKind::RunStarted { run_id, .. } => {
+                        Some(("run_started", run_id, None))
+                    }
+                    AgentEventKind::RunCompleted { run_id, outcome } => {
+                        Some(("run_completed", run_id, Some(outcome)))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        async fn wait_for_completed_runs(&self, count: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let completed = self
+                    .run_lifecycle()
+                    .await
+                    .iter()
+                    .filter(|(kind, _, _)| *kind == "run_completed")
+                    .count();
+                if completed >= count {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {count} completed run(s)"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
         async fn new() -> Self {
             Self::with_session_id("test-session").await
         }
@@ -3414,9 +3599,17 @@ mod tests {
             let history_writes = Arc::new(AtomicUsize::new(0));
             let current_intent = Arc::new(std::sync::Mutex::new(None));
             let session_clone = session.clone();
+            let session_deleted = Arc::new(AtomicBool::new(false));
+            let deleted_for_get = session_deleted.clone();
             store
                 .expect_get_session()
-                .returning(move |_| Ok(Some(session_clone.clone())))
+                .returning(move |_| {
+                    if deleted_for_get.load(Ordering::SeqCst) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(session_clone.clone()))
+                    }
+                })
                 .times(0..);
             let llm_for_mock = llm_config.clone();
             store
@@ -3461,6 +3654,10 @@ mod tests {
                 .returning(|| Ok(vec![]))
                 .times(0..);
             store.expect_get_task().returning(|_| Ok(None)).times(0..);
+            store
+                .expect_get_remote_session_bookmark()
+                .returning(|_| Ok(None))
+                .times(0..);
             let writes_for_history = history_writes.clone();
             store
                 .expect_add_message()
@@ -3486,10 +3683,12 @@ mod tests {
                 .returning(move |_| Ok(intent_for_get.lock().expect("intent lock").clone()))
                 .times(0..);
 
+            let lease_dir = tempfile::TempDir::new().expect("lease dir");
             let mock_storage = Arc::new(
                 crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                     .await
-                    .expect("create event store"),
+                    .expect("create event store")
+                    .with_run_lease_root(lease_dir.path().join("leases")),
             );
             let store: Arc<dyn SessionStore> = Arc::new(store);
             let provider = Arc::new(crate::session::provider::SessionProvider::new(
@@ -3524,7 +3723,290 @@ mod tests {
                 event_journal,
                 intent_writes,
                 history_writes,
+                lease_dir,
+                session_deleted,
             }
+        }
+    }
+
+    fn text_submit(session_id: &str, text: &str) -> SubmitSessionInput {
+        SubmitSessionInput {
+            input: SubmitInput {
+                session_id: session_id.to_string(),
+                client_input_id: None,
+                expected_run_id: None,
+                delivery: InputDelivery::Queue,
+                prompt: vec![crate::acp::protocol::ContentBlock::Text(
+                    crate::acp::protocol::TextContent::new(text),
+                )],
+            },
+        }
+    }
+
+    async fn seed_orphan(f: &ActorFixture, run_id: &str) {
+        f.config
+            .storage
+            .event_journal()
+            .append_durable(&crate::session::projection::NewDurableEvent {
+                session_seq: None,
+                session_id: f._session_id.clone(),
+                origin: crate::events::EventOrigin::Local,
+                source_node: None,
+                source_node_id: None,
+                source_seq: None,
+                kind: AgentEventKind::RunStarted {
+                    run_id: run_id.to_string(),
+                    origin: "interactive".to_string(),
+                },
+            })
+            .await
+            .expect("seed orphan");
+    }
+
+    #[tokio::test]
+    async fn reconcile_on_cancel_of_idle_actor_closes_orphaned_run_once() {
+        let f = ActorFixture::new().await;
+        seed_orphan(&f, "orphan").await;
+
+        f.actor_ref.tell(Cancel).await.unwrap();
+        f.wait_for_completed_runs(1).await;
+        // A second cancel is a no-op for the already-closed run.
+        f.actor_ref.tell(Cancel).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let completed: Vec<_> = f
+            .run_lifecycle()
+            .await
+            .into_iter()
+            .filter(|(kind, _, _)| *kind == "run_completed")
+            .collect();
+        assert_eq!(
+            completed,
+            vec![(
+                "run_completed",
+                "orphan".to_string(),
+                Some("interrupted".to_string())
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_live_run_does_not_reconcile() {
+        let f = ActorFixture::new().await;
+        let SubmitInputResult::Started { run_id, .. } = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected Started");
+        };
+
+        f.actor_ref.tell(Cancel).await.unwrap();
+        f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // The live run holds the lease, so even a racing reconcile finds it
+        // busy; nothing may be journaled as interrupted for it.
+        assert!(
+            f.run_lifecycle()
+                .await
+                .iter()
+                .all(|(_, id, outcome)| id != &run_id || outcome.as_deref() != Some("interrupted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_run_lease_rejects_prompt_without_run_started() {
+        let f = ActorFixture::new().await;
+        let _held = f
+            .lease_root()
+            .try_acquire(&f._session_id)
+            .unwrap()
+            .expect("lease free");
+
+        let result = f.actor_ref.ask(text_submit(&f._session_id, "hi")).await;
+        assert!(matches!(
+            result,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::SessionRunningElsewhere { .. }
+            ))
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(f.run_lifecycle().await.is_empty());
+        let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(status, SessionRuntimeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn deleted_session_does_not_start_a_run_or_keep_the_lease() {
+        let f = ActorFixture::new().await;
+        f.session_deleted.store(true, Ordering::SeqCst);
+
+        let result = f.actor_ref.ask(text_submit(&f._session_id, "hi")).await;
+        assert!(matches!(
+            result,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::SessionNotFound { .. }
+            ))
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(f.run_lifecycle().await.is_empty());
+        assert!(
+            f.lease_root()
+                .try_acquire(&f._session_id)
+                .unwrap()
+                .is_some(),
+            "lease must be released when the session no longer exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_lease_momentary_holder_delays_but_does_not_reject_prompt() {
+        let f = ActorFixture::new().await;
+        // Simulates a reconciler or delete holding the lease for a moment.
+        let held = f
+            .lease_root()
+            .try_acquire(&f._session_id)
+            .unwrap()
+            .expect("lease free");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(held);
+        });
+
+        let result = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .expect("prompt must wait out a momentary holder");
+        assert!(matches!(result, SubmitInputResult::Started { .. }));
+        release.await.unwrap();
+        assert!(
+            f.lease_root()
+                .try_acquire(&f._session_id)
+                .unwrap()
+                .is_none(),
+            "started run must hold the lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_lease_is_held_for_the_run_and_released_after_prompt_finished() {
+        let f = ActorFixture::new().await;
+        let started = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .expect("submit");
+        let SubmitInputResult::Started { run_id, .. } = started else {
+            panic!("expected Started");
+        };
+        let root = f.lease_root();
+        assert!(
+            root.try_acquire(&f._session_id).unwrap().is_none(),
+            "lease must be held while the run is active"
+        );
+
+        // Finish the run deterministically, independent of the mock provider.
+        f.actor_ref
+            .tell(PromptFinished {
+                generation: 1,
+                run_id: run_id.clone(),
+                disposition: RunCompletionDisposition::Completed,
+            })
+            .await
+            .unwrap();
+        f.wait_for_completed_runs(1).await;
+        let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(status, SessionRuntimeStatus::Idle);
+        assert!(
+            root.try_acquire(&f._session_id).unwrap().is_some(),
+            "lease must be released once the run is closed"
+        );
+        let events = f.run_lifecycle().await;
+        assert_eq!(events[0], ("run_started", run_id.clone(), None));
+        assert_eq!(
+            events[1],
+            ("run_completed", run_id, Some("completed".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_lease_is_handed_over_to_queued_prompt_without_release() {
+        let f = ActorFixture::new().await;
+        let SubmitInputResult::Started { run_id: first, .. } = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "one"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected Started");
+        };
+        let queued = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "two"))
+            .await
+            .unwrap();
+        assert!(matches!(queued, SubmitInputResult::Queued { .. }));
+
+        f.actor_ref
+            .tell(PromptFinished {
+                generation: 1,
+                run_id: first.clone(),
+                disposition: RunCompletionDisposition::Completed,
+            })
+            .await
+            .unwrap();
+        f.wait_for_completed_runs(1).await;
+
+        // The second run started with its own run id, under the lease handed
+        // over from the first run (never released in between).
+        let status = loop {
+            let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
+            if status
+                .active_run_id
+                .as_deref()
+                .is_some_and(|id| id != first)
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let second = status.active_run_id.unwrap();
+        assert!(
+            f.lease_root()
+                .try_acquire(&f._session_id)
+                .unwrap()
+                .is_none(),
+            "queued run must hold the lease"
+        );
+
+        f.actor_ref
+            .tell(PromptFinished {
+                generation: 2,
+                run_id: second.clone(),
+                disposition: RunCompletionDisposition::Completed,
+            })
+            .await
+            .unwrap();
+        f.wait_for_completed_runs(2).await;
+        let events = f.run_lifecycle().await;
+        for run_id in [&first, &second] {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(kind, id, _)| *kind == "run_started" && id == run_id)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|(kind, id, _)| *kind == "run_completed" && id == run_id)
+                    .count(),
+                1
+            );
         }
     }
 
@@ -5114,6 +5596,33 @@ mod tests {
         // After shutdown, the actor should no longer accept messages
         let result = f.actor_ref.ask(GetMode).await;
         assert!(result.is_err(), "actor should be stopped after Shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_run_lease_before_returning() {
+        let f = ActorFixture::new().await;
+        let started = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .expect("submit");
+        assert!(matches!(started, SubmitInputResult::Started { .. }));
+
+        f.actor_ref.tell(Shutdown).await.expect("tell Shutdown");
+        f.actor_ref
+            .wait_for_shutdown_result()
+            .await
+            .expect("actor shut down");
+
+        // The lease is dropped in on_stop, so it is free as soon as shutdown
+        // is reported (a delete can then remove the lease file).
+        assert!(
+            f.lease_root()
+                .try_acquire(&f._session_id)
+                .unwrap()
+                .is_some(),
+            "stopped actor must not keep the run lease"
+        );
     }
 
     #[tokio::test]

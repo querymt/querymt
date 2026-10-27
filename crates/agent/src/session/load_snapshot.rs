@@ -111,6 +111,9 @@ pub async fn load_session_snapshot(
     let audit = if let Some(bookmark) = bookmark {
         journal_backed_audit_view(agent, session_id, &bookmark.node_id).await?
     } else {
+        // Close a dead process's run before the audit view is read, so the
+        // served snapshot already contains the closing event.
+        crate::session::run_reconcile::reconcile_orphaned_run(&agent.config, session_id).await;
         view_store.get_audit_view(session_id, false).await?
     };
     let cursor = cursor_from_events(&audit.events);
@@ -335,6 +338,53 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(error.to_string().contains("history unavailable"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_reconciles_orphaned_run_unless_lease_is_held() {
+        use crate::events::AgentEventKind;
+        use crate::session::run_reconcile::tests::{fixture, seed, started};
+
+        let f = fixture().await;
+        let agent = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        let held_id = f
+            .storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        let free_id = f
+            .storage
+            .create_session(None, None, None, None)
+            .await
+            .unwrap()
+            .public_id;
+        seed(&f.storage, &held_id, started("held-run")).await;
+        seed(&f.storage, &free_id, started("orphan")).await;
+
+        let last_event =
+            |snapshot: &SessionLoadSnapshot| snapshot.audit.events.last().map(|e| e.kind.clone());
+
+        // A live owner keeps its run open.
+        let lease = f.lease_root.try_acquire(&held_id).unwrap().unwrap();
+        let held = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &held_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            last_event(&held),
+            Some(AgentEventKind::RunStarted { .. })
+        ));
+        drop(lease);
+
+        // An orphan is closed before the snapshot is served.
+        let free = load_session_snapshot(&agent, f.storage.view_store().unwrap(), &free_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            last_event(&free),
+            Some(AgentEventKind::RunCompleted { run_id, outcome })
+                if run_id == "orphan" && outcome == "interrupted"
+        ));
     }
 
     #[test]

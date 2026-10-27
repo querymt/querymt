@@ -16,15 +16,14 @@ use crate::session::runtime::RuntimeContext;
 use crate::session::sqlite_storage::SqliteStorage;
 use crate::session::store::{SessionExecutionConfig, SessionStore};
 use crate::test_utils::{
-    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestPluginLoader,
-    TestProviderFactory, mock_querymt_tool_call,
+    MockChatResponse, MockLlmProvider, MockSessionStore, SharedLlmProvider, TestProviderFactory,
+    mock_plugin_registry, mock_plugin_registry_in, mock_querymt_tool_call,
 };
 use kameo::actor::Spawn;
 use mockall::Sequence;
 use querymt::LLMParams;
 use querymt::chat::FinishReason;
 use querymt::chat::{ChatRole, ReasoningEffort};
-use querymt::plugin::host::PluginRegistry;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -697,21 +696,7 @@ impl TestHarness {
             tools: Vec::new().into_boxed_slice(),
         };
         let factory = Arc::new(TestProviderFactory::new(shared_provider));
-        let temp_dir = TempDir::new().expect("temp dir");
-        let wasm_path = temp_dir.path().join("mock.wasm");
-        std::fs::write(&wasm_path, "").expect("write wasm");
-        let config_path = temp_dir.path().join("providers.toml");
-        std::fs::write(
-            &config_path,
-            format!(
-                "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
-                wasm_path.display()
-            ),
-        )
-        .expect("write config");
-
-        let mut registry = PluginRegistry::from_path(&config_path).expect("registry");
-        registry.register_loader(Box::new(TestPluginLoader { factory }));
+        let (registry, temp_dir) = mock_plugin_registry(factory).expect("plugin registry");
         let registry = Arc::new(registry);
 
         // Use a single shared in-memory SQLite store for orchestrator and delegates.
@@ -1080,24 +1065,10 @@ async fn build_delegate_handle(
     let delegate_factory = Arc::new(TestProviderFactory::new(delegate_shared));
 
     let delegate_temp_dir = TempDir::new().expect("temp dir");
-    let delegate_wasm_path = delegate_temp_dir.path().join("mock.wasm");
-    std::fs::write(&delegate_wasm_path, "").expect("write wasm");
-    let delegate_config_path = delegate_temp_dir.path().join("providers.toml");
-    std::fs::write(
-        &delegate_config_path,
-        format!(
-            "[[providers]]\nname = \"mock\"\npath = \"{}\"\n",
-            delegate_wasm_path.display()
-        ),
-    )
-    .expect("write config");
-
-    let mut delegate_plugin_registry =
-        PluginRegistry::from_path(&delegate_config_path).expect("registry");
-    delegate_plugin_registry.register_loader(Box::new(TestPluginLoader {
-        factory: delegate_factory,
-    }));
-    let delegate_plugin_registry = Arc::new(delegate_plugin_registry);
+    let delegate_plugin_registry = Arc::new(
+        mock_plugin_registry_in(delegate_temp_dir.path(), delegate_factory)
+            .expect("plugin registry"),
+    );
 
     let mut delegate_params = LLMParams::new().provider("mock").model("mock-model");
     delegate_params.reasoning_effort = reasoning_effort;

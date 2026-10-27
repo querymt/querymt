@@ -5,6 +5,8 @@ use super::*;
 /// runs under the registry lock.
 const UNLOAD_STATUS_MAILBOX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const UNLOAD_STATUS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const STOP_LOCAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const STOP_REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl LocalAgentHandle {
     pub(super) async fn bound_session_handle(
@@ -104,6 +106,62 @@ impl LocalAgentHandle {
         self.stop_session_in_runtime(session_id).await
     }
 
+    /// Tear down `session_id`'s local actor for deletion: no graceful-stop
+    /// wait, no stop events. Cancelling and shutting the actor down is enough
+    /// because nothing will read the run's outcome once the session is gone.
+    /// Routed to the bound runtime like [`Self::stop_session`]. Remote-hosted
+    /// sessions keep the full stop protocol; unloaded sessions are a no-op.
+    ///
+    /// Returns the per-session materialization guard of the runtime that owns
+    /// the session. The caller must keep it until the session row is deleted:
+    /// a concurrent load/resume of this session then waits, and afterwards
+    /// finds no row instead of registering an actor for a deleted session.
+    /// The guard is per session, so creating sessions and materializing other
+    /// sessions are never blocked. Teardown is best-effort (failures are
+    /// logged); the guard is returned regardless.
+    pub(crate) async fn terminate_for_delete(
+        &self,
+        session_id: &str,
+    ) -> crate::agent::session_materializer::SessionSingleFlightGuard {
+        // Resolve the owning runtime before locking: this may build a profile
+        // runtime, which must not happen while loads of this session wait.
+        let bound = match self.bound_session_handle(session_id).await {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(session_id, %error, "failed to resolve session runtime for delete");
+                None
+            }
+        };
+        let bound_handle = bound
+            .as_ref()
+            .and_then(|(handle, _)| handle.as_any().downcast_ref::<LocalAgentHandle>());
+        let runtime: &LocalAgentHandle = bound_handle.unwrap_or(self);
+
+        let guard = runtime.session_materializer.lock_session(session_id).await;
+        if let Err(error) = Box::pin(runtime.terminate_session_in_runtime(session_id)).await {
+            tracing::warn!(session_id, %error, "failed to terminate session actor for delete");
+        }
+        guard
+    }
+
+    async fn terminate_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
+        let removed = {
+            let mut registry = self.registry.lock().await;
+            match registry.get(session_id) {
+                None => return Ok(()),
+                Some(session) if session.is_remote() => None,
+                Some(_) => registry.remove(session_id),
+            }
+        };
+        let Some(session_ref) = removed else {
+            return self.stop_session_in_runtime(session_id).await;
+        };
+        if let Err(err) = session_ref.shutdown().await {
+            tracing::warn!(session_id, error = %err, "failed to shut down deleted session actor");
+        }
+        Ok(())
+    }
+
     /// Unload `session_id`'s actor when it is loaded and idle, without
     /// cancelling anything. Returns `Ok(true)` when the session is busy (a
     /// running turn, queued or steered input, or a remote host) and was left
@@ -161,7 +219,7 @@ impl LocalAgentHandle {
         Ok(false)
     }
 
-    async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
+    pub(super) async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
 
         const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -172,10 +230,18 @@ impl LocalAgentHandle {
         };
 
         let Some(session_ref) = session_ref else {
-            log::warn!(
-                "Stop requested for session {} but not found in registry",
-                session_id
-            );
+            // Not loaded here, so no run of this process exists. An unmatched
+            // run_started can only be an orphan; close it (local sessions only,
+            // reconciliation skips remote bookmarks).
+            let closed =
+                crate::session::run_reconcile::reconcile_orphaned_run(&self.config, session_id)
+                    .await;
+            if closed.is_empty() {
+                log::warn!(
+                    "Stop requested for session {} but not found in registry",
+                    session_id
+                );
+            }
             return Ok(());
         };
 
@@ -183,7 +249,26 @@ impl LocalAgentHandle {
             .emit_event(session_id, AgentEventKind::SessionStopRequested);
         let _ = session_ref.cancel().await;
 
-        tokio::time::sleep(STOP_ESCALATION_TIMEOUT).await;
+        // Give the cancelled run up to STOP_ESCALATION_TIMEOUT to wind down,
+        // returning as soon as the session is idle. The mailbox is ordered, so
+        // the first status already reflects the cancel above.
+        let poll_interval = if session_ref.is_remote() {
+            STOP_REMOTE_POLL_INTERVAL
+        } else {
+            STOP_LOCAL_POLL_INTERVAL
+        };
+        let deadline = tokio::time::Instant::now() + STOP_ESCALATION_TIMEOUT;
+        loop {
+            let idle = matches!(
+                session_ref.get_runtime_status().await,
+                Ok(status) if status.phase == SessionRuntimePhase::Idle
+            );
+            let now = tokio::time::Instant::now();
+            if idle || now >= deadline {
+                break;
+            }
+            tokio::time::sleep(poll_interval.min(deadline - now)).await;
+        }
 
         let status = session_ref
             .get_runtime_status()

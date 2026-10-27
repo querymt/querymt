@@ -456,7 +456,8 @@ impl RealStorageHandleFixture {
         let storage = Arc::new(
             crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
                 .await
-                .expect("create storage"),
+                .expect("create storage")
+                .with_run_lease_root(temp_dir.path().join("run-leases")),
         );
 
         let mut initial_config = LLMParams::new().provider("mock").model("mock-model");

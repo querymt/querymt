@@ -226,6 +226,231 @@ async fn querymt_session_lifecycle_ext_rejects_empty_and_null_patches() {
 }
 
 #[tokio::test]
+async fn reconcile_on_stop_of_unloaded_session_closes_orphaned_run() {
+    use crate::session::projection::EventJournal;
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = f
+        .storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("create local session")
+        .public_id;
+    crate::session::run_reconcile::tests::seed(
+        &f.storage,
+        &session_id,
+        crate::session::run_reconcile::tests::started("orphan"),
+    )
+    .await;
+
+    // The session is not in the registry, so Stop must reconcile directly.
+    f.handle
+        .stop_session_in_runtime(&session_id)
+        .await
+        .expect("stop unloaded session");
+
+    let interrupted = f
+        .storage
+        .load_session_stream(&session_id, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome }
+                if run_id == "orphan" && outcome == "interrupted")
+        })
+        .count();
+    assert_eq!(interrupted, 1);
+}
+
+#[tokio::test]
+async fn stop_of_idle_loaded_session_returns_without_full_grace_wait() {
+    let f = HandleFixture::new().await;
+    let session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    register_test_session(&f, &session.public_id).await;
+
+    let started = std::time::Instant::now();
+    f.handle
+        .stop_session_in_runtime(&session.public_id)
+        .await
+        .expect("stop idle session");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "stop took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&session.public_id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn terminate_session_removes_and_shuts_down_the_actor() {
+    let f = HandleFixture::new().await;
+    let session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    register_test_session(&f, &session.public_id).await;
+    let session_ref = f
+        .handle
+        .registry
+        .lock()
+        .await
+        .get(&session.public_id)
+        .cloned()
+        .expect("registered");
+
+    let guard = f.handle.terminate_for_delete(&session.public_id).await;
+
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&session.public_id)
+            .is_none()
+    );
+    assert!(session_ref.get_runtime_status().await.is_err());
+    drop(guard);
+    // Unloaded sessions are a no-op.
+    drop(f.handle.terminate_for_delete(&session.public_id).await);
+}
+
+#[tokio::test]
+async fn delete_guard_blocks_only_load_of_the_same_session() {
+    use std::time::Duration;
+    let f = RealStorageHandleFixture::new().await;
+    let doomed = seed_session_with_reasoning(&f, None).await;
+    let other = seed_session_with_reasoning(&f, None).await;
+    let load = |id: &str| {
+        crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(id.to_string()),
+            std::path::PathBuf::new(),
+        )
+    };
+
+    async fn step<T>(label: &str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .unwrap_or_else(|_| panic!("step timed out: {label}"))
+    }
+
+    // An empty directory: a session cwd makes the actor index its workspace in
+    // the background, and indexing a large tree (e.g. the system temp dir)
+    // would stall runtime shutdown at the end of the test.
+    let new_session_cwd = tempfile::tempdir().expect("tempdir");
+
+    let guard = step(
+        "terminate_for_delete",
+        f.handle.terminate_for_delete(&doomed),
+    )
+    .await;
+
+    // A load of the session being deleted waits for the guard.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            f.handle.load_session(load(&doomed))
+        )
+        .await
+        .is_err(),
+        "load of a session under deletion must wait"
+    );
+
+    // Creating sessions and loading other sessions are not held up.
+    step(
+        "new_session while delete guard held",
+        f.handle
+            .new_session(NewSessionRequest::new(new_session_cwd.path().to_path_buf())),
+    )
+    .await
+    .expect("new_session");
+    step(
+        "load other session while delete guard held",
+        f.handle.load_session(load(&other)),
+    )
+    .await
+    .expect("load other");
+
+    // Once the row is gone and the guard is released, the load fails cleanly
+    // and no actor is registered for the deleted session.
+    step(
+        "delete row",
+        f.handle
+            .config
+            .provider
+            .history_store()
+            .delete_session(&doomed),
+    )
+    .await
+    .expect("delete row");
+    drop(guard);
+    assert!(
+        step("final load", f.handle.load_session(load(&doomed)))
+            .await
+            .is_err()
+    );
+    assert!(
+        step("registry lock", f.handle.registry.lock())
+            .await
+            .get(&doomed)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn run_lease_file_removed_on_delete_only_when_free() {
+    let f = RealStorageHandleFixture::new().await;
+    let root = crate::session::run_lease::RunLeaseRoot::new(
+        f.storage.run_lease_root().expect("lease root"),
+    );
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            f.storage
+                .create_session(None, None, None, None)
+                .await
+                .expect("create local session")
+                .public_id,
+        );
+    }
+    // Free session: a lease file exists from an earlier run.
+    drop(root.try_acquire(&ids[0]).unwrap().unwrap());
+    // Busy session: the lease is held while it is deleted.
+    let held = root.try_acquire(&ids[1]).unwrap().unwrap();
+
+    for id in &ids {
+        SendAgent::delete_session(
+            &f.handle,
+            DeleteSessionRequest::new(SessionId::from(id.clone())),
+        )
+        .await
+        .expect("delete session");
+    }
+
+    assert!(!root.lease_path(&ids[0]).unwrap().exists());
+    assert!(root.lease_path(&ids[1]).unwrap().exists());
+    drop(held);
+}
+
+#[tokio::test]
 async fn querymt_session_set_pinned_notifies_only_when_state_changes() {
     let f = RealStorageHandleFixture::new().await;
     let session = f
