@@ -131,7 +131,9 @@ impl<'a> PromptChain<'a> {
             let response_text = match step.mode {
                 ChainStepMode::Chat => {
                     let messages = vec![crate::chat::ChatMessage::user().text(prompt).build()];
-                    self.llm.chat(&messages).await?
+                    self.llm
+                        .chat(&crate::chat::ChatCall::new(&messages))
+                        .await?
                 }
                 ChainStepMode::Completion => {
                     let mut req = crate::completion::CompletionRequest::new(prompt);

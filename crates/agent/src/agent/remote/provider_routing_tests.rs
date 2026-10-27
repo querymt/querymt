@@ -122,7 +122,7 @@ mod provider_routing_integration_tests {
             .await
             .expect("build_provider with provider_node_id should succeed");
 
-        let result = provider.chat_with_tools(&[], None).await;
+        let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
         match result {
             Err(LLMError::ProviderError(msg)) => {
                 assert!(
@@ -143,7 +143,7 @@ mod provider_routing_integration_tests {
         let node_name = format!("alpha-{}", test_id);
         let provider = MeshChatProvider::new(f.mesh, &node_name, "nonexistent", "no-model");
 
-        let result = provider.chat_with_tools(&[], None).await;
+        let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
         assert!(
             matches!(result, Err(LLMError::ProviderError(_))),
             "should return ProviderError (from ProviderHostActor handler), got {:?}",

@@ -1630,7 +1630,7 @@ mod tests {
             .build_provider_for_session(&session_id)
             .await
             .expect("mesh-backed provider should build");
-        match provider.chat_with_tools(&[], None).await {
+        match provider.chat(&querymt::chat::ChatCall::new(&[])).await {
             Err(LLMError::ProviderError(message)) => message,
             other => panic!("expected provider error from mesh lookup; got: {other:?}"),
         }

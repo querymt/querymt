@@ -73,7 +73,7 @@ TOOLS = [
 ]
 ```
 
-Use them with `chat_with_tools(...)` or `chat_stream_with_tools(...)`.
+Use them with `chat_with_tools(...)` or `chat_stream_with_tools(...)` (thin Python wrappers over a Rust `ChatCall`).
 
 ## Helper Builders
 

@@ -1,9 +1,6 @@
 use crate::{
     LLMProvider, Tool,
-    chat::{
-        ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions,
-        StreamChunk, ToolResultPart,
-    },
+    chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream, ToolResultPart},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -11,10 +8,8 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use futures::Stream;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::pin::Pin;
 
 /// Adapter interface for your host‐side implementations.
 ///
@@ -91,6 +86,11 @@ impl ToolEnabledProvider {
         }
     }
 
+    /// `call` with this provider's tools filled in when the caller set none.
+    fn with_default_tools<'a>(&'a self, call: &ChatCall<'a>) -> ChatCall<'a> {
+        call.maybe_tools(Some(call.tools.unwrap_or(&self.tool_list)))
+    }
+
     /// Construct with a pre-built tool list.
     pub fn with_tool_list(
         inner: Box<dyn LLMProvider + Send + Sync>,
@@ -121,56 +121,16 @@ impl EmbeddingProvider for ToolEnabledProvider {
 
 #[async_trait]
 impl ChatProvider for ToolEnabledProvider {
-    fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+    fn capabilities(&self) -> ChatCapabilities {
+        self.inner.capabilities()
     }
 
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        let to_send = tools.unwrap_or(&self.tool_list);
-        self.inner.chat_with_tools(messages, Some(to_send)).await
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        self.inner.chat(&self.with_default_tools(call)).await
     }
 
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
-        let to_send = tools.unwrap_or(&self.tool_list);
-        self.inner
-            .chat_stream_with_tools(messages, Some(to_send))
-            .await
-    }
-
-    fn supported_generation_options(&self) -> GenerationOptionSupport {
-        self.inner.supported_generation_options()
-    }
-
-    async fn chat_with_tools_and_options(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        options: &GenerationOptions,
-    ) -> Result<ChatOutput, LLMError> {
-        let to_send = tools.unwrap_or(&self.tool_list);
-        self.inner
-            .chat_with_tools_and_options(messages, Some(to_send), options)
-            .await
-    }
-
-    async fn chat_stream_with_tools_and_options(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        options: &GenerationOptions,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
-        let to_send = tools.unwrap_or(&self.tool_list);
-        self.inner
-            .chat_stream_with_tools_and_options(messages, Some(to_send), options)
-            .await
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        self.inner.chat_stream(&self.with_default_tools(call)).await
     }
 }
 
@@ -204,5 +164,121 @@ impl LLMProvider for ToolEnabledProvider {
 
     async fn speech(&self, req: &tts::TtsRequest) -> Result<tts::TtsResponse, LLMError> {
         self.inner.speech(req).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat::{GenerationOptionSupport, GenerationOptions};
+    use crate::validated_llm::ValidatedLLM;
+    use std::sync::{Arc, Mutex};
+
+    /// What the innermost provider saw for each call.
+    type Seen = Arc<Mutex<Vec<(GenerationOptions, usize)>>>;
+
+    struct Recorder {
+        seen: Seen,
+        replies: Mutex<Vec<&'static str>>,
+    }
+
+    #[async_trait]
+    impl ChatProvider for Recorder {
+        async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((call.options, call.tools.map_or(0, <[Tool]>::len)));
+            let text = self.replies.lock().unwrap().remove(0);
+            Ok(ChatOutput::from_projections(
+                None,
+                Some(text.into()),
+                None,
+                None,
+                None,
+            ))
+        }
+
+        async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((call.options, call.tools.map_or(0, <[Tool]>::len)));
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        fn capabilities(&self) -> ChatCapabilities {
+            ChatCapabilities::NONE
+                .with_streaming(true)
+                .with_options(GenerationOptionSupport::ALL)
+        }
+    }
+
+    #[async_trait]
+    impl CompletionProvider for Recorder {
+        async fn complete(&self, _: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
+            Err(LLMError::NotImplemented("unused".into()))
+        }
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for Recorder {
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
+            Err(LLMError::NotImplemented("unused".into()))
+        }
+    }
+
+    impl LLMProvider for Recorder {}
+
+    /// `ToolEnabledProvider -> ValidatedLLM -> Recorder`, rejecting the first reply.
+    fn decorated(seen: &Seen) -> ToolEnabledProvider {
+        let recorder = Recorder {
+            seen: Arc::clone(seen),
+            replies: Mutex::new(vec!["bad", "good"]),
+        };
+        let validated = ValidatedLLM::new(
+            Box::new(recorder),
+            Box::new(|reply| {
+                if reply == "good" {
+                    Ok(())
+                } else {
+                    Err("not good".into())
+                }
+            }),
+            3,
+        );
+        ToolEnabledProvider::new(Box::new(validated), HashMap::new())
+    }
+
+    #[tokio::test]
+    async fn options_survive_the_decorator_chain_including_validation_retries() {
+        let seen = Seen::default();
+        let provider = decorated(&seen);
+        let options = GenerationOptions::default().with_max_tokens(64_000);
+
+        provider
+            .chat(&ChatCall::new(&[]).options(options))
+            .await
+            .unwrap();
+
+        // Both the rejected attempt and its retry carry the caller's options.
+        assert_eq!(*seen.lock().unwrap(), [(options, 0), (options, 0)]);
+    }
+
+    #[tokio::test]
+    async fn streaming_forwards_options_and_the_wrapper_reports_inner_capabilities() {
+        let seen = Seen::default();
+        let provider = decorated(&seen);
+        let options = GenerationOptions::default().with_max_tokens(1_000);
+
+        let _stream = provider
+            .chat_stream(&ChatCall::new(&[]).options(options))
+            .await
+            .unwrap();
+
+        assert_eq!(*seen.lock().unwrap(), [(options, 0)]);
+        let caps = provider.capabilities();
+        assert!(caps.streaming);
+        assert_eq!(caps.options, GenerationOptionSupport::ALL);
     }
 }

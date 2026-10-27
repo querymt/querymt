@@ -253,7 +253,7 @@ pub(crate) async fn resolve_provider_config(
 mod tests {
     use super::*;
     use querymt::HTTPLLMProvider;
-    use querymt::chat::{ChatMessage, ChatOutput, Tool};
+    use querymt::chat::{ChatOutput, Tool};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::host::{PluginRegistry, ProviderBinding};
@@ -264,15 +264,19 @@ mod tests {
     struct DummyHttpProvider;
 
     impl querymt::chat::http::HTTPChatProvider for DummyHttpProvider {
-        fn chat_request(
+        fn prepare_chat_request(
             &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<http::Request<Vec<u8>>, LLMError> {
+            _call: &querymt::chat::ChatCall<'_>,
+            _stream: bool,
+        ) -> Result<querymt::chat::http::PreparedChatRequest, LLMError> {
             unimplemented!()
         }
 
-        fn parse_chat(&self, _resp: http::Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        fn parse_chat(
+            &self,
+            _resp: http::Response<Vec<u8>>,
+            _context: serde_json::Value,
+        ) -> Result<ChatOutput, LLMError> {
             unimplemented!()
         }
     }

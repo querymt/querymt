@@ -42,7 +42,7 @@ One of the powerful features of modern Large Language Models is their ability to
     *   Source: `crates/querymt/src/tool_decorator.rs`
 
 *   **`querymt::tool_decorator::ToolEnabledProvider`**: A decorator struct that wraps an `LLMProvider`. When you register tools using `LLMBuilder::add_tool()`, the builder automatically wraps the base provider with `ToolEnabledProvider`. This wrapper manages the registered tools and handles the two-way communication:
-    1.  It passes the tool descriptors to the LLM during a `chat_with_tools` call.
+    1.  It passes the tool descriptors to the LLM during a `chat` call.
     2.  If the LLM responds with a `ToolCall`, `ToolEnabledProvider` can dispatch the call to the appropriate `CallFunctionTool` implementation via its `call_tool` method.
     *   Source: `crates/querymt/src/tool_decorator.rs`
 
@@ -56,7 +56,7 @@ One of the powerful features of modern Large Language Models is their ability to
     *   When building your `LLMProvider` using `LLMBuilder`, use the `add_tool()` method to register instances of your `CallFunctionTool` implementations.
 
 3.  **Chat with Tools:**
-    *   Use the `chat_with_tools()` method on the `LLMProvider`. The `ToolEnabledProvider` (if tools were added) will automatically pass the descriptors of registered tools to the LLM.
+    *   Call `chat()` on the `LLMProvider` with a `ChatCall` (the provider does not need tools set per call). The `ToolEnabledProvider` (if tools were added) will automatically pass the descriptors of registered tools to the LLM.
     *   You can use `ToolChoice` to guide the LLM's tool usage.
 
 4.  **LLM Decides to Call a Tool:**
@@ -71,7 +71,7 @@ One of the powerful features of modern Large Language Models is their ability to
 6.  **Return Tool Result to LLM:**
     *   For each tool call that was executed, create a corresponding `ToolCall` struct that contains the result. The result string is placed into the `function.arguments` field.
     *   Construct a new `ChatMessage` using the builder: `ChatMessage::user().tool_result(vec_of_result_tool_calls).build()`.
-    *   Send this message (along with the conversation history) back to the LLM using `chat_with_tools()`.
+    *   Send this message (along with the conversation history) back to the LLM using `chat()`.
 
 7.  **LLM Continues:**
     *   The LLM uses the tool's output to formulate its final response or decide on further actions.
@@ -115,7 +115,7 @@ impl CallFunctionTool for GetWeatherTool {
 // To use it:
 // let builder = registry.builder("some_provider").add_tool(GetWeatherTool);
 // let llm = builder.build().await?;
-// ... then use llm.chat_with_tools(...) ...
+// ... then use llm.chat(&ChatCall::new(&messages)) ...
 ```
 
 Tool usage significantly enhances the capabilities of LLMs, allowing them to perform complex tasks that require external information or actions. QueryMT's system provides a structured way to integrate these tools into your LLM applications.

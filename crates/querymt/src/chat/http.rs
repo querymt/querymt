@@ -1,6 +1,5 @@
 use crate::{
-    Tool,
-    chat::{ChatMessage, ChatOutput, GenerationOptionSupport, GenerationOptions, StreamChunk},
+    chat::{ChatCall, ChatCapabilities, ChatOutput, StreamChunk},
     error::{LLMError, classify_status_only},
 };
 use http::{Request, Response};
@@ -26,45 +25,53 @@ pub struct PreparedChatRequest {
     pub context: serde_json::Value,
 }
 
-pub trait HTTPChatProvider: Send + Sync {
-    fn prepare_chat_request(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        stream: bool,
-    ) -> Result<PreparedChatRequest, LLMError> {
-        let request = if stream {
-            self.chat_stream_request(messages, tools)?
-        } else {
-            self.chat_request(messages, tools)?
-        };
-        Ok(PreparedChatRequest {
+impl PreparedChatRequest {
+    /// A request whose response needs no provider-private decoding context.
+    #[must_use]
+    pub fn stateless(request: Request<Vec<u8>>) -> Self {
+        Self {
             request,
             context: serde_json::Value::Null,
-        })
+        }
     }
+}
 
-    /// Which per-request [`GenerationOptions`] this provider honours in
-    /// [`Self::prepare_chat_request_with_options`]. Defaults to none.
-    fn supported_generation_options(&self) -> GenerationOptionSupport {
-        GenerationOptionSupport::NONE
-    }
-
-    /// Options-aware sibling of [`Self::prepare_chat_request`].
+pub trait HTTPChatProvider: Send + Sync {
+    /// Builds the HTTP request for `call`.
     ///
-    /// Set options override the provider's configured values for this request
-    /// only. The default ignores `options` and delegates to
-    /// [`Self::prepare_chat_request`], so requests without overrides are
-    /// byte-identical to before.
-    fn prepare_chat_request_with_options(
+    /// One function serves streaming and non-streaming requests (`stream`).
+    /// Set `call.options` override the provider's configured values for this
+    /// request only; a call with empty options must produce the same request
+    /// as before options existed.
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
+        call: &ChatCall<'_>,
         stream: bool,
-        options: &GenerationOptions,
-    ) -> Result<PreparedChatRequest, LLMError> {
-        let _ = options;
-        self.prepare_chat_request(messages, tools, stream)
+    ) -> Result<PreparedChatRequest, LLMError>;
+
+    /// Parse a **successful** chat HTTP body.
+    ///
+    /// `context` is the opaque value returned by
+    /// [`Self::prepare_chat_request`] for this request. The HTTP adapter only
+    /// calls this after a success status. Non-success responses go through
+    /// [`Self::classify_chat_error`] instead — do not re-check status here.
+    fn parse_chat(
+        &self,
+        resp: Response<Vec<u8>>,
+        context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError>;
+
+    /// Transfer the request's opaque context into its independent stream
+    /// parser. Providers that report [`ChatCapabilities::streaming`] must
+    /// override this.
+    fn chat_stream_parser(
+        &self,
+        context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        let _ = context;
+        Err(LLMError::NotImplemented(
+            "Streaming not supported by this HTTP provider".into(),
+        ))
     }
 
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
@@ -82,53 +89,8 @@ pub trait HTTPChatProvider: Send + Sync {
         Box::pin(async move { self.classify_chat_error(response) })
     }
 
-    fn chat_request(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError>;
-
-    fn chat_stream_request(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Streaming request construction not supported by this HTTP provider".into(),
-        ))
-    }
-
-    /// Parse a **successful** chat HTTP body.
-    ///
-    /// The HTTP adapter only calls this after a success status. Non-success
-    /// responses go through [`Self::classify_chat_error`] instead — do not
-    /// re-check status here.
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError>;
-
-    /// Decode using the opaque context returned during request preparation.
-    fn parse_chat_with_context(
-        &self,
-        resp: Response<Vec<u8>>,
-        _context: serde_json::Value,
-    ) -> Result<ChatOutput, LLMError> {
-        self.parse_chat(resp)
-    }
-
-    /// Transfer the request's opaque context into its independent stream parser.
-    fn chat_stream_parser_with_context(
-        &self,
-        _context: serde_json::Value,
-    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        self.chat_stream_parser()
-    }
-
-    fn supports_streaming(&self) -> bool {
-        false
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Err(LLMError::NotImplemented(
-            "Streaming not supported by this HTTP provider".into(),
-        ))
+    /// What this provider supports. Defaults to nothing.
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE
     }
 }

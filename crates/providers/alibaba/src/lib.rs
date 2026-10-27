@@ -6,7 +6,8 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatOutput, StructuredOutputFormat, Tool, ToolChoice, http::HTTPChatProvider,
+        ChatCall, ChatOutput, StructuredOutputFormat, Tool, ToolChoice,
+        http::{HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -128,15 +129,23 @@ impl HTTPChatProvider for Alibaba {
         classify_openai_http_error(response)
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        openai_chat_request(self, messages, tools)
+        call: &ChatCall<'_>,
+        _stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        Ok(PreparedChatRequest::stateless(openai_chat_request(
+            self,
+            call.messages,
+            call.tools,
+        )?))
     }
 
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+    fn parse_chat(
+        &self,
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 }

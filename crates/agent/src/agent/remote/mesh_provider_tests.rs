@@ -34,7 +34,7 @@ mod mesh_provider_tests {
         // We verify the internal DHT name via the error message on lookup failure,
         // which includes the name.  A cleaner approach would be an accessor; for
         // now the error path is the only observable.
-        let result = provider.chat_with_tools(&[], None).await;
+        let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
         match result {
             Err(LLMError::ProviderError(msg)) => {
                 assert!(
@@ -96,7 +96,7 @@ mod mesh_provider_tests {
         // We can't directly inspect private fields, but we can verify it
         // compiles and the builder pattern works. The params are forwarded
         // in the actual chat_with_tools call (tested via integration tests).
-        assert!(provider.supports_streaming());
+        assert!(provider.capabilities().streaming);
     }
 
     // ── B.3c — MeshChatProvider with_params None ─────────────────────────────
@@ -107,7 +107,7 @@ mod mesh_provider_tests {
         let provider =
             MeshChatProvider::new(mesh, "any-node", "anthropic", "claude-3").with_params(None);
 
-        assert!(provider.supports_streaming());
+        assert!(provider.capabilities().streaming);
     }
 
     #[tokio::test]
@@ -116,7 +116,7 @@ mod mesh_provider_tests {
         let provider = MeshChatProvider::new(mesh, "missing-node", "anthropic", "claude-3")
             .with_stream_controls(7, 33);
 
-        assert!(provider.supports_streaming());
+        assert!(provider.capabilities().streaming);
         assert!(
             provider
                 .get_remote_stream_status("missing-session", None)
@@ -133,7 +133,7 @@ mod mesh_provider_tests {
         let mesh = get_test_mesh().await;
         let provider = MeshChatProvider::new(mesh, "any-node", "anthropic", "claude-3");
         assert!(
-            provider.supports_streaming(),
+            provider.capabilities().streaming,
             "MeshChatProvider must advertise streaming support"
         );
     }
@@ -188,7 +188,7 @@ mod mesh_provider_tests {
         let unregistered = format!("unregistered-node-b7-{}", test_id);
         let provider = MeshChatProvider::new(mesh, &unregistered, "anthropic", "claude-3");
 
-        let result = provider.chat_with_tools(&[], None).await;
+        let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
         assert!(
             matches!(result, Err(LLMError::ProviderError(_))),
             "should return ProviderError when DHT name is not registered, got {:?}",
@@ -252,7 +252,7 @@ mod mesh_provider_tests {
 
         let provider =
             MeshChatProvider::new(mesh, &found_node_id.to_string(), provider_name, model_name);
-        let result = provider.chat_with_tools(&[], None).await;
+        let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
         assert!(
             matches!(result, Err(LLMError::ProviderError(_))),
             "catalog-only discovery should resolve the node before provider-host lookup fails, got {:?}",
@@ -278,7 +278,7 @@ mod mesh_provider_tests {
 
         // The ProviderHostActor exists in the mesh but the provider "nonexistent"
         // can't be built → should get a HandlerError wrapped as ProviderError.
-        let result = provider.chat_with_tools(&[], None).await;
+        let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
         assert!(
             matches!(result, Err(LLMError::ProviderError(_))),
             "should return ProviderError (provider not buildable), got {:?}",

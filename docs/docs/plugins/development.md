@@ -80,9 +80,9 @@ pub struct MyProvider {
 // 3. Implement the core HTTP provider traits for your provider struct.
 // This defines how to build requests and parse responses.
 impl HTTPChatProvider for MyProvider {
-    // ... implement chat_request() and parse_chat() ...
-    fn chat_request(&self, messages: &[ChatMessage], _tools: Option<&[Tool]>) -> Result<http::Request<Vec<u8>>, LLMError> { /* ... */ Ok(http::Request::default()) }
-    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<Box<dyn ChatResponse>, Box<dyn Error>> { /* ... */ Ok(Box::new(querymt::completion::CompletionResponse{text:"...".into()})) }
+    // ... implement prepare_chat_request() and parse_chat() ...
+    fn prepare_chat_request(&self, call: &ChatCall<'_>, _stream: bool) -> Result<PreparedChatRequest, LLMError> { /* ... */ Ok(PreparedChatRequest::stateless(http::Request::default())) }
+    fn parse_chat(&self, resp: http::Response<Vec<u8>>, _context: serde_json::Value) -> Result<ChatOutput, LLMError> { /* ... */ Ok(ChatOutput::default()) }
 }
 impl HTTPEmbeddingProvider for MyProvider { /* ... */
     fn embed_request(&self, inputs: &[String]) -> Result<http::Request<Vec<u8>>, LLMError> { Ok(http::Request::default()) }
@@ -128,33 +128,34 @@ pub unsafe extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactor
 
 #### Honouring per-request generation options (optional)
 
-Callers can override `max_tokens` and `reasoning_effort` for one request (see [Chat Interactions](../core/chat.md#per-request-generation-options)). A plugin opts in by overriding two `HTTPChatProvider` methods. Both have defaults, so existing plugins keep working unchanged and simply report no support.
+Callers can override `max_tokens` and `reasoning_effort` for one request (see [Chat Interactions](../core/chat.md#per-request-generation-options)). `HTTPChatProvider::prepare_chat_request` receives the whole `ChatCall`, so a plugin applies `call.options` while building the request, and reports what it honours from `capabilities()`. Streaming and non-streaming requests are built by the same function, keyed by `stream`.
 
 ```rust
-use querymt::chat::{ChatMessage, GenerationOptionSupport, GenerationOptions, Tool};
+use querymt::chat::{ChatCall, ChatCapabilities, GenerationOptionSupport};
 use querymt::chat::http::{HTTPChatProvider, PreparedChatRequest};
 
 impl HTTPChatProvider for MyProvider {
-    // ... chat_request() and parse_chat() as above ...
+    // ... parse_chat(resp, context) and chat_stream_parser(context) as above ...
 
-    fn supported_generation_options(&self) -> GenerationOptionSupport {
-        GenerationOptionSupport::ALL // or set only the fields you honour
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE
+            .with_streaming(true)
+            .with_options(GenerationOptionSupport::ALL) // or only the fields you honour
     }
 
-    fn prepare_chat_request_with_options(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
+        call: &ChatCall<'_>,
         stream: bool,
-        options: &GenerationOptions,
     ) -> Result<PreparedChatRequest, LLMError> {
         // Apply the overrides to a copy of the config, then build the request
         // as usual, so configured and per-request values share one code path.
         let mut cfg = self.clone();
-        if let Some(max_tokens) = options.max_tokens {
+        if let Some(max_tokens) = call.options.max_tokens {
             cfg.max_tokens = max_tokens;
         }
-        cfg.prepare_chat_request(messages, tools, stream)
+        cfg.stream = Some(stream);
+        Ok(PreparedChatRequest::stateless(cfg.build_request(call.messages, call.tools)?))
     }
 }
 ```
@@ -164,6 +165,10 @@ Guidelines:
 *   Do not mutate `self`. An override must never leak into the next request.
 *   Re-derive anything that depends on an overridden value. For example, Anthropic fits its thinking budget to `max_tokens`, so it recomputes the budget after applying the override.
 *   Requests built without options must stay byte-identical to before.
+
+#### Extism plugin contract
+
+Extism plugins built with `impl_extism_http_plugin!` export `prepare_chat_request`, `parse_chat_response`, the stream-parser functions and `capabilities`. The host checks `prepared_chat_contract_version`; a plugin built against an older contract fails with "rebuild the plugin". Rebuild plugins after upgrading `querymt`.
 
 ### 4. Building the Plugin
 

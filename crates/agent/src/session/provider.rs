@@ -12,7 +12,9 @@ use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatOutput, ChatRole, GenerationOptionSupport, GenerationOptions},
+    chat::{
+        ChatCall, ChatMessage, ChatOutput, ChatRole, GenerationOptionSupport, GenerationOptions,
+    },
     error::LLMError,
 };
 use std::sync::Arc;
@@ -39,9 +41,7 @@ pub(crate) fn supported_overrides(
     provider: &dyn LLMProvider,
     requested: GenerationOptions,
 ) -> GenerationOptions {
-    let supported = provider
-        .supported_generation_options()
-        .retain_supported(requested);
+    let supported = provider.capabilities().options.retain_supported(requested);
     if supported != requested {
         tracing::debug!(
             ?requested,
@@ -996,7 +996,7 @@ impl SessionHandle {
     pub(crate) async fn generation_option_support(&self) -> GenerationOptionSupport {
         self.provider()
             .await
-            .map(|provider| provider.supported_generation_options())
+            .map(|provider| provider.capabilities().options)
             .unwrap_or(GenerationOptionSupport::NONE)
     }
 
@@ -1017,30 +1017,15 @@ impl SessionHandle {
         }
     }
 
-    /// Submit messages to the LLM without auto-saving
-    pub async fn submit_request(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
-        self.submit_request_with_options(messages, GenerationOptions::NONE)
-            .await
-    }
-
-    /// Submit messages with per-request generation overrides.
+    /// Submit a chat call to the LLM without auto-saving.
     ///
-    /// Overrides the provider does not honour are dropped (see
-    /// [`supported_overrides`]).
-    pub async fn submit_request_with_options(
-        &self,
-        messages: &[ChatMessage],
-        requested: GenerationOptions,
-    ) -> Result<ChatOutput, LLMError> {
+    /// Per-request options the provider does not honour are dropped (see
+    /// [`supported_overrides`]); the request then runs with the configured
+    /// values.
+    pub async fn submit_request(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         let provider = self.provider().await?;
-        let options = supported_overrides(provider.as_ref(), requested);
-        if options.is_empty() {
-            provider.chat(messages).await
-        } else {
-            provider
-                .chat_with_tools_and_options(messages, None, &options)
-                .await
-        }
+        let options = supported_overrides(provider.as_ref(), call.options);
+        provider.chat(&call.options(options)).await
     }
 
     /// Higher-level chat interface (used by CLI) that handles conversion and storage
@@ -1055,7 +1040,7 @@ impl SessionHandle {
         let llm_messages = self.history().await?;
 
         // 3. Call LLM
-        let response = self.submit_request(&llm_messages).await?;
+        let response = self.submit_request(&ChatCall::new(&llm_messages)).await?;
 
         // 4. Store response
         let response_msg: ChatMessage = response.clone().into();
@@ -1429,12 +1414,11 @@ impl<'a> ProviderRequest<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk};
+    use querymt::chat::{ChatOutput, FinishReason};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
     use std::collections::HashMap;
-    use std::pin::Pin;
 
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -1556,25 +1540,17 @@ pub mod tests {
 
     #[async_trait::async_trait]
     impl querymt::chat::ChatProvider for MockProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[querymt::chat::Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             Ok(MockChatResponse {
                 content: self.response_text.clone(),
             }
             .into())
         }
 
-        async fn chat_stream_with_tools(
+        async fn chat_stream(
             &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[querymt::chat::Tool]>,
-        ) -> Result<
-            Pin<Box<dyn tokio_stream::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-            LLMError,
-        > {
+            _call: &ChatCall<'_>,
+        ) -> Result<querymt::chat::ChatStream, LLMError> {
             let (_tx, rx) = mpsc::channel(1);
             Ok(Box::pin(ReceiverStream::new(rx)))
         }

@@ -17,18 +17,18 @@ QueryMT provides comprehensive support for chat-based interactions with Large La
     *   `usage()`: Optional token usage information (`querymt::Usage`).
     *   Source: `crates/querymt/src/chat/mod.rs`
 
-*   **`querymt::chat::BasicChatProvider`**: A trait that LLM providers implement to support fundamental chat functionality. It has a single method:
-    *   `chat(&self, messages: &[ChatMessage])`: Sends a list of messages to the LLM and returns a `ChatResponse`.
-    *   Source: `crates/querymt/src/chat/mod.rs`
+*   **`querymt::chat::ChatCall`**: The single request value every chat entry point takes. It carries the `messages`, optional `tools` and per-request `GenerationOptions`. Build it with `ChatCall::new(&messages)`, then chain `.tools(&tools)` / `.maybe_tools(opt)` and `.options(opts)`. A new request parameter is a new field here, never a new provider method.
 
-*   **`querymt::chat::ToolChatProvider`**: Extends `BasicChatProvider` to include support for tools (function calling). It has one primary method:
-    *   `chat_with_tools(&self, messages: &[ChatMessage], tools: Option<&[Tool]>)`: Sends messages along with a list of available tools the LLM can use.
+*   **`querymt::chat::ChatProvider`**: The trait LLM providers implement. It has three methods:
+    *   `chat(&self, call: &ChatCall<'_>)`: Sends one request and returns a `ChatOutput`.
+    *   `chat_stream(&self, call: &ChatCall<'_>)`: Streams the response as `StreamChunk`s (returns `NotImplemented` unless the provider supports streaming).
+    *   `capabilities(&self)`: Reports a `ChatCapabilities { streaming, options }` so callers can check streaming and per-request option support before sending.
     *   Source: `crates/querymt/src/chat/mod.rs`
 
 ## How It Works
 
 1.  **Construct Messages:** Your application assembles a sequence of `ChatMessage` objects representing the conversation history. Use `ChatMessage::user()` for user messages and `ChatMessage::assistant()` for assistant messages. This typically starts with alternating `User` and `Assistant` messages.
-2.  **Initiate Chat:** You call the `chat` or `chat_with_tools` method on an `LLMProvider` instance, passing the message history and optionally, a list of available tools.
+2.  **Initiate Chat:** You call `chat` (or `chat_stream`) on an `LLMProvider` instance with a `ChatCall` holding the message history and, optionally, the available tools.
 3.  **Provider Interaction:** The `LLMProvider` (or its underlying implementation like `HTTPLLMProvider`) formats the request according to the specific LLM's API, sends it, and receives the raw response.
 4.  **Parse Response:** The provider parses the raw response into an object implementing `ChatResponse`.
 5.  **Handle Response:** Your application processes the `ChatResponse`:
@@ -41,7 +41,7 @@ QueryMT provides comprehensive support for chat-based interactions with Large La
 ## Example Flow (Conceptual)
 
 ```rust
-use querymt::chat::{ChatMessage, ChatMessageBuilder, ChatResponse, MessageType, Tool, ToolCall};
+use querymt::chat::{ChatCall, ChatMessage, ChatMessageBuilder, ChatResponse, MessageType, Tool, ToolCall};
 use querymt::LLMProvider;
 use serde_json::Value;
 
@@ -56,7 +56,9 @@ async fn handle_tool_calling_loop(
     let mut messages = initial_messages;
 
     loop {
-        let response = llm_provider.chat_with_tools(&messages, Some(my_tools)).await?;
+        let response = llm_provider
+            .chat(&ChatCall::new(&messages).tools(my_tools))
+            .await?;
 
             // Add the assistant's response to the history. It might contain text and/or tool calls.
             let mut msg_builder = ChatMessage::assistant().text(response.text().unwrap_or_default());
@@ -116,25 +118,26 @@ async fn handle_tool_calling_loop(
 Some settings, such as the output-token cap or the reasoning effort, are normally fixed when a provider is built. `querymt::chat::GenerationOptions` overrides them for a **single** chat request, without rebuilding the provider:
 
 ```rust
-use querymt::chat::{GenerationOptions, ReasoningEffort};
+use querymt::chat::{ChatCall, GenerationOptions, ReasoningEffort};
 
 let options = GenerationOptions::default()
     .with_max_tokens(128_000)
     .with_reasoning_effort(ReasoningEffort::Low);
 
-// Streaming has an equivalent: `chat_stream_with_tools_and_options`.
+// `chat_stream` takes the same `ChatCall`.
 let output = provider
-    .chat_with_tools_and_options(&messages, Some(&tools), &options)
+    .chat(&ChatCall::new(&messages).tools(&tools).options(options))
     .await?;
 
 // The next call, made without options, uses the configured values again.
-let output = provider.chat_with_tools(&messages, Some(&tools)).await?;
+let output = provider.chat(&ChatCall::new(&messages).tools(&tools)).await?;
 ```
 
 *   A set field overrides the configured value for that request only. An unset field leaves the configured value in effect.
-*   Providers report what they honour through `ChatProvider::supported_generation_options()`, which returns a `GenerationOptionSupport`. Query it before relying on an override. Options a provider does not honour are ignored and the request still succeeds. `GenerationOptionSupport::retain_supported` drops the unsupported overrides from a `GenerationOptions` value.
-*   The existing methods (`chat`, `chat_with_tools`, `chat_stream_with_tools`) are unchanged, and their requests are identical to before.
-*   Options travel unchanged through the HTTP adapter, the tool and validation decorators, Extism plugins and remote (mesh) providers. Older plugins and remote peers ignore the field. A remote peer reports its support in the contract handshake, and a peer that predates options is treated as supporting none.
+*   Providers report what they honour through `ChatProvider::capabilities()`; its `options` field is a `GenerationOptionSupport`. Query it before relying on an override. Options a provider does not honour are ignored and the request still succeeds. `GenerationOptionSupport::retain_supported` drops the unsupported overrides from a `GenerationOptions` value.
+*   A call without options produces a request identical to one made before options existed.
+*   Wrappers (tool and validation decorators, the HTTP adapter, mesh and remote providers, the Extism host) forward the whole `ChatCall`, so options and any future field cannot be dropped silently.
+*   Plugins and remote peers built against an older contract are rejected with an actionable "rebuild the plugin" / "upgrade both peers" error rather than silently ignoring options. A remote host answers the contract handshake with the capabilities of the provider it builds for the request.
 *   Today the Anthropic provider honours both fields. Other providers report no support until they are updated.
 
 Source: `crates/querymt/src/chat/mod.rs`

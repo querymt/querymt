@@ -42,28 +42,67 @@ pub struct GenerationOptions {
 }
 ```
 
-- `ChatProvider` gains `chat_with_tools_and_options` and `chat_stream_with_tools_and_options`. Their defaults ignore the options and call the existing methods, so no implementer breaks. It also gains `supported_generation_options() -> GenerationOptionSupport` (default: none).
-- `HTTPChatProvider::prepare_chat_request` gets an options-aware sibling. `LLMProviderFromHTTP` forwards the options to it.
-- Extism: `ExtismChatRequest` gains `#[serde(default)] options: Option<GenerationOptions>`. Older plugins ignore the unknown field, and older hosts omit it.
-- Remote: the mesh chat request types gain the same optional field. A peer that doesn't know it ignores it (serde default).
-- Decorators (`tool_decorator`, `validated_llm`, `chain`) forward options.
+**Revised (API review):** options go on a single request value, not on new method pairs. The first implementation added `chat_with_tools_and_options` / `chat_stream_with_tools_and_options` / `prepare_chat_request_with_options` next to the existing `chat` / `chat_with_tools` / `*_with_context` pairs. Each new request dimension doubled the trait surface. The defaults also silently dropped options for wrappers that only overrode the older method. That code is replaced as follows:
+
+```rust
+#[non_exhaustive]
+pub struct ChatCall<'a> {              // not `ChatRequest`: clashes with api::types::ChatRequest
+    pub messages: &'a [ChatMessage],
+    pub tools: Option<&'a [Tool]>,
+    pub options: GenerationOptions,
+}
+// ChatCall::new(&msgs).tools(&tools).options(opts)
+
+trait ChatProvider {
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError>;
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError>;
+    fn capabilities(&self) -> ChatCapabilities; // { streaming: bool, options: GenerationOptionSupport }
+}
+
+trait HTTPChatProvider {
+    fn prepare_chat_request(&self, call: &ChatCall<'_>, stream: bool) -> Result<PreparedChatRequest, LLMError>;
+    fn parse_chat(&self, resp: Response<Vec<u8>>, context: Value) -> Result<ChatOutput, LLMError>;
+    fn chat_stream_parser(&self, context: Value) -> Result<Box<dyn ChatStreamParser>, LLMError>;
+    fn classify_chat_error(&self, resp: &Response<Vec<u8>>) -> LLMError;
+    fn capabilities(&self) -> ChatCapabilities;
+}
+```
+
+- **Removed:** `chat_with_tools`, `chat_stream_with_tools`, both `*_and_options` methods, `supported_generation_options`, `supports_streaming` (all on `ChatProvider`). Also `chat_request`, `chat_stream_request`, `prepare_chat_request_with_options`, `parse_chat_with_context` and `chat_stream_parser_with_context` (on `HTTPChatProvider`). No compatibility shims (AGENTS.md); nothing here is released.
+- There are no request-forwarding defaults. Wrappers (`tool_decorator`, `validated_llm`, `chain`, `adapters`, `mesh_client`, `remote_chat_provider`, the Extism host) forward the whole `ChatCall`, so a new field cannot be dropped silently.
+- A future request parameter (temperature, stop sequences, …) is a new field on `GenerationOptions` or `ChatCall`, never a new method.
+- HTTP providers build streaming and non-streaming requests in one function keyed by `stream` (most already do `cfg.stream = Some(true); chat_request(..)`).
+- `ChatStream` is a type alias for the boxed chunk stream.
+- Extism: `ExtismChatRequest` keeps `options: Option<GenerationOptions>`. The plugin exports collapse to `prepare_chat_request`, `parse_chat_response`, the stream-parser exports and `capabilities`. `PREPARED_CHAT_CONTRACT_VERSION` is bumped and every plugin is rebuilt; the host does not support the old exports.
+- Remote: `ProviderChatRequest` / `ProviderStreamRequest` keep `options`. `build_chat_request` / `build_stream_request` take a `ChatCall` (the `*_with_options` builders are removed). `MESH_PROTOCOL_VERSION` is bumped.
+- Remote capability reporting: the host answers `GetProviderContractInfo` with the options the *built provider* honours, not a blanket `ALL`.
 - **Alternative rejected:** building a one-off provider per escalated request. It is cheap, but it bypasses provider caching, OAuth resolver reuse and plugin instance locking, and it doesn't extend to effort changes.
+- **Alternative rejected:** keeping method pairs with default delegation. This was the first implementation; it grows without bound and fails silently.
 
 ### 2. Initial cap and ceiling (D1)
 
 - `ModelDefaults::for_model(provider, model, model_info: Option<&ModelInfo>)`. If the config has no `max_tokens`, it sets `max_tokens = min(32_000, output_limit)` (32k when unknown, Anthropic only, as today).
 - It also returns `output_ceiling = output_limit.unwrap_or(max_tokens)`.
 - If the user set `max_tokens`, `output_ceiling = max_tokens`, so escalation never goes past an explicit choice.
-- The ceiling is stored on the session's resolved provider snapshot and exposed to the execution context as `exec_ctx.output_caps { initial, ceiling }`.
+- **Revised (API review):** the caps are part of a per-session `ModelProfile` (see Decision 3), built once when the provider is resolved and replaced on model switch. They are not a separate `exec_ctx.output_caps` value.
 - Non-Anthropic providers keep their current defaults. The ceiling is still computed so the middleware can escalate wherever per-request options are supported.
 
 ### 3. Request overrides travel on `ConversationContext`
 
 - Add `request_overrides: GenerationOptions` (an Arc'd field, default empty) with builder-style `with_request_overrides`.
 - `transition_before_llm_call` copies it into `PreparedModelRequest.options`.
-- `transition_call_llm` calls the `*_and_options` methods when the options are non-empty and the provider supports them. Otherwise it logs at debug level and sends without them.
+- `transition_call_llm` drops options the provider does not honour (per `profile.capabilities.options`), logging them at debug level, and sends the rest.
 - Overrides last for one request: `transition_after_llm` builds the new context without them.
-- `LlmRequestStart` gains `max_tokens: Option<u32>`, the cap actually requested, so the recovery middleware and events know the cap that was in effect.
+- `transition_call_llm` builds one `ChatCall` (Decision 1) from `PreparedModelRequest` and calls `chat` / `chat_stream`. It never picks between method variants.
+
+**Revised (API review): no side channel, no event field.** The first implementation added `LlmRequestStart.max_tokens` and `SessionRuntime.last_llm_request: Mutex<LastLlmRequest>`. The execution loop wrote that struct before each request and the middleware read it back. Both are removed:
+
+- `LlmRequestStart` stays `{ message_count }`. Every request parameter added there would become a persisted, typeshare-exported wire commitment, and nothing outside tests reads it. Clients see caps through `OutputLimitRecovery { from_max_tokens, to_max_tokens }`.
+- Effective request parameters go to telemetry. The chat span records `gen_ai.request.max_tokens` (and the other `gen_ai.request.*` attributes) from the *effective* values (configured values with overrides applied), not only the configured ones (`GenerationSettings::record` today).
+- **Per-session facts** go into one `ModelProfile { caps: Option<OutputCaps>, capabilities: ChatCapabilities, reasoning_effort: Option<ReasoningEffort>, pricing: Option<ModelPricing> }`. It is resolved with the provider, swapped atomically on model switch (the same path as `provider` / `model`) and carried on `ConversationContext` as `profile: Arc<ModelProfile>`.
+- **Per-request fact:** `LlmResponse` gains `applied: GenerationOptions`, the overrides the request was actually sent with (after dropping unsupported ones). A response describes its own request, so nothing has to be reconstructed from "the last request".
+- The middleware derives the cap that was used as `response.applied.max_tokens.or(profile.caps.map(|c| c.initial))`. `on_stopped` reads the cap from the `Stopped` state's context. That context carries the response's `applied` value forward as `last_applied: GenerationOptions`, and it is cleared at turn start.
+- **Alternative rejected:** a mutex-guarded "last request" struct on `SessionRuntime`. It works around the state machine, mixes session facts with request facts, and breaks if anything else issues a request in between (compaction, retries).
 
 ### 4. Cut-off classification
 
@@ -129,12 +168,14 @@ on_stopped(Stopped{ModelTokenLimit, context}):
 
 - **[Escalation doubles the cost of a cut-off step]** → One escalation per turn at most. The ceiling equals the model's real limit, and usage is reported accurately.
 - **[A large `max_tokens` on old models must fit input + output within the context window]** → Escalation cap = `min(ceiling, context_limit - estimated_input_tokens)` when the context limit is known.
-- **[Remote peer on an older version ignores options]** → Escalation then has no effect, and the middleware sees a second `Length` at the same cap and moves on to continuation. This is acceptable. `supported_generation_options` reported by the remote provider lets the middleware skip escalation.
+- **[Remote peer on an older version ignores options]** → Escalation then has no effect, and the middleware sees a second `Length` at the same cap and moves on to continuation. This is acceptable. With `MESH_PROTOCOL_VERSION` bumped, an older peer fails the contract handshake with an actionable error instead of silently ignoring options. Capabilities reported by the remote host (from the built provider) let the middleware skip escalation.
 - **[The instruction fragment could persist if the turn ends abnormally]** → Fragments are per-context and `reset()` clears state at the next turn.
+- **[Breaking `ChatProvider` / `HTTPChatProvider` / Extism ABI / mesh protocol]** → Intentional (API review). Nothing is released; all in-tree implementers, examples, Python bindings and docs move in the same change, and every OCI plugin is rebuilt. Out-of-tree plugins fail fast on the contract version check.
 - **[Changed `run_completed.outcome` value]** → Additive. Clients that don't know `"stopped"` treat it as unknown. querymt-desktop will be updated.
 
 ## Migration Plan
 
-- No storage migration: new event variant and fields use serde defaults.
-- Ship querymt, providers and agent together. Mesh peers on older versions keep working, without escalation.
+- No storage migration: new event variant and fields use serde defaults. `LlmRequestStart` keeps its pre-change shape.
+- Order of work: land the `ChatCall` API refactor first (tasks section 0), then rework the already-implemented recovery code onto it (tasks 2.2r, 4.1r, 5.xr).
+- Ship querymt, providers, plugins and agent together. Mesh peers and plugins on older versions are rejected by the contract/protocol version checks.
 - Rollback: set `[[middleware]] type = "output_limit_recovery", enabled = false`, or remove it from the presets.

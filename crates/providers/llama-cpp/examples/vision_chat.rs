@@ -25,7 +25,7 @@
 use clap::Parser;
 use futures::StreamExt;
 use qmt_llama_cpp::{LlamaCppConfig, create_provider};
-use querymt::chat::{ChatMessage, ChatRole};
+use querymt::chat::{ChatCall, ChatMessage};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -152,7 +152,7 @@ async fn run(
 
     if args.stream {
         println!("--- streaming ---");
-        let mut stream = provider.chat_stream(&messages).await?;
+        let mut stream = provider.chat_stream(&ChatCall::new(&messages)).await?;
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(querymt::chat::StreamChunk::Text(t)) => {
@@ -171,7 +171,7 @@ async fn run(
         }
     } else {
         println!("--- response ---");
-        let response = provider.chat(&messages).await?;
+        let response = provider.chat(&ChatCall::new(&messages)).await?;
         println!("{}", response.text().unwrap_or_default());
         if let Some(u) = response.usage.clone() {
             println!("---\ninput={} output={}", u.input_tokens, u.output_tokens);

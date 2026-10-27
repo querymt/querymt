@@ -27,7 +27,7 @@
 //! 3. Loads the message history (up to the specified step or all messages)
 //! 4. Loads tool definitions from the session events
 //! 5. In dry-run mode: Displays all reconstructed state
-//! 6. In execute mode: Rebuilds the provider and calls chat_with_tools()
+//! 6. In execute mode: Rebuilds the provider and calls chat()
 //!
 //! ## Debugging delegations
 //!
@@ -300,8 +300,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Tools are already in querymt::chat::Tool format from the events
 
-        // Call chat_with_tools
-        match provider.chat_with_tools(&chat_messages, Some(&tools)).await {
+        // Call chat
+        match provider
+            .chat(&querymt::chat::ChatCall::new(&chat_messages).tools(&tools))
+            .await
+        {
             Ok(response) => {
                 println!("✅ LLM Response:");
                 if let Some(text) = response.text() {

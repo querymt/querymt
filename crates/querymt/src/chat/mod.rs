@@ -181,7 +181,7 @@ pub enum ReasoningEffort {
 /// A set field overrides the provider's configured value for a single chat
 /// request; an unset field leaves the configured value in effect. Providers
 /// report which fields they honour via
-/// [`ChatProvider::supported_generation_options`] and ignore the rest.
+/// [`ChatProvider::capabilities`] and ignore the rest.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GenerationOptions {
     /// Output-token cap for this request.
@@ -763,134 +763,154 @@ impl fmt::Debug for StreamChunk {
     }
 }
 
-/// Unified ChatProvider trait that combines all chat capabilities.
+/// Boxed stream of chat chunks returned by [`ChatProvider::chat_stream`].
+pub type ChatStream = Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>;
+
+/// One chat request: the conversation, optional tools and per-request
+/// [`GenerationOptions`].
 ///
-/// This trait provides a single interface for both synchronous and streaming chat interactions,
-/// with or without tool support. Providers can implement the methods they support and rely on
-/// default implementations for others.
+/// This is the single value every chat entry point takes, so a new request
+/// parameter is a new field here (or on [`GenerationOptions`]), never a new
+/// provider method. Wrappers forward the whole value, so nothing is dropped
+/// silently.
+///
+/// ```
+/// use querymt::chat::{ChatCall, GenerationOptions};
+///
+/// let call = ChatCall::new(&[]).options(GenerationOptions::default().with_max_tokens(64_000));
+/// assert_eq!(call.options.max_tokens, Some(64_000));
+/// assert!(call.tools.is_none());
+/// ```
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ChatCall<'a> {
+    /// The conversation history.
+    pub messages: &'a [ChatMessage],
+    /// Tools available to the model. `None` disables tools for this call, even
+    /// if the provider has tools configured.
+    pub tools: Option<&'a [Tool]>,
+    /// Per-request overrides of the provider's configured settings.
+    pub options: GenerationOptions,
+}
+
+impl<'a> ChatCall<'a> {
+    /// A call over `messages` with no tools and no option overrides.
+    #[must_use]
+    pub const fn new(messages: &'a [ChatMessage]) -> Self {
+        Self {
+            messages,
+            tools: None,
+            options: GenerationOptions::NONE,
+        }
+    }
+
+    /// Sets the tools offered to the model.
+    #[must_use]
+    pub const fn tools(mut self, tools: &'a [Tool]) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Sets the tools offered to the model; `None` offers no tools.
+    #[must_use]
+    pub const fn maybe_tools(mut self, tools: Option<&'a [Tool]>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Sets the per-request generation options.
+    #[must_use]
+    pub const fn options(mut self, options: GenerationOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// The same call over different messages (e.g. after provider-side
+    /// rewriting), keeping tools and options.
+    #[must_use]
+    pub const fn with_messages(mut self, messages: &'a [ChatMessage]) -> Self {
+        self.messages = messages;
+        self
+    }
+}
+
+/// What a provider supports for chat calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ChatCapabilities {
+    /// The provider supports streaming responses.
+    #[serde(default)]
+    pub streaming: bool,
+    /// Which per-request [`GenerationOptions`] the provider honours. Options
+    /// outside this set are ignored without failing the request.
+    #[serde(default)]
+    pub options: GenerationOptionSupport,
+}
+
+impl ChatCapabilities {
+    /// No streaming and no per-request options.
+    pub const NONE: Self = Self {
+        streaming: false,
+        options: GenerationOptionSupport::NONE,
+    };
+
+    /// Sets whether streaming is supported.
+    #[must_use]
+    pub const fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
+    /// Sets which per-request options are honoured.
+    #[must_use]
+    pub const fn with_options(mut self, options: GenerationOptionSupport) -> Self {
+        self.options = options;
+        self
+    }
+}
+
+/// Unified chat interface for synchronous and streaming interactions, with or
+/// without tools.
+///
+/// Both entry points take a [`ChatCall`], so messages, tools and per-request
+/// [`GenerationOptions`] always travel together. Providers report what they
+/// support through [`ChatProvider::capabilities`].
 ///
 /// # Examples
 ///
-/// ## Basic usage without tools
 /// ```rust,ignore
-/// let response = provider.chat(&messages).await?;
-/// ```
+/// let call = ChatCall::new(&messages).tools(&tools);
+/// let response = provider.chat(&call).await?;
 ///
-/// ## With tools
-/// ```rust,ignore
-/// let response = provider.chat_with_tools(&messages, Some(&tools)).await?;
-/// ```
-///
-/// ## Streaming
-/// ```rust,ignore
-/// let mut stream = provider.chat_stream(&messages).await?;
+/// let mut stream = provider.chat_stream(&call).await?;
 /// while let Some(chunk) = stream.next().await {
 ///     // Process chunk
 /// }
 /// ```
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
-    /// Returns true if the provider supports streaming responses.
-    fn supports_streaming(&self) -> bool {
-        false
-    }
-
-    /// Basic chat interaction without tools.
-    ///
-    /// This is a convenience method that delegates to `chat_with_tools` with `None` for tools.
-    async fn chat(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
-        self.chat_with_tools(messages, None).await
-    }
-
-    /// Chat interaction with tools.
+    /// Chat interaction.
     ///
     /// Returns the authoritative item-aware [`ChatOutput`]. Text, visible
     /// reasoning, executable function calls, usage, and finish reason are
     /// derived projections of that value.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` - The conversation history
-    /// * `tools` - Optional list of tools available to the model. Pass `None` to disable tools
-    ///   for this specific call, even if the provider has tools configured.
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError>;
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError>;
 
-    /// Basic streaming chat interaction.
+    /// Streaming chat interaction.
     ///
-    /// This is a convenience method that delegates to `chat_stream_with_tools` with `None` for tools.
-    async fn chat_stream(
-        &self,
-        messages: &[ChatMessage],
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
-        self.chat_stream_with_tools(messages, None).await
-    }
-
-    /// Streaming chat interaction with tools.
-    ///
-    /// Returns a stream of `StreamChunk` events which can include text deltas, tool use events,
-    /// and completion signals.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` - The conversation history
-    /// * `tools` - Optional list of tools available to the model
-    ///
-    /// # Default Implementation
-    ///
-    /// By default, this returns a `NotImplemented` error. Providers that support streaming
-    /// should override this method.
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
-        let _ = (messages, tools);
+    /// Returns a stream of [`StreamChunk`] events (text deltas, tool use
+    /// events and completion signals). Providers that report
+    /// [`ChatCapabilities::streaming`] must override this; the default returns
+    /// [`LLMError::NotImplemented`].
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        let _ = call;
         Err(LLMError::NotImplemented(
-            "Streaming with tools not supported by this provider".into(),
+            "Streaming not supported by this provider".into(),
         ))
     }
 
-    /// Reports which per-request [`GenerationOptions`] this provider honours.
-    ///
-    /// Defaults to none: options passed to the `*_and_options` methods are
-    /// ignored and the configured values stay in effect.
-    fn supported_generation_options(&self) -> GenerationOptionSupport {
-        GenerationOptionSupport::NONE
-    }
-
-    /// Chat interaction with tools and per-request generation options.
-    ///
-    /// Set options override the provider's configured values for this request
-    /// only. The default implementation ignores `options` and delegates to
-    /// [`ChatProvider::chat_with_tools`]; providers that honour options should
-    /// override it and report them in
-    /// [`ChatProvider::supported_generation_options`].
-    async fn chat_with_tools_and_options(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        options: &GenerationOptions,
-    ) -> Result<ChatOutput, LLMError> {
-        let _ = options;
-        self.chat_with_tools(messages, tools).await
-    }
-
-    /// Streaming chat interaction with tools and per-request generation options.
-    ///
-    /// The default implementation ignores `options` and delegates to
-    /// [`ChatProvider::chat_stream_with_tools`].
-    async fn chat_stream_with_tools_and_options(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        options: &GenerationOptions,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError> {
-        let _ = options;
-        self.chat_stream_with_tools(messages, tools).await
+    /// What this provider supports. Defaults to nothing.
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE
     }
 }
 
@@ -1420,36 +1440,6 @@ impl ChatMessageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Implements only the required method, as pre-existing providers do.
-    /// Records which entry point was called.
-    #[derive(Default)]
-    struct LegacyProvider {
-        calls: Mutex<Vec<&'static str>>,
-    }
-
-    #[async_trait]
-    impl ChatProvider for LegacyProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
-            self.calls.lock().unwrap().push("chat_with_tools");
-            Ok(ChatOutput::default())
-        }
-
-        async fn chat_stream_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
-        {
-            self.calls.lock().unwrap().push("chat_stream_with_tools");
-            Ok(Box::pin(futures::stream::empty()))
-        }
-    }
 
     #[test]
     fn generation_options_default_is_empty() {
@@ -1500,39 +1490,50 @@ mod tests {
     }
 
     #[test]
-    fn legacy_provider_reports_no_generation_option_support() {
-        let provider = LegacyProvider::default();
-        assert_eq!(
-            provider.supported_generation_options(),
-            GenerationOptionSupport::NONE
-        );
-        assert!(!provider.supported_generation_options().any());
+    fn chat_call_builder_sets_tools_and_options() {
+        let messages = [ChatMessage::user().text("hi").build()];
+        let tools: [Tool; 0] = [];
+        let options = GenerationOptions::default().with_max_tokens(64_000);
+
+        let call = ChatCall::new(&messages).tools(&tools).options(options);
+
+        assert_eq!(call.messages.len(), 1);
+        assert_eq!(call.tools.map(<[Tool]>::len), Some(0));
+        assert_eq!(call.options, options);
+        assert!(ChatCall::new(&messages).tools.is_none());
+        assert!(ChatCall::new(&messages).options.is_empty());
+    }
+
+    #[test]
+    fn chat_capabilities_default_is_none() {
+        assert_eq!(ChatCapabilities::default(), ChatCapabilities::NONE);
+        let caps = ChatCapabilities::NONE
+            .with_streaming(true)
+            .with_options(GenerationOptionSupport::ALL);
+        assert!(caps.streaming && caps.options.any());
+    }
+
+    #[test]
+    fn chat_capabilities_deserialize_with_missing_fields() {
+        let caps: ChatCapabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!(caps, ChatCapabilities::NONE);
+    }
+
+    struct ChatOnly;
+
+    #[async_trait]
+    impl ChatProvider for ChatOnly {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            Ok(ChatOutput::default())
+        }
     }
 
     #[tokio::test]
-    async fn default_chat_with_options_delegates_to_chat_with_tools() {
-        let provider = LegacyProvider::default();
-        let options = GenerationOptions::default().with_max_tokens(128_000);
-
-        provider
-            .chat_with_tools_and_options(&[], None, &options)
-            .await
-            .unwrap();
-
-        assert_eq!(*provider.calls.lock().unwrap(), ["chat_with_tools"]);
-    }
-
-    #[tokio::test]
-    async fn default_stream_with_options_delegates_to_stream_with_tools() {
-        let provider = LegacyProvider::default();
-        let options = GenerationOptions::default().with_max_tokens(128_000);
-
-        let _stream = provider
-            .chat_stream_with_tools_and_options(&[], None, &options)
-            .await
-            .unwrap();
-
-        assert_eq!(*provider.calls.lock().unwrap(), ["chat_stream_with_tools"]);
+    async fn chat_only_provider_reports_no_capabilities_and_no_streaming() {
+        let provider = ChatOnly;
+        assert_eq!(provider.capabilities(), ChatCapabilities::NONE);
+        let err = provider.chat_stream(&ChatCall::new(&[])).await.err();
+        assert!(matches!(err, Some(LLMError::NotImplemented(_))));
     }
 
     #[test]

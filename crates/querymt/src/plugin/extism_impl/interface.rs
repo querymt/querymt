@@ -177,8 +177,12 @@ pub struct ExtismChatParseRequest<C> {
     pub context: serde_json::Value,
 }
 
-/// Versioned opaque request-context contract shared by host and plugin.
-pub const PREPARED_CHAT_CONTRACT_VERSION: u32 = 1;
+/// Versioned prepared-chat contract shared by host and plugin.
+///
+/// Version 2 replaces the per-direction `chat_request` / `chat_stream_request`
+/// exports and `supported_generation_options` / `supports_streaming` with
+/// `prepare_chat_request(call, stream)` and `capabilities`.
+pub const PREPARED_CHAT_CONTRACT_VERSION: u32 = 2;
 
 #[derive(Deserialize, Serialize)]
 pub struct ExtismPreparedChatRequest {

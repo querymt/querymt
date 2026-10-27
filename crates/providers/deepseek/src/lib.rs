@@ -7,8 +7,9 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat,
+        Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -153,34 +154,38 @@ impl HTTPChatProvider for Deepseek {
         classify_openai_http_error(response)
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        openai_chat_request(self, messages, tools)
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let request = if stream {
+            let mut cfg = self.clone();
+            cfg.stream = Some(true);
+            openai_chat_request(&cfg, call.messages, call.tools)
+        } else {
+            openai_chat_request(self, call.messages, call.tools)
+        }?;
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn chat_stream_request(
+    fn parse_chat(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut cfg = self.clone();
-        cfg.stream = Some(true);
-        openai_chat_request(&cfg, messages, tools)
-    }
-
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(DeepseekStreamParser::default()))
     }
 
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(DeepseekStreamParser::default()))
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
@@ -277,7 +282,7 @@ pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
 #[cfg(test)]
 mod tests {
     use super::Deepseek;
-    use querymt::chat::{ChatMessage, ToolResultPart, http::HTTPChatProvider};
+    use querymt::chat::{ChatCall, ChatMessage, ToolResultPart, http::HTTPChatProvider};
     use serde_json::Value;
 
     #[test]
@@ -302,7 +307,10 @@ mod tests {
                 .build(),
         ];
 
-        let request = provider.chat_stream_request(&messages, None).unwrap();
+        let request = provider
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), true)
+            .map(|p| p.request)
+            .unwrap();
         let body: Value = serde_json::from_slice(request.body()).unwrap();
         let api_messages = body["messages"].as_array().unwrap();
 

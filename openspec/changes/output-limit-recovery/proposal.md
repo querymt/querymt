@@ -10,7 +10,7 @@ When a model reply hits its output-token cap (`finish_reason = Length`), the age
 
 ## What Changes
 
-- **Per-request generation options in querymt.** Chat calls accept optional per-request settings (`max_tokens`, `reasoning_effort`) that override the provider's configured values for that one request. They are carried by the HTTP adapter, the Extism plugin interface and the remote mesh. Providers declare whether they honour them. The Anthropic provider is the first to do so.
+- **Per-request generation options in querymt, via one request value.** Chat calls take a single `ChatCall { messages, tools, options }`, and its optional settings (`max_tokens`, `reasoning_effort`) override the provider's configured values for that one request. **BREAKING (API):** `ChatProvider` collapses to `chat` / `chat_stream` / `capabilities`, and `HTTPChatProvider` to `prepare_chat_request` / `parse_chat` / `chat_stream_parser` / `classify_chat_error` / `capabilities`. The `*_with_tools`, `*_and_options`, `*_with_options` and `*_with_context` variants are removed. Options are carried by the HTTP adapter, the Extism plugin interface (contract version bumped) and the remote mesh (protocol version bumped). Providers report what they honour through `capabilities()`. The Anthropic provider is the first to honour options.
 - **Starting `max_tokens` from model metadata.** When no `max_tokens` is configured, the cap is `min(32,000, model output limit)`, and the model output limit is recorded as the escalation ceiling. This replaces the fixed Anthropic 32k heuristic. An explicit `max_tokens` is always respected and turns escalation off.
 - **Cut-offs become length outcomes.** A stream that ends with `Length` and unfinished tool calls is treated as an incomplete, length-limited reply, not a transient error. It is no longer retried, and its partial output is kept.
 - **New `on_stopped` middleware phase.** It runs before a stop is published. Middleware may turn the stop into `BeforeLlmCall` to keep going, with a per-turn loop guard.
@@ -19,6 +19,7 @@ When a model reply hits its output-token cap (`finish_reason = Length`), the age
   - In `on_stopped`, it continues up to N times (default 3) with a configurable fixed instruction: resume without recap, split large writes into smaller tool calls. For thinking-only cut-offs it also lowers reasoning effort for that request.
   - The instruction is removed after the next reply that isn't cut off.
 - **Accounting.** Discarded attempts still count towards usage and cost. Thinking-only cut-offs are not stored in history.
+- **Request facts travel with state, not side channels.** A per-session `ModelProfile` (caps, capabilities, effort, pricing) rides on `ConversationContext`, and `LlmResponse.applied` records the options a request was sent with. `LlmRequestStart` gains no fields, and `SessionRuntime` gains no last-request state. Effective `gen_ai.request.*` values go to the chat span.
 - **Visibility.**
   - Recovery steps produce an `output_limit_recovery` event.
   - Runs that end on a stop report outcome `stopped`, with the stop type, instead of `completed`. **BREAKING (event payload):** `run_completed.outcome` can now be `"stopped"`.
@@ -36,19 +37,21 @@ When a model reply hits its output-token cap (`finish_reason = Length`), the age
 ## Impact
 
 - **querymt:**
-  - `chat/mod.rs` (`ChatProvider` gains option-aware methods with defaults).
-  - `chat/http.rs` (`prepare_chat_request` with options).
-  - `adapters.rs`.
-  - `plugin/extism_impl` (`ExtismChatRequest.options`, serde default).
+  - `chat/mod.rs` (`ChatCall`, `ChatCapabilities`, `ChatStream`; `ChatProvider` reduced to three methods).
+  - `chat/http.rs` (`HTTPChatProvider` reduced; `prepare_chat_request(call, stream)`).
+  - `adapters.rs`, `tool_decorator.rs`, `validated_llm.rs`, `chain`.
+  - `plugin/extism_impl` and `querymt-extism-macros` (`ExtismChatRequest.options`, reduced exports, `PREPARED_CHAT_CONTRACT_VERSION` bump).
+  - All `ChatProvider` / `HTTPChatProvider` implementers under `crates/providers/`, `querymt-py`, examples and docs.
   - `chat/streaming.rs` (length-aware `finish`).
-  - `querymt-remote` chat request types.
+  - `querymt-remote` chat request types, builders taking `ChatCall`, host capability reporting, `MESH_PROTOCOL_VERSION` bump.
 - **Providers:** Anthropic honours `max_tokens` and `reasoning_effort` per request. Other providers report no support until they are updated.
 - **Agent:**
   - `model_heuristics.rs` / `session/provider_config.rs` (initial cap and ceiling).
   - `agent/execution/transitions.rs` (request options, length classification, thinking-only persistence, usage of discarded attempts).
   - `agent/execution/mod.rs` and `middleware/driver.rs` (`on_stopped`).
   - New `middleware/output_limit.rs`, plus presets and factory registration.
-  - `events.rs` (`OutputLimitRecovery`, run outcome).
+  - `events.rs` (`OutputLimitRecovery`, run outcome; `LlmRequestStart` unchanged).
+  - `middleware/state.rs` (`ConversationContext.profile`, `LlmResponse.applied`); `agent/core.rs` (no `LastLlmRequest`).
   - `agent/session_actor.rs` (`RunCompletionDisposition::Stopped`).
   - `acp/shared.rs` (notice).
   - Regenerated typeshare types.

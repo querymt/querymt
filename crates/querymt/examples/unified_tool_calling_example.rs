@@ -204,7 +204,9 @@ async fn run_until_final_answer(
     conversation: &mut Vec<ChatMessage>,
 ) -> ExampleResult<String> {
     loop {
-        let response = llm.chat_with_tools(conversation, Some(tools)).await?;
+        let response = llm
+            .chat(&querymt::chat::ChatCall::new(conversation).tools(tools))
+            .await?;
 
         if let Some(tool_calls) = response.tool_calls() {
             println!("Model requested {} tool(s)", tool_calls.len());

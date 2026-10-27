@@ -1,5 +1,5 @@
 use ::querymt::chat::{
-    ChatInputPart, ChatMessage, ChatRole, FinishReason, MediaKind, StreamChunk, Tool,
+    ChatCall, ChatInputPart, ChatMessage, ChatRole, FinishReason, MediaKind, StreamChunk, Tool,
 };
 use ::querymt::dynamic::PluginRegistryDynamicExt;
 use ::querymt::plugin::host::PluginRegistry;
@@ -194,14 +194,17 @@ impl PyProvider {
         let provider = Arc::clone(&self.inner);
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let response = provider.chat(&messages).await.map_err(into_py_err)?;
+            let response = provider
+                .chat(&ChatCall::new(&messages))
+                .await
+                .map_err(into_py_err)?;
             let response = chat_output_to_python(&response);
             Python::attach(|py| Py::new(py, response))
         })
     }
 
     fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+        self.inner.capabilities().streaming
     }
 
     #[pyo3(signature = (messages, tools=None))]
@@ -217,7 +220,7 @@ impl PyProvider {
             .map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let response = provider
-                .chat_with_tools(&messages, tools.as_deref())
+                .chat(&ChatCall::new(&messages).maybe_tools(tools.as_deref()))
                 .await
                 .map_err(into_py_err)?;
             let response = chat_output_to_python(&response);
@@ -233,7 +236,10 @@ impl PyProvider {
         let provider = Arc::clone(&self.inner);
         let messages = py_messages_to_rust(messages.bind(py)).map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let stream = provider.chat_stream(&messages).await.map_err(into_py_err)?;
+            let stream = provider
+                .chat_stream(&ChatCall::new(&messages))
+                .await
+                .map_err(into_py_err)?;
             let stream = stream_to_python(stream);
             Python::attach(|py| Py::new(py, stream))
         })
@@ -252,7 +258,7 @@ impl PyProvider {
             .map_err(into_py_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stream = provider
-                .chat_stream_with_tools(&messages, tools.as_deref())
+                .chat_stream(&ChatCall::new(&messages).maybe_tools(tools.as_deref()))
                 .await
                 .map_err(into_py_err)?;
             let stream = stream_to_python(stream);

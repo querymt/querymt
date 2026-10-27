@@ -2,7 +2,7 @@ use crate::{
     ITEM_AWARE_CHAT_CONTRACT_VERSION, ProviderChatRequest, ProviderStreamRequest,
     messages_require_item_aware_contract,
 };
-use querymt::chat::{ChatMessage, GenerationOptions, Tool};
+use querymt::chat::{ChatCall, Tool};
 
 #[derive(Clone, Debug)]
 pub struct RemoteProviderClientConfig {
@@ -60,58 +60,22 @@ impl RemoteProviderClientConfig {
         std::time::Duration::from_secs((self.lease_ttl_secs / 3).max(1))
     }
 
-    pub fn build_chat_request(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> ProviderChatRequest {
-        self.build_chat_request_with_options(messages, tools, &GenerationOptions::NONE)
-    }
-
-    pub fn build_chat_request_with_options(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        options: &GenerationOptions,
-    ) -> ProviderChatRequest {
+    pub fn build_chat_request(&self, call: &ChatCall<'_>) -> ProviderChatRequest {
         ProviderChatRequest {
             provider: self.provider_name.clone(),
             model: self.model.clone(),
-            messages: messages.to_vec(),
-            tools: tools.map(|t| t.to_vec()),
+            messages: call.messages.to_vec(),
+            tools: call.tools.map(<[Tool]>::to_vec),
             params: self.params.clone(),
-            item_aware_contract_version: messages_require_item_aware_contract(messages)
+            item_aware_contract_version: messages_require_item_aware_contract(call.messages)
                 .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
-            options: options.non_empty(),
+            options: call.options.non_empty(),
         }
     }
 
     pub fn build_stream_request<TRouterRef>(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        session_id: String,
-        request_id: String,
-        stream_router_ref: TRouterRef,
-        reconnect_grace_secs: u64,
-    ) -> ProviderStreamRequest<TRouterRef> {
-        self.build_stream_request_with_options(
-            messages,
-            tools,
-            &GenerationOptions::NONE,
-            session_id,
-            request_id,
-            stream_router_ref,
-            reconnect_grace_secs,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_stream_request_with_options<TRouterRef>(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        options: &GenerationOptions,
+        call: &ChatCall<'_>,
         session_id: String,
         request_id: String,
         stream_router_ref: TRouterRef,
@@ -120,8 +84,8 @@ impl RemoteProviderClientConfig {
         ProviderStreamRequest {
             provider: self.provider_name.clone(),
             model: self.model.clone(),
-            messages: messages.to_vec(),
-            tools: tools.map(|t| t.to_vec()),
+            messages: call.messages.to_vec(),
+            tools: call.tools.map(<[Tool]>::to_vec),
             session_id,
             request_id,
             stream_router_ref,
@@ -129,9 +93,9 @@ impl RemoteProviderClientConfig {
             heartbeat_interval_secs: self.heartbeat_interval_secs,
             lease_ttl_secs: self.lease_ttl_secs,
             params: self.params.clone(),
-            item_aware_contract_version: messages_require_item_aware_contract(messages)
+            item_aware_contract_version: messages_require_item_aware_contract(call.messages)
                 .then_some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
-            options: options.non_empty(),
+            options: call.options.non_empty(),
         }
     }
 }
@@ -173,14 +137,13 @@ mod tests {
             .with_stream_controls(5, 9);
         let messages = vec![ChatMessage::user().text("hello").build()];
 
-        let chat = config.build_chat_request(&messages, None);
+        let chat = config.build_chat_request(&ChatCall::new(&messages));
         assert_eq!(chat.provider, "demo");
         assert_eq!(chat.model, "m1");
         assert_eq!(chat.params, Some(json!({"temperature": 0.7})));
 
         let stream = config.build_stream_request(
-            &messages,
-            None,
+            &ChatCall::new(&messages),
             "session-1".to_string(),
             "request-1".to_string(),
             "router-ref",

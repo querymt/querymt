@@ -3,7 +3,7 @@
 
 use crate::{
     LLMProvider,
-    chat::{ChatInputPart, ChatMessage, ToolResult},
+    chat::{ChatCall, ChatInputPart, ChatMessage, ToolResult},
     completion::CompletionRequest,
     error::LLMError,
 };
@@ -225,8 +225,10 @@ impl<'a> MultiPromptChain<'a> {
                     const MAX_TOOL_ITERATIONS: usize = 5;
 
                     for _ in 0..MAX_TOOL_ITERATIONS {
-                        // Always use `chat_with_tools` to provide the tool definitions to the LLM.
-                        let response = llm.chat_with_tools(&step_messages, llm.tools()).await?;
+                        // Always offer the tool definitions to the LLM.
+                        let response = llm
+                            .chat(&ChatCall::new(&step_messages).maybe_tools(llm.tools()))
+                            .await?;
 
                         let response_text = response.text();
                         let tool_calls = response.executable_tool_calls();

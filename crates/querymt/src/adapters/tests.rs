@@ -1,7 +1,9 @@
 use super::*;
 use crate::auth::{ApiKeyResolver, static_key};
-use crate::chat::ChatProvider;
-use crate::chat::http::{ChatStreamParser, HTTPChatProvider};
+use crate::chat::http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest};
+use crate::chat::{
+    ChatCall, ChatCapabilities, ChatProvider, GenerationOptionSupport, GenerationOptions,
+};
 use crate::completion::http::HTTPCompletionProvider;
 use crate::embedding::http::HTTPEmbeddingProvider;
 use crate::error::LLMError;
@@ -52,23 +54,19 @@ struct ResolveAwareHttpProvider {
 }
 
 impl HTTPChatProvider for DummyHttpProvider {
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
+        _call: &ChatCall<'_>,
+        _stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
         Err(LLMError::NotImplemented("unused in test".into()))
     }
 
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
-        Err(LLMError::NotImplemented("unused in test".into()))
-    }
-
-    fn supports_streaming(&self) -> bool {
-        false
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn parse_chat(
+        &self,
+        _resp: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         Err(LLMError::NotImplemented("unused in test".into()))
     }
 }
@@ -104,30 +102,29 @@ impl HTTPLLMProvider for DummyHttpProvider {
 }
 
 impl HTTPChatProvider for ResolveAwareHttpProvider {
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
+        _call: &ChatCall<'_>,
+        _stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
         let token = self.resolver.current();
-        let req = Request::builder()
+        let request = Request::builder()
             .method("POST")
             .uri("https://example.invalid/chat")
             .header("authorization", format!("Bearer {token}"))
             .body(Vec::new())
             .map_err(|e| LLMError::InvalidRequest(format!("failed building request: {e}")))?;
-        Ok(req)
+        Ok(PreparedChatRequest {
+            request,
+            context: serde_json::Value::Null,
+        })
     }
 
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
-        Err(LLMError::NotImplemented("unused in test".into()))
-    }
-
-    fn supports_streaming(&self) -> bool {
-        false
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn parse_chat(
+        &self,
+        _resp: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         Err(LLMError::NotImplemented("unused in test".into()))
     }
 }
@@ -184,8 +181,9 @@ async fn ensure_credential_fresh_resolves_before_request_building() {
     assert_eq!(
         adapter
             .inner
-            .chat_request(&[], None)
+            .prepare_chat_request(&ChatCall::new(&[]), false)
             .expect("request should build")
+            .request
             .headers()
             .get("authorization")
             .expect("auth header should exist"),
@@ -201,8 +199,9 @@ async fn ensure_credential_fresh_resolves_before_request_building() {
     assert_eq!(
         adapter
             .inner
-            .chat_request(&[], None)
+            .prepare_chat_request(&ChatCall::new(&[]), false)
             .expect("request should build")
+            .request
             .headers()
             .get("authorization")
             .expect("auth header should exist"),
@@ -337,18 +336,21 @@ impl ChatStreamParser for StreamTestParser {
 impl HTTPChatProvider for StreamTestProvider {
     fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
+        _call: &ChatCall<'_>,
         stream: bool,
-    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
-        let request = self.chat_stream_request(messages, tools)?;
-        Ok(crate::chat::http::PreparedChatRequest {
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let request = Request::builder()
+            .method("POST")
+            .uri(&self.uri)
+            .body(Vec::new())
+            .map_err(|e| LLMError::InvalidRequest(e.to_string()))?;
+        Ok(PreparedChatRequest {
             request,
             context: serde_json::json!({"private": "decoder-state", "stream": stream}),
         })
     }
 
-    fn parse_chat_with_context(
+    fn parse_chat(
         &self,
         _response: Response<Vec<u8>>,
         context: serde_json::Value,
@@ -360,7 +362,7 @@ impl HTTPChatProvider for StreamTestProvider {
         Ok(ChatOutput::default())
     }
 
-    fn chat_stream_parser_with_context(
+    fn chat_stream_parser(
         &self,
         context: serde_json::Value,
     ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
@@ -368,7 +370,7 @@ impl HTTPChatProvider for StreamTestProvider {
             context,
             serde_json::json!({"private": "decoder-state", "stream": true})
         );
-        self.chat_stream_parser()
+        Ok(Box::new(StreamTestParser { mode: self.parser }))
     }
 
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> crate::error::LLMError {
@@ -383,36 +385,8 @@ impl HTTPChatProvider for StreamTestProvider {
         .into()
     }
 
-    fn chat_request(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        Err(LLMError::NotImplemented("unused".into()))
-    }
-
-    fn chat_stream_request(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        Request::builder()
-            .method("POST")
-            .uri(&self.uri)
-            .body(Vec::new())
-            .map_err(|e| LLMError::InvalidRequest(e.to_string()))
-    }
-
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
-        Err(LLMError::NotImplemented("unused".into()))
-    }
-
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(StreamTestParser { mode: self.parser }))
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
@@ -453,7 +427,7 @@ async fn stream_open_non_success_preserves_classification() {
     });
     let adapter = LLMProviderFromHTTP::new(inner);
 
-    let err = match adapter.chat_stream_with_tools(&[], None).await {
+    let err = match adapter.chat_stream(&ChatCall::new(&[])).await {
         Ok(_) => panic!("non-success stream open must fail before yielding a stream"),
         Err(e) => e,
     };
@@ -492,7 +466,7 @@ async fn stream_parser_finish_failure_preserves_classification() {
     let adapter = LLMProviderFromHTTP::new(inner);
 
     let mut stream = adapter
-        .chat_stream_with_tools(&[], None)
+        .chat_stream(&ChatCall::new(&[]))
         .await
         .expect("200 open should succeed");
 
@@ -533,7 +507,7 @@ async fn stream_parser_chunk_failure_preserves_classification() {
     let adapter = LLMProviderFromHTTP::new(inner);
 
     let mut stream = adapter
-        .chat_stream_with_tools(&[], None)
+        .chat_stream(&ChatCall::new(&[]))
         .await
         .expect("200 open should succeed");
 
@@ -564,71 +538,52 @@ async fn http_adapter_returns_private_context_to_non_streaming_decoder() {
         parser: StreamTestParserMode::Unused,
     }));
     adapter
-        .chat_with_tools(&[], None)
+        .chat(&ChatCall::new(&[]))
         .await
         .expect("context-aware decode");
 }
 
-/// Minimal HTTP provider whose options-aware preparation records what it saw.
+/// Minimal HTTP provider whose preparation records what it saw.
 struct OptionsRecordingProvider {
     uri: String,
     seen: Arc<std::sync::Mutex<Vec<(bool, GenerationOptions)>>>,
 }
 
-impl OptionsRecordingProvider {
-    fn request(&self) -> Result<Request<Vec<u8>>, LLMError> {
-        Request::builder()
-            .method("POST")
-            .uri(&self.uri)
-            .body(Vec::new())
-            .map_err(|e| LLMError::InvalidRequest(e.to_string()))
-    }
-}
-
 impl HTTPChatProvider for OptionsRecordingProvider {
-    fn supported_generation_options(&self) -> GenerationOptionSupport {
-        GenerationOptionSupport::ALL
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE
+            .with_streaming(true)
+            .with_options(GenerationOptionSupport::ALL)
     }
 
-    fn prepare_chat_request_with_options(
+    fn prepare_chat_request(
         &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
+        call: &ChatCall<'_>,
         stream: bool,
-        options: &GenerationOptions,
-    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
-        self.seen.lock().unwrap().push((stream, *options));
-        Ok(crate::chat::http::PreparedChatRequest {
-            request: self.request()?,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        self.seen.lock().unwrap().push((stream, call.options));
+        Ok(PreparedChatRequest {
+            request: Request::builder()
+                .method("POST")
+                .uri(&self.uri)
+                .body(Vec::new())
+                .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
             context: serde_json::Value::Null,
         })
     }
 
-    fn chat_request(
+    fn parse_chat(
         &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        self.request()
-    }
-
-    fn chat_stream_request(
-        &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        self.request()
-    }
-
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        _resp: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         Ok(ChatOutput::default())
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         Ok(Box::new(StreamTestParser {
             mode: StreamTestParserMode::Unused,
         }))
@@ -669,12 +624,9 @@ async fn http_adapter_forwards_options_to_prepare_chat_request() {
         .with_max_tokens(128_000)
         .with_reasoning_effort(crate::chat::ReasoningEffort::Low);
 
-    assert_eq!(
-        adapter.supported_generation_options(),
-        GenerationOptionSupport::ALL
-    );
+    assert_eq!(adapter.capabilities().options, GenerationOptionSupport::ALL);
     adapter
-        .chat_with_tools_and_options(&[], None, &options)
+        .chat(&ChatCall::new(&[]).options(options))
         .await
         .expect("chat with options");
 
@@ -697,7 +649,7 @@ async fn http_adapter_forwards_options_on_streaming_requests() {
     let options = GenerationOptions::default().with_max_tokens(64_000);
 
     let _events: Vec<_> = adapter
-        .chat_stream_with_tools_and_options(&[], None, &options)
+        .chat_stream(&ChatCall::new(&[]).options(options))
         .await
         .expect("stream open")
         .collect()
@@ -716,51 +668,46 @@ async fn http_adapter_without_options_prepares_with_empty_options() {
     }));
 
     adapter
-        .chat_with_tools(&[], None)
+        .chat(&ChatCall::new(&[]))
         .await
         .expect("chat without options");
 
     assert_eq!(*seen.lock().unwrap(), [(false, GenerationOptions::NONE)]);
 }
 
-/// Provider written before options existed: overrides only `prepare_chat_request`.
-struct LegacyPrepareProvider {
+/// Provider that honours no per-request options and ignores them.
+struct NoOptionsProvider {
     uri: String,
     prepare_calls: Arc<AtomicUsize>,
 }
 
-impl HTTPChatProvider for LegacyPrepareProvider {
+impl HTTPChatProvider for NoOptionsProvider {
     fn prepare_chat_request(
         &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
+        _call: &ChatCall<'_>,
         _stream: bool,
-    ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
+    ) -> Result<PreparedChatRequest, LLMError> {
         self.prepare_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(crate::chat::http::PreparedChatRequest {
+        Ok(PreparedChatRequest {
             request: Request::builder()
                 .method("POST")
                 .uri(&self.uri)
-                .body(b"legacy-body".to_vec())
+                .body(b"plain-body".to_vec())
                 .map_err(|e| LLMError::InvalidRequest(e.to_string()))?,
             context: serde_json::Value::Null,
         })
     }
 
-    fn chat_request(
+    fn parse_chat(
         &self,
-        _messages: &[ChatMessage],
-        _tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        Err(LLMError::NotImplemented("unused".into()))
-    }
-
-    fn parse_chat(&self, _resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        _resp: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         Ok(ChatOutput::default())
     }
 }
 
-impl HTTPCompletionProvider for LegacyPrepareProvider {
+impl HTTPCompletionProvider for NoOptionsProvider {
     fn complete_request(&self, _req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
         Err(LLMError::NotImplemented("unused".into()))
     }
@@ -770,7 +717,7 @@ impl HTTPCompletionProvider for LegacyPrepareProvider {
     }
 }
 
-impl HTTPEmbeddingProvider for LegacyPrepareProvider {
+impl HTTPEmbeddingProvider for NoOptionsProvider {
     fn embed_request(&self, _inputs: &[String]) -> Result<Request<Vec<u8>>, LLMError> {
         Err(LLMError::NotImplemented("unused".into()))
     }
@@ -780,28 +727,31 @@ impl HTTPEmbeddingProvider for LegacyPrepareProvider {
     }
 }
 
-impl HTTPLLMProvider for LegacyPrepareProvider {}
+impl HTTPLLMProvider for NoOptionsProvider {}
 
 #[tokio::test]
-async fn http_adapter_default_options_path_uses_legacy_prepare_chat_request() {
+async fn http_adapter_ignores_options_the_provider_does_not_honour() {
     let prepare_calls = Arc::new(AtomicUsize::new(0));
-    let adapter = LLMProviderFromHTTP::new(Box::new(LegacyPrepareProvider {
+    let adapter = LLMProviderFromHTTP::new(Box::new(NoOptionsProvider {
         uri: serve_once("HTTP/1.1 200 OK", &[], b"{}").await,
         prepare_calls: Arc::clone(&prepare_calls),
     }));
-    assert_eq!(
-        adapter.supported_generation_options(),
-        GenerationOptionSupport::NONE
-    );
+    assert_eq!(adapter.capabilities(), ChatCapabilities::NONE);
 
-    // Options are ignored by a provider that does not honour them, and the
-    // legacy preparation hook still builds the request.
+    // The request still succeeds; the provider simply does not use the option.
     let options = GenerationOptions::default().with_max_tokens(128_000);
     adapter
-        .chat_with_tools_and_options(&[], None, &options)
+        .chat(&ChatCall::new(&[]).options(options))
         .await
         .expect("options ignored");
     assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+
+    let err = adapter
+        .chat_stream(&ChatCall::new(&[]))
+        .await
+        .err()
+        .expect("streaming is not advertised");
+    assert!(matches!(err, LLMError::NotImplemented(_)));
 }
 
 #[tokio::test]
@@ -851,7 +801,7 @@ async fn http_adapter_frames_split_utf8_json_and_sse_once() {
         parser: StreamTestParserMode::SemanticSse,
     }));
     let events: Vec<StreamChunk> = adapter
-        .chat_stream_with_tools(&[], None)
+        .chat_stream(&ChatCall::new(&[]))
         .await
         .expect("stream open")
         .map(|result| result.expect("semantic event"))

@@ -27,9 +27,9 @@ use futures_util::future::join_all;
 use log::{debug, trace, warn};
 use querymt::ToolCall;
 use querymt::chat::{
-    CacheHint, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputItem, ChatOutputStatus,
-    ChatRole, ChatStreamAccumulator, ChatStreamAccumulatorError, ChatStreamFinish, FinishReason,
-    ReasoningPartKind, StreamChunk, StructuredStreamEvent,
+    CacheHint, ChatCall, ChatMessage, ChatMessagePartDelta, ChatOutput, ChatOutputItem,
+    ChatOutputStatus, ChatRole, ChatStreamAccumulator, ChatStreamAccumulatorError,
+    ChatStreamFinish, FinishReason, ReasoningPartKind, StreamChunk, StructuredStreamEvent,
 };
 use querymt::error::LLMError;
 use querymt::error::{ProviderErrorKind, ProviderFailure};
@@ -691,8 +691,9 @@ pub(super) async fn transition_call_llm(
                 let messages_with_cache = &messages_with_cache;
                 let cancel = cancel.clone();
                 async move {
+                    let call = ChatCall::new(messages_with_cache).options(options);
                     tokio::select! {
-                        result = session_handle.submit_request_with_options(messages_with_cache, options) => {
+                        result = session_handle.submit_request(&call) => {
                             result
                         }
                         _ = cancel.cancelled() => {
@@ -742,7 +743,7 @@ pub(super) async fn transition_call_llm(
         };
 
         session_handle.record_generation_settings(&chat_span);
-        if provider.supports_streaming() {
+        if provider.capabilities().streaming {
             tracing::Span::current().record("gen_ai.request.stream", true);
             // === STREAMING PATH (all capable providers) ===
             let message_id = Uuid::new_v4().to_string();
@@ -868,10 +869,10 @@ pub(super) async fn transition_call_llm(
 
                 first_chunk.start();
                 let mut stream = match provider
-                    .chat_stream_with_tools_and_options(
-                        messages_with_cache,
-                        Some(tools.as_ref()),
-                        &options,
+                    .chat_stream(
+                        &ChatCall::new(messages_with_cache)
+                            .tools(tools.as_ref())
+                            .options(options),
                     )
                     .await
                 {
@@ -1245,11 +1246,14 @@ pub(super) async fn transition_call_llm(
                     let provider = &provider;
                     let messages_with_cache = &messages_with_cache;
                     let tools = tools.as_ref();
-                    let options = &options;
+                    let options = options;
                     let cancel = cancel.clone();
                     async move {
+                        let call = ChatCall::new(messages_with_cache)
+                            .tools(tools)
+                            .options(options);
                         tokio::select! {
-                            result = provider.chat_with_tools_and_options(messages_with_cache, Some(tools), options) => {
+                            result = provider.chat(&call) => {
                                 result
                             }
                             _ = cancel.cancelled() => {
@@ -2230,36 +2234,13 @@ mod tests {
 
         #[async_trait::async_trait]
         impl querymt::chat::ChatProvider for TimedProvider {
-            fn supports_streaming(&self) -> bool {
-                self.streaming
+            fn capabilities(&self) -> querymt::chat::ChatCapabilities {
+                querymt::chat::ChatCapabilities::NONE
+                    .with_streaming(self.streaming)
+                    .with_options(*self.support.lock().unwrap())
             }
-            fn supported_generation_options(&self) -> querymt::chat::GenerationOptionSupport {
-                *self.support.lock().unwrap()
-            }
-            async fn chat_with_tools_and_options(
-                &self,
-                messages: &[ChatMessage],
-                tools: Option<&[querymt::chat::Tool]>,
-                options: &querymt::chat::GenerationOptions,
-            ) -> Result<ChatOutput, LLMError> {
-                self.options_seen.lock().unwrap().push(*options);
-                self.chat_with_tools(messages, tools).await
-            }
-            async fn chat_stream_with_tools_and_options(
-                &self,
-                messages: &[ChatMessage],
-                tools: Option<&[querymt::chat::Tool]>,
-                options: &querymt::chat::GenerationOptions,
-            ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
-            {
-                self.options_seen.lock().unwrap().push(*options);
-                self.chat_stream_with_tools(messages, tools).await
-            }
-            async fn chat_with_tools(
-                &self,
-                _: &[ChatMessage],
-                _: Option<&[querymt::chat::Tool]>,
-            ) -> Result<ChatOutput, LLMError> {
+            async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+                self.options_seen.lock().unwrap().push(call.options);
                 Ok(ChatOutput::from_projections(
                     None,
                     Some("SECRET_RESPONSE".into()),
@@ -2268,12 +2249,11 @@ mod tests {
                     Some(FinishReason::Stop),
                 ))
             }
-            async fn chat_stream_with_tools(
+            async fn chat_stream(
                 &self,
-                _: &[ChatMessage],
-                _: Option<&[querymt::chat::Tool]>,
-            ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
-            {
+                call: &ChatCall<'_>,
+            ) -> Result<querymt::chat::ChatStream, LLMError> {
+                self.options_seen.lock().unwrap().push(call.options);
                 self.clock
                     .lock()
                     .unwrap()

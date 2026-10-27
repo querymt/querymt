@@ -44,7 +44,7 @@ pub trait RemoteProviderBackend: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, Tool};
+    use querymt::chat::{ChatCall, ChatOutput, ChatProvider};
     use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
@@ -58,31 +58,7 @@ mod tests {
 
     #[async_trait]
     impl ChatProvider for DummyProvider {
-        fn supports_streaming(&self) -> bool {
-            false
-        }
-
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
-            Err(LLMError::NotImplemented("dummy".into()))
-        }
-
-        async fn chat_stream_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<
-            std::pin::Pin<
-                Box<
-                    dyn futures_util::Stream<Item = Result<querymt::chat::StreamChunk, LLMError>>
-                        + Send,
-                >,
-            >,
-            LLMError,
-        > {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             Err(LLMError::NotImplemented("dummy".into()))
         }
     }

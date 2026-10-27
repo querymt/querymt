@@ -12,7 +12,7 @@ use kameo::Actor;
 use kameo::message::{Context, Message};
 use kameo::remote::_internal;
 use parking_lot::Mutex;
-use querymt::chat::StreamChunk;
+use querymt::chat::{ChatCall, StreamChunk};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -173,15 +173,23 @@ impl Message<GetProviderContractInfo> for ProviderHostActor {
 
     async fn handle(
         &mut self,
-        _msg: GetProviderContractInfo,
+        msg: GetProviderContractInfo,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
+        // Report what the provider built for this request honours, not a
+        // blanket claim: callers use it to decide which options to send.
+        let provider = build_provider_for_request(
+            self.backend.as_ref(),
+            &msg.provider,
+            &msg.model,
+            msg.params.as_ref(),
+        )
+        .await
+        .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
         Ok(ProviderContractInfo {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
-            // The host forwards options to whichever provider it builds for the
-            // request; providers that do not honour an option ignore it.
-            generation_options: querymt::chat::GenerationOptionSupport::ALL,
+            capabilities: provider.capabilities(),
         })
     }
 }
@@ -221,12 +229,13 @@ impl Message<ProviderChatRequest> for ProviderHostActor {
             .await
             .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
-            let tools_slice = msg.tools.as_deref();
-            let options = msg.options.unwrap_or_default();
+            let call = ChatCall::new(&msg.messages)
+                .maybe_tools(msg.tools.as_deref())
+                .options(msg.options.unwrap_or_default());
             let response = provider
-                .chat_with_tools_and_options(&msg.messages, tools_slice, &options)
+                .chat(&call)
                 .await
-                .map_err(|e| RemoteProviderHostError::provider_chat("chat_with_tools", &e))?;
+                .map_err(|e| RemoteProviderHostError::provider_chat("chat", &e))?;
 
             let tool_calls = response.tool_calls().unwrap_or_default();
             let finish_reason = response.finish_reason.map(|r| format!("{:?}", r));
@@ -323,14 +332,13 @@ impl Message<ProviderStreamRequest<kameo::actor::RemoteActorRef<crate::ProviderS
                 .await
                 .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
 
-                let tools_slice = msg.tools.as_deref();
-                let options = msg.options.unwrap_or_default();
+                let call = ChatCall::new(&msg.messages)
+                    .maybe_tools(msg.tools.as_deref())
+                    .options(msg.options.unwrap_or_default());
                 let stream = provider
-                    .chat_stream_with_tools_and_options(&msg.messages, tools_slice, &options)
+                    .chat_stream(&call)
                     .await
-                    .map_err(|e| {
-                        RemoteProviderHostError::provider_chat("chat_stream_with_tools", &e)
-                    })?;
+                    .map_err(|e| RemoteProviderHostError::provider_chat("chat_stream", &e))?;
 
                 Ok::<_, RemoteProviderHostError>((provider, stream))
             }
@@ -860,7 +868,8 @@ mod tests {
     use kameo::actor::Spawn;
     use querymt::LLMProvider;
     use querymt::chat::{
-        ChatMessage, ChatOutput, ChatProvider, GenerationOptionSupport, GenerationOptions, Tool,
+        ChatCall, ChatCapabilities, ChatOutput, ChatProvider, GenerationOptionSupport,
+        GenerationOptions,
     };
     use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use querymt::embedding::EmbeddingProvider;
@@ -876,27 +885,13 @@ mod tests {
 
     #[async_trait]
     impl ChatProvider for RecordingProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
-            self.seen.lock().push(GenerationOptions::NONE);
+        async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+            self.seen.lock().push(call.options);
             Ok(ChatOutput::default())
         }
 
-        fn supported_generation_options(&self) -> GenerationOptionSupport {
-            GenerationOptionSupport::ALL
-        }
-
-        async fn chat_with_tools_and_options(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-            options: &GenerationOptions,
-        ) -> Result<ChatOutput, LLMError> {
-            self.seen.lock().push(*options);
-            Ok(ChatOutput::default())
+        fn capabilities(&self) -> ChatCapabilities {
+            ChatCapabilities::NONE.with_options(GenerationOptionSupport::ALL)
         }
     }
 
@@ -978,16 +973,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn contract_info_advertises_generation_option_support() {
+    async fn contract_info_reports_the_built_providers_capabilities() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let actor =
             ProviderHostActor::spawn(ProviderHostActor::new(Arc::new(RecordingBackend { seen })));
 
         let info = actor
-            .ask(GetProviderContractInfo)
+            .ask(GetProviderContractInfo {
+                provider: "demo".into(),
+                model: "m1".into(),
+                params: None,
+            })
             .await
             .expect("contract info");
 
-        assert_eq!(info.generation_options, GenerationOptionSupport::ALL);
+        assert_eq!(info.capabilities.options, GenerationOptionSupport::ALL);
     }
 }

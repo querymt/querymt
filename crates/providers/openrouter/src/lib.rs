@@ -7,8 +7,9 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider,
     chat::{
-        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatOutput, StreamChunk, StructuredOutputFormat, Tool,
+        ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -234,25 +235,26 @@ impl HTTPChatProvider for OpenRouter {
         classify_openai_http_error_with(response, Some(classify_openrouter_error))
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        openai_chat_request(self, messages, tools)
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let request = if stream {
+            let mut cfg = self.clone();
+            cfg.stream = Some(true);
+            openai_chat_request(&cfg, call.messages, call.tools)
+        } else {
+            openai_chat_request(self, call.messages, call.tools)
+        }?;
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn chat_stream_request(
+    fn parse_chat(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut cfg = self.clone();
-        cfg.stream = Some(true);
-        openai_chat_request(&cfg, messages, tools)
-    }
-
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         openai_parse_chat_with(
             self,
             normalize_openrouter_chat_error_response(response),
@@ -260,12 +262,15 @@ impl HTTPChatProvider for OpenRouter {
         )
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(OpenRouterStreamParser::default()))
     }
 
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(OpenRouterStreamParser::default()))
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
@@ -399,7 +404,7 @@ mod extism_exports {
 mod tests {
     use super::{OpenRouter, OpenRouterFactory};
     use http::Response;
-    use querymt::chat::{StreamChunk, http::HTTPChatProvider};
+    use querymt::chat::{ChatCall, StreamChunk, http::HTTPChatProvider};
     use querymt::{
         error::{LLMError, ProviderErrorKind},
         plugin::HTTPLLMProviderFactory,
@@ -427,7 +432,7 @@ mod tests {
 
     #[test]
     fn supports_streaming() {
-        assert!(test_provider().supports_streaming());
+        assert!(test_provider().capabilities().streaming);
     }
 
     #[test]
@@ -435,7 +440,8 @@ mod tests {
         let provider = test_provider();
 
         let req = provider
-            .chat_stream_request(&[], None)
+            .prepare_chat_request(&ChatCall::new(&[]).maybe_tools(None), true)
+            .map(|p| p.request)
             .expect("stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
@@ -444,7 +450,7 @@ mod tests {
     fn parse_stream_error(error: Value) -> LLMError {
         let provider = test_provider();
         let mut parser = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("parser should initialize");
         let chunk = format!("data: {}\n\n", serde_json::json!({ "error": error }));
         parser
@@ -534,7 +540,7 @@ mod tests {
             .unwrap();
 
         let error = provider
-            .parse_chat(response)
+            .parse_chat(response, serde_json::Value::Null)
             .err()
             .expect("HTTP 200 error body should fail");
         assert!(matches!(
@@ -558,7 +564,7 @@ mod tests {
             .unwrap();
 
         let error = provider
-            .parse_chat(response)
+            .parse_chat(response, serde_json::Value::Null)
             .err()
             .expect("choice-level error should fail");
         assert!(matches!(
@@ -574,10 +580,10 @@ mod tests {
         let provider = test_provider();
 
         let mut parser_a = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("parser A should initialize");
         let mut parser_b = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("parser B should initialize");
 
         let a_delta = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}

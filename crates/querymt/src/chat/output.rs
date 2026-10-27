@@ -1250,7 +1250,7 @@ impl ChatMessagePayload {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::{ChatMessage, ChatProvider, Tool};
+    use crate::chat::ChatProvider;
     use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use crate::embedding::EmbeddingProvider;
     use crate::error::LLMError;
@@ -1601,11 +1601,7 @@ mod tests {
 
     #[async_trait]
     impl ChatProvider for LimitedProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &crate::chat::ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             Ok(ChatOutput::from_projections(
                 None,
                 Some("legacy text".into()),
@@ -1644,7 +1640,10 @@ mod tests {
     #[tokio::test]
     async fn legacy_provider_remains_usable_through_dyn_llm_provider() {
         let provider: &dyn crate::LLMProvider = &LimitedProvider;
-        let output = provider.chat(&[]).await.unwrap();
+        let output = provider
+            .chat(&crate::chat::ChatCall::new(&[]))
+            .await
+            .unwrap();
 
         assert!(!output.requires_item_aware_fidelity());
         assert_eq!(output.text().as_deref(), Some("legacy text"));
