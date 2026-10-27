@@ -58,14 +58,18 @@ pub(crate) struct SessionSingleFlightGuard {
 impl Drop for SessionSingleFlightGuard {
     fn drop(&mut self) {
         // Remove the per-session lock once the last materialization waiter finishes.
-        if Arc::strong_count(&self.lock) == 3 {
-            let mut inflight = self.inflight.lock().unwrap();
-            if inflight
+        //
+        // The count check must happen while holding the `inflight` lock:
+        // `acquire_session_lock` clones the entry under that same lock, so the
+        // count cannot grow between the check and the removal.
+        // 3 = map entry + `self.lock` + the Arc held by `_guard`.
+        let mut inflight = self.inflight.lock().unwrap();
+        if Arc::strong_count(&self.lock) == 3
+            && inflight
                 .get(&self.session_id)
                 .is_some_and(|entry| Arc::ptr_eq(entry, &self.lock))
-            {
-                inflight.remove(&self.session_id);
-            }
+        {
+            inflight.remove(&self.session_id);
         }
     }
 }
@@ -1548,14 +1552,17 @@ impl SessionMaterializer {
                 .await
                 .map_err(|e| Error::internal_error().data(e.to_string()))?;
             for notice in hook_result.notices {
-                self.config.emit_event(
-                    &prepared.session_id,
-                    crate::events::AgentEventKind::HookNotice {
-                        event_name: notice.event_name,
-                        message: notice.message,
-                        is_error: notice.is_error,
-                    },
-                );
+                self.config
+                    .emit_event_persisted(
+                        &prepared.session_id,
+                        crate::events::AgentEventKind::HookNotice {
+                            event_name: notice.event_name,
+                            message: notice.message,
+                            is_error: notice.is_error,
+                        },
+                    )
+                    .await
+                    .map_err(|e| Error::internal_error().data(e.to_string()))?;
             }
             if let Some(stop_reason) = hook_result.stop_reason {
                 log::warn!(
@@ -1577,16 +1584,19 @@ impl SessionMaterializer {
             let context_limit =
                 crate::model_info::get_model_info(&llm_config.provider, &llm_config.model)
                     .and_then(|m| m.context_limit());
-            self.config.emit_event(
-                &prepared.session_id,
-                crate::events::AgentEventKind::ProviderChanged {
-                    provider: llm_config.provider.clone(),
-                    model: llm_config.model.clone(),
-                    config_id: llm_config.id,
-                    context_limit,
-                    provider_node_id: None,
-                },
-            );
+            self.config
+                .emit_event_persisted(
+                    &prepared.session_id,
+                    crate::events::AgentEventKind::ProviderChanged {
+                        provider: llm_config.provider.clone(),
+                        model: llm_config.model.clone(),
+                        config_id: llm_config.id,
+                        context_limit,
+                        provider_node_id: None,
+                    },
+                )
+                .await
+                .map_err(|e| Error::internal_error().data(e.to_string()))?;
         }
 
         // Background: initialize workspace index (only if the path exists on this machine)
@@ -1621,23 +1631,17 @@ impl SessionMaterializer {
             .map(crate::config::McpServerConfig::from_acp)
             .map(crate::events::McpServerInfo::from)
             .collect();
-        self.config.emit_event(
-            &prepared.session_id,
-            crate::events::AgentEventKind::SessionConfigured {
-                cwd: prepared.cwd.clone(),
-                mcp_servers,
-                limits: self.config.get_session_limits(),
-            },
-        );
-
-        // The setup events above are queued, not awaited. Wait until they are
-        // persisted so callers that await finalization (create, load, resume)
-        // never read a history that is still missing them.
         self.config
-            .event_sink
-            .session_stream(&prepared.session_id)
-            .flush()
-            .await;
+            .emit_event_persisted(
+                &prepared.session_id,
+                crate::events::AgentEventKind::SessionConfigured {
+                    cwd: prepared.cwd.clone(),
+                    mcp_servers,
+                    limits: self.config.get_session_limits(),
+                },
+            )
+            .await
+            .map_err(|e| Error::internal_error().data(e.to_string()))?;
 
         Ok(())
     }
