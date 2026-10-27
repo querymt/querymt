@@ -1383,6 +1383,10 @@ impl AgentSessions {
     pub async fn delete(&self, session_id: impl AsRef<str>) -> Result<()> {
         let session_id = session_id.as_ref().to_string();
         let store = self.session_store();
+        // Tear down the session's actor first (best-effort, routed to the
+        // runtime the session is bound to) so no idle actor can start a run,
+        // or recreate the run lease file, once the row is gone.
+        let _ = self.agent.terminate_session(&session_id).await;
         // Remove the durable remote bookmark first: if that fails, return
         // early with the session row intact instead of deleting the row and
         // leaving a dangling bookmark behind.

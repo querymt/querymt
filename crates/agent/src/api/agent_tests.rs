@@ -663,6 +663,23 @@ async fn delete_session_clears_delegate_model_overrides() -> Result<()> {
 }
 
 #[tokio::test]
+async fn delete_loaded_idle_session_does_not_wait_for_stop_grace() -> Result<()> {
+    let agent = test_agent().await?;
+    let session_id = agent.create_session().await?;
+
+    let started = std::time::Instant::now();
+    agent.sessions().delete(&session_id).await?;
+
+    // Stop escalation allows 3s; deleting an idle session must not pay it.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "delete took {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn acp_list_sessions_orders_by_updated_at_and_paginates() -> Result<()> {
     let agent = test_agent().await?;
     let session_store = agent.storage_backend().session_store();

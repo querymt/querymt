@@ -5,6 +5,8 @@ use super::*;
 /// runs under the registry lock.
 const UNLOAD_STATUS_MAILBOX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const UNLOAD_STATUS_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const STOP_LOCAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+const STOP_REMOTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl LocalAgentHandle {
     pub(super) async fn bound_session_handle(
@@ -104,6 +106,47 @@ impl LocalAgentHandle {
         self.stop_session_in_runtime(session_id).await
     }
 
+    /// Tear down `session_id`'s local actor for deletion: no graceful-stop
+    /// wait, no stop events. Cancelling and shutting the actor down is enough
+    /// because nothing will read the run's outcome once the session is gone.
+    /// Routed to the bound runtime like [`Self::stop_session`]. Remote-hosted
+    /// sessions keep the full stop protocol; unloaded sessions are a no-op.
+    pub(crate) async fn terminate_session(&self, session_id: &str) -> Result<(), Error> {
+        if let Some((session_handle, binding)) = self.bound_session_handle(session_id).await? {
+            let local_handle = session_handle
+                .as_any()
+                .downcast_ref::<LocalAgentHandle>()
+                .ok_or_else(|| {
+                    Error::internal_error().data(serde_json::json!({
+                        "message": "bound session runtime is not local",
+                        "sessionId": session_id,
+                        "profileId": binding.profile_id,
+                        "agentId": binding.agent_id,
+                    }))
+                })?;
+            return Box::pin(local_handle.terminate_session_in_runtime(session_id)).await;
+        }
+        self.terminate_session_in_runtime(session_id).await
+    }
+
+    async fn terminate_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
+        let removed = {
+            let mut registry = self.registry.lock().await;
+            match registry.get(session_id) {
+                None => return Ok(()),
+                Some(session) if session.is_remote() => None,
+                Some(_) => registry.remove(session_id),
+            }
+        };
+        let Some(session_ref) = removed else {
+            return self.stop_session_in_runtime(session_id).await;
+        };
+        if let Err(err) = session_ref.shutdown().await {
+            tracing::warn!(session_id, error = %err, "failed to shut down deleted session actor");
+        }
+        Ok(())
+    }
+
     /// Unload `session_id`'s actor when it is loaded and idle, without
     /// cancelling anything. Returns `Ok(true)` when the session is busy (a
     /// running turn, queued or steered input, or a remote host) and was left
@@ -191,7 +234,26 @@ impl LocalAgentHandle {
             .emit_event(session_id, AgentEventKind::SessionStopRequested);
         let _ = session_ref.cancel().await;
 
-        tokio::time::sleep(STOP_ESCALATION_TIMEOUT).await;
+        // Give the cancelled run up to STOP_ESCALATION_TIMEOUT to wind down,
+        // returning as soon as the session is idle. The mailbox is ordered, so
+        // the first status already reflects the cancel above.
+        let poll_interval = if session_ref.is_remote() {
+            STOP_REMOTE_POLL_INTERVAL
+        } else {
+            STOP_LOCAL_POLL_INTERVAL
+        };
+        let deadline = tokio::time::Instant::now() + STOP_ESCALATION_TIMEOUT;
+        loop {
+            let idle = matches!(
+                session_ref.get_runtime_status().await,
+                Ok(status) if status.phase == SessionRuntimePhase::Idle
+            );
+            let now = tokio::time::Instant::now();
+            if idle || now >= deadline {
+                break;
+            }
+            tokio::time::sleep(poll_interval.min(deadline - now)).await;
+        }
 
         let status = session_ref
             .get_runtime_status()

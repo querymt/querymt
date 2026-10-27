@@ -263,6 +263,82 @@ async fn reconcile_on_stop_of_unloaded_session_closes_orphaned_run() {
 }
 
 #[tokio::test]
+async fn stop_of_idle_loaded_session_returns_without_full_grace_wait() {
+    let f = HandleFixture::new().await;
+    let session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    register_test_session(&f, &session.public_id).await;
+
+    let started = std::time::Instant::now();
+    f.handle
+        .stop_session_in_runtime(&session.public_id)
+        .await
+        .expect("stop idle session");
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "stop took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&session.public_id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn terminate_session_removes_and_shuts_down_the_actor() {
+    let f = HandleFixture::new().await;
+    let session = f
+        .handle
+        .config
+        .provider
+        .history_store()
+        .create_session(None, None, None, None)
+        .await
+        .expect("create session");
+    register_test_session(&f, &session.public_id).await;
+    let session_ref = f
+        .handle
+        .registry
+        .lock()
+        .await
+        .get(&session.public_id)
+        .cloned()
+        .expect("registered");
+
+    f.handle
+        .terminate_session(&session.public_id)
+        .await
+        .expect("terminate");
+
+    assert!(
+        f.handle
+            .registry
+            .lock()
+            .await
+            .get(&session.public_id)
+            .is_none()
+    );
+    assert!(session_ref.get_runtime_status().await.is_err());
+    // Unloaded sessions are a no-op.
+    f.handle
+        .terminate_session(&session.public_id)
+        .await
+        .expect("terminate unloaded");
+}
+
+#[tokio::test]
 async fn run_lease_file_removed_on_delete_only_when_free() {
     let f = RealStorageHandleFixture::new().await;
     let root = crate::session::run_lease::RunLeaseRoot::new(

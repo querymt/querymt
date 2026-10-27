@@ -457,8 +457,8 @@ async fn test_load_config_path_with_profile_metadata_resolves_file_references() 
     let prompt_path = prompt_dir.join(prompt_file);
     let config_path = temp_config_path("profile-single");
     let config = format!(
-        "[profile]\nid = \"file-profile\"\n\n[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = \"{}\" }}]\n",
-        prompt_path.display()
+        "[profile]\nid = \"file-profile\"\n\n[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = {} }}]\n",
+        crate::test_utils::toml_path_value(&prompt_path)
     );
     std::fs::write(&config_path, config).expect("failed to write temp config");
 
@@ -484,8 +484,8 @@ async fn test_load_config_path_resolves_file_references() {
     let prompt_path = prompt_dir.join(prompt_file);
     let config_path = temp_config_path("single");
     let config = format!(
-        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = \"{}\" }}]\n",
-        prompt_path.display()
+        "[agent]\nprovider = \"test\"\nmodel = \"test-model\"\ntools = []\nsystem = [{{ file = {} }}]\n",
+        crate::test_utils::toml_path_value(&prompt_path)
     );
     std::fs::write(&config_path, config).expect("failed to write temp config");
 

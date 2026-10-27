@@ -13,7 +13,8 @@ use crate::session::run_lease::RunLeaseRoot;
 /// unmatched `run_started` events, e.g. after repeated crashes).
 const MAX_RUNS_PER_RECONCILE: usize = 64;
 
-/// Close every orphaned run of the session. Best-effort: failures are logged
+/// Close the orphaned runs of the session, up to [`MAX_RUNS_PER_RECONCILE`] per
+/// call; any remainder is closed by the next call. Best-effort: failures are logged
 /// and never propagated, so a load, cancel or stop is never blocked by it.
 ///
 /// Returns the run ids that were closed, most recent first.

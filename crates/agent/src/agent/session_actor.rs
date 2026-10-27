@@ -262,6 +262,19 @@ impl Actor for SessionActor {
             }
             _ => warn!("SessionActor {} stopped: {}", self.session_id, reason),
         }
+        // A stopped actor must not leave work behind. Cancelling the current
+        // token ends a run that is still winding down, and dropping the queued
+        // prompts keeps a finished run from starting the next one. Releasing
+        // the lease here (kameo reports shutdown complete before the actor
+        // itself is dropped) means it is free once `shutdown()` returns; an
+        // unmatched `run_started` is then closed by reconciliation.
+        self.turn_state.token.cancel();
+        for queued in self.queued_prompts.drain(..) {
+            let _ = queued
+                .reply
+                .send(Ok(PromptResponse::new(StopReason::Cancelled)));
+        }
+        self.run_lease = None;
         self.config
             .event_sink
             .retire_session_stream(&self.session_id)
@@ -473,6 +486,23 @@ impl SessionActor {
             .await
         {
             Ok(Some(lease)) => {
+                // A delete may have completed while this acquisition waited
+                // out the grace period. Re-check under the lease so a deleted
+                // session never starts a run (and never recreates its lease
+                // file). Lookup failures are not treated as deletion.
+                if matches!(
+                    self.config
+                        .provider
+                        .history_store()
+                        .get_session(&self.session_id)
+                        .await,
+                    Ok(None)
+                ) {
+                    drop(lease);
+                    return Err(AgentError::SessionNotFound {
+                        session_id: self.session_id.clone(),
+                    });
+                }
                 self.run_lease = Some(lease);
                 Ok(())
             }
@@ -3473,6 +3503,7 @@ mod tests {
         intent_writes: Arc<AtomicUsize>,
         history_writes: Arc<AtomicUsize>,
         lease_dir: tempfile::TempDir,
+        session_deleted: Arc<AtomicBool>,
     }
 
     impl ActorFixture {
@@ -3568,9 +3599,17 @@ mod tests {
             let history_writes = Arc::new(AtomicUsize::new(0));
             let current_intent = Arc::new(std::sync::Mutex::new(None));
             let session_clone = session.clone();
+            let session_deleted = Arc::new(AtomicBool::new(false));
+            let deleted_for_get = session_deleted.clone();
             store
                 .expect_get_session()
-                .returning(move |_| Ok(Some(session_clone.clone())))
+                .returning(move |_| {
+                    if deleted_for_get.load(Ordering::SeqCst) {
+                        Ok(None)
+                    } else {
+                        Ok(Some(session_clone.clone()))
+                    }
+                })
                 .times(0..);
             let llm_for_mock = llm_config.clone();
             store
@@ -3685,6 +3724,7 @@ mod tests {
                 intent_writes,
                 history_writes,
                 lease_dir,
+                session_deleted,
             }
         }
     }
@@ -3796,6 +3836,29 @@ mod tests {
         assert!(f.run_lifecycle().await.is_empty());
         let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
         assert_eq!(status, SessionRuntimeStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn deleted_session_does_not_start_a_run_or_keep_the_lease() {
+        let f = ActorFixture::new().await;
+        f.session_deleted.store(true, Ordering::SeqCst);
+
+        let result = f.actor_ref.ask(text_submit(&f._session_id, "hi")).await;
+        assert!(matches!(
+            result,
+            Err(kameo::error::SendError::HandlerError(
+                AgentError::SessionNotFound { .. }
+            ))
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(f.run_lifecycle().await.is_empty());
+        assert!(
+            f.lease_root()
+                .try_acquire(&f._session_id)
+                .unwrap()
+                .is_some(),
+            "lease must be released when the session no longer exists"
+        );
     }
 
     #[tokio::test]
@@ -5533,6 +5596,33 @@ mod tests {
         // After shutdown, the actor should no longer accept messages
         let result = f.actor_ref.ask(GetMode).await;
         assert!(result.is_err(), "actor should be stopped after Shutdown");
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_run_lease_before_returning() {
+        let f = ActorFixture::new().await;
+        let started = f
+            .actor_ref
+            .ask(text_submit(&f._session_id, "hi"))
+            .await
+            .expect("submit");
+        assert!(matches!(started, SubmitInputResult::Started { .. }));
+
+        f.actor_ref.tell(Shutdown).await.expect("tell Shutdown");
+        f.actor_ref
+            .wait_for_shutdown_result()
+            .await
+            .expect("actor shut down");
+
+        // The lease is dropped in on_stop, so it is free as soon as shutdown
+        // is reported (a delete can then remove the lease file).
+        assert!(
+            f.lease_root()
+                .try_acquire(&f._session_id)
+                .unwrap()
+                .is_some(),
+            "stopped actor must not keep the run lease"
+        );
     }
 
     #[tokio::test]

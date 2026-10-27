@@ -299,7 +299,7 @@ impl LocalAgentHandle {
 
         // Closing is best-effort: deleting persisted history is the primary intent.
         // Route through the session binding so delegated runtimes are released too.
-        let _ = self.stop_session(&session_id).await;
+        let _ = self.terminate_session(&session_id).await;
         if let Err(error) = self.run_session_end_hook(&session_id, "delete").await {
             tracing::warn!(session_id, %error, "session_end hook failed during delete");
         }
