@@ -321,6 +321,7 @@ impl LocalAgentHandle {
         store.delete_session(&session_id).await.map_err(|e| {
             Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
         })?;
+        self.config.remove_run_lease_file(&session_id);
         if store.supports_session_pins() {
             crate::control::notifications::emit_session_pins_changed_notification(
                 self,

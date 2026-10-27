@@ -119,3 +119,42 @@ jobs:
           verbose: true
           fail_ci_if_error: false
 
+  # Job 4: Run leases and orphaned-run reconciliation rely on OS file locks,
+  # whose crash-release semantics differ on Windows.
+  test-windows-run-lease:
+    name: Run lease tests (Windows)
+    runs-on: windows-latest
+    needs: [format, clippy]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          key: agent-test-windows
+
+      - name: Prepare embedded dashboard fixture
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP 'dashboard-ui'
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Set-Content -Path (Join-Path $dist 'index.html') -Value '<!doctype html><title>QueryMT</title>'
+          Set-Content -Path (Join-Path $dist 'querymt-ui.json') -Value '{"revision":"ci","target":"embedded","acpWebSocketPath":"/acp/ws"}'
+          "QMT_UI_DIST=$dist" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run lease, reconciliation and incident tests
+        shell: bash
+        # Lease, reconciliation and incident tests are named `run_lease_*`,
+        # `reconcile_*` or `*orphan*`, or live in the run_lease/run_reconcile modules.
+        run: >
+          cargo nextest run -p querymt-agent --lib --features "${features}"
+          -E 'test(/run_lease|run_reconcile|reconcile_|orphan|last_unfinished_run/)'
+

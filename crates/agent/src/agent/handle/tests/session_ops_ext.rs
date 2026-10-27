@@ -226,6 +226,78 @@ async fn querymt_session_lifecycle_ext_rejects_empty_and_null_patches() {
 }
 
 #[tokio::test]
+async fn reconcile_on_stop_of_unloaded_session_closes_orphaned_run() {
+    use crate::session::projection::EventJournal;
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = f
+        .storage
+        .create_session(None, None, None, None)
+        .await
+        .expect("create local session")
+        .public_id;
+    crate::session::run_reconcile::tests::seed(
+        &f.storage,
+        &session_id,
+        crate::session::run_reconcile::tests::started("orphan"),
+    )
+    .await;
+
+    // The session is not in the registry, so Stop must reconcile directly.
+    f.handle
+        .stop_session_in_runtime(&session_id)
+        .await
+        .expect("stop unloaded session");
+
+    let interrupted = f
+        .storage
+        .load_session_stream(&session_id, None, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome }
+                if run_id == "orphan" && outcome == "interrupted")
+        })
+        .count();
+    assert_eq!(interrupted, 1);
+}
+
+#[tokio::test]
+async fn run_lease_file_removed_on_delete_only_when_free() {
+    let f = RealStorageHandleFixture::new().await;
+    let root = crate::session::run_lease::RunLeaseRoot::new(
+        f.storage.run_lease_root().expect("lease root"),
+    );
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            f.storage
+                .create_session(None, None, None, None)
+                .await
+                .expect("create local session")
+                .public_id,
+        );
+    }
+    // Free session: a lease file exists from an earlier run.
+    drop(root.try_acquire(&ids[0]).unwrap().unwrap());
+    // Busy session: the lease is held while it is deleted.
+    let held = root.try_acquire(&ids[1]).unwrap().unwrap();
+
+    for id in &ids {
+        SendAgent::delete_session(
+            &f.handle,
+            DeleteSessionRequest::new(SessionId::from(id.clone())),
+        )
+        .await
+        .expect("delete session");
+    }
+
+    assert!(!root.lease_path(&ids[0]).unwrap().exists());
+    assert!(root.lease_path(&ids[1]).unwrap().exists());
+    drop(held);
+}
+
+#[tokio::test]
 async fn querymt_session_set_pinned_notifies_only_when_state_changes() {
     let f = RealStorageHandleFixture::new().await;
     let session = f

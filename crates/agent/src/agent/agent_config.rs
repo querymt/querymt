@@ -218,6 +218,14 @@ impl AgentConfig {
         self.event_sink.session_stream(session_id).emit(kind);
     }
 
+    /// Best-effort removal of a deleted session's run lease file. The file is
+    /// removed only after the lease is acquired, so a live run keeps it.
+    pub fn remove_run_lease_file(&self, session_id: &str) {
+        if let Some(root) = self.storage.run_lease_root() {
+            crate::session::run_lease::RunLeaseRoot::new(root).remove_if_free(session_id);
+        }
+    }
+
     /// Publishes an ephemeral event and returns its `session_seq`, so a prompt
     /// response can be held until the event has been delivered.
     pub fn emit_ephemeral_event(&self, session_id: &str, kind: AgentEventKind) -> i64 {

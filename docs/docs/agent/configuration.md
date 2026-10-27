@@ -353,6 +353,28 @@ Database path precedence:
 
 Programmatic builders may still call `.db(...)` as an explicit runtime override.
 
+### Run leases
+
+While a local session run is in progress, the process holds an exclusive OS file lock (a *run lease*) on
+`<db-dir>/<db-stem>.run-leases/<session-id>.lock`, e.g. `~/.qmt/sessions.run-leases/`. The directory sits next to the
+sessions database, so a separate `--db` gets separate leases.
+
+- The operating system releases the lease when the process exits, including a crash or kill. This works the same on
+  Linux, macOS and Windows.
+- If a process dies mid-run, the session journal keeps a `run_started` without a `run_completed`. The next process that
+  loads, cancels or stops that session sees the free lease and records `run_completed` with outcome `interrupted`, so the
+  session no longer shows as running.
+- A prompt sent to a session whose lease is held by another process fails with `session is running in another process`.
+  A lease held only for a moment (while another process reconciles or deletes the session) delays the prompt briefly
+  instead. Queued prompts of one process keep the lease between turns.
+- Processes that take no lease (QueryMT versions before run leases, or a run that could not take one) are not
+  visible to others: loading such a session elsewhere marks its live run `interrupted`. Restart running instances when
+  upgrading.
+- The lock files are empty and are kept after a run. Deleting a session removes its file when it is free.
+- Leases are per machine. They are not reliable on network filesystems (NFS/SMB); keep the sessions database on a local
+  disk. If the lease cannot be taken for any other I/O reason, the run proceeds without one.
+- Sessions hosted on a remote node are not reconciled locally; the host closes its own runs.
+
 ## Multi-Agent (Quorum) Configuration
 
 For planner-delegate workflows:

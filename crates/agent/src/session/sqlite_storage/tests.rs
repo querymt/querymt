@@ -7,9 +7,10 @@ use rusqlite::Connection;
 use crate::acp::protocol::{ContentBlock, ImageContent, TextContent};
 use crate::agent::core::AgentMode;
 use crate::agent::session_control::{SessionControlState, SessionModelBinding};
-use crate::events::{AgentEventKind, EventOrigin};
+use crate::events::{AgentEventKind, DurableEvent, EventOrigin};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::domain::ForkOrigin;
+use crate::session::error::SessionResult;
 use crate::session::lifecycle::{
     ArchiveFilter, ResolutionFilter, SessionLifecycleFilter, SessionLifecyclePatch,
 };
@@ -3480,6 +3481,193 @@ async fn journal_legacy_rows_without_source_cursor_remain_readable() {
     assert_eq!(stream.len(), 1);
     assert!(matches!(stream[0].origin, EventOrigin::Local));
     assert_eq!(stream[0].source_node, None);
+}
+
+/// Journal that only forwards `load_session_stream`, so
+/// `last_unfinished_run` exercises the trait's default implementation.
+struct StreamOnlyJournal(SqliteStorage);
+
+#[async_trait::async_trait]
+impl EventJournal for StreamOnlyJournal {
+    async fn append_durable(&self, event: &NewDurableEvent) -> SessionResult<DurableEvent> {
+        self.0.append_durable(event).await
+    }
+    async fn load_session_stream(
+        &self,
+        session_id: &str,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        self.0
+            .load_session_stream(session_id, after_seq, limit)
+            .await
+    }
+    async fn load_global_stream(
+        &self,
+        after_seq: Option<i64>,
+        limit: Option<usize>,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        self.0.load_global_stream(after_seq, limit).await
+    }
+    async fn delete_session_events_from(
+        &self,
+        session_id: &str,
+        from_seq: i64,
+    ) -> SessionResult<usize> {
+        self.0
+            .delete_session_events_from(session_id, from_seq)
+            .await
+    }
+    async fn append_durable_from_source(
+        &self,
+        event: &NewDurableEvent,
+    ) -> SessionResult<Option<DurableEvent>> {
+        self.0.append_durable_from_source(event).await
+    }
+    async fn latest_source_seq(&self, s: &str, n: &str) -> SessionResult<Option<i64>> {
+        self.0.latest_source_seq(s, n).await
+    }
+    async fn remote_sync_cursor(&self, s: &str, n: &str) -> SessionResult<Option<i64>> {
+        self.0.remote_sync_cursor(s, n).await
+    }
+    async fn advance_remote_sync_cursor(
+        &self,
+        s: &str,
+        n: &str,
+        seq: i64,
+        complete: bool,
+    ) -> SessionResult<()> {
+        self.0.advance_remote_sync_cursor(s, n, seq, complete).await
+    }
+    async fn load_remote_session_stream(
+        &self,
+        s: &str,
+        n: &str,
+    ) -> SessionResult<Vec<DurableEvent>> {
+        self.0.load_remote_session_stream(s, n).await
+    }
+    async fn max_stream_seq(&self, session_id: &str) -> SessionResult<i64> {
+        self.0.max_stream_seq(session_id).await
+    }
+}
+
+async fn assert_last_unfinished_run_semantics(journal: &dyn EventJournal) {
+    let started = |id: &str| AgentEventKind::RunStarted {
+        run_id: id.to_string(),
+        origin: "interactive".to_string(),
+    };
+    let completed = |id: &str| AgentEventKind::RunCompleted {
+        run_id: id.to_string(),
+        outcome: "completed".to_string(),
+    };
+    let append = |session: &'static str, kind: AgentEventKind| async move {
+        journal
+            .append_durable(&new_durable(session, kind))
+            .await
+            .unwrap();
+    };
+
+    // No runs.
+    append("none", AgentEventKind::SessionCreated).await;
+    assert_eq!(journal.last_unfinished_run("none").await.unwrap(), None);
+
+    // Matched run.
+    append("matched", started("a")).await;
+    append("matched", completed("a")).await;
+    assert_eq!(journal.last_unfinished_run("matched").await.unwrap(), None);
+
+    // Unmatched last run, after a matched one.
+    append("last", started("a")).await;
+    append("last", completed("a")).await;
+    append("last", started("b")).await;
+    assert_eq!(
+        journal
+            .last_unfinished_run("last")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("b")
+    );
+
+    // Unmatched earlier run followed by a matched later run: the earlier one
+    // is still the last unfinished run.
+    append("earlier", started("a")).await;
+    append("earlier", started("b")).await;
+    append("earlier", completed("b")).await;
+    assert_eq!(
+        journal
+            .last_unfinished_run("earlier")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("a")
+    );
+
+    // Other sessions are never consulted.
+    assert_eq!(journal.last_unfinished_run("unknown").await.unwrap(), None);
+
+    // Events mirrored from a remote host describe runs that host owns and
+    // closes; they are never orphans of this node.
+    let remote_started = NewDurableEvent {
+        origin: EventOrigin::Remote,
+        source_node: Some("peer".to_string()),
+        source_node_id: Some("node-a".to_string()),
+        source_seq: Some(1),
+        ..new_durable("mirrored", started("remote-run"))
+    };
+    journal
+        .append_durable_from_source(&remote_started)
+        .await
+        .unwrap();
+    assert_eq!(journal.last_unfinished_run("mirrored").await.unwrap(), None);
+    // A local unfinished run in the same session is still found.
+    append("mirrored", started("local-run")).await;
+    assert_eq!(
+        journal
+            .last_unfinished_run("mirrored")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("local-run")
+    );
+}
+
+#[tokio::test]
+async fn last_unfinished_run_query_uses_run_lifecycle_index() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    let conn = storage.conn_for_test();
+    let conn = conn.lock().unwrap();
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN \
+             SELECT kind, json_extract(payload_json, '$.data.run_id') \
+             FROM event_journal \
+             WHERE session_id = ? AND kind IN ('run_started', 'run_completed') \
+             AND origin = 'local' \
+             ORDER BY stream_seq ASC",
+        )
+        .unwrap()
+        .query_map(["s"], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("idx_event_journal_run_lifecycle")),
+        "query must use the partial index, plan: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn journal_last_unfinished_run_sqlite_override() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    assert_last_unfinished_run_semantics(&storage).await;
+}
+
+#[tokio::test]
+async fn journal_last_unfinished_run_default_impl() {
+    let storage = SqliteStorage::connect(":memory:".into()).await.unwrap();
+    assert_last_unfinished_run_semantics(&StreamOnlyJournal(storage)).await;
 }
 
 #[tokio::test]

@@ -50,6 +50,36 @@ impl From<StopType> for StopReason {
     }
 }
 
+/// Outcome recorded in `AgentEventKind::RunCompleted`.
+///
+/// The wire field stays a `String`; this enum is the single source of the
+/// values written by run owners and by orphaned-run reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+    /// The owning process died before closing the run.
+    Interrupted,
+}
+
+impl RunOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RunOutcome::Completed => "completed",
+            RunOutcome::Failed => "failed",
+            RunOutcome::Cancelled => "cancelled",
+            RunOutcome::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl From<RunOutcome> for String {
+    fn from(outcome: RunOutcome) -> Self {
+        outcome.as_str().to_string()
+    }
+}
+
 /// Execution progress metrics.
 /// Typeshare-annotated: generated for TypeScript and Swift.
 #[typeshare]
@@ -1516,6 +1546,39 @@ mod tests {
     fn classify_session_created_is_durable() {
         assert_eq!(
             classify_durability(&AgentEventKind::SessionCreated),
+            Durability::Durable
+        );
+    }
+
+    #[test]
+    fn run_completed_interrupted_round_trips() {
+        let json = r#"{"type":"run_completed","data":{"run_id":"r","outcome":"interrupted"}}"#;
+        let kind: AgentEventKind = serde_json::from_str(json).expect("run_completed");
+        assert!(matches!(
+            &kind,
+            AgentEventKind::RunCompleted { run_id, outcome }
+                if run_id == "r" && outcome == RunOutcome::Interrupted.as_str()
+        ));
+        assert_eq!(
+            serde_json::to_value(&kind).unwrap(),
+            serde_json::from_str::<serde_json::Value>(json).unwrap()
+        );
+    }
+
+    #[test]
+    fn classify_run_lifecycle_events_are_durable() {
+        assert_eq!(
+            classify_durability(&AgentEventKind::RunStarted {
+                run_id: "r".into(),
+                origin: "interactive".into(),
+            }),
+            Durability::Durable
+        );
+        assert_eq!(
+            classify_durability(&AgentEventKind::RunCompleted {
+                run_id: "r".into(),
+                outcome: RunOutcome::Interrupted.into(),
+            }),
             Durability::Durable
         );
     }

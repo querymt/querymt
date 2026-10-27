@@ -88,6 +88,8 @@ fn configure_journal_durability(
 #[derive(Clone)]
 pub struct SqliteStorage {
     pub(super) conn: Arc<Mutex<Connection>>,
+    /// Directory of per-session run leases; `None` for in-memory databases.
+    run_lease_root: Option<PathBuf>,
 }
 
 impl SqliteStorage {
@@ -104,6 +106,18 @@ impl SqliteStorage {
         self.conn.clone()
     }
 
+    /// Directory holding this database's per-session run leases.
+    pub fn run_lease_root(&self) -> Option<PathBuf> {
+        self.run_lease_root.clone()
+    }
+
+    /// Override the run lease root (tests opt in with a temp directory).
+    #[cfg(test)]
+    pub fn with_run_lease_root(mut self, root: PathBuf) -> Self {
+        self.run_lease_root = Some(root);
+        self
+    }
+
     pub async fn connect(path: PathBuf) -> SessionResult<Self> {
         Self::connect_with_options(path, true).await
     }
@@ -115,6 +129,7 @@ impl SqliteStorage {
     /// export) that must not alter the existing data.
     pub async fn connect_with_options(path: PathBuf, migrate: bool) -> SessionResult<Self> {
         let db_path = path.clone();
+        let run_lease_root = crate::session::run_lease::run_lease_root_for_db(&path);
         let conn = tokio::task::spawn_blocking(move || -> Result<Connection, rusqlite::Error> {
             let mut conn = Connection::open(&db_path)?;
             conn.execute("PRAGMA foreign_keys = ON;", [])?;
@@ -130,6 +145,7 @@ impl SqliteStorage {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            run_lease_root,
         })
     }
 

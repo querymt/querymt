@@ -37,6 +37,10 @@ pub enum AgentError {
     #[error("session semaphore closed")]
     SessionSemaphoreClosed,
 
+    /// Another process on this machine holds the session's run lease.
+    #[error("session is running in another process")]
+    SessionRunningElsewhere { session_id: String },
+
     #[error("session execution timeout: {details}")]
     SessionTimeout { details: String },
 
@@ -184,6 +188,13 @@ impl From<AgentError> for AcpError {
                 "message": e.to_string(),
             }));
         }
+        if let AgentError::SessionRunningElsewhere { session_id } = &e {
+            return AcpError::new(-32603, e.to_string()).data(serde_json::json!({
+                "category": "session_running_elsewhere",
+                "session_id": session_id,
+                "message": e.to_string(),
+            }));
+        }
         if let AgentError::InvalidInteractionResponse { detail } = &e {
             return AcpError::invalid_params().data(detail.clone());
         }
@@ -326,6 +337,20 @@ mod tests {
         assert_eq!(error.code, ErrorCode::InternalError);
         assert!(error.message.contains("expected 30"));
         assert!(error.message.contains("found 31"));
+    }
+
+    #[test]
+    fn session_running_elsewhere_maps_to_descriptive_acp_error() {
+        let acp: AcpError = AgentError::SessionRunningElsewhere {
+            session_id: "s-1".to_string(),
+        }
+        .into();
+        assert_eq!(acp.code, ErrorCode::InternalError);
+        assert_eq!(acp.message, "session is running in another process");
+        assert_eq!(
+            acp.data.as_ref().and_then(|d| d.get("session_id")),
+            Some(&serde_json::json!("s-1"))
+        );
     }
 
     #[test]

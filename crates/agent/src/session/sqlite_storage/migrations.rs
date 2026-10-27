@@ -149,7 +149,26 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         version: "0031_workspace_handoff_keeps_marker",
         apply: migration_0031_workspace_handoff_keeps_marker,
     },
+    Migration {
+        version: "0032_event_journal_run_lifecycle_index",
+        apply: migration_0032_event_journal_run_lifecycle_index,
+    },
 ];
+
+/// Partial index over run lifecycle rows so finding a session's unfinished
+/// run reads only those rows instead of every event of the session.
+///
+/// The predicate must stay textually identical to the one in
+/// `EventJournal::last_unfinished_run` for SQLite to use the index.
+fn migration_0032_event_journal_run_lifecycle_index(
+    conn: &mut Connection,
+) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_event_journal_run_lifecycle \
+         ON event_journal(session_id, stream_seq) \
+         WHERE kind IN ('run_started', 'run_completed');",
+    )
+}
 
 /// Drop the `to_session_id` cascade so deleting a successor keeps the
 /// read-only marker of its previous owners.

@@ -1637,6 +1637,10 @@ impl SessionMaterializer {
         _options: &SessionMaterializationOptions,
         mutation_gate: Option<Arc<crate::worktree::gate::CheckoutMutationGate>>,
     ) -> Result<SessionMaterialization, Error> {
+        // No run of this process can exist yet, so a free lease with an
+        // unmatched run_started means the previous owner died.
+        crate::session::run_reconcile::reconcile_orphaned_run(&self.config, &session_id).await;
+
         let mut mutation_gate = mutation_gate;
         let mut slash_registry: Option<Arc<crate::slash_commands::SlashCommandRegistry>> = None;
         let mut activity = None;
@@ -2301,10 +2305,12 @@ mod worktree_binding_tests {
         configure_service: bool,
         owner_failures: usize,
     ) -> WorktreeFixture {
+        let storage_root = tempfile::TempDir::new().unwrap();
         let storage = Arc::new(
             SqliteStorage::connect(":memory:".into())
                 .await
-                .expect("create sqlite storage"),
+                .expect("create sqlite storage")
+                .with_run_lease_root(storage_root.path().join("run-leases")),
         );
         let provider_inner = Arc::new(Mutex::new(MockLlmProvider::new()));
         let shared = SharedLlmProvider {
@@ -2323,7 +2329,6 @@ mod worktree_binding_tests {
         commit_files(repo.path(), "initial", &[("README.md", "hello\n")]);
         materialize(repo.path(), &[("README.md", "hello\n")]);
 
-        let storage_root = tempfile::TempDir::new().unwrap();
         let registry: Arc<dyn crate::worktree::WorkspaceRepository> = if owner_failures > 0 {
             Arc::new(FlakyOwnerBinding {
                 inner: storage
@@ -2457,6 +2462,49 @@ mod worktree_binding_tests {
             rendered.contains("no workspace service"),
             "diagnostic: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn load_reconciles_orphaned_run_before_registering_actor() {
+        use crate::session::projection::EventJournal;
+        let fx = worktree_fixture(true).await;
+        let req = NewSessionRequest::new(fx.repo.path().to_path_buf());
+        let session_id = fx
+            .materializer
+            .prepare_new_session(req)
+            .await
+            .expect("session prepares")
+            .session_id
+            .clone();
+        crate::session::run_reconcile::tests::seed(
+            &fx.storage,
+            &session_id,
+            crate::events::AgentEventKind::RunStarted {
+                run_id: "orphan".into(),
+                origin: "interactive".into(),
+            },
+        )
+        .await;
+
+        let load = LoadSessionRequest::new(SessionId::from(session_id.clone()), PathBuf::new());
+        let _prepared = fx
+            .materializer
+            .prepare_load_session(load, None)
+            .await
+            .unwrap();
+
+        let interrupted = fx
+            .storage
+            .load_session_stream(&session_id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| {
+                matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome }
+                    if run_id == "orphan" && outcome == "interrupted")
+            })
+            .count();
+        assert_eq!(interrupted, 1);
     }
 
     #[tokio::test]

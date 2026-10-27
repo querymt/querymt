@@ -161,7 +161,7 @@ impl LocalAgentHandle {
         Ok(false)
     }
 
-    async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
+    pub(super) async fn stop_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
         use crate::agent::messages::{SessionRuntimePhase, SessionRuntimeStatus};
 
         const STOP_ESCALATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
@@ -172,10 +172,18 @@ impl LocalAgentHandle {
         };
 
         let Some(session_ref) = session_ref else {
-            log::warn!(
-                "Stop requested for session {} but not found in registry",
-                session_id
-            );
+            // Not loaded here, so no run of this process exists. An unmatched
+            // run_started can only be an orphan; close it (local sessions only,
+            // reconciliation skips remote bookmarks).
+            let closed =
+                crate::session::run_reconcile::reconcile_orphaned_run(&self.config, session_id)
+                    .await;
+            if closed.is_empty() {
+                log::warn!(
+                    "Stop requested for session {} but not found in registry",
+                    session_id
+                );
+            }
             return Ok(());
         };
 
