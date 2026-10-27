@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{
-    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, resolve_arg_path,
-    root_arg_resolves,
+    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, effective_root,
+    resolve_arg_path,
 };
 
 use super::helpers::{resolve_root, resolve_target};
@@ -123,12 +123,11 @@ impl Tool for ReplaceSymbolTool {
     }
 
     fn file_access(&self, args: &Value, cwd: Option<&Path>) -> FileAccess {
-        // Mirror `call`: `resolve_root` must succeed, and every target goes
-        // through `ToolContext::resolve_path` (relative paths are joined with
-        // the cwd, so `root` never changes which file a relative path names).
-        if !root_arg_resolves(args, cwd) {
+        // Mirror `call`: `resolve_root` must succeed, and every relative
+        // target is joined with that root (see `helpers::resolve_target`).
+        let Some(root) = effective_root(args, cwd) else {
             return FileAccess::None;
-        }
+        };
         let Some(entries) = args.get("replacements").and_then(Value::as_array) else {
             return FileAccess::None;
         };
@@ -138,7 +137,7 @@ impl Tool for ReplaceSymbolTool {
             let Some(path) = entry
                 .get("path")
                 .and_then(Value::as_str)
-                .and_then(|raw| resolve_arg_path(raw, cwd))
+                .and_then(|raw| resolve_arg_path(raw, Some(&root)))
             else {
                 // Malformed entry: the call fails validation before writing.
                 return FileAccess::None;
@@ -170,7 +169,7 @@ impl Tool for ReplaceSymbolTool {
             let mut resolved: Vec<ResolvedReplacement> = Vec::new();
 
             for req in &requests {
-                let target = resolve_target(&req.path, &root, context)?;
+                let target = resolve_target(&req.path, &root);
 
                 // Read file if not already loaded
                 let content = match file_contents.get(&target) {
@@ -674,8 +673,8 @@ mod tests {
         std::fs::create_dir_all(cwd.join("sub")).unwrap();
         let tool = ReplaceSymbolTool::new();
 
-        // Same resolution as `call`: relative paths go through
-        // `ToolContext::resolve_path` (joined with cwd); `root` must resolve.
+        // Same resolution as `call`: relative paths are joined with `root`
+        // (itself resolved against cwd); absolute paths are used as written.
         let access = tool.file_access(
             &json!({
                 "root": "sub",
@@ -688,10 +687,47 @@ mod tests {
             Some(&cwd),
         );
 
-        // Duplicate spellings of a.rs collapse into one entry.
+        // Duplicate spellings of a.rs collapse into one entry, under `root`.
         assert_eq!(
             access,
-            FileAccess::writes([cwd.join("a.rs"), cwd.join("sub/b.rs")])
+            FileAccess::writes([cwd.join("sub/a.rs"), cwd.join("sub/b.rs")])
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_root_not_cwd() {
+        // Mirrors the real failure: session cwd is one repo, `root` another.
+        let cwd_dir = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        let target = root_dir.path().join("src/lib.rs");
+        tokio::fs::create_dir_all(target.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&target, "fn greet() {}\n").await.unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = ReplaceSymbolTool::new();
+        let args = json!({
+            "replacements": [{
+                "path": "src/lib.rs",
+                "symbol": "greet",
+                "newText": "fn greet() { 1 }"
+            }],
+            "root": root_dir.path()
+        });
+
+        // `file_access` must predict the same file `call` writes.
+        let cwd = dunce::canonicalize(cwd_dir.path()).unwrap();
+        let canonical_target = dunce::canonicalize(&target).unwrap();
+        assert_eq!(
+            tool.file_access(&args, Some(&cwd)),
+            FileAccess::writes([canonical_target])
+        );
+
+        tool.call(args, &context).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "fn greet() { 1 }\n"
         );
     }
 

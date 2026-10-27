@@ -49,15 +49,25 @@ pub fn resolve_arg_path(raw: &str, cwd: Option<&Path>) -> Option<PathBuf> {
     Some(normalize_tool_path(raw, cwd))
 }
 
+/// The normalised directory that relative target paths are resolved against:
+/// the optional `root` argument (itself resolved against `cwd`), or `cwd` when
+/// `root` is absent.
+///
+/// Mirrors `helpers::resolve_root`. `None` means the tool fails before touching
+/// any file, so it must declare no file access.
+pub fn effective_root(args: &serde_json::Value, cwd: Option<&Path>) -> Option<PathBuf> {
+    match args.get("root").and_then(serde_json::Value::as_str) {
+        Some(root) => resolve_arg_path(root, cwd),
+        None => cwd.map(|cwd| normalize_tool_path(cwd, None)),
+    }
+}
+
 /// Whether the optional `root` argument (or, when absent, the `cwd`) resolves.
 ///
-/// Mirrors `helpers::resolve_root`: when this is `false` the tool fails before
-/// touching any file, so it must declare no file access.
+/// When this is `false` the tool fails before touching any file, so it must
+/// declare no file access.
 pub fn root_arg_resolves(args: &serde_json::Value, cwd: Option<&Path>) -> bool {
-    match args.get("root").and_then(serde_json::Value::as_str) {
-        Some(root) => resolve_arg_path(root, cwd).is_some(),
-        None => cwd.is_some(),
-    }
+    effective_root(args, cwd).is_some()
 }
 
 /// `FileAccess` for tools that write the single path in `args[key]`.
@@ -136,9 +146,9 @@ pub fn path_list_read_access(
     key: &str,
     cwd: Option<&Path>,
 ) -> FileAccess {
-    if !root_arg_resolves(args, cwd) {
+    let Some(root) = effective_root(args, cwd) else {
         return FileAccess::None;
-    }
+    };
     let Some(entries) = args.get(key).and_then(serde_json::Value::as_array) else {
         return FileAccess::None;
     };
@@ -146,7 +156,7 @@ pub fn path_list_read_access(
         entries
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .map(|raw| resolve_arg_path(raw, cwd)),
+            .map(|raw| resolve_arg_path(raw, Some(&root))),
     )
 }
 
@@ -336,6 +346,50 @@ mod tests {
         assert!(root_arg_resolves(&abs, None));
         assert!(root_arg_resolves(&rel, Some(&root)));
         assert!(!root_arg_resolves(&rel, None));
+    }
+
+    #[test]
+    fn effective_root_resolves_root_arg_against_cwd() {
+        let (_guard, root) = canonical_tmp();
+        let other = root.join("other");
+
+        assert_eq!(
+            effective_root(&serde_json::json!({}), Some(&root)),
+            Some(root.clone())
+        );
+        assert_eq!(effective_root(&serde_json::json!({}), None), None);
+        assert_eq!(
+            effective_root(&serde_json::json!({"root": "sub"}), Some(&root)),
+            Some(root.join("sub"))
+        );
+        assert_eq!(
+            effective_root(
+                &serde_json::json!({"root": other.to_str().unwrap()}),
+                Some(&root)
+            ),
+            Some(other)
+        );
+    }
+
+    #[test]
+    fn path_list_read_access_joins_relative_paths_with_root_arg() {
+        let (_guard, root) = canonical_tmp();
+        let other = root.join("other");
+        let args = serde_json::json!({
+            "root": other.to_str().unwrap(),
+            "paths": ["src/a.rs"]
+        });
+
+        // `root` differs from the cwd: the relative path names a file under `root`.
+        assert_eq!(
+            path_list_read_access(&args, "paths", Some(&root)),
+            FileAccess::reads([other.join("src/a.rs")])
+        );
+        // An absolute root makes relative paths resolvable even without a cwd.
+        assert_eq!(
+            path_list_read_access(&args, "paths", None),
+            FileAccess::reads([other.join("src/a.rs")])
+        );
     }
 
     #[test]

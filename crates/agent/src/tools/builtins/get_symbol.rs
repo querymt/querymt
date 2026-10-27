@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::index::symbol_index::{SymbolEntry, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{
     CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, collect_read_paths,
-    resolve_arg_path, root_arg_resolves,
+    effective_root, resolve_arg_path,
 };
 
 use super::helpers::{resolve_root, resolve_target};
@@ -99,9 +99,9 @@ impl Tool for GetSymbolTool {
     }
 
     fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
-        if !root_arg_resolves(args, cwd) {
+        let Some(root) = effective_root(args, cwd) else {
             return FileAccess::None;
-        }
+        };
         // Mirrors `parse_requests`: a single object is accepted as well as an array.
         let entries: Vec<&Value> = match args.get("requests") {
             Some(Value::Array(items)) => items.iter().collect(),
@@ -113,7 +113,7 @@ impl Tool for GetSymbolTool {
             let Some(raw) = entry.get("path").and_then(Value::as_str) else {
                 return FileAccess::None;
             };
-            paths.push(resolve_arg_path(raw, cwd));
+            paths.push(resolve_arg_path(raw, Some(&root)));
         }
         collect_read_paths(paths)
     }
@@ -141,7 +141,7 @@ impl Tool for GetSymbolTool {
         let mut file_results: Vec<(String, Vec<String>)> = Vec::new();
 
         for req in &requests {
-            let target = resolve_target(&req.path, &root, context)?;
+            let target = resolve_target(&req.path, &root);
             let content = match tokio::fs::read_to_string(&target).await {
                 Ok(c) => c,
                 Err(e) => {
@@ -534,6 +534,32 @@ mod tests {
         assert!(parameters.get("paths").is_none());
         assert!(parameters.get("symbols").is_none());
         assert!(parameters.get("kind").is_none());
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_root_not_cwd() {
+        let cwd_dir = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        tokio::fs::write(root_dir.path().join("lib.rs"), "struct Config {}\n")
+            .await
+            .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = GetSymbolTool::new();
+        let args = json!({
+            "requests": [{"path": "lib.rs", "symbol": "Config"}],
+            "root": root_dir.path()
+        });
+
+        let cwd = dunce::canonicalize(cwd_dir.path()).unwrap();
+        let expected = dunce::canonicalize(root_dir.path().join("lib.rs")).unwrap();
+        assert_eq!(
+            tool.file_access(&args, Some(&cwd)),
+            FileAccess::reads([expected])
+        );
+
+        let result = text_content(tool.call(args, &context).await.unwrap());
+        assert!(result.contains("00001| struct Config"));
     }
 
     #[tokio::test]

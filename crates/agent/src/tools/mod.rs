@@ -17,7 +17,7 @@ pub use context::{
 };
 pub use context_impl::{AgentToolContext, ElicitationRequest};
 pub use path::{
-    collect_read_paths, normalize_tool_path, path_list_read_access,
+    collect_read_paths, effective_root, normalize_tool_path, path_list_read_access,
     path_or_cwd_filtered_read_access, path_or_cwd_read_access, paths_overlap, resolve_arg_path,
     root_arg_resolves, single_path_read_access, single_path_write_access,
 };
