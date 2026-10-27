@@ -768,6 +768,10 @@ pub async fn authenticate(
         (tokens, api_key)
     };
 
+    // Serialize with any in-flight refresh so it cannot overwrite the fresh
+    // login tokens (in the cache or the keyring) after we store them.
+    let token_guard = lock_provider_tokens(provider.name()).await;
+
     // Store tokens
     store.set_oauth_tokens(provider.name(), &tokens)?;
     // A fresh login supersedes anything cached in this process.
@@ -781,6 +785,7 @@ pub async fn authenticate(
         if let Some(key_name) = provider.api_key_name() {
             store.set(key_name, &api_key)?;
         }
+        drop(token_guard);
 
         ui.success("API key created and stored!");
         ui.status(&format!(
@@ -788,6 +793,7 @@ pub async fn authenticate(
             provider.name()
         ));
     } else {
+        drop(token_guard);
         ui.status(&format!(
             "Your OAuth tokens have been securely stored in your system keychain.\nYou can now use {} with: qmt -p {} \"your prompt\"",
             provider.display_name(),
@@ -1207,8 +1213,9 @@ pub fn extract_code_from_query(input: &str) -> Option<String> {
 /// # }
 /// ```
 pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
-    let lock = oauth_refresh_lock(provider).await;
-    let _guard = lock.lock().await;
+    // Owned guard: the final keyring write below moves it into the blocking
+    // task, so the lock outlives this future if it is cancelled mid-persist.
+    let guard = lock_provider_tokens(provider).await;
 
     // Fast path: a token cached by this process that is still comfortably valid
     // needs no keyring access (and therefore no keychain prompt).
@@ -1274,8 +1281,12 @@ pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
 
     let name = provider.to_string();
     let api_key_name = oauth_provider.api_key_name().map(str::to_owned);
-    let persisted = keyring_blocking(move |store| {
-        persist_refreshed(store, &name, api_key_name.as_deref(), &refreshed)
+    // `spawn_blocking` work cannot be cancelled: if this future is dropped while
+    // the write is in flight, the write still completes. Hand the guard to the
+    // blocking task so logout/login cannot interleave with that late write.
+    let persisted = run_blocking_holding(guard, move || {
+        let mut store = SecretStore::new().map_err(|e| anyhow!("{e}"))?;
+        persist_refreshed(&mut store, &name, api_key_name.as_deref(), &refreshed)
             .map_err(anyhow::Error::from)
     })
     .await;
@@ -1289,12 +1300,43 @@ pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
     Ok(access_token)
 }
 
+/// Acquire the per-provider OAuth token lock shared with [`get_or_refresh_token`].
+///
+/// Hold the returned guard while writing or deleting a provider's stored
+/// credentials (login/logout) so an in-flight refresh cannot repopulate the
+/// cache or keyring afterwards. Do not call [`get_or_refresh_token`] for the
+/// same provider while holding it.
+pub async fn lock_provider_tokens(provider: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    oauth_refresh_lock(provider).await.lock_owned().await
+}
+
 /// Drop any token or keyring back-off state cached for `provider` in this process.
 ///
 /// Call after logging in or out so the next [`get_or_refresh_token`] re-reads
 /// the keyring.
 pub fn invalidate_cached_tokens(provider: &str) {
     token_cache::clear(provider);
+}
+
+/// Run `operation` on the blocking thread pool, keeping `guard` held until it
+/// finishes.
+///
+/// Unlike a guard held by the awaiting future, this one is released only when
+/// the blocking work itself completes, even if the caller is cancelled.
+async fn run_blocking_holding<T, F>(
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    operation: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        operation()
+    })
+    .await
+    .map_err(|e| anyhow!("keyring task failed: {e}"))?
 }
 
 /// Run a keyring operation on the blocking thread pool.
@@ -1629,6 +1671,40 @@ mod tests {
         token_cache::store(provider, token_set(3600));
         assert!(token_cache::failure_backoff_remaining(provider).is_none());
         token_cache::clear(provider);
+    }
+
+    #[tokio::test]
+    async fn provider_lock_outlives_cancelled_caller_until_blocking_work_finishes() {
+        use std::time::Duration;
+        let provider = "lock-outlives-cancel-test";
+
+        let guard = lock_provider_tokens(provider).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+        let caller = tokio::spawn(run_blocking_holding(guard, move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            Ok(())
+        }));
+        started_rx.await.expect("blocking work started");
+
+        // Cancel the awaiting future while the blocking work is in flight.
+        caller.abort();
+        let _ = caller.await;
+
+        // The orphaned blocking task must still own the lock.
+        let contended =
+            tokio::time::timeout(Duration::from_millis(100), lock_provider_tokens(provider)).await;
+        assert!(
+            contended.is_err(),
+            "lock released before blocking work finished"
+        );
+
+        release_tx.send(()).expect("release blocking work");
+        tokio::time::timeout(Duration::from_secs(5), lock_provider_tokens(provider))
+            .await
+            .expect("lock released after blocking work finished");
     }
 
     #[tokio::test]

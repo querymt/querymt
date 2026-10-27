@@ -525,6 +525,10 @@ impl OAuthService {
                 }
             };
 
+            // Serialize with any in-flight token refresh so it cannot repopulate
+            // the cache or keyring after the credentials are removed.
+            let token_guard = crate::auth::lock_provider_tokens(&provider_name).await;
+
             let delete_result = (|| {
                 if store.get_oauth_tokens(&provider_name).is_some() {
                     store
@@ -541,10 +545,13 @@ impl OAuthService {
                 Ok::<(), String>(())
             })();
 
+            // Make sure a token cached in this process stops being used, even if
+            // deletion only partially succeeded.
+            crate::auth::invalidate_cached_tokens(&provider_name);
+            drop(token_guard);
+
             match delete_result {
                 Ok(()) => {
-                    // Make sure a token cached in this process stops being used.
-                    crate::auth::invalidate_cached_tokens(&provider_name);
                     // Clean up pending flows for this owner+provider.
                     {
                         let mut map = self.flows.lock().await;
@@ -850,11 +857,7 @@ pub(crate) async fn persist_oauth_credentials(
     let mut store = crate::auth::SecretStore::new()
         .map_err(|e| format!("Failed to access secure storage: {}", e))?;
 
-    store
-        .set_oauth_tokens(oauth_provider.name(), tokens)
-        .map_err(|e| format!("Failed to save OAuth tokens: {}", e))?;
-    crate::auth::invalidate_cached_tokens(oauth_provider.name());
-
+    // Do the network call before taking the lock so it is never held across it.
     let api_key_to_store = if let Some(api_key) = api_key_override {
         Some(api_key.to_string())
     } else {
@@ -864,6 +867,15 @@ pub(crate) async fn persist_oauth_credentials(
             .ok()
             .flatten()
     };
+
+    // Serialize with token refresh and logout for *all* credential writes
+    // (tokens and API key), so neither can overwrite or resurrect part of a
+    // fresh login. Only synchronous keyring calls happen under the guard.
+    let _token_guard = crate::auth::lock_provider_tokens(oauth_provider.name()).await;
+    store
+        .set_oauth_tokens(oauth_provider.name(), tokens)
+        .map_err(|e| format!("Failed to save OAuth tokens: {}", e))?;
+    crate::auth::invalidate_cached_tokens(oauth_provider.name());
 
     if let Some(api_key) = api_key_to_store
         && let Some(key_name) = oauth_provider.api_key_name()

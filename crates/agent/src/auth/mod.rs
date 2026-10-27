@@ -48,8 +48,8 @@ pub use querymt_utils::OAuthFlowKind;
 pub use querymt_utils::oauth::{
     OAuthFlowData, OAuthMode, OAuthProvider, OAuthUI, TokenSet, anthropic_callback_server,
     authenticate, extract_code_from_query, get_oauth_provider, get_or_refresh_token,
-    get_valid_token, invalidate_cached_tokens, openai_callback_server, refresh_tokens,
-    show_auth_status,
+    get_valid_token, invalidate_cached_tokens, lock_provider_tokens, openai_callback_server,
+    refresh_tokens, show_auth_status,
 };
 
 #[cfg(feature = "oauth")]
