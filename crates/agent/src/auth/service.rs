@@ -543,6 +543,8 @@ impl OAuthService {
 
             match delete_result {
                 Ok(()) => {
+                    // Make sure a token cached in this process stops being used.
+                    crate::auth::invalidate_cached_tokens(&provider_name);
                     // Clean up pending flows for this owner+provider.
                     {
                         let mut map = self.flows.lock().await;
@@ -851,6 +853,7 @@ pub(crate) async fn persist_oauth_credentials(
     store
         .set_oauth_tokens(oauth_provider.name(), tokens)
         .map_err(|e| format!("Failed to save OAuth tokens: {}", e))?;
+    crate::auth::invalidate_cached_tokens(oauth_provider.name());
 
     let api_key_to_store = if let Some(api_key) = api_key_override {
         Some(api_key.to_string())

@@ -770,6 +770,8 @@ pub async fn authenticate(
 
     // Store tokens
     store.set_oauth_tokens(provider.name(), &tokens)?;
+    // A fresh login supersedes anything cached in this process.
+    invalidate_cached_tokens(provider.name());
     ui.success("Successfully authenticated!");
 
     // Store API key if we got one
@@ -835,29 +837,98 @@ pub async fn refresh_tokens(
     provider: &dyn OAuthProvider,
     store: &mut SecretStore,
 ) -> Result<TokenSet> {
-    let tokens = store
-        .get_oauth_tokens(provider.name())
-        .ok_or_else(|| anyhow!("No OAuth tokens found for {}", provider.display_name()))?;
+    let tokens = read_stored_tokens(provider, store)?;
+    refresh_with_tokens(provider, store, &tokens).await
+}
 
-    // Bound the refresh so a stalled transport releases the per-provider
-    // refresh lock promptly instead of blocking every later token read.
-    let new_tokens = bound_refresh(provider.display_name(), async {
-        let new_tokens = provider.refresh_token(&tokens.refresh_token).await?;
+/// Read stored tokens, reporting keyring failures distinctly from "not logged in".
+fn read_stored_tokens(provider: &dyn OAuthProvider, store: &SecretStore) -> Result<TokenSet> {
+    store
+        .try_get_oauth_tokens(provider.name())
+        .map_err(|e| {
+            anyhow!(
+                "Keyring access failed while reading {} OAuth tokens: {}",
+                provider.display_name(),
+                e
+            )
+        })?
+        .ok_or_else(|| anyhow!("No OAuth tokens found for {}", provider.display_name()))
+}
 
-        // Store the new tokens
-        store.set_oauth_tokens(provider.name(), &new_tokens)?;
+/// Result of a successful remote refresh, before it is persisted.
+struct RefreshedTokens {
+    tokens: TokenSet,
+    api_key: Option<String>,
+}
 
-        if let Ok(Some(api_key)) = provider.create_api_key(&new_tokens.access_token).await
-            && let Some(key_name) = provider.api_key_name()
-        {
-            let _ = store.set(key_name, &api_key);
-        }
-
-        Ok::<TokenSet, anyhow::Error>(new_tokens)
+/// Exchange `refresh_token` for new tokens (and optionally an API key).
+///
+/// Bounded so a stalled transport releases the per-provider refresh lock
+/// promptly instead of blocking every later token read. Performs no keyring
+/// access.
+async fn refresh_remote(
+    provider: &dyn OAuthProvider,
+    refresh_token: &str,
+) -> Result<RefreshedTokens> {
+    bound_refresh(provider.display_name(), async {
+        let tokens = provider.refresh_token(refresh_token).await?;
+        let api_key = match provider.create_api_key(&tokens.access_token).await {
+            Ok(key) => key,
+            Err(error) => {
+                log::debug!(
+                    "{} API key creation after refresh failed: {}",
+                    provider.display_name(),
+                    error
+                );
+                None
+            }
+        };
+        Ok::<RefreshedTokens, anyhow::Error>(RefreshedTokens { tokens, api_key })
     })
-    .await??;
+    .await?
+}
 
-    Ok(new_tokens)
+/// Persist refreshed tokens (and API key, best effort).
+///
+/// Only a failure to store the token set is reported; the API key is a
+/// convenience copy.
+fn persist_refreshed(
+    store: &mut SecretStore,
+    provider_name: &str,
+    api_key_name: Option<&str>,
+    refreshed: &RefreshedTokens,
+) -> std::io::Result<()> {
+    store.set_oauth_tokens(provider_name, &refreshed.tokens)?;
+    if let (Some(api_key), Some(key_name)) = (refreshed.api_key.as_deref(), api_key_name)
+        && let Err(error) = store.set(key_name, api_key)
+    {
+        log::warn!("Failed to persist API key '{key_name}' after token refresh: {error}");
+    }
+    Ok(())
+}
+
+/// Refresh `tokens` and persist the result.
+///
+/// Refresh tokens rotate, so once the remote exchange has succeeded the new
+/// tokens are returned even if the keyring write fails; discarding them would
+/// leave only an already-invalidated refresh token on disk.
+async fn refresh_with_tokens(
+    provider: &dyn OAuthProvider,
+    store: &mut SecretStore,
+    tokens: &TokenSet,
+) -> Result<TokenSet> {
+    let refreshed = refresh_remote(provider, &tokens.refresh_token).await?;
+    if let Err(error) =
+        persist_refreshed(store, provider.name(), provider.api_key_name(), &refreshed)
+    {
+        log::warn!(
+            "Refreshed {} OAuth tokens but could not save them to the keyring: {}. \
+             Using them for this session only.",
+            provider.display_name(),
+            error
+        );
+    }
+    Ok(refreshed.tokens)
 }
 
 /// Get a valid access token for a provider, refreshing if necessary
@@ -874,17 +945,17 @@ pub async fn get_valid_token(
     provider: &dyn OAuthProvider,
     store: &mut SecretStore,
 ) -> Result<String> {
-    // Try to get valid token
-    if let Some(token) = store.get_valid_access_token(provider.name()) {
-        return Ok(token);
+    // Single keyring read; the same token set feeds the refresh if needed.
+    let tokens = read_stored_tokens(provider, store)?;
+    if !tokens.is_expired() {
+        return Ok(tokens.access_token);
     }
 
-    // Token is expired or missing, try to refresh
     log::info!(
         "{} OAuth token expired, attempting to refresh...",
         provider.display_name()
     );
-    let new_tokens = refresh_tokens(provider, store).await?;
+    let new_tokens = refresh_with_tokens(provider, store, &tokens).await?;
 
     Ok(new_tokens.access_token)
 }
@@ -1138,13 +1209,174 @@ pub fn extract_code_from_query(input: &str) -> Option<String> {
 pub async fn get_or_refresh_token(provider: &str) -> Result<String> {
     let lock = oauth_refresh_lock(provider).await;
     let _guard = lock.lock().await;
-    // Load credentials only after acquiring the guard: another request may have rotated them.
-    log::debug!("Checking OAuth tokens for provider: {}", provider);
 
-    let mut store = SecretStore::new().map_err(|e| anyhow!("Keyring access failed: {}", e))?;
+    // Fast path: a token cached by this process that is still comfortably valid
+    // needs no keyring access (and therefore no keychain prompt).
+    if let Some(token) = token_cache::fresh_access_token(provider) {
+        return Ok(token);
+    }
 
     let oauth_provider = get_oauth_provider(provider, None)?;
-    get_valid_token(oauth_provider.as_ref(), &mut store).await
+    let display = oauth_provider.display_name().to_string();
+
+    // After a recent keyring failure (denied/cancelled prompt, locked keychain),
+    // fail fast instead of re-prompting on every LLM step.
+    if let Some(remaining) = token_cache::failure_backoff_remaining(provider) {
+        return Err(anyhow!(
+            "{display} OAuth tokens are unavailable: the system keyring denied or failed a \
+             recent read. Retrying in {}s. Check that this binary is allowed to access the \
+             'querymt' keychain item.",
+            remaining.as_secs().max(1)
+        ));
+    }
+
+    // Load credentials only after acquiring the guard: another process may have
+    // rotated them. The keyring call can block on a user prompt, so it runs off
+    // the async worker threads.
+    log::debug!("Checking OAuth tokens for provider: {}", provider);
+    let name = provider.to_string();
+    let stored = keyring_blocking(move |store| {
+        store
+            .try_get_oauth_tokens(&name)
+            .map_err(anyhow::Error::from)
+    })
+    .await;
+
+    let tokens = match stored {
+        Ok(Some(tokens)) => tokens,
+        Ok(None) => return Err(anyhow!("No OAuth tokens found for {display}")),
+        Err(error) => {
+            token_cache::record_failure(provider);
+            log::warn!(
+                "Keyring access failed while reading {display} OAuth tokens: {error}. \
+                 Not retrying for {}s.",
+                token_cache::KEYRING_FAILURE_BACKOFF.as_secs()
+            );
+            return Err(anyhow!(
+                "Keyring access failed while reading {display} OAuth tokens: {error}"
+            ));
+        }
+    };
+
+    if !tokens.is_expired() {
+        let access_token = tokens.access_token.clone();
+        token_cache::store(provider, tokens);
+        return Ok(access_token);
+    }
+
+    log::info!("{display} OAuth token expired, attempting to refresh...");
+    let refreshed = refresh_remote(oauth_provider.as_ref(), &tokens.refresh_token).await?;
+
+    // Refresh tokens rotate: keep the new set in memory before touching the
+    // keyring so a failed write cannot lose it.
+    let access_token = refreshed.tokens.access_token.clone();
+    token_cache::store(provider, refreshed.tokens.clone());
+
+    let name = provider.to_string();
+    let api_key_name = oauth_provider.api_key_name().map(str::to_owned);
+    let persisted = keyring_blocking(move |store| {
+        persist_refreshed(store, &name, api_key_name.as_deref(), &refreshed)
+            .map_err(anyhow::Error::from)
+    })
+    .await;
+    if let Err(error) = persisted {
+        log::warn!(
+            "Refreshed {display} OAuth tokens but could not save them to the keyring: {error}. \
+             Using them for this session only."
+        );
+    }
+
+    Ok(access_token)
+}
+
+/// Drop any token or keyring back-off state cached for `provider` in this process.
+///
+/// Call after logging in or out so the next [`get_or_refresh_token`] re-reads
+/// the keyring.
+pub fn invalidate_cached_tokens(provider: &str) {
+    token_cache::clear(provider);
+}
+
+/// Run a keyring operation on the blocking thread pool.
+///
+/// Keychain access is synchronous and may wait on a user prompt, which must not
+/// stall an async worker thread.
+async fn keyring_blocking<T, F>(operation: F) -> Result<T>
+where
+    F: FnOnce(&mut SecretStore) -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let mut store = SecretStore::new().map_err(|e| anyhow!("{e}"))?;
+        operation(&mut store)
+    })
+    .await
+    .map_err(|e| anyhow!("keyring task failed: {e}"))?
+}
+
+/// Per-process token cache and keyring failure back-off, keyed by provider.
+mod token_cache {
+    use super::TokenSet;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// How long to avoid the keyring after a failed read.
+    pub(super) const KEYRING_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+
+    #[derive(Default)]
+    struct State {
+        tokens: HashMap<String, TokenSet>,
+        failures: HashMap<String, Instant>,
+    }
+
+    fn state() -> MutexGuard<'static, State> {
+        static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+        STATE
+            .get_or_init(|| Mutex::new(State::default()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Cached access token, if it is not within the expiry buffer.
+    pub(super) fn fresh_access_token(provider: &str) -> Option<String> {
+        state()
+            .tokens
+            .get(provider)
+            .filter(|tokens| !tokens.is_expired())
+            .map(|tokens| tokens.access_token.clone())
+    }
+
+    pub(super) fn store(provider: &str, tokens: TokenSet) {
+        let mut state = state();
+        state.failures.remove(provider);
+        state.tokens.insert(provider.to_string(), tokens);
+    }
+
+    pub(super) fn record_failure(provider: &str) {
+        state()
+            .failures
+            .insert(provider.to_string(), Instant::now());
+    }
+
+    /// Remaining back-off after a keyring failure, if still active.
+    pub(super) fn failure_backoff_remaining(provider: &str) -> Option<Duration> {
+        let mut state = state();
+        let failed_at = *state.failures.get(provider)?;
+        match KEYRING_FAILURE_BACKOFF.checked_sub(failed_at.elapsed()) {
+            Some(remaining) if !remaining.is_zero() => Some(remaining),
+            _ => {
+                state.failures.remove(provider);
+                None
+            }
+        }
+    }
+
+    pub(super) fn clear(provider: &str) {
+        let mut state = state();
+        state.tokens.remove(provider);
+        state.failures.remove(provider);
+    }
 }
 
 async fn oauth_refresh_lock(provider: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
@@ -1353,6 +1585,68 @@ mod tests {
     #[test]
     fn get_oauth_provider_rejects_unknown() {
         assert!(get_oauth_provider("unknown-provider", None).is_err());
+    }
+
+    fn token_set(expires_in_secs: u64) -> TokenSet {
+        TokenSet {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: current_epoch_seconds() + expires_in_secs,
+        }
+    }
+
+    #[test]
+    fn token_cache_serves_only_fresh_tokens() {
+        let provider = "cache-test-fresh";
+        assert!(token_cache::fresh_access_token(provider).is_none());
+
+        token_cache::store(provider, token_set(3600));
+        assert_eq!(
+            token_cache::fresh_access_token(provider).as_deref(),
+            Some("access")
+        );
+
+        // Inside the expiry buffer the cache must defer to the keyring, which
+        // may hold a newer rotated token set.
+        token_cache::store(provider, token_set(10));
+        assert!(token_cache::fresh_access_token(provider).is_none());
+        token_cache::clear(provider);
+    }
+
+    #[test]
+    fn keyring_failure_backoff_is_active_until_cleared_or_token_stored() {
+        let provider = "cache-test-backoff";
+        assert!(token_cache::failure_backoff_remaining(provider).is_none());
+
+        token_cache::record_failure(provider);
+        let remaining = token_cache::failure_backoff_remaining(provider).expect("active");
+        assert!(remaining <= token_cache::KEYRING_FAILURE_BACKOFF);
+
+        invalidate_cached_tokens(provider);
+        assert!(token_cache::failure_backoff_remaining(provider).is_none());
+
+        token_cache::record_failure(provider);
+        token_cache::store(provider, token_set(3600));
+        assert!(token_cache::failure_backoff_remaining(provider).is_none());
+        token_cache::clear(provider);
+    }
+
+    #[tokio::test]
+    async fn get_or_refresh_token_uses_cache_without_keyring() {
+        // "anthropic" is a known provider; a cached fresh token must be returned
+        // before any keyring access is attempted.
+        token_cache::store("anthropic", token_set(3600));
+        let token = get_or_refresh_token("anthropic").await.expect("cached");
+        assert_eq!(token, "access");
+        token_cache::clear("anthropic");
+    }
+
+    #[tokio::test]
+    async fn get_or_refresh_token_fails_fast_during_backoff() {
+        token_cache::record_failure("codex");
+        let error = get_or_refresh_token("codex").await.unwrap_err().to_string();
+        assert!(error.contains("unavailable"), "{error}");
+        token_cache::clear("codex");
     }
 
     #[tokio::test(start_paused = true)]
