@@ -299,10 +299,15 @@ impl LocalAgentHandle {
 
         // Closing is best-effort: deleting persisted history is the primary intent.
         // Route through the session binding so delegated runtimes are released too.
-        let _ = self.terminate_session(&session_id).await;
+        //
+        // The hook runs before the per-session guard is taken so a slow hook
+        // cannot hold up loads of this session. The guard then spans teardown
+        // through the row delete, so a concurrent load cannot register an
+        // actor for a session that is being deleted.
         if let Err(error) = self.run_session_end_hook(&session_id, "delete").await {
             tracing::warn!(session_id, %error, "session_end hook failed during delete");
         }
+        let delete_guard = self.terminate_for_delete(&session_id).await;
 
         let store = self.config.provider.history_store();
         let exists = store
@@ -322,6 +327,7 @@ impl LocalAgentHandle {
             Error::internal_error().data(serde_json::json!({"error": e.to_string()}))
         })?;
         self.config.remove_run_lease_file(&session_id);
+        drop(delete_guard);
         if store.supports_session_pins() {
             crate::control::notifications::emit_session_pins_changed_notification(
                 self,

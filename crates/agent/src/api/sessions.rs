@@ -1385,14 +1385,18 @@ impl AgentSessions {
         let store = self.session_store();
         // Tear down the session's actor first (best-effort, routed to the
         // runtime the session is bound to) so no idle actor can start a run,
-        // or recreate the run lease file, once the row is gone.
-        let _ = self.agent.terminate_session(&session_id).await;
+        // or recreate the run lease file, once the row is gone. The returned
+        // guard keeps a concurrent load of this session from registering a
+        // new actor until the row is deleted; it does not affect other
+        // sessions or session creation.
+        let delete_guard = self.agent.terminate_for_delete(&session_id).await;
         // Remove the durable remote bookmark first: if that fails, return
         // early with the session row intact instead of deleting the row and
         // leaving a dangling bookmark behind.
         store.remove_remote_session_bookmark(&session_id).await?;
         store.delete_session(&session_id).await?;
         self.agent.config.remove_run_lease_file(&session_id);
+        drop(delete_guard);
         if store.supports_session_pins() {
             crate::control::notifications::emit_session_pins_changed_notification(
                 &self.agent,

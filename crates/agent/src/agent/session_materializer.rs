@@ -48,7 +48,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 ///
 /// Contains everything needed to insert into the registry's in-memory maps,
 /// but hasn't been registered yet.
-struct SessionSingleFlightGuard {
+pub(crate) struct SessionSingleFlightGuard {
     session_id: String,
     lock: Arc<tokio::sync::Mutex<()>>,
     inflight: Arc<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -165,6 +165,14 @@ impl SessionMaterializer {
     #[cfg(feature = "remote")]
     pub fn mesh(&self) -> Option<crate::agent::remote::MeshHandle> {
         self.mesh.read().clone()
+    }
+
+    /// Hold the per-session materialization lock for `session_id`.
+    ///
+    /// Delete uses this to serialize with load/resume of the same session only:
+    /// creating sessions and materializing other sessions never wait on it.
+    pub(crate) async fn lock_session(&self, session_id: &str) -> SessionSingleFlightGuard {
+        self.acquire_session_lock(session_id).await
     }
 
     /// Acquire a per-session single-flight lock.
@@ -1622,6 +1630,15 @@ impl SessionMaterializer {
             },
         );
 
+        // The setup events above are queued, not awaited. Wait until they are
+        // persisted so callers that await finalization (create, load, resume)
+        // never read a history that is still missing them.
+        self.config
+            .event_sink
+            .session_stream(&prepared.session_id)
+            .flush()
+            .await;
+
         Ok(())
     }
 
@@ -2505,6 +2522,38 @@ mod worktree_binding_tests {
             })
             .count();
         assert_eq!(interrupted, 1);
+    }
+
+    #[tokio::test]
+    async fn finalize_session_persists_setup_events_before_returning() {
+        use crate::session::projection::EventJournal;
+        let fx = worktree_fixture(false).await;
+        let prepared = fx
+            .materializer
+            .prepare_new_session(NewSessionRequest::new(fx.repo.path().to_path_buf()))
+            .await
+            .expect("session prepares");
+        fx.materializer
+            .finalize_session(&prepared)
+            .await
+            .expect("session finalizes");
+
+        // Read immediately, with no sleep: queued setup events must already be
+        // persisted when finalization returns.
+        let kinds = fx
+            .storage
+            .load_session_stream(&prepared.session_id, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, crate::events::AgentEventKind::SessionConfigured { .. })),
+            "SessionConfigured must be persisted before finalize_session returns: {kinds:?}"
+        );
     }
 
     #[tokio::test]

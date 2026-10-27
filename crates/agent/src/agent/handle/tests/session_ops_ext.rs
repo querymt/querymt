@@ -317,10 +317,7 @@ async fn terminate_session_removes_and_shuts_down_the_actor() {
         .cloned()
         .expect("registered");
 
-    f.handle
-        .terminate_session(&session.public_id)
-        .await
-        .expect("terminate");
+    let guard = f.handle.terminate_for_delete(&session.public_id).await;
 
     assert!(
         f.handle
@@ -331,11 +328,91 @@ async fn terminate_session_removes_and_shuts_down_the_actor() {
             .is_none()
     );
     assert!(session_ref.get_runtime_status().await.is_err());
+    drop(guard);
     // Unloaded sessions are a no-op.
-    f.handle
-        .terminate_session(&session.public_id)
+    drop(f.handle.terminate_for_delete(&session.public_id).await);
+}
+
+#[tokio::test]
+async fn delete_guard_blocks_only_load_of_the_same_session() {
+    use std::time::Duration;
+    let f = RealStorageHandleFixture::new().await;
+    let doomed = seed_session_with_reasoning(&f, None).await;
+    let other = seed_session_with_reasoning(&f, None).await;
+    let load = |id: &str| {
+        crate::acp::protocol::LoadSessionRequest::new(
+            SessionId::from(id.to_string()),
+            std::path::PathBuf::new(),
+        )
+    };
+
+    async fn step<T>(label: &str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+            .await
+            .unwrap_or_else(|_| panic!("step timed out: {label}"))
+    }
+
+    // An empty directory: a session cwd makes the actor index its workspace in
+    // the background, and indexing a large tree (e.g. the system temp dir)
+    // would stall runtime shutdown at the end of the test.
+    let new_session_cwd = tempfile::tempdir().expect("tempdir");
+
+    let guard = step(
+        "terminate_for_delete",
+        f.handle.terminate_for_delete(&doomed),
+    )
+    .await;
+
+    // A load of the session being deleted waits for the guard.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            f.handle.load_session(load(&doomed))
+        )
         .await
-        .expect("terminate unloaded");
+        .is_err(),
+        "load of a session under deletion must wait"
+    );
+
+    // Creating sessions and loading other sessions are not held up.
+    step(
+        "new_session while delete guard held",
+        f.handle
+            .new_session(NewSessionRequest::new(new_session_cwd.path().to_path_buf())),
+    )
+    .await
+    .expect("new_session");
+    step(
+        "load other session while delete guard held",
+        f.handle.load_session(load(&other)),
+    )
+    .await
+    .expect("load other");
+
+    // Once the row is gone and the guard is released, the load fails cleanly
+    // and no actor is registered for the deleted session.
+    step(
+        "delete row",
+        f.handle
+            .config
+            .provider
+            .history_store()
+            .delete_session(&doomed),
+    )
+    .await
+    .expect("delete row");
+    drop(guard);
+    assert!(
+        step("final load", f.handle.load_session(load(&doomed)))
+            .await
+            .is_err()
+    );
+    assert!(
+        step("registry lock", f.handle.registry.lock())
+            .await
+            .get(&doomed)
+            .is_none()
+    );
 }
 
 #[tokio::test]

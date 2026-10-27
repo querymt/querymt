@@ -111,22 +111,37 @@ impl LocalAgentHandle {
     /// because nothing will read the run's outcome once the session is gone.
     /// Routed to the bound runtime like [`Self::stop_session`]. Remote-hosted
     /// sessions keep the full stop protocol; unloaded sessions are a no-op.
-    pub(crate) async fn terminate_session(&self, session_id: &str) -> Result<(), Error> {
-        if let Some((session_handle, binding)) = self.bound_session_handle(session_id).await? {
-            let local_handle = session_handle
-                .as_any()
-                .downcast_ref::<LocalAgentHandle>()
-                .ok_or_else(|| {
-                    Error::internal_error().data(serde_json::json!({
-                        "message": "bound session runtime is not local",
-                        "sessionId": session_id,
-                        "profileId": binding.profile_id,
-                        "agentId": binding.agent_id,
-                    }))
-                })?;
-            return Box::pin(local_handle.terminate_session_in_runtime(session_id)).await;
+    ///
+    /// Returns the per-session materialization guard of the runtime that owns
+    /// the session. The caller must keep it until the session row is deleted:
+    /// a concurrent load/resume of this session then waits, and afterwards
+    /// finds no row instead of registering an actor for a deleted session.
+    /// The guard is per session, so creating sessions and materializing other
+    /// sessions are never blocked. Teardown is best-effort (failures are
+    /// logged); the guard is returned regardless.
+    pub(crate) async fn terminate_for_delete(
+        &self,
+        session_id: &str,
+    ) -> crate::agent::session_materializer::SessionSingleFlightGuard {
+        // Resolve the owning runtime before locking: this may build a profile
+        // runtime, which must not happen while loads of this session wait.
+        let bound = match self.bound_session_handle(session_id).await {
+            Ok(bound) => bound,
+            Err(error) => {
+                tracing::warn!(session_id, %error, "failed to resolve session runtime for delete");
+                None
+            }
+        };
+        let bound_handle = bound
+            .as_ref()
+            .and_then(|(handle, _)| handle.as_any().downcast_ref::<LocalAgentHandle>());
+        let runtime: &LocalAgentHandle = bound_handle.unwrap_or(self);
+
+        let guard = runtime.session_materializer.lock_session(session_id).await;
+        if let Err(error) = Box::pin(runtime.terminate_session_in_runtime(session_id)).await {
+            tracing::warn!(session_id, %error, "failed to terminate session actor for delete");
         }
-        self.terminate_session_in_runtime(session_id).await
+        guard
     }
 
     async fn terminate_session_in_runtime(&self, session_id: &str) -> Result<(), Error> {
