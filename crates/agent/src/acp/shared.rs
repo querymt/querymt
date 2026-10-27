@@ -36,6 +36,7 @@ type SessionRequestLocks = Arc<Mutex<HashMap<(String, String), Weak<Mutex<()>>>>
 #[derive(Clone, Default)]
 pub struct SessionOwnerMap {
     owners: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    interaction_owners: Arc<Mutex<HashMap<String, String>>>,
     request_locks: SessionRequestLocks,
 }
 
@@ -43,6 +44,48 @@ impl SessionOwnerMap {
     /// Lock the session subscription map.
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, HashSet<String>>> {
         self.owners.lock().await
+    }
+
+    /// Live human-input requests follow the input submitter, not every observer.
+    pub(crate) async fn owns_interactions(&self, session_id: &str, conn_id: &str) -> bool {
+        self.interaction_owner(session_id).await.as_deref() == Some(conn_id)
+    }
+
+    pub(crate) async fn interaction_owner(&self, session_id: &str) -> Option<String> {
+        let owners = self.owners.lock().await;
+        let subscribers = owners.get(session_id)?;
+        let mut interaction_owners = self.interaction_owners.lock().await;
+        if interaction_owners
+            .get(session_id)
+            .is_none_or(|owner| !subscribers.contains(owner))
+        {
+            let Some(owner) = subscribers.iter().min() else {
+                interaction_owners.remove(session_id);
+                return None;
+            };
+            interaction_owners.insert(session_id.to_string(), owner.clone());
+        }
+        interaction_owners.get(session_id).cloned()
+    }
+
+    pub(crate) async fn forget_interaction_owner(&self, session_id: &str, conn_id: &str) {
+        let mut owners = self.interaction_owners.lock().await;
+        if owners.get(session_id).is_some_and(|owner| owner == conn_id) {
+            owners.remove(session_id);
+        }
+    }
+
+    async fn set_interaction_owner(&self, session_id: &str, conn_id: &str) {
+        let owners = self.owners.lock().await;
+        if owners
+            .get(session_id)
+            .is_some_and(|subscribers| subscribers.contains(conn_id))
+        {
+            self.interaction_owners
+                .lock()
+                .await
+                .insert(session_id.to_string(), conn_id.to_string());
+        }
     }
 
     async fn request_lock(&self, session_id: &str, conn_id: &str) -> Arc<Mutex<()>> {
@@ -64,12 +107,18 @@ async fn subscribe_connection(
     session_id: String,
     conn_id: &str,
 ) -> bool {
+    let mut owners = session_owners.lock().await;
+    let inserted = owners
+        .entry(session_id.clone())
+        .or_default()
+        .insert(conn_id.to_string());
     session_owners
+        .interaction_owners
         .lock()
         .await
         .entry(session_id)
-        .or_default()
-        .insert(conn_id.to_string())
+        .or_insert_with(|| conn_id.to_string());
+    inserted
 }
 
 async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &str, conn_id: &str) {
@@ -81,6 +130,9 @@ async fn unsubscribe_connection(session_owners: &SessionOwnerMap, session_id: &s
     if remove_session {
         owners.remove(session_id);
     }
+    session_owners
+        .forget_interaction_owner(session_id, conn_id)
+        .await;
 }
 
 /// Type alias for pending elicitation requests (elicitation_id -> response sender)
@@ -405,6 +457,11 @@ async fn attach_rpc_session_locked<S: SendAgent>(
     let ownership_inserted =
         subscribe_connection(session_owners, session_id.to_string(), conn_id).await;
     let Some(local_agent) = agent.as_any().downcast_ref::<AgentHandle>() else {
+        if bridge_required {
+            session_owners
+                .set_interaction_owner(session_id, conn_id)
+                .await;
+        }
         return Ok(ownership_inserted);
     };
     if ownership_inserted && let Some(translator) = context.translator.as_ref() {
@@ -430,6 +487,16 @@ async fn attach_rpc_session_locked<S: SendAgent>(
             unsubscribe_connection(session_owners, session_id, conn_id).await;
         }
         return Err(error);
+    }
+    if bridge_required {
+        session_owners
+            .set_interaction_owner(session_id, conn_id)
+            .await;
+        if let Some(recovery) = context.elicitation_recovery.as_ref() {
+            recovery
+                .authorize_live_owner(session_owners, conn_id, session_id, local_agent)
+                .await;
+        }
     }
     Ok(ownership_inserted)
 }
@@ -2737,7 +2804,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                 conn_id,
                                 &context,
                                 session_id,
-                                false,
+                                matches!(ext_method, "querymt/session/steer" | "querymt/session/queue"),
                             )
                             .await?
                         } else {

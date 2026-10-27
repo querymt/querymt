@@ -2,7 +2,7 @@ use agent_client_protocol::Error;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 use typeshare::typeshare;
 
@@ -17,9 +17,12 @@ pub const ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION: &str =
 pub const ELICITATION_RECOVERY_COMPLETED_NOTIFICATION: &str = "querymt/elicitation/completed";
 pub const ELICITATION_RECOVERY_DENIED_CODE: i32 = -32003;
 
+type SessionAuthorityLocks = Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>;
+
 #[derive(Clone, Default)]
 pub struct ElicitationRecoveryRegistry {
     inner: Arc<Mutex<ElicitationRecoveryRegistryState>>,
+    session_locks: SessionAuthorityLocks,
 }
 
 #[derive(Default)]
@@ -39,6 +42,17 @@ struct SessionAuthority {
 }
 
 impl ElicitationRecoveryRegistry {
+    async fn session_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.session_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
     pub async fn register_connection(&self, connection_id: String, secure_transport: bool) {
         self.inner.lock().await.connections.insert(
             connection_id,
@@ -77,12 +91,64 @@ impl ElicitationRecoveryRegistry {
         }
     }
 
+    /// Authorize the selected live owner without rotating a pending authority.
+    /// Session observation alone is not sufficient to acquire this authorization.
+    pub(crate) async fn authorize_live_owner(
+        &self,
+        owners: &crate::acp::shared::SessionOwnerMap,
+        connection_id: &str,
+        session_id: &str,
+        agent: &crate::agent::LocalAgentHandle,
+    ) {
+        let session_lock = self.session_lock(session_id).await;
+        let _guard = session_lock.lock().await;
+        if !owners.owns_interactions(session_id, connection_id).await {
+            return;
+        }
+        let Ok(supports_forms) = self
+            .verify_connection(connection_id, ELICITATION_RECOVERY_VERSION)
+            .await
+        else {
+            return;
+        };
+        if !supports_forms
+            && !crate::elicitation::session_pending_is_permission_only(agent, session_id).await
+        {
+            return;
+        }
+        // Capability inspection can await an actor. Revalidate ownership and the
+        // connection before granting access to the existing verifier.
+        if !owners.owns_interactions(session_id, connection_id).await {
+            return;
+        }
+        let mut state = self.inner.lock().await;
+        if !state
+            .connections
+            .get(connection_id)
+            .is_some_and(|connection| {
+                connection.secure_transport
+                    && connection.supports_form_elicitation == supports_forms
+            })
+        {
+            return;
+        }
+        if let Some(authority) = state.sessions.get_mut(session_id) {
+            authority
+                .authorized_connections
+                .insert(connection_id.to_string());
+        }
+    }
+
     pub async fn issue_for_session(
         &self,
         connection_id: &str,
         session_id: &str,
         agent: &crate::agent::LocalAgentHandle,
     ) -> Option<String> {
+        // Registration and waiter binding form one lifecycle operation. Keep
+        // other sessions and connection teardown independent of actor awaits.
+        let session_lock = self.session_lock(session_id).await;
+        let _guard = session_lock.lock().await;
         let (existing_verifier, supports_forms) = {
             let state = self.inner.lock().await;
             let connection = state.connections.get(connection_id)?;
@@ -170,6 +236,8 @@ impl ElicitationRecoveryRegistry {
         elicitation_id: &str,
         agent: &crate::agent::LocalAgentHandle,
     ) -> Option<crate::elicitation::ClaimedElicitationDelivery> {
+        let session_lock = self.session_lock(session_id).await;
+        let _guard = session_lock.lock().await;
         let authority = {
             let state = self.inner.lock().await;
             state.sessions.get(session_id).map(|authority| {
@@ -220,32 +288,51 @@ impl ElicitationRecoveryRegistry {
             .await?;
         let verifier = authority_verifier(&request.resume_authority);
         let verifier_hex = hex::encode(verifier);
-        let mut session_ids =
-            crate::elicitation::pending_sessions_for_authority(agent, &verifier_hex).await;
-        if !supports_forms && !session_ids.is_empty() {
-            // Without form-question support only permission-only sessions are
-            // recoverable. Deny without pruning: the authority is still valid
-            // for the client that holds form support.
-            let mut recoverable = Vec::new();
-            for session_id in session_ids {
-                if crate::elicitation::session_pending_is_permission_only(agent, &session_id).await
-                {
-                    recoverable.push(session_id);
-                }
+        let candidates = {
+            let state = self.inner.lock().await;
+            state
+                .sessions
+                .iter()
+                .filter(|(_, authority)| constant_time_eq(&authority.verifier, &verifier))
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut session_ids = Vec::new();
+        let mut capability_mismatch = false;
+        for session_id in candidates {
+            let session_lock = self.session_lock(&session_id).await;
+            let _guard = session_lock.lock().await;
+            let pending =
+                crate::elicitation::pending_sessions_for_authority(agent, &verifier_hex).await;
+            let mut state = self.inner.lock().await;
+            if !state
+                .sessions
+                .get(&session_id)
+                .is_some_and(|authority| constant_time_eq(&authority.verifier, &verifier))
+            {
+                continue;
             }
-            if recoverable.is_empty() {
-                return Err(elicitation_recovery_denied(
-                    ElicitationRecoveryDenialReason::CapabilityMismatch,
-                ));
+            if !pending.contains(&session_id) {
+                state.sessions.remove(&session_id);
+                continue;
             }
-            session_ids = recoverable;
+            drop(state);
+            if !supports_forms
+                && !crate::elicitation::session_pending_is_permission_only(agent, &session_id).await
+            {
+                capability_mismatch = true;
+                continue;
+            }
+            session_ids.push(session_id);
         }
         if session_ids.is_empty() {
-            self.prune_authority(&verifier).await;
-            return Err(elicitation_recovery_denied(
-                ElicitationRecoveryDenialReason::AuthorityExpired,
-            ));
+            return Err(elicitation_recovery_denied(if capability_mismatch {
+                ElicitationRecoveryDenialReason::CapabilityMismatch
+            } else {
+                ElicitationRecoveryDenialReason::AuthorityExpired
+            }));
         }
+        session_ids.sort();
         Ok(ListPendingElicitationSessionsResponse {
             version: ELICITATION_RECOVERY_VERSION,
             session_ids,
@@ -258,6 +345,8 @@ impl ElicitationRecoveryRegistry {
         request: &AttachPendingElicitationSessionRequest,
         agent: &crate::agent::LocalAgentHandle,
     ) -> Result<AttachPendingElicitationSessionResponse, Error> {
+        let session_lock = self.session_lock(&request.session_id).await;
+        let _guard = session_lock.lock().await;
         let supports_forms = self
             .verify_connection(connection_id, request.version)
             .await?;
@@ -325,6 +414,8 @@ impl ElicitationRecoveryRegistry {
         session_id: &str,
         agent: &crate::agent::LocalAgentHandle,
     ) {
+        let session_lock = self.session_lock(session_id).await;
+        let _guard = session_lock.lock().await;
         let verifier = {
             let state = self.inner.lock().await;
             state
@@ -369,14 +460,6 @@ impl ElicitationRecoveryRegistry {
             ));
         }
         Ok(connection.supports_form_elicitation)
-    }
-
-    async fn prune_authority(&self, verifier: &[u8; 32]) {
-        self.inner
-            .lock()
-            .await
-            .sessions
-            .retain(|_, authority| !constant_time_eq(&authority.verifier, verifier));
     }
 }
 
@@ -589,6 +672,34 @@ mod tests {
             .await
             .expect("original secure connection receives authority");
         (registry, fixture, secret)
+    }
+
+    #[tokio::test]
+    async fn live_owner_authorization_requires_ownership_secure_transport_and_form_support() {
+        let (registry, fixture, _secret) = authorized_fixture("session-a", "question").await;
+        for (connection, secure, forms, selected) in [
+            ("observer", true, true, false),
+            ("insecure", false, true, true),
+            ("no-forms", true, false, true),
+            ("controller", true, true, true),
+        ] {
+            registry
+                .register_connection(connection.into(), secure)
+                .await;
+            registry.record_client_capabilities(connection, forms).await;
+            let owners = crate::acp::shared::SessionOwnerMap::default();
+            owners.lock().await.insert(
+                "session-a".into(),
+                HashSet::from([if selected { connection } else { "original" }.to_string()]),
+            );
+            registry
+                .authorize_live_owner(&owners, connection, "session-a", &fixture.handle)
+                .await;
+            let claim = registry
+                .claim_live_delivery(connection, "session-a", "question", &fixture.handle)
+                .await;
+            assert_eq!(claim.is_some(), selected && secure && forms, "{connection}");
+        }
     }
 
     #[tokio::test]
@@ -836,6 +947,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_authority_issue_keeps_the_question_deliverable() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let fixture = pending_fixture("session-a", "elicitation-a").await;
+        let registry = ElicitationRecoveryRegistry::default();
+        for connection in ["first", "second"] {
+            registry
+                .register_connection(connection.to_string(), true)
+                .await;
+            registry.record_client_capabilities(connection, true).await;
+        }
+
+        // Pause assignment after the first issuer publishes its authority. The
+        // second issuer must not expire it while scanning the unassigned waiter.
+        let agent_registry = fixture.handle.registry_lock().await;
+        let mut first = Box::pin(registry.issue_for_session("first", "session-a", &fixture.handle));
+        let mut second =
+            Box::pin(registry.issue_for_session("second", "session-a", &fixture.handle));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(first.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(second.as_mut().poll(&mut context), Poll::Pending));
+        drop(agent_registry);
+
+        let first_secret = first.await.expect("first connection receives authority");
+        assert!(
+            second.await.is_none(),
+            "an observer must not replace an in-flight authority"
+        );
+        let claim = registry
+            .claim_live_delivery("first", "session-a", "elicitation-a", &fixture.handle)
+            .await
+            .expect("the original question remains deliverable");
+        let pending = crate::elicitation::snapshot_pending_elicitations(
+            &fixture.handle.pending_elicitations(),
+        )
+        .await;
+        assert_eq!(
+            pending[0].owner_authority,
+            Some(hex::encode(authority_verifier(&first_secret)))
+        );
+        assert_eq!(pending[0].delivery_connection.as_deref(), Some("first"));
+        assert_eq!(claim.elicitation_id, "elicitation-a");
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_cannot_expire_authority_during_waiter_binding() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (registry, fixture, secret) = authorized_fixture("session-a", "old").await;
+        let map = fixture.handle.pending_elicitations();
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        crate::elicitation::insert_pending_elicitation(
+            &map,
+            "new".into(),
+            "session-a".into(),
+            sender,
+        )
+        .await;
+        let agent_registry = fixture.handle.registry_lock().await;
+        let mut issue =
+            Box::pin(registry.issue_for_session("original", "session-a", &fixture.handle));
+        let request = ListPendingElicitationSessionsRequest {
+            version: ELICITATION_RECOVERY_VERSION,
+            resume_authority: secret,
+        };
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(issue.as_mut().poll(&mut context), Poll::Pending));
+        map.lock().await.remove("old");
+        let mut scan =
+            Box::pin(registry.list_pending_sessions("original", &request, &fixture.handle));
+        assert!(matches!(scan.as_mut().poll(&mut context), Poll::Pending));
+        drop(agent_registry);
+        assert!(issue.await.is_none(), "existing authority should be reused");
+        assert_eq!(
+            scan.await.expect("recovery waits for binding").session_ids,
+            vec!["session-a"]
+        );
+        assert!(
+            registry
+                .claim_live_delivery("original", "session-a", "new", &fixture.handle)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn authority_issue_revalidates_connection_after_pending_scan() {
         let (registry, fixture, _secret) = authorized_fixture("session-a", "elicitation-a").await;
         let pending_map = fixture.handle.pending_elicitations();
@@ -953,6 +1152,20 @@ mod tests {
         registry
             .register_connection("replacement".to_string(), true)
             .await;
+        let owners = crate::acp::shared::SessionOwnerMap::default();
+        owners
+            .lock()
+            .await
+            .insert("session-p".into(), HashSet::from(["replacement".into()]));
+        registry
+            .authorize_live_owner(&owners, "replacement", "session-p", &fixture.handle)
+            .await;
+        assert!(
+            registry
+                .claim_live_delivery("replacement", "session-p", "perm-1", &fixture.handle)
+                .await
+                .is_some()
+        );
         let attached = registry
             .authorize_attach(
                 "replacement",
