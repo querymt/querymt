@@ -75,7 +75,7 @@ trait HTTPChatProvider {
 - `ChatStream` is a type alias for the boxed chunk stream.
 - Extism: `ExtismChatRequest` keeps `options: Option<GenerationOptions>`. The plugin exports collapse to `prepare_chat_request`, `parse_chat_response`, the stream-parser exports and `capabilities`. `PREPARED_CHAT_CONTRACT_VERSION` is bumped and every plugin is rebuilt; the host does not support the old exports.
 - Remote: `ProviderChatRequest` / `ProviderStreamRequest` keep `options`. `build_chat_request` / `build_stream_request` take a `ChatCall` (the `*_with_options` builders are removed). `MESH_PROTOCOL_VERSION` is bumped.
-- Remote capability reporting: the host answers `GetProviderContractInfo` with the options the *built provider* honours, not a blanket `ALL`.
+- Remote capability reporting: the host answers `GetProviderContractInfo` with the options the *built provider* honours, not a blanket `ALL`. The handshake also carries the host-resolved initial cap, output ceiling and reasoning effort. Session provider construction negotiates these facts before snapshotting `ModelProfile`, respecting host defaults and explicit caps. Mesh protocol version 4 requires peers to ship this profile together.
 - **Alternative rejected:** building a one-off provider per escalated request. It is cheap, but it bypasses provider caching, OAuth resolver reuse and plugin instance locking, and it doesn't extend to effort changes.
 - **Alternative rejected:** keeping method pairs with default delegation. This was the first implementation; it grows without bound and fails silently.
 
@@ -125,13 +125,13 @@ trait HTTPChatProvider {
 ### 6. `OutputLimitRecoveryMiddleware`
 
 ```
-state per turn: escalated: bool, continuations: u8, fragment_active: bool
+state per turn: escalated: bool, escalated_cap: Option<u32>, continuations: u8, fragment_active: bool
 
 on_after_llm(AfterLlm{response, context}):
   cut = response.finish_reason == Length
-  if !cut && fragment_active -> remove fragment, reset continuations
+  if !cut && fragment_active -> remove fragment (keep the per-turn continuation count)
   if cut && !escalated && last_cap < ceiling:
-      escalated = true; emit Recovery{escalate}
+      escalated = true; escalated_cap = context-clamped target; emit Recovery{escalate}
       record_discarded_usage(response.usage)          // via runtime hook, see 7
       return BeforeLlmCall(context.with_request_overrides(max_tokens=ceiling))
   pass
@@ -140,12 +140,14 @@ on_stopped(Stopped{ModelTokenLimit, context}):
   if continuations < max_continuations:
       continuations += 1; emit Recovery{continue}
       ctx = context.upsert_fragment("output_limit_recovery", instruction, High)
-      overrides.max_tokens = ceiling (if escalated)
+      overrides.max_tokens = escalated_cap (if escalated)
       if thinking_only: overrides.reasoning_effort = lower(current effort, floor Low; Auto->Medium)
       return BeforeLlmCall(ctx.with_request_overrides(overrides))
   pass
 ```
 
+- Continuation guidance follows a retained assistant reply rather than creating assistant prefill. For a latest tool-result message, fragments are appended to its input parts to preserve tool-use/result adjacency. Latest durable user feedback otherwise stays after fragments.
+- Pending request overrides survive queued steering. After history, tools and context hooks are prepared, output overrides are clamped again against the available context window.
 - Because `on_after_llm` returns `BeforeLlmCall`, `transition_after_llm` doesn't run: the escalated attempt's reply is never stored. The streamed partial message is closed by the recovery event, which carries `discarded_message_id` so clients drop it.
 - Config (TOML, all optional): `enabled = true`, `escalate = true`, `max_continuations = 3`, `instruction = "<default text>"`, `lower_effort_on_thinking_only = true`.
 - Default instruction: "Your previous response was cut off by the output-token limit ({cap} tokens). Continue directly from where you stopped without repeating or summarising earlier output. Split large file writes or edits into several smaller tool calls, and keep reasoning brief."

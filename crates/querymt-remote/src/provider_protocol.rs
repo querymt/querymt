@@ -25,7 +25,15 @@ pub struct GetProviderContractInfo {
 /// via [`GetProviderContractInfo`] before the first provider call and fail
 /// fast with an actionable message on mismatch instead of surfacing opaque
 /// MessagePack decoding complaints.
-pub const MESH_PROTOCOL_VERSION: u32 = 3;
+pub const MESH_PROTOCOL_VERSION: u32 = 4;
+
+/// Host-resolved generation settings used to plan output-limit recovery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderGenerationProfile {
+    pub initial_max_tokens: Option<u32>,
+    pub output_ceiling: Option<u32>,
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderContractInfo {
@@ -39,6 +47,8 @@ pub struct ProviderContractInfo {
     /// including which per-request options it honours.
     #[serde(default)]
     pub capabilities: ChatCapabilities,
+    #[serde(default)]
+    pub generation: ProviderGenerationProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +735,11 @@ mod rmp_wire_tests {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             protocol_version: Some(MESH_PROTOCOL_VERSION),
             capabilities: Default::default(),
+            generation: ProviderGenerationProfile {
+                initial_max_tokens: Some(32_000),
+                output_ceiling: Some(128_000),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            },
         };
         assert_rmp_round_trip_equal(&current);
 

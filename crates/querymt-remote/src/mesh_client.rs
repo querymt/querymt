@@ -363,6 +363,11 @@ impl MeshChatProvider {
         Self::new(mesh, &target_node_id.to_string(), provider_name, model)
     }
 
+    /// Resolve the remote provider's capabilities and generation defaults before use.
+    pub async fn negotiate_contract(&self) -> Result<crate::ProviderContractInfo, LLMError> {
+        self.inner.core().negotiate_contract().await
+    }
+
     pub fn with_params(mut self, params: Option<serde_json::Value>) -> Self {
         let config = self.inner.core().config().clone().with_params(params);
         self.rebuild_with_config(config);

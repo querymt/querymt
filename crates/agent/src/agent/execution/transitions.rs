@@ -97,6 +97,18 @@ pub(super) async fn transition_before_llm_call(
         }
     };
 
+    // A failed eager initialization may have left the turn with an empty profile.
+    // Provider retries must refresh it before request options are filtered.
+    let context = if context.profile.capabilities != provider.capabilities() {
+        Arc::new(
+            (**context)
+                .clone()
+                .with_profile(exec_ctx.session_handle.profile().await),
+        )
+    } else {
+        context.clone()
+    };
+
     let tools = config.collect_tools(
         provider,
         Some(exec_ctx.runtime.as_ref()),
@@ -173,7 +185,7 @@ pub(super) async fn transition_before_llm_call(
     };
     validate_tool_context_budget(tool_tokens, context_window)?;
     let estimated_tokens = hook_result.estimated_tokens.saturating_add(tool_tokens);
-    if estimated_tokens > context_window as usize {
+    if estimated_tokens >= context_window as usize {
         return Ok(ExecutionState::Stopped {
             message: format!(
                 "Prepared request is approximately {} tokens, exceeding the {} token context window",
@@ -185,13 +197,19 @@ pub(super) async fn transition_before_llm_call(
         });
     }
     let messages = apply_cache_breakpoints(&messages);
+    // Re-evaluate room after history, steering, tools, and context hooks are prepared.
+    let mut options = context.request_overrides;
+    if let Some(cap) = options.max_tokens {
+        let room = context_window.saturating_sub(estimated_tokens as u32);
+        options.max_tokens = Some(cap.min(room));
+    }
     Ok(ExecutionState::CallLlm {
         context: context.clone(),
         request: Arc::new(PreparedModelRequest {
             messages: Arc::from(messages.into_boxed_slice()),
             tools: Arc::from(tools.into_boxed_slice()),
             estimated_tokens,
-            options: context.request_overrides,
+            options,
         }),
     })
 }
@@ -2582,10 +2600,45 @@ mod tests {
             let state = transition_before_llm_call(&fixture.config, &context, &exec)
                 .await
                 .expect("before llm call");
-            let ExecutionState::CallLlm { request, .. } = state else {
+            let ExecutionState::CallLlm { request, context } = state else {
                 panic!("expected CallLlm, got {}", state.name());
             };
             assert_eq!(request.options, overrides);
+            assert_eq!(
+                context.profile.capabilities,
+                exec.session_handle.provider().await.unwrap().capabilities(),
+                "successful initialization must replace a stale or empty profile"
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_cap_is_clamped_after_preparing_the_request() {
+            let (fixture, _factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            let exec = fixture.execution_context().await;
+            let mut context = (*crate::test_utils::test_context(&exec.session_id, 0)).clone();
+            context.messages = Arc::from([ChatMessage::user().text("continue the report").build()]);
+            context.request_overrides = querymt::chat::GenerationOptions::NONE
+                .with_max_tokens(u32::MAX)
+                .with_reasoning_effort(querymt::chat::ReasoningEffort::Low);
+            let window = crate::model_info::get_model_info(&context.provider, &context.model)
+                .and_then(|info| info.limits.context)
+                .unwrap_or(u64::from(u32::MAX))
+                .min(u64::from(u32::MAX)) as u32;
+            let state = transition_before_llm_call(&fixture.config, &Arc::new(context), &exec)
+                .await
+                .unwrap();
+            let ExecutionState::CallLlm { request, .. } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            assert!(request.estimated_tokens > 0);
+            assert_eq!(
+                request.options.max_tokens,
+                Some(window - request.estimated_tokens as u32)
+            );
+            assert_eq!(
+                request.options.reasoning_effort,
+                Some(querymt::chat::ReasoningEffort::Low)
+            );
         }
 
         #[tokio::test]

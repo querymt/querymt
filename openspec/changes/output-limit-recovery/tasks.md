@@ -59,7 +59,24 @@
 - [x] 7.1 Run `cargo test` for `querymt`, `querymt-remote`, every provider crate touched in 0.4 (Anthropic native and Extism), `querymt-py` and `querymt-agent --all-features`, plus clippy and fmt; verify all green, and that the OCI plugin builds succeed with the bumped contract.
 - [x] 7.2 Run a manual end-to-end check with `claude-sonnet-5-5`, using a prompt that asks for a very large single file write: the run escalates or continues instead of stopping, and the journal shows `output_limit_recovery` events; record the result in the change notes.
 
+## 8. Review fixes
+
+- [x] 8.1 Place continuation guidance after retained assistant output without breaking tool-result adjacency; add regression tests.
+- [x] 8.2 Preserve the effective escalation cap and clamp recovery requests to available context room; add regression tests.
+- [x] 8.3 Keep continuation counts cumulative across successful intermediate replies in a turn; add regression tests.
+- [x] 8.4 Preserve pending request overrides when applying queued steering; add regression coverage.
+- [x] 8.5 Negotiate remote capabilities before building the recovery profile and resolve remote output caps and effort; add regression coverage.
+- [x] 8.6 Run focused tests and formatting checks for the review fixes.
+
 ## Verification notes
+
+### Review-fix verification
+
+- Passing with `querymt-agent --features remote --lib`: output-limit middleware (30), execution (145), session provider (9), context state (8), and provider routing integration (4).
+- `cargo test -p querymt-remote --features kameo-mesh --lib`: 169 passing, including negotiation before chat and generation-profile serialization.
+- `cargo check -p querymt-agent --lib`, `cargo clippy -p querymt-agent -p querymt-remote --features querymt-agent/remote --lib --tests`, `cargo fmt --all --check`, and `git diff --check` pass. Existing feature-gated unused-import/dead-code warnings remain.
+- Remote negotiation now happens during session provider construction. Unreachable peers fail there rather than at the first chat; routing tests assert this behavior. Both peers must use mesh protocol version 4.
+- These fixes were not exercised against a live Anthropic endpoint or across physical machines; focused tests use local fixtures and mock transports.
 
 ### 7.1 Test run
 

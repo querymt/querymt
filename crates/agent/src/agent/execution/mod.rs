@@ -246,6 +246,7 @@ pub(crate) async fn apply_pending_steering(
     .with_session_mode(context.session_mode)
     .with_profile(context.profile.clone())
     .with_last_applied(context.last_applied)
+    .with_request_overrides(context.request_overrides)
     .with_fragments(context.fragments.clone());
     Ok(Some(Arc::new(next)))
 }
@@ -989,13 +990,19 @@ mod tests {
         )
         .with_turn_id("run-1")
         .with_steering(steering);
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            session_id.clone().into(),
-            Arc::from([]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ));
+        let overrides = querymt::chat::GenerationOptions::NONE
+            .with_max_tokens(128_000)
+            .with_reasoning_effort(querymt::chat::ReasoningEffort::Low);
+        let context = Arc::new(
+            crate::middleware::ConversationContext::new(
+                session_id.clone().into(),
+                Arc::from([]),
+                Arc::new(crate::middleware::AgentStats::default()),
+                "mock".into(),
+                "mock".into(),
+            )
+            .with_request_overrides(overrides),
+        );
         let mut live_events = fixture.config.subscribe_events();
 
         let next = apply_pending_steering(
@@ -1010,6 +1017,7 @@ mod tests {
         .expect("steering changes context");
 
         assert_eq!(next.messages.len(), 1);
+        assert_eq!(next.request_overrides, overrides);
         let history = fixture
             .config
             .provider

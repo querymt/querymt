@@ -3570,9 +3570,9 @@ mod tests {
                     AgentEventKind::RunStarted { run_id, .. } => {
                         Some(("run_started", run_id, None))
                     }
-                    AgentEventKind::RunCompleted { run_id, outcome, .. } => {
-                        Some(("run_completed", run_id, Some(outcome)))
-                    }
+                    AgentEventKind::RunCompleted {
+                        run_id, outcome, ..
+                    } => Some(("run_completed", run_id, Some(outcome))),
                     _ => None,
                 })
                 .collect()

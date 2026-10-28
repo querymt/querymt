@@ -81,6 +81,8 @@ impl Default for OutputLimitConfig {
 pub(crate) struct TurnState {
     /// The one-shot escalation to the ceiling has been spent.
     pub(crate) escalated: bool,
+    /// Effective escalation cap, including any context-window clamp.
+    escalated_cap: Option<u32>,
     /// Continuations issued so far.
     pub(crate) continuations: u8,
     /// The continuation instruction is currently part of the context.
@@ -105,16 +107,13 @@ fn lowered_effort(current: Option<ReasoningEffort>) -> ReasoningEffort {
 /// continuation or it would silently fall back to the initial cap.
 fn continuation_options(
     profile: &ModelProfile,
-    escalated: bool,
+    escalated_cap: Option<u32>,
     lower_effort: bool,
 ) -> GenerationOptions {
     let supported = profile.capabilities.options;
     let mut options = GenerationOptions::NONE;
-    if escalated
-        && supported.max_tokens
-        && let Some(caps) = profile.caps
-    {
-        options.max_tokens = Some(caps.ceiling);
+    if supported.max_tokens {
+        options.max_tokens = escalated_cap;
     }
     if lower_effort && supported.reasoning_effort {
         options.reasoning_effort = Some(lowered_effort(profile.reasoning_effort));
@@ -268,11 +267,7 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
         // A reply that finished normally ends any continuation: drop the instruction.
         if !cut {
             let was_active = self.with_turn(&context.session_id, |turn| {
-                let active = std::mem::take(&mut turn.fragment_active);
-                if active {
-                    turn.continuations = 0;
-                }
-                active
+                std::mem::take(&mut turn.fragment_active)
             });
             let context = if was_active {
                 Arc::new(context.remove_fragment(FRAGMENT_KEY))
@@ -289,7 +284,13 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
         let target = escalation_target(&context.profile, used, context_room(&context, &response));
         let escalate = target.filter(|_| {
             self.with_turn(&context.session_id, |turn| {
-                !std::mem::replace(&mut turn.escalated, true)
+                if turn.escalated {
+                    false
+                } else {
+                    turn.escalated = true;
+                    turn.escalated_cap = target;
+                    true
+                }
             })
         });
         match escalate {
@@ -331,12 +332,12 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
                 turn.fragment_active = true;
                 (
                     turn.continuations,
-                    turn.escalated,
+                    turn.escalated_cap,
                     turn.last_cut_thinking_only,
                 )
             })
         });
-        let Some((attempt, escalated, thinking_only)) = plan else {
+        let Some((attempt, escalated_cap, thinking_only)) = plan else {
             return Ok(state);
         };
 
@@ -344,7 +345,7 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
         let instruction = self.config.instruction.replace("{cap}", &cap);
         let options = continuation_options(
             &context.profile,
-            escalated,
+            escalated_cap,
             thinking_only && self.config.lower_effort_on_thinking_only,
         );
         debug!(
@@ -729,6 +730,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_continuation_follows_the_retained_assistant_reply() {
+        let mw = OutputLimitRecoveryMiddleware::default();
+        let profile = profile_for(128_000, 128_000);
+        let mut context = (*context_with("s", profile)).clone();
+        context.messages = Arc::from([
+            querymt::chat::ChatMessage::user()
+                .text("write a report")
+                .build(),
+            querymt::chat::ChatMessage::assistant()
+                .text("partial report")
+                .build(),
+        ]);
+        let state = ExecutionState::Stopped {
+            message: "cut off".into(),
+            stop_type: StopType::ModelTokenLimit,
+            context: Some(Arc::new(context)),
+        };
+        let context = recovered(mw.on_stopped(state, None).await.unwrap());
+        let messages = context.request_messages();
+        assert_eq!(messages[1].text(), "partial report");
+        assert_eq!(messages[2].role, querymt::chat::ChatRole::User);
+        assert!(messages[2].text().contains("Continue directly"));
+        assert_eq!(context.messages.len(), 2, "guidance stays temporary");
+    }
+
+    #[tokio::test]
+    async fn continuation_preserves_the_clamped_escalation_cap() {
+        let mw = OutputLimitRecoveryMiddleware::default();
+        let profile = profile_for(32_000, 128_000);
+        mw.with_turn(&"s".into(), |turn| {
+            turn.escalated = true;
+            turn.escalated_cap = Some(50_000);
+        });
+        let context = recovered(
+            stop_with(
+                &mw,
+                &profile,
+                GenerationOptions::NONE.with_max_tokens(50_000),
+                StopType::ModelTokenLimit,
+            )
+            .await,
+        );
+        assert_eq!(context.request_overrides.max_tokens, Some(50_000));
+    }
+
+    #[tokio::test]
+    async fn successful_intermediate_replies_do_not_replenish_continuations() {
+        let mw = OutputLimitRecoveryMiddleware::new(OutputLimitConfig {
+            max_continuations: 2,
+            ..Default::default()
+        });
+        let profile = profile_for(128_000, 128_000);
+        for expected in 1..=2 {
+            let context = recovered(stop(&mw, &profile, StopType::ModelTokenLimit).await);
+            mw.on_after_llm(
+                ExecutionState::AfterLlm {
+                    response: reply(FinishReason::ToolCalls),
+                    context,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                mw.with_turn(&"s".into(), |turn| turn.continuations),
+                expected
+            );
+        }
+        assert!(matches!(
+            stop(&mw, &profile, StopType::ModelTokenLimit).await,
+            ExecutionState::Stopped { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn continuation_repeats_the_escalated_cap() {
         let mw = OutputLimitRecoveryMiddleware::default();
         let runtime = profile_for(32_000, 128_000);
@@ -801,7 +877,7 @@ mod tests {
             panic!("expected AfterLlm, got {}", state.name());
         };
         assert!(context.fragments.iter().all(|f| f.key != FRAGMENT_KEY));
-        assert_eq!(mw.with_turn(&"s".into(), |t| t.continuations), 0);
+        assert_eq!(mw.with_turn(&"s".into(), |t| t.continuations), 1);
     }
 
     #[tokio::test]

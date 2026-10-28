@@ -238,6 +238,17 @@ where
         Ok(())
     }
 
+    /// Negotiate provider facts before a caller snapshots its model profile.
+    pub async fn negotiate_contract(&self) -> Result<ProviderContractInfo, LLMError> {
+        let host = self.lookup_host().await?;
+        self.validate_contract(&host, None).await?;
+        Ok(self
+            .contract_info
+            .get()
+            .expect("validated contract is cached")
+            .clone())
+    }
+
     pub fn build_chat_request(&self, call: &ChatCall<'_>) -> ProviderChatRequest {
         self.config.build_chat_request(call)
     }
@@ -752,6 +763,7 @@ mod tests {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION),
             capabilities: Default::default(),
+            generation: Default::default(),
         });
 
         core.validate_contract(&(), None).await.unwrap();
@@ -761,11 +773,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiation_resolves_recovery_profile_before_any_chat() {
+        let expected = ProviderContractInfo {
+            item_aware_chat_version: Some(querymt::chat::ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: ChatCapabilities::NONE
+                .with_streaming(true)
+                .with_options(querymt::chat::GenerationOptionSupport::ALL),
+            generation: crate::provider_protocol::ProviderGenerationProfile {
+                initial_max_tokens: Some(32_000),
+                output_ceiling: Some(128_000),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            },
+        };
+        let (transport, core) = core_with_contract(expected.clone());
+        assert!(!core.capabilities().options.max_tokens);
+        assert_eq!(core.negotiate_contract().await.unwrap(), expected);
+        assert_eq!(core.capabilities(), expected.capabilities);
+        assert_eq!(core.negotiate_contract().await.unwrap(), expected);
+        assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 1);
+        // TestTransport rejects chat calls: negotiation must not invoke the model.
+    }
+
+    #[tokio::test]
     async fn missing_protocol_version_fails_with_upgrade_guidance() {
         let (_transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: None,
             capabilities: Default::default(),
+            generation: Default::default(),
         });
 
         let error = core.validate_contract(&(), None).await.unwrap_err();
@@ -785,6 +821,7 @@ mod tests {
                 item_aware_chat_version: None,
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
                 capabilities: Default::default(),
+                generation: Default::default(),
             },
             Some(transport_error),
         );
@@ -808,6 +845,7 @@ mod tests {
                 item_aware_chat_version: None,
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
                 capabilities: Default::default(),
+                generation: Default::default(),
             },
             Some(TransportErrorKind::Timeout),
         );
@@ -827,6 +865,7 @@ mod tests {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION + 1),
             capabilities: Default::default(),
+            generation: Default::default(),
         });
 
         let error = core.validate_contract(&(), None).await.unwrap_err();
@@ -844,6 +883,7 @@ mod tests {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION),
             capabilities: Default::default(),
+            generation: Default::default(),
         };
         core.validate_contract(&(), None).await.unwrap();
         assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);

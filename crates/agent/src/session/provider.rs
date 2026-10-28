@@ -459,7 +459,7 @@ impl SessionProvider {
             .map(|built| built.provider)
     }
 
-    async fn build_provider_snapshot(
+    pub(crate) async fn build_provider_snapshot(
         &self,
         req: ProviderRequest<'_>,
     ) -> SessionResult<ProviderSnapshot> {
@@ -516,7 +516,7 @@ impl SessionProvider {
                     p
                 })
                 .or_else(|| Some(serde_json::json!({"_remote_session_id": session_id})));
-            return Ok(ProviderSnapshot::unverified(Arc::new(
+            return ProviderSnapshot::remote(
                 querymt_remote::MeshChatProvider::from_node_id(
                     mesh,
                     &node_id,
@@ -524,7 +524,8 @@ impl SessionProvider {
                     model,
                 )
                 .with_params(remote_params),
-            )));
+            )
+            .await;
         }
 
         // ── Case 2: Try local provider ─────────────────────────────────────────
@@ -575,7 +576,7 @@ impl SessionProvider {
                             .or_else(|| {
                                 Some(serde_json::json!({"_remote_session_id": session_id}))
                             });
-                        return Ok(ProviderSnapshot::unverified(Arc::new(
+                        return ProviderSnapshot::remote(
                             querymt_remote::MeshChatProvider::from_node_id(
                                 mesh,
                                 &node_id,
@@ -583,7 +584,8 @@ impl SessionProvider {
                                 model,
                             )
                             .with_params(remote_params),
-                        )));
+                        )
+                        .await;
                     }
                 }
                 return Err(SessionError::ProviderError(local_error));
@@ -733,10 +735,10 @@ impl Clone for SessionProvider {
     }
 }
 
-struct ProviderSnapshot {
+pub(crate) struct ProviderSnapshot {
     provider: Arc<dyn LLMProvider>,
     settings: crate::agent::utils::genai::GenerationSettings,
-    /// Output caps resolved with the provider; `None` when unknown (e.g. remote).
+    /// Output caps resolved with the provider; `None` when unknown.
     output_caps: Option<OutputCaps>,
     /// Reasoning effort the provider was configured with, when any.
     reasoning_effort: Option<querymt::chat::ReasoningEffort>,
@@ -744,12 +746,39 @@ struct ProviderSnapshot {
 
 impl ProviderSnapshot {
     #[cfg(feature = "remote")]
-    fn unverified(provider: Arc<dyn LLMProvider>) -> Self {
+    async fn remote(provider: querymt_remote::MeshChatProvider) -> SessionResult<Self> {
+        let info = provider.negotiate_contract().await?;
+        Ok(Self::from_remote_contract(Arc::new(provider), &info))
+    }
+
+    #[cfg(feature = "remote")]
+    fn from_remote_contract(
+        provider: Arc<dyn LLMProvider>,
+        info: &querymt_remote::ProviderContractInfo,
+    ) -> Self {
         Self {
             provider,
             settings: Default::default(),
-            output_caps: None,
-            reasoning_effort: None,
+            output_caps: info
+                .generation
+                .initial_max_tokens
+                .zip(info.generation.output_ceiling)
+                .map(|(initial, ceiling)| OutputCaps { initial, ceiling }),
+            reasoning_effort: info.generation.reasoning_effort,
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn contract_info(&self) -> querymt_remote::ProviderContractInfo {
+        querymt_remote::ProviderContractInfo {
+            item_aware_chat_version: Some(querymt_remote::ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(querymt_remote::provider_protocol::MESH_PROTOCOL_VERSION),
+            capabilities: self.provider.capabilities(),
+            generation: querymt_remote::provider_protocol::ProviderGenerationProfile {
+                initial_max_tokens: self.output_caps.map(|caps| caps.initial),
+                output_ceiling: self.output_caps.map(|caps| caps.ceiling),
+                reasoning_effort: self.reasoning_effort,
+            },
         }
     }
 }
@@ -1394,6 +1423,33 @@ pub mod tests {
     use crate::agent::session_control::{SessionControlState, SessionModelBinding};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry, mock_session};
 
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_snapshot_preserves_host_resolved_caps_and_effort() {
+        for caps in [
+            OutputCaps {
+                initial: 32_000,
+                ceiling: 128_000,
+            },
+            OutputCaps {
+                initial: 20_000,
+                ceiling: 20_000,
+            },
+        ] {
+            let host = ProviderSnapshot {
+                provider: Arc::new(MockProvider::new()),
+                settings: Default::default(),
+                output_caps: Some(caps),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            };
+            let contract = host.contract_info();
+            let remote = ProviderSnapshot::from_remote_contract(host.provider.clone(), &contract);
+            assert_eq!(remote.output_caps, Some(caps));
+            assert_eq!(remote.reasoning_effort, host.reasoning_effort);
+            assert_eq!(contract.capabilities, host.provider.capabilities());
+        }
+    }
+
     #[tokio::test]
     async fn handle_construction_uses_atomic_control_snapshot_during_model_transition() {
         let mut session = mock_session("transitioning-session");
@@ -1657,15 +1713,17 @@ pub mod tests {
             .public()
             .to_peer_id()
             .to_string();
+        let remote_error = provider
+            .build_provider(
+                ProviderRequest::new("invalid-config", "test-model")
+                    .with_provider_node_id(Some(&other_node)),
+            )
+            .await
+            .err()
+            .expect("an unavailable remote host fails during negotiation");
         assert!(
-            provider
-                .build_provider(
-                    ProviderRequest::new("invalid-config", "test-model")
-                        .with_provider_node_id(Some(&other_node))
-                )
-                .await
-                .is_ok(),
-            "a different node must still create a remote provider"
+            remote_error.to_string().contains("provider_host::"),
+            "a different node must use mesh negotiation, not the local factory: {remote_error}"
         );
     }
 

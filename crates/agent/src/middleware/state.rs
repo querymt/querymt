@@ -319,6 +319,12 @@ impl ConversationContext {
                 }
                 messages.push(latest);
             }
+        } else if messages
+            .last()
+            .is_some_and(|last| last.role == ChatRole::Assistant)
+        {
+            // A retained partial reply must be followed by guidance, not used as prefill.
+            messages.extend(fragments);
         } else if let Some(latest) = messages.pop() {
             messages.extend(fragments);
             messages.push(latest);

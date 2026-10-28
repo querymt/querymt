@@ -112,7 +112,7 @@ mod provider_routing_integration_tests {
         let provider_node_id = random_node_id();
         f.config.provider.set_mesh(Some(mesh.clone()));
 
-        let provider = f
+        let error = f
             .config
             .provider
             .build_provider(
@@ -120,19 +120,12 @@ mod provider_routing_integration_tests {
                     .with_provider_node_id(Some(&provider_node_id)),
             )
             .await
-            .expect("build_provider with provider_node_id should succeed");
-
-        let result = provider.chat(&querymt::chat::ChatCall::new(&[])).await;
-        match result {
-            Err(LLMError::ProviderError(msg)) => {
-                assert!(
-                    msg.contains("provider_host::"),
-                    "error should name the DHT key (mesh routing confirmed), got: {}",
-                    msg
-                );
-            }
-            other => panic!("expected ProviderError from mesh routing, got {:?}", other),
-        }
+            .err()
+            .expect("unavailable remote host must fail negotiation before chat");
+        assert!(
+            error.to_string().contains("provider_host::"),
+            "error should name the DHT key (mesh routing confirmed): {error}"
+        );
     }
 
     #[tokio::test]

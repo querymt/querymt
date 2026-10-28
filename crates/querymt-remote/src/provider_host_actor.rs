@@ -176,21 +176,15 @@ impl Message<GetProviderContractInfo> for ProviderHostActor {
         msg: GetProviderContractInfo,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        // Report what the provider built for this request honours, not a
-        // blanket claim: callers use it to decide which options to send.
-        let provider = build_provider_for_request(
-            self.backend.as_ref(),
-            &msg.provider,
-            &msg.model,
-            msg.params.as_ref(),
-        )
-        .await
-        .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))?;
-        Ok(ProviderContractInfo {
-            item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
-            protocol_version: Some(crate::provider_protocol::MESH_PROTOCOL_VERSION),
-            capabilities: provider.capabilities(),
-        })
+        let host_defaults = self.backend.host_default_params(&msg.provider, &msg.model);
+        let params =
+            crate::merge_remote_provider_params(msg.params.as_ref(), host_defaults.as_ref());
+        self.backend
+            .contract_info(
+                crate::ProviderBuildRequest::new(&msg.provider, &msg.model).with_params(params),
+            )
+            .await
+            .map_err(|e| RemoteProviderHostError::Internal(e.to_string()))
     }
 }
 
