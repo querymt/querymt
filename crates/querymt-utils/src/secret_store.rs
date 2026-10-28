@@ -90,6 +90,17 @@ pub fn install_android_default_store(store: std::sync::Arc<keyring_core::Credent
     keyring_core::set_default_store(store);
 }
 
+/// Convert a keyring error into an `io::Error`, preserving the distinction
+/// between "the OS refused access" (`PermissionDenied`) and other failures.
+fn map_keyring_error(error: keyring_core::Error) -> io::Error {
+    match error {
+        keyring_core::Error::NoStorageAccess(_) => {
+            io::Error::new(io::ErrorKind::PermissionDenied, error.to_string())
+        }
+        other => io::Error::other(other.to_string()),
+    }
+}
+
 /// Key used to store the default provider in the secret store
 const DEFAULT_PROVIDER_KEY: &str = "default";
 
@@ -134,11 +145,9 @@ impl SecretStore {
         let key = key.into();
         let value = value.into();
 
-        let entry = Entry::new(SERVICE_NAME, &key).map_err(|e| io::Error::other(e.to_string()))?;
+        let entry = Entry::new(SERVICE_NAME, &key).map_err(map_keyring_error)?;
 
-        entry
-            .set_password(&value)
-            .map_err(|e| io::Error::other(e.to_string()))
+        entry.set_password(&value).map_err(map_keyring_error)
     }
 
     /// Retrieves a secret value for the given key
@@ -150,18 +159,27 @@ impl SecretStore {
     /// # Returns
     ///
     /// * `Option<String>` - The secret value if found, or None
+    ///
+    /// Backend failures (for example a denied keychain prompt) are logged at
+    /// `warn` level and reported as `None`. Use [`SecretStore::try_get`] when
+    /// the caller needs to distinguish "missing" from "unreadable".
     pub fn get(&self, key: &str) -> Option<String> {
-        self.try_get(key).ok().flatten()
+        match self.try_get(key) {
+            Ok(value) => value,
+            Err(error) => {
+                log::warn!("Failed to read secret '{key}' from the system keyring: {error}");
+                None
+            }
+        }
     }
 
     /// Retrieves a secret while distinguishing a missing key from backend failure.
     pub fn try_get(&self, key: &str) -> io::Result<Option<String>> {
-        let entry =
-            Entry::new(SERVICE_NAME, key).map_err(|error| io::Error::other(error.to_string()))?;
+        let entry = Entry::new(SERVICE_NAME, key).map_err(map_keyring_error)?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(error) => Err(io::Error::other(error.to_string())),
+            Err(error) => Err(map_keyring_error(error)),
         }
     }
 
@@ -179,11 +197,11 @@ impl SecretStore {
     ///
     /// * `io::Result<()>` - Success or an IO error
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        let entry = Entry::new(SERVICE_NAME, key).map_err(|e| io::Error::other(e.to_string()))?;
+        let entry = Entry::new(SERVICE_NAME, key).map_err(map_keyring_error)?;
 
         match entry.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(e) => Err(io::Error::other(e.to_string())),
+            Err(e) => Err(map_keyring_error(e)),
         }
     }
 
@@ -254,9 +272,33 @@ impl SecretStore {
     /// # Returns
     ///
     /// * `Option<TokenSet>` - The OAuth token set if found, or None
+    ///
+    /// Keyring failures are logged and reported as `None`; use
+    /// [`SecretStore::try_get_oauth_tokens`] to observe them.
     pub fn get_oauth_tokens(&self, provider: &str) -> Option<TokenSet> {
-        let tokens_json = self.get(&format!("oauth_{}", provider))?;
-        serde_json::from_str(&tokens_json).ok()
+        match self.try_get_oauth_tokens(provider) {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                log::warn!("Failed to read OAuth tokens for '{provider}': {error}");
+                None
+            }
+        }
+    }
+
+    /// Retrieves OAuth tokens for a provider, distinguishing "no tokens stored"
+    /// (`Ok(None)`) from a keyring failure (`Err`), such as a denied keychain
+    /// access prompt. Unparseable stored data is treated as absent.
+    pub fn try_get_oauth_tokens(&self, provider: &str) -> io::Result<Option<TokenSet>> {
+        let Some(tokens_json) = self.try_get(&format!("oauth_{}", provider))? else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&tokens_json) {
+            Ok(tokens) => Ok(Some(tokens)),
+            Err(error) => {
+                log::warn!("Stored OAuth tokens for '{provider}' are unreadable: {error}");
+                Ok(None)
+            }
+        }
     }
 
     /// Deletes OAuth tokens for a provider
