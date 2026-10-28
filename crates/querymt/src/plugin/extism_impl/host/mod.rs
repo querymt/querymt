@@ -5,7 +5,7 @@ use crate::{
     adapters::LLMProviderFromHTTP,
     auth::ApiKeyResolver,
     chat::{
-        ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool,
+        ChatCall, ChatCapabilities, ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool,
         http::{ChatStreamParser, HTTPChatProvider},
     },
     completion::{
@@ -32,7 +32,7 @@ use crate::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use extism::{Manifest, Plugin, PluginBuilder, Wasm, convert::Json};
-use futures::{FutureExt, StreamExt};
+use futures::FutureExt;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
@@ -61,32 +61,6 @@ fn decode_plugin_error(e: extism::Error, code: i32) -> LLMError {
 
 fn parse_config_json(cfg: &str) -> Result<Value, LLMError> {
     serde_json::from_str(cfg).map_err(LLMError::from)
-}
-
-#[cfg(debug_assertions)]
-fn header_token_hint(value: Option<&http::HeaderValue>) -> String {
-    let Some(value) = value else {
-        return "<missing>".to_string();
-    };
-    let Ok(value_str) = value.to_str() else {
-        return "<non-utf8>".to_string();
-    };
-    let mut parts = value_str.splitn(2, ' ');
-    let scheme = parts.next().unwrap_or("<unknown>");
-    let token = parts.next().unwrap_or("");
-    if token.is_empty() {
-        return format!("{scheme} <empty>");
-    }
-    format!("{scheme} <redacted>")
-}
-
-fn decode_stream_item(item: Result<Vec<u8>, LLMError>) -> Result<StreamChunk, LLMError> {
-    match item {
-        Ok(bytes) => serde_json::from_slice::<crate::plugin::extism_impl::ExtismChatChunk>(&bytes)
-            .map(|c| c.chunk)
-            .map_err(|e| LLMError::PluginError(format!("Failed to deserialize chunk: {}", e))),
-        Err(llm_err) => Err(llm_err),
-    }
 }
 
 fn decode_classified_plugin_error(error: PluginError) -> LLMError {
@@ -384,8 +358,7 @@ fn validate_runtime_base_url(
 impl ExtismFactory {
     fn supports_http_adapter_abi(&self) -> bool {
         let plug = self.plugin.lock().unwrap();
-        plug.function_exists("chat_request")
-            && plug.function_exists("chat_stream_request")
+        plug.function_exists("prepare_chat_request")
             && plug.function_exists("parse_chat_response")
             && plug.function_exists("list_models_request")
             && plug.function_exists("parse_list_models_response")
@@ -649,19 +622,6 @@ impl ExtismProvider {
         Self::ensure_item_aware_contract_version(self.item_aware_contract_version()?)
     }
 
-    /// Same validation as [`Self::validate_item_aware_messages`], but probing
-    /// through an already-locked plugin so async entry points never
-    /// synchronously block on the plugin mutex.
-    fn validate_item_aware_messages_with_plugin(
-        plug: &mut Plugin,
-        messages: &[ChatMessage],
-    ) -> Result<Option<u32>, LLMError> {
-        if !messages_require_item_aware_contract(messages) {
-            return Ok(None);
-        }
-        Self::ensure_item_aware_contract_version(Self::probe_item_aware_contract_version(plug)?)
-    }
-
     fn ensure_item_aware_contract_version(version: Option<u32>) -> Result<Option<u32>, LLMError> {
         if version != Some(ITEM_AWARE_CHAT_CONTRACT_VERSION) {
             return Err(LLMError::InvalidRequest(format!(
@@ -690,6 +650,28 @@ impl ExtismProvider {
             );
         }
         Ok(cfg)
+    }
+
+    /// Asks the plugin what it supports for chat.
+    ///
+    /// A plugin without a `capabilities` export falls back to streaming being
+    /// available when all stream-parser exports exist, and no per-request
+    /// options, so options are never sent to plugins that cannot honour them.
+    fn plugin_capabilities(&self) -> ChatCapabilities {
+        let Ok(mut plug) = self.plugin.lock() else {
+            return ChatCapabilities::NONE;
+        };
+        if plug.function_exists("capabilities") {
+            return plug
+                .call::<_, Json<ChatCapabilities>>("capabilities", Json(self.config.clone()))
+                .map(|Json(caps)| caps)
+                .unwrap_or(ChatCapabilities::NONE);
+        }
+        ChatCapabilities::NONE.with_streaming(
+            ["start", "parse", "finish", "close"]
+                .iter()
+                .all(|op| plug.function_exists(format!("chat_stream_parser_{op}"))),
+        )
     }
 
     fn call_short_blocking<T, F>(&self, op: &'static str, f: F) -> Result<T, LLMError>
@@ -757,7 +739,7 @@ impl ExtismProvider {
 
         // Capture the current tracing span so host function callbacks
         // (e.g. `host_reqwest_http`) inside `spawn_blocking` are parented
-        // under `extism_provider.chat_stream_with_tools` rather than
+        // under `http_adapter.chat_stream` rather than
         // appearing as orphaned root spans.
         let caller_span = tracing::Span::current();
 
@@ -791,264 +773,14 @@ impl ExtismProvider {
     }
 }
 
+/// Chat on a bare [`ExtismProvider`] is unsupported: plugins chat through the
+/// prepared-chat contract, driven by [`LLMProviderFromHTTP`].
 #[async_trait]
 impl ChatProvider for ExtismProvider {
-    fn supports_streaming(&self) -> bool {
-        let mut plug = self.plugin.lock().unwrap();
-        if !plug.function_exists("supports_streaming") {
-            return false;
-        }
-        let res: Result<Json<bool>, _> = plug.call("supports_streaming", Json(self.config.clone()));
-        match res {
-            Ok(Json(supported)) => supported,
-            Err(_) => false,
-        }
-    }
-
-    #[cfg_attr(
-        feature = "tracing",
-        instrument(name = "extism_provider.chat_with_tools", skip_all)
-    )]
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        let mut cfg = self.config.clone();
-
-        // Refresh OAuth token if resolver is present
-        if let Some(ref resolver) = self.key_resolver {
-            resolver.resolve().await?;
-            if let Some(obj) = cfg.as_object_mut() {
-                obj.insert(
-                    "api_key".to_string(),
-                    serde_json::Value::String(resolver.current()),
-                );
-            }
-        }
-
-        let messages = messages.to_vec();
-        let tools = tools.map(|v| v.to_vec());
-        // chat can do host HTTP calls, so run the Extism VM call off the Tokio runtime thread to
-        // avoid deadlocks on current-thread runtimes. Also wire cancellation so dropping the
-        // future can interrupt host HTTP and release the plugin mutex.
-        let out = self
-            .call_blocking_with_cancel("chat", move |plug| {
-                // The item-aware contract probe runs here, with the plugin
-                // mutex already held, so the async executor never blocks on it.
-                let item_aware_contract_version =
-                    Self::validate_item_aware_messages_with_plugin(plug, &messages)?;
-                let arg = ExtismChatRequest {
-                    cfg,
-                    messages,
-                    tools,
-                    item_aware_contract_version,
-                };
-                let out: Json<ExtismChatResponse> = plug
-                    .call_get_error_code("chat", Json(arg))
-                    .map_err(|(e, code)| decode_plugin_error(e, code))?;
-                Ok(out.0)
-            })
-            .await?;
-
-        Ok(out.into_canonical_output())
-    }
-
-    #[cfg_attr(
-        feature = "tracing",
-        instrument(name = "extism_provider.chat_stream_with_tools", skip_all)
-    )]
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-        LLMError,
-    > {
-        if !ChatProvider::supports_streaming(self) {
-            return Err(LLMError::NotImplemented(
-                "Streaming not supported by this plugin".into(),
-            ));
-        }
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-
-        if let Some(user_data) = &self.user_data {
-            let state = user_data
-                .get()
-                .map_err(|e| LLMError::PluginError(format!("{:#}", e)))?;
-            let mut state_guard = state.lock().unwrap();
-            state_guard.cancel_state = functions::CancelState::NotCancelled;
-            let _ = state_guard.cancel_watch_tx.send(false);
-            state_guard.yield_tx = Some(tx);
-        } else {
-            return Err(LLMError::PluginError(
-                "No UserData found for streaming".into(),
-            ));
-        }
-
-        let plugin = self.plugin.clone();
-        let user_data_clone = self.user_data.clone().unwrap();
-        let mut cfg = self.config.clone();
-
-        // Refresh OAuth token if resolver is present
-        if let Some(ref resolver) = self.key_resolver {
-            resolver.resolve().await?;
-            if let Some(obj) = cfg.as_object_mut() {
-                obj.insert(
-                    "api_key".to_string(),
-                    serde_json::Value::String(resolver.current()),
-                );
-            }
-        }
-
-        if let Some(obj) = cfg.as_object_mut() {
-            obj.insert("stream".to_string(), serde_json::Value::Bool(true));
-        }
-        let messages = messages.to_vec();
-        let tools = tools.map(|v| v.to_vec());
-
-        let caller_span = tracing::Span::current();
-
-        tokio::task::spawn_blocking(move || {
-            let _guard = caller_span.enter();
-            log::debug!("Extism plugin chat_stream thread started");
-            let mut plug = plugin.lock().unwrap();
-
-            // The item-aware contract probe runs here, with the plugin mutex
-            // already held, so the async executor never blocks on it.
-            let arg = match Self::validate_item_aware_messages_with_plugin(&mut plug, &messages) {
-                Ok(item_aware_contract_version) => ExtismChatRequest {
-                    cfg,
-                    messages,
-                    tools,
-                    item_aware_contract_version,
-                },
-                Err(error) => {
-                    log::error!("chat_stream contract probe failed: {:#}", error);
-                    // Surface the failure like a plugin error and release the
-                    // stream wiring so the consumer sees the stream end.
-                    if let Ok(state) = user_data_clone.get() {
-                        let mut state_guard = state.lock().unwrap();
-                        if let Some(tx) = state_guard.yield_tx.take() {
-                            let _ = tx.send(Err(error));
-                        }
-                    }
-                    return;
-                }
-            };
-
-            let res: Result<(), (extism::Error, i32)> =
-                plug.call_get_error_code("chat_stream", Json(arg));
-
-            if let Err((e, code)) = res {
-                // Decode the error using the proper error code from WithReturnCode
-                let llm_error = decode_plugin_error(e, code);
-
-                let cancel_state = user_data_clone
-                    .get()
-                    .ok()
-                    .map(|s| s.lock().unwrap().cancel_state)
-                    .unwrap_or(functions::CancelState::NotCancelled);
-
-                match cancel_state {
-                    functions::CancelState::NotCancelled => {
-                        log::error!("chat_stream plugin call failed: {:#}", llm_error);
-                        // Propagate error to stream consumer so it surfaces in UI
-                        if let Ok(state) = user_data_clone.get() {
-                            let state_guard = state.lock().unwrap();
-                            if let Some(tx) = &state_guard.yield_tx {
-                                let _ = tx.send(Err(llm_error));
-                            }
-                        }
-                    }
-                    functions::CancelState::CancelledByConsumerDrop => {
-                        log::info!("chat_stream stopped due to cancellation: {:#}", llm_error);
-                    }
-                    functions::CancelState::YieldReceiverDropped => {
-                        log::warn!(
-                            "chat_stream stopped after receiver dropped (not explicit cancel): {:#}",
-                            llm_error
-                        );
-                    }
-                }
-            }
-
-            log::debug!("Extism plugin chat_stream thread finished, clearing yield_tx");
-            if let Ok(state) = user_data_clone.get() {
-                let mut state_guard = state.lock().unwrap();
-                state_guard.yield_tx = None;
-            }
-        });
-
-        // If the consumer drops this stream, mark the host state as cancelled.
-        struct StreamCancelGuard {
-            user_data: extism::UserData<functions::HostState>,
-        }
-
-        impl Drop for StreamCancelGuard {
-            fn drop(&mut self) {
-                if let Ok(state) = self.user_data.get() {
-                    let mut state_guard = state.lock().unwrap();
-
-                    // Only treat this as a "cancellation" if the stream was still actively wired.
-                    let was_active = state_guard.yield_tx.is_some();
-                    if was_active {
-                        state_guard.cancel_state = functions::CancelState::CancelledByConsumerDrop;
-                        let _ = state_guard.cancel_watch_tx.send(true);
-                        state_guard.yield_tx = None;
-                        log::debug!("Extism stream cancelled: consumer dropped stream");
-                    } else {
-                        log::debug!(
-                            "Extism stream dropped after completion/error (not a user cancel)"
-                        );
-                    }
-                }
-            }
-        }
-
-        struct GuardedStream {
-            inner: std::pin::Pin<
-                Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>,
-            >,
-            _guard: StreamCancelGuard,
-        }
-
-        impl futures::Stream for GuardedStream {
-            type Item = Result<StreamChunk, LLMError>;
-
-            fn poll_next(
-                mut self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
-            ) -> std::task::Poll<Option<Self::Item>> {
-                self.inner.as_mut().poll_next(cx)
-            }
-        }
-
-        let first_item = rx.recv().await.ok_or_else(|| {
-            LLMError::PluginError("Extism streaming ended before the first chunk".into())
-        })?;
-
-        match decode_stream_item(first_item) {
-            Ok(first_chunk) => {
-                let guard = StreamCancelGuard {
-                    user_data: self.user_data.clone().unwrap(),
-                };
-
-                let stream = futures::stream::once(async move { Ok(first_chunk) }).chain(
-                    futures::stream::unfold(rx, |mut rx| async move {
-                        rx.recv().await.map(|item| (decode_stream_item(item), rx))
-                    }),
-                );
-
-                Ok(Box::pin(GuardedStream {
-                    inner: Box::pin(stream),
-                    _guard: guard,
-                }))
-            }
-            Err(err) => Err(err),
-        }
+    async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        Err(LLMError::PluginError(
+            "Provider plugin lacks the prepared-chat contract; rebuild the plugin".into(),
+        ))
     }
 }
 
@@ -1291,19 +1023,23 @@ impl ChatStreamParser for ExtismStreamParser {
 }
 
 impl HTTPChatProvider for ExtismProvider {
+    fn capabilities(&self) -> ChatCapabilities {
+        self.plugin_capabilities()
+    }
+
     fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
+        call: &ChatCall<'_>,
         stream: bool,
     ) -> Result<crate::chat::http::PreparedChatRequest, LLMError> {
-        let item_aware_contract_version = self.validate_item_aware_messages(messages)?;
+        let item_aware_contract_version = self.validate_item_aware_messages(call.messages)?;
         let cfg = self.effective_config()?;
         let chat = ExtismChatRequest {
             cfg,
-            messages: messages.to_vec(),
-            tools: tools.map(<[Tool]>::to_vec),
+            messages: call.messages.to_vec(),
+            tools: call.tools.map(<[Tool]>::to_vec),
             item_aware_contract_version,
+            options: call.options.non_empty(),
         };
         self.call_short_blocking("prepare_chat_request", move |plug| {
             if !plug.function_exists("prepared_chat_contract_version") {
@@ -1380,85 +1116,7 @@ impl HTTPChatProvider for ExtismProvider {
         })
     }
 
-    fn chat_request(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<http::Request<Vec<u8>>, LLMError> {
-        let item_aware_contract_version = self.validate_item_aware_messages(messages)?;
-        let cfg = self.effective_config()?;
-        self.call_short_blocking("chat_request", move |plug| {
-            let req: Json<SerializableHttpRequest> = plug
-                .call_get_error_code(
-                    "chat_request",
-                    Json(ExtismChatRequest {
-                        cfg,
-                        messages: messages.to_vec(),
-                        tools: tools.map(|v| v.to_vec()),
-                        item_aware_contract_version,
-                    }),
-                )
-                .map_err(|(e, code)| decode_plugin_error(e, code))?;
-            let req = req.0.req;
-            #[cfg(debug_assertions)]
-            {
-                let auth_header = req.headers().get(http::header::AUTHORIZATION);
-                let auth_hint = header_token_hint(auth_header);
-                log::debug!(
-                    "Extism HTTP chat_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
-                    req.method(),
-                    req.uri(),
-                    auth_header.is_some(),
-                    auth_hint,
-                    req.body().len()
-                );
-            }
-            Ok(req)
-        })
-    }
-
-    fn chat_stream_request(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<http::Request<Vec<u8>>, LLMError> {
-        let item_aware_contract_version = self.validate_item_aware_messages(messages)?;
-        let cfg = self.effective_config()?;
-        self.call_short_blocking("chat_stream_request", move |plug| {
-            let req: Json<SerializableHttpRequest> = plug
-                .call_get_error_code(
-                    "chat_stream_request",
-                    Json(ExtismChatRequest {
-                        cfg,
-                        messages: messages.to_vec(),
-                        tools: tools.map(|v| v.to_vec()),
-                        item_aware_contract_version,
-                    }),
-                )
-                .map_err(|(e, code)| decode_plugin_error(e, code))?;
-            let req = req.0.req;
-            #[cfg(debug_assertions)]
-            {
-                let auth_header = req.headers().get(http::header::AUTHORIZATION);
-                let auth_hint = header_token_hint(auth_header);
-                log::debug!(
-                    "Extism HTTP chat_stream_request built: method={} uri={} has_authorization={} auth_hint={} body_len={}",
-                    req.method(),
-                    req.uri(),
-                    auth_header.is_some(),
-                    auth_hint,
-                    req.body().len()
-                );
-            }
-            Ok(req)
-        })
-    }
-
-    fn parse_chat(&self, resp: http::Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
-        self.parse_chat_with_context(resp, Value::Null)
-    }
-
-    fn parse_chat_with_context(
+    fn parse_chat(
         &self,
         resp: http::Response<Vec<u8>>,
         context: Value,
@@ -1481,22 +1139,7 @@ impl HTTPChatProvider for ExtismProvider {
         Ok(out.into_canonical_output())
     }
 
-    fn supports_streaming(&self) -> bool {
-        let plug = self.plugin.lock().unwrap();
-        plug.function_exists("chat_stream_parser_start")
-            && plug.function_exists("chat_stream_parser_parse")
-            && plug.function_exists("chat_stream_parser_finish")
-            && plug.function_exists("chat_stream_parser_close")
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        self.chat_stream_parser_with_context(Value::Null)
-    }
-
-    fn chat_stream_parser_with_context(
-        &self,
-        context: Value,
-    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn chat_stream_parser(&self, context: Value) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         let cfg = self.effective_config()?;
         let parser_id = self.call_short_blocking("chat_stream_parser_start", move |plug| {
             let out: Json<i64> = plug
@@ -1607,37 +1250,36 @@ impl HTTPLLMProvider for ExtismProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Usage, chat::StreamChunk};
 
     // Each export writes to WASI stdout, exercising Wasmtime's synchronous Tokio bridge.
-    fn model_listing_factory(static_models: Option<&str>, request_json: &str) -> ExtismFactory {
-        fn export(name: &str, output: &str) -> String {
-            let stores = output
-                .bytes()
-                .enumerate()
-                .map(|(i, byte)| {
-                    format!(
-                        "(call $store_u8 (i64.add (local.get $ptr) (i64.const {i})) (i32.const {byte}))"
-                    )
-                })
-                .collect::<String>();
-            let len = output.len();
-            format!(
-                r#"(func (export "{name}") (result i32)
-                    (local $ptr i64)
-                    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0)))
-                    (local.set $ptr (call $alloc (i64.const {len})))
-                    {stores}
-                    (call $output_set (local.get $ptr) (i64.const {len}))
-                    (i32.const 0))"#
-            )
-        }
+    fn export(name: &str, output: &str) -> String {
+        let stores = output
+            .bytes()
+            .enumerate()
+            .map(|(i, byte)| {
+                format!(
+                    "(call $store_u8 (i64.add (local.get $ptr) (i64.const {i})) (i32.const {byte}))"
+                )
+            })
+            .collect::<String>();
+        let len = output.len();
+        format!(
+            r#"(func (export "{name}") (result i32)
+                (local $ptr i64)
+                (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 0) (i32.const 0)))
+                (local.set $ptr (call $alloc (i64.const {len})))
+                {stores}
+                (call $output_set (local.get $ptr) (i64.const {len}))
+                (i32.const 0))"#
+        )
+    }
 
-        let static_export = static_models
-            .map(|models| export("list_models_static", models))
-            .unwrap_or_default();
-        let request_export = export("list_models_request", request_json);
-        let parse_export = export("parse_list_models_response", r#"["parsed-model"]"#);
+    /// Builds a plugin exporting each `(name, json_output)` pair.
+    fn wat_plugin(exports: &[(&str, &str)]) -> Plugin {
+        let funcs = exports
+            .iter()
+            .map(|(name, output)| export(name, output))
+            .collect::<String>();
         let wasm = format!(
             r#"(module
                 (import "wasi_snapshot_preview1" "fd_write"
@@ -1646,17 +1288,89 @@ mod tests {
                 (import "extism:host/env" "store_u8" (func $store_u8 (param i64 i32)))
                 (import "extism:host/env" "output_set" (func $output_set (param i64 i64)))
                 (memory (export "memory") 1)
-                (func (export "chat_request") (result i32) (i32.const 0))
-                (func (export "chat_stream_request") (result i32) (i32.const 0))
-                (func (export "parse_chat_response") (result i32) (i32.const 0))
-                {static_export}
-                {request_export}
-                {parse_export})"#
+                {funcs})"#
         );
-        let plugin = PluginBuilder::new(Manifest::new([Wasm::data(wasm.into_bytes())]))
+        PluginBuilder::new(Manifest::new([Wasm::data(wasm.into_bytes())]))
             .with_wasi(true)
             .build()
-            .expect("test plugin should build");
+            .expect("test plugin should build")
+    }
+
+    fn provider_over(plugin: Plugin) -> ExtismProvider {
+        ExtismProvider {
+            plugin: Arc::new(Mutex::new(plugin)),
+            config: serde_json::json!({}),
+            user_data: None,
+            key_resolver: None,
+        }
+    }
+
+    #[test]
+    fn plugin_without_prepared_chat_contract_asks_for_a_rebuild() {
+        let provider = provider_over(wat_plugin(&[("prepare_chat_request", "{}")]));
+
+        let error = provider
+            .prepare_chat_request(&ChatCall::new(&[]), false)
+            .err()
+            .expect("plugin without the contract export must be rejected");
+
+        assert!(error.to_string().contains("rebuild the plugin"), "{error}");
+    }
+
+    #[test]
+    fn plugin_built_against_the_previous_contract_asks_for_a_rebuild() {
+        let previous = (PREPARED_CHAT_CONTRACT_VERSION - 1).to_string();
+        let provider = provider_over(wat_plugin(&[
+            ("prepared_chat_contract_version", &previous),
+            ("prepare_chat_request", "{}"),
+        ]));
+
+        let error = provider
+            .prepare_chat_request(&ChatCall::new(&[]), false)
+            .err()
+            .expect("old contract must be rejected");
+
+        let message = error.to_string();
+        assert!(message.contains("rebuild the plugin"), "{message}");
+        assert!(
+            message.contains(&format!("expected {PREPARED_CHAT_CONTRACT_VERSION}")),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn capabilities_come_from_the_plugin_export() {
+        let caps = r#"{"streaming":true,"options":{"max_tokens":true,"reasoning_effort":false}}"#;
+        let provider = provider_over(wat_plugin(&[("capabilities", caps)]));
+
+        let caps = HTTPChatProvider::capabilities(&provider);
+
+        assert!(caps.streaming);
+        assert!(caps.options.max_tokens && !caps.options.reasoning_effort);
+    }
+
+    #[test]
+    fn plugin_without_capabilities_export_supports_no_options() {
+        let provider = provider_over(wat_plugin(&[]));
+
+        assert_eq!(
+            HTTPChatProvider::capabilities(&provider),
+            crate::chat::ChatCapabilities::NONE
+        );
+    }
+
+    fn model_listing_factory(static_models: Option<&str>, request_json: &str) -> ExtismFactory {
+        let mut exports = vec![
+            ("prepare_chat_request", "{}"),
+            ("parse_chat_response", "{}"),
+            ("list_models_request", request_json),
+            ("parse_list_models_response", r#"["parsed-model"]"#),
+        ];
+        // A missing static export is distinct from one returning `null`.
+        if let Some(models) = static_models {
+            exports.push(("list_models_static", models));
+        }
+        let plugin = wat_plugin(&exports);
         ExtismFactory {
             plugin: Arc::new(Mutex::new(plugin)),
             name: "test".to_string(),
@@ -1814,46 +1528,6 @@ mod tests {
         assert!(
             matches!(err, LLMError::InvalidRequest(message) if message.contains("allowed_hosts"))
         );
-    }
-
-    #[test]
-    fn decode_stream_item_returns_chunk_for_valid_payload() {
-        let bytes = serde_json::to_vec(&crate::plugin::extism_impl::ExtismChatChunk {
-            chunk: StreamChunk::Text("hello".into()),
-        })
-        .expect("serialize chunk");
-
-        let chunk = decode_stream_item(Ok(bytes)).expect("chunk should decode");
-        assert!(matches!(chunk, StreamChunk::Text(text) if text == "hello"));
-    }
-
-    #[test]
-    fn decode_stream_item_accepts_legacy_duplicate_usage_field() {
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "chunk": {"usage": Usage::default()},
-            "usage": Usage::default()
-        }))
-        .expect("serialize legacy chunk");
-
-        let chunk = decode_stream_item(Ok(bytes)).expect("legacy chunk should decode");
-        assert!(matches!(chunk, StreamChunk::Usage(_)));
-    }
-
-    #[test]
-    fn decode_stream_item_preserves_llm_error() {
-        let decoded = decode_stream_item(Err(LLMError::HttpStatus {
-            status_code: 503,
-            message: "upstream connect error".into(),
-            retry_after_secs: None,
-        }))
-        .expect_err("error should propagate");
-        assert!(matches!(
-            decoded,
-            LLMError::HttpStatus {
-                status_code: 503,
-                ..
-            }
-        ));
     }
 
     #[test]

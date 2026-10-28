@@ -902,6 +902,44 @@ where
     )
 }
 
+/// Notice title naming why a run stopped.
+fn stop_notice_title(stop_type: crate::events::StopType) -> &'static str {
+    use crate::events::StopType;
+    match stop_type {
+        StopType::ModelTokenLimit => "Output token limit reached",
+        StopType::StepLimit => "Step limit reached",
+        StopType::TurnLimit => "Turn limit reached",
+        StopType::PriceLimit => "Cost limit reached",
+        StopType::ContextThreshold => "Context limit reached",
+        StopType::ContentFilter => "Response blocked by content filter",
+        StopType::DelegationBlocked => "Delegation blocked",
+        StopType::Other => "Run stopped",
+    }
+}
+
+/// Notice title for one output-limit recovery step, e.g.
+/// "Output limit hit; retrying at 128000 tokens (1)".
+fn output_limit_recovery_title(
+    action: crate::events::OutputLimitRecoveryAction,
+    attempt: u32,
+    from: Option<u32>,
+    to: Option<u32>,
+) -> String {
+    use crate::events::OutputLimitRecoveryAction;
+    match (action, to) {
+        (OutputLimitRecoveryAction::Escalate, Some(to)) => {
+            format!("Output limit hit; retrying at {to} tokens")
+        }
+        (OutputLimitRecoveryAction::Escalate, None) => "Output limit hit; retrying".to_owned(),
+        (OutputLimitRecoveryAction::Continue, _) => match from {
+            Some(from) => {
+                format!("Output limit hit at {from} tokens; continuing (attempt {attempt})")
+            }
+            None => format!("Output limit hit; continuing (attempt {attempt})"),
+        },
+    }
+}
+
 /// Projects replayed session history with materialized state.
 ///
 /// Durable session-update state (configuration, metadata, usage, the current
@@ -1148,9 +1186,13 @@ fn materialize_replay_state(
                 });
                 open_legacy_start = None;
             }
-            AgentEventKind::CompactionSummaryChunk { .. } | AgentEventKind::HookNotice { .. } => {
-                // Live-only content: notices are never replayed and summary
-                // chunks would duplicate the materialized terminal summary.
+            AgentEventKind::CompactionSummaryChunk { .. }
+            | AgentEventKind::HookNotice { .. }
+            | AgentEventKind::MiddlewareStopped { .. }
+            | AgentEventKind::OutputLimitRecovery { .. } => {
+                // Live-only content: notices (hook, stop and recovery) are never
+                // replayed and summary chunks would duplicate the materialized
+                // terminal summary.
             }
             AgentEventKind::ToolCallStart {
                 ref tool_name,
@@ -1785,6 +1827,37 @@ impl AcpLiveEventTranslator {
                 vec![SessionUpdate::Notice(
                     Notice::new(severity, title).description(message.clone()),
                 )]
+            }
+            AgentEventKind::MiddlewareStopped {
+                stop_type, reason, ..
+            } => {
+                if !self.capabilities.notices {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::Notice(
+                    Notice::new(NoticeSeverity::Warning, stop_notice_title(*stop_type))
+                        .description(reason.clone()),
+                )]
+            }
+            AgentEventKind::OutputLimitRecovery {
+                attempt,
+                action,
+                from_max_tokens,
+                to_max_tokens,
+                ..
+            } => {
+                if !self.capabilities.notices {
+                    return Vec::new();
+                }
+                vec![SessionUpdate::Notice(Notice::new(
+                    NoticeSeverity::Info,
+                    output_limit_recovery_title(
+                        *action,
+                        *attempt,
+                        *from_max_tokens,
+                        *to_max_tokens,
+                    ),
+                ))]
             }
             AgentEventKind::ToolCallStart {
                 tool_name,
@@ -7346,6 +7419,105 @@ mod session_update_tests {
         };
         assert_eq!(notice.severity, NoticeSeverity::Info);
         assert!(!notice.title.is_empty());
+    }
+
+    fn stop_event() -> AgentEventKind {
+        AgentEventKind::MiddlewareStopped {
+            stop_type: crate::events::StopType::ModelTokenLimit,
+            reason: "model hit its output limit".to_string(),
+            metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+        }
+    }
+
+    fn recovery_event() -> AgentEventKind {
+        AgentEventKind::OutputLimitRecovery {
+            turn: 1,
+            attempt: 1,
+            action: crate::events::OutputLimitRecoveryAction::Escalate,
+            from_max_tokens: Some(32_000),
+            to_max_tokens: Some(128_000),
+            thinking_only: false,
+            discarded_message_id: None,
+        }
+    }
+
+    #[test]
+    fn output_limit_stop_and_recovery_become_live_notices_for_capable_clients() {
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+
+        let stop = capable.translate_updates(&envelope(1, stop_event()));
+        let [SessionUpdate::Notice(notice)] = stop.as_slice() else {
+            panic!("expected a stop notice, got {stop:?}");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Warning);
+        assert!(
+            notice.title.contains("Output token limit"),
+            "{}",
+            notice.title
+        );
+        assert_eq!(
+            notice.description.as_deref(),
+            Some("model hit its output limit")
+        );
+
+        let recovery = capable.translate_updates(&envelope(2, recovery_event()));
+        let [SessionUpdate::Notice(notice)] = recovery.as_slice() else {
+            panic!("expected a recovery notice, got {recovery:?}");
+        };
+        assert_eq!(notice.severity, NoticeSeverity::Info);
+        assert!(notice.title.contains("128000"), "{}", notice.title);
+    }
+
+    #[test]
+    fn clients_without_notice_support_get_no_stop_or_recovery_notice() {
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(
+            legacy
+                .translate_updates(&envelope(1, stop_event()))
+                .is_empty()
+        );
+        assert!(
+            legacy
+                .translate_updates(&envelope(2, recovery_event()))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stop_and_recovery_notices_are_not_replayed() {
+        let events = vec![
+            agent_event(1, stop_event()),
+            agent_event(2, recovery_event()),
+        ];
+        let updates = replay_updates(events, plan_ops());
+        assert!(
+            updates
+                .iter()
+                .all(|update| !matches!(update, SessionUpdate::Notice(_))),
+            "{updates:?}"
+        );
+    }
+
+    #[test]
+    fn output_limit_stop_reports_max_tokens_without_querymt_meta() {
+        // Capable and non-capable clients get the same protocol-level reason.
+        let response = crate::acp::protocol::PromptResponse::new(
+            crate::acp::protocol::StopReason::from(crate::events::StopType::ModelTokenLimit),
+        );
+        assert_eq!(
+            response.stop_reason,
+            crate::acp::protocol::StopReason::MaxTokens
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("_meta")
+                .and_then(|meta| meta.get("querymt"))
+                .is_none_or(
+                    |querymt| querymt.get("stopType").is_none() && querymt.get("reason").is_none()
+                ),
+            "{json}"
+        );
     }
 
     // ── 5.3 Compaction lifecycle projection ────────────────────────────────

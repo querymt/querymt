@@ -61,6 +61,20 @@ pub trait MiddlewareDriver: Send + Sync {
         Ok(state)
     }
 
+    /// Runs when the run is about to end on a stop (state is `Stopped`),
+    /// before the stop is published.
+    ///
+    /// Middleware may recover by returning `BeforeLlmCall` (a continuation),
+    /// or `Cancelled`. Returning the `Stopped` state unchanged passes it on to
+    /// the next driver and, finally, to publication.
+    async fn on_stopped(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        Ok(state)
+    }
+
     /// Called once the agent's final tool registry and event sink are known
     /// (when the `AgentConfig` is assembled). Tool-aware middleware should use
     /// this registry so they agree with the scheduler about what tools exist;
@@ -224,6 +238,34 @@ impl CompositeDriver {
         .await
     }
 
+    /// Offers a `Stopped` state to each driver in order.
+    ///
+    /// Returns `BeforeLlmCall` as soon as a driver recovers (later drivers are
+    /// skipped), `Cancelled` on cancellation, otherwise the unchanged stop.
+    pub async fn run_stopped(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        self.run_phase(state, runtime, MiddlewarePhase::Stopped, None)
+            .await
+    }
+
+    pub async fn run_stopped_cancellable(
+        &self,
+        state: ExecutionState,
+        runtime: Option<&Arc<SessionRuntime>>,
+        cancellation_token: &CancellationToken,
+    ) -> Result<ExecutionState> {
+        self.run_phase(
+            state,
+            runtime,
+            MiddlewarePhase::Stopped,
+            Some(cancellation_token),
+        )
+        .await
+    }
+
     pub fn reset(&self) {
         debug!(
             "Resetting CompositeDriver with {} middleware",
@@ -323,6 +365,7 @@ impl CompositeDriver {
                         driver.on_processing_tool_calls(current, runtime)
                     }
                     MiddlewarePhase::TurnEnd => driver.on_turn_end(current, runtime),
+                    MiddlewarePhase::Stopped => driver.on_stopped(current, runtime),
                 }
                 .instrument(span.clone());
 
@@ -348,7 +391,15 @@ impl CompositeDriver {
             // middleware may transform it to BeforeLlmCall (e.g., dedup_check
             // injecting a duplicate-code review). Only Stopped/Cancelled are
             // truly terminal during TurnEnd.
+            //
+            // During Stopped, the stop itself is the pass-through state: the
+            // phase ends only when a driver recovers (BeforeLlmCall) or the
+            // run is cancelled.
             let is_terminal = match phase {
+                MiddlewarePhase::Stopped => matches!(
+                    current,
+                    ExecutionState::BeforeLlmCall { .. } | ExecutionState::Cancelled
+                ),
                 MiddlewarePhase::TurnEnd => {
                     matches!(
                         current,
@@ -397,6 +448,7 @@ enum MiddlewarePhase {
     AfterLlm,
     ProcessingToolCalls,
     TurnEnd,
+    Stopped,
 }
 
 impl MiddlewarePhase {
@@ -407,6 +459,7 @@ impl MiddlewarePhase {
             MiddlewarePhase::AfterLlm => "after_llm",
             MiddlewarePhase::ProcessingToolCalls => "processing_tool_calls",
             MiddlewarePhase::TurnEnd => "turn_end",
+            MiddlewarePhase::Stopped => "stopped",
         }
     }
 }
@@ -470,6 +523,9 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: Default::default(),
+            profile: Default::default(),
+            last_applied: Default::default(),
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
@@ -504,6 +560,9 @@ mod tests {
             provider: "mock".into(),
             model: "mock-model".into(),
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: Default::default(),
+            profile: Default::default(),
+            last_applied: Default::default(),
         });
 
         let state = ExecutionState::BeforeLlmCall { context };
@@ -511,5 +570,131 @@ mod tests {
 
         // Should stop at the second driver and not run third
         assert!(matches!(result, ExecutionState::Stopped { .. }));
+    }
+
+    /// Records every `on_stopped` call and optionally recovers from the stop.
+    struct StopRecorder {
+        name: &'static str,
+        recover: bool,
+        calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl MiddlewareDriver for StopRecorder {
+        async fn on_stopped(
+            &self,
+            state: ExecutionState,
+            _runtime: Option<&Arc<SessionRuntime>>,
+        ) -> Result<ExecutionState> {
+            self.calls.lock().unwrap().push(self.name);
+            match (self.recover, state.context()) {
+                (true, Some(context)) => Ok(ExecutionState::BeforeLlmCall {
+                    context: context.clone(),
+                }),
+                _ => Ok(state),
+            }
+        }
+
+        fn reset(&self) {}
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    fn stopped_state() -> ExecutionState {
+        let context = Arc::new(ConversationContext::new(
+            "test".into(),
+            Arc::from([]),
+            Arc::new(AgentStats::default()),
+            "mock".into(),
+            "mock-model".into(),
+        ));
+        ExecutionState::Stopped {
+            message: "cut off".into(),
+            stop_type: StopType::ModelTokenLimit,
+            context: Some(context),
+        }
+    }
+
+    fn recorders(
+        spec: &[(&'static str, bool)],
+    ) -> (CompositeDriver, Arc<std::sync::Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drivers = spec
+            .iter()
+            .map(|&(name, recover)| {
+                Arc::new(StopRecorder {
+                    name,
+                    recover,
+                    calls: calls.clone(),
+                }) as Arc<dyn MiddlewareDriver>
+            })
+            .collect();
+        (CompositeDriver::new(drivers), calls)
+    }
+
+    #[tokio::test]
+    async fn run_stopped_passes_the_stop_through_when_nobody_recovers() {
+        let (composite, calls) = recorders(&[("first", false), ("second", false)]);
+
+        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
+
+        assert!(matches!(
+            result,
+            ExecutionState::Stopped {
+                stop_type: StopType::ModelTokenLimit,
+                ..
+            }
+        ));
+        // A Stopped result moves on, so every driver gets to act.
+        assert_eq!(*calls.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn run_stopped_ends_the_phase_when_a_driver_recovers() {
+        let (composite, calls) = recorders(&[("recovers", true), ("never_runs", true)]);
+
+        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
+
+        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+        assert_eq!(*calls.lock().unwrap(), vec!["recovers"]);
+    }
+
+    #[tokio::test]
+    async fn run_stopped_runs_drivers_in_order_until_one_recovers() {
+        let (composite, calls) = recorders(&[("first", false), ("second", true), ("third", true)]);
+
+        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
+
+        assert!(matches!(result, ExecutionState::BeforeLlmCall { .. }));
+        assert_eq!(*calls.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn default_on_stopped_is_a_pass_through() {
+        let composite = CompositeDriver::new(vec![Arc::new(TestDriver {
+            name: "plain",
+            should_stop: false,
+        }) as Arc<dyn MiddlewareDriver>]);
+
+        let result = composite.run_stopped(stopped_state(), None).await.unwrap();
+
+        assert!(matches!(result, ExecutionState::Stopped { .. }));
+    }
+
+    #[tokio::test]
+    async fn run_stopped_cancellable_reports_cancellation() {
+        let (composite, calls) = recorders(&[("first", true)]);
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = composite
+            .run_stopped_cancellable(stopped_state(), None, &token)
+            .await
+            .unwrap();
+
+        assert!(matches!(result, ExecutionState::Cancelled));
+        assert!(calls.lock().unwrap().is_empty());
     }
 }

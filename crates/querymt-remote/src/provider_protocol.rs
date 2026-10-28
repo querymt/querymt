@@ -1,13 +1,22 @@
 use querymt::ToolCall;
 use querymt::Usage;
-use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
+use querymt::chat::{
+    ChatCapabilities, ChatMessage, ChatOutput, FinishReason, GenerationOptions, StreamChunk, Tool,
+};
 pub use querymt::chat::{ITEM_AWARE_CHAT_CONTRACT_VERSION, messages_require_item_aware_contract};
 use querymt::error::LLMErrorPayload;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct GetProviderContractInfo;
+/// Asks a provider host for its contract and the capabilities of the provider
+/// it would build for this `(provider, model, params)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetProviderContractInfo {
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
 
 /// Wire-protocol generation advertised by mesh provider hosts.
 ///
@@ -16,7 +25,15 @@ pub struct GetProviderContractInfo;
 /// via [`GetProviderContractInfo`] before the first provider call and fail
 /// fast with an actionable message on mismatch instead of surfacing opaque
 /// MessagePack decoding complaints.
-pub const MESH_PROTOCOL_VERSION: u32 = 2;
+pub const MESH_PROTOCOL_VERSION: u32 = 4;
+
+/// Host-resolved generation settings used to plan output-limit recovery.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderGenerationProfile {
+    pub initial_max_tokens: Option<u32>,
+    pub output_ceiling: Option<u32>,
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderContractInfo {
@@ -26,6 +43,12 @@ pub struct ProviderContractInfo {
     /// before protocol versioning; the client treats that as a mismatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<u32>,
+    /// Chat capabilities of the provider the peer builds for the request,
+    /// including which per-request options it honours.
+    #[serde(default)]
+    pub capabilities: ChatCapabilities,
+    #[serde(default)]
+    pub generation: ProviderGenerationProfile,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +191,10 @@ pub struct ProviderChatRequest {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, and
+    /// ignored by peers that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 pub type GenericProviderStreamRequest<TRouterRef> = ProviderStreamRequest<TRouterRef>;
@@ -190,6 +217,10 @@ pub struct ProviderStreamRequest<TRouterRef> {
     pub params: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub item_aware_contract_version: Option<u32>,
+    /// Per-request generation overrides. Omitted from the wire when unset, and
+    /// ignored by peers that predate the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<GenerationOptions>,
 }
 
 pub fn default_stream_heartbeat_secs() -> u64 {
@@ -303,7 +334,7 @@ pub fn should_ack_relay_message(
 mod item_aware_tests {
     use super::*;
     use querymt::chat::{
-        ChatFunctionCallItem, ChatMessage, ChatOutput, ChatOutputItem, ChatOutputStatus,
+        ChatCall, ChatFunctionCallItem, ChatMessage, ChatOutput, ChatOutputItem, ChatOutputStatus,
         ChatStreamAccumulator, StructuredStreamEvent,
     };
     use serde_json::json;
@@ -440,10 +471,11 @@ mod item_aware_tests {
     #[test]
     fn requests_advertise_item_aware_contract_only_when_needed() {
         let config = crate::RemoteProviderClientConfig::new("peer", "demo", "m1");
-        let legacy = config.build_chat_request(&[ChatMessage::user().text("hi").build()], None);
+        let legacy =
+            config.build_chat_request(&ChatCall::new(&[ChatMessage::user().text("hi").build()]));
         assert_eq!(legacy.item_aware_contract_version, None);
 
-        let structured = config.build_chat_request(&[structured_message()], None);
+        let structured = config.build_chat_request(&ChatCall::new(&[structured_message()]));
         assert_eq!(
             structured.item_aware_contract_version,
             Some(ITEM_AWARE_CHAT_CONTRACT_VERSION)
@@ -518,14 +550,11 @@ mod item_aware_tests {
             .push(ToolResultPart::text("result payload"));
         let result = ChatMessage::from_user_parts(vec![ChatInputPart::tool_result(tool_result)]);
 
-        let request = config.build_chat_request(
-            &[
-                ChatMessage::from_user_parts(vec![ChatInputPart::text("look it up")]),
-                assistant,
-                result,
-            ],
-            None,
-        );
+        let request = config.build_chat_request(&ChatCall::new(&[
+            ChatMessage::from_user_parts(vec![ChatInputPart::text("look it up")]),
+            assistant,
+            result,
+        ]));
         assert_eq!(
             request.item_aware_contract_version,
             Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
@@ -608,6 +637,7 @@ mod rmp_wire_tests {
             tools: None,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         }
     }
 
@@ -694,6 +724,7 @@ mod rmp_wire_tests {
             lease_ttl_secs: 60,
             params: None,
             item_aware_contract_version: None,
+            options: None,
         };
         assert_rmp_round_trip_equal(&request);
     }
@@ -703,6 +734,12 @@ mod rmp_wire_tests {
         let current = ProviderContractInfo {
             item_aware_chat_version: Some(ITEM_AWARE_CHAT_CONTRACT_VERSION),
             protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: Default::default(),
+            generation: ProviderGenerationProfile {
+                initial_max_tokens: Some(32_000),
+                output_ceiling: Some(128_000),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            },
         };
         assert_rmp_round_trip_equal(&current);
 
@@ -711,6 +748,39 @@ mod rmp_wire_tests {
         }))
         .expect("legacy contract info");
         assert_eq!(legacy.protocol_version, None);
+    }
+
+    #[test]
+    fn requests_without_options_decode_and_omit_options_on_the_wire() {
+        // A peer that predates per-request options sends no `options` field.
+        let legacy: ProviderChatRequest = serde_json::from_value(serde_json::json!({
+            "provider": "demo",
+            "model": "m1",
+            "messages": [],
+            "tools": null
+        }))
+        .expect("legacy chat request");
+        assert_eq!(legacy.options, None);
+
+        // And unset options are never sent to older peers.
+        let encoded = serde_json::to_value(chat_request(Vec::new())).unwrap();
+        assert!(encoded.get("options").is_none());
+    }
+
+    #[test]
+    fn requests_with_options_round_trip_over_rmp() {
+        let mut request = chat_request(Vec::new());
+        request.options = Some(GenerationOptions::default().with_max_tokens(64_000));
+        assert_rmp_round_trip_equal(&request);
+    }
+
+    #[test]
+    fn contract_info_without_capabilities_reports_none() {
+        let legacy: ProviderContractInfo = serde_json::from_value(serde_json::json!({
+            "protocol_version": MESH_PROTOCOL_VERSION
+        }))
+        .expect("legacy contract info");
+        assert_eq!(legacy.capabilities, ChatCapabilities::NONE);
     }
 
     #[test]

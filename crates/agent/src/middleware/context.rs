@@ -774,6 +774,7 @@ mod tests {
                 messages: Arc::from([]),
                 tools: Arc::from([]),
                 estimated_tokens: 0,
+                options: Default::default(),
             }),
         };
 

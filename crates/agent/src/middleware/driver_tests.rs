@@ -264,6 +264,7 @@ async fn test_max_steps_ignores_other_states() {
             messages: Arc::from([]),
             tools: Arc::from([]),
             estimated_tokens: 0,
+            options: Default::default(),
         }),
     };
     let result = middleware.on_step_start(state, None).await.unwrap();

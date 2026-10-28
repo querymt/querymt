@@ -62,11 +62,17 @@ use std::sync::Arc;
 use tracing::{Instrument, info_span, instrument};
 
 /// Outcome of a single execution cycle
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CycleOutcome {
     Completed,
     Cancelled,
-    Stopped(StopReason),
+    /// The run ended on a middleware stop. `stop_reason` is the protocol-level
+    /// value for ACP; `stop_type` and `reason` keep the QueryMT cause for events.
+    Stopped {
+        stop_reason: StopReason,
+        stop_type: StopType,
+        reason: String,
+    },
 }
 
 /// Allow one automatic compaction between main model requests, preventing non-progress loops.
@@ -238,6 +244,9 @@ pub(crate) async fn apply_pending_steering(
         context.model.clone(),
     )
     .with_session_mode(context.session_mode)
+    .with_profile(context.profile.clone())
+    .with_last_applied(context.last_applied)
+    .with_request_overrides(context.request_overrides)
     .with_fragments(context.fragments.clone());
     Ok(Some(Arc::new(next)))
 }
@@ -340,7 +349,8 @@ pub(crate) async fn execute_cycle_state_machine(
             llm_config.provider.as_str().into(),
             llm_config.model.as_str().into(),
         )
-        .with_session_mode(session_mode),
+        .with_session_mode(session_mode)
+        .with_profile(exec_ctx.session_handle.profile().await),
     );
 
     let mut state = ExecutionState::BeforeLlmCall {
@@ -349,6 +359,8 @@ pub(crate) async fn execute_cycle_state_machine(
     let mut event_rx = config.event_sink.fanout().subscribe();
     let mut stop_hook_continuations = 0u8;
     let mut task_completion_guard_continuations = 0u8;
+    // Times middleware has turned a stop into a continuation this turn.
+    let mut stop_recoveries = 0u8;
     let mut task_completion_tool_available = false;
     let mut llm_request_count = 0u32;
     let mut last_compaction_request_count = None;
@@ -627,6 +639,7 @@ pub(crate) async fn execute_cycle_state_machine(
                         context.model.clone(),
                     )
                     .with_session_mode(context.session_mode)
+                    .with_profile(context.profile.clone())
                     .with_fragments(context.fragments.clone()),
                 );
                 if let Some(context) = apply_pending_steering(
@@ -789,6 +802,58 @@ pub(crate) async fn execute_cycle_state_machine(
                     }
                 }
 
+                // Give middleware the chance to replace the stop with a
+                // continuation. The per-turn guard bounds any recovery loop.
+                if state.context().is_some() {
+                    let max_recoveries = config.execution_policy.max_stop_recoveries;
+                    if stop_recoveries >= max_recoveries {
+                        warn!(
+                            "Session {}: stop recovery limit ({}) reached; publishing stop",
+                            exec_ctx.session_id, max_recoveries
+                        );
+                    } else {
+                        let stopped = std::mem::replace(&mut state, ExecutionState::Cancelled);
+                        let recovered = driver
+                            .run_stopped_cancellable(
+                                stopped,
+                                Some(&exec_ctx.runtime),
+                                &exec_ctx.cancellation_token,
+                            )
+                            .instrument(info_span!(
+                                "agent.execution.middleware.stopped",
+                                session_id = %exec_ctx.session_id
+                            ))
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Middleware error: {}", e))?;
+                        match recovered {
+                            ExecutionState::BeforeLlmCall { .. } => {
+                                stop_recoveries += 1;
+                                debug!(
+                                    "Session {}: stop recovered by middleware ({}/{})",
+                                    exec_ctx.session_id, stop_recoveries, max_recoveries
+                                );
+                                state = recovered;
+                                continue;
+                            }
+                            ExecutionState::Cancelled => return Ok(CycleOutcome::Cancelled),
+                            ExecutionState::Stopped { .. } => state = recovered,
+                            other => {
+                                // Not a documented outcome; let the state machine handle it.
+                                state = other;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                let ExecutionState::Stopped {
+                    ref message,
+                    stop_type,
+                    ..
+                } = state
+                else {
+                    unreachable!("stop recovery only returns Stopped or diverts above");
+                };
+
                 let metrics = state
                     .context()
                     .map(|ctx| ExecutionMetrics {
@@ -814,7 +879,11 @@ pub(crate) async fn execute_cycle_state_machine(
                     },
                 );
 
-                return Ok(CycleOutcome::Stopped(StopReason::from(stop_type)));
+                return Ok(CycleOutcome::Stopped {
+                    stop_reason: StopReason::from(stop_type),
+                    stop_type,
+                    reason: message.to_string(),
+                });
             }
 
             ExecutionState::Cancelled => {
@@ -921,13 +990,19 @@ mod tests {
         )
         .with_turn_id("run-1")
         .with_steering(steering);
-        let context = Arc::new(crate::middleware::ConversationContext::new(
-            session_id.clone().into(),
-            Arc::from([]),
-            Arc::new(crate::middleware::AgentStats::default()),
-            "mock".into(),
-            "mock".into(),
-        ));
+        let overrides = querymt::chat::GenerationOptions::NONE
+            .with_max_tokens(128_000)
+            .with_reasoning_effort(querymt::chat::ReasoningEffort::Low);
+        let context = Arc::new(
+            crate::middleware::ConversationContext::new(
+                session_id.clone().into(),
+                Arc::from([]),
+                Arc::new(crate::middleware::AgentStats::default()),
+                "mock".into(),
+                "mock".into(),
+            )
+            .with_request_overrides(overrides),
+        );
         let mut live_events = fixture.config.subscribe_events();
 
         let next = apply_pending_steering(
@@ -942,6 +1017,7 @@ mod tests {
         .expect("steering changes context");
 
         assert_eq!(next.messages.len(), 1);
+        assert_eq!(next.request_overrides, overrides);
         let history = fixture
             .config
             .provider

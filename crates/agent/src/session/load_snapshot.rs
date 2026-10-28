@@ -382,7 +382,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             last_event(&free),
-            Some(AgentEventKind::RunCompleted { run_id, outcome })
+            Some(AgentEventKind::RunCompleted { run_id, outcome, .. })
                 if run_id == "orphan" && outcome == "interrupted"
         ));
     }

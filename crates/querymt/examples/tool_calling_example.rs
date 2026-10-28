@@ -75,7 +75,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build(),
     ];
 
-    let first_response = llm.chat_with_tools(&messages, Some(&tools)).await?;
+    let first_response = llm
+        .chat(&querymt::chat::ChatCall::new(&messages).tools(&tools))
+        .await?;
     if let Some(tool_calls) = first_response.tool_calls() {
         println!("Model requested {} tool(s)", tool_calls.len());
 
@@ -109,7 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         messages.push(tool_result_message.build());
 
-        let final_response = llm.chat_with_tools(&messages, Some(&tools)).await?;
+        let final_response = llm
+            .chat(&querymt::chat::ChatCall::new(&messages).tools(&tools))
+            .await?;
         println!("Final response:\n{}", final_response);
     } else {
         println!("Model answered directly:\n{}", first_response);

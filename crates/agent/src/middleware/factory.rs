@@ -72,6 +72,7 @@ impl MiddlewareRegistry {
         registry.register(Arc::new(super::context::ContextFactory));
         registry.register(Arc::new(super::modes::AgentModeFactory));
         registry.register(Arc::new(super::modes::PlanModeCompatFactory));
+        registry.register(Arc::new(super::output_limit::OutputLimitRecoveryFactory));
         registry
     }
 

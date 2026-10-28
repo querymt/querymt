@@ -1,6 +1,8 @@
 #[cfg(feature = "remote")]
 use crate::agent::remote::NodeId;
+use crate::middleware::ModelProfile;
 use crate::model::{AgentMessage, MessagePart, OutputTarget};
+use crate::model_heuristics::OutputCaps;
 use crate::model_info::get_model_info;
 use crate::session::error::{SessionError, SessionResult};
 use crate::session::provider_config::{ProviderConfigMode, resolve_provider_config};
@@ -11,7 +13,7 @@ use querymt::plugin::host::{PluginRegistry, ProviderResolver};
 use querymt::providers::ModelPricing;
 use querymt::{
     LLMProvider,
-    chat::{ChatMessage, ChatOutput, ChatRole},
+    chat::{ChatCall, ChatMessage, ChatOutput, ChatRole, GenerationOptions},
     error::LLMError,
 };
 use std::sync::Arc;
@@ -29,6 +31,25 @@ type ProviderCacheEntry = (i64, Option<String>, bool, Arc<dyn LLMProvider>);
 /// Lock-free single-entry provider cache.  Reads (every turn) use `ArcSwap::load`,
 /// writes (model switch, mesh fallback toggle) use `ArcSwap::store`.
 type ProviderCache = Arc<ArcSwap<Option<ProviderCacheEntry>>>;
+
+/// Keeps the requested per-request overrides the provider honours.
+///
+/// Dropped overrides are logged at debug level; the request then runs with the
+/// provider's configured values.
+pub(crate) fn supported_overrides(
+    provider: &dyn LLMProvider,
+    requested: GenerationOptions,
+) -> GenerationOptions {
+    let supported = provider.capabilities().options.retain_supported(requested);
+    if supported != requested {
+        tracing::debug!(
+            ?requested,
+            ?supported,
+            "provider does not honour some per-request generation options; skipping them"
+        );
+    }
+    supported
+}
 
 fn is_non_billable_oauth_provider(provider: &str) -> bool {
     matches!(provider, "codex" | "kimi-code")
@@ -438,7 +459,7 @@ impl SessionProvider {
             .map(|built| built.provider)
     }
 
-    async fn build_provider_snapshot(
+    pub(crate) async fn build_provider_snapshot(
         &self,
         req: ProviderRequest<'_>,
     ) -> SessionResult<ProviderSnapshot> {
@@ -495,7 +516,7 @@ impl SessionProvider {
                     p
                 })
                 .or_else(|| Some(serde_json::json!({"_remote_session_id": session_id})));
-            return Ok(ProviderSnapshot::unverified(Arc::new(
+            return ProviderSnapshot::remote(
                 querymt_remote::MeshChatProvider::from_node_id(
                     mesh,
                     &node_id,
@@ -503,7 +524,8 @@ impl SessionProvider {
                     model,
                 )
                 .with_params(remote_params),
-            )));
+            )
+            .await;
         }
 
         // ── Case 2: Try local provider ─────────────────────────────────────────
@@ -554,7 +576,7 @@ impl SessionProvider {
                             .or_else(|| {
                                 Some(serde_json::json!({"_remote_session_id": session_id}))
                             });
-                        return Ok(ProviderSnapshot::unverified(Arc::new(
+                        return ProviderSnapshot::remote(
                             querymt_remote::MeshChatProvider::from_node_id(
                                 mesh,
                                 &node_id,
@@ -562,7 +584,8 @@ impl SessionProvider {
                                 model,
                             )
                             .with_params(remote_params),
-                        )));
+                        )
+                        .await;
                     }
                 }
                 return Err(SessionError::ProviderError(local_error));
@@ -583,6 +606,8 @@ impl SessionProvider {
         .await?;
 
         let settings = resolved_cfg.generation_settings;
+        let output_caps = resolved_cfg.output_caps;
+        let reasoning_effort = resolved_cfg.reasoning_effort;
 
         #[cfg(feature = "oauth")]
         let builder_config = resolved_cfg.builder_config;
@@ -642,6 +667,8 @@ impl SessionProvider {
                 return Ok(ProviderSnapshot {
                     provider: Arc::from(provider),
                     settings,
+                    output_caps,
+                    reasoning_effort,
                 });
             }
 
@@ -661,6 +688,8 @@ impl SessionProvider {
                 return Ok(ProviderSnapshot {
                     provider: Arc::from(Box::new(adapter) as Box<dyn LLMProvider>),
                     settings,
+                    output_caps,
+                    reasoning_effort,
                 });
             }
 
@@ -673,6 +702,8 @@ impl SessionProvider {
             return Ok(ProviderSnapshot {
                 provider: Arc::from(provider),
                 settings,
+                output_caps,
+                reasoning_effort,
             });
         }
 
@@ -680,6 +711,8 @@ impl SessionProvider {
         Ok(ProviderSnapshot {
             provider: Arc::from(provider),
             settings,
+            output_caps,
+            reasoning_effort,
         })
     }
 }
@@ -702,17 +735,50 @@ impl Clone for SessionProvider {
     }
 }
 
-struct ProviderSnapshot {
+pub(crate) struct ProviderSnapshot {
     provider: Arc<dyn LLMProvider>,
     settings: crate::agent::utils::genai::GenerationSettings,
+    /// Output caps resolved with the provider; `None` when unknown.
+    output_caps: Option<OutputCaps>,
+    /// Reasoning effort the provider was configured with, when any.
+    reasoning_effort: Option<querymt::chat::ReasoningEffort>,
 }
 
 impl ProviderSnapshot {
     #[cfg(feature = "remote")]
-    fn unverified(provider: Arc<dyn LLMProvider>) -> Self {
+    async fn remote(provider: querymt_remote::MeshChatProvider) -> SessionResult<Self> {
+        let info = provider.negotiate_contract().await?;
+        Ok(Self::from_remote_contract(Arc::new(provider), &info))
+    }
+
+    #[cfg(feature = "remote")]
+    fn from_remote_contract(
+        provider: Arc<dyn LLMProvider>,
+        info: &querymt_remote::ProviderContractInfo,
+    ) -> Self {
         Self {
             provider,
             settings: Default::default(),
+            output_caps: info
+                .generation
+                .initial_max_tokens
+                .zip(info.generation.output_ceiling)
+                .map(|(initial, ceiling)| OutputCaps { initial, ceiling }),
+            reasoning_effort: info.generation.reasoning_effort,
+        }
+    }
+
+    #[cfg(feature = "remote")]
+    pub(crate) fn contract_info(&self) -> querymt_remote::ProviderContractInfo {
+        querymt_remote::ProviderContractInfo {
+            item_aware_chat_version: Some(querymt_remote::ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(querymt_remote::provider_protocol::MESH_PROTOCOL_VERSION),
+            capabilities: self.provider.capabilities(),
+            generation: querymt_remote::provider_protocol::ProviderGenerationProfile {
+                initial_max_tokens: self.output_caps.map(|caps| caps.initial),
+                output_ceiling: self.output_caps.map(|caps| caps.ceiling),
+                reasoning_effort: self.reasoning_effort,
+            },
         }
     }
 }
@@ -831,9 +897,35 @@ impl SessionHandle {
             .map(|built| Arc::clone(&built.provider))
     }
 
-    pub(crate) fn record_generation_settings(&self, span: &tracing::Span) {
+    /// The facts about this turn's model: output caps, what the provider
+    /// honours per request, configured effort and pricing.
+    ///
+    /// Builds (and caches) the provider if needed. When the provider cannot be
+    /// built the profile is empty (no caps, no per-request options); the real
+    /// request surfaces the error. A model switch builds a new handle and so a
+    /// new profile.
+    pub(crate) async fn profile(&self) -> Arc<ModelProfile> {
+        let Ok(provider) = self.provider().await else {
+            return Arc::new(ModelProfile::default());
+        };
+        let built = self.cached_llm_provider.get();
+        Arc::new(ModelProfile {
+            caps: built.and_then(|built| built.output_caps),
+            capabilities: provider.capabilities(),
+            reasoning_effort: built.and_then(|built| built.reasoning_effort),
+            pricing: self.get_pricing(),
+        })
+    }
+
+    /// Record the request settings on the chat span: the configured values
+    /// with this request's applied overrides on top.
+    pub(crate) fn record_generation_settings(
+        &self,
+        span: &tracing::Span,
+        applied: GenerationOptions,
+    ) {
         if let Some(built) = self.cached_llm_provider.get() {
-            built.settings.record(span);
+            built.settings.with_overrides(applied).record(span);
         }
     }
 
@@ -921,10 +1013,15 @@ impl SessionHandle {
         provider.call_tool(name, args).await
     }
 
-    /// Submit messages to the LLM without auto-saving
-    pub async fn submit_request(&self, messages: &[ChatMessage]) -> Result<ChatOutput, LLMError> {
+    /// Submit a chat call to the LLM without auto-saving.
+    ///
+    /// Per-request options the provider does not honour are dropped (see
+    /// [`supported_overrides`]); the request then runs with the configured
+    /// values.
+    pub async fn submit_request(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         let provider = self.provider().await?;
-        provider.chat(messages).await
+        let options = supported_overrides(provider.as_ref(), call.options);
+        provider.chat(&call.options(options)).await
     }
 
     /// Higher-level chat interface (used by CLI) that handles conversion and storage
@@ -939,7 +1036,7 @@ impl SessionHandle {
         let llm_messages = self.history().await?;
 
         // 3. Call LLM
-        let response = self.submit_request(&llm_messages).await?;
+        let response = self.submit_request(&ChatCall::new(&llm_messages)).await?;
 
         // 4. Store response
         let response_msg: ChatMessage = response.clone().into();
@@ -1313,12 +1410,11 @@ impl<'a> ProviderRequest<'a> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk};
+    use querymt::chat::{ChatOutput, FinishReason};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::LLMProviderFactory;
     use std::collections::HashMap;
-    use std::pin::Pin;
 
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
@@ -1326,6 +1422,33 @@ pub mod tests {
     use crate::agent::core::AgentMode;
     use crate::agent::session_control::{SessionControlState, SessionModelBinding};
     use crate::test_utils::{MockSessionStore, empty_plugin_registry, mock_session};
+
+    #[cfg(feature = "remote")]
+    #[test]
+    fn remote_snapshot_preserves_host_resolved_caps_and_effort() {
+        for caps in [
+            OutputCaps {
+                initial: 32_000,
+                ceiling: 128_000,
+            },
+            OutputCaps {
+                initial: 20_000,
+                ceiling: 20_000,
+            },
+        ] {
+            let host = ProviderSnapshot {
+                provider: Arc::new(MockProvider::new()),
+                settings: Default::default(),
+                output_caps: Some(caps),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            };
+            let contract = host.contract_info();
+            let remote = ProviderSnapshot::from_remote_contract(host.provider.clone(), &contract);
+            assert_eq!(remote.output_caps, Some(caps));
+            assert_eq!(remote.reasoning_effort, host.reasoning_effort);
+            assert_eq!(contract.capabilities, host.provider.capabilities());
+        }
+    }
 
     #[tokio::test]
     async fn handle_construction_uses_atomic_control_snapshot_during_model_transition() {
@@ -1440,25 +1563,17 @@ pub mod tests {
 
     #[async_trait::async_trait]
     impl querymt::chat::ChatProvider for MockProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[querymt::chat::Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             Ok(MockChatResponse {
                 content: self.response_text.clone(),
             }
             .into())
         }
 
-        async fn chat_stream_with_tools(
+        async fn chat_stream(
             &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[querymt::chat::Tool]>,
-        ) -> Result<
-            Pin<Box<dyn tokio_stream::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-            LLMError,
-        > {
+            _call: &ChatCall<'_>,
+        ) -> Result<querymt::chat::ChatStream, LLMError> {
             let (_tx, rx) = mpsc::channel(1);
             Ok(Box::pin(ReceiverStream::new(rx)))
         }
@@ -1598,15 +1713,17 @@ pub mod tests {
             .public()
             .to_peer_id()
             .to_string();
+        let remote_error = provider
+            .build_provider(
+                ProviderRequest::new("invalid-config", "test-model")
+                    .with_provider_node_id(Some(&other_node)),
+            )
+            .await
+            .err()
+            .expect("an unavailable remote host fails during negotiation");
         assert!(
-            provider
-                .build_provider(
-                    ProviderRequest::new("invalid-config", "test-model")
-                        .with_provider_node_id(Some(&other_node))
-                )
-                .await
-                .is_ok(),
-            "a different node must still create a remote provider"
+            remote_error.to_string().contains("provider_host::"),
+            "a different node must use mesh negotiation, not the local factory: {remote_error}"
         );
     }
 

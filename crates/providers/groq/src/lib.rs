@@ -10,8 +10,9 @@ use qmt_openai::api::{
 use querymt::{
     HTTPLLMProvider, ToolCall,
     chat::{
-        ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat, Tool, ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatMessage, ChatOutput, StreamChunk, StructuredOutputFormat,
+        Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -162,34 +163,38 @@ impl HTTPChatProvider for Groq {
         classify_openai_http_error(response)
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        openai_chat_request(self, messages, tools)
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let request = if stream {
+            let mut cfg = self.clone();
+            cfg.stream = Some(true);
+            openai_chat_request(&cfg, call.messages, call.tools)
+        } else {
+            openai_chat_request(self, call.messages, call.tools)
+        }?;
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn chat_stream_request(
+    fn parse_chat(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut cfg = self.clone();
-        cfg.stream = Some(true);
-        openai_chat_request(&cfg, messages, tools)
-    }
-
-    fn parse_chat(&self, response: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        response: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         openai_parse_chat(self, response)
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(GroqStreamParser::default()))
     }
 
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(GroqStreamParser::default()))
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
@@ -331,7 +336,7 @@ mod extism_exports {
 #[cfg(test)]
 mod tests {
     use super::Groq;
-    use querymt::chat::{ChatMessage, StreamChunk, http::HTTPChatProvider};
+    use querymt::chat::{ChatCall, ChatMessage, StreamChunk, http::HTTPChatProvider};
     use serde_json::Value;
 
     fn test_provider() -> Groq {
@@ -344,7 +349,7 @@ mod tests {
 
     #[test]
     fn supports_streaming() {
-        assert!(test_provider().supports_streaming());
+        assert!(test_provider().capabilities().streaming);
     }
 
     #[test]
@@ -365,7 +370,8 @@ mod tests {
         ];
 
         let request = provider
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("request should build");
         let body: Value =
             serde_json::from_slice(request.body()).expect("body should be valid json");
@@ -393,7 +399,8 @@ mod tests {
         let provider = test_provider();
 
         let req = provider
-            .chat_stream_request(&[], None)
+            .prepare_chat_request(&ChatCall::new(&[]).maybe_tools(None), true)
+            .map(|p| p.request)
             .expect("stream request should build");
         let body: Value = serde_json::from_slice(req.body()).expect("body should be valid json");
         assert_eq!(body.get("stream"), Some(&Value::Bool(true)));
@@ -404,10 +411,10 @@ mod tests {
         let provider = test_provider();
 
         let mut parser_a = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("parser A should initialize");
         let mut parser_b = provider
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("parser B should initialize");
 
         let a_delta = br#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}

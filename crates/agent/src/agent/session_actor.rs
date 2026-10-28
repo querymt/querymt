@@ -587,16 +587,10 @@ impl SessionActor {
             // The reply carries the last `session_seq` the run produced, so a
             // transport can hold the response until its connection has
             // delivered every update of this prompt.
-            let result = execute_prompt_detached(exec)
-                .await
-                .map(|response| crate::acp::delivery::with_event_tip(response, event_stream.tip()));
-            let disposition = if completion_token.is_cancelled() {
-                RunCompletionDisposition::Cancelled
-            } else if result.is_err() {
-                RunCompletionDisposition::Failed
-            } else {
-                RunCompletionDisposition::Completed
-            };
+            let run = execute_prompt_detached(exec).await;
+            let disposition = run_disposition(completion_token.is_cancelled(), &run);
+            let result = run
+                .map(|run| crate::acp::delivery::with_event_tip(run.response, event_stream.tip()));
             let _ = reply.send(result);
             let _ = actor_ref
                 .tell(PromptFinished {
@@ -730,10 +724,13 @@ impl Message<PromptFinished> for SessionActor {
             return;
         }
 
-        let outcome = match msg.disposition {
-            RunCompletionDisposition::Completed => RunOutcome::Completed,
-            RunCompletionDisposition::Failed => RunOutcome::Failed,
-            RunCompletionDisposition::Cancelled => RunOutcome::Cancelled,
+        let (outcome, stop_type, reason) = match msg.disposition {
+            RunCompletionDisposition::Completed => (RunOutcome::Completed, None, None),
+            RunCompletionDisposition::Failed => (RunOutcome::Failed, None, None),
+            RunCompletionDisposition::Cancelled => (RunOutcome::Cancelled, None, None),
+            RunCompletionDisposition::Stopped { stop_type, reason } => {
+                (RunOutcome::Stopped, Some(stop_type), Some(reason))
+            }
         };
         // The run lease is released only after the completion is recorded, so
         // a reconciler never sees a free lease with an unmatched run_started
@@ -745,6 +742,8 @@ impl Message<PromptFinished> for SessionActor {
                 AgentEventKind::RunCompleted {
                     run_id: msg.run_id,
                     outcome: outcome.into(),
+                    stop_type,
+                    reason,
                 },
             )
             .await
@@ -2430,13 +2429,8 @@ impl Message<ScheduledPrompt> for SessionActor {
                     }
                 }
 
-                let disposition = if completion_token.is_cancelled() {
-                    RunCompletionDisposition::Cancelled
-                } else if result.is_err() {
-                    RunCompletionDisposition::Failed
-                } else {
-                    RunCompletionDisposition::Completed
-                };
+                let disposition = run_disposition(completion_token.is_cancelled(), &result);
+                let result = result.map(|run| run.response);
                 if let Err(e) = actor_ref
                     .tell(PromptFinished {
                         generation: prompt_generation,
@@ -2596,9 +2590,46 @@ async fn validate_execution_task(
     Ok(Some(task))
 }
 
-async fn execute_prompt_detached(
-    exec: DetachedPromptExecution,
-) -> Result<PromptResponse, AgentError> {
+/// A prompt's ACP response plus the QueryMT stop that ended it, if any.
+///
+/// The stop travels to the actor for `run_completed`; the response keeps only
+/// the ACP stop reason.
+struct PromptRun {
+    response: PromptResponse,
+    stop: Option<(crate::events::StopType, String)>,
+}
+
+impl PromptRun {
+    fn finished(response: PromptResponse) -> Self {
+        Self {
+            response,
+            stop: None,
+        }
+    }
+}
+
+/// How a finished prompt task ended, for `run_completed`.
+fn run_disposition(
+    cancelled: bool,
+    result: &Result<PromptRun, AgentError>,
+) -> RunCompletionDisposition {
+    if cancelled {
+        return RunCompletionDisposition::Cancelled;
+    }
+    match result {
+        Err(_) => RunCompletionDisposition::Failed,
+        Ok(PromptRun {
+            stop: Some((stop_type, reason)),
+            ..
+        }) => RunCompletionDisposition::Stopped {
+            stop_type: *stop_type,
+            reason: reason.clone(),
+        },
+        Ok(_) => RunCompletionDisposition::Completed,
+    }
+}
+
+async fn execute_prompt_detached(exec: DetachedPromptExecution) -> Result<PromptRun, AgentError> {
     // Construct the existing execution span explicitly: OTel 0.33 starts it on entry,
     // so the request's remote parent must be installed before instrumenting the future.
     let span = info_span!(
@@ -2650,7 +2681,7 @@ async fn execute_prompt_detached(
     .await
 }
 
-async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptResponse, AgentError> {
+async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun, AgentError> {
     let admission_started = std::time::Instant::now();
     let DetachedPromptExecution {
         req,
@@ -2689,7 +2720,9 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
     {
         PermitWaitOutcome::Acquired(permit) => permit,
         PermitWaitOutcome::Cancelled => {
-            return Ok(PromptResponse::new(StopReason::Cancelled));
+            return Ok(PromptRun::finished(PromptResponse::new(
+                StopReason::Cancelled,
+            )));
         }
         PermitWaitOutcome::TimedOut => {
             debug!(
@@ -2712,7 +2745,9 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
             {
                 PermitWaitOutcome::Acquired(permit) => permit,
                 PermitWaitOutcome::Cancelled => {
-                    return Ok(PromptResponse::new(StopReason::Cancelled));
+                    return Ok(PromptRun::finished(PromptResponse::new(
+                        StopReason::Cancelled,
+                    )));
                 }
                 PermitWaitOutcome::TimedOut => {
                     return Err(AgentError::SessionTimeout {
@@ -3105,9 +3140,20 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRes
     debug!("Session {}: post-turn snapshot done", session_id);
 
     match result {
-        Ok(CycleOutcome::Completed) => Ok(PromptResponse::new(StopReason::EndTurn)),
-        Ok(CycleOutcome::Cancelled) => Ok(PromptResponse::new(StopReason::Cancelled)),
-        Ok(CycleOutcome::Stopped(stop_reason)) => Ok(PromptResponse::new(stop_reason)),
+        Ok(CycleOutcome::Completed) => Ok(PromptRun::finished(PromptResponse::new(
+            StopReason::EndTurn,
+        ))),
+        Ok(CycleOutcome::Cancelled) => Ok(PromptRun::finished(PromptResponse::new(
+            StopReason::Cancelled,
+        ))),
+        Ok(CycleOutcome::Stopped {
+            stop_reason,
+            stop_type,
+            reason,
+        }) => Ok(PromptRun {
+            response: PromptResponse::new(stop_reason),
+            stop: Some((stop_type, reason)),
+        }),
         Err(e) => {
             let message = e.to_string();
             config.emit_event(
@@ -3318,7 +3364,7 @@ mod tests {
                         assert!(futures_util::poll!(&mut future).is_pending());
                         drop(future);
                     } else {
-                        let result = execute_prompt_detached(exec).await;
+                        let result = execute_prompt_detached(exec).await.map(|run| run.response);
                         assert_eq!(result.is_ok(), cancelled);
                     }
                 }
@@ -3524,9 +3570,9 @@ mod tests {
                     AgentEventKind::RunStarted { run_id, .. } => {
                         Some(("run_started", run_id, None))
                     }
-                    AgentEventKind::RunCompleted { run_id, outcome } => {
-                        Some(("run_completed", run_id, Some(outcome)))
-                    }
+                    AgentEventKind::RunCompleted {
+                        run_id, outcome, ..
+                    } => Some(("run_completed", run_id, Some(outcome))),
                     _ => None,
                 })
                 .collect()
@@ -5354,6 +5400,91 @@ mod tests {
         // GetMode should still work, confirming actor is alive
         let mode = f.actor_ref.ask(GetMode).await.expect("ask GetMode");
         assert_eq!(mode, AgentMode::Build);
+    }
+
+    #[test]
+    fn run_disposition_reports_stops_without_touching_the_response() {
+        let stopped: Result<PromptRun, AgentError> = Ok(PromptRun {
+            response: PromptResponse::new(StopReason::MaxTokens),
+            stop: Some((crate::events::StopType::ModelTokenLimit, "cut off".into())),
+        });
+        assert_eq!(
+            run_disposition(false, &stopped),
+            RunCompletionDisposition::Stopped {
+                stop_type: crate::events::StopType::ModelTokenLimit,
+                reason: "cut off".into(),
+            }
+        );
+        // Cancellation wins over a stop; plain completion and errors map as before.
+        assert_eq!(
+            run_disposition(true, &stopped),
+            RunCompletionDisposition::Cancelled
+        );
+        let done: Result<PromptRun, AgentError> = Ok(PromptRun::finished(PromptResponse::new(
+            StopReason::EndTurn,
+        )));
+        assert_eq!(
+            run_disposition(false, &done),
+            RunCompletionDisposition::Completed
+        );
+        let failed: Result<PromptRun, AgentError> = Err(AgentError::Internal("x".into()));
+        assert_eq!(
+            run_disposition(false, &failed),
+            RunCompletionDisposition::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_finished_with_a_stop_emits_run_completed_stopped() {
+        let fixture = ActorFixture::new().await;
+        let mut actor = SessionActor::new(
+            fixture.config.clone(),
+            fixture._session_id.clone(),
+            crate::agent::core::SessionRuntime::new(
+                None,
+                HashMap::new(),
+                crate::agent::core::McpToolState::empty(),
+            ),
+        );
+        actor.active_run = Some(ActiveRun::new(
+            "run-stop".to_string(),
+            1,
+            CancellationToken::new(),
+        ));
+        let actor_ref = SessionActor::spawn(actor);
+        let mut events = fixture.config.subscribe_events();
+
+        actor_ref
+            .tell(PromptFinished {
+                generation: 1,
+                run_id: "run-stop".to_string(),
+                disposition: RunCompletionDisposition::Stopped {
+                    stop_type: crate::events::StopType::ModelTokenLimit,
+                    reason: "output limit".to_string(),
+                },
+            })
+            .await
+            .expect("tell PromptFinished");
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let envelope = events.recv().await.expect("event stream open");
+                if let AgentEventKind::RunCompleted {
+                    outcome,
+                    stop_type,
+                    reason,
+                    ..
+                } = envelope.kind()
+                {
+                    return (outcome.clone(), *stop_type, reason.clone());
+                }
+            }
+        })
+        .await
+        .expect("run_completed emitted");
+        assert_eq!(completed.0, "stopped");
+        assert_eq!(completed.1, Some(crate::events::StopType::ModelTokenLimit));
+        assert_eq!(completed.2.as_deref(), Some("output limit"));
     }
 
     #[tokio::test]

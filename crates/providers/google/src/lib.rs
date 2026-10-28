@@ -46,10 +46,10 @@ use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatFunctionCallItem, ChatInputPart, ChatMessage, ChatOutput, ChatOutputItem, ChatRole,
-        Extensions, FinishReason, MediaSource, ReasoningEffort, StructuredOutputFormat, Tool,
-        ToolChoice,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatFunctionCallItem, ChatInputPart, ChatMessage, ChatOutput,
+        ChatOutputItem, ChatRole, Extensions, FinishReason, MediaSource, ReasoningEffort,
+        StructuredOutputFormat, Tool, ToolChoice,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -829,11 +829,17 @@ impl HTTPChatProvider for Google {
         classify_google_http_error(response)
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        if stream && self.stream != Some(true) {
+            let mut cfg = self.clone();
+            cfg.stream = Some(true);
+            return cfg.prepare_chat_request(call, true);
+        }
+        let (messages, tools) = (call.messages, call.tools);
         let resolved_key = self.resolved_key();
         if resolved_key.is_empty() {
             return Err(LLMError::AuthError("Missing Google API key".into()));
@@ -1013,24 +1019,19 @@ impl HTTPChatProvider for Google {
             .map_err(|e| LLMError::HttpError(e.to_string()))?;
         url.set_query(Some(&format!("key={}", &resolved_key)));
 
-        Ok(Request::builder()
+        let request = Request::builder()
             .method(Method::POST)
             .uri(url.as_str())
             .header(CONTENT_TYPE, "application/json")
-            .body(json_body)?)
+            .body(json_body)?;
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn chat_stream_request(
+    fn parse_chat(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut cfg = self.clone();
-        cfg.stream = Some(true);
-        cfg.chat_request(messages, tools)
-    }
-
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        resp: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         debug_assert!(
             resp.status().is_success(),
             "parse_chat is success-only; adapter must classify non-success first"
@@ -1051,23 +1052,27 @@ impl HTTPChatProvider for Google {
         }
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
+    fn chat_stream_parser(
+        &self,
+        _context: serde_json::Value,
+    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+        Ok(Box::new(GoogleStreamParser::default()))
     }
 
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(GoogleStreamParser::default()))
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 }
 
 impl HTTPCompletionProvider for Google {
     fn complete_request(&self, req: &CompletionRequest) -> Result<Request<Vec<u8>>, LLMError> {
         let chat_message = ChatMessage::user().text(req.prompt.clone()).build();
-        self.chat_request(&[chat_message], None)
+        self.prepare_chat_request(&ChatCall::new(&[chat_message]), false)
+            .map(|prepared| prepared.request)
     }
 
     fn parse_complete(&self, resp: Response<Vec<u8>>) -> Result<CompletionResponse, LLMError> {
-        let chat_response = self.parse_chat(resp)?;
+        let chat_response = self.parse_chat(resp, serde_json::Value::Null)?;
         if let Some(text) = chat_response.text() {
             Ok(CompletionResponse { text })
         } else {
@@ -1828,7 +1833,7 @@ mod tests {
     #[test]
     fn stream_parser_classifies_mid_stream_error_object() {
         let google = test_google();
-        let mut parser = google.chat_stream_parser().unwrap();
+        let mut parser = google.chat_stream_parser(serde_json::Value::Null).unwrap();
         let chunk = br#"{"error":{"code":429,"message":"Resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
         let err = parser
             .parse_chunk(chunk)
@@ -1845,7 +1850,7 @@ mod tests {
     #[test]
     fn stream_parser_keeps_unknown_google_server_error_retryable() {
         let google = test_google();
-        let mut parser = google.chat_stream_parser().unwrap();
+        let mut parser = google.chat_stream_parser(serde_json::Value::Null).unwrap();
         let chunk =
             br#"{"error":{"code":500,"message":"Internal server error","status":"INTERNAL"}}"#;
         let error = parser

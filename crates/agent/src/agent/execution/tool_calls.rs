@@ -1383,7 +1383,9 @@ pub(super) async fn store_all_tool_results(
             context.provider.clone(),
             context.model.clone(),
         )
-        .with_session_mode(context.session_mode),
+        .with_session_mode(context.session_mode)
+        .with_profile(context.profile.clone())
+        .with_last_applied(context.last_applied),
     );
 
     // Aggregate changed file paths from tool results for dedup check

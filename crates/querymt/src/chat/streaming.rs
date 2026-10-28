@@ -8,6 +8,10 @@ use super::{
 };
 use crate::Usage;
 
+/// Terminal detail reported when a reply is cut off by the output token limit
+/// while tool calls are still being streamed.
+pub const LENGTH_CUTOFF_DETAIL: &str = "output token limit";
+
 /// Item-aware stream events. Providers emit metadata before semantic events to declare
 /// structured mode. Compatibility projections are produced only at explicit boundaries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -364,6 +368,17 @@ impl ChatStreamAccumulator {
         match status {
             Some(ChatOutputStatus::Completed) => {
                 if !incomplete_legacy_calls.is_empty() {
+                    // A length stop inside a tool call is an output-limit
+                    // cut-off, not a transient stream failure: report it as
+                    // incomplete so it is never retried as-is.
+                    if output.finish_reason == Some(FinishReason::Length) {
+                        let mut output = output;
+                        output.status = Some(ChatOutputStatus::Incomplete);
+                        return ChatStreamFinish::Incomplete {
+                            output,
+                            detail: Some(LENGTH_CUTOFF_DETAIL.to_string()),
+                        };
+                    }
                     return ChatStreamFinish::Failed {
                         error: ChatStreamAccumulatorError::IncompleteToolCalls(
                             incomplete_legacy_calls,
@@ -1216,6 +1231,45 @@ mod tests {
             ),
             other => panic!("expected failed outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_length_stop_with_unfinished_tool_call_is_incomplete() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        accumulator
+            .push(&StreamChunk::ToolUseStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "write_file".into(),
+            })
+            .unwrap();
+        accumulator
+            .push(&StreamChunk::Done {
+                finish_reason: FinishReason::Length,
+            })
+            .unwrap();
+        match accumulator.finish() {
+            ChatStreamFinish::Incomplete { output, detail } => {
+                assert_eq!(detail.as_deref(), Some(LENGTH_CUTOFF_DETAIL));
+                assert_eq!(output.finish_reason, Some(FinishReason::Length));
+                assert_eq!(output.status, Some(ChatOutputStatus::Incomplete));
+            }
+            other => panic!("expected incomplete outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_length_stop_without_open_calls_still_completes() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        accumulator
+            .push(&StreamChunk::Text("partial".into()))
+            .unwrap();
+        accumulator
+            .push(&StreamChunk::Done {
+                finish_reason: FinishReason::Length,
+            })
+            .unwrap();
+        assert!(accumulator.finish().is_completed());
     }
 
     #[test]

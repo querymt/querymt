@@ -805,6 +805,21 @@ impl AgentBuilder {
             }
         }
 
+        // Auto-add output-limit recovery unless the user supplied a driver or any
+        // `output_limit_recovery` config entry (including a disabled one).
+        let has_recovery_entry = self
+            .middleware_entries
+            .iter()
+            .any(|e| e.middleware_type == "output_limit_recovery");
+        let has_recovery_driver = middleware_drivers
+            .iter()
+            .any(|d| d.name() == "OutputLimitRecoveryMiddleware");
+        if !has_recovery_entry && !has_recovery_driver {
+            middleware_drivers.push(Arc::new(
+                crate::middleware::OutputLimitRecoveryMiddleware::default(),
+            ));
+        }
+
         // Auto-add ParallelEditGuard (warn mode) unless the user supplied a driver
         // or any `parallel_edit_guard` config entry (including a disabled one).
         let has_guard_entry = self

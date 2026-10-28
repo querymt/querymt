@@ -26,7 +26,10 @@
 
 use async_trait::async_trait;
 
-use crate::chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk, Tool, ToolResultPart};
+use crate::chat::{
+    ChatCall, ChatCapabilities, ChatMessage, ChatOutput, ChatProvider, ChatStream, Tool,
+    ToolResultPart,
+};
 use crate::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
 use crate::embedding::EmbeddingProvider;
 use crate::error::LLMError;
@@ -103,56 +106,46 @@ impl LLMProvider for ValidatedLLM {
 
 #[async_trait]
 impl ChatProvider for ValidatedLLM {
-    fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+    fn capabilities(&self) -> ChatCapabilities {
+        self.inner.capabilities()
     }
 
     /// Sends a chat request and validates the response.
     ///
-    /// If validation fails, retries with feedback to the model about the validation error.
-    /// The feedback is appended as a new user message to help guide the model.
-    ///
-    /// # Arguments
-    ///
-    /// * `messages` - The chat messages to send to the model
+    /// If validation fails, retries with feedback to the model about the
+    /// validation error. The feedback is appended as a new user message to help
+    /// guide the model. Tools and options of `call` apply to every attempt,
+    /// including validation retries.
     ///
     /// # Returns
     ///
-    /// * `Ok(String)` - The validated response from the model
+    /// * `Ok(ChatOutput)` - The validated response from the model
     /// * `Err(LLMError)` - If validation fails after max attempts or other errors occur
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        let mut local_messages = messages.to_vec();
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        let mut local_messages = call.messages.to_vec();
         let mut remaining_attempts = self.attempts;
 
         loop {
-            let response = match self.inner.chat_with_tools(&local_messages, tools).await {
-                Ok(resp) => resp,
-                Err(e) => return Err(e),
-            };
+            let response = self
+                .inner
+                .chat(&call.with_messages(&local_messages))
+                .await?;
 
             match (self.validator)(&response.text().unwrap_or_default()) {
-                Ok(()) => {
-                    return Ok(response);
-                }
+                Ok(()) => return Ok(response),
                 Err(err) => {
-                    remaining_attempts -= 1;
+                    remaining_attempts = remaining_attempts.saturating_sub(1);
                     if remaining_attempts == 0 {
                         return Err(LLMError::InvalidRequest(format!(
-                            "Validation error after max attempts: {}",
-                            err
+                            "Validation error after max attempts: {err}"
                         )));
                     }
 
                     local_messages.push(
                         ChatMessage::user()
                             .text(format!(
-                                "Your previous output was invalid because: {}\n\
-                         Please try again and produce a valid response.",
-                                err
+                                "Your previous output was invalid because: {err}\n\
+                                 Please try again and produce a valid response."
                             ))
                             .build(),
                     );
@@ -161,15 +154,8 @@ impl ChatProvider for ValidatedLLM {
         }
     }
 
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-        LLMError,
-    > {
-        self.inner.chat_stream_with_tools(messages, tools).await
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        self.inner.chat_stream(call).await
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::model_heuristics::ModelDefaults;
+use crate::model_heuristics::{ModelDefaults, OutputCaps};
 use crate::session::error::SessionError;
 use querymt::LLMParams;
 use querymt::error::LLMError;
@@ -24,6 +24,10 @@ pub(crate) struct ResolvedProviderConfig {
     pub builder_config: Value,
     pub pruned_config_str: String,
     pub generation_settings: crate::agent::utils::genai::GenerationSettings,
+    /// Initial output cap and escalation ceiling; `None` when no cap is known.
+    pub output_caps: Option<OutputCaps>,
+    /// Reasoning effort left in the final (pruned) config, when the provider takes one.
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
     pub pruned_keys: Vec<String>,
     pub use_oauth_resolver: bool,
 }
@@ -95,6 +99,7 @@ pub(crate) async fn resolve_provider_config(
     let factory = &binding.factory;
     let provider_name = binding.logical_name.as_str();
     let mut use_oauth_resolver = false;
+    let mut output_caps = None;
 
     match mode {
         ProviderConfigMode::Runtime {
@@ -109,7 +114,14 @@ pub(crate) async fn resolve_provider_config(
                 builder.merge_value(params_value, ConfigOverrideMode::Overwrite);
             }
 
-            let defaults = ModelDefaults::for_model(provider_name, model);
+            // Only parse the models.dev cache when it can change the caps.
+            let model_info = ModelDefaults::wants_model_info(provider_name, builder.value())
+                .then(|| crate::model_info::get_model_info(provider_name, model))
+                .flatten();
+            let defaults = ModelDefaults::for_model(provider_name, model, model_info.as_ref());
+            // Resolve caps before applying defaults so an explicit `max_tokens`
+            // is recognised as its own ceiling.
+            output_caps = defaults.output_caps(builder.value());
             defaults.apply_to(builder.value_mut(), session_id);
 
             if let Some(http_factory) = factory.as_http() {
@@ -221,11 +233,17 @@ pub(crate) async fn resolve_provider_config(
         })
         .unwrap_or_default();
 
+    let reasoning_effort = pruned_config
+        .get("reasoning_effort")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+
     Ok(ResolvedProviderConfig {
         #[cfg(feature = "oauth")]
         builder_config: full_config,
         pruned_config_str,
         generation_settings,
+        output_caps,
+        reasoning_effort,
         pruned_keys,
         use_oauth_resolver,
     })
@@ -235,7 +253,7 @@ pub(crate) async fn resolve_provider_config(
 mod tests {
     use super::*;
     use querymt::HTTPLLMProvider;
-    use querymt::chat::{ChatMessage, ChatOutput, Tool};
+    use querymt::chat::{ChatOutput, Tool};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use querymt::plugin::host::{PluginRegistry, ProviderBinding};
@@ -246,15 +264,19 @@ mod tests {
     struct DummyHttpProvider;
 
     impl querymt::chat::http::HTTPChatProvider for DummyHttpProvider {
-        fn chat_request(
+        fn prepare_chat_request(
             &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<http::Request<Vec<u8>>, LLMError> {
+            _call: &querymt::chat::ChatCall<'_>,
+            _stream: bool,
+        ) -> Result<querymt::chat::http::PreparedChatRequest, LLMError> {
             unimplemented!()
         }
 
-        fn parse_chat(&self, _resp: http::Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+        fn parse_chat(
+            &self,
+            _resp: http::Response<Vec<u8>>,
+            _context: serde_json::Value,
+        ) -> Result<ChatOutput, LLMError> {
             unimplemented!()
         }
     }
@@ -460,6 +482,15 @@ mod tests {
             assert!(config.get("top_p").is_none());
             let max = binding_max.unwrap_or(32_000);
             assert_eq!(config["max_tokens"], max);
+            // Unknown model: 32k default for both; explicit config is its own ceiling.
+            let expected = u32::try_from(max).unwrap();
+            assert_eq!(
+                resolved.output_caps,
+                Some(OutputCaps {
+                    initial: expected,
+                    ceiling: expected,
+                })
+            );
             let (_, spans) = capture(async {
                 let span = tracing::info_span!("resolved-settings");
                 resolved.generation_settings.record(&span);
@@ -505,6 +536,8 @@ mod tests {
         .unwrap();
         let config: serde_json::Value = serde_json::from_str(&resolved.pruned_config_str).unwrap();
         assert!(config.get("reasoning_effort").is_none());
+        // No max_tokens source for a non-Anthropic provider: nothing to escalate.
+        assert_eq!(resolved.output_caps, None);
         let (_, spans) = capture(async {
             let span = tracing::info_span!("resolved-settings");
             resolved.generation_settings.record(&span);

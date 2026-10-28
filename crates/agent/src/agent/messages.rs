@@ -132,11 +132,16 @@ impl SessionRuntimeStatus {
 /// completions from older queued tasks.
 ///
 /// NOT serializable — only sent by spawned task within the same actor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RunCompletionDisposition {
     Completed,
     Failed,
     Cancelled,
+    /// The run ended on a middleware stop (e.g. the model's output limit).
+    Stopped {
+        stop_type: crate::events::StopType,
+        reason: String,
+    },
 }
 
 pub(crate) struct PromptFinished {

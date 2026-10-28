@@ -5,7 +5,11 @@
 
 mod parallel;
 
-use crate::{LLMProvider, chat::ChatMessage, error::LLMError};
+use crate::{
+    LLMProvider,
+    chat::{ChatCall, ChatMessage},
+    error::LLMError,
+};
 
 pub use parallel::{ParallelEvalResult, ParallelEvaluator};
 
@@ -57,7 +61,7 @@ impl LLMEvaluator {
     ) -> Result<Vec<EvalResult>, LLMError> {
         let mut results = Vec::new();
         for llm in &self.llms {
-            let response = llm.chat(messages).await?;
+            let response = llm.chat(&ChatCall::new(messages)).await?;
             let score = self.compute_score(&response.text().unwrap_or_default());
             results.push(EvalResult {
                 text: response.text().unwrap_or_default(),

@@ -503,6 +503,7 @@ impl MiddlewareDriver for BeforeLlmCallToCallLlmDriver {
                     messages: Arc::from([]),
                     tools: Arc::from([]),
                     estimated_tokens: 0,
+                    options: Default::default(),
                 }),
             }),
             other => Ok(other),

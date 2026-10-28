@@ -4,6 +4,7 @@ use crate::{
     ProviderStreamStatus, RemoteProviderClientConfig, StreamRelayMessage,
 };
 use async_trait::async_trait;
+use querymt::chat::{ChatCall, ChatCapabilities};
 use querymt::error::{LLMError, TransportErrorKind};
 use std::future::Future;
 use std::pin::Pin;
@@ -162,7 +163,14 @@ where
             .get_or_try_init(|| async {
                 let info = self
                     .transport
-                    .get_contract_info(host, GetProviderContractInfo)
+                    .get_contract_info(
+                        host,
+                        GetProviderContractInfo {
+                            provider: self.config.provider_name.clone(),
+                            model: self.config.model.clone(),
+                            params: self.config.params.clone(),
+                        },
+                    )
                     .await?;
                 // Validate inside the init closure so a peer with a missing or
                 // incompatible protocol version is never cached: a later call
@@ -230,21 +238,40 @@ where
         Ok(())
     }
 
-    pub fn build_chat_request(
-        &self,
-        messages: &[querymt::chat::ChatMessage],
-        tools: Option<&[querymt::chat::Tool]>,
-    ) -> ProviderChatRequest {
-        self.config.build_chat_request(messages, tools)
+    /// Negotiate provider facts before a caller snapshots its model profile.
+    pub async fn negotiate_contract(&self) -> Result<ProviderContractInfo, LLMError> {
+        let host = self.lookup_host().await?;
+        self.validate_contract(&host, None).await?;
+        Ok(self
+            .contract_info
+            .get()
+            .expect("validated contract is cached")
+            .clone())
     }
 
-    pub async fn chat_with_tools(
+    pub fn build_chat_request(&self, call: &ChatCall<'_>) -> ProviderChatRequest {
+        self.config.build_chat_request(call)
+    }
+
+    /// Chat capabilities the remote peer reported for its provider.
+    ///
+    /// Known only after the contract handshake. Until then no per-request
+    /// option is assumed to be honoured, so callers never rely on an override
+    /// an older or less capable peer would drop.
+    pub fn capabilities(&self) -> ChatCapabilities {
+        self.contract_info
+            .get()
+            .map_or(ChatCapabilities::NONE.with_streaming(true), |info| {
+                info.capabilities
+            })
+    }
+
+    pub async fn chat(
         &self,
-        messages: &[querymt::chat::ChatMessage],
-        tools: Option<&[querymt::chat::Tool]>,
+        call: &ChatCall<'_>,
         should_retry: impl Fn(&LLMError) -> bool,
     ) -> Result<ProviderChatResponse, LLMError> {
-        let request = self.build_chat_request(messages, tools);
+        let request = self.config.build_chat_request(call);
         let host = self.lookup_host().await?;
         self.validate_contract(&host, request.item_aware_contract_version)
             .await?;
@@ -254,16 +281,14 @@ where
 
     pub fn build_stream_request(
         &self,
-        messages: &[querymt::chat::ChatMessage],
-        tools: Option<&[querymt::chat::Tool]>,
+        call: &ChatCall<'_>,
         session_id: String,
         request_id: String,
         remote_router_ref: TTransport::RemoteRouterRef,
         reconnect_grace_secs: u64,
     ) -> ProviderStreamRequest<TTransport::RemoteRouterRef> {
         self.config.build_stream_request(
-            messages,
-            tools,
+            call,
             session_id,
             request_id,
             remote_router_ref,
@@ -737,6 +762,8 @@ mod tests {
         let (transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: Default::default(),
+            generation: Default::default(),
         });
 
         core.validate_contract(&(), None).await.unwrap();
@@ -746,10 +773,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiation_resolves_recovery_profile_before_any_chat() {
+        let expected = ProviderContractInfo {
+            item_aware_chat_version: Some(querymt::chat::ITEM_AWARE_CHAT_CONTRACT_VERSION),
+            protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: ChatCapabilities::NONE
+                .with_streaming(true)
+                .with_options(querymt::chat::GenerationOptionSupport::ALL),
+            generation: crate::provider_protocol::ProviderGenerationProfile {
+                initial_max_tokens: Some(32_000),
+                output_ceiling: Some(128_000),
+                reasoning_effort: Some(querymt::chat::ReasoningEffort::High),
+            },
+        };
+        let (transport, core) = core_with_contract(expected.clone());
+        assert!(!core.capabilities().options.max_tokens);
+        assert_eq!(core.negotiate_contract().await.unwrap(), expected);
+        assert_eq!(core.capabilities(), expected.capabilities);
+        assert_eq!(core.negotiate_contract().await.unwrap(), expected);
+        assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 1);
+        // TestTransport rejects chat calls: negotiation must not invoke the model.
+    }
+
+    #[tokio::test]
     async fn missing_protocol_version_fails_with_upgrade_guidance() {
         let (_transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: None,
+            capabilities: Default::default(),
+            generation: Default::default(),
         });
 
         let error = core.validate_contract(&(), None).await.unwrap_err();
@@ -768,6 +820,8 @@ mod tests {
             ProviderContractInfo {
                 item_aware_chat_version: None,
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
+                capabilities: Default::default(),
+                generation: Default::default(),
             },
             Some(transport_error),
         );
@@ -790,6 +844,8 @@ mod tests {
             ProviderContractInfo {
                 item_aware_chat_version: None,
                 protocol_version: Some(MESH_PROTOCOL_VERSION),
+                capabilities: Default::default(),
+                generation: Default::default(),
             },
             Some(TransportErrorKind::Timeout),
         );
@@ -808,6 +864,8 @@ mod tests {
         let (transport, core) = core_with_contract(ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION + 1),
+            capabilities: Default::default(),
+            generation: Default::default(),
         });
 
         let error = core.validate_contract(&(), None).await.unwrap_err();
@@ -824,6 +882,8 @@ mod tests {
         *transport.contract_info.lock().unwrap() = ProviderContractInfo {
             item_aware_chat_version: None,
             protocol_version: Some(MESH_PROTOCOL_VERSION),
+            capabilities: Default::default(),
+            generation: Default::default(),
         };
         core.validate_contract(&(), None).await.unwrap();
         assert_eq!(transport.contract_calls.load(Ordering::SeqCst), 2);

@@ -1569,8 +1569,6 @@ mod tests {
     use crate::agent::remote::test_helpers::fixtures::{get_test_mesh, random_node_id};
     use crate::session::sqlite_storage::SqliteStorage;
     use crate::test_utils::empty_plugin_registry;
-    #[cfg(feature = "remote")]
-    use querymt::error::LLMError;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::Notify;
@@ -1626,13 +1624,11 @@ mod tests {
             .await
             .expect("set provider_node_id");
 
-        let provider = provider
-            .build_provider_for_session(&session_id)
-            .await
-            .expect("mesh-backed provider should build");
-        match provider.chat_with_tools(&[], None).await {
-            Err(LLMError::ProviderError(message)) => message,
-            other => panic!("expected provider error from mesh lookup; got: {other:?}"),
+        // Remote providers negotiate their contract while being built, so an
+        // unknown peer fails here rather than on the first chat call.
+        match provider.build_provider_for_session(&session_id).await {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("expected mesh negotiation to fail for an unknown peer"),
         }
     }
 

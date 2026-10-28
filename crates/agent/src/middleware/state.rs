@@ -1,4 +1,4 @@
-use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason};
+use querymt::chat::{ChatMessage, ChatOutput, ChatRole, FinishReason, GenerationOptions};
 use std::sync::Arc;
 
 use crate::events::StopType;
@@ -69,6 +69,31 @@ impl AgentStats {
     }
 }
 
+/// Fold one request's token usage (and cost, when pricing is known) into `stats`.
+///
+/// Shared by the normal reply path and by discarded attempts (for example an
+/// escalated retry), so every request that was billed is counted exactly once.
+/// Does not touch `steps`; callers decide whether the attempt counts as a step.
+pub fn apply_usage_to_stats(
+    stats: &mut AgentStats,
+    usage: Option<&querymt::Usage>,
+    pricing: Option<&querymt::providers::ModelPricing>,
+) {
+    let Some(usage) = usage else {
+        return;
+    };
+    stats.total_input_tokens += u64::from(usage.input_tokens);
+    stats.total_output_tokens += u64::from(usage.output_tokens);
+    stats.reasoning_tokens += u64::from(usage.reasoning_tokens);
+    stats.cache_read_tokens += u64::from(usage.cache_read);
+    stats.cache_write_tokens += u64::from(usage.cache_write);
+    stats.context_tokens = calculate_context_tokens(Some(usage)) as usize;
+
+    if let Some(pricing) = pricing {
+        stats.update_costs(pricing);
+    }
+}
+
 /// Calculate current context size from usage.
 /// Single source of truth for context token calculation.
 /// Returns the sum of input, output, reasoning, cache_read and cache_write tokens, or 0 if no usage provided.
@@ -113,6 +138,26 @@ pub struct PreparedModelRequest {
     pub messages: Arc<[ChatMessage]>,
     pub tools: Arc<[querymt::chat::Tool]>,
     pub estimated_tokens: usize,
+    /// Per-request generation overrides copied from
+    /// [`ConversationContext::request_overrides`].
+    pub options: GenerationOptions,
+}
+
+/// Per-session facts about the model a session talks to.
+///
+/// Resolved together with the provider, replaced when the model is switched and
+/// carried on [`ConversationContext`], so middleware never has to reconstruct
+/// them from "the last request".
+#[derive(Debug, Clone, Default)]
+pub struct ModelProfile {
+    /// Initial output cap and escalation ceiling; `None` when unknown.
+    pub caps: Option<crate::model_heuristics::OutputCaps>,
+    /// What the session's provider supports per request.
+    pub capabilities: querymt::chat::ChatCapabilities,
+    /// Reasoning effort the provider is configured with, when known.
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+    /// Pricing used to account for this session's usage, when billable.
+    pub pricing: Option<querymt::providers::ModelPricing>,
 }
 
 /// Context passed to middleware during state transitions
@@ -130,6 +175,19 @@ pub struct ConversationContext {
     /// Used by `AgentModeMiddleware` to inject mode-specific reminders.
     /// Defaults to `Build` for backward compatibility.
     pub session_mode: crate::agent::core::AgentMode,
+    /// Generation overrides for the next model request only.
+    ///
+    /// Middleware sets these when it returns to `BeforeLlmCall` (e.g. to raise
+    /// `max_tokens`). They are consumed by exactly one request: the context built
+    /// after that request does not carry them forward.
+    pub request_overrides: GenerationOptions,
+    /// Facts about the session's model (caps, capabilities, effort, pricing).
+    pub profile: Arc<ModelProfile>,
+    /// Options the most recent model request was actually sent with.
+    ///
+    /// Carried to the `Stopped` state so `on_stopped` knows which cap was hit.
+    /// Cleared at turn start.
+    pub last_applied: GenerationOptions,
 }
 
 impl ConversationContext {
@@ -148,7 +206,24 @@ impl ConversationContext {
             provider,
             model,
             session_mode: crate::agent::core::AgentMode::Build,
+            request_overrides: GenerationOptions::NONE,
+            profile: Arc::new(ModelProfile::default()),
+            last_applied: GenerationOptions::NONE,
         }
+    }
+
+    /// Set the model profile (builder-style).
+    #[must_use]
+    pub fn with_profile(mut self, profile: Arc<ModelProfile>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Set the options the last request was sent with (builder-style).
+    #[must_use]
+    pub fn with_last_applied(mut self, applied: GenerationOptions) -> Self {
+        self.last_applied = applied;
+        self
     }
 
     /// Returns the number of user messages in the conversation
@@ -175,6 +250,9 @@ impl ConversationContext {
             provider: self.provider.clone(),
             model: self.model.clone(),
             session_mode: self.session_mode,
+            request_overrides: self.request_overrides,
+            profile: self.profile.clone(),
+            last_applied: self.last_applied,
         }
     }
 
@@ -241,6 +319,12 @@ impl ConversationContext {
                 }
                 messages.push(latest);
             }
+        } else if messages
+            .last()
+            .is_some_and(|last| last.role == ChatRole::Assistant)
+        {
+            // A retained partial reply must be followed by guidance, not used as prefill.
+            messages.extend(fragments);
         } else if let Some(latest) = messages.pop() {
             messages.extend(fragments);
             messages.push(latest);
@@ -259,6 +343,20 @@ impl ConversationContext {
     pub fn with_fragments(mut self, fragments: Arc<[ContextFragment]>) -> Self {
         self.fragments = fragments;
         self
+    }
+
+    /// Set the overrides applied to the next model request (builder-style).
+    #[must_use]
+    pub fn with_request_overrides(mut self, overrides: GenerationOptions) -> Self {
+        self.request_overrides = overrides;
+        self
+    }
+
+    /// Returns a copy of this context whose overrides are cleared, so a
+    /// consumed override never leaks into a later request.
+    #[must_use]
+    pub fn without_request_overrides(&self) -> Self {
+        self.clone().with_request_overrides(GenerationOptions::NONE)
     }
 
     /// Returns true if this is the first user turn
@@ -287,6 +385,9 @@ pub struct LlmResponse {
     /// When set, `transition_after_llm` will use this ID so the final
     /// `AssistantMessageStored` event matches the delta events already sent to the UI.
     pub message_id: Option<String>,
+    /// Per-request overrides this response's request was actually sent with
+    /// (after dropping the ones the provider does not honour).
+    pub applied: GenerationOptions,
 }
 
 impl LlmResponse {
@@ -305,7 +406,14 @@ impl LlmResponse {
             finish_reason,
             output: None,
             message_id: None,
+            applied: GenerationOptions::NONE,
         }
+    }
+
+    /// Record the options the request was sent with (builder-style).
+    pub fn with_applied(mut self, applied: GenerationOptions) -> Self {
+        self.applied = applied;
+        self
     }
 
     /// Set the canonical structured output (builder-style).
@@ -338,6 +446,23 @@ impl LlmResponse {
 
     pub fn is_stop(&self) -> bool {
         self.finish_reason.unwrap_or(FinishReason::Unknown) == FinishReason::Stop
+    }
+
+    /// A reply cut off by the output token limit that produced no visible text
+    /// and no tool calls, only reasoning (or nothing at all).
+    ///
+    /// Such a reply carries nothing worth keeping in history, and replaying it
+    /// would only burn the next request's budget on the same reasoning.
+    pub fn is_thinking_only_length_cutoff(&self) -> bool {
+        self.finish_reason == Some(FinishReason::Length)
+            && self.content.trim().is_empty()
+            && self.tool_calls.is_empty()
+            && self.output.as_ref().is_none_or(|output| {
+                output
+                    .items
+                    .iter()
+                    .all(|item| matches!(item, querymt::chat::ChatOutputItem::Reasoning(_)))
+            })
     }
 }
 

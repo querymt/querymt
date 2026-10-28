@@ -26,11 +26,12 @@ use querymt::{
     HTTPLLMProvider, Usage,
     auth::ApiKeyResolver,
     chat::{
-        ChatFunctionCallItem, ChatInputPart, ChatMessage, ChatMessageItem, ChatMessagePart,
-        ChatOutput, ChatOutputItem, ChatOutputStatus, ChatReasoningItem, ChatReasoningPart,
-        ChatRole, FinishReason, MediaKind, MediaPart, MediaSource, ReasoningEffort, Tool,
-        ToolChoice, ToolResultPart,
-        http::{ChatStreamParser, HTTPChatProvider},
+        ChatCall, ChatCapabilities, ChatFunctionCallItem, ChatInputPart, ChatMessage,
+        ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputStatus,
+        ChatReasoningItem, ChatReasoningPart, ChatRole, FinishReason, GenerationOptionSupport,
+        GenerationOptions, MediaKind, MediaPart, MediaSource, ReasoningEffort, Tool, ToolChoice,
+        ToolResultPart,
+        http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -1043,6 +1044,26 @@ impl Anthropic {
         }
     }
 
+    /// Copy of this config with per-request overrides applied.
+    ///
+    /// Every downstream decision (budget fitting against `max_tokens`, adaptive
+    /// effort, sampling restrictions) reads from the config, so applying the
+    /// overrides up front keeps one code path for configured and per-request
+    /// values. An effort override also discards a configured explicit
+    /// `reasoning_budget_tokens`; otherwise that budget would silently win over
+    /// the requested effort.
+    fn with_generation_options(&self, options: &GenerationOptions) -> Self {
+        let mut cfg = self.clone();
+        if let Some(max_tokens) = options.max_tokens {
+            cfg.max_tokens = max_tokens;
+        }
+        if let Some(effort) = options.reasoning_effort {
+            cfg.reasoning_effort = Some(effort);
+            cfg.reasoning_budget_tokens = None;
+        }
+        cfg
+    }
+
     /// Parsed Claude model, or `None` for IDs that aren't recognisable.
     fn parsed_model(&self) -> Option<ClaudeModel> {
         parse_claude_model(&self.model)
@@ -1298,26 +1319,10 @@ fn tool_result_content(part: &ToolResultPart) -> Option<ToolResultContent> {
     }
 }
 
-impl HTTPChatProvider for Anthropic {
-    fn prepare_chat_request(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-        stream: bool,
-    ) -> Result<querymt::chat::http::PreparedChatRequest, LLMError> {
-        let names = self.declared_tool_names(tools)?;
-        let request = if stream {
-            self.chat_stream_request(messages, tools)?
-        } else {
-            self.chat_request(messages, tools)?
-        };
-        Ok(querymt::chat::http::PreparedChatRequest {
-            request,
-            context: serde_json::to_value(names)?,
-        })
-    }
-
-    fn chat_request(
+impl Anthropic {
+    /// Builds the wire request for the settings in `self` (streaming is
+    /// controlled by `self.stream`).
+    fn build_chat_request(
         &self,
         messages: &[ChatMessage],
         tools: Option<&[Tool]>,
@@ -1564,30 +1569,41 @@ impl HTTPChatProvider for Anthropic {
 
         Ok(builder.body(json_req)?)
     }
+}
 
-    fn chat_stream_request(
+impl HTTPChatProvider for Anthropic {
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE
+            .with_streaming(true)
+            .with_options(GenerationOptionSupport::ALL)
+    }
+
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
-        let mut cfg = self.clone();
-        cfg.stream = Some(true);
-        cfg.chat_request(messages, tools)
+        call: &ChatCall<'_>,
+        stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let mut cfg = if call.options.is_empty() {
+            self.clone()
+        } else {
+            self.with_generation_options(&call.options)
+        };
+        if stream {
+            cfg.stream = Some(true);
+        }
+        let names = cfg.declared_tool_names(call.tools)?;
+        let request = cfg.build_chat_request(call.messages, call.tools)?;
+        Ok(PreparedChatRequest {
+            request,
+            context: serde_json::to_value(names)?,
+        })
     }
 
     fn classify_chat_error(&self, response: &Response<Vec<u8>>) -> LLMError {
         classify_anthropic_http_error(response)
     }
 
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
-        self.parse_chat_with_context(resp, Value::Null)
-    }
-
-    fn parse_chat_with_context(
-        &self,
-        resp: Response<Vec<u8>>,
-        context: Value,
-    ) -> Result<ChatOutput, LLMError> {
+    fn parse_chat(&self, resp: Response<Vec<u8>>, context: Value) -> Result<ChatOutput, LLMError> {
         let mut json_resp: AnthropicCompleteResponse = serde_json::from_slice(resp.body())
             .map_err(|e| LLMError::ResponseFormatError {
                 message: format!("Failed to parse Anthropic response JSON: {e}"),
@@ -1607,18 +1623,7 @@ impl HTTPChatProvider for Anthropic {
         Ok(json_resp.into())
     }
 
-    fn supports_streaming(&self) -> bool {
-        true
-    }
-
-    fn chat_stream_parser(&self) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        self.chat_stream_parser_with_context(Value::Null)
-    }
-
-    fn chat_stream_parser_with_context(
-        &self,
-        context: Value,
-    ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
+    fn chat_stream_parser(&self, context: Value) -> Result<Box<dyn ChatStreamParser>, LLMError> {
         Ok(Box::new(AnthropicStreamParser {
             oauth: self.is_oauth(),
             tool_names: self.tool_names_from_context(context)?,
@@ -2020,7 +2025,8 @@ mod tests {
                 .build(),
         ];
         let req = anthropic
-            .chat_request(&messages, None)
+            .prepare_chat_request(&ChatCall::new(&messages).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("chat request should build");
 
         let body: serde_json::Value =
@@ -2449,13 +2455,13 @@ mod tests {
         ] {
             let tools = [test_tool(name)];
             let prepared = anthropic
-                .prepare_chat_request(&[], Some(&tools), false)
+                .prepare_chat_request(&ChatCall::new(&[]).tools(&tools), false)
                 .unwrap();
             let wire = anthropic.prefix_tool_name(name);
             let request: Value = serde_json::from_slice(prepared.request.body()).unwrap();
             assert_eq!(request["tools"][0]["name"], wire);
             let output = anthropic
-                .parse_chat_with_context(tool_response(&wire), prepared.context)
+                .parse_chat(tool_response(&wire), prepared.context)
                 .unwrap();
             assert_eq!(output_tool_name(output), name);
         }
@@ -2467,13 +2473,15 @@ mod tests {
         anthropic.tools = Some(vec![test_tool("getWeather")]);
         let upper = [test_tool("GetWeather")];
         let first = anthropic
-            .prepare_chat_request(&[], Some(&upper), false)
+            .prepare_chat_request(&ChatCall::new(&[]).tools(&upper), false)
             .unwrap();
-        let second = anthropic.prepare_chat_request(&[], None, false).unwrap();
+        let second = anthropic
+            .prepare_chat_request(&ChatCall::new(&[]), false)
+            .unwrap();
         assert_eq!(
             output_tool_name(
                 anthropic
-                    .parse_chat_with_context(tool_response("mcp_GetWeather"), second.context,)
+                    .parse_chat(tool_response("mcp_GetWeather"), second.context,)
                     .unwrap()
             ),
             "getWeather"
@@ -2481,14 +2489,14 @@ mod tests {
         assert_eq!(
             output_tool_name(
                 anthropic
-                    .parse_chat_with_context(tool_response("mcp_GetWeather"), first.context,)
+                    .parse_chat(tool_response("mcp_GetWeather"), first.context,)
                     .unwrap()
             ),
             "GetWeather"
         );
 
         let empty = anthropic
-            .prepare_chat_request(&[], Some(&[]), false)
+            .prepare_chat_request(&ChatCall::new(&[]).tools(&[]), false)
             .unwrap();
         assert_eq!(empty.context, serde_json::json!({}));
         let request: Value = serde_json::from_slice(empty.request.body()).unwrap();
@@ -2501,19 +2509,17 @@ mod tests {
         let upper = [test_tool("GetWeather")];
         let lower = [test_tool("getWeather")];
         let a = anthropic
-            .prepare_chat_request(&[], Some(&upper), true)
+            .prepare_chat_request(&ChatCall::new(&[]).tools(&upper), true)
             .unwrap();
         let b = anthropic
-            .prepare_chat_request(&[], Some(&lower), true)
+            .prepare_chat_request(&ChatCall::new(&[]).tools(&lower), true)
             .unwrap();
         let request: Value = serde_json::from_slice(a.request.body()).unwrap();
         assert_eq!(request["stream"], true);
         // Exercise the same JSON boundary used by the plugin transport.
         let context = serde_json::from_slice(&serde_json::to_vec(&a.context).unwrap()).unwrap();
-        let mut a = anthropic.chat_stream_parser_with_context(context).unwrap();
-        let mut b = anthropic
-            .chat_stream_parser_with_context(b.context)
-            .unwrap();
+        let mut a = anthropic.chat_stream_parser(context).unwrap();
+        let mut b = anthropic.chat_stream_parser(b.context).unwrap();
         let frame = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"mcp_GetWeather"}}
 "#;
         for (parser, expected) in [(&mut b, "getWeather"), (&mut a, "GetWeather")] {
@@ -2530,18 +2536,23 @@ mod tests {
         let tools = [test_tool("getWeather"), test_tool("GetWeather")];
         for stream in [false, true] {
             let error = anthropic
-                .prepare_chat_request(&[], Some(&tools), stream)
+                .prepare_chat_request(&ChatCall::new(&[]).tools(&tools), stream)
                 .err()
                 .expect("collision");
             assert!(
                 matches!(error, LLMError::InvalidRequest(message) if message.contains("mcp_GetWeather"))
             );
         }
-        assert!(anthropic.chat_request(&[], Some(&tools)).is_err());
+        assert!(
+            anthropic
+                .prepare_chat_request(&ChatCall::new(&[]).maybe_tools(Some(&tools)), false)
+                .map(|p| p.request)
+                .is_err()
+        );
         let api_key = test_anthropic("sk-ant-api03-test");
         assert!(
             api_key
-                .prepare_chat_request(&[], Some(&tools), false)
+                .prepare_chat_request(&ChatCall::new(&[]).tools(&tools), false)
                 .is_ok()
         );
     }
@@ -2626,7 +2637,9 @@ mod tests {
             .body(serde_json::to_vec(&body).expect("json should serialize"))
             .expect("response should build");
 
-        let output = anthropic.parse_chat(resp).expect("response should parse");
+        let output = anthropic
+            .parse_chat(resp, serde_json::Value::Null)
+            .expect("response should parse");
         let names: Vec<&str> = output
             .items
             .iter()
@@ -2696,7 +2709,7 @@ mod tests {
     /// collect all emitted `StreamChunk`s.
     fn collect_chunks(anthropic: &Anthropic, lines: &[&str]) -> Vec<querymt::chat::StreamChunk> {
         let mut parser = anthropic
-            .chat_stream_parser()
+            .chat_stream_parser(serde_json::Value::Null)
             .expect("stream parser should initialize");
         let mut out = Vec::new();
         for line in lines {
@@ -3054,7 +3067,9 @@ mod tests {
     #[test]
     fn streaming_error_event_overloaded_is_retryable() {
         let anthropic = test_anthropic("sk-ant-api03-test");
-        let mut parser = anthropic.chat_stream_parser().unwrap();
+        let mut parser = anthropic
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let line =
             br#"data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
 "#;
@@ -3073,7 +3088,9 @@ mod tests {
     #[test]
     fn streaming_api_error_is_transient() {
         let anthropic = test_anthropic("sk-ant-api03-test");
-        let mut parser = anthropic.chat_stream_parser().unwrap();
+        let mut parser = anthropic
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let line = br#"data: {"type":"error","error":{"type":"api_error","message":"Internal server error"}}
 "#;
         let error = parser
@@ -3092,7 +3109,9 @@ mod tests {
     #[test]
     fn streaming_error_event_invalid_request_is_permanent() {
         let anthropic = test_anthropic("sk-ant-api03-test");
-        let mut parser = anthropic.chat_stream_parser().unwrap();
+        let mut parser = anthropic
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let line = br#"data: {"type":"error","error":{"type":"invalid_request_error","message":"bad request"}}
 "#;
         let err = parser
@@ -3121,8 +3140,125 @@ mod tests {
     }
 
     fn body_of(a: &Anthropic, messages: &[ChatMessage]) -> Value {
-        let req = a.chat_request(messages, None).expect("request builds");
-        serde_json::from_slice(req.body()).expect("valid JSON")
+        let prepared = a
+            .prepare_chat_request(&ChatCall::new(messages), false)
+            .expect("request builds");
+        serde_json::from_slice(prepared.request.body()).expect("valid JSON")
+    }
+
+    fn options_body(a: &Anthropic, options: &GenerationOptions, stream: bool) -> Value {
+        let prepared = a
+            .prepare_chat_request(&ChatCall::new(&user_msgs()).options(*options), stream)
+            .expect("request builds");
+        serde_json::from_slice(prepared.request.body()).expect("valid JSON")
+    }
+
+    #[test]
+    fn provider_reports_per_request_option_support() {
+        let a = anthropic_for("claude-sonnet-4-5", None, 32_000);
+        assert_eq!(a.capabilities().options, GenerationOptionSupport::ALL);
+    }
+
+    #[test]
+    fn max_tokens_override_applies_to_one_request_only() {
+        let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+        let options = GenerationOptions::default().with_max_tokens(128_000);
+
+        assert_eq!(options_body(&a, &options, false)["max_tokens"], 128_000);
+        assert_eq!(options_body(&a, &options, true)["max_tokens"], 128_000);
+        // The next request, made without options, uses the configured value.
+        assert_eq!(
+            options_body(&a, &GenerationOptions::NONE, false)["max_tokens"],
+            32_000
+        );
+        assert_eq!(a.max_tokens, 32_000);
+    }
+
+    #[test]
+    fn empty_options_produce_an_identical_request() {
+        let a = anthropic_for("claude-opus-4-8", Some(ReasoningEffort::High), 32_000);
+        let plain = a
+            .prepare_chat_request(&ChatCall::new(&user_msgs()), false)
+            .unwrap()
+            .request;
+        let with_none = a
+            .prepare_chat_request(
+                &ChatCall::new(&user_msgs()).options(GenerationOptions::NONE),
+                false,
+            )
+            .unwrap()
+            .request;
+        assert_eq!(plain.body(), with_none.body());
+    }
+
+    #[test]
+    fn effort_override_changes_adaptive_output_config() {
+        let a = anthropic_for("claude-sonnet-5-5", Some(ReasoningEffort::High), 32_000);
+        let low = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Low);
+
+        let b = options_body(&a, &low, false);
+        assert_eq!(b["thinking"]["type"], "adaptive");
+        assert_eq!(b["output_config"]["effort"], "low");
+        assert_eq!(body(&a)["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn effort_override_enables_thinking_when_none_configured() {
+        let a = anthropic_for("claude-sonnet-5-5", None, 32_000);
+        assert!(body(&a).get("thinking").is_none());
+
+        let options = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Medium);
+        let b = options_body(&a, &options, false);
+        assert_eq!(b["output_config"]["effort"], "medium");
+    }
+
+    #[test]
+    fn effort_override_replaces_budget_for_budget_models() {
+        let a = anthropic_for("claude-sonnet-4-5", Some(ReasoningEffort::High), 32_000);
+        assert_eq!(body(&a)["thinking"]["budget_tokens"], 16_000);
+
+        let low = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Low);
+        assert_eq!(
+            options_body(&a, &low, false)["thinking"]["budget_tokens"],
+            1_024
+        );
+    }
+
+    #[test]
+    fn effort_override_beats_configured_explicit_budget() {
+        let mut a = anthropic_for("claude-sonnet-4-5", Some(ReasoningEffort::High), 32_000);
+        a.reasoning_budget_tokens = Some(12_000);
+        assert_eq!(body(&a)["thinking"]["budget_tokens"], 12_000);
+
+        let low = GenerationOptions::default().with_reasoning_effort(ReasoningEffort::Low);
+        assert_eq!(
+            options_body(&a, &low, false)["thinking"]["budget_tokens"],
+            1_024
+        );
+        // Without an effort override the configured budget still applies.
+        let tokens = GenerationOptions::default().with_max_tokens(64_000);
+        assert_eq!(
+            options_body(&a, &tokens, false)["thinking"]["budget_tokens"],
+            12_000
+        );
+    }
+
+    #[test]
+    fn max_tokens_override_refits_the_thinking_budget() {
+        let a = anthropic_for("claude-sonnet-4-5", Some(ReasoningEffort::High), 20_000);
+        assert_eq!(body(&a)["thinking"]["budget_tokens"], 10_000);
+
+        let larger = GenerationOptions::default().with_max_tokens(64_000);
+        assert_eq!(
+            options_body(&a, &larger, false)["thinking"]["budget_tokens"],
+            16_000
+        );
+
+        // A cap too small for the minimum budget omits thinking entirely.
+        let tiny = GenerationOptions::default().with_max_tokens(1_500);
+        let b = options_body(&a, &tiny, false);
+        assert!(b.get("thinking").is_none());
+        assert_eq!(b["max_tokens"], 1_500);
     }
 
     fn user_msgs() -> Vec<ChatMessage> {
@@ -3183,7 +3319,11 @@ mod tests {
         c.adaptive_thinking = Some(true);
         c.tools = Some(vec![test_tool("x")]);
         c.tool_choice = Some(ToolChoice::Tool("x".into()));
-        assert!(c.chat_request(&user_msgs(), None).is_ok());
+        assert!(
+            c.prepare_chat_request(&ChatCall::new(&user_msgs()).maybe_tools(None), false)
+                .map(|p| p.request)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3317,7 +3457,10 @@ mod tests {
         let mut a = anthropic_for("claude-sonnet-5-5", None, 32_000);
         a.tools = Some(tools.clone());
         a.tool_choice = Some(ToolChoice::Tool("x".into()));
-        let err = a.chat_request(&user_msgs(), None).unwrap_err();
+        let err = a
+            .prepare_chat_request(&ChatCall::new(&user_msgs()).maybe_tools(None), false)
+            .map(|p| p.request)
+            .unwrap_err();
         assert!(matches!(err, LLMError::InvalidRequest(ref m) if m.contains("claude-sonnet-5-5")));
 
         // Other adaptive model: sent unchanged.
@@ -3332,7 +3475,11 @@ mod tests {
         let mut a = anthropic_for("claude-sonnet-5-5", None, 32_000);
         a.tools = Some(tools);
         a.tool_choice = Some(ToolChoice::Auto);
-        assert!(a.chat_request(&user_msgs(), None).is_ok());
+        assert!(
+            a.prepare_chat_request(&ChatCall::new(&user_msgs()).maybe_tools(None), false)
+                .map(|p| p.request)
+                .is_ok()
+        );
     }
 
     fn reasoning_item(text: &str, signature: Option<&str>) -> ChatOutputItem {
@@ -3538,7 +3685,8 @@ mod tests {
             .status(200)
             .body(serde_json::to_vec(&json).unwrap())
             .unwrap();
-        a.parse_chat(resp).expect("response parses")
+        a.parse_chat(resp, serde_json::Value::Null)
+            .expect("response parses")
     }
 
     #[test]

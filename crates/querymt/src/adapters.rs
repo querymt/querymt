@@ -1,6 +1,6 @@
 use crate::{
     HTTPLLMProvider, LLMProvider, Tool,
-    chat::{ChatMessage, ChatOutput, ChatProvider, StreamChunk},
+    chat::{ChatCall, ChatCapabilities, ChatOutput, ChatProvider, ChatStream, StreamChunk},
     completion::{CompletionProvider, CompletionRequest, CompletionResponse},
     embedding::EmbeddingProvider,
     error::LLMError,
@@ -9,7 +9,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::StreamExt;
-use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
@@ -34,54 +33,34 @@ impl LLMProviderFromHTTP {
         }
         Ok(())
     }
+}
 
-    async fn do_chat(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
+#[async_trait]
+impl ChatProvider for LLMProviderFromHTTP {
+    fn capabilities(&self) -> ChatCapabilities {
+        self.inner.capabilities()
+    }
+
+    #[cfg_attr(feature = "tracing", instrument(name = "http_adapter.chat", skip_all))]
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
         self.ensure_credential_fresh().await?;
 
-        let prepared = self.inner.prepare_chat_request(messages, tools, false)?;
+        let prepared = self.inner.prepare_chat_request(call, false)?;
 
         let resp = call_outbound_raw(prepared.request).await?;
         if !resp.status().is_success() {
             return Err(self.inner.classify_chat_error_async(&resp).await);
         }
 
-        self.inner.parse_chat_with_context(resp, prepared.context)
-    }
-}
-
-#[async_trait]
-impl ChatProvider for LLMProviderFromHTTP {
-    fn supports_streaming(&self) -> bool {
-        self.inner.supports_streaming()
+        self.inner.parse_chat(resp, prepared.context)
     }
 
     #[cfg_attr(
         feature = "tracing",
-        instrument(name = "http_adapter.chat_with_tools", skip_all)
+        instrument(name = "http_adapter.chat_stream", skip_all)
     )]
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        self.do_chat(messages, tools).await
-    }
-
-    #[cfg_attr(
-        feature = "tracing",
-        instrument(name = "http_adapter.chat_stream_with_tools", skip_all)
-    )]
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>, LLMError>
-    {
-        if !self.inner.supports_streaming() {
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        if !self.inner.capabilities().streaming {
             return Err(LLMError::NotImplemented(
                 "Streaming not supported by underlying HTTP provider".into(),
             ));
@@ -89,7 +68,7 @@ impl ChatProvider for LLMProviderFromHTTP {
 
         self.ensure_credential_fresh().await?;
 
-        let prepared = self.inner.prepare_chat_request(messages, tools, true)?;
+        let prepared = self.inner.prepare_chat_request(call, true)?;
 
         let stream = match call_outbound_stream_raw(prepared.request).await? {
             OutboundStreamResult::Failure { response } => {
@@ -98,9 +77,7 @@ impl ChatProvider for LLMProviderFromHTTP {
             OutboundStreamResult::Success { stream } => stream,
         };
 
-        let mut parser = self
-            .inner
-            .chat_stream_parser_with_context(prepared.context)?;
+        let mut parser = self.inner.chat_stream_parser(prepared.context)?;
         let s = stream
             .map(move |res: reqwest::Result<bytes::Bytes>| res.map_err(LLMError::from))
             .chain(futures::stream::iter([

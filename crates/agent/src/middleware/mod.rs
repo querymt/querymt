@@ -11,6 +11,7 @@ mod delegation;
 pub mod delegation_guard;
 mod limits;
 mod modes;
+pub mod output_limit;
 mod parallel_edit_guard;
 mod presets;
 mod specialized;
@@ -21,8 +22,8 @@ pub use driver::{CompositeDriver, MiddlewareDriver};
 pub use error::{MiddlewareError, Result};
 pub use state::{
     AgentStats, ContextFragment, ContextPriority, ConversationContext, ExecutionState, LlmResponse,
-    PreparedModelRequest, ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason,
-    calculate_context_tokens,
+    ModelProfile, PreparedModelRequest, ToolCall, ToolFunction, ToolResult, WaitCondition,
+    WaitReason, apply_usage_to_stats, calculate_context_tokens,
 };
 
 // Re-export model info types for convenience
@@ -38,6 +39,9 @@ pub use delegation_guard::DelegationGuardMiddleware;
 pub use factory::{MIDDLEWARE_REGISTRY, MiddlewareFactory, MiddlewareRegistry};
 pub use limits::{
     LimitsConfig, LimitsMiddleware, MaxStepsMiddleware, PriceLimitMiddleware, TurnLimitMiddleware,
+};
+pub use output_limit::{
+    OutputLimitConfig, OutputLimitRecoveryFactory, OutputLimitRecoveryMiddleware,
 };
 pub use parallel_edit_guard::{ParallelEditGuard, ParallelEditGuardFactory, ParallelEditMode};
 pub use presets::MiddlewarePresets;

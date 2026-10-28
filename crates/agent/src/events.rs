@@ -36,6 +36,18 @@ pub enum StopType {
     Other,
 }
 
+/// What an output-limit recovery step did.
+/// Typeshare-annotated: generated for TypeScript and Swift.
+#[typeshare]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputLimitRecoveryAction {
+    /// The cut-off reply was discarded and the request retried at the model's output ceiling.
+    Escalate,
+    /// The run continued with an instruction to resume without recap.
+    Continue,
+}
+
 impl From<StopType> for StopReason {
     fn from(stop_type: StopType) -> Self {
         match stop_type {
@@ -59,6 +71,8 @@ pub enum RunOutcome {
     Completed,
     Failed,
     Cancelled,
+    /// The run ended on a middleware stop (e.g. the model's output limit).
+    Stopped,
     /// The owning process died before closing the run.
     Interrupted,
 }
@@ -69,6 +83,7 @@ impl RunOutcome {
             RunOutcome::Completed => "completed",
             RunOutcome::Failed => "failed",
             RunOutcome::Cancelled => "cancelled",
+            RunOutcome::Stopped => "stopped",
             RunOutcome::Interrupted => "interrupted",
         }
     }
@@ -292,6 +307,12 @@ pub enum AgentEventKind {
     RunCompleted {
         run_id: String,
         outcome: String,
+        /// Why the run stopped; set only when `outcome` is `"stopped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_type: Option<StopType>,
+        /// Human-readable stop reason; set only when `outcome` is `"stopped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     SteeringAccepted {
         run_id: String,
@@ -550,6 +571,31 @@ pub enum AgentEventKind {
         reason: String,
         /// Execution metrics at time of stop
         metrics: ExecutionMetrics,
+    },
+    /// A reply was cut off by the output-token limit and the agent recovered
+    /// instead of stopping. Emitted once per escalation or continuation.
+    OutputLimitRecovery {
+        /// Turn the recovery belongs to (conversation turn count at the time).
+        #[typeshare(serialized_as = "number")]
+        turn: u32,
+        /// 1-based attempt number within the turn, per action.
+        #[typeshare(serialized_as = "number")]
+        attempt: u32,
+        action: OutputLimitRecoveryAction,
+        /// Output-token cap of the request that was cut off, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        from_max_tokens: Option<u32>,
+        /// Output-token cap requested next, when the recovery changes it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[typeshare(serialized_as = "Option<number>")]
+        to_max_tokens: Option<u32>,
+        /// The cut-off reply carried only reasoning.
+        #[serde(default)]
+        thinking_only: bool,
+        /// Streamed message that was discarded; clients should drop it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        discarded_message_id: Option<String>,
     },
     /// Emitted when a prompt is queued because another operation is executing
     SessionQueued {
@@ -1323,6 +1369,53 @@ mod tests {
     }
 
     #[test]
+    fn run_completed_reports_stop_fields_only_when_stopped() {
+        let stopped = AgentEventKind::RunCompleted {
+            run_id: "r".into(),
+            outcome: "stopped".into(),
+            stop_type: Some(StopType::ModelTokenLimit),
+            reason: Some("output limit".into()),
+        };
+        let json = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(json["data"]["outcome"], "stopped");
+        assert_eq!(json["data"]["stop_type"], "model_token_limit");
+        assert_eq!(json["data"]["reason"], "output limit");
+        let parsed: AgentEventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::RunCompleted {
+                stop_type: Some(StopType::ModelTokenLimit),
+                ..
+            }
+        ));
+
+        let completed = AgentEventKind::RunCompleted {
+            run_id: "r".into(),
+            outcome: "completed".into(),
+            stop_type: None,
+            reason: None,
+        };
+        let json = serde_json::to_value(&completed).unwrap();
+        assert!(json["data"].get("stop_type").is_none());
+        assert!(json["data"].get("reason").is_none());
+
+        // Events journaled before this change still decode.
+        let legacy = serde_json::json!({
+            "type": "run_completed",
+            "data": {"run_id": "r", "outcome": "completed"}
+        });
+        let parsed: AgentEventKind = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::RunCompleted {
+                stop_type: None,
+                reason: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn agent_event_kind_middleware_stopped_construction() {
         let kind = AgentEventKind::MiddlewareStopped {
             stop_type: StopType::StepLimit,
@@ -1339,6 +1432,74 @@ mod tests {
         assert_eq!(json["data"]["reason"], "max steps reached");
         assert_eq!(json["data"]["metrics"]["steps"], 10);
         assert_eq!(json["data"]["metrics"]["turns"], 5);
+    }
+
+    #[test]
+    fn output_limit_recovery_serializes_with_snake_case_action() {
+        let kind = AgentEventKind::OutputLimitRecovery {
+            turn: 2,
+            attempt: 1,
+            action: OutputLimitRecoveryAction::Escalate,
+            from_max_tokens: Some(32_000),
+            to_max_tokens: Some(128_000),
+            thinking_only: true,
+            discarded_message_id: Some("m-1".into()),
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["type"], "output_limit_recovery");
+        assert_eq!(json["data"]["action"], "escalate");
+        assert_eq!(json["data"]["from_max_tokens"], 32_000);
+        assert_eq!(json["data"]["to_max_tokens"], 128_000);
+        assert_eq!(json["data"]["thinking_only"], true);
+        assert_eq!(json["data"]["discarded_message_id"], "m-1");
+
+        let back: AgentEventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            AgentEventKind::OutputLimitRecovery {
+                action: OutputLimitRecoveryAction::Escalate,
+                turn: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn output_limit_recovery_omits_unset_options_and_decodes_without_them() {
+        let kind = AgentEventKind::OutputLimitRecovery {
+            turn: 1,
+            attempt: 1,
+            action: OutputLimitRecoveryAction::Continue,
+            from_max_tokens: None,
+            to_max_tokens: None,
+            thinking_only: false,
+            discarded_message_id: None,
+        };
+        let json = serde_json::to_value(&kind).unwrap();
+        let data = json["data"].as_object().unwrap();
+        assert!(!data.contains_key("from_max_tokens"));
+        assert!(!data.contains_key("to_max_tokens"));
+        assert!(!data.contains_key("discarded_message_id"));
+
+        let minimal = serde_json::json!({
+            "type": "output_limit_recovery",
+            "data": {"turn": 1, "attempt": 2, "action": "continue"}
+        });
+        assert!(serde_json::from_value::<AgentEventKind>(minimal).is_ok());
+    }
+
+    #[test]
+    fn output_limit_recovery_is_durable() {
+        let kind = AgentEventKind::OutputLimitRecovery {
+            turn: 1,
+            attempt: 1,
+            action: OutputLimitRecoveryAction::Escalate,
+            from_max_tokens: None,
+            to_max_tokens: None,
+            thinking_only: false,
+            discarded_message_id: None,
+        };
+        assert_eq!(classify_durability(&kind), Durability::Durable);
     }
 
     #[test]
@@ -1462,6 +1623,18 @@ mod tests {
         assert_eq!(json["turns"], 3);
     }
 
+    #[test]
+    fn llm_request_start_keeps_its_original_shape() {
+        let kind = AgentEventKind::LlmRequestStart { message_count: 3 };
+        let json = serde_json::to_value(&kind).unwrap();
+        assert_eq!(json["data"], serde_json::json!({"message_count": 3}));
+        let parsed: AgentEventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::LlmRequestStart { message_count: 3 }
+        ));
+    }
+
     // ── SessionLimits defaults and serialization ───────────────────────────
 
     #[test]
@@ -1556,7 +1729,7 @@ mod tests {
         let kind: AgentEventKind = serde_json::from_str(json).expect("run_completed");
         assert!(matches!(
             &kind,
-            AgentEventKind::RunCompleted { run_id, outcome }
+            AgentEventKind::RunCompleted { run_id, outcome, .. }
                 if run_id == "r" && outcome == RunOutcome::Interrupted.as_str()
         ));
         assert_eq!(
@@ -1578,6 +1751,8 @@ mod tests {
             classify_durability(&AgentEventKind::RunCompleted {
                 run_id: "r".into(),
                 outcome: RunOutcome::Interrupted.into(),
+                stop_type: None,
+                reason: None,
             }),
             Durability::Durable
         );

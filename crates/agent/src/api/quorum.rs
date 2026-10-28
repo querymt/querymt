@@ -1442,6 +1442,17 @@ fn apply_middleware_from_config(
         )));
     }
 
+    // Output-limit recovery is on by default; any `output_limit_recovery` entry
+    // (including a disabled one) or an explicit driver replaces it.
+    let has_recovery_entry = entries
+        .iter()
+        .any(|e| e.middleware_type == "output_limit_recovery");
+    if !has_recovery_entry && !builder.has_middleware_named("OutputLimitRecoveryMiddleware") {
+        builder.push_middleware(Arc::new(
+            crate::middleware::OutputLimitRecoveryMiddleware::default(),
+        ));
+    }
+
     // The guard goes last (same order as `AgentBuilder::build`) so its note is
     // the final message of the request, after any compaction.
     // Auto-add ParallelEditGuard (warn mode) unless a driver or any
@@ -1760,7 +1771,7 @@ include_external = false
             .expect("local delegate");
         let provider_node_id = random_node_id();
 
-        delegate
+        let shared_error = delegate
             .config
             .provider
             .build_provider(
@@ -1768,7 +1779,14 @@ include_external = false
                     .with_provider_node_id(Some(&provider_node_id)),
             )
             .await
-            .expect("ordinary delegate should build an explicit mesh provider");
+            .err()
+            .expect("unavailable remote host must fail during mesh negotiation");
+        let shared_message = shared_error.to_string();
+        assert!(
+            !shared_message.contains("no mesh handle available")
+                && shared_message.contains("provider_host::"),
+            "ordinary delegate did not receive the planner mesh: {shared_message}"
+        );
 
         agent.handle().clear_mesh();
         let error = match delegate

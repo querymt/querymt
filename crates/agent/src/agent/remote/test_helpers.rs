@@ -23,14 +23,13 @@ pub(crate) mod fixtures {
     use kameo::actor::{ActorRef, Spawn};
     use querymt::LLMParams;
     use querymt::LLMProvider;
-    use querymt::chat::{ChatMessage, ChatOutput, FinishReason, StreamChunk, Tool};
+    use querymt::chat::{ChatOutput, FinishReason, StreamChunk};
     use querymt::completion::{CompletionProvider, CompletionRequest, CompletionResponse};
     use querymt::embedding::EmbeddingProvider;
     use querymt::error::LLMError;
     use querymt::plugin::host::PluginRegistry;
     use querymt_remote::ProviderHostActor;
     use std::path::PathBuf;
-    use std::pin::Pin;
     use std::sync::{Arc, OnceLock};
     use tempfile::TempDir;
     use tokio::sync::{Mutex, OnceCell};
@@ -244,11 +243,7 @@ pub(crate) mod fixtures {
 
     #[async_trait::async_trait]
     impl querymt::chat::ChatProvider for MockLLMProvider {
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &querymt::chat::ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             let mut count = self.call_count.lock().await;
             *count += 1;
             Ok(MockChatResp {
@@ -258,14 +253,10 @@ pub(crate) mod fixtures {
             .into())
         }
 
-        async fn chat_stream_with_tools(
+        async fn chat_stream(
             &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<
-            Pin<Box<dyn futures_util::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-            LLMError,
-        > {
+            _call: &querymt::chat::ChatCall<'_>,
+        ) -> Result<querymt::chat::ChatStream, LLMError> {
             use futures_util::stream;
             let text = self.response_text.clone();
             let chunks = vec![

@@ -7,8 +7,9 @@ use http::{Method, Request, Response, header::AUTHORIZATION, header::CONTENT_TYP
 use querymt::{
     FunctionCall, HTTPLLMProvider, ToolCall, Usage,
     chat::{
-        ChatInputPart, ChatMessage, ChatOutput, ChatRole, FinishReason, MediaKind, MediaSource,
-        ReasoningEffort, StructuredOutputFormat, Tool, ToolResultPart, http::HTTPChatProvider,
+        ChatCall, ChatInputPart, ChatOutput, ChatRole, FinishReason, MediaKind, MediaSource,
+        ReasoningEffort, StructuredOutputFormat, Tool, ToolResultPart,
+        http::{HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
     embedding::http::HTTPEmbeddingProvider,
@@ -444,11 +445,12 @@ impl HTTPChatProvider for Ollama {
         classify_ollama_http_error(response)
     }
 
-    fn chat_request(
+    fn prepare_chat_request(
         &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<Request<Vec<u8>>, LLMError> {
+        call: &ChatCall<'_>,
+        _stream: bool,
+    ) -> Result<PreparedChatRequest, LLMError> {
+        let (messages, tools) = (call.messages, call.tools);
         let mut chat_messages: Vec<OllamaChatMessage> = vec![];
 
         for msg in messages {
@@ -583,10 +585,15 @@ impl HTTPChatProvider for Ollama {
             .method(Method::POST)
             .uri(url.as_str())
             .header(CONTENT_TYPE, "application/json");
-        Ok(self.maybe_add_auth(builder).body(req_json)?)
+        let request = self.maybe_add_auth(builder).body(req_json)?;
+        Ok(PreparedChatRequest::stateless(request))
     }
 
-    fn parse_chat(&self, resp: Response<Vec<u8>>) -> Result<ChatOutput, LLMError> {
+    fn parse_chat(
+        &self,
+        resp: Response<Vec<u8>>,
+        _context: serde_json::Value,
+    ) -> Result<ChatOutput, LLMError> {
         debug_assert!(
             resp.status().is_success(),
             "parse_chat is success-only; adapter must classify non-success first"
@@ -803,7 +810,8 @@ mod tests {
     fn chat_request_includes_bearer_when_api_key_set() {
         let ollama = test_ollama(Some("test-key-123"));
         let req = ollama
-            .chat_request(&[], None)
+            .prepare_chat_request(&ChatCall::new(&[]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("chat_request should succeed");
         let auth = req
             .headers()
@@ -816,7 +824,8 @@ mod tests {
     fn chat_request_omits_auth_when_no_api_key() {
         let ollama = test_ollama(None);
         let req = ollama
-            .chat_request(&[], None)
+            .prepare_chat_request(&ChatCall::new(&[]).maybe_tools(None), false)
+            .map(|p| p.request)
             .expect("chat_request should succeed");
         assert!(req.headers().get("authorization").is_none());
     }

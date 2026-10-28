@@ -8,7 +8,9 @@ use crate::model::{AgentMessage, MessagePart};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
 use futures_util::{FutureExt, StreamExt};
-use querymt::chat::{ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator, FinishReason};
+use querymt::chat::{
+    ChatCall, ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator, FinishReason,
+};
 use querymt::error::LLMError;
 use std::sync::Arc;
 use std::time::Duration;
@@ -171,7 +173,7 @@ impl SessionCompaction {
             gen_ai.request.model = model,
             gen_ai.conversation.id = session_id,
             session.id = session_id,
-            gen_ai.request.stream = provider.supports_streaming(),
+            gen_ai.request.stream = provider.capabilities().streaming,
             querymt.compaction = true,
         )
     )]
@@ -205,10 +207,10 @@ impl SessionCompaction {
             // inference.  The streaming path uses per-chunk timeouts instead of
             // a single total-request timeout, keeping the connection alive
             // while the model generates.
-            let result = if provider.supports_streaming() {
+            let result = if provider.capabilities().streaming {
                 Self::call_streaming(messages, &provider, &mut first_chunk, &chat_span).await
             } else {
-                provider.chat(messages).await
+                provider.chat(&ChatCall::new(messages)).await
             }
             .and_then(|output| {
                 // Failed attempts must not poison the eventual logical operation status.
@@ -258,7 +260,7 @@ impl SessionCompaction {
         chat_span: &tracing::Span,
     ) -> std::result::Result<ChatOutput, LLMError> {
         first_chunk.start();
-        let mut stream = provider.chat_stream(messages).await?;
+        let mut stream = provider.chat_stream(&ChatCall::new(messages)).await?;
         let mut accumulator = ChatStreamAccumulator::new();
         let mut terminal_seen = false;
         while let Some(chunk) = stream.next().await {
@@ -548,8 +550,8 @@ mod tests {
     use super::*;
     use crate::test_utils::mocks::MockCompactionProvider;
     use querymt::chat::{
-        ChatMessage, ChatMessageItem, ChatMessagePart, ChatMessagePartDelta, ChatOutputItem,
-        StreamChunk, StructuredStreamEvent, Tool,
+        ChatMessageItem, ChatMessagePart, ChatMessagePartDelta, ChatOutputItem, StreamChunk,
+        StructuredStreamEvent,
     };
     use querymt::error::LLMError;
     use std::collections::VecDeque;
@@ -892,34 +894,21 @@ mod tests {
 
     #[async_trait::async_trait]
     impl querymt::chat::ChatProvider for ScriptedProvider {
-        fn supports_streaming(&self) -> bool {
-            self.streaming
+        fn capabilities(&self) -> querymt::chat::ChatCapabilities {
+            querymt::chat::ChatCapabilities::NONE.with_streaming(self.streaming)
         }
 
-        async fn chat_with_tools(
-            &self,
-            _: &[ChatMessage],
-            _: Option<&[Tool]>,
-        ) -> std::result::Result<ChatOutput, LLMError> {
+        async fn chat(&self, _: &ChatCall<'_>) -> std::result::Result<ChatOutput, LLMError> {
             let Attempt::Output(output) = self.next().await else {
                 panic!("expected non-streaming call")
             };
             Ok(*output)
         }
 
-        async fn chat_stream_with_tools(
+        async fn chat_stream(
             &self,
-            _: &[ChatMessage],
-            _: Option<&[Tool]>,
-        ) -> std::result::Result<
-            std::pin::Pin<
-                Box<
-                    dyn futures_util::Stream<Item = std::result::Result<StreamChunk, LLMError>>
-                        + Send,
-                >,
-            >,
-            LLMError,
-        > {
+            _: &ChatCall<'_>,
+        ) -> std::result::Result<querymt::chat::ChatStream, LLMError> {
             self.clock
                 .lock()
                 .unwrap()

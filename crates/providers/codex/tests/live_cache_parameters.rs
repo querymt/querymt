@@ -426,7 +426,9 @@ fn capture_response_satisfies_the_codex_parser_and_cli_accumulator() {
     let individual_frames: Vec<&str> = CAPTURE_RESPONSE.split_inclusive("\n\n").collect();
     // Transports may deliver multiple SSE frames together or one at a time.
     for frames in [vec![CAPTURE_RESPONSE], individual_frames] {
-        let mut parser = provider.chat_stream_parser().unwrap();
+        let mut parser = provider
+            .chat_stream_parser(serde_json::Value::Null)
+            .unwrap();
         let mut accumulator = ChatStreamAccumulator::default();
         for frame in frames {
             for chunk in parser.parse_chunk(frame.as_bytes()).unwrap() {

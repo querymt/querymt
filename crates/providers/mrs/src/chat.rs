@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use futures::TryFutureExt;
 use mistralrs::{ChatCompletionResponse, RequestBuilder, ResponseOk};
-use querymt::chat::{ChatMessage, ChatOutput, ChatProvider, FinishReason, StreamChunk, Tool};
+use querymt::chat::{
+    ChatCall, ChatCapabilities, ChatMessage, ChatOutput, ChatProvider, ChatStream, FinishReason,
+    StreamChunk, Tool,
+};
 use querymt::error::LLMError;
 use querymt::{FunctionCall, ToolCall, Usage};
 use serde::Deserialize;
@@ -112,16 +115,12 @@ fn build_chat_request(
 
 #[async_trait::async_trait]
 impl ChatProvider for MistralRS {
-    fn supports_streaming(&self) -> bool {
-        true
+    fn capabilities(&self) -> ChatCapabilities {
+        ChatCapabilities::NONE.with_streaming(true)
     }
 
-    async fn chat_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<ChatOutput, LLMError> {
-        let req = build_chat_request(self, messages, tools)?;
+    async fn chat(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+        let req = build_chat_request(self, call.messages, call.tools)?;
         let response = self
             .mrs_model
             .send_chat_request(req)
@@ -132,15 +131,8 @@ impl ChatProvider for MistralRS {
         Ok(response.into())
     }
 
-    async fn chat_stream_with_tools(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Tool]>,
-    ) -> Result<
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamChunk, LLMError>> + Send>>,
-        LLMError,
-    > {
-        let req = build_chat_request(self, messages, tools)?;
+    async fn chat_stream(&self, call: &ChatCall<'_>) -> Result<ChatStream, LLMError> {
+        let req = build_chat_request(self, call.messages, call.tools)?;
 
         let model = std::sync::Arc::clone(&self.mrs_model);
         let (tx, rx) = mpsc::unbounded_channel();

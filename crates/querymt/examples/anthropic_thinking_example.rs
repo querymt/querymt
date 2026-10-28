@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     // Send chat request and handle the response
-    match llm.chat(&messages).await {
+    match llm.chat(&querymt::chat::ChatCall::new(&messages)).await {
         Ok(text) => {
             if let Some(thinking) = text.thinking() {
                 println!("Thinking: {}", thinking);

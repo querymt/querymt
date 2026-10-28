@@ -1,5 +1,5 @@
 use querymt::LLMProvider;
-use querymt::chat::{ChatMessageBuilder, ChatRole};
+use querymt::chat::{ChatCall, ChatMessageBuilder, ChatRole};
 use querymt::completion::CompletionRequest;
 use querymt::error::LLMError;
 
@@ -184,7 +184,7 @@ async fn mrs_chat_integration_test() {
             .build(),
     ];
 
-    let _resp = provider.chat(&messages).await.unwrap();
+    let _resp = provider.chat(&ChatCall::new(&messages)).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

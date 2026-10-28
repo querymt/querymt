@@ -3559,6 +3559,8 @@ async fn assert_last_unfinished_run_semantics(journal: &dyn EventJournal) {
     let completed = |id: &str| AgentEventKind::RunCompleted {
         run_id: id.to_string(),
         outcome: "completed".to_string(),
+        stop_type: None,
+        reason: None,
     };
     let append = |session: &'static str, kind: AgentEventKind| async move {
         journal

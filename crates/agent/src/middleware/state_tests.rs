@@ -30,6 +30,7 @@ fn test_execution_state_name_all_variants() {
                     messages: Arc::from([]),
                     tools: Arc::from([]),
                     estimated_tokens: 0,
+                    options: Default::default(),
                 }),
             },
             "CallLlm",
@@ -98,6 +99,7 @@ fn test_execution_state_context_accessors() {
                 messages: Arc::from([]),
                 tools: Arc::from([]),
                 estimated_tokens: 0,
+                options: Default::default(),
             }),
         },
         ExecutionState::AfterLlm {

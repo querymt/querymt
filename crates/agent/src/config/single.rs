@@ -99,10 +99,11 @@ pub struct SingleAgentConfig {
 ]))]
 pub struct MiddlewareEntry {
     /// The middleware type name. Built-in types: `"limits"`, `"context"`,
-    /// `"dedup_check"`, `"agent_mode"`, `"plan_mode"`, `"parallel_edit_guard"`.
+    /// `"dedup_check"`, `"agent_mode"`, `"plan_mode"`, `"parallel_edit_guard"`,
+    /// `"output_limit_recovery"`.
     /// Custom middleware types can be registered at runtime.
     #[serde(rename = "type")]
-    #[schemars(extend("enum" = ["limits", "context", "dedup_check", "agent_mode", "plan_mode", "parallel_edit_guard"]))]
+    #[schemars(extend("enum" = ["limits", "context", "dedup_check", "agent_mode", "plan_mode", "parallel_edit_guard", "output_limit_recovery"]))]
     pub middleware_type: String,
 
     /// Middleware-specific configuration fields.

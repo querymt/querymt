@@ -14,8 +14,8 @@ use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use futures_util::{FutureExt, StreamExt};
 use querymt::LLMProvider;
 use querymt::chat::{
-    ChatMessage, ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator, FinishReason,
-    StreamChunk,
+    ChatCall, ChatMessage, ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator,
+    FinishReason, StreamChunk,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,7 +132,7 @@ impl DelegationSummarizer {
         let messages = vec![ChatMessage::user().text(input).build()];
 
         let timeout = self.timeout;
-        let use_streaming = self.provider.supports_streaming();
+        let use_streaming = self.provider.capabilities().streaming;
         span.record(
             "llm_transport",
             if use_streaming {
@@ -204,7 +204,7 @@ impl DelegationSummarizer {
             let chat_span = tracing::Span::current();
             let mut first_chunk = genai::FirstChunk::default();
             first_chunk.start();
-            let mut stream = provider.chat_stream(messages).await?;
+            let mut stream = provider.chat_stream(&ChatCall::new(messages)).await?;
             let mut accumulator = ChatStreamAccumulator::new();
             let mut terminal_seen = false;
             while let Some(chunk) = stream.next().await {
@@ -238,7 +238,7 @@ impl DelegationSummarizer {
             }
             (output, completed)
         } else {
-            (provider.chat(messages).await?, true)
+            (provider.chat(&ChatCall::new(messages)).await?, true)
         };
 
         // Record billed usage and actual finish before applying the summary-only success policy.
@@ -487,7 +487,7 @@ planning conversation."#
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use querymt::chat::{ChatOutput, FinishReason, Tool};
+    use querymt::chat::{ChatOutput, FinishReason};
     use querymt::completion::{CompletionRequest, CompletionResponse};
     use querymt::error::LLMError;
     use std::pin::Pin;
@@ -572,15 +572,11 @@ mod tests {
 
     #[async_trait]
     impl querymt::chat::ChatProvider for SummaryTestProvider {
-        fn supports_streaming(&self) -> bool {
-            self.supports_streaming
+        fn capabilities(&self) -> querymt::chat::ChatCapabilities {
+            querymt::chat::ChatCapabilities::NONE.with_streaming(self.supports_streaming)
         }
 
-        async fn chat_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<ChatOutput, LLMError> {
+        async fn chat(&self, _call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
             self.chat_calls.fetch_add(1, Ordering::SeqCst);
             self.chat_result
                 .lock()
@@ -593,11 +589,7 @@ mod tests {
                 })
         }
 
-        async fn chat_stream_with_tools(
-            &self,
-            _messages: &[ChatMessage],
-            _tools: Option<&[Tool]>,
-        ) -> Result<SummaryStream, LLMError> {
+        async fn chat_stream(&self, _call: &ChatCall<'_>) -> Result<SummaryStream, LLMError> {
             self.stream_calls.fetch_add(1, Ordering::SeqCst);
             if !self.setup_delay.is_zero() {
                 tokio::time::sleep(self.setup_delay).await;
