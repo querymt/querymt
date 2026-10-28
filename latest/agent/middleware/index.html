@@ -1489,6 +1489,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#outputlimitrecoverymiddleware" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        OutputLimitRecoveryMiddleware
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#contextfactory-middleware" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2271,300 +2282,170 @@ never delays the tool calls. A guidance message that was not delivered
 the files (or directories) they read, so they never observe a half-written file.
 <code>search_text</code> and <code>glob</code> only wait for writes their filter could see: a
 <code>search_text</code> with <code>include = "*.md"</code> runs alongside an <code>edit</code> of <code>src/a.rs</code>.</p>
-<h3 id="contextfactory-middleware">ContextFactory Middleware</h3>
-<p>Legacy context management middleware.</p>
+<h3 id="outputlimitrecoverymiddleware">OutputLimitRecoveryMiddleware</h3>
+<p>Recovers when a model reply is cut off by the output-token limit, instead of ending
+the run with a "model hit token limit" stop. It is active for every agent by default.</p>
 <p><strong>Configuration:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-7-1">1</a></span>
 <span class="normal"><a href="#__codelineno-7-2">2</a></span>
 <span class="normal"><a href="#__codelineno-7-3">3</a></span>
-<span class="normal"><a href="#__codelineno-7-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="n">max_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">128000</span>
-<a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="n">compact_on_overflow</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<span class="normal"><a href="#__codelineno-7-4">4</a></span>
+<span class="normal"><a href="#__codelineno-7-5">5</a></span>
+<span class="normal"><a href="#__codelineno-7-6">6</a></span>
+<span class="normal"><a href="#__codelineno-7-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"output_limit_recovery"</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">                        </span><span class="c1"># default</span>
+<a id="__codelineno-7-4" name="__codelineno-7-4"></a><span class="n">escalate</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">                       </span><span class="c1"># default</span>
+<a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="n">max_continuations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span><span class="w">                 </span><span class="c1"># default</span>
+<a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="n">lower_effort_on_thinking_only</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span><span class="w">  </span><span class="c1"># default</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="n">instruction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"..."</span><span class="w">                   </span><span class="c1"># default shown below</span>
+</code></pre></div></td></tr></table></div></p>
+<p><strong>Recovery steps</strong>, in order, per turn:</p>
+<ol>
+<li><strong>Escalate</strong> (<code>escalate</code>): when a request sent below the model's output ceiling is
+   cut off, the reply is discarded and the same request is retried once with
+   <code>max_tokens</code> set to the ceiling. The discarded reply never reaches history, but its
+   token usage and cost are counted. Escalation needs a provider that honours a
+   per-request <code>max_tokens</code> (currently Anthropic). It never goes past an explicit
+   <code>max_tokens</code> from your configuration, which is its own ceiling, and it is capped by
+   the room left in the context window.</li>
+<li><strong>Continue</strong> (<code>max_continuations</code>): when the reply is cut off again (or escalation
+   is not possible), the run continues with a temporary instruction. The instruction
+   is removed after the next reply that is not cut off. A cut-off that contained only
+   reasoning is not stored in history, and, when <code>lower_effort_on_thinking_only</code> is
+   set and the provider honours it, the continuation uses a lower reasoning effort
+   (one step down, <code>medium</code> when none was configured, never below <code>low</code>).</li>
+</ol>
+<p>After <code>max_continuations</code> continuations in one turn the run stops as before, with stop
+type <code>model_token_limit</code>. A reply that is cut off in the middle of a tool call never
+runs that call; the model is told to split the write into smaller calls.</p>
+<p><strong>Initial cap and ceiling.</strong> With no <code>max_tokens</code> configured, Anthropic requests start at
+<code>min(32000, model output limit)</code> and the model's output limit is the ceiling. If the
+limit is unknown, 32,000 is used for both.</p>
+<p><strong>Default instruction.</strong> <code>{cap}</code> expands to the cap that was hit:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1">1</a></span>
+<span class="normal"><a href="#__codelineno-8-2">2</a></span>
+<span class="normal"><a href="#__codelineno-8-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a>Your previous response was cut off by the output-token limit ({cap} tokens). Continue
+<a id="__codelineno-8-2" name="__codelineno-8-2"></a>directly from where you stopped without repeating or summarising earlier output. Split
+<a id="__codelineno-8-3" name="__codelineno-8-3"></a>large file writes or edits into several smaller tool calls, and keep reasoning brief.
+</code></pre></div></td></tr></table></div>
+<p><strong>Events.</strong> Each escalation or continuation publishes a durable <code>output_limit_recovery</code>
+event with the turn, attempt number, action (<code>escalate</code> or <code>continue</code>), the cap before
+and after, whether the reply was thinking-only, and, for an escalation, the id of the
+discarded streamed message so clients can drop it.</p>
+<p><strong>Disable:</strong>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1">1</a></span>
+<span class="normal"><a href="#__codelineno-9-2">2</a></span>
+<span class="normal"><a href="#__codelineno-9-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"output_limit_recovery"</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+</code></pre></div></td></tr></table></div></p>
+<p>Adding an <code>output_limit_recovery</code> entry replaces the default instance. See
+<code>crates/agent/examples/confs/output_limit_recovery.toml</code> for a complete example.</p>
+<h3 id="contextfactory-middleware">ContextFactory Middleware</h3>
+<p>Legacy context management middleware.</p>
+<p><strong>Configuration:</strong>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1">1</a></span>
+<span class="normal"><a href="#__codelineno-10-2">2</a></span>
+<span class="normal"><a href="#__codelineno-10-3">3</a></span>
+<span class="normal"><a href="#__codelineno-10-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"context"</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="n">max_tokens</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">128000</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="n">compact_on_overflow</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
 </code></pre></div></td></tr></table></div></p>
 <h2 id="creating-custom-middleware">Creating Custom Middleware</h2>
 <h3 id="basic-middleware">Basic Middleware</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-8-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-8-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-8-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-8-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-8-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-8-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-8-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-8-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-8-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-8-10">10</a></span>
-<span class="normal"><a href="#__codelineno-8-11">11</a></span>
-<span class="normal"><a href="#__codelineno-8-12">12</a></span>
-<span class="normal"><a href="#__codelineno-8-13">13</a></span>
-<span class="normal"><a href="#__codelineno-8-14">14</a></span>
-<span class="normal"><a href="#__codelineno-8-15">15</a></span>
-<span class="normal"><a href="#__codelineno-8-16">16</a></span>
-<span class="normal"><a href="#__codelineno-8-17">17</a></span>
-<span class="normal"><a href="#__codelineno-8-18">18</a></span>
-<span class="normal"><a href="#__codelineno-8-19">19</a></span>
-<span class="normal"><a href="#__codelineno-8-20">20</a></span>
-<span class="normal"><a href="#__codelineno-8-21">21</a></span>
-<span class="normal"><a href="#__codelineno-8-22">22</a></span>
-<span class="normal"><a href="#__codelineno-8-23">23</a></span>
-<span class="normal"><a href="#__codelineno-8-24">24</a></span>
-<span class="normal"><a href="#__codelineno-8-25">25</a></span>
-<span class="normal"><a href="#__codelineno-8-26">26</a></span>
-<span class="normal"><a href="#__codelineno-8-27">27</a></span>
-<span class="normal"><a href="#__codelineno-8-28">28</a></span>
-<span class="normal"><a href="#__codelineno-8-29">29</a></span>
-<span class="normal"><a href="#__codelineno-8-30">30</a></span>
-<span class="normal"><a href="#__codelineno-8-31">31</a></span>
-<span class="normal"><a href="#__codelineno-8-32">32</a></span>
-<span class="normal"><a href="#__codelineno-8-33">33</a></span>
-<span class="normal"><a href="#__codelineno-8-34">34</a></span>
-<span class="normal"><a href="#__codelineno-8-35">35</a></span>
-<span class="normal"><a href="#__codelineno-8-36">36</a></span>
-<span class="normal"><a href="#__codelineno-8-37">37</a></span>
-<span class="normal"><a href="#__codelineno-8-38">38</a></span>
-<span class="normal"><a href="#__codelineno-8-39">39</a></span>
-<span class="normal"><a href="#__codelineno-8-40">40</a></span>
-<span class="normal"><a href="#__codelineno-8-41">41</a></span>
-<span class="normal"><a href="#__codelineno-8-42">42</a></span>
-<span class="normal"><a href="#__codelineno-8-43">43</a></span>
-<span class="normal"><a href="#__codelineno-8-44">44</a></span>
-<span class="normal"><a href="#__codelineno-8-45">45</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::{</span><span class="n">MiddlewareDriver</span><span class="p">,</span><span class="w"> </span><span class="n">MiddlewareError</span><span class="p">,</span><span class="w"> </span><span class="nb">Result</span><span class="p">};</span>
-<a id="__codelineno-8-2" name="__codelineno-8-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::</span><span class="n">state</span><span class="p">::{</span><span class="n">ExecutionState</span><span class="p">,</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">,</span><span class="w"> </span><span class="n">ToolResult</span><span class="p">};</span>
-<a id="__codelineno-8-3" name="__codelineno-8-3"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">Arc</span><span class="p">;</span>
-<a id="__codelineno-8-4" name="__codelineno-8-4"></a>
-<a id="__codelineno-8-5" name="__codelineno-8-5"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">LoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-6" name="__codelineno-8-6"></a><span class="w">    </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-8-7" name="__codelineno-8-7"></a><span class="p">}</span>
-<a id="__codelineno-8-8" name="__codelineno-8-8"></a>
-<a id="__codelineno-8-9" name="__codelineno-8-9"></a><span class="k">impl</span><span class="w"> </span><span class="n">LoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-10" name="__codelineno-8-10"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-11" name="__codelineno-8-11"></a><span class="w">        </span><span class="bp">Self</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-12" name="__codelineno-8-12"></a><span class="w">            </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="s">"logging"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-8-13" name="__codelineno-8-13"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-8-14" name="__codelineno-8-14"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-8-15" name="__codelineno-8-15"></a><span class="p">}</span>
-<a id="__codelineno-8-16" name="__codelineno-8-16"></a>
-<a id="__codelineno-8-17" name="__codelineno-8-17"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">LoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-18" name="__codelineno-8-18"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-19" name="__codelineno-8-19"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">.</span><span class="n">name</span>
-<a id="__codelineno-8-20" name="__codelineno-8-20"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-8-21" name="__codelineno-8-21"></a>
-<a id="__codelineno-8-22" name="__codelineno-8-22"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_request</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-23" name="__codelineno-8-23"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Request: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">);</span>
-<a id="__codelineno-8-24" name="__codelineno-8-24"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-8-25" name="__codelineno-8-25"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-8-26" name="__codelineno-8-26"></a>
-<a id="__codelineno-8-27" name="__codelineno-8-27"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_response</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Response</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-28" name="__codelineno-8-28"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Response: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">);</span>
-<a id="__codelineno-8-29" name="__codelineno-8-29"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-8-30" name="__codelineno-8-30"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-8-31" name="__codelineno-8-31"></a>
-<a id="__codelineno-8-32" name="__codelineno-8-32"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_call</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">tool_call</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-33" name="__codelineno-8-33"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Tool call: {}({})"</span><span class="p">,</span><span class="w"> </span>
-<a id="__codelineno-8-34" name="__codelineno-8-34"></a><span class="w">            </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span>
-<a id="__codelineno-8-35" name="__codelineno-8-35"></a><span class="w">            </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">);</span>
-<a id="__codelineno-8-36" name="__codelineno-8-36"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-8-37" name="__codelineno-8-37"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-8-38" name="__codelineno-8-38"></a>
-<a id="__codelineno-8-39" name="__codelineno-8-39"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_result</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolResult</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-8-40" name="__codelineno-8-40"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Tool result: {} -&gt; {} bytes"</span><span class="p">,</span><span class="w"> </span>
-<a id="__codelineno-8-41" name="__codelineno-8-41"></a><span class="w">            </span><span class="n">result</span><span class="p">.</span><span class="n">tool_name</span><span class="p">,</span><span class="w"> </span>
-<a id="__codelineno-8-42" name="__codelineno-8-42"></a><span class="w">            </span><span class="n">result</span><span class="p">.</span><span class="n">result</span><span class="p">.</span><span class="n">len</span><span class="p">());</span>
-<a id="__codelineno-8-43" name="__codelineno-8-43"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-8-44" name="__codelineno-8-44"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-8-45" name="__codelineno-8-45"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-11-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-11-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-11-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-11-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-11-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-11-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-11-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-11-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-11-10">10</a></span>
+<span class="normal"><a href="#__codelineno-11-11">11</a></span>
+<span class="normal"><a href="#__codelineno-11-12">12</a></span>
+<span class="normal"><a href="#__codelineno-11-13">13</a></span>
+<span class="normal"><a href="#__codelineno-11-14">14</a></span>
+<span class="normal"><a href="#__codelineno-11-15">15</a></span>
+<span class="normal"><a href="#__codelineno-11-16">16</a></span>
+<span class="normal"><a href="#__codelineno-11-17">17</a></span>
+<span class="normal"><a href="#__codelineno-11-18">18</a></span>
+<span class="normal"><a href="#__codelineno-11-19">19</a></span>
+<span class="normal"><a href="#__codelineno-11-20">20</a></span>
+<span class="normal"><a href="#__codelineno-11-21">21</a></span>
+<span class="normal"><a href="#__codelineno-11-22">22</a></span>
+<span class="normal"><a href="#__codelineno-11-23">23</a></span>
+<span class="normal"><a href="#__codelineno-11-24">24</a></span>
+<span class="normal"><a href="#__codelineno-11-25">25</a></span>
+<span class="normal"><a href="#__codelineno-11-26">26</a></span>
+<span class="normal"><a href="#__codelineno-11-27">27</a></span>
+<span class="normal"><a href="#__codelineno-11-28">28</a></span>
+<span class="normal"><a href="#__codelineno-11-29">29</a></span>
+<span class="normal"><a href="#__codelineno-11-30">30</a></span>
+<span class="normal"><a href="#__codelineno-11-31">31</a></span>
+<span class="normal"><a href="#__codelineno-11-32">32</a></span>
+<span class="normal"><a href="#__codelineno-11-33">33</a></span>
+<span class="normal"><a href="#__codelineno-11-34">34</a></span>
+<span class="normal"><a href="#__codelineno-11-35">35</a></span>
+<span class="normal"><a href="#__codelineno-11-36">36</a></span>
+<span class="normal"><a href="#__codelineno-11-37">37</a></span>
+<span class="normal"><a href="#__codelineno-11-38">38</a></span>
+<span class="normal"><a href="#__codelineno-11-39">39</a></span>
+<span class="normal"><a href="#__codelineno-11-40">40</a></span>
+<span class="normal"><a href="#__codelineno-11-41">41</a></span>
+<span class="normal"><a href="#__codelineno-11-42">42</a></span>
+<span class="normal"><a href="#__codelineno-11-43">43</a></span>
+<span class="normal"><a href="#__codelineno-11-44">44</a></span>
+<span class="normal"><a href="#__codelineno-11-45">45</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::{</span><span class="n">MiddlewareDriver</span><span class="p">,</span><span class="w"> </span><span class="n">MiddlewareError</span><span class="p">,</span><span class="w"> </span><span class="nb">Result</span><span class="p">};</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::</span><span class="n">state</span><span class="p">::{</span><span class="n">ExecutionState</span><span class="p">,</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">,</span><span class="w"> </span><span class="n">ToolResult</span><span class="p">};</span>
+<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">Arc</span><span class="p">;</span>
+<a id="__codelineno-11-4" name="__codelineno-11-4"></a>
+<a id="__codelineno-11-5" name="__codelineno-11-5"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">LoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-6" name="__codelineno-11-6"></a><span class="w">    </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-11-7" name="__codelineno-11-7"></a><span class="p">}</span>
+<a id="__codelineno-11-8" name="__codelineno-11-8"></a>
+<a id="__codelineno-11-9" name="__codelineno-11-9"></a><span class="k">impl</span><span class="w"> </span><span class="n">LoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-10" name="__codelineno-11-10"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">()</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-11" name="__codelineno-11-11"></a><span class="w">        </span><span class="bp">Self</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-12" name="__codelineno-11-12"></a><span class="w">            </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="s">"logging"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-11-13" name="__codelineno-11-13"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-11-14" name="__codelineno-11-14"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-11-15" name="__codelineno-11-15"></a><span class="p">}</span>
+<a id="__codelineno-11-16" name="__codelineno-11-16"></a>
+<a id="__codelineno-11-17" name="__codelineno-11-17"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">LoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-18" name="__codelineno-11-18"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-19" name="__codelineno-11-19"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">.</span><span class="n">name</span>
+<a id="__codelineno-11-20" name="__codelineno-11-20"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-11-21" name="__codelineno-11-21"></a>
+<a id="__codelineno-11-22" name="__codelineno-11-22"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_request</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-23" name="__codelineno-11-23"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Request: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">);</span>
+<a id="__codelineno-11-24" name="__codelineno-11-24"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-11-25" name="__codelineno-11-25"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-11-26" name="__codelineno-11-26"></a>
+<a id="__codelineno-11-27" name="__codelineno-11-27"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_response</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Response</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-28" name="__codelineno-11-28"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Response: {:?}"</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">);</span>
+<a id="__codelineno-11-29" name="__codelineno-11-29"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-11-30" name="__codelineno-11-30"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-11-31" name="__codelineno-11-31"></a>
+<a id="__codelineno-11-32" name="__codelineno-11-32"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_call</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">tool_call</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-33" name="__codelineno-11-33"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Tool call: {}({})"</span><span class="p">,</span><span class="w"> </span>
+<a id="__codelineno-11-34" name="__codelineno-11-34"></a><span class="w">            </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span>
+<a id="__codelineno-11-35" name="__codelineno-11-35"></a><span class="w">            </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="p">);</span>
+<a id="__codelineno-11-36" name="__codelineno-11-36"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-11-37" name="__codelineno-11-37"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-11-38" name="__codelineno-11-38"></a>
+<a id="__codelineno-11-39" name="__codelineno-11-39"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_result</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolResult</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-11-40" name="__codelineno-11-40"></a><span class="w">        </span><span class="n">log</span><span class="p">::</span><span class="n">info</span><span class="o">!</span><span class="p">(</span><span class="s">"Tool result: {} -&gt; {} bytes"</span><span class="p">,</span><span class="w"> </span>
+<a id="__codelineno-11-41" name="__codelineno-11-41"></a><span class="w">            </span><span class="n">result</span><span class="p">.</span><span class="n">tool_name</span><span class="p">,</span><span class="w"> </span>
+<a id="__codelineno-11-42" name="__codelineno-11-42"></a><span class="w">            </span><span class="n">result</span><span class="p">.</span><span class="n">result</span><span class="p">.</span><span class="n">len</span><span class="p">());</span>
+<a id="__codelineno-11-43" name="__codelineno-11-43"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-11-44" name="__codelineno-11-44"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-11-45" name="__codelineno-11-45"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="middleware-with-state">Middleware with State</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-9-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-9-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-9-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-9-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-9-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-9-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-9-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-9-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-9-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-9-10">10</a></span>
-<span class="normal"><a href="#__codelineno-9-11">11</a></span>
-<span class="normal"><a href="#__codelineno-9-12">12</a></span>
-<span class="normal"><a href="#__codelineno-9-13">13</a></span>
-<span class="normal"><a href="#__codelineno-9-14">14</a></span>
-<span class="normal"><a href="#__codelineno-9-15">15</a></span>
-<span class="normal"><a href="#__codelineno-9-16">16</a></span>
-<span class="normal"><a href="#__codelineno-9-17">17</a></span>
-<span class="normal"><a href="#__codelineno-9-18">18</a></span>
-<span class="normal"><a href="#__codelineno-9-19">19</a></span>
-<span class="normal"><a href="#__codelineno-9-20">20</a></span>
-<span class="normal"><a href="#__codelineno-9-21">21</a></span>
-<span class="normal"><a href="#__codelineno-9-22">22</a></span>
-<span class="normal"><a href="#__codelineno-9-23">23</a></span>
-<span class="normal"><a href="#__codelineno-9-24">24</a></span>
-<span class="normal"><a href="#__codelineno-9-25">25</a></span>
-<span class="normal"><a href="#__codelineno-9-26">26</a></span>
-<span class="normal"><a href="#__codelineno-9-27">27</a></span>
-<span class="normal"><a href="#__codelineno-9-28">28</a></span>
-<span class="normal"><a href="#__codelineno-9-29">29</a></span>
-<span class="normal"><a href="#__codelineno-9-30">30</a></span>
-<span class="normal"><a href="#__codelineno-9-31">31</a></span>
-<span class="normal"><a href="#__codelineno-9-32">32</a></span>
-<span class="normal"><a href="#__codelineno-9-33">33</a></span>
-<span class="normal"><a href="#__codelineno-9-34">34</a></span>
-<span class="normal"><a href="#__codelineno-9-35">35</a></span>
-<span class="normal"><a href="#__codelineno-9-36">36</a></span>
-<span class="normal"><a href="#__codelineno-9-37">37</a></span>
-<span class="normal"><a href="#__codelineno-9-38">38</a></span>
-<span class="normal"><a href="#__codelineno-9-39">39</a></span>
-<span class="normal"><a href="#__codelineno-9-40">40</a></span>
-<span class="normal"><a href="#__codelineno-9-41">41</a></span>
-<span class="normal"><a href="#__codelineno-9-42">42</a></span>
-<span class="normal"><a href="#__codelineno-9-43">43</a></span>
-<span class="normal"><a href="#__codelineno-9-44">44</a></span>
-<span class="normal"><a href="#__codelineno-9-45">45</a></span>
-<span class="normal"><a href="#__codelineno-9-46">46</a></span>
-<span class="normal"><a href="#__codelineno-9-47">47</a></span>
-<span class="normal"><a href="#__codelineno-9-48">48</a></span>
-<span class="normal"><a href="#__codelineno-9-49">49</a></span>
-<span class="normal"><a href="#__codelineno-9-50">50</a></span>
-<span class="normal"><a href="#__codelineno-9-51">51</a></span>
-<span class="normal"><a href="#__codelineno-9-52">52</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::{</span><span class="n">Arc</span><span class="p">,</span><span class="w"> </span><span class="n">Mutex</span><span class="p">};</span>
-<a id="__codelineno-9-2" name="__codelineno-9-2"></a>
-<a id="__codelineno-9-3" name="__codelineno-9-3"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">RateLimitMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-4" name="__codelineno-9-4"></a><span class="w">    </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-9-5" name="__codelineno-9-5"></a><span class="w">    </span><span class="n">requests</span><span class="p">:</span><span class="w"> </span><span class="nc">Arc</span><span class="o">&lt;</span><span class="n">Mutex</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u64</span><span class="o">&gt;&gt;&gt;</span><span class="p">,</span>
-<a id="__codelineno-9-6" name="__codelineno-9-6"></a><span class="w">    </span><span class="n">max_per_second</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
-<a id="__codelineno-9-7" name="__codelineno-9-7"></a><span class="p">}</span>
-<a id="__codelineno-9-8" name="__codelineno-9-8"></a>
-<a id="__codelineno-9-9" name="__codelineno-9-9"></a><span class="k">impl</span><span class="w"> </span><span class="n">RateLimitMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-10" name="__codelineno-9-10"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">(</span><span class="n">max_per_second</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-11" name="__codelineno-9-11"></a><span class="w">        </span><span class="bp">Self</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-12" name="__codelineno-9-12"></a><span class="w">            </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="s">"rate_limit"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
-<a id="__codelineno-9-13" name="__codelineno-9-13"></a><span class="w">            </span><span class="n">requests</span><span class="p">:</span><span class="w"> </span><span class="nc">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Mutex</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">())),</span>
-<a id="__codelineno-9-14" name="__codelineno-9-14"></a><span class="w">            </span><span class="n">max_per_second</span><span class="p">,</span>
-<a id="__codelineno-9-15" name="__codelineno-9-15"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-9-16" name="__codelineno-9-16"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-9-17" name="__codelineno-9-17"></a>
-<a id="__codelineno-9-18" name="__codelineno-9-18"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">cleanup_old_requests</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-19" name="__codelineno-9-19"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">SystemTime</span><span class="p">::</span><span class="n">now</span><span class="p">()</span>
-<a id="__codelineno-9-20" name="__codelineno-9-20"></a><span class="w">            </span><span class="p">.</span><span class="n">duration_since</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">UNIX_EPOCH</span><span class="p">)</span>
-<a id="__codelineno-9-21" name="__codelineno-9-21"></a><span class="w">            </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
-<a id="__codelineno-9-22" name="__codelineno-9-22"></a><span class="w">            </span><span class="p">.</span><span class="n">as_secs</span><span class="p">();</span>
-<a id="__codelineno-9-23" name="__codelineno-9-23"></a>
-<a id="__codelineno-9-24" name="__codelineno-9-24"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">requests</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">requests</span><span class="p">.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
-<a id="__codelineno-9-25" name="__codelineno-9-25"></a><span class="w">        </span><span class="n">requests</span><span class="p">.</span><span class="n">retain</span><span class="p">(</span><span class="o">|&amp;</span><span class="n">t</span><span class="o">|</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
-<a id="__codelineno-9-26" name="__codelineno-9-26"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-9-27" name="__codelineno-9-27"></a><span class="p">}</span>
-<a id="__codelineno-9-28" name="__codelineno-9-28"></a>
-<a id="__codelineno-9-29" name="__codelineno-9-29"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">RateLimitMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-30" name="__codelineno-9-30"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-31" name="__codelineno-9-31"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">.</span><span class="n">name</span>
-<a id="__codelineno-9-32" name="__codelineno-9-32"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-9-33" name="__codelineno-9-33"></a>
-<a id="__codelineno-9-34" name="__codelineno-9-34"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_request</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-35" name="__codelineno-9-35"></a><span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">cleanup_old_requests</span><span class="p">();</span>
-<a id="__codelineno-9-36" name="__codelineno-9-36"></a>
-<a id="__codelineno-9-37" name="__codelineno-9-37"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">requests</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">requests</span><span class="p">.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
-<a id="__codelineno-9-38" name="__codelineno-9-38"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">requests</span><span class="p">.</span><span class="n">len</span><span class="p">()</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">max_per_second</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-9-39" name="__codelineno-9-39"></a><span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">MiddlewareError</span><span class="p">::</span><span class="n">rate_limit_exceeded</span><span class="p">(</span>
-<a id="__codelineno-9-40" name="__codelineno-9-40"></a><span class="w">                </span><span class="bp">self</span><span class="p">.</span><span class="n">name</span><span class="p">().</span><span class="n">to_string</span><span class="p">()</span>
-<a id="__codelineno-9-41" name="__codelineno-9-41"></a><span class="w">            </span><span class="p">));</span>
-<a id="__codelineno-9-42" name="__codelineno-9-42"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-9-43" name="__codelineno-9-43"></a><span class="w">        </span><span class="n">requests</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">SystemTime</span><span class="p">::</span><span class="n">now</span><span class="p">()</span>
-<a id="__codelineno-9-44" name="__codelineno-9-44"></a><span class="w">            </span><span class="p">.</span><span class="n">duration_since</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">UNIX_EPOCH</span><span class="p">)</span>
-<a id="__codelineno-9-45" name="__codelineno-9-45"></a><span class="w">            </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
-<a id="__codelineno-9-46" name="__codelineno-9-46"></a><span class="w">            </span><span class="p">.</span><span class="n">as_secs</span><span class="p">());</span>
-<a id="__codelineno-9-47" name="__codelineno-9-47"></a>
-<a id="__codelineno-9-48" name="__codelineno-9-48"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-9-49" name="__codelineno-9-49"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-9-50" name="__codelineno-9-50"></a>
-<a id="__codelineno-9-51" name="__codelineno-9-51"></a><span class="w">    </span><span class="c1">// Other methods...</span>
-<a id="__codelineno-9-52" name="__codelineno-9-52"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="middleware-with-configuration">Middleware with Configuration</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-10-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-10-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-10-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-10-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-10-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-10-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-10-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-10-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-10-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-10-10">10</a></span>
-<span class="normal"><a href="#__codelineno-10-11">11</a></span>
-<span class="normal"><a href="#__codelineno-10-12">12</a></span>
-<span class="normal"><a href="#__codelineno-10-13">13</a></span>
-<span class="normal"><a href="#__codelineno-10-14">14</a></span>
-<span class="normal"><a href="#__codelineno-10-15">15</a></span>
-<span class="normal"><a href="#__codelineno-10-16">16</a></span>
-<span class="normal"><a href="#__codelineno-10-17">17</a></span>
-<span class="normal"><a href="#__codelineno-10-18">18</a></span>
-<span class="normal"><a href="#__codelineno-10-19">19</a></span>
-<span class="normal"><a href="#__codelineno-10-20">20</a></span>
-<span class="normal"><a href="#__codelineno-10-21">21</a></span>
-<span class="normal"><a href="#__codelineno-10-22">22</a></span>
-<span class="normal"><a href="#__codelineno-10-23">23</a></span>
-<span class="normal"><a href="#__codelineno-10-24">24</a></span>
-<span class="normal"><a href="#__codelineno-10-25">25</a></span>
-<span class="normal"><a href="#__codelineno-10-26">26</a></span>
-<span class="normal"><a href="#__codelineno-10-27">27</a></span>
-<span class="normal"><a href="#__codelineno-10-28">28</a></span>
-<span class="normal"><a href="#__codelineno-10-29">29</a></span>
-<span class="normal"><a href="#__codelineno-10-30">30</a></span>
-<span class="normal"><a href="#__codelineno-10-31">31</a></span>
-<span class="normal"><a href="#__codelineno-10-32">32</a></span>
-<span class="normal"><a href="#__codelineno-10-33">33</a></span>
-<span class="normal"><a href="#__codelineno-10-34">34</a></span>
-<span class="normal"><a href="#__codelineno-10-35">35</a></span>
-<span class="normal"><a href="#__codelineno-10-36">36</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1"></a><span class="k">use</span><span class="w"> </span><span class="n">serde</span><span class="p">::{</span><span class="n">Deserialize</span><span class="p">,</span><span class="w"> </span><span class="n">Serialize</span><span class="p">};</span>
-<a id="__codelineno-10-2" name="__codelineno-10-2"></a><span class="k">use</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">;</span>
-<a id="__codelineno-10-3" name="__codelineno-10-3"></a>
-<a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="cp">#[derive(Debug, Clone, Deserialize)]</span>
-<a id="__codelineno-10-5" name="__codelineno-10-5"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-6" name="__codelineno-10-6"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">enabled</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span>
-<a id="__codelineno-10-7" name="__codelineno-10-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">option1</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
-<a id="__codelineno-10-8" name="__codelineno-10-8"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">option2</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">,</span>
-<a id="__codelineno-10-9" name="__codelineno-10-9"></a><span class="p">}</span>
-<a id="__codelineno-10-10" name="__codelineno-10-10"></a>
-<a id="__codelineno-10-11" name="__codelineno-10-11"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">MyMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-12" name="__codelineno-10-12"></a><span class="w">    </span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="p">,</span>
-<a id="__codelineno-10-13" name="__codelineno-10-13"></a><span class="p">}</span>
-<a id="__codelineno-10-14" name="__codelineno-10-14"></a>
-<a id="__codelineno-10-15" name="__codelineno-10-15"></a><span class="k">impl</span><span class="w"> </span><span class="n">MyMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-16" name="__codelineno-10-16"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">(</span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-17" name="__codelineno-10-17"></a><span class="w">        </span><span class="bp">Self</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="p">}</span>
-<a id="__codelineno-10-18" name="__codelineno-10-18"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-10-19" name="__codelineno-10-19"></a><span class="p">}</span>
-<a id="__codelineno-10-20" name="__codelineno-10-20"></a>
-<a id="__codelineno-10-21" name="__codelineno-10-21"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">MyMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-22" name="__codelineno-10-22"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-23" name="__codelineno-10-23"></a><span class="w">        </span><span class="s">"my_middleware"</span>
-<a id="__codelineno-10-24" name="__codelineno-10-24"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-10-25" name="__codelineno-10-25"></a>
-<a id="__codelineno-10-26" name="__codelineno-10-26"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_request</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-27" name="__codelineno-10-27"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="bp">self</span><span class="p">.</span><span class="n">config</span><span class="p">.</span><span class="n">enabled</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-10-28" name="__codelineno-10-28"></a><span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(());</span>
-<a id="__codelineno-10-29" name="__codelineno-10-29"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-10-30" name="__codelineno-10-30"></a>
-<a id="__codelineno-10-31" name="__codelineno-10-31"></a><span class="w">        </span><span class="c1">// Custom logic here</span>
-<a id="__codelineno-10-32" name="__codelineno-10-32"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-10-33" name="__codelineno-10-33"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-10-34" name="__codelineno-10-34"></a>
-<a id="__codelineno-10-35" name="__codelineno-10-35"></a><span class="w">    </span><span class="c1">// Other methods...</span>
-<a id="__codelineno-10-36" name="__codelineno-10-36"></a><span class="p">}</span>
-</code></pre></div></td></tr></table></div>
-<h2 id="registering-middleware">Registering Middleware</h2>
-<h3 id="via-config-file">Via Config File</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1">1</a></span>
-<span class="normal"><a href="#__codelineno-11-2">2</a></span>
-<span class="normal"><a href="#__codelineno-11-3">3</a></span>
-<span class="normal"><a href="#__codelineno-11-4">4</a></span>
-<span class="normal"><a href="#__codelineno-11-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1"></a><span class="k">[[middleware]]</span>
-<a id="__codelineno-11-2" name="__codelineno-11-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"my_middleware"</span>
-<a id="__codelineno-11-3" name="__codelineno-11-3"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
-<a id="__codelineno-11-4" name="__codelineno-11-4"></a><span class="n">option1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"value1"</span>
-<a id="__codelineno-11-5" name="__codelineno-11-5"></a><span class="n">option2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span>
-</code></pre></div></td></tr></table></div>
-<h3 id="programmatically">Programmatically</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-12-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-12-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-12-3"> 3</a></span>
@@ -2575,20 +2456,101 @@ the files (or directories) they read, so they never observe a half-written file.
 <span class="normal"><a href="#__codelineno-12-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-12-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-12-10">10</a></span>
-<span class="normal"><a href="#__codelineno-12-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
-<a id="__codelineno-12-2" name="__codelineno-12-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::</span><span class="n">MiddlewareDriver</span><span class="p">;</span>
-<a id="__codelineno-12-3" name="__codelineno-12-3"></a>
-<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
-<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
-<a id="__codelineno-12-6" name="__codelineno-12-6"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
-<a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">])</span>
-<a id="__codelineno-12-8" name="__codelineno-12-8"></a><span class="w">    </span><span class="p">.</span><span class="n">middleware</span><span class="p">(</span><span class="n">LoggingMiddleware</span><span class="p">::</span><span class="n">new</span><span class="p">())</span>
-<a id="__codelineno-12-9" name="__codelineno-12-9"></a><span class="w">    </span><span class="p">.</span><span class="n">middleware</span><span class="p">(</span><span class="n">RateLimitMiddleware</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="mi">10</span><span class="p">))</span>
-<a id="__codelineno-12-10" name="__codelineno-12-10"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
-<a id="__codelineno-12-11" name="__codelineno-12-11"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
+<span class="normal"><a href="#__codelineno-12-11">11</a></span>
+<span class="normal"><a href="#__codelineno-12-12">12</a></span>
+<span class="normal"><a href="#__codelineno-12-13">13</a></span>
+<span class="normal"><a href="#__codelineno-12-14">14</a></span>
+<span class="normal"><a href="#__codelineno-12-15">15</a></span>
+<span class="normal"><a href="#__codelineno-12-16">16</a></span>
+<span class="normal"><a href="#__codelineno-12-17">17</a></span>
+<span class="normal"><a href="#__codelineno-12-18">18</a></span>
+<span class="normal"><a href="#__codelineno-12-19">19</a></span>
+<span class="normal"><a href="#__codelineno-12-20">20</a></span>
+<span class="normal"><a href="#__codelineno-12-21">21</a></span>
+<span class="normal"><a href="#__codelineno-12-22">22</a></span>
+<span class="normal"><a href="#__codelineno-12-23">23</a></span>
+<span class="normal"><a href="#__codelineno-12-24">24</a></span>
+<span class="normal"><a href="#__codelineno-12-25">25</a></span>
+<span class="normal"><a href="#__codelineno-12-26">26</a></span>
+<span class="normal"><a href="#__codelineno-12-27">27</a></span>
+<span class="normal"><a href="#__codelineno-12-28">28</a></span>
+<span class="normal"><a href="#__codelineno-12-29">29</a></span>
+<span class="normal"><a href="#__codelineno-12-30">30</a></span>
+<span class="normal"><a href="#__codelineno-12-31">31</a></span>
+<span class="normal"><a href="#__codelineno-12-32">32</a></span>
+<span class="normal"><a href="#__codelineno-12-33">33</a></span>
+<span class="normal"><a href="#__codelineno-12-34">34</a></span>
+<span class="normal"><a href="#__codelineno-12-35">35</a></span>
+<span class="normal"><a href="#__codelineno-12-36">36</a></span>
+<span class="normal"><a href="#__codelineno-12-37">37</a></span>
+<span class="normal"><a href="#__codelineno-12-38">38</a></span>
+<span class="normal"><a href="#__codelineno-12-39">39</a></span>
+<span class="normal"><a href="#__codelineno-12-40">40</a></span>
+<span class="normal"><a href="#__codelineno-12-41">41</a></span>
+<span class="normal"><a href="#__codelineno-12-42">42</a></span>
+<span class="normal"><a href="#__codelineno-12-43">43</a></span>
+<span class="normal"><a href="#__codelineno-12-44">44</a></span>
+<span class="normal"><a href="#__codelineno-12-45">45</a></span>
+<span class="normal"><a href="#__codelineno-12-46">46</a></span>
+<span class="normal"><a href="#__codelineno-12-47">47</a></span>
+<span class="normal"><a href="#__codelineno-12-48">48</a></span>
+<span class="normal"><a href="#__codelineno-12-49">49</a></span>
+<span class="normal"><a href="#__codelineno-12-50">50</a></span>
+<span class="normal"><a href="#__codelineno-12-51">51</a></span>
+<span class="normal"><a href="#__codelineno-12-52">52</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::{</span><span class="n">Arc</span><span class="p">,</span><span class="w"> </span><span class="n">Mutex</span><span class="p">};</span>
+<a id="__codelineno-12-2" name="__codelineno-12-2"></a>
+<a id="__codelineno-12-3" name="__codelineno-12-3"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">RateLimitMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-4" name="__codelineno-12-4"></a><span class="w">    </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-12-5" name="__codelineno-12-5"></a><span class="w">    </span><span class="n">requests</span><span class="p">:</span><span class="w"> </span><span class="nc">Arc</span><span class="o">&lt;</span><span class="n">Mutex</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u64</span><span class="o">&gt;&gt;&gt;</span><span class="p">,</span>
+<a id="__codelineno-12-6" name="__codelineno-12-6"></a><span class="w">    </span><span class="n">max_per_second</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">,</span>
+<a id="__codelineno-12-7" name="__codelineno-12-7"></a><span class="p">}</span>
+<a id="__codelineno-12-8" name="__codelineno-12-8"></a>
+<a id="__codelineno-12-9" name="__codelineno-12-9"></a><span class="k">impl</span><span class="w"> </span><span class="n">RateLimitMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-10" name="__codelineno-12-10"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">(</span><span class="n">max_per_second</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-11" name="__codelineno-12-11"></a><span class="w">        </span><span class="bp">Self</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-12" name="__codelineno-12-12"></a><span class="w">            </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="s">"rate_limit"</span><span class="p">.</span><span class="n">to_string</span><span class="p">(),</span>
+<a id="__codelineno-12-13" name="__codelineno-12-13"></a><span class="w">            </span><span class="n">requests</span><span class="p">:</span><span class="w"> </span><span class="nc">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">Mutex</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">())),</span>
+<a id="__codelineno-12-14" name="__codelineno-12-14"></a><span class="w">            </span><span class="n">max_per_second</span><span class="p">,</span>
+<a id="__codelineno-12-15" name="__codelineno-12-15"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-12-16" name="__codelineno-12-16"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-12-17" name="__codelineno-12-17"></a>
+<a id="__codelineno-12-18" name="__codelineno-12-18"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">cleanup_old_requests</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-19" name="__codelineno-12-19"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">SystemTime</span><span class="p">::</span><span class="n">now</span><span class="p">()</span>
+<a id="__codelineno-12-20" name="__codelineno-12-20"></a><span class="w">            </span><span class="p">.</span><span class="n">duration_since</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">UNIX_EPOCH</span><span class="p">)</span>
+<a id="__codelineno-12-21" name="__codelineno-12-21"></a><span class="w">            </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
+<a id="__codelineno-12-22" name="__codelineno-12-22"></a><span class="w">            </span><span class="p">.</span><span class="n">as_secs</span><span class="p">();</span>
+<a id="__codelineno-12-23" name="__codelineno-12-23"></a>
+<a id="__codelineno-12-24" name="__codelineno-12-24"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">requests</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">requests</span><span class="p">.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+<a id="__codelineno-12-25" name="__codelineno-12-25"></a><span class="w">        </span><span class="n">requests</span><span class="p">.</span><span class="n">retain</span><span class="p">(</span><span class="o">|&amp;</span><span class="n">t</span><span class="o">|</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">t</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<a id="__codelineno-12-26" name="__codelineno-12-26"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-12-27" name="__codelineno-12-27"></a><span class="p">}</span>
+<a id="__codelineno-12-28" name="__codelineno-12-28"></a>
+<a id="__codelineno-12-29" name="__codelineno-12-29"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">RateLimitMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-30" name="__codelineno-12-30"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-31" name="__codelineno-12-31"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">.</span><span class="n">name</span>
+<a id="__codelineno-12-32" name="__codelineno-12-32"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-12-33" name="__codelineno-12-33"></a>
+<a id="__codelineno-12-34" name="__codelineno-12-34"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_request</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-35" name="__codelineno-12-35"></a><span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">cleanup_old_requests</span><span class="p">();</span>
+<a id="__codelineno-12-36" name="__codelineno-12-36"></a>
+<a id="__codelineno-12-37" name="__codelineno-12-37"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">requests</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">requests</span><span class="p">.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+<a id="__codelineno-12-38" name="__codelineno-12-38"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">requests</span><span class="p">.</span><span class="n">len</span><span class="p">()</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">max_per_second</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-12-39" name="__codelineno-12-39"></a><span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">MiddlewareError</span><span class="p">::</span><span class="n">rate_limit_exceeded</span><span class="p">(</span>
+<a id="__codelineno-12-40" name="__codelineno-12-40"></a><span class="w">                </span><span class="bp">self</span><span class="p">.</span><span class="n">name</span><span class="p">().</span><span class="n">to_string</span><span class="p">()</span>
+<a id="__codelineno-12-41" name="__codelineno-12-41"></a><span class="w">            </span><span class="p">));</span>
+<a id="__codelineno-12-42" name="__codelineno-12-42"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-12-43" name="__codelineno-12-43"></a><span class="w">        </span><span class="n">requests</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">SystemTime</span><span class="p">::</span><span class="n">now</span><span class="p">()</span>
+<a id="__codelineno-12-44" name="__codelineno-12-44"></a><span class="w">            </span><span class="p">.</span><span class="n">duration_since</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">UNIX_EPOCH</span><span class="p">)</span>
+<a id="__codelineno-12-45" name="__codelineno-12-45"></a><span class="w">            </span><span class="p">.</span><span class="n">unwrap</span><span class="p">()</span>
+<a id="__codelineno-12-46" name="__codelineno-12-46"></a><span class="w">            </span><span class="p">.</span><span class="n">as_secs</span><span class="p">());</span>
+<a id="__codelineno-12-47" name="__codelineno-12-47"></a>
+<a id="__codelineno-12-48" name="__codelineno-12-48"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-12-49" name="__codelineno-12-49"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-12-50" name="__codelineno-12-50"></a>
+<a id="__codelineno-12-51" name="__codelineno-12-51"></a><span class="w">    </span><span class="c1">// Other methods...</span>
+<a id="__codelineno-12-52" name="__codelineno-12-52"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<h2 id="middleware-factory-pattern">Middleware Factory Pattern</h2>
-<p>For config-based middleware creation, implement the <code>MiddlewareFactory</code> trait:</p>
+<h3 id="middleware-with-configuration">Middleware with Configuration</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-13-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-13-3"> 3</a></span>
@@ -2615,84 +2577,65 @@ the files (or directories) they read, so they never observe a half-written file.
 <span class="normal"><a href="#__codelineno-13-24">24</a></span>
 <span class="normal"><a href="#__codelineno-13-25">25</a></span>
 <span class="normal"><a href="#__codelineno-13-26">26</a></span>
-<span class="normal"><a href="#__codelineno-13-27">27</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::{</span><span class="n">MiddlewareFactory</span><span class="p">,</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="p">,</span><span class="w"> </span><span class="nb">Result</span><span class="p">};</span>
-<a id="__codelineno-13-2" name="__codelineno-13-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">agent</span><span class="p">::</span><span class="n">agent_config</span><span class="p">::</span><span class="n">AgentConfig</span><span class="p">;</span>
-<a id="__codelineno-13-3" name="__codelineno-13-3"></a><span class="k">use</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">;</span>
-<a id="__codelineno-13-4" name="__codelineno-13-4"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">Arc</span><span class="p">;</span>
-<a id="__codelineno-13-5" name="__codelineno-13-5"></a>
-<a id="__codelineno-13-6" name="__codelineno-13-6"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">MyMiddlewareFactory</span><span class="p">;</span>
-<a id="__codelineno-13-7" name="__codelineno-13-7"></a>
-<a id="__codelineno-13-8" name="__codelineno-13-8"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareFactory</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">MyMiddlewareFactory</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-13-9" name="__codelineno-13-9"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">type_name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="nb">static</span><span class="w"> </span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-13-10" name="__codelineno-13-10"></a><span class="w">        </span><span class="s">"my_middleware"</span>
-<a id="__codelineno-13-11" name="__codelineno-13-11"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-13-12" name="__codelineno-13-12"></a>
-<a id="__codelineno-13-13" name="__codelineno-13-13"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">create</span><span class="p">(</span>
-<a id="__codelineno-13-14" name="__codelineno-13-14"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span>
-<a id="__codelineno-13-15" name="__codelineno-13-15"></a><span class="w">        </span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">Value</span><span class="p">,</span>
-<a id="__codelineno-13-16" name="__codelineno-13-16"></a><span class="w">        </span><span class="n">_agent_config</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">AgentConfig</span><span class="p">,</span>
-<a id="__codelineno-13-17" name="__codelineno-13-17"></a><span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-13-18" name="__codelineno-13-18"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">from_value</span><span class="p">(</span><span class="n">config</span><span class="p">.</span><span class="n">clone</span><span class="p">())</span>
-<a id="__codelineno-13-19" name="__codelineno-13-19"></a><span class="w">            </span><span class="p">.</span><span class="n">map_err</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="n">anyhow</span><span class="p">::</span><span class="n">anyhow</span><span class="o">!</span><span class="p">(</span><span class="s">"Invalid config: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">e</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="normal"><a href="#__codelineno-13-27">27</a></span>
+<span class="normal"><a href="#__codelineno-13-28">28</a></span>
+<span class="normal"><a href="#__codelineno-13-29">29</a></span>
+<span class="normal"><a href="#__codelineno-13-30">30</a></span>
+<span class="normal"><a href="#__codelineno-13-31">31</a></span>
+<span class="normal"><a href="#__codelineno-13-32">32</a></span>
+<span class="normal"><a href="#__codelineno-13-33">33</a></span>
+<span class="normal"><a href="#__codelineno-13-34">34</a></span>
+<span class="normal"><a href="#__codelineno-13-35">35</a></span>
+<span class="normal"><a href="#__codelineno-13-36">36</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a><span class="k">use</span><span class="w"> </span><span class="n">serde</span><span class="p">::{</span><span class="n">Deserialize</span><span class="p">,</span><span class="w"> </span><span class="n">Serialize</span><span class="p">};</span>
+<a id="__codelineno-13-2" name="__codelineno-13-2"></a><span class="k">use</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">;</span>
+<a id="__codelineno-13-3" name="__codelineno-13-3"></a>
+<a id="__codelineno-13-4" name="__codelineno-13-4"></a><span class="cp">#[derive(Debug, Clone, Deserialize)]</span>
+<a id="__codelineno-13-5" name="__codelineno-13-5"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-6" name="__codelineno-13-6"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">enabled</span><span class="p">:</span><span class="w"> </span><span class="kt">bool</span><span class="p">,</span>
+<a id="__codelineno-13-7" name="__codelineno-13-7"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">option1</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<a id="__codelineno-13-8" name="__codelineno-13-8"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="n">option2</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="kt">usize</span><span class="o">&gt;</span><span class="p">,</span>
+<a id="__codelineno-13-9" name="__codelineno-13-9"></a><span class="p">}</span>
+<a id="__codelineno-13-10" name="__codelineno-13-10"></a>
+<a id="__codelineno-13-11" name="__codelineno-13-11"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">MyMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-12" name="__codelineno-13-12"></a><span class="w">    </span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="p">,</span>
+<a id="__codelineno-13-13" name="__codelineno-13-13"></a><span class="p">}</span>
+<a id="__codelineno-13-14" name="__codelineno-13-14"></a>
+<a id="__codelineno-13-15" name="__codelineno-13-15"></a><span class="k">impl</span><span class="w"> </span><span class="n">MyMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-16" name="__codelineno-13-16"></a><span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">(</span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-17" name="__codelineno-13-17"></a><span class="w">        </span><span class="bp">Self</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-13-18" name="__codelineno-13-18"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-13-19" name="__codelineno-13-19"></a><span class="p">}</span>
 <a id="__codelineno-13-20" name="__codelineno-13-20"></a>
-<a id="__codelineno-13-21" name="__codelineno-13-21"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">MyMiddleware</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">config</span><span class="p">)))</span>
-<a id="__codelineno-13-22" name="__codelineno-13-22"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-13-23" name="__codelineno-13-23"></a><span class="p">}</span>
-<a id="__codelineno-13-24" name="__codelineno-13-24"></a>
-<a id="__codelineno-13-25" name="__codelineno-13-25"></a><span class="c1">// Register the factory</span>
-<a id="__codelineno-13-26" name="__codelineno-13-26"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::</span><span class="n">MIDDLEWARE_REGISTRY</span><span class="p">;</span>
-<a id="__codelineno-13-27" name="__codelineno-13-27"></a><span class="n">MIDDLEWARE_REGISTRY</span><span class="p">.</span><span class="n">register</span><span class="p">(</span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">MyMiddlewareFactory</span><span class="p">));</span>
+<a id="__codelineno-13-21" name="__codelineno-13-21"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">MyMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-22" name="__codelineno-13-22"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-23" name="__codelineno-13-23"></a><span class="w">        </span><span class="s">"my_middleware"</span>
+<a id="__codelineno-13-24" name="__codelineno-13-24"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-13-25" name="__codelineno-13-25"></a>
+<a id="__codelineno-13-26" name="__codelineno-13-26"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_request</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">request</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-27" name="__codelineno-13-27"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="bp">self</span><span class="p">.</span><span class="n">config</span><span class="p">.</span><span class="n">enabled</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-13-28" name="__codelineno-13-28"></a><span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Ok</span><span class="p">(());</span>
+<a id="__codelineno-13-29" name="__codelineno-13-29"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-13-30" name="__codelineno-13-30"></a>
+<a id="__codelineno-13-31" name="__codelineno-13-31"></a><span class="w">        </span><span class="c1">// Custom logic here</span>
+<a id="__codelineno-13-32" name="__codelineno-13-32"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-13-33" name="__codelineno-13-33"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-13-34" name="__codelineno-13-34"></a>
+<a id="__codelineno-13-35" name="__codelineno-13-35"></a><span class="w">    </span><span class="c1">// Other methods...</span>
+<a id="__codelineno-13-36" name="__codelineno-13-36"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<h2 id="middleware-execution-order">Middleware Execution Order</h2>
-<p>Middleware is executed in the order it was added to the chain:</p>
-<pre class="mermaid"><code>flowchart TD
-    A([Request]) --&gt; M1
-    M1["Middleware 1 (first added)"] --&gt; M2
-    M2[Middleware 2] --&gt; M3
-    M3["Middleware 3 (last added)"] --&gt; AP
-    AP([Agent Processing]) --&gt; M3R
-    M3R["Middleware 3 (response)"] --&gt; M2R
-    M2R["Middleware 2 (response)"] --&gt; M1R
-    M1R["Middleware 1 (response)"] --&gt; Z([Done])</code></pre>
-<h2 id="common-patterns">Common Patterns</h2>
-<h3 id="request-validation">Request Validation</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1"> 1</a></span>
-<span class="normal"><a href="#__codelineno-14-2"> 2</a></span>
-<span class="normal"><a href="#__codelineno-14-3"> 3</a></span>
-<span class="normal"><a href="#__codelineno-14-4"> 4</a></span>
-<span class="normal"><a href="#__codelineno-14-5"> 5</a></span>
-<span class="normal"><a href="#__codelineno-14-6"> 6</a></span>
-<span class="normal"><a href="#__codelineno-14-7"> 7</a></span>
-<span class="normal"><a href="#__codelineno-14-8"> 8</a></span>
-<span class="normal"><a href="#__codelineno-14-9"> 9</a></span>
-<span class="normal"><a href="#__codelineno-14-10">10</a></span>
-<span class="normal"><a href="#__codelineno-14-11">11</a></span>
-<span class="normal"><a href="#__codelineno-14-12">12</a></span>
-<span class="normal"><a href="#__codelineno-14-13">13</a></span>
-<span class="normal"><a href="#__codelineno-14-14">14</a></span>
-<span class="normal"><a href="#__codelineno-14-15">15</a></span>
-<span class="normal"><a href="#__codelineno-14-16">16</a></span>
-<span class="normal"><a href="#__codelineno-14-17">17</a></span>
-<span class="normal"><a href="#__codelineno-14-18">18</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">PermissionMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="w">    </span><span class="c1">// ...</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="p">}</span>
-<a id="__codelineno-14-4" name="__codelineno-14-4"></a>
-<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">PermissionMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-6" name="__codelineno-14-6"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_call</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">tool_call</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-7" name="__codelineno-14-7"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">requires_permission</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-8" name="__codelineno-14-8"></a><span class="w">            </span><span class="c1">// Request permission from user</span>
-<a id="__codelineno-14-9" name="__codelineno-14-9"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">granted</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">request_permission</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
-<a id="__codelineno-14-10" name="__codelineno-14-10"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="n">granted</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-14-11" name="__codelineno-14-11"></a><span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">MiddlewareError</span><span class="p">::</span><span class="n">permission_denied</span><span class="p">(</span>
-<a id="__codelineno-14-12" name="__codelineno-14-12"></a><span class="w">                    </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">clone</span><span class="p">()</span>
-<a id="__codelineno-14-13" name="__codelineno-14-13"></a><span class="w">                </span><span class="p">));</span>
-<a id="__codelineno-14-14" name="__codelineno-14-14"></a><span class="w">            </span><span class="p">}</span>
-<a id="__codelineno-14-15" name="__codelineno-14-15"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-14-16" name="__codelineno-14-16"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-14-17" name="__codelineno-14-17"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-14-18" name="__codelineno-14-18"></a><span class="p">}</span>
+<h2 id="registering-middleware">Registering Middleware</h2>
+<h3 id="via-config-file">Via Config File</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
+<span class="normal"><a href="#__codelineno-14-2">2</a></span>
+<span class="normal"><a href="#__codelineno-14-3">3</a></span>
+<span class="normal"><a href="#__codelineno-14-4">4</a></span>
+<span class="normal"><a href="#__codelineno-14-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="k">[[middleware]]</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"my_middleware"</span>
+<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="n">enabled</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-14-4" name="__codelineno-14-4"></a><span class="n">option1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"value1"</span>
+<a id="__codelineno-14-5" name="__codelineno-14-5"></a><span class="n">option2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">42</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="response-modification">Response Modification</h3>
+<h3 id="programmatically">Programmatically</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-15-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-15-3"> 3</a></span>
@@ -2703,19 +2646,20 @@ the files (or directories) they read, so they never observe a half-written file.
 <span class="normal"><a href="#__codelineno-15-8"> 8</a></span>
 <span class="normal"><a href="#__codelineno-15-9"> 9</a></span>
 <span class="normal"><a href="#__codelineno-15-10">10</a></span>
-<span class="normal"><a href="#__codelineno-15-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">SanitizationMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="w">    </span><span class="c1">// ...</span>
-<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="p">}</span>
-<a id="__codelineno-15-4" name="__codelineno-15-4"></a>
-<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">SanitizationMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_response</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Response</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="w">        </span><span class="c1">// Remove sensitive information</span>
-<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="w">        </span><span class="n">response</span><span class="p">.</span><span class="n">content</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">sanitize</span><span class="p">(</span><span class="o">&amp;</span><span class="n">response</span><span class="p">.</span><span class="n">content</span><span class="p">);</span>
-<a id="__codelineno-15-9" name="__codelineno-15-9"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-15-10" name="__codelineno-15-10"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-15-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::</span><span class="n">MiddlewareDriver</span><span class="p">;</span>
+<a id="__codelineno-15-3" name="__codelineno-15-3"></a>
+<a id="__codelineno-15-4" name="__codelineno-15-4"></a><span class="kd">let</span><span class="w"> </span><span class="n">agent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Agent</span><span class="p">::</span><span class="n">single</span><span class="p">()</span>
+<a id="__codelineno-15-5" name="__codelineno-15-5"></a><span class="w">    </span><span class="p">.</span><span class="n">provider</span><span class="p">(</span><span class="s">"anthropic"</span><span class="p">,</span><span class="w"> </span><span class="s">"claude-sonnet-4-5-20250929"</span><span class="p">)</span>
+<a id="__codelineno-15-6" name="__codelineno-15-6"></a><span class="w">    </span><span class="p">.</span><span class="n">cwd</span><span class="p">(</span><span class="s">"."</span><span class="p">)</span>
+<a id="__codelineno-15-7" name="__codelineno-15-7"></a><span class="w">    </span><span class="p">.</span><span class="n">tools</span><span class="p">([</span><span class="s">"read_tool"</span><span class="p">,</span><span class="w"> </span><span class="s">"shell"</span><span class="p">])</span>
+<a id="__codelineno-15-8" name="__codelineno-15-8"></a><span class="w">    </span><span class="p">.</span><span class="n">middleware</span><span class="p">(</span><span class="n">LoggingMiddleware</span><span class="p">::</span><span class="n">new</span><span class="p">())</span>
+<a id="__codelineno-15-9" name="__codelineno-15-9"></a><span class="w">    </span><span class="p">.</span><span class="n">middleware</span><span class="p">(</span><span class="n">RateLimitMiddleware</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="mi">10</span><span class="p">))</span>
+<a id="__codelineno-15-10" name="__codelineno-15-10"></a><span class="w">    </span><span class="p">.</span><span class="n">build</span><span class="p">()</span>
+<a id="__codelineno-15-11" name="__codelineno-15-11"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
-<h3 id="tool-call-interception">Tool Call Interception</h3>
+<h2 id="middleware-factory-pattern">Middleware Factory Pattern</h2>
+<p>For config-based middleware creation, implement the <code>MiddlewareFactory</code> trait:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-16-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-16-2"> 2</a></span>
 <span class="normal"><a href="#__codelineno-16-3"> 3</a></span>
@@ -2735,42 +2679,169 @@ the files (or directories) they read, so they never observe a half-written file.
 <span class="normal"><a href="#__codelineno-16-17">17</a></span>
 <span class="normal"><a href="#__codelineno-16-18">18</a></span>
 <span class="normal"><a href="#__codelineno-16-19">19</a></span>
-<span class="normal"><a href="#__codelineno-16-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ToolLoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="w">    </span><span class="c1">// ...</span>
-<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="p">}</span>
-<a id="__codelineno-16-4" name="__codelineno-16-4"></a>
-<a id="__codelineno-16-5" name="__codelineno-16-5"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">ToolLoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-16-6" name="__codelineno-16-6"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_call</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">tool_call</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-16-7" name="__codelineno-16-7"></a><span class="w">        </span><span class="c1">// Log before execution</span>
-<a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">log_tool_call</span><span class="p">(</span><span class="n">tool_call</span><span class="p">);</span>
-<a id="__codelineno-16-9" name="__codelineno-16-9"></a>
-<a id="__codelineno-16-10" name="__codelineno-16-10"></a><span class="w">        </span><span class="c1">// Modify arguments if needed</span>
-<a id="__codelineno-16-11" name="__codelineno-16-11"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">"shell"</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-16-12" name="__codelineno-16-12"></a><span class="w">            </span><span class="c1">// Add safety prefix</span>
-<a id="__codelineno-16-13" name="__codelineno-16-13"></a><span class="w">            </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">sanitize_shell_args</span><span class="p">(</span>
-<a id="__codelineno-16-14" name="__codelineno-16-14"></a><span class="w">                </span><span class="o">&amp;</span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span>
-<a id="__codelineno-16-15" name="__codelineno-16-15"></a><span class="w">            </span><span class="p">);</span>
-<a id="__codelineno-16-16" name="__codelineno-16-16"></a><span class="w">        </span><span class="p">}</span>
-<a id="__codelineno-16-17" name="__codelineno-16-17"></a>
-<a id="__codelineno-16-18" name="__codelineno-16-18"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
-<a id="__codelineno-16-19" name="__codelineno-16-19"></a><span class="w">    </span><span class="p">}</span>
-<a id="__codelineno-16-20" name="__codelineno-16-20"></a><span class="p">}</span>
+<span class="normal"><a href="#__codelineno-16-20">20</a></span>
+<span class="normal"><a href="#__codelineno-16-21">21</a></span>
+<span class="normal"><a href="#__codelineno-16-22">22</a></span>
+<span class="normal"><a href="#__codelineno-16-23">23</a></span>
+<span class="normal"><a href="#__codelineno-16-24">24</a></span>
+<span class="normal"><a href="#__codelineno-16-25">25</a></span>
+<span class="normal"><a href="#__codelineno-16-26">26</a></span>
+<span class="normal"><a href="#__codelineno-16-27">27</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::{</span><span class="n">MiddlewareFactory</span><span class="p">,</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="p">,</span><span class="w"> </span><span class="nb">Result</span><span class="p">};</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">agent</span><span class="p">::</span><span class="n">agent_config</span><span class="p">::</span><span class="n">AgentConfig</span><span class="p">;</span>
+<a id="__codelineno-16-3" name="__codelineno-16-3"></a><span class="k">use</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">Value</span><span class="p">;</span>
+<a id="__codelineno-16-4" name="__codelineno-16-4"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">Arc</span><span class="p">;</span>
+<a id="__codelineno-16-5" name="__codelineno-16-5"></a>
+<a id="__codelineno-16-6" name="__codelineno-16-6"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">MyMiddlewareFactory</span><span class="p">;</span>
+<a id="__codelineno-16-7" name="__codelineno-16-7"></a>
+<a id="__codelineno-16-8" name="__codelineno-16-8"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareFactory</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">MyMiddlewareFactory</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-16-9" name="__codelineno-16-9"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">type_name</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="nb">static</span><span class="w"> </span><span class="kt">str</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-16-10" name="__codelineno-16-10"></a><span class="w">        </span><span class="s">"my_middleware"</span>
+<a id="__codelineno-16-11" name="__codelineno-16-11"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-16-12" name="__codelineno-16-12"></a>
+<a id="__codelineno-16-13" name="__codelineno-16-13"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">create</span><span class="p">(</span>
+<a id="__codelineno-16-14" name="__codelineno-16-14"></a><span class="w">        </span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span>
+<a id="__codelineno-16-15" name="__codelineno-16-15"></a><span class="w">        </span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">Value</span><span class="p">,</span>
+<a id="__codelineno-16-16" name="__codelineno-16-16"></a><span class="w">        </span><span class="n">_agent_config</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">AgentConfig</span><span class="p">,</span>
+<a id="__codelineno-16-17" name="__codelineno-16-17"></a><span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="n">Arc</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-16-18" name="__codelineno-16-18"></a><span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">config</span><span class="p">:</span><span class="w"> </span><span class="nc">MyMiddlewareConfig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">serde_json</span><span class="p">::</span><span class="n">from_value</span><span class="p">(</span><span class="n">config</span><span class="p">.</span><span class="n">clone</span><span class="p">())</span>
+<a id="__codelineno-16-19" name="__codelineno-16-19"></a><span class="w">            </span><span class="p">.</span><span class="n">map_err</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="n">anyhow</span><span class="p">::</span><span class="n">anyhow</span><span class="o">!</span><span class="p">(</span><span class="s">"Invalid config: {}"</span><span class="p">,</span><span class="w"> </span><span class="n">e</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-16-20" name="__codelineno-16-20"></a>
+<a id="__codelineno-16-21" name="__codelineno-16-21"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(</span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">MyMiddleware</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">config</span><span class="p">)))</span>
+<a id="__codelineno-16-22" name="__codelineno-16-22"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-16-23" name="__codelineno-16-23"></a><span class="p">}</span>
+<a id="__codelineno-16-24" name="__codelineno-16-24"></a>
+<a id="__codelineno-16-25" name="__codelineno-16-25"></a><span class="c1">// Register the factory</span>
+<a id="__codelineno-16-26" name="__codelineno-16-26"></a><span class="k">use</span><span class="w"> </span><span class="n">querymt_agent</span><span class="p">::</span><span class="n">middleware</span><span class="p">::</span><span class="n">MIDDLEWARE_REGISTRY</span><span class="p">;</span>
+<a id="__codelineno-16-27" name="__codelineno-16-27"></a><span class="n">MIDDLEWARE_REGISTRY</span><span class="p">.</span><span class="n">register</span><span class="p">(</span><span class="n">Arc</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">MyMiddlewareFactory</span><span class="p">));</span>
+</code></pre></div></td></tr></table></div>
+<h2 id="middleware-execution-order">Middleware Execution Order</h2>
+<p>Middleware is executed in the order it was added to the chain:</p>
+<pre class="mermaid"><code>flowchart TD
+    A([Request]) --&gt; M1
+    M1["Middleware 1 (first added)"] --&gt; M2
+    M2[Middleware 2] --&gt; M3
+    M3["Middleware 3 (last added)"] --&gt; AP
+    AP([Agent Processing]) --&gt; M3R
+    M3R["Middleware 3 (response)"] --&gt; M2R
+    M2R["Middleware 2 (response)"] --&gt; M1R
+    M1R["Middleware 1 (response)"] --&gt; Z([Done])</code></pre>
+<h2 id="common-patterns">Common Patterns</h2>
+<h3 id="request-validation">Request Validation</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-17-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-17-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-17-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-17-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-17-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-17-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-17-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-17-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-17-10">10</a></span>
+<span class="normal"><a href="#__codelineno-17-11">11</a></span>
+<span class="normal"><a href="#__codelineno-17-12">12</a></span>
+<span class="normal"><a href="#__codelineno-17-13">13</a></span>
+<span class="normal"><a href="#__codelineno-17-14">14</a></span>
+<span class="normal"><a href="#__codelineno-17-15">15</a></span>
+<span class="normal"><a href="#__codelineno-17-16">16</a></span>
+<span class="normal"><a href="#__codelineno-17-17">17</a></span>
+<span class="normal"><a href="#__codelineno-17-18">18</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">PermissionMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="w">    </span><span class="c1">// ...</span>
+<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="p">}</span>
+<a id="__codelineno-17-4" name="__codelineno-17-4"></a>
+<a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">PermissionMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-17-6" name="__codelineno-17-6"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_call</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">tool_call</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-17-7" name="__codelineno-17-7"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">requires_permission</span><span class="p">(</span><span class="o">&amp;</span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-17-8" name="__codelineno-17-8"></a><span class="w">            </span><span class="c1">// Request permission from user</span>
+<a id="__codelineno-17-9" name="__codelineno-17-9"></a><span class="w">            </span><span class="kd">let</span><span class="w"> </span><span class="n">granted</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">request_permission</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
+<a id="__codelineno-17-10" name="__codelineno-17-10"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="n">granted</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-17-11" name="__codelineno-17-11"></a><span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="n">MiddlewareError</span><span class="p">::</span><span class="n">permission_denied</span><span class="p">(</span>
+<a id="__codelineno-17-12" name="__codelineno-17-12"></a><span class="w">                    </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="p">.</span><span class="n">clone</span><span class="p">()</span>
+<a id="__codelineno-17-13" name="__codelineno-17-13"></a><span class="w">                </span><span class="p">));</span>
+<a id="__codelineno-17-14" name="__codelineno-17-14"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-17-15" name="__codelineno-17-15"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-17-16" name="__codelineno-17-16"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-17-17" name="__codelineno-17-17"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-17-18" name="__codelineno-17-18"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<h3 id="response-modification">Response Modification</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-18-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-18-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-18-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-18-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-18-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-18-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-18-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-18-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-18-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-18-10">10</a></span>
+<span class="normal"><a href="#__codelineno-18-11">11</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">SanitizationMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-18-2" name="__codelineno-18-2"></a><span class="w">    </span><span class="c1">// ...</span>
+<a id="__codelineno-18-3" name="__codelineno-18-3"></a><span class="p">}</span>
+<a id="__codelineno-18-4" name="__codelineno-18-4"></a>
+<a id="__codelineno-18-5" name="__codelineno-18-5"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">SanitizationMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-18-6" name="__codelineno-18-6"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_response</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Response</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-18-7" name="__codelineno-18-7"></a><span class="w">        </span><span class="c1">// Remove sensitive information</span>
+<a id="__codelineno-18-8" name="__codelineno-18-8"></a><span class="w">        </span><span class="n">response</span><span class="p">.</span><span class="n">content</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">sanitize</span><span class="p">(</span><span class="o">&amp;</span><span class="n">response</span><span class="p">.</span><span class="n">content</span><span class="p">);</span>
+<a id="__codelineno-18-9" name="__codelineno-18-9"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-18-10" name="__codelineno-18-10"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-18-11" name="__codelineno-18-11"></a><span class="p">}</span>
+</code></pre></div></td></tr></table></div>
+<h3 id="tool-call-interception">Tool Call Interception</h3>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-19-1"> 1</a></span>
+<span class="normal"><a href="#__codelineno-19-2"> 2</a></span>
+<span class="normal"><a href="#__codelineno-19-3"> 3</a></span>
+<span class="normal"><a href="#__codelineno-19-4"> 4</a></span>
+<span class="normal"><a href="#__codelineno-19-5"> 5</a></span>
+<span class="normal"><a href="#__codelineno-19-6"> 6</a></span>
+<span class="normal"><a href="#__codelineno-19-7"> 7</a></span>
+<span class="normal"><a href="#__codelineno-19-8"> 8</a></span>
+<span class="normal"><a href="#__codelineno-19-9"> 9</a></span>
+<span class="normal"><a href="#__codelineno-19-10">10</a></span>
+<span class="normal"><a href="#__codelineno-19-11">11</a></span>
+<span class="normal"><a href="#__codelineno-19-12">12</a></span>
+<span class="normal"><a href="#__codelineno-19-13">13</a></span>
+<span class="normal"><a href="#__codelineno-19-14">14</a></span>
+<span class="normal"><a href="#__codelineno-19-15">15</a></span>
+<span class="normal"><a href="#__codelineno-19-16">16</a></span>
+<span class="normal"><a href="#__codelineno-19-17">17</a></span>
+<span class="normal"><a href="#__codelineno-19-18">18</a></span>
+<span class="normal"><a href="#__codelineno-19-19">19</a></span>
+<span class="normal"><a href="#__codelineno-19-20">20</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">ToolLoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-19-2" name="__codelineno-19-2"></a><span class="w">    </span><span class="c1">// ...</span>
+<a id="__codelineno-19-3" name="__codelineno-19-3"></a><span class="p">}</span>
+<a id="__codelineno-19-4" name="__codelineno-19-4"></a>
+<a id="__codelineno-19-5" name="__codelineno-19-5"></a><span class="k">impl</span><span class="w"> </span><span class="n">MiddlewareDriver</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">ToolLoggingMiddleware</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-19-6" name="__codelineno-19-6"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_call</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">tool_call</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolCall</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-19-7" name="__codelineno-19-7"></a><span class="w">        </span><span class="c1">// Log before execution</span>
+<a id="__codelineno-19-8" name="__codelineno-19-8"></a><span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">log_tool_call</span><span class="p">(</span><span class="n">tool_call</span><span class="p">);</span>
+<a id="__codelineno-19-9" name="__codelineno-19-9"></a>
+<a id="__codelineno-19-10" name="__codelineno-19-10"></a><span class="w">        </span><span class="c1">// Modify arguments if needed</span>
+<a id="__codelineno-19-11" name="__codelineno-19-11"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">"shell"</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-19-12" name="__codelineno-19-12"></a><span class="w">            </span><span class="c1">// Add safety prefix</span>
+<a id="__codelineno-19-13" name="__codelineno-19-13"></a><span class="w">            </span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">sanitize_shell_args</span><span class="p">(</span>
+<a id="__codelineno-19-14" name="__codelineno-19-14"></a><span class="w">                </span><span class="o">&amp;</span><span class="n">tool_call</span><span class="p">.</span><span class="n">function</span><span class="p">.</span><span class="n">arguments</span>
+<a id="__codelineno-19-15" name="__codelineno-19-15"></a><span class="w">            </span><span class="p">);</span>
+<a id="__codelineno-19-16" name="__codelineno-19-16"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-19-17" name="__codelineno-19-17"></a>
+<a id="__codelineno-19-18" name="__codelineno-19-18"></a><span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<a id="__codelineno-19-19" name="__codelineno-19-19"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-19-20" name="__codelineno-19-20"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <h2 id="error-handling">Error Handling</h2>
 <p>Middleware errors are categorized:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-17-1">1</a></span>
-<span class="normal"><a href="#__codelineno-17-2">2</a></span>
-<span class="normal"><a href="#__codelineno-17-3">3</a></span>
-<span class="normal"><a href="#__codelineno-17-4">4</a></span>
-<span class="normal"><a href="#__codelineno-17-5">5</a></span>
-<span class="normal"><a href="#__codelineno-17-6">6</a></span>
-<span class="normal"><a href="#__codelineno-17-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">MiddlewareError</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-17-2" name="__codelineno-17-2"></a><span class="w">    </span><span class="n">InternalError</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
-<a id="__codelineno-17-3" name="__codelineno-17-3"></a><span class="w">    </span><span class="n">ValidationError</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
-<a id="__codelineno-17-4" name="__codelineno-17-4"></a><span class="w">    </span><span class="n">PermissionDenied</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
-<a id="__codelineno-17-5" name="__codelineno-17-5"></a><span class="w">    </span><span class="n">RateLimitExceeded</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
-<a id="__codelineno-17-6" name="__codelineno-17-6"></a><span class="w">    </span><span class="n">ConfigError</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
-<a id="__codelineno-17-7" name="__codelineno-17-7"></a><span class="p">}</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-20-1">1</a></span>
+<span class="normal"><a href="#__codelineno-20-2">2</a></span>
+<span class="normal"><a href="#__codelineno-20-3">3</a></span>
+<span class="normal"><a href="#__codelineno-20-4">4</a></span>
+<span class="normal"><a href="#__codelineno-20-5">5</a></span>
+<span class="normal"><a href="#__codelineno-20-6">6</a></span>
+<span class="normal"><a href="#__codelineno-20-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-20-1" name="__codelineno-20-1"></a><span class="k">pub</span><span class="w"> </span><span class="k">enum</span><span class="w"> </span><span class="nc">MiddlewareError</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-20-2" name="__codelineno-20-2"></a><span class="w">    </span><span class="n">InternalError</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
+<a id="__codelineno-20-3" name="__codelineno-20-3"></a><span class="w">    </span><span class="n">ValidationError</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
+<a id="__codelineno-20-4" name="__codelineno-20-4"></a><span class="w">    </span><span class="n">PermissionDenied</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
+<a id="__codelineno-20-5" name="__codelineno-20-5"></a><span class="w">    </span><span class="n">RateLimitExceeded</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
+<a id="__codelineno-20-6" name="__codelineno-20-6"></a><span class="w">    </span><span class="n">ConfigError</span><span class="p">(</span><span class="nb">String</span><span class="p">),</span>
+<a id="__codelineno-20-7" name="__codelineno-20-7"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
 <p>Errors can:
 - <strong>Block execution</strong>: Return error to stop processing

@@ -1818,7 +1818,7 @@
 <li>
 <p><strong><code>querymt::tool_decorator::ToolEnabledProvider</code></strong>: A decorator struct that wraps an <code>LLMProvider</code>. When you register tools using <code>LLMBuilder::add_tool()</code>, the builder automatically wraps the base provider with <code>ToolEnabledProvider</code>. This wrapper manages the registered tools and handles the two-way communication:</p>
 <ol>
-<li>It passes the tool descriptors to the LLM during a <code>chat_with_tools</code> call.</li>
+<li>It passes the tool descriptors to the LLM during a <code>chat</code> call.</li>
 <li>If the LLM responds with a <code>ToolCall</code>, <code>ToolEnabledProvider</code> can dispatch the call to the appropriate <code>CallFunctionTool</code> implementation via its <code>call_tool</code> method.</li>
 <li>Source: <code>crates/querymt/src/tool_decorator.rs</code></li>
 </ol>
@@ -1842,7 +1842,7 @@
 <li>
 <p><strong>Chat with Tools:</strong></p>
 <ul>
-<li>Use the <code>chat_with_tools()</code> method on the <code>LLMProvider</code>. The <code>ToolEnabledProvider</code> (if tools were added) will automatically pass the descriptors of registered tools to the LLM.</li>
+<li>Call <code>chat()</code> on the <code>LLMProvider</code> with a <code>ChatCall</code> (the provider does not need tools set per call). The <code>ToolEnabledProvider</code> (if tools were added) will automatically pass the descriptors of registered tools to the LLM.</li>
 <li>You can use <code>ToolChoice</code> to guide the LLM's tool usage.</li>
 </ul>
 </li>
@@ -1868,7 +1868,7 @@
 <ul>
 <li>For each tool call that was executed, create a corresponding <code>ToolCall</code> struct that contains the result. The result string is placed into the <code>function.arguments</code> field.</li>
 <li>Construct a new <code>ChatMessage</code> using the builder: <code>ChatMessage::user().tool_result(vec_of_result_tool_calls).build()</code>.</li>
-<li>Send this message (along with the conversation history) back to the LLM using <code>chat_with_tools()</code>.</li>
+<li>Send this message (along with the conversation history) back to the LLM using <code>chat()</code>.</li>
 </ul>
 </li>
 <li>
@@ -1951,7 +1951,7 @@
 <a id="__codelineno-0-34" name="__codelineno-0-34"></a><span class="c1">// To use it:</span>
 <a id="__codelineno-0-35" name="__codelineno-0-35"></a><span class="c1">// let builder = registry.builder("some_provider").add_tool(GetWeatherTool);</span>
 <a id="__codelineno-0-36" name="__codelineno-0-36"></a><span class="c1">// let llm = builder.build().await?;</span>
-<a id="__codelineno-0-37" name="__codelineno-0-37"></a><span class="c1">// ... then use llm.chat_with_tools(...) ...</span>
+<a id="__codelineno-0-37" name="__codelineno-0-37"></a><span class="c1">// ... then use llm.chat(&amp;ChatCall::new(&amp;messages)) ...</span>
 </code></pre></div></td></tr></table></div>
 <p>Tool usage significantly enhances the capabilities of LLMs, allowing them to perform complex tasks that require external information or actions. QueryMT's system provides a structured way to integrate these tools into your LLM applications.</p>
 
