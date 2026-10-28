@@ -1771,7 +1771,7 @@ include_external = false
             .expect("local delegate");
         let provider_node_id = random_node_id();
 
-        delegate
+        let shared_error = delegate
             .config
             .provider
             .build_provider(
@@ -1779,7 +1779,14 @@ include_external = false
                     .with_provider_node_id(Some(&provider_node_id)),
             )
             .await
-            .expect("ordinary delegate should build an explicit mesh provider");
+            .err()
+            .expect("unavailable remote host must fail during mesh negotiation");
+        let shared_message = shared_error.to_string();
+        assert!(
+            !shared_message.contains("no mesh handle available")
+                && shared_message.contains("provider_host::"),
+            "ordinary delegate did not receive the planner mesh: {shared_message}"
+        );
 
         agent.handle().clear_mesh();
         let error = match delegate
