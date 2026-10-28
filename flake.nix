@@ -28,6 +28,25 @@
     else
       flake-parts.lib.mkFlake {inherit inputs;} {
         systems = ["x86_64-linux" "aarch64-linux" "aarch64-darwin"];
+        flake = let
+          qmtcodeModule = import ./nix/modules/qmtcode.nix {
+            inherit self;
+            scope = "nixos";
+          };
+          qmtcodeHomeModule = import ./nix/modules/qmtcode.nix {
+            inherit self;
+            scope = "home";
+          };
+        in {
+          nixosModules = {
+            qmtcode = qmtcodeModule;
+            default = qmtcodeModule;
+          };
+          homeManagerModules = {
+            qmtcode = qmtcodeHomeModule;
+            default = qmtcodeHomeModule;
+          };
+        };
         perSystem = {system, ...}: let
           overlays = [(import rust-overlay)];
           nixpkgsConfig = {
@@ -40,7 +59,7 @@
           };
 
           pkgsCuda =
-            if pkgs.stdenv.isLinux
+            if pkgs.stdenv.hostPlatform.isLinux
             then
               import nixpkgs {
                 inherit system overlays;
@@ -72,7 +91,15 @@
             llvmPackages.libclang
             rust-bindgen
             pkg-config
-            typeshare
+            (typeshare.overrideAttrs (old: {
+              # This generated-output example is not a compilable Rust doctest.
+              postPatch =
+                (old.postPatch or "")
+                + ''
+                  substituteInPlace core/src/language/mod.rs \
+                    --replace-fail '/// ```rust' '/// ```text'
+                '';
+            }))
             libgcc
             gdb
           ];
@@ -148,6 +175,7 @@
                 install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/examples/qmtcode $out/bin/qmtcode
                 runHook postInstall
               '';
+              meta.mainProgram = "qmtcode";
             };
 
             qmt = pkgs.rustPlatform.buildRustPackage {
@@ -187,6 +215,7 @@
                 install -Dm755 target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/$cargoBuildType/qmt $out/bin/qmt
                 runHook postInstall
               '';
+              meta.mainProgram = "qmt";
             };
           };
 
@@ -216,7 +245,7 @@
                   '';
               };
             }
-            // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
               vulkan = pkgs.mkShell {
                 buildInputs = commonInputs ++ (with pkgs; [vulkan-loader]);
 
@@ -256,6 +285,12 @@
                   '';
               };
             };
+
+          checks = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            qmtcode-service-module = import ./nix/checks/qmtcode-service.nix {
+              inherit pkgs self system;
+            };
+          };
         };
       };
 }
