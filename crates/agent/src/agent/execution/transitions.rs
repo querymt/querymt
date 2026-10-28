@@ -642,22 +642,19 @@ pub(super) async fn transition_call_llm(
         return Ok(ExecutionState::Cancelled);
     }
 
-    // Overrides last for exactly this request; unsupported ones are dropped (and
-    // logged) so the event reports the cap that was really requested.
-    let options = exec_ctx
-        .session_handle
-        .honoured_overrides(request.options)
-        .await;
-    let caps = exec_ctx.output_caps().await;
-    let max_tokens = options.max_tokens.or(caps.map(|caps| caps.initial));
-    // Middleware only sees the runtime; give it what this request was sent with.
-    *exec_ctx.runtime.last_llm_request.lock() = crate::agent::core::LastLlmRequest {
-        max_tokens,
-        caps,
-        supported: exec_ctx.session_handle.generation_option_support().await,
-        reasoning_effort: exec_ctx.session_handle.configured_reasoning_effort(),
-        pricing: exec_ctx.session_handle.get_pricing(),
-    };
+    // Overrides last for exactly this request. Options the provider does not
+    // honour are dropped (and logged); `applied` records what was really sent.
+    let options = context
+        .profile
+        .capabilities
+        .options
+        .retain_supported(request.options);
+    if options != request.options {
+        debug!(
+            "provider does not honour some per-request generation options; skipping them (requested={:?}, applied={:?})",
+            request.options, options
+        );
+    }
     config.emit_event(
         session_id,
         AgentEventKind::LlmRequestStart {
@@ -666,7 +663,6 @@ pub(super) async fn transition_call_llm(
                 "request_messages.len",
                 Some(session_id),
             ),
-            max_tokens,
         },
     );
 
@@ -706,11 +702,11 @@ pub(super) async fn transition_call_llm(
         .await
         {
             Ok(resp) => {
-                session_handle.record_generation_settings(&chat_span);
+                session_handle.record_generation_settings(&chat_span, options);
                 resp
             }
             Err(e) => {
-                session_handle.record_generation_settings(&chat_span);
+                session_handle.record_generation_settings(&chat_span, options);
                 return map_failed_llm_call(e, false, context);
             }
         }
@@ -742,7 +738,7 @@ pub(super) async fn transition_call_llm(
             }
         };
 
-        session_handle.record_generation_settings(&chat_span);
+        session_handle.record_generation_settings(&chat_span, options);
         if provider.capabilities().streaming {
             tracing::Span::current().record("gen_ai.request.stream", true);
             // === STREAMING PATH (all capable providers) ===
@@ -1246,7 +1242,6 @@ pub(super) async fn transition_call_llm(
                     let provider = &provider;
                     let messages_with_cache = &messages_with_cache;
                     let tools = tools.as_ref();
-                    let options = options;
                     let cancel = cancel.clone();
                     async move {
                         let call = ChatCall::new(messages_with_cache)
@@ -1344,6 +1339,7 @@ pub(super) async fn transition_call_llm(
         .collect();
 
     let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
+        .with_applied(options)
         .with_thinking(response_thinking)
         .with_thinking_signature(response_thinking_signature)
         .with_output(Some(output));
@@ -1351,11 +1347,16 @@ pub(super) async fn transition_call_llm(
         llm_response = llm_response.with_message_id(mid);
     }
 
-    // The overrides were consumed by this request; later states must not see them.
-    let context = if context.request_overrides.is_empty() {
+    // The overrides were consumed by this request; later states must not see
+    // them. What the request was sent with travels on as `last_applied`.
+    let context = if context.request_overrides.is_empty() && context.last_applied == options {
         context.clone()
     } else {
-        Arc::new(context.without_request_overrides())
+        Arc::new(
+            context
+                .without_request_overrides()
+                .with_last_applied(options),
+        )
     };
 
     Ok(ExecutionState::AfterLlm {
@@ -1553,6 +1554,8 @@ pub(super) async fn transition_after_llm(
             context.model.clone(),
         )
         .with_session_mode(context.session_mode)
+        .with_profile(context.profile.clone())
+        .with_last_applied(response.applied)
         .with_fragments(context.fragments.clone()),
     );
 
@@ -2531,6 +2534,31 @@ mod tests {
             .unwrap()
         }
 
+        /// A model profile for a streaming provider honouring `support`.
+        fn profile_with(
+            support: querymt::chat::GenerationOptionSupport,
+            caps: Option<crate::model_heuristics::OutputCaps>,
+        ) -> Arc<crate::middleware::ModelProfile> {
+            Arc::new(crate::middleware::ModelProfile {
+                caps,
+                capabilities: querymt::chat::ChatCapabilities::NONE
+                    .with_streaming(true)
+                    .with_options(support),
+                ..Default::default()
+            })
+        }
+
+        fn profiled_context(
+            session_id: &str,
+            profile: Arc<crate::middleware::ModelProfile>,
+        ) -> Arc<ConversationContext> {
+            Arc::new(
+                (*crate::test_utils::test_context(session_id, 0))
+                    .clone()
+                    .with_profile(profile),
+            )
+        }
+
         fn stop_chunks() -> Vec<(u64, Result<StreamChunk, LLMError>)> {
             vec![(
                 0,
@@ -2570,13 +2598,15 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let mut events = fixture.config.subscribe_events();
             let exec = fixture.execution_context().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
             let context = Arc::new(
-                (*crate::test_utils::test_context(&exec.session_id, 0))
-                    .clone()
-                    .with_request_overrides(overrides),
+                (*profiled_context(
+                    &exec.session_id,
+                    profile_with(querymt::chat::GenerationOptionSupport::ALL, None),
+                ))
+                .clone()
+                .with_request_overrides(overrides),
             );
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
@@ -2590,9 +2620,15 @@ mod tests {
             )
             .await
             .expect("first request");
-            let ExecutionState::AfterLlm { context: next, .. } = state else {
+            let ExecutionState::AfterLlm {
+                response,
+                context: next,
+            } = state
+            else {
                 panic!("expected AfterLlm, got {}", state.name());
             };
+            assert_eq!(response.applied, overrides);
+            assert_eq!(next.last_applied, overrides);
             assert!(
                 next.request_overrides.is_empty(),
                 "the consumed override must not carry into the next state"
@@ -2600,27 +2636,18 @@ mod tests {
 
             // The follow-up request is prepared from the cleared context.
             prepared.options = next.request_overrides;
-            transition_call_llm(&fixture.config, &next, &Arc::new(prepared), &exec)
+            let state = transition_call_llm(&fixture.config, &next, &Arc::new(prepared), &exec)
                 .await
                 .expect("second request");
+            let ExecutionState::AfterLlm { response, .. } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
+            assert_eq!(response.applied, querymt::chat::GenerationOptions::NONE);
 
             assert_eq!(
                 *factory.provider.options_seen.lock().unwrap(),
                 vec![overrides, querymt::chat::GenerationOptions::NONE]
             );
-
-            let mut caps = Vec::new();
-            while let Ok(Ok(envelope)) =
-                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
-            {
-                if let crate::events::AgentEventKind::LlmRequestStart { max_tokens, .. } =
-                    envelope.kind()
-                {
-                    caps.push(*max_tokens);
-                }
-            }
-            assert_eq!(caps.first(), Some(&Some(64_000)));
-            assert_ne!(caps.get(1), Some(&Some(64_000)));
         }
 
         #[tokio::test]
@@ -2628,7 +2655,6 @@ mod tests {
             let (fixture, factory) =
                 timed_fixture(true, vec![Ok(stop_chunks())], "openai", None).await;
             // `support` defaults to none.
-            let mut events = fixture.config.subscribe_events();
             let exec = fixture.execution_context().await;
             let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
             let context = crate::test_utils::test_context(&exec.session_id, 0);
@@ -2636,28 +2662,127 @@ mod tests {
             prepared.tools = vec![write_file_tool()].into();
             prepared.options = overrides;
 
-            transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
+            let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)
                 .await
                 .expect("request");
+            let ExecutionState::AfterLlm { response, .. } = state else {
+                panic!("expected AfterLlm, got {}", state.name());
+            };
 
             assert_eq!(
                 *factory.provider.options_seen.lock().unwrap(),
                 vec![querymt::chat::GenerationOptions::NONE],
                 "unsupported overrides must not reach the provider"
             );
-            while let Ok(Ok(envelope)) =
-                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
-            {
-                if let crate::events::AgentEventKind::LlmRequestStart { max_tokens, .. } =
-                    envelope.kind()
-                {
-                    assert_ne!(
-                        *max_tokens,
-                        Some(64_000),
-                        "event reports the cap really sent"
-                    );
-                }
-            }
+            assert_eq!(
+                response.applied,
+                querymt::chat::GenerationOptions::NONE,
+                "the response reports what was really sent"
+            );
+        }
+
+        #[tokio::test]
+        async fn session_profile_carries_caps_capabilities_and_effort() {
+            let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            factory.binding.lock().unwrap()["reasoning_effort"] = serde_json::json!("high");
+            let exec = fixture.execution_context().await;
+
+            let profile = exec.session_handle.profile().await;
+
+            // The binding's explicit max_tokens is its own ceiling.
+            assert_eq!(
+                profile.caps,
+                Some(crate::model_heuristics::OutputCaps {
+                    initial: 123,
+                    ceiling: 123,
+                })
+            );
+            assert!(profile.capabilities.streaming);
+            assert_eq!(
+                profile.capabilities.options,
+                querymt::chat::GenerationOptionSupport::ALL
+            );
+            assert_eq!(
+                profile.reasoning_effort,
+                Some(querymt::chat::ReasoningEffort::High)
+            );
+        }
+
+        #[tokio::test]
+        async fn model_switch_replaces_the_profile() {
+            let (fixture, factory) = timed_fixture(true, Vec::new(), "openai", None).await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let before = fixture.execution_context().await;
+            let old = before.session_handle.profile().await;
+            assert!(old.capabilities.options.max_tokens);
+
+            // A switch rebinds the session to another model: the next turn builds a
+            // new handle, and with it a new profile (new caps, new capabilities).
+            *factory.provider.support.lock().unwrap() =
+                querymt::chat::GenerationOptionSupport::NONE;
+            factory.binding.lock().unwrap()["max_tokens"] = serde_json::json!(999);
+            fixture.config.provider.clear_provider_cache().await;
+            let after = fixture.execution_context().await;
+            let new = after.session_handle.profile().await;
+
+            assert!(!Arc::ptr_eq(&old, &new));
+            assert_eq!(
+                new.capabilities.options,
+                querymt::chat::GenerationOptionSupport::NONE
+            );
+            assert_eq!(new.caps.map(|caps| caps.initial), Some(999));
+            // The old turn keeps its own, unchanged profile.
+            assert_eq!(old.caps.map(|caps| caps.initial), Some(123));
+        }
+
+        #[tokio::test]
+        async fn chat_span_records_the_escalated_max_tokens() {
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![Ok(stop_chunks()), Ok(stop_chunks())],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let support = querymt::chat::GenerationOptionSupport::ALL;
+            *factory.provider.support.lock().unwrap() = support;
+            let exec = fixture.execution_context().await;
+            let overrides = querymt::chat::GenerationOptions::NONE.with_max_tokens(64_000);
+            let profile = profile_with(support, None);
+            let plain = profiled_context(&exec.session_id, profile.clone());
+            let escalated = Arc::new((*plain).clone().with_request_overrides(overrides));
+            let mut prepared = (*request()).clone();
+            prepared.tools = vec![write_file_tool()].into();
+            let plain_request = Arc::new(prepared.clone());
+            prepared.options = overrides;
+            let escalated_request = Arc::new(prepared);
+
+            let (_, spans) = capture(async {
+                transition_call_llm(&fixture.config, &escalated, &escalated_request, &exec)
+                    .await
+                    .expect("escalated request");
+                transition_call_llm(&fixture.config, &plain, &plain_request, &exec)
+                    .await
+                    .expect("plain request");
+            })
+            .await;
+
+            let max_tokens: Vec<_> = spans
+                .iter()
+                .filter(|span| attr(span, "gen_ai.operation.name") == Some(&Value::from("chat")))
+                .map(|span| attr(span, "gen_ai.request.max_tokens").cloned())
+                .collect();
+            assert_eq!(max_tokens.len(), 2);
+            assert!(
+                max_tokens.contains(&Some(Value::I64(64_000))),
+                "{max_tokens:?}"
+            );
+            // The configured value (binding override) returns once the override is spent.
+            assert!(
+                max_tokens.contains(&Some(Value::I64(123))),
+                "{max_tokens:?}"
+            );
         }
 
         fn text_reply(text: &str, finish_reason: FinishReason) -> TimedChunks {
@@ -2682,18 +2807,20 @@ mod tests {
             )
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
-            let mut events = fixture.config.subscribe_events();
             let mut exec = fixture.execution_context().await;
-            exec.session_handle
-                .override_output_caps(crate::model_heuristics::OutputCaps {
-                    initial: 32_000,
-                    ceiling: 128_000,
-                })
-                .await;
             let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
             let mut prepared = (*request()).clone();
             prepared.tools = vec![write_file_tool()].into();
-            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let context = profiled_context(
+                &exec.session_id,
+                profile_with(
+                    querymt::chat::GenerationOptionSupport::ALL,
+                    Some(crate::model_heuristics::OutputCaps {
+                        initial: 32_000,
+                        ceiling: 128_000,
+                    }),
+                ),
+            );
 
             // First request: cut off at the initial cap.
             let state = transition_call_llm(
@@ -2758,18 +2885,6 @@ mod tests {
                 !history.contains("first, cut off"),
                 "the discarded reply must not reach history: {history}"
             );
-
-            let mut caps = Vec::new();
-            while let Ok(Ok(envelope)) =
-                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
-            {
-                if let crate::events::AgentEventKind::LlmRequestStart { max_tokens, .. } =
-                    envelope.kind()
-                {
-                    caps.push(*max_tokens);
-                }
-            }
-            assert_eq!(caps, vec![Some(32_000), Some(128_000)]);
         }
 
         fn thinking_reply(finish_reason: FinishReason) -> TimedChunks {
@@ -2800,18 +2915,21 @@ mod tests {
             .await;
             *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
             let mut exec = fixture.execution_context().await;
-            exec.session_handle
-                .override_output_caps(crate::model_heuristics::OutputCaps {
-                    initial: 32_000,
-                    ceiling: 128_000,
-                })
-                .await;
             let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
             let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
             let instruction_marker = "cut off by the output-token limit";
 
             // Request 1: initial cap, thinking only, cut off -> escalate.
-            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let context = profiled_context(
+                &exec.session_id,
+                profile_with(
+                    querymt::chat::GenerationOptionSupport::ALL,
+                    Some(crate::model_heuristics::OutputCaps {
+                        initial: 32_000,
+                        ceiling: 128_000,
+                    }),
+                ),
+            );
             let mut prepared = (*request()).clone();
             prepared.tools = tools.clone();
             let state = transition_call_llm(&fixture.config, &context, &Arc::new(prepared), &exec)

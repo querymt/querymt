@@ -2521,7 +2521,7 @@ mod worktree_binding_tests {
             .unwrap()
             .into_iter()
             .filter(|e| {
-                matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome }
+                matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome, .. }
                     if run_id == "orphan" && outcome == "interrupted")
             })
             .count();

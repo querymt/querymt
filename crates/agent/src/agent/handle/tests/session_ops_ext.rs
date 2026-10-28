@@ -255,7 +255,7 @@ async fn reconcile_on_stop_of_unloaded_session_closes_orphaned_run() {
         .unwrap()
         .into_iter()
         .filter(|e| {
-            matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome }
+            matches!(&e.kind, crate::events::AgentEventKind::RunCompleted { run_id, outcome, .. }
                 if run_id == "orphan" && outcome == "interrupted")
         })
         .count();

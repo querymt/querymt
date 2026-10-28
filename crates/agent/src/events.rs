@@ -71,6 +71,8 @@ pub enum RunOutcome {
     Completed,
     Failed,
     Cancelled,
+    /// The run ended on a middleware stop (e.g. the model's output limit).
+    Stopped,
     /// The owning process died before closing the run.
     Interrupted,
 }
@@ -81,6 +83,7 @@ impl RunOutcome {
             RunOutcome::Completed => "completed",
             RunOutcome::Failed => "failed",
             RunOutcome::Cancelled => "cancelled",
+            RunOutcome::Stopped => "stopped",
             RunOutcome::Interrupted => "interrupted",
         }
     }
@@ -304,6 +307,12 @@ pub enum AgentEventKind {
     RunCompleted {
         run_id: String,
         outcome: String,
+        /// Why the run stopped; set only when `outcome` is `"stopped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_type: Option<StopType>,
+        /// Human-readable stop reason; set only when `outcome` is `"stopped"`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     SteeringAccepted {
         run_id: String,
@@ -468,10 +477,6 @@ pub enum AgentEventKind {
     },
     LlmRequestStart {
         message_count: u32,
-        /// Output-token cap in effect for this request, when known.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[typeshare(serialized_as = "Option<number>")]
-        max_tokens: Option<u32>,
     },
     LlmRequestEnd {
         #[typeshare(serialized_as = "Option<Usage>")]
@@ -1364,6 +1369,53 @@ mod tests {
     }
 
     #[test]
+    fn run_completed_reports_stop_fields_only_when_stopped() {
+        let stopped = AgentEventKind::RunCompleted {
+            run_id: "r".into(),
+            outcome: "stopped".into(),
+            stop_type: Some(StopType::ModelTokenLimit),
+            reason: Some("output limit".into()),
+        };
+        let json = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(json["data"]["outcome"], "stopped");
+        assert_eq!(json["data"]["stop_type"], "model_token_limit");
+        assert_eq!(json["data"]["reason"], "output limit");
+        let parsed: AgentEventKind = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::RunCompleted {
+                stop_type: Some(StopType::ModelTokenLimit),
+                ..
+            }
+        ));
+
+        let completed = AgentEventKind::RunCompleted {
+            run_id: "r".into(),
+            outcome: "completed".into(),
+            stop_type: None,
+            reason: None,
+        };
+        let json = serde_json::to_value(&completed).unwrap();
+        assert!(json["data"].get("stop_type").is_none());
+        assert!(json["data"].get("reason").is_none());
+
+        // Events journaled before this change still decode.
+        let legacy = serde_json::json!({
+            "type": "run_completed",
+            "data": {"run_id": "r", "outcome": "completed"}
+        });
+        let parsed: AgentEventKind = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(
+            parsed,
+            AgentEventKind::RunCompleted {
+                stop_type: None,
+                reason: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn agent_event_kind_middleware_stopped_construction() {
         let kind = AgentEventKind::MiddlewareStopped {
             stop_type: StopType::StepLimit,
@@ -1572,41 +1624,14 @@ mod tests {
     }
 
     #[test]
-    fn llm_request_start_serializes_max_tokens_when_known() {
-        let kind = AgentEventKind::LlmRequestStart {
-            message_count: 3,
-            max_tokens: Some(32_000),
-        };
+    fn llm_request_start_keeps_its_original_shape() {
+        let kind = AgentEventKind::LlmRequestStart { message_count: 3 };
         let json = serde_json::to_value(&kind).unwrap();
-        assert_eq!(json["data"]["message_count"], 3);
-        assert_eq!(json["data"]["max_tokens"], 32_000);
+        assert_eq!(json["data"], serde_json::json!({"message_count": 3}));
         let parsed: AgentEventKind = serde_json::from_value(json).unwrap();
         assert!(matches!(
             parsed,
-            AgentEventKind::LlmRequestStart {
-                message_count: 3,
-                max_tokens: Some(32_000)
-            }
-        ));
-    }
-
-    #[test]
-    fn llm_request_start_omits_unknown_max_tokens_and_reads_legacy_events() {
-        let kind = AgentEventKind::LlmRequestStart {
-            message_count: 1,
-            max_tokens: None,
-        };
-        let json = serde_json::to_value(&kind).unwrap();
-        assert!(json["data"].get("max_tokens").is_none());
-
-        let legacy = serde_json::json!({"type": "llm_request_start", "data": {"message_count": 7}});
-        let parsed: AgentEventKind = serde_json::from_value(legacy).unwrap();
-        assert!(matches!(
-            parsed,
-            AgentEventKind::LlmRequestStart {
-                message_count: 7,
-                max_tokens: None
-            }
+            AgentEventKind::LlmRequestStart { message_count: 3 }
         ));
     }
 
@@ -1704,7 +1729,7 @@ mod tests {
         let kind: AgentEventKind = serde_json::from_str(json).expect("run_completed");
         assert!(matches!(
             &kind,
-            AgentEventKind::RunCompleted { run_id, outcome }
+            AgentEventKind::RunCompleted { run_id, outcome, .. }
                 if run_id == "r" && outcome == RunOutcome::Interrupted.as_str()
         ));
         assert_eq!(
@@ -1726,6 +1751,8 @@ mod tests {
             classify_durability(&AgentEventKind::RunCompleted {
                 run_id: "r".into(),
                 outcome: RunOutcome::Interrupted.into(),
+                stop_type: None,
+                reason: None,
             }),
             Durability::Durable
         );

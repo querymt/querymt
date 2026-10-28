@@ -62,11 +62,17 @@ use std::sync::Arc;
 use tracing::{Instrument, info_span, instrument};
 
 /// Outcome of a single execution cycle
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CycleOutcome {
     Completed,
     Cancelled,
-    Stopped(StopReason),
+    /// The run ended on a middleware stop. `stop_reason` is the protocol-level
+    /// value for ACP; `stop_type` and `reason` keep the QueryMT cause for events.
+    Stopped {
+        stop_reason: StopReason,
+        stop_type: StopType,
+        reason: String,
+    },
 }
 
 /// Allow one automatic compaction between main model requests, preventing non-progress loops.
@@ -238,6 +244,8 @@ pub(crate) async fn apply_pending_steering(
         context.model.clone(),
     )
     .with_session_mode(context.session_mode)
+    .with_profile(context.profile.clone())
+    .with_last_applied(context.last_applied)
     .with_fragments(context.fragments.clone());
     Ok(Some(Arc::new(next)))
 }
@@ -340,7 +348,8 @@ pub(crate) async fn execute_cycle_state_machine(
             llm_config.provider.as_str().into(),
             llm_config.model.as_str().into(),
         )
-        .with_session_mode(session_mode),
+        .with_session_mode(session_mode)
+        .with_profile(exec_ctx.session_handle.profile().await),
     );
 
     let mut state = ExecutionState::BeforeLlmCall {
@@ -629,6 +638,7 @@ pub(crate) async fn execute_cycle_state_machine(
                         context.model.clone(),
                     )
                     .with_session_mode(context.session_mode)
+                    .with_profile(context.profile.clone())
                     .with_fragments(context.fragments.clone()),
                 );
                 if let Some(context) = apply_pending_steering(
@@ -868,7 +878,11 @@ pub(crate) async fn execute_cycle_state_machine(
                     },
                 );
 
-                return Ok(CycleOutcome::Stopped(StopReason::from(stop_type)));
+                return Ok(CycleOutcome::Stopped {
+                    stop_reason: StopReason::from(stop_type),
+                    stop_type,
+                    reason: message.to_string(),
+                });
             }
 
             ExecutionState::Cancelled => {

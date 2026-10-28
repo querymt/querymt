@@ -97,6 +97,8 @@ async fn reconcile_with_root(
                 AgentEventKind::RunCompleted {
                     run_id: run_id.clone(),
                     outcome: RunOutcome::Interrupted.into(),
+                    stop_type: None,
+                    reason: None,
                 },
             )
             .await
@@ -278,6 +280,8 @@ pub(crate) mod tests {
             AgentEventKind::RunCompleted {
                 run_id: "r2".into(),
                 outcome: RunOutcome::Completed.into(),
+                stop_type: None,
+                reason: None,
             },
         )
         .await;
@@ -483,7 +487,7 @@ pub(crate) mod tests {
                 .unwrap();
             if matches!(
                 last_kind(&snapshot.audit.events),
-                Some(AgentEventKind::RunCompleted { ref run_id, ref outcome })
+                Some(AgentEventKind::RunCompleted { ref run_id, ref outcome, .. })
                     if run_id == "incident-run" && outcome == "interrupted"
             ) {
                 break;

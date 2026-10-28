@@ -223,6 +223,25 @@ pub(crate) mod genai {
             }
         }
 
+        /// Effective settings: the configured values with a request's applied
+        /// overrides on top. A reasoning override only replaces a level the
+        /// provider already reports, since providers such as Anthropic send a
+        /// thinking mode/budget instead of a level.
+        pub(crate) fn with_overrides(mut self, applied: querymt::chat::GenerationOptions) -> Self {
+            if let Some(max_tokens) = applied.max_tokens {
+                self.max_tokens = Some(i64::from(max_tokens));
+            }
+            if let (Some(effort), Some(_)) = (applied.reasoning_effort, self.reasoning) {
+                self.reasoning = Some(match effort {
+                    querymt::chat::ReasoningEffort::Low => "low",
+                    querymt::chat::ReasoningEffort::Medium => "medium",
+                    querymt::chat::ReasoningEffort::High => "high",
+                    querymt::chat::ReasoningEffort::Max => "xhigh",
+                });
+            }
+            self
+        }
+
         pub(crate) fn record(&self, span: &Span) {
             if let Some(value) = self.max_tokens {
                 span.set_attribute("gen_ai.request.max_tokens", value);

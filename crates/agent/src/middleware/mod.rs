@@ -22,8 +22,8 @@ pub use driver::{CompositeDriver, MiddlewareDriver};
 pub use error::{MiddlewareError, Result};
 pub use state::{
     AgentStats, ContextFragment, ContextPriority, ConversationContext, ExecutionState, LlmResponse,
-    PreparedModelRequest, ToolCall, ToolFunction, ToolResult, WaitCondition, WaitReason,
-    apply_usage_to_stats, calculate_context_tokens,
+    ModelProfile, PreparedModelRequest, ToolCall, ToolFunction, ToolResult, WaitCondition,
+    WaitReason, apply_usage_to_stats, calculate_context_tokens,
 };
 
 // Re-export model info types for convenience

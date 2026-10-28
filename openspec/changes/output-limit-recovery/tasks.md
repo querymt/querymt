@@ -25,7 +25,7 @@
 
 - [x] 2.1 Pass `ModelInfo` into `ModelDefaults::for_model`, compute `max_tokens = min(32_000, output_limit)` when unset and the output ceiling (explicit `max_tokens` is its own ceiling); verify `model_heuristics` tests for a 128k model, an unknown model, and an explicit 20k config.
 - [x] 2.2 Carry the caps from `resolve_provider_config` to the session runtime (`SessionRuntime`/`ExecutionContext.output_caps`) and add `max_tokens` to `LlmRequestStart`; verify a provider-config test and an event serialization test, and regenerate typeshare types. *(Superseded by 2.2r.)*
-- [ ] 2.2r Replace `LastLlmRequest` / `SessionRuntime.last_llm_request` and `output_caps` with `ModelProfile { caps, capabilities, reasoning_effort, pricing }`, resolved with the provider, swapped on model switch and carried as `ConversationContext.profile`; remove `max_tokens` from `LlmRequestStart` (and its tests); record effective `gen_ai.request.*` values on the chat span; verify a provider-config test that the profile carries the caps, a model-switch test that the profile is replaced, and a span test for an escalated `max_tokens`.
+- [x] 2.2r Replace `LastLlmRequest` / `SessionRuntime.last_llm_request` and `output_caps` with `ModelProfile { caps, capabilities, reasoning_effort, pricing }`, resolved with the provider, swapped on model switch and carried as `ConversationContext.profile`; remove `max_tokens` from `LlmRequestStart` (and its tests); record effective `gen_ai.request.*` values on the chat span; verify a provider-config test that the profile carries the caps, a model-switch test that the profile is replaced, and a span test for an escalated `max_tokens`.
 
 ## 3. Length-aware cut-off handling
 
@@ -36,7 +36,7 @@
 ## 4. Request overrides and `on_stopped`
 
 - [x] 4.1 Add `request_overrides` to `ConversationContext`, copy them into `PreparedModelRequest`, call the options-aware provider methods when they are supported, and clear the overrides after each request; verify execution tests that an override applies to exactly one request and is skipped (with a debug log) for unsupported providers. *(Wiring superseded by 4.1r.)*
-- [ ] 4.1r Build one `ChatCall` in `transition_call_llm`, filter options against `profile.capabilities.options`, and set `LlmResponse.applied` to the options actually sent; carry it as `last_applied` on the context that reaches `Stopped` (cleared at turn start); keep the existing one-request and unsupported-provider tests green.
+- [x] 4.1r Build one `ChatCall` in `transition_call_llm`, filter options against `profile.capabilities.options`, and set `LlmResponse.applied` to the options actually sent; carry it as `last_applied` on the context that reaches `Stopped` (cleared at turn start); keep the existing one-request and unsupported-provider tests green.
 - [x] 4.2 Add `MiddlewareDriver::on_stopped`, `CompositeDriver::run_stopped` and the phase-ending rules; verify driver tests for pass-through, recovery to `BeforeLlmCall` and ordering across two drivers.
 - [x] 4.3 Call `run_stopped` from the `Stopped` branch in `agent/execution/mod.rs` with the per-turn `max_stop_recoveries` guard (default 5); verify execution tests that a recovering middleware suppresses `MiddlewareStopped` and that the guard publishes the stop.
 
@@ -45,22 +45,55 @@
 - [x] 5.1 Implement `middleware/output_limit.rs` with config (`enabled`, `escalate`, `max_continuations`, `instruction`, `lower_effort_on_thinking_only`), the factory (`type = "output_limit_recovery"`) and registration in `MiddlewarePresets::defaults()`; verify factory/preset tests.
 - [x] 5.2 Implement escalation in `on_after_llm` (once per turn, below the ceiling, discarded reply's usage counted); verify middleware tests and an execution test that the escalated request uses the ceiling and history holds only the second reply.
 - [x] 5.3 Implement continuation in `on_stopped` (fragment instruction, ceiling cap, effort lowering for thinking-only replies, removal after the next normal reply, cap at `max_continuations`); verify middleware tests for each branch and an execution test replaying this session's sequence (thinking-only cut-off → escalate → cut-off → continue → success).
-- [ ] 5.r Rework the middleware to read `context.profile` and `response.applied` / `context.last_applied` instead of `runtime.last_llm_request` (cap used = `applied.max_tokens.or(profile.caps.initial)`); verify the existing escalation, continuation and replay tests pass unchanged in behaviour.
+- [x] 5.r Rework the middleware to read `context.profile` and `response.applied` / `context.last_applied` instead of `runtime.last_llm_request` (cap used = `applied.max_tokens.or(profile.caps.initial)`); verify the existing escalation, continuation and replay tests pass unchanged in behaviour.
 - [x] 5.4 Add the `OutputLimitRecovery` event (turn, attempt, action, from/to cap, thinking-only, discarded message id), emitted on each step; verify event serialization and journal persistence tests and regenerate typeshare types.
 - [x] 5.5 Document the middleware, its configuration and default instruction in the agent middleware docs, with an example TOML in `crates/agent/examples/confs`; verify the example config loads in a config test.
 
 ## 6. Run outcome and ACP reporting
 
-- [ ] 6.1 Add `RunCompletionDisposition::Stopped { stop_type, reason }`, carry it from `CycleOutcome::Stopped`, and emit `run_completed` with outcome `stopped` and the stop fields; verify session-actor tests and event serialization.
-- [ ] 6.2 Translate `MiddlewareStopped` and `OutputLimitRecovery` into live notices for notice-capable ACP clients (not replayed), keeping `PromptResponse` to the ACP stop reason only (no `_meta` stop fields); verify ACP tests for capable and non-capable clients (both get stop reason `max_tokens` for an output-limit stop, and the response has no `_meta.querymt` stop fields) and replay without notices.
+- [x] 6.1 Add `RunCompletionDisposition::Stopped { stop_type, reason }`, carry it from `CycleOutcome::Stopped`, and emit `run_completed` with outcome `stopped` and the stop fields; verify session-actor tests and event serialization.
+- [x] 6.2 Translate `MiddlewareStopped` and `OutputLimitRecovery` into live notices for notice-capable ACP clients (not replayed), keeping `PromptResponse` to the ACP stop reason only (no `_meta` stop fields); verify ACP tests for capable and non-capable clients (both get stop reason `max_tokens` for an output-limit stop, and the response has no `_meta.querymt` stop fields) and replay without notices.
 
 ## 7. Integration
 
-- [ ] 7.1 Run `cargo test` for `querymt`, `querymt-remote`, every provider crate touched in 0.4 (Anthropic native and Extism), `querymt-py` and `querymt-agent --all-features`, plus clippy and fmt; verify all green, and that the OCI plugin builds succeed with the bumped contract.
-- [ ] 7.2 Run a manual end-to-end check with `claude-sonnet-5-5`, using a prompt that asks for a very large single file write: the run escalates or continues instead of stopping, and the journal shows `output_limit_recovery` events; record the result in the change notes.
+- [x] 7.1 Run `cargo test` for `querymt`, `querymt-remote`, every provider crate touched in 0.4 (Anthropic native and Extism), `querymt-py` and `querymt-agent --all-features`, plus clippy and fmt; verify all green, and that the OCI plugin builds succeed with the bumped contract.
+- [x] 7.2 Run a manual end-to-end check with `claude-sonnet-5-5`, using a prompt that asks for a very large single file write: the run escalates or continues instead of stopping, and the journal shows `output_limit_recovery` events; record the result in the change notes.
+
+## Verification notes
+
+### 7.1 Test run
+
+- `cargo nextest run` was used throughout. Passing: `querymt` (224), `querymt-remote` (169), `querymt-py` and `querymt-agent-py` (with `PYO3_PYTHON` set to Python 3.14, since the default interpreter is 3.9 and the crate needs 3.10 or newer), Anthropic with the `native` feature (81), and the other provider crates (several have no tests).
+- `querymt-agent --all-features`: all tests pass except `config::tests::example_profiles_keep_workspace_disabled_and_delegates_inheriting`, which failed only because of an unrelated uncommitted edit to `crates/agent/examples/confs/single_coder.toml` (it passes with that edit stashed). A few `execution_tests`, delegation and websocket tests timed out or failed in the full parallel run and pass when run alone (load flakes).
+- `cargo clippy` is clean for `querymt`, `querymt-remote` and `querymt-agent` (all features, tests). `cargo fmt --check` is clean.
+- Extism: `cargo b -p qmt-anthropic --release --target wasm32-wasip1` builds with the bumped contract. OCI plugin publishing is done by CI and was not run locally.
+
+### 7.2 Manual end-to-end check
+
+Run with `claude-sonnet-5-5` (Anthropic OAuth), the `from_config` example, a throwaway DB, and a config without `max_tokens` (initial cap 32,000, ceiling 128,000). Prompt: write `big.txt` with the numbers 1 to 15000 in a single `write_file` call.
+
+| Journal seq | Event |
+|---|---|
+| 11 | `llm_request_end`: `finish_reason` Length after 31,832 output tokens, no tool call |
+| 12 | `output_limit_recovery`: action `escalate`, attempt 1, 32,000 to 128,000, `thinking_only` false, cut-off message recorded as discarded |
+| 13 | `llm_request_start`: same request retried; no assistant message stored between 11 and 13 |
+| 16 | `llm_request_end`: ToolCalls after 44,077 output tokens (above the old cap, so the raised cap was sent) |
+| 22 | `write_file` ran; `big.txt` has 15,000 lines |
+| 26, 29 | Final reply `Stop`; `run_completed` outcome `completed` |
+
+Message history afterwards holds 2 user and 2 assistant messages, none from the cut-off reply. The run used about 76k output tokens.
+
+Not verified end to end (covered by unit tests only):
+
+- The continuation path and the `stopped` run outcome. A cheap run with `max_tokens = 1024` did not exercise them: selecting a model through the dashboard rebuilt the session's LLM config without `[agent.parameters]`, so the 1024 cap never reached the request and nothing was cut off.
+- The new stop and recovery notices in a live ACP client.
+
+Unexplained: the journal of this run contains a `session_mode_changed` to `plan` (seq 14, 15) during the retried request, although `from_config` has no way to switch mode. See the follow-up below.
 
 ## Workflow follow-up
 
 - Open a querymt-desktop change to render stop notices, the `stopped` run outcome and recovery events, and to drop discarded streamed messages.
 - Open a small change to fix the `StopType` → ACP `StopReason` mapping: `ContentFilter` → `refusal` (currently `end_turn`), and reconsider `PriceLimit` → `max_tokens`.
 - If a consumer needs fine-grained stop types over ACP (e.g. delegation failure messages in `delegation/core.rs`, which only see `MaxTokens`), propose a dedicated stop-reporting requirement naming that consumer.
+- Open a small change to keep `[agent.parameters]` (e.g. `max_tokens`) when a session's model is selected. `apply_model_selection` (`session_actor.rs`) and `set_provider` (`handle/session_config.rs`) rebuild the LLM config from provider, model, system prompt and reasoning effort only, so the parameters are lost even when the same model is picked again; the dashboard does this at session start.
+- Investigate the unexplained switch to `plan` mode during the 7.2 run (journal seq 14-15 in a `from_config` session with no other known client), and why `write_file` still ran afterwards.

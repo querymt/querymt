@@ -424,7 +424,8 @@ pub(super) async fn run_ai_compaction(
                 ctx.provider.clone(),
                 ctx.model.clone(),
             )
-            .with_session_mode(ctx.session_mode),
+            .with_session_mode(ctx.session_mode)
+            .with_profile(ctx.profile.clone()),
         )
     } else {
         return Err(anyhow::anyhow!("No context available for compaction"));
@@ -755,7 +756,10 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert!(matches!(outcome, super::super::CycleOutcome::Stopped(_)));
+        assert!(matches!(
+            outcome,
+            super::super::CycleOutcome::Stopped { .. }
+        ));
         let after = config
             .provider
             .history_store()

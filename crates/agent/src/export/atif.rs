@@ -557,10 +557,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 origin: EventOrigin::Local,
                 source_node: None,
-                kind: AgentEventKind::LlmRequestStart {
-                    message_count: 1,
-                    max_tokens: None,
-                },
+                kind: AgentEventKind::LlmRequestStart { message_count: 1 },
             },
             AgentEvent {
                 session_seq: 0,
@@ -765,10 +762,7 @@ mod tests {
                 session_id: "sess-1".to_string(),
                 origin: EventOrigin::Local,
                 source_node: None,
-                kind: AgentEventKind::LlmRequestStart {
-                    message_count: 1,
-                    max_tokens: None,
-                },
+                kind: AgentEventKind::LlmRequestStart { message_count: 1 },
             },
             AgentEvent {
                 session_seq: 0,

@@ -143,6 +143,23 @@ pub struct PreparedModelRequest {
     pub options: GenerationOptions,
 }
 
+/// Per-session facts about the model a session talks to.
+///
+/// Resolved together with the provider, replaced when the model is switched and
+/// carried on [`ConversationContext`], so middleware never has to reconstruct
+/// them from "the last request".
+#[derive(Debug, Clone, Default)]
+pub struct ModelProfile {
+    /// Initial output cap and escalation ceiling; `None` when unknown.
+    pub caps: Option<crate::model_heuristics::OutputCaps>,
+    /// What the session's provider supports per request.
+    pub capabilities: querymt::chat::ChatCapabilities,
+    /// Reasoning effort the provider is configured with, when known.
+    pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
+    /// Pricing used to account for this session's usage, when billable.
+    pub pricing: Option<querymt::providers::ModelPricing>,
+}
+
 /// Context passed to middleware during state transitions
 #[derive(Debug, Clone)]
 pub struct ConversationContext {
@@ -164,6 +181,13 @@ pub struct ConversationContext {
     /// `max_tokens`). They are consumed by exactly one request: the context built
     /// after that request does not carry them forward.
     pub request_overrides: GenerationOptions,
+    /// Facts about the session's model (caps, capabilities, effort, pricing).
+    pub profile: Arc<ModelProfile>,
+    /// Options the most recent model request was actually sent with.
+    ///
+    /// Carried to the `Stopped` state so `on_stopped` knows which cap was hit.
+    /// Cleared at turn start.
+    pub last_applied: GenerationOptions,
 }
 
 impl ConversationContext {
@@ -183,7 +207,23 @@ impl ConversationContext {
             model,
             session_mode: crate::agent::core::AgentMode::Build,
             request_overrides: GenerationOptions::NONE,
+            profile: Arc::new(ModelProfile::default()),
+            last_applied: GenerationOptions::NONE,
         }
+    }
+
+    /// Set the model profile (builder-style).
+    #[must_use]
+    pub fn with_profile(mut self, profile: Arc<ModelProfile>) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Set the options the last request was sent with (builder-style).
+    #[must_use]
+    pub fn with_last_applied(mut self, applied: GenerationOptions) -> Self {
+        self.last_applied = applied;
+        self
     }
 
     /// Returns the number of user messages in the conversation
@@ -211,6 +251,8 @@ impl ConversationContext {
             model: self.model.clone(),
             session_mode: self.session_mode,
             request_overrides: self.request_overrides,
+            profile: self.profile.clone(),
+            last_applied: self.last_applied,
         }
     }
 
@@ -337,6 +379,9 @@ pub struct LlmResponse {
     /// When set, `transition_after_llm` will use this ID so the final
     /// `AssistantMessageStored` event matches the delta events already sent to the UI.
     pub message_id: Option<String>,
+    /// Per-request overrides this response's request was actually sent with
+    /// (after dropping the ones the provider does not honour).
+    pub applied: GenerationOptions,
 }
 
 impl LlmResponse {
@@ -355,7 +400,14 @@ impl LlmResponse {
             finish_reason,
             output: None,
             message_id: None,
+            applied: GenerationOptions::NONE,
         }
+    }
+
+    /// Record the options the request was sent with (builder-style).
+    pub fn with_applied(mut self, applied: GenerationOptions) -> Self {
+        self.applied = applied;
+        self
     }
 
     /// Set the canonical structured output (builder-style).

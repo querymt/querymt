@@ -535,7 +535,16 @@ async fn recovery_guard_publishes_the_stop_after_the_limit() {
 
     let outcome = harness.run().await;
 
-    assert_eq!(outcome, CycleOutcome::Stopped(StopReason::MaxTokens));
+    assert!(
+        matches!(
+            &outcome,
+            CycleOutcome::Stopped {
+                stop_reason: StopReason::MaxTokens,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
     assert_eq!(
         middleware.recoveries_offered.load(Ordering::SeqCst),
         2,
@@ -557,7 +566,7 @@ async fn stop_without_a_recovering_middleware_is_published_immediately() {
 
     let outcome = harness.run().await;
 
-    assert!(matches!(outcome, CycleOutcome::Stopped(_)));
+    assert!(matches!(outcome, CycleOutcome::Stopped { .. }));
     assert_eq!(drain_middleware_stopped(&mut events).await, 1);
 }
 
@@ -1518,7 +1527,16 @@ async fn test_middleware_stops_execution() {
 
     let outcome = harness.run().await;
 
-    assert_eq!(outcome, CycleOutcome::Stopped(StopReason::EndTurn));
+    assert!(
+        matches!(
+            &outcome,
+            CycleOutcome::Stopped {
+                stop_reason: StopReason::EndTurn,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test]

@@ -129,11 +129,6 @@ impl ExecutionContext {
         }
     }
 
-    /// Output-token caps (initial cap and escalation ceiling) for this turn's provider.
-    pub async fn output_caps(&self) -> Option<crate::model_heuristics::OutputCaps> {
-        self.session_handle.output_caps().await
-    }
-
     /// Attach a cancellation token, replacing the default no-op token.
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = token;

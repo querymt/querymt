@@ -779,10 +779,7 @@ mod event_relay_extended {
                 session_id: "s1".to_string(),
                 origin: EventOrigin::Local,
                 source_node: None,
-                kind: AgentEventKind::LlmRequestStart {
-                    message_count: 5,
-                    max_tokens: None,
-                },
+                kind: AgentEventKind::LlmRequestStart { message_count: 5 },
             },
         ];
 
