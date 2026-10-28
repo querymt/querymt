@@ -2035,27 +2035,30 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
             batch_id: None,
         },
     );
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // The delegation status is persisted before the child session is resolved,
+    // so wait for both to avoid observing the gap between the two updates.
+    let retry_child_id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             let current = store
                 .get_delegation(&retry_delegation.public_id)
                 .await
                 .expect("retry delegation lookup")
                 .expect("retry delegation");
-            if current.status == DelegationStatus::Complete {
-                break;
+            if current.status == DelegationStatus::Complete
+                && let Some(retry_child_id) = harness
+                    .child_sessions()
+                    .await
+                    .into_iter()
+                    .find(|session_id| session_id != &child_session_id)
+                && harness.session_lifecycle(&retry_child_id).await.resolved
+            {
+                break retry_child_id;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("new delegation attempt timed out");
-    let retry_child_id = harness
-        .child_sessions()
-        .await
-        .into_iter()
-        .find(|session_id| session_id != &child_session_id)
-        .expect("fresh retry child session");
+    .expect("new delegation attempt did not complete and resolve its child");
     assert!(harness.session_lifecycle(&retry_child_id).await.resolved);
     assert!(
         !harness.session_lifecycle(&child_session_id).await.resolved,
