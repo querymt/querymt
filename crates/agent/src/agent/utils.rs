@@ -559,6 +559,9 @@ pub fn extract_locations(args: &serde_json::Value) -> Vec<ToolCallLocation> {
     if let Some(root) = map.get("root").and_then(|v| v.as_str()) {
         locations.push(ToolCallLocation::new(root));
     }
+    if let Some(file_path) = map.get("file_path").and_then(|v| v.as_str()) {
+        locations.push(ToolCallLocation::new(file_path));
+    }
     locations
 }
 
@@ -590,8 +593,21 @@ pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{format_prompt_user_text_only, render_prompt_for_display};
-    use crate::acp::protocol::{ContentBlock, TextContent};
+    use super::{extract_locations, format_prompt_user_text_only, render_prompt_for_display};
+    use crate::acp::protocol::{ContentBlock, TextContent, ToolCallLocation};
+
+    #[test]
+    fn extract_locations_includes_file_path_path_and_root() {
+        assert_eq!(
+            extract_locations(&serde_json::json!({"file_path": "/a.rs", "old_string": "x"})),
+            vec![ToolCallLocation::new("/a.rs")]
+        );
+        assert_eq!(
+            extract_locations(&serde_json::json!({"path": "p", "root": "r"})),
+            vec![ToolCallLocation::new("p"), ToolCallLocation::new("r")]
+        );
+        assert!(extract_locations(&serde_json::json!("not an object")).is_empty());
+    }
 
     #[tokio::test]
     async fn genai_generation_settings_are_typed_bounded_and_provider_specific() {
