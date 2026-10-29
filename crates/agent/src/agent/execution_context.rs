@@ -94,7 +94,7 @@ pub(crate) struct ExecutionContext {
     pub run_objective: Option<RunObjective>,
     /// Reports execution phase changes back to the owning session actor.
     pub phase_reporter:
-        Option<tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>>,
+        Option<tokio::sync::mpsc::UnboundedSender<Option<crate::agent::turn_control::RunPhase>>>,
     /// Delegations left running when steering interrupts a wait.
     pub suspended_delegations: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// Immutable accounting handle for this execution cycle, created at the
@@ -196,7 +196,7 @@ impl ExecutionContext {
 
     pub fn with_phase_reporter(
         mut self,
-        reporter: tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>,
+        reporter: tokio::sync::mpsc::UnboundedSender<Option<crate::agent::turn_control::RunPhase>>,
     ) -> Self {
         self.phase_reporter = Some(reporter);
         self
@@ -221,9 +221,15 @@ impl ExecutionContext {
             .await
     }
 
+    pub fn report_runtime_change(&self) {
+        if let Some(reporter) = &self.phase_reporter {
+            let _ = reporter.send(None);
+        }
+    }
+
     pub fn report_phase(&self, phase: crate::agent::turn_control::RunPhase) {
         if let Some(reporter) = &self.phase_reporter {
-            let _ = reporter.send(phase);
+            let _ = reporter.send(Some(phase));
         }
     }
 

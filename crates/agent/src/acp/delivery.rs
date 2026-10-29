@@ -269,6 +269,15 @@ impl ConnectionDelivery {
         out
     }
 
+    pub(crate) fn observed_sessions(&self) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     /// Recover every durable event a lagged connection missed, for every
     /// session it has seen events of. Call [`Self::finish_lag_recovery`] after
     /// the returned events were handled.

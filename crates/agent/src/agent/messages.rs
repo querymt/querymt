@@ -69,12 +69,48 @@ pub struct SessionRuntimeStatus {
     pub queued_input_count: u32,
     #[typeshare(serialized_as = "Option<number>")]
     pub run_started_at_ms: Option<u64>,
+    pub observation: RuntimeObservation,
+    #[serde(default)]
+    pub delegation_activity:
+        Vec<crate::control::delegation_notifications::DelegationUpdateNotification>,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeObservation {
+    pub availability: RuntimeAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<String>,
+    #[typeshare(serialized_as = "Option<number>")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeAvailability {
+    Live,
+    Inactive,
+    Unavailable,
+}
+
+impl RuntimeObservation {
+    pub const INACTIVE: Self = Self {
+        availability: RuntimeAvailability::Inactive,
+        epoch: None,
+        revision: None,
+        reason: None,
+    };
 }
 
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRuntimePhase {
+    Unknown,
     Idle,
     Starting,
     Model,
@@ -85,6 +121,18 @@ pub enum SessionRuntimePhase {
 }
 
 impl SessionRuntimeStatus {
+    pub fn unavailable(reason: &str) -> Self {
+        Self {
+            phase: SessionRuntimePhase::Unknown,
+            observation: RuntimeObservation {
+                availability: RuntimeAvailability::Unavailable,
+                reason: Some(reason.to_string()),
+                ..RuntimeObservation::INACTIVE
+            },
+            ..Self::Idle
+        }
+    }
+
     #[allow(non_upper_case_globals)]
     pub const Idle: Self = Self {
         phase: SessionRuntimePhase::Idle,
@@ -93,6 +141,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 
     #[allow(non_upper_case_globals)]
@@ -103,6 +153,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 
     #[allow(non_upper_case_globals)]
@@ -113,6 +165,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 
     #[allow(non_upper_case_globals)]
@@ -123,6 +177,8 @@ impl SessionRuntimeStatus {
         pending_steering_count: 0,
         queued_input_count: 0,
         run_started_at_ms: None,
+        observation: RuntimeObservation::INACTIVE,
+        delegation_activity: Vec::new(),
     };
 }
 
@@ -153,7 +209,7 @@ pub(crate) struct PromptFinished {
 pub(crate) struct RunPhaseChanged {
     pub generation: u64,
     pub run_id: String,
-    pub phase: crate::agent::turn_control::RunPhase,
+    pub phase: Option<crate::agent::turn_control::RunPhase>,
 }
 
 /// Run a scheduled prompt on this session.

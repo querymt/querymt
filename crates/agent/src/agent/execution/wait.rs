@@ -73,8 +73,10 @@ pub(super) async fn transition_waiting_for_event(
     }
 
     if config.delegation_wait_policy == crate::config::DelegationWaitPolicy::Any {
+        let mut recover = true;
         loop {
             tokio::select! {
+                biased;
                 _ = exec_ctx.cancellation_token.cancelled() => {
                     return Ok(ExecutionState::Cancelled);
                 }
@@ -91,10 +93,17 @@ pub(super) async fn transition_waiting_for_event(
                     let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
                     return Ok(ExecutionState::BeforeLlmCall { context: new_context });
                 }
-                event = event_rx.recv() => {
+                recovered = durable_wait_outcomes(config, exec_ctx, &wait.correlation_ids), if recover => {
+                    recover = false;
+                    if let Some(outcome) = recovered?.into_iter().next() {
+                        let new_context = inject_wait_message(config, context, exec_ctx, format_wait_outcome(&outcome)).await?;
+                        return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                    }
+                }
+                event = event_rx.recv(), if !recover => {
                     let event = match event {
                         Ok(event) => event,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { recover = true; continue; },
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return Ok(ExecutionState::Stopped {
                                 message: "Event stream closed while waiting".into(),
@@ -145,9 +154,12 @@ pub(super) async fn transition_waiting_for_event(
         tokio::time::sleep(std::time::Duration::from_secs(u64::MAX / 2))
     };
     tokio::pin!(sleep);
+    let mut recover = true;
 
     loop {
+        let ids: Vec<_> = pending.iter().cloned().collect();
         tokio::select! {
+            biased;
             _ = exec_ctx.cancellation_token.cancelled() => {
                 return Ok(ExecutionState::Cancelled);
             }
@@ -175,10 +187,27 @@ pub(super) async fn transition_waiting_for_event(
                 let new_context = inject_wait_message(config, context, exec_ctx, message).await?;
                 return Ok(ExecutionState::BeforeLlmCall { context: new_context });
             }
-            event = event_rx.recv() => {
+            recovered = durable_wait_outcomes(config, exec_ctx, &ids), if recover => {
+                recover = false;
+                let mut progressed = false;
+                for outcome in recovered? {
+                    if pending.remove(outcome_id(&outcome)) {
+                        outcomes.push(format_wait_all_item(&outcome));
+                        progressed = true;
+                    }
+                }
+                if pending.is_empty() {
+                    let new_context = inject_wait_message(config, context, exec_ctx, format_wait_all_summary(&outcomes)).await?;
+                    return Ok(ExecutionState::BeforeLlmCall { context: new_context });
+                }
+                if progressed && timeout_secs > 0 {
+                    sleep.as_mut().reset(tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs));
+                }
+            }
+            event = event_rx.recv(), if !recover => {
                 let event = match event {
                     Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => { recover = true; continue; },
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Ok(ExecutionState::Stopped {
                             message: "Event stream closed while waiting".into(),
@@ -236,10 +265,14 @@ pub(super) async fn reconcile_suspended_delegations(
     if exec_ctx.suspended_delegations.lock().await.is_empty() {
         return Ok(context);
     }
+    context = recover_suspended(config, context, exec_ctx).await?;
     loop {
         let event = match event_rx.try_recv() {
             Ok(event) => event,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                context = recover_suspended(config, context, exec_ctx).await?;
+                continue;
+            }
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
             | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
         };
@@ -271,6 +304,66 @@ pub(super) async fn reconcile_suspended_delegations(
             inject_wait_message(config, &context, exec_ctx, format_wait_outcome(&outcome)).await?;
     }
     Ok(context)
+}
+
+async fn recover_suspended(
+    config: &AgentConfig,
+    mut context: Arc<crate::middleware::ConversationContext>,
+    exec_ctx: &ExecutionContext,
+) -> Result<Arc<crate::middleware::ConversationContext>, anyhow::Error> {
+    let ids: Vec<_> = exec_ctx
+        .suspended_delegations
+        .lock()
+        .await
+        .iter()
+        .cloned()
+        .collect();
+    for outcome in durable_wait_outcomes(config, exec_ctx, &ids).await? {
+        if exec_ctx
+            .suspended_delegations
+            .lock()
+            .await
+            .remove(outcome_id(&outcome))
+        {
+            context =
+                inject_wait_message(config, &context, exec_ctx, format_wait_outcome(&outcome))
+                    .await?;
+        }
+    }
+    Ok(context)
+}
+
+fn outcome_id(outcome: &WaitEventOutcome) -> &str {
+    match outcome {
+        WaitEventOutcome::Completed { delegation_id, .. }
+        | WaitEventOutcome::Failed { delegation_id, .. }
+        | WaitEventOutcome::Cancelled { delegation_id } => delegation_id,
+    }
+}
+
+async fn durable_wait_outcomes(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    ids: &[String],
+) -> Result<Vec<WaitEventOutcome>, anyhow::Error> {
+    let wait = WaitCondition {
+        reason: WaitReason::Delegation,
+        correlation_ids: ids.to_vec(),
+    };
+    let events = tokio::select! {
+        biased;
+        _ = exec_ctx.cancellation_token.cancelled() => return Ok(Vec::new()),
+        events = config.event_sink.journal().load_delegation_terminals(&exec_ctx.session_id, ids) => events?,
+    };
+    let mut seen = HashSet::new();
+    Ok(events
+        .into_iter()
+        .filter_map(|event| {
+            let outcome = match_wait_event(&wait, &crate::events::EventEnvelope::Durable(event))?;
+            seen.insert(outcome_id(&outcome).to_string())
+                .then_some(outcome)
+        })
+        .collect())
 }
 
 fn match_wait_event(
@@ -462,4 +555,340 @@ async fn inject_wait_message(
     );
 
     Ok(Arc::new(context.inject_message(content)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{backend::StorageBackend, sqlite_storage::SqliteStorage};
+
+    async fn fixture() -> (
+        AgentConfig,
+        ExecutionContext,
+        Arc<crate::middleware::ConversationContext>,
+        tempfile::TempDir,
+    ) {
+        let (plugins, dir) = crate::test_utils::empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            SqliteStorage::connect(dir.path().join("wait.db"))
+                .await
+                .unwrap(),
+        );
+        let store = storage.session_store();
+        let session = store.create_session(None, None, None, None).await.unwrap();
+        let config = crate::agent::agent_config_builder::AgentConfigBuilder::new(
+            Arc::new(plugins),
+            storage,
+            querymt::LLMParams::new()
+                .provider("mock")
+                .model("mock-model"),
+        )
+        .build();
+        let handle =
+            crate::session::provider::SessionHandle::new(config.provider.clone(), session.clone())
+                .await
+                .unwrap();
+        let state = crate::session::runtime::RuntimeContext::new(store, session.public_id.clone())
+            .await
+            .unwrap();
+        let runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            Default::default(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let exec = ExecutionContext::new(
+            session.public_id.clone(),
+            runtime,
+            state,
+            handle,
+            config.tool_config.clone(),
+        );
+        let context = Arc::new(crate::middleware::ConversationContext::new(
+            Arc::from(session.public_id.as_str()),
+            Arc::from([]),
+            Arc::new(crate::middleware::AgentStats::default()),
+            Arc::from("mock"),
+            Arc::from("mock-model"),
+        ));
+        (config, exec, context, dir)
+    }
+
+    #[tokio::test]
+    async fn delegation_wait_recovers_terminal_after_broadcast_lag_or_late_entry() {
+        for policy in [
+            crate::config::DelegationWaitPolicy::Any,
+            crate::config::DelegationWaitPolicy::All,
+        ] {
+            for late_entry in [false, true] {
+                let (mut config, exec, context, _dir) = fixture().await;
+                config.delegation_wait_policy = policy.clone();
+                let mut rx = config.subscribe_events();
+                config
+                    .emit_event_persisted(
+                        &exec.session_id,
+                        AgentEventKind::DelegationCompleted {
+                            delegation_id: "finished-child".into(),
+                            result: Some("result survives lost wakeup".into()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                if late_entry {
+                    rx = config.subscribe_events();
+                } else {
+                    for _ in 0..2048 {
+                        config.event_sink.emit_ephemeral(
+                            &exec.session_id,
+                            AgentEventKind::AssistantContentDelta {
+                                message_id: "noise".into(),
+                                content: "x".into(),
+                            },
+                        );
+                    }
+                    config
+                        .event_sink
+                        .session_stream(&exec.session_id)
+                        .flush()
+                        .await;
+                    assert!(matches!(
+                        rx.try_recv(),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+                    ));
+                }
+                let wait = WaitCondition {
+                    reason: WaitReason::Delegation,
+                    correlation_ids: vec!["finished-child".into()],
+                };
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx),
+                )
+                .await;
+                assert!(
+                    matches!(result, Ok(Ok(ExecutionState::BeforeLlmCall { .. }))),
+                    "terminal outcome lost for {policy:?}, late_entry={late_entry}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delegation_wait_recovers_lag_after_wait_entry() {
+        for policy in [
+            crate::config::DelegationWaitPolicy::Any,
+            crate::config::DelegationWaitPolicy::All,
+        ] {
+            let (mut config, exec, context, _dir) = fixture().await;
+            config.delegation_wait_policy = policy;
+            let mut rx = config.subscribe_events();
+            let mut lag_witness = config.subscribe_events();
+            let wait = WaitCondition {
+                reason: WaitReason::Delegation,
+                correlation_ids: vec!["mid-wait-child".into()],
+            };
+            let waiting = transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx);
+            tokio::pin!(waiting);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), &mut waiting)
+                    .await
+                    .is_err()
+            );
+            config
+                .emit_event_persisted(
+                    &exec.session_id,
+                    AgentEventKind::DelegationCompleted {
+                        delegation_id: "mid-wait-child".into(),
+                        result: Some("durable mid-wait completion".into()),
+                    },
+                )
+                .await
+                .unwrap();
+            for _ in 0..2200 {
+                config.event_sink.emit_ephemeral(
+                    &exec.session_id,
+                    AgentEventKind::AssistantContentDelta {
+                        message_id: "noise".into(),
+                        content: "x".into(),
+                    },
+                );
+            }
+            config
+                .event_sink
+                .session_stream(&exec.session_id)
+                .flush()
+                .await;
+            assert!(matches!(
+                lag_witness.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+            ));
+            assert!(matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting).await,
+                Ok(Ok(ExecutionState::BeforeLlmCall { .. }))
+            ));
+        }
+    }
+
+    struct TerminalReadGate {
+        inner: Arc<dyn crate::session::projection::EventJournal>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::session::projection::EventJournal for TerminalReadGate {
+        async fn load_delegation_terminals(
+            &self,
+            session: &str,
+            ids: &[String],
+        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.load_delegation_terminals(session, ids).await
+        }
+        fn max_session_seq_blocking(&self, session: &str) -> i64 {
+            self.inner.max_session_seq_blocking(session)
+        }
+        async fn append_durable(
+            &self,
+            event: &crate::session::projection::NewDurableEvent,
+        ) -> crate::session::error::SessionResult<crate::events::DurableEvent> {
+            self.inner.append_durable(event).await
+        }
+        async fn load_session_stream(
+            &self,
+            session: &str,
+            after: Option<i64>,
+            limit: Option<usize>,
+        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+            self.inner.load_session_stream(session, after, limit).await
+        }
+        async fn load_global_stream(
+            &self,
+            after: Option<i64>,
+            limit: Option<usize>,
+        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+            self.inner.load_global_stream(after, limit).await
+        }
+        async fn delete_session_events_from(
+            &self,
+            session: &str,
+            from: i64,
+        ) -> crate::session::error::SessionResult<usize> {
+            self.inner.delete_session_events_from(session, from).await
+        }
+        async fn append_durable_from_source(
+            &self,
+            event: &crate::session::projection::NewDurableEvent,
+        ) -> crate::session::error::SessionResult<Option<crate::events::DurableEvent>> {
+            self.inner.append_durable_from_source(event).await
+        }
+        async fn latest_source_seq(
+            &self,
+            session: &str,
+            node: &str,
+        ) -> crate::session::error::SessionResult<Option<i64>> {
+            self.inner.latest_source_seq(session, node).await
+        }
+        async fn remote_sync_cursor(
+            &self,
+            session: &str,
+            node: &str,
+        ) -> crate::session::error::SessionResult<Option<i64>> {
+            self.inner.remote_sync_cursor(session, node).await
+        }
+        async fn advance_remote_sync_cursor(
+            &self,
+            session: &str,
+            node: &str,
+            seq: i64,
+            complete: bool,
+        ) -> crate::session::error::SessionResult<()> {
+            self.inner
+                .advance_remote_sync_cursor(session, node, seq, complete)
+                .await
+        }
+        async fn load_remote_session_stream(
+            &self,
+            session: &str,
+            node: &str,
+        ) -> crate::session::error::SessionResult<Vec<crate::events::DurableEvent>> {
+            self.inner.load_remote_session_stream(session, node).await
+        }
+        async fn max_stream_seq(&self, session: &str) -> crate::session::error::SessionResult<i64> {
+            self.inner.max_stream_seq(session).await
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_durable_recovery_preserves_cancellation_and_inactivity_timeout() {
+        for cancel in [true, false] {
+            let (mut config, exec, context, _dir) = fixture().await;
+            config.delegation_wait_policy = crate::config::DelegationWaitPolicy::All;
+            config.delegation_wait_timeout_secs = 1;
+            let gate = Arc::new(TerminalReadGate {
+                inner: config.event_sink.journal().clone(),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            config.event_sink = Arc::new(crate::event_sink::EventSink::new(
+                gate.clone(),
+                Arc::new(crate::event_fanout::EventFanout::new()),
+            ));
+            let mut rx = config.subscribe_events();
+            let wait = WaitCondition {
+                reason: WaitReason::Delegation,
+                correlation_ids: vec!["stalled-child".into()],
+            };
+            let token = exec.cancellation_token.clone();
+            let trigger_gate = gate.clone();
+            let trigger = tokio::spawn(async move {
+                trigger_gate.entered.notified().await;
+                if cancel {
+                    token.cancel();
+                }
+            });
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                transition_waiting_for_event(&config, &wait, &context, &exec, &mut rx),
+            )
+            .await;
+            gate.release.notify_waiters();
+            trigger.abort();
+            if cancel {
+                assert!(matches!(result, Ok(Ok(ExecutionState::Cancelled))));
+            } else {
+                assert!(
+                    matches!(result, Ok(Ok(ExecutionState::BeforeLlmCall { .. }))),
+                    "terminal read must not defeat existing inactivity timeout"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suspended_delegation_recovery_does_not_depend_on_live_receiver() {
+        let (config, exec, context, _dir) = fixture().await;
+        exec.suspended_delegations
+            .lock()
+            .await
+            .insert("finished-child".into());
+        config
+            .emit_event_persisted(
+                &exec.session_id,
+                AgentEventKind::DelegationCompleted {
+                    delegation_id: "finished-child".into(),
+                    result: Some("saved result".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let mut rx = config.subscribe_events();
+        reconcile_suspended_delegations(&config, &context, &exec, &mut rx)
+            .await
+            .unwrap();
+        assert!(
+            exec.suspended_delegations.lock().await.is_empty(),
+            "durable result must resolve suspended steering wait"
+        );
+    }
 }

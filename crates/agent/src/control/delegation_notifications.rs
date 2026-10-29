@@ -25,6 +25,26 @@ impl DelegationUpdateState {
 }
 
 #[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationStage {
+    Queued,
+    Executing,
+    Verifying,
+    Finalizing,
+    CancelRequested,
+}
+
+#[typeshare]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationActivity {
+    Live,
+    #[default]
+    Historical,
+}
+
+#[typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DelegationUpdateNotification {
@@ -57,12 +77,22 @@ pub struct DelegationUpdateNotification {
     pub result_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default)]
+    pub activity: DelegationActivity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<DelegationStage>,
+    #[typeshare(serialized_as = "Option<number>")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epoch: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct DelegationUpdateProjector {
     snapshots: HashMap<String, DelegationUpdateNotification>,
     pending: HashMap<String, Vec<PendingDelegationTransition>>,
+    stage_order: HashMap<String, (String, i64)>,
     max_tracked: Option<usize>,
 }
 
@@ -75,6 +105,11 @@ enum PendingDelegationTransition {
         selected_provider_node_id: Option<String>,
         timestamp: i64,
     },
+    Stage {
+        timestamp: i64,
+        stage: Option<DelegationStage>,
+        source_epoch: String,
+    },
     Finished {
         timestamp: i64,
         state: DelegationUpdateState,
@@ -86,7 +121,9 @@ enum PendingDelegationTransition {
 impl PendingDelegationTransition {
     fn timestamp(&self) -> i64 {
         match self {
-            Self::Forked { timestamp, .. } | Self::Finished { timestamp, .. } => *timestamp,
+            Self::Forked { timestamp, .. }
+            | Self::Finished { timestamp, .. }
+            | Self::Stage { timestamp, .. } => *timestamp,
         }
     }
 
@@ -95,6 +132,7 @@ impl PendingDelegationTransition {
             (self, other),
             (Self::Forked { .. }, Self::Forked { .. })
                 | (Self::Finished { .. }, Self::Finished { .. })
+                | (Self::Stage { .. }, Self::Stage { .. })
         )
     }
 }
@@ -111,11 +149,90 @@ impl DelegationUpdateProjector {
         &mut self,
         event: &EventEnvelope,
     ) -> Option<DelegationUpdateNotification> {
-        self.project(event.session_id(), event.timestamp(), event.kind())
+        let id = match event.kind() {
+            AgentEventKind::DelegationRequested { delegation, .. } => {
+                Some(delegation.public_id.as_str())
+            }
+            AgentEventKind::SessionForked {
+                origin: ForkOrigin::Delegation,
+                fork_point_ref,
+                ..
+            } => Some(fork_point_ref.as_str()),
+            AgentEventKind::DelegationStageChanged { delegation_id, .. }
+            | AgentEventKind::DelegationCompleted { delegation_id, .. }
+            | AgentEventKind::DelegationFailed { delegation_id, .. }
+            | AgentEventKind::DelegationCancelled { delegation_id } => Some(delegation_id.as_str()),
+            _ => None,
+        };
+        // Replayed history cannot alter an already newer owned observation at the same order.
+        if let Some(current) = id.and_then(|id| self.snapshots.get(id))
+            && current.source_epoch.is_some()
+            && event.session_seq() > 0
+            && current
+                .session_seq
+                .is_some_and(|seq| event.session_seq() <= seq)
+        {
+            return None;
+        }
+        if let AgentEventKind::DelegationStageChanged {
+            delegation_id,
+            source_epoch,
+            ..
+        } = event.kind()
+        {
+            if event.session_seq() <= 0
+                || self
+                    .stage_order
+                    .get(delegation_id)
+                    .is_some_and(|(epoch, seq)| {
+                        epoch != source_epoch || event.session_seq() <= *seq
+                    })
+            {
+                return None;
+            }
+            self.stage_order.insert(
+                delegation_id.clone(),
+                (source_epoch.clone(), event.session_seq()),
+            );
+        }
+        let update = self.project(event.session_id(), event.timestamp(), event.kind())?;
+        if let Some(snapshot) = self.snapshots.get_mut(&update.delegation_id) {
+            let stage_seq = self
+                .stage_order
+                .get(&update.delegation_id)
+                .map_or(0, |(_, seq)| *seq);
+            let seq = event
+                .session_seq()
+                .max(stage_seq)
+                .max(snapshot.session_seq.unwrap_or(0));
+            if seq > 0 {
+                snapshot.session_seq = Some(seq);
+            }
+            return Some(snapshot.clone());
+        }
+        Some(update)
     }
 
     pub fn project_event(&mut self, event: &AgentEvent) -> Option<DelegationUpdateNotification> {
-        self.project(&event.session_id, event.timestamp, &event.kind)
+        self.project_envelope(&event.clone().into())
+    }
+
+    pub(crate) fn restore_observation(&mut self, update: DelegationUpdateNotification) {
+        if self
+            .snapshots
+            .get(&update.delegation_id)
+            .is_some_and(|current| {
+                current.session_seq.unwrap_or(0) > update.session_seq.unwrap_or(0)
+            })
+        {
+            return;
+        }
+        if let (Some(epoch), Some(seq)) = (&update.source_epoch, update.session_seq) {
+            self.stage_order
+                .insert(update.delegation_id.clone(), (epoch.clone(), seq));
+        }
+        self.snapshots.insert(update.delegation_id.clone(), update);
+        self.prune_snapshots();
     }
 
     pub fn snapshots(&self) -> Vec<DelegationUpdateNotification> {
@@ -164,6 +281,10 @@ impl DelegationUpdateProjector {
                     updated_at: timestamp,
                     result_summary: None,
                     error: None,
+                    activity: DelegationActivity::Historical,
+                    stage: None,
+                    session_seq: None,
+                    source_epoch: None,
                 };
                 self.snapshots
                     .insert(delegation.public_id.clone(), snapshot.clone());
@@ -198,6 +319,22 @@ impl DelegationUpdateProjector {
                     return None;
                 }
                 self.snapshots.get(fork_point_ref).cloned()
+            }
+            AgentEventKind::DelegationStageChanged {
+                delegation_id,
+                stage,
+                source_epoch,
+            } => {
+                let transition = PendingDelegationTransition::Stage {
+                    timestamp,
+                    stage: *stage,
+                    source_epoch: source_epoch.clone(),
+                };
+                if !self.apply_transition(delegation_id, transition.clone()) {
+                    self.queue_pending(delegation_id, transition);
+                    return None;
+                }
+                self.snapshots.get(delegation_id).cloned()
             }
             AgentEventKind::DelegationCompleted {
                 delegation_id,
@@ -260,6 +397,20 @@ impl DelegationUpdateProjector {
             return false;
         };
         match transition {
+            PendingDelegationTransition::Stage {
+                timestamp,
+                stage,
+                source_epoch,
+            } => {
+                snapshot.stage = stage;
+                snapshot.activity = if stage.is_some() {
+                    DelegationActivity::Live
+                } else {
+                    DelegationActivity::Historical
+                };
+                snapshot.source_epoch = Some(source_epoch);
+                snapshot.updated_at = snapshot.updated_at.max(timestamp);
+            }
             PendingDelegationTransition::Forked {
                 session_id,
                 child_session_id,
@@ -313,7 +464,9 @@ impl DelegationUpdateProjector {
             .iter_mut()
             .find(|existing| existing.same_kind(&transition))
         {
-            if transition.timestamp() < existing.timestamp() {
+            if matches!(transition, PendingDelegationTransition::Stage { .. })
+                || transition.timestamp() < existing.timestamp()
+            {
                 *existing = transition;
             }
         } else {
@@ -330,12 +483,14 @@ impl DelegationUpdateProjector {
             let Some(oldest) = self
                 .snapshots
                 .iter()
+                .filter(|(_, snapshot)| snapshot.activity != DelegationActivity::Live)
                 .min_by_key(|(_, snapshot)| snapshot.updated_at)
                 .map(|(id, _)| id.clone())
             else {
                 break;
             };
             self.snapshots.remove(&oldest);
+            self.stage_order.remove(&oldest);
         }
     }
 
@@ -428,6 +583,118 @@ mod tests {
             source_node: None,
             kind,
         }
+    }
+
+    #[test]
+    fn status_consistency_terminal_update_advances_stage_order() {
+        let mut projector = DelegationUpdateProjector::for_live_stream();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: None,
+                batch_id: None,
+            },
+        ));
+        let mut stage = event(
+            2,
+            AgentEventKind::DelegationStageChanged {
+                delegation_id: "delegation-1".into(),
+                stage: Some(DelegationStage::Finalizing),
+                source_epoch: "workflow-1".into(),
+            },
+        );
+        stage.session_seq = 10;
+        let before = projector.project_envelope(&stage.into()).unwrap();
+        let mut fork = event(
+            2,
+            AgentEventKind::SessionForked {
+                parent_session_id: "parent-1".into(),
+                child_session_id: "child-1".into(),
+                target_agent_id: "coder".into(),
+                origin: ForkOrigin::Delegation,
+                fork_point_type: ForkPointType::MessageIndex,
+                fork_point_ref: "delegation-1".into(),
+                instructions: None,
+                selected_model_id: None,
+                selected_provider_node_id: None,
+            },
+        );
+        fork.session_seq = 11;
+        let linked = projector.project_envelope(&fork.clone().into()).unwrap();
+        assert!(linked.session_seq > before.session_seq);
+        assert_eq!(linked.child_session_id.as_deref(), Some("child-1"));
+        let mut terminal = event(
+            2,
+            AgentEventKind::DelegationCompleted {
+                delegation_id: "delegation-1".into(),
+                result: Some("done".into()),
+            },
+        );
+        terminal.session_seq = 12;
+        let after = projector.project_envelope(&terminal.into()).unwrap();
+        assert!(
+            after.session_seq > before.session_seq,
+            "terminal result cannot share stale stage ordering"
+        );
+        assert_eq!(after.activity, DelegationActivity::Live);
+        assert!(after.session_seq > linked.session_seq);
+        assert!(
+            projector.project_event(&fork).is_none(),
+            "history cannot emit changed data at a stale/equal live order"
+        );
+        assert_eq!(projector.snapshots()[0], after);
+    }
+
+    #[test]
+    fn late_stage_cannot_resurrect_cleaned_workflow() {
+        let mut projector = DelegationUpdateProjector::for_live_stream();
+        projector.project_event(&event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: None,
+                batch_id: None,
+            },
+        ));
+        let stage = |seq, value| {
+            EventEnvelope::Ephemeral(crate::events::EphemeralEvent {
+                session_id: "parent-1".into(),
+                session_seq: seq,
+                timestamp: 2,
+                origin: EventOrigin::Local,
+                source_node: None,
+                kind: AgentEventKind::DelegationStageChanged {
+                    delegation_id: "delegation-1".into(),
+                    stage: value,
+                    source_epoch: "workflow-1".into(),
+                },
+            })
+        };
+        projector.project_envelope(&stage(10, Some(DelegationStage::Verifying)));
+        projector.project_event(&event(
+            2,
+            AgentEventKind::DelegationCancelled {
+                delegation_id: "delegation-1".into(),
+            },
+        ));
+        assert_eq!(
+            projector.snapshots()[0].activity,
+            DelegationActivity::Live,
+            "terminal record must not hide owned cleanup"
+        );
+        projector.project_envelope(&stage(12, None));
+        assert_eq!(
+            projector.snapshots()[0].activity,
+            DelegationActivity::Historical
+        );
+        projector.project_envelope(&stage(11, Some(DelegationStage::Verifying)));
+        assert_eq!(
+            projector.snapshots()[0].activity,
+            DelegationActivity::Historical,
+            "late same-timestamp stage must not revive cleanup"
+        );
+        assert_eq!(projector.snapshots()[0].session_seq, Some(12));
     }
 
     #[test]

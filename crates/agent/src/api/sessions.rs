@@ -815,7 +815,7 @@ impl AgentSessions {
         let remote_scope = acp_session_scope_from_meta(request.meta.as_ref());
         #[cfg(feature = "remote")]
         if let Some(cursor) = remote_cursor {
-            return Self::list_acp_remote_page(
+            let mut page = Self::list_acp_remote_page(
                 agent,
                 &remote_nodes,
                 remote_cwd.as_deref(),
@@ -823,7 +823,9 @@ impl AgentSessions {
                 lifecycle,
                 cursor,
             )
-            .await;
+            .await?;
+            Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
+            return Ok(page);
         }
 
         let mut page = if pinned.is_some() {
@@ -844,7 +846,6 @@ impl AgentSessions {
         } else {
             Self::list_for_acp_from_view_store(view_store.clone(), request).await?
         };
-        Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
         #[cfg(feature = "remote")]
         if !remote_nodes.is_empty() && page.next_cursor.is_none() {
             let remote_page = Self::list_acp_remote_page(
@@ -860,6 +861,7 @@ impl AgentSessions {
             page.next_cursor = remote_page.next_cursor;
             page.total_count += remote_page.total_count;
         }
+        Self::hydrate_acp_session_meta(agent, view_store, &mut page.sessions).await?;
         Ok(page)
     }
 
@@ -1212,22 +1214,7 @@ impl AgentSessions {
         } else {
             HashMap::new()
         };
-        let actor_refs = {
-            let registry = agent.registry.lock().await;
-            registry.get_many(session_ids.iter().map(String::as_str))
-        };
-        let runtime_statuses = futures_util::future::join_all(actor_refs.into_iter().map(
-            |(session_id, actor_ref)| async move {
-                let status = actor_ref
-                    .get_runtime_status()
-                    .await
-                    .unwrap_or(SessionRuntimeStatus::Idle);
-                (session_id, status)
-            },
-        ))
-        .await
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+        let runtime_statuses = agent.observe_session_runtimes(&session_ids).await;
 
         for info in sessions {
             let session_id = info.session_id.to_string();
@@ -1238,7 +1225,7 @@ impl AgentSessions {
             let runtime_status = runtime_statuses
                 .get(&session_id)
                 .cloned()
-                .unwrap_or(SessionRuntimeStatus::Idle);
+                .unwrap_or_else(|| SessionRuntimeStatus::unavailable("observation_unavailable"));
             let has_errors = stats.last_finish_reason == Some(FinishReason::Error);
             let meta = SessionMeta {
                 message_count: stats.message_count,

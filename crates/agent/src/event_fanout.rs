@@ -15,6 +15,8 @@ const FANOUT_BUFFER: usize = 1024;
 pub struct EventFanout {
     sender: broadcast::Sender<EventEnvelope>,
     delegation_sender: broadcast::Sender<(EventEnvelope, Option<tracing::Span>)>,
+    delegation_activity:
+        parking_lot::Mutex<crate::control::delegation_notifications::DelegationUpdateProjector>,
 }
 
 impl EventFanout {
@@ -25,6 +27,7 @@ impl EventFanout {
         Self {
             sender,
             delegation_sender,
+            delegation_activity: parking_lot::Mutex::new(crate::control::delegation_notifications::DelegationUpdateProjector::for_live_stream()),
         }
     }
 
@@ -59,10 +62,39 @@ impl EventFanout {
         envelope: EventEnvelope,
         parent: Option<tracing::Span>,
     ) {
+        self.delegation_activity.lock().project_envelope(&envelope);
         if Self::is_delegation_event(envelope.kind()) {
             let _ = self.delegation_sender.send((envelope.clone(), parent));
         }
         let _ = self.sender.send(envelope);
+    }
+
+    pub(crate) fn live_delegation_activity(
+        &self,
+        session_id: &str,
+    ) -> Vec<crate::control::delegation_notifications::DelegationUpdateNotification> {
+        self.delegation_activity
+            .lock()
+            .snapshots()
+            .into_iter()
+            .filter(|update| {
+                update.session_id == session_id
+                    && update.activity
+                        == crate::control::delegation_notifications::DelegationActivity::Live
+            })
+            .collect()
+    }
+
+    pub(crate) fn delegation_snapshots(
+        &self,
+        session_ids: &[String],
+    ) -> Vec<crate::control::delegation_notifications::DelegationUpdateNotification> {
+        self.delegation_activity
+            .lock()
+            .snapshots()
+            .into_iter()
+            .filter(|update| session_ids.contains(&update.session_id))
+            .collect()
     }
 
     /// Number of active subscribers.

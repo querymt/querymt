@@ -483,7 +483,7 @@ impl LocalAgentHandle {
     fn should_return_without_force_stop(
         status: crate::agent::messages::SessionRuntimeStatus,
     ) -> bool {
-        matches!(status, crate::agent::messages::SessionRuntimeStatus::Idle)
+        status.phase == crate::agent::messages::SessionRuntimePhase::Idle
     }
 }
 

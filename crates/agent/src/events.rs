@@ -274,6 +274,14 @@ pub struct AgentEvent {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentEventKind {
     SessionCreated,
+    RuntimeChanged {
+        runtime: crate::agent::messages::SessionRuntimeStatus,
+    },
+    DelegationStageChanged {
+        delegation_id: String,
+        stage: Option<crate::control::delegation_notifications::DelegationStage>,
+        source_epoch: String,
+    },
     SessionWorkspaceBound {
         workspace: crate::session::projection::SessionWorkspaceView,
         #[typeshare(serialized_as = "Option<string>")]
@@ -1141,6 +1149,10 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // ── Ephemeral: high-frequency streaming deltas ──────────────
         // Rationale: per-token chunks; the full content is captured by
         // AssistantMessageStored which IS durable.
+        // Live owner observations, not persisted evidence that work survives a restart.
+        AgentEventKind::RuntimeChanged { .. } | AgentEventKind::DelegationStageChanged { .. } => {
+            Durability::Ephemeral
+        }
         AgentEventKind::UserPromptBlock { .. } => Durability::Ephemeral,
         AgentEventKind::AssistantContentDelta { .. } => Durability::Ephemeral,
         AgentEventKind::AssistantThinkingDelta { .. } => Durability::Ephemeral,

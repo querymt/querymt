@@ -294,6 +294,9 @@ async fn websocket_event_forwarder_recovers_from_broadcast_lag_in_order() {
             })
             .expect("wire open");
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        if json["method"] == super::shared::QMT_NOTIFICATION_RUNTIME_CHANGED {
+            continue;
+        }
         let text = json["params"]["update"]["content"]["text"]
             .as_str()
             .expect("agent message text")
@@ -314,12 +317,118 @@ async fn websocket_event_forwarder_recovers_from_broadcast_lag_in_order() {
         reasoning_parts: Vec::new(),
         message_id: Some("id-after".to_string()),
     });
-    let raw = timeout(Duration::from_secs(5), wire_rx.recv())
-        .await
-        .expect("update after recovery")
-        .expect("wire open");
-    let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let json = timeout(Duration::from_secs(5), async {
+        loop {
+            let raw = wire_rx.recv().await.expect("wire open");
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if json["method"] != super::shared::QMT_NOTIFICATION_RUNTIME_CHANGED {
+                break json;
+            }
+        }
+    })
+    .await
+    .expect("update after recovery");
     assert_eq!(json["params"]["update"]["content"]["text"], "after-lag");
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn status_consistency_lag_refreshes_ephemeral_runtime_and_cleanup() {
+    use crate::control::delegation_notifications::DelegationStage;
+    let (fixture, session_id) = prompt_fixture().await;
+    let state = WsServerState::new(fixture.handle.clone());
+    state
+        .session_owners
+        .lock()
+        .await
+        .insert(session_id.clone(), HashSet::from(["lag-observer".into()]));
+    let (tx, mut rx) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    let mut connection = connection_state_for_test(
+        "lag-observer",
+        tx,
+        Default::default(),
+        Arc::new(AtomicU64::new(1)),
+    );
+    connection.connection_cancel = cancel.clone();
+    spawn_event_forwarders(state, connection, test_translator());
+    let stream = fixture.config.event_sink.session_stream(&session_id);
+    let delegation = crate::session::domain::Delegation {
+        isolation: Default::default(),
+        id: 0,
+        public_id: "lag-workflow".into(),
+        session_id: 0,
+        task_id: None,
+        target_agent_id: "coder".into(),
+        objective: "observe cleanup".into(),
+        objective_hash: Default::default(),
+        context: None,
+        constraints: None,
+        expected_output: None,
+        verification_spec: None,
+        planning_summary: None,
+        status: crate::session::domain::DelegationStatus::Requested,
+        retry_count: 0,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        completed_at: None,
+    };
+    stream.emit(AgentEventKind::DelegationRequested {
+        delegation,
+        tool_call_id: None,
+        batch_id: None,
+    });
+    stream.emit_ephemeral(AgentEventKind::DelegationStageChanged {
+        delegation_id: "lag-workflow".into(),
+        stage: Some(DelegationStage::Verifying),
+        source_epoch: "lag-owner".into(),
+    });
+    stream.flush().await;
+    // Wait until the bounded wire is full, then lose BOTH ephemeral final observations.
+    timeout(Duration::from_secs(2), async {
+        while rx.is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::task::yield_now().await;
+    stream.emit_ephemeral(AgentEventKind::DelegationStageChanged {
+        delegation_id: "lag-workflow".into(),
+        stage: None,
+        source_epoch: "lag-owner".into(),
+    });
+    stream.emit_ephemeral(AgentEventKind::RuntimeChanged {
+        runtime: fixture
+            .handle
+            .observe_session_runtimes(std::slice::from_ref(&session_id))
+            .await
+            .remove(&session_id)
+            .unwrap(),
+    });
+    for _ in 0..2200 {
+        stream.emit_ephemeral(AgentEventKind::AssistantThinkingDelta {
+            content: "noise".into(),
+            message_id: "lag-noise".into(),
+            part_id: None,
+        });
+    }
+    stream.flush().await;
+    let mut idle = false;
+    let mut cleanup = false;
+    timeout(Duration::from_secs(8), async {
+        while !(idle && cleanup) {
+            let message: serde_json::Value =
+                serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            idle |= message["method"] == "querymt/session/runtimeChanged"
+                && message["params"]["runtime"]["phase"] == "idle";
+            cleanup |= message["method"] == "querymt/session/delegationUpdate"
+                && message["params"]["delegationId"] == "lag-workflow"
+                && message["params"]["activity"] == "historical"
+                && message["params"]["sourceEpoch"] == "lag-owner";
+        }
+    })
+    .await
+    .expect("lag must refresh current runtime and cached cleanup, not only durable text");
     cancel.cancel();
 }
 

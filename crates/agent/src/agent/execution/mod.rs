@@ -164,6 +164,9 @@ pub(crate) async fn apply_pending_steering(
     if pending.is_empty() {
         return Ok(None);
     }
+    // Consumption happens off the actor mailbox; publish its new count even if
+    // the next model/tool interval is silent and no phase transition follows.
+    exec_ctx.report_runtime_change();
 
     let mut messages = context.messages.to_vec();
     for input in pending {

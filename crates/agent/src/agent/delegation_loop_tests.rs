@@ -2294,6 +2294,182 @@ async fn cancelled_delegation_resolves_child_after_terminal_claim() {
 }
 
 #[tokio::test]
+async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct() {
+    use crate::control::delegation_notifications::{DelegationActivity, DelegationStage};
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    harness.stop_harness_orchestrator();
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    let parent_id = harness.exec_ctx.session_id.clone();
+    let parent = store.get_session(&parent_id).await.unwrap().unwrap();
+    let release_file = harness._temp_dir.path().join("verification-release");
+    let entered_file = harness._temp_dir.path().join("verification-entered");
+    let delegation = store
+        .create_delegation(Delegation {
+            id: 0,
+            public_id: String::new(),
+            session_id: parent.id,
+            task_id: None,
+            target_agent_id: "agent".into(),
+            objective: "bounded verification cleanup".into(),
+            objective_hash: crate::hash::RapidHash::new(b"bounded verification cleanup"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: Some(crate::verification::VerificationSpec {
+                description: "wait for test release".into(),
+                strategy: Default::default(),
+                steps: vec![crate::verification::VerificationStep::ToolCall {
+                    tool_name: "shell".into(),
+                    arguments: serde_json::json!({"command": "sh", "args": ["-c", ": > \"$2\"; i=0; while test ! -f \"$1\" && test $i -lt 500; do i=$((i+1)); sleep 0.01; done; test -f \"$1\"", "qmt-verification", release_file, entered_file], "workdir": harness._temp_dir.path()}),
+                    expectation: crate::verification::Expectation::Success,
+                    error_message: None,
+                }],
+            }),
+            status: DelegationStatus::Requested,
+            isolation: Default::default(),
+            retry_count: 0,
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: None,
+            planning_summary: None,
+        })
+        .await
+        .unwrap();
+    let mut verification_tools = crate::tools::ToolRegistry::new();
+    verification_tools.add(Arc::new(crate::tools::builtins::ShellTool::new()));
+    let orchestrator = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            store.clone(),
+            config.agent_registry.clone(),
+            Arc::new(verification_tools),
+            config.hooks.clone(),
+            None,
+        )
+        .with_verification(true)
+        .with_cancel_grace_secs(2),
+    );
+    let listener = orchestrator.start_listening(config.event_sink.fanout());
+    let mut events = config.subscribe_events();
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationRequested {
+            delegation: delegation.clone(),
+            tool_call_id: None,
+            batch_id: None,
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged {
+                    stage: Some(DelegationStage::Verifying),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !entered_file.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual verification shell must be waiting before cancellation");
+    let activity = config.event_sink.live_delegation_activity(&parent_id);
+    let child_id = activity[0].child_session_id.clone().unwrap();
+    let delegate = config.agent_registry.get_handle("agent").unwrap();
+    let local = delegate
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .unwrap();
+    let child = local
+        .observe_session_runtimes(std::slice::from_ref(&child_id))
+        .await
+        .remove(&child_id)
+        .unwrap();
+    assert_eq!(
+        child.phase,
+        crate::agent::messages::SessionRuntimePhase::Idle
+    );
+    assert_eq!(activity[0].stage, Some(DelegationStage::Verifying));
+    assert!(
+        store
+            .transition_delegation_status(
+                &delegation.public_id,
+                DelegationStatus::Running,
+                DelegationStatus::Cancelled
+            )
+            .await
+            .unwrap()
+    );
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationCancelRequested {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationCancelled {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged {
+                    stage: Some(DelegationStage::CancelRequested),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let during = config.event_sink.live_delegation_activity(&parent_id);
+    assert_eq!(during[0].activity, DelegationActivity::Live);
+    assert_eq!(
+        during[0].state,
+        crate::control::delegation_notifications::DelegationUpdateState::Cancelled
+    );
+    assert_eq!(during[0].stage, Some(DelegationStage::CancelRequested));
+    tokio::fs::write(release_file, "released").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged { stage: None, .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        config
+            .event_sink
+            .live_delegation_activity(&parent_id)
+            .is_empty()
+    );
+    orchestrator.cancel_active_delegations().await;
+    listener.abort();
+}
+
+#[tokio::test]
 async fn verification_failure_resolves_terminal_delegate_child() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     harness.stop_harness_orchestrator();

@@ -36,6 +36,8 @@ pub struct UserPromptRecord {
 #[typeshare]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionLoadSnapshot {
+    #[serde(rename = "runtimeStatus")]
+    pub runtime_status: crate::agent::messages::SessionRuntimeStatus,
     pub audit: AuditView,
     pub cursor: StreamCursor,
     /// Authoritative replacement accounting at `cursor`, reduced from the same
@@ -126,8 +128,25 @@ pub async fn load_session_snapshot(
         session_id,
         audit.events.iter().map(|event| &event.kind),
     );
-    let delegation_updates =
+    let mut delegation_updates =
         crate::control::delegation_notifications::delegation_updates_from_events(&audit.events);
+    let runtime_status = agent
+        .observe_session_runtimes(&[session_id.to_string()])
+        .await
+        .remove(session_id)
+        .unwrap_or_else(|| {
+            crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
+        });
+    for live in &runtime_status.delegation_activity {
+        if let Some(previous) = delegation_updates
+            .iter_mut()
+            .find(|entry| entry.delegation_id == live.delegation_id)
+        {
+            *previous = live.clone();
+        } else {
+            delegation_updates.push(live.clone());
+        }
+    }
     // Journal-backed sessions (remote attached, or merely bookmarked while
     // offline) live on their peer and have no local history rows, so
     // `get_history` reports `SessionNotFound`. Treat that as an empty history
@@ -151,6 +170,7 @@ pub async fn load_session_snapshot(
     };
     let user_prompts = Some(user_prompt_records(&messages));
     Ok(SessionLoadSnapshot {
+        runtime_status,
         audit,
         cursor,
         accounting,
@@ -322,6 +342,15 @@ mod tests {
         store
             .expect_get_remote_session_bookmark()
             .returning(|_| Ok(None))
+            .times(2);
+        let observed_session = session.clone();
+        store
+            .expect_get_session()
+            .returning(move |_| Ok(Some(observed_session.clone())))
+            .times(1);
+        store
+            .expect_get_session_runtime_binding()
+            .returning(|_| Ok(None))
             .times(1);
         store
             .expect_get_history()
@@ -400,6 +429,7 @@ mod tests {
     #[test]
     fn old_snapshot_without_user_prompts_deserializes() {
         let value = serde_json::json!({
+            "runtimeStatus": crate::agent::messages::SessionRuntimeStatus::unavailable("snapshot_fixture"),
             "audit": {
                 "session_id": "s1",
                 "events": [],
@@ -563,7 +593,8 @@ mod tests {
                     }))
                 }
             })
-            .times(1);
+            .times(2);
+        store.expect_get_session().returning(|_| Ok(None)).times(1);
         let (plugin_registry, _temp_dir) = empty_plugin_registry().unwrap();
         let provider = Arc::new(SessionProvider::new(
             Arc::new(plugin_registry),

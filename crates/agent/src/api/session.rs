@@ -118,15 +118,18 @@ impl AgentSession {
     }
 
     pub async fn runtime_state(&self) -> Result<crate::agent::messages::SessionRuntimeStatus> {
-        let session = self
+        let state = self
             .agent
-            .session_ref_for_agent_session(&self.session_id)
+            .observe_session_runtimes(std::slice::from_ref(&self.session_id))
             .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-        session
-            .get_runtime_status()
-            .await
-            .map_err(|error| anyhow!(error.to_string()))
+            .remove(&self.session_id)
+            .unwrap_or_else(|| {
+                crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
+            });
+        if state.observation.reason.as_deref() == Some("session_not_found") {
+            return Err(anyhow!("unknown session"));
+        }
+        Ok(state)
     }
 
     pub async fn steer(&self, expected_run_id: &str, prompt: &str) -> Result<()> {

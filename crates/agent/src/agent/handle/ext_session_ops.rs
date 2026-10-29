@@ -224,22 +224,15 @@ impl LocalAgentHandle {
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
         let parsed: SessionIdRequest = parse_session_op_request(req)?;
-        #[cfg(feature = "remote")]
-        let state = self
-            .execute_session_operation(
-                &parsed.session_id,
-                session_operation::SessionOperation::RuntimeState,
-                |session_ref| Box::pin(session_ref.get_runtime_status()),
-            )
-            .await
-            .map_err(session_operation::SessionOperationError::into_acp_error)?;
-        #[cfg(not(feature = "remote"))]
-        let state = self
-            .session_ref_for_agent_session(&parsed.session_id)
-            .await?
-            .get_runtime_status()
-            .await
-            .map_err(Error::from)?;
+        let mut observations = self
+            .observe_session_runtimes(std::slice::from_ref(&parsed.session_id))
+            .await;
+        let state = observations.remove(&parsed.session_id).unwrap_or_else(|| {
+            crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
+        });
+        if state.observation.reason.as_deref() == Some("session_not_found") {
+            return Err(Error::invalid_params().data("unknown session"));
+        }
         ext_json_response(&state)
     }
 

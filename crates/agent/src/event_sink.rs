@@ -80,6 +80,13 @@ impl EventSink {
         .cloned()
     }
 
+    pub(crate) fn live_delegation_activity(
+        &self,
+        session_id: &str,
+    ) -> Vec<crate::control::delegation_notifications::DelegationUpdateNotification> {
+        self.fanout.live_delegation_activity(session_id)
+    }
+
     /// The ordered emit handle of a session, created on first use.
     ///
     /// All emitters of one session (actor, execution task, delegation,

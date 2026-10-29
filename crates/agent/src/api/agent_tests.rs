@@ -1135,7 +1135,11 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
         child_meta
             .get("runtimeStatus")
             .and_then(|status| status.get("phase")),
-        Some(&serde_json::json!("idle"))
+        Some(&serde_json::json!("unknown"))
+    );
+    assert_eq!(
+        child_meta["runtimeStatus"]["observation"]["availability"], "unavailable",
+        "unmaterialized in-memory storage has no owner or run-lease evidence"
     );
     assert_eq!(
         child_meta
