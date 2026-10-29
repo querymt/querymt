@@ -51,6 +51,7 @@ impl ToolTrait for ReadTaskTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": { "task_id": { "type": "string" } }
                 }),
                 strict: None,
@@ -96,6 +97,7 @@ impl ToolTrait for UpdateTaskTool {
                 description: "Patch a task commitment using compare-and-swap revision control. Use complete_task for completion.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "task_id": { "type": "string" },
                         "expected_revision": { "type": "integer", "minimum": 1 },
@@ -220,6 +222,7 @@ impl ToolTrait for CompleteTaskTool {
                         .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "task_id": { "type": "string" },
                         "expected_revision": { "type": "integer", "minimum": 1 },

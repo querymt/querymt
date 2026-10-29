@@ -605,6 +605,116 @@ QueryMT includes several built-in commands:
 
 For complete slash commands documentation, see [Slash Commands Guide](slash-commands.md).
 
+## Tool Argument Handling
+
+Builtin tool parameters use `snake_case` names everywhere. The edit tools were the
+only exception and were renamed in a single release:
+
+| Tool | Canonical parameters |
+|---|---|
+| `edit` | `file_path`, `old_string`, `new_string`, `replace_all` |
+| `multiedit` | `file_path`, `edits[]` of `old_string`, `new_string`, `replace_all` |
+| `replace_symbol` | `replacements[]` of `path`, `symbol`, `kind`, `occurrence`, `expected_hash`, `new_text`; `root` |
+
+**Permanent aliases.** The previous camelCase names (`filePath`, `oldString`,
+`newString`, `replaceAll`, `newText`, `expectedHash`) and the short forms `old_str` /
+`new_str` are still accepted, at the top level and inside `edits` / `replacements`
+items, and are renamed to the canonical names before the call is processed. Aliases
+are never advertised to the model and exist only for builtin tools: MCP and provider
+tools receive their keys unchanged. Sending two spellings of one parameter (for
+example `new_string` and `newString`) is rejected, even when the values are equal.
+
+**Closed schemas.** Every builtin object schema sets `additionalProperties: false`, so
+an unknown key fails validation instead of being ignored.
+
+**Unambiguous shape repairs.** Before validation the schema is used to repair
+mistakes that have one reading: a JSON string where an array or object is expected, an
+integer sent as a string (`"466, "`), a single string where an array of strings is
+expected, and a single edit or replacement sent without its `edits` / `replacements`
+array. Broken JSON, string-typed content (such as edit text that happens to contain
+JSON) and union-typed values are never modified.
+
+`search_text.exclude` accepts either one glob string or an array of globs. A
+`question` header longer than 12 characters is accepted and shortened to its first 12
+Unicode scalar values before it is shown.
+
+### Raw and effective arguments
+
+Every tool call has two argument representations with separate owners:
+
+| Representation | What it is | Consumed by |
+|---|---|---|
+| **Raw** | The argument text exactly as the model emitted it (aliases, stringified containers, odd whitespace). Never rewritten. | Stored assistant output/history, provider replay on the next request, diagnostics. |
+| **Effective** | Normalised, hook-adjusted and validated arguments of the prepared call. | `pre_tool_use` hooks (the normalised input), validation, file-access scheduling, middleware review (`ParallelEditGuard`), permission checks, tool invocation, snapshots, `ToolCallStart` events, progress records, `post_tool_use` hooks, and the `tool_arguments` stored on tool results. |
+
+A repair therefore never rewrites history: the assistant message keeps what the model
+sent, while the matching tool result records what actually ran, including a target
+changed by a hook.
+
+### Preparation order
+
+Each call is prepared once, in model order, and the prepared call (not the raw
+text) is what gets scheduled and executed:
+
+0. Reject invalid outer input (see [Invalid outer input](#invalid-outer-input)). No
+   hook, permission check or tool sees such a call.
+1. Normalise the raw arguments (aliases, shape repairs). Conflicting spellings reject
+   the call before any hook runs.
+2. Run `pre_tool_use` hooks once on the normalised input. A hook `updated_input` is
+   normalised the same way; a hook block wins over a conflict inside its replacement.
+3. Validate the effective arguments against the tool schema.
+4. Declare the call's file access from the effective arguments.
+5. Middleware reviews the prepared batch (`on_prepared_tool_calls`) and may reject
+   calls, for example `ParallelEditGuard` in `deny` mode.
+6. Conflict-aware waves are planned from the declared accesses and executed.
+
+Preparation happens one execution segment at a time. A segment is a run of
+parallel-safe calls, or a single stateful/clarification barrier call. Calls after a
+barrier are prepared only after it finished, so their hooks see its effects (for
+example an updated task state). Calls skipped by cancellation or by a clarification
+answer are never prepared: their hooks do not run and they receive a synthetic result
+in model order. Every call ends with exactly one result.
+
+### Invalid outer input
+
+For every provider, a call whose raw arguments are malformed JSON, are not a JSON
+object, or were marked invalid by the provider is **never executed**. It is rejected
+before hooks, permission checks and invocation, and receives exactly one error result
+whose text is `{"INVALID_JSON": "<raw input>"}`. The raw input is cut to 2,000 Unicode
+scalar values. Invalid input never becomes an executable `{}`.
+
+The Anthropic provider marks a streamed tool call invalid when its completed buffer is
+not a JSON object, and when `max_tokens` interrupts the block, even if the partial
+buffer happens to parse. Each interrupted block completes exactly once, before the
+response terminates. A block that finished normally before the limit is not
+invalidated, and a block with no input deltas is the valid zero-argument call `{}`. The
+marker travels on the canonical function-call item and is carried onto the prepared
+call; it is not inferred from the argument text.
+
+This is different from an unrepaired value *inside* a valid object:
+
+```jsonc
+// Invalid outer input: rejected as INVALID_JSON, hooks and tool never run.
+{"edits": [
+
+// Valid outer object, unrepairable nested string: reaches schema validation, so hooks
+// run once and the error lists the violation with a hint.
+// /edits: expected array, got string: "[{\"old_string\": ..."; hint: `edits` must be
+// a JSON array of objects, not a string containing JSON
+{"file_path": "a.rs", "edits": "[{\"old_string\": \"x\", "}
+```
+
+The rejected call keeps its raw arguments in stored assistant history, and the tool
+result records them as emitted (there are no effective arguments to record).
+
+### Anthropic history replay
+
+Anthropic requires `tool_use.input` to be an object. When an assistant tool call whose
+stored arguments are not a JSON object is replayed, the provider sends `input: {}` and
+logs a warning containing the call ID (never the argument text). That `{}` is a protocol
+placeholder only: stored history keeps the raw arguments, the matching error result
+stays in place, and the placeholder is never executed.
+
 ## New Tools Reference
 
 QueryMT includes several new code intelligence tools:
@@ -664,7 +774,7 @@ Replace entire symbol bodies using AST byte ranges:
 replace_symbol(replacements=[{
     path: "src/lib.rs",
     symbol: "my_function",
-    newText: "fn my_function() -> i32 { 42 }"
+    new_text: "fn my_function() -> i32 { 42 }"
 }])
 ```
 

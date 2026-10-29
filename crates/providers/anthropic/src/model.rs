@@ -180,6 +180,17 @@ impl ClaudeModel {
         ThinkingClass::Budget
     }
 
+    /// Strict tool use (`strict: true`) is available on Opus and Sonnet 4.5+,
+    /// Haiku 4.5+, and every Fable and Mythos model. Unversioned Opus, Sonnet
+    /// and Haiku IDs and unrecognised families do not qualify.
+    pub fn supports_strict_tools(&self) -> bool {
+        match self.family {
+            Family::Opus | Family::Sonnet | Family::Haiku => self.version_at_least(4, 5),
+            Family::Fable | Family::Mythos => true,
+            Family::Other => false,
+        }
+    }
+
     /// Opus 4.7+, every Claude 5+, Fable and Mythos reject non-default
     /// `temperature`, `top_p` and `top_k`.
     pub fn rejects_sampling_params(&self) -> bool {
@@ -359,6 +370,36 @@ mod tests {
             resolve_thinking_class(sonnet45.as_ref(), Some(true)),
             ThinkingClass::OptInAdaptive
         );
+    }
+
+    #[test]
+    fn strict_tool_support_by_family_and_version() {
+        let cases = [
+            ("claude-opus-4-5", true),
+            ("claude-opus-4-8", true),
+            ("claude-sonnet-4-5-20250929", true),
+            ("claude-sonnet-5-5", true),
+            ("claude-haiku-4-5", true),
+            ("claude-haiku-5", true),
+            ("claude-fable-5", true),
+            ("claude-mythos-preview", true),
+            ("claude-sonnet-4-0", false),
+            ("claude-opus-4-1", false),
+            ("claude-haiku-4-0", false),
+            ("claude-3-7-sonnet-20250219", false),
+            ("claude-3-5-haiku-20241022", false),
+            ("claude-instant-1", false),
+        ];
+        for (id, expected) in cases {
+            let parsed = parse_claude_model(id);
+            assert_eq!(
+                parsed.is_some_and(|m| m.supports_strict_tools()),
+                expected,
+                "{id}"
+            );
+        }
+        // Unrecognisable IDs never parse, so they never qualify.
+        assert!(parse_claude_model("my-proxy-model").is_none());
     }
 
     #[test]

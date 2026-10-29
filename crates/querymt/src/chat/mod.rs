@@ -31,8 +31,8 @@ pub use output::{
     ChatFunctionCallItem, ChatInputPart, ChatMessageItem, ChatMessagePart, ChatMessagePayload,
     ChatOpaqueItem, ChatOpaquePart, ChatOutput, ChatOutputItem, ChatOutputProvenance,
     ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatTextAnnotation, Extensions,
-    MediaKind, MediaNormalizationError, MediaPart, MediaSource, MediaType, MediaTypeError,
-    ToolResult, ToolResultPart, empty_message_part,
+    INVALID_INPUT_EXTENSION, MediaKind, MediaNormalizationError, MediaPart, MediaSource, MediaType,
+    MediaTypeError, ToolResult, ToolResultPart, empty_message_part,
 };
 pub use streaming::{
     ANTHROPIC_BLOCK_EXTENSION, ANTHROPIC_REDACTED_THINKING, ChatMessagePartDelta,

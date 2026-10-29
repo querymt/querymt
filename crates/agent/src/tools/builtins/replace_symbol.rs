@@ -12,11 +12,39 @@ use std::path::{Path, PathBuf};
 
 use crate::index::symbol_index::{SymbolDigest, SymbolIndex, SymbolKind, parse_kind_filter};
 use crate::tools::{
-    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, resolve_arg_path,
-    root_arg_resolves,
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
+    WrapRule, effective_root, resolve_arg_path,
 };
 
 use super::helpers::{resolve_root, resolve_target};
+
+/// Compatibility spellings accepted inside `replacements` items (never advertised).
+const REPLACE_SYMBOL_ARG_ALIASES: &[ArgAlias] = &[
+    ArgAlias {
+        scope: AliasScope::ArrayItems("replacements"),
+        from: "newText",
+        to: "new_text",
+    },
+    ArgAlias {
+        scope: AliasScope::ArrayItems("replacements"),
+        from: "expectedHash",
+        to: "expected_hash",
+    },
+];
+
+/// A single replacement may be sent flat, without the `replacements` array.
+const REPLACE_SYMBOL_WRAP: WrapRule = WrapRule {
+    array: "replacements",
+    fields: &[
+        "path",
+        "symbol",
+        "kind",
+        "occurrence",
+        "expected_hash",
+        "new_text",
+    ],
+    required: &["path", "symbol", "new_text"],
+};
 
 pub struct ReplaceSymbolTool;
 
@@ -96,13 +124,14 @@ impl Tool for ReplaceSymbolTool {
                                         "default": 0,
                                         "minimum": 0
                                     },
-                                    "expectedHash": {
+                                    "expected_hash": {
                                         "type": "string",
                                         "description": "If provided, the replacement is rejected when the current hash does not match."
                                     },
-                                    "newText": { "type": "string", "description": "New symbol body text." }
+                                    "new_text": { "type": "string", "description": "New symbol body text." }
                                 },
-                                "required": ["path", "symbol", "newText"]
+                                "required": ["path", "symbol", "new_text"],
+                                "additionalProperties": false
                             }
                         },
                         "root": {
@@ -111,7 +140,8 @@ impl Tool for ReplaceSymbolTool {
                             "default": "."
                         }
                     },
-                    "required": ["replacements"]
+                    "required": ["replacements"],
+                    "additionalProperties": false
                 }),
                 strict: None,
             },
@@ -122,13 +152,20 @@ impl Tool for ReplaceSymbolTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn arg_aliases(&self) -> &'static [ArgAlias] {
+        REPLACE_SYMBOL_ARG_ALIASES
+    }
+
+    fn wrap_single_item(&self) -> Option<WrapRule> {
+        Some(REPLACE_SYMBOL_WRAP)
+    }
+
     fn file_access(&self, args: &Value, cwd: Option<&Path>) -> FileAccess {
-        // Mirror `call`: `resolve_root` must succeed, and every target goes
-        // through `ToolContext::resolve_path` (relative paths are joined with
-        // the cwd, so `root` never changes which file a relative path names).
-        if !root_arg_resolves(args, cwd) {
+        // Mirror `call`: `resolve_root` must succeed, and every relative
+        // target is joined with that root (see `helpers::resolve_target`).
+        let Some(root) = effective_root(args, cwd) else {
             return FileAccess::None;
-        }
+        };
         let Some(entries) = args.get("replacements").and_then(Value::as_array) else {
             return FileAccess::None;
         };
@@ -138,7 +175,7 @@ impl Tool for ReplaceSymbolTool {
             let Some(path) = entry
                 .get("path")
                 .and_then(Value::as_str)
-                .and_then(|raw| resolve_arg_path(raw, cwd))
+                .and_then(|raw| resolve_arg_path(raw, Some(&root)))
             else {
                 // Malformed entry: the call fails validation before writing.
                 return FileAccess::None;
@@ -170,7 +207,7 @@ impl Tool for ReplaceSymbolTool {
             let mut resolved: Vec<ResolvedReplacement> = Vec::new();
 
             for req in &requests {
-                let target = resolve_target(&req.path, &root, context)?;
+                let target = resolve_target(&req.path, &root);
 
                 // Read file if not already loaded
                 let content = match file_contents.get(&target) {
@@ -307,11 +344,11 @@ fn parse_replacements(args: &Value) -> Result<Vec<ReplacementRequest>, ToolError
             let kind = parse_kind_filter(kind_str).map_err(ToolError::InvalidRequest)?;
             let occurrence = r.get("occurrence").and_then(Value::as_u64).unwrap_or(0) as usize;
             let expected_hash = r
-                .get("expectedHash")
+                .get("expected_hash")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let new_text = r.get("newText").and_then(Value::as_str).ok_or_else(|| {
-                ToolError::InvalidRequest("each replacement requires newText".to_string())
+            let new_text = r.get("new_text").and_then(Value::as_str).ok_or_else(|| {
+                ToolError::InvalidRequest("each replacement requires new_text".to_string())
             })?;
 
             Ok(ReplacementRequest {
@@ -471,7 +508,7 @@ mod tests {
                     "replacements": [{
                         "path": "lib.rs",
                         "symbol": "greet",
-                        "newText": "fn greet() {\n    println!(\"world\");\n}"
+                        "new_text": "fn greet() {\n    println!(\"world\");\n}"
                     }],
                     "root": dir.path()
                 }),
@@ -510,7 +547,7 @@ mod tests {
                     "replacements": [{
                         "path": "Counter.svelte",
                         "symbol": "increment",
-                        "newText": "function increment(): void {\n    count += 2;\n}"
+                        "new_text": "function increment(): void {\n    count += 2;\n}"
                     }],
                     "root": dir.path()
                 }),
@@ -545,7 +582,7 @@ mod tests {
                     "replacements": [{
                         "path": "lib.rs",
                         "symbol": "Config",
-                        "newText": "struct Config {\n    name: String,\n    version: u32,\n}"
+                        "new_text": "struct Config {\n    name: String,\n    version: u32,\n}"
                     }],
                     "root": dir.path()
                 }),
@@ -574,8 +611,8 @@ mod tests {
                     "replacements": [{
                         "path": "lib.rs",
                         "symbol": "foo",
-                        "expectedHash": "bogus_hash",
-                        "newText": "fn foo() { 1 }"
+                        "expected_hash": "bogus_hash",
+                        "new_text": "fn foo() { 1 }"
                     }],
                     "root": dir.path()
                 }),
@@ -607,10 +644,10 @@ mod tests {
             .call(
                 json!({
                     "replacements": [
-                        {"path": "lib.rs", "symbol": "a", "newText": "fn a() { 1 }"},
+                        {"path": "lib.rs", "symbol": "a", "new_text": "fn a() { 1 }"},
                         // "b" doesn't overlap with "a" in this case, but let's make it overlap
                         // by requesting the same symbol twice
-                        {"path": "lib.rs", "symbol": "a", "occurrence": 0, "newText": "fn a() { 2 }"}
+                        {"path": "lib.rs", "symbol": "a", "occurrence": 0, "new_text": "fn a() { 2 }"}
                     ],
                     "root": dir.path()
                 }),
@@ -639,8 +676,8 @@ mod tests {
             tool.call(
                 json!({
                     "replacements": [
-                        {"path": "a.rs", "symbol": "alpha", "newText": "fn alpha() { 10 }"},
-                        {"path": "b.rs", "symbol": "beta", "newText": "fn beta() { 20 }"}
+                        {"path": "a.rs", "symbol": "alpha", "new_text": "fn alpha() { 10 }"},
+                        {"path": "b.rs", "symbol": "beta", "new_text": "fn beta() { 20 }"}
                     ],
                     "root": dir.path()
                 }),
@@ -674,24 +711,61 @@ mod tests {
         std::fs::create_dir_all(cwd.join("sub")).unwrap();
         let tool = ReplaceSymbolTool::new();
 
-        // Same resolution as `call`: relative paths go through
-        // `ToolContext::resolve_path` (joined with cwd); `root` must resolve.
+        // Same resolution as `call`: relative paths are joined with `root`
+        // (itself resolved against cwd); absolute paths are used as written.
         let access = tool.file_access(
             &json!({
                 "root": "sub",
                 "replacements": [
-                    {"path": "a.rs", "symbol": "alpha", "newText": "x"},
-                    {"path": cwd.join("sub/b.rs").to_str().unwrap(), "symbol": "beta", "newText": "y"},
-                    {"path": "./a.rs", "symbol": "alpha2", "newText": "z"}
+                    {"path": "a.rs", "symbol": "alpha", "new_text": "x"},
+                    {"path": cwd.join("sub/b.rs").to_str().unwrap(), "symbol": "beta", "new_text": "y"},
+                    {"path": "./a.rs", "symbol": "alpha2", "new_text": "z"}
                 ]
             }),
             Some(&cwd),
         );
 
-        // Duplicate spellings of a.rs collapse into one entry.
+        // Duplicate spellings of a.rs collapse into one entry, under `root`.
         assert_eq!(
             access,
-            FileAccess::writes([cwd.join("a.rs"), cwd.join("sub/b.rs")])
+            FileAccess::writes([cwd.join("sub/a.rs"), cwd.join("sub/b.rs")])
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_root_not_cwd() {
+        // Mirrors the real failure: session cwd is one repo, `root` another.
+        let cwd_dir = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        let target = root_dir.path().join("src/lib.rs");
+        tokio::fs::create_dir_all(target.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&target, "fn greet() {}\n").await.unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = ReplaceSymbolTool::new();
+        let args = json!({
+            "replacements": [{
+                "path": "src/lib.rs",
+                "symbol": "greet",
+                "new_text": "fn greet() { 1 }"
+            }],
+            "root": root_dir.path()
+        });
+
+        // `file_access` must predict the same file `call` writes.
+        let cwd = dunce::canonicalize(cwd_dir.path()).unwrap();
+        let canonical_target = dunce::canonicalize(&target).unwrap();
+        assert_eq!(
+            tool.file_access(&args, Some(&cwd)),
+            FileAccess::writes([canonical_target])
+        );
+
+        tool.call(args, &context).await.unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&target).await.unwrap(),
+            "fn greet() { 1 }\n"
         );
     }
 
@@ -707,7 +781,7 @@ mod tests {
         );
         assert_eq!(
             tool.file_access(
-                &json!({"replacements": [{"symbol": "a", "newText": "b"}]}),
+                &json!({"replacements": [{"symbol": "a", "new_text": "b"}]}),
                 Some(&cwd)
             ),
             FileAccess::None
@@ -715,7 +789,7 @@ mod tests {
         // Relative paths cannot be resolved without a cwd.
         assert_eq!(
             tool.file_access(
-                &json!({"replacements": [{"path": "a.rs", "symbol": "a", "newText": "b"}]}),
+                &json!({"replacements": [{"path": "a.rs", "symbol": "a", "new_text": "b"}]}),
                 None
             ),
             FileAccess::None
@@ -735,7 +809,7 @@ mod tests {
         let err = tool
             .call(
                 json!({
-                    "replacements": [{"path": "lib.rs", "symbol": "missing", "newText": "fn missing() {}"}],
+                    "replacements": [{"path": "lib.rs", "symbol": "missing", "new_text": "fn missing() {}"}],
                     "root": dir.path()
                 }),
                 &context,

@@ -1,5 +1,62 @@
 //! Helper functions for creating test fixtures
 
+/// In-memory metric capture for tests. Installs one process-wide meter provider
+/// on first use (run tests with `cargo nextest run`, one process per test);
+/// assertions should compare counter deltas so they stay independent of other
+/// calls recorded in the same process.
+pub(crate) mod genai_metrics {
+    use opentelemetry::Value;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+    use std::sync::OnceLock;
+
+    static STATE: OnceLock<(InMemoryMetricExporter, SdkMeterProvider)> = OnceLock::new();
+
+    fn state() -> &'static (InMemoryMetricExporter, SdkMeterProvider) {
+        STATE.get_or_init(|| {
+            let exporter = InMemoryMetricExporter::default();
+            let provider = SdkMeterProvider::builder()
+                .with_reader(PeriodicReader::builder(exporter.clone()).build())
+                .build();
+            opentelemetry::global::set_meter_provider(provider.clone());
+            (exporter, provider)
+        })
+    }
+
+    /// Install the capture provider. Call before the code under test records.
+    pub(crate) fn install() {
+        let _ = state();
+    }
+
+    /// Current cumulative value of counter `name` summed over every data point
+    /// whose attributes include all of `want`.
+    pub(crate) fn sum(name: &str, want: &[(&str, Value)]) -> u64 {
+        let (exporter, provider) = state();
+        exporter.reset();
+        provider.force_flush().expect("flush metrics");
+        let mut total = 0;
+        for resource in exporter.get_finished_metrics().expect("finished metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                    if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                        for point in sum.data_points() {
+                            let attrs: Vec<_> = point.attributes().collect();
+                            if want.iter().all(|(key, value)| {
+                                attrs
+                                    .iter()
+                                    .any(|kv| kv.key.as_str() == *key && &kv.value == value)
+                            }) {
+                                total += point.value();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+}
+
 /// Isolated, capture-based trace tests; never installs global telemetry or uses OTLP.
 pub(crate) mod genai_trace {
     use opentelemetry::trace::TracerProvider as _;
@@ -175,6 +232,7 @@ pub fn mock_tool_call(id: &str, name: &str, args: &str) -> ToolCall {
             name: name.to_string(),
             arguments: args.to_string(),
         },
+        invalid_input: false,
     }
 }
 

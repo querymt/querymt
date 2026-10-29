@@ -147,6 +147,49 @@ Spans may carry lightweight metadata such as:
     guarantee for preexisting diagnostic logs or span events: verbose logging
     can include payload previews, so use it only with appropriate data controls.
 
+### Metrics
+
+The agent exports two counters through the same OTLP endpoint as traces and logs
+(periodic export; `QMT_NO_TELEMETRY` disables them as well).
+
+| Metric | Attributes | Meaning |
+|---|---|---|
+| `querymt.tool.args_repaired` | `tool`, `rule` | One increment per argument repair actually applied before validation. `rule` is `alias`, `wrap`, `json_string`, `int_string` or `scalar_to_array`. |
+| `querymt.tool.calls` | `tool`, `repaired`, `outcome` | One increment per tool call. `repaired` is `true` when at least one repair was applied. `outcome` is `success`, `error` (the tool ran or its pipeline failed) or `rejected` (never ran: conflicting spellings, hook block, validation failure or middleware rejection). |
+
+Repairs are counted once per call, when its arguments are prepared: both the
+normalisation of the model's arguments and the normalisation of a pre-tool hook
+replacement count, but scheduling, middleware review, execution and re-normalising an
+already canonical value do not. A repaired call is also marked on its
+`execute_tool` span with `querymt.tool.args_repairs`, the list of applied rule
+names (never argument values).
+
+Rule counters alone cannot tell whether a repair helped, because a call can be
+repaired and still fail. Use `querymt.tool.calls` for that:
+
+```text
+# repaired calls that ran fine vs. repaired calls that still failed, per tool
+sum by (tool, outcome) (querymt_tool_calls_total{repaired="true"})
+
+# share of repaired calls that did not succeed
+sum(querymt_tool_calls_total{repaired="true", outcome!="success"})
+  / sum(querymt_tool_calls_total{repaired="true"})
+
+# which repairs fire most
+sum by (tool, rule) (increase(querymt_tool_args_repaired_total[7d]))
+```
+
+(Metric names are shown in Prometheus form; other backends may render dots
+differently.)
+
+**Retention.** QueryMT does not retain metrics itself. Counters are cumulative and
+kept for as long as your collector/backend keeps them; choose a window of at least
+seven days to compare release periods. Failure and volume figures that must be
+independent of telemetry come from the session execution records (stored tool
+results, with `is_error` and the effective arguments), which live as long as the
+session history. If the metrics backend is unavailable, report repair outcomes as
+unavailable instead of inferring them from failed calls.
+
 ### Logs
 
 Application log messages at the configured level and above are exported

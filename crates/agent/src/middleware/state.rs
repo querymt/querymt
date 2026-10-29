@@ -111,6 +111,11 @@ pub fn calculate_context_tokens(usage: Option<&querymt::Usage>) -> u64 {
 pub struct ToolCall {
     pub id: String,
     pub function: ToolFunction,
+    /// The provider marked this call's input invalid (for example a block cut
+    /// off by a token limit), even if `function.arguments` parses. Read from the
+    /// canonical function-call item before the lossy projection to
+    /// `querymt::ToolCall`. Such a call is rejected before hooks or invocation.
+    pub invalid_input: bool,
 }
 
 #[derive(Debug, Clone)]

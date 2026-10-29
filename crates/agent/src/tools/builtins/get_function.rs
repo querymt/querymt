@@ -43,6 +43,7 @@ impl Tool for GetFunctionTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "paths": {
                             "type": "array",
@@ -96,7 +97,7 @@ impl Tool for GetFunctionTool {
 
         let mut file_results = Vec::new();
         for path_str in &path_strs {
-            let target = resolve_target(path_str, &root, context)?;
+            let target = resolve_target(path_str, &root);
             let content = tokio::fs::read_to_string(&target)
                 .await
                 .map_err(|e| ToolError::ProviderError(format!("Failed to read file: {e}")))?;
@@ -283,6 +284,29 @@ mod tests {
             ToolResultPart::Text { text } => text,
             _ => panic!("expected text content"),
         }
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_root_not_cwd() {
+        let cwd_dir = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        tokio::fs::write(root_dir.path().join("lib.rs"), "fn alpha() {}\n")
+            .await
+            .unwrap();
+        let context =
+            AgentToolContext::basic("session".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = GetFunctionTool::new();
+        let args = json!({"paths": ["lib.rs"], "names": ["alpha"], "root": root_dir.path()});
+
+        let cwd = dunce::canonicalize(cwd_dir.path()).unwrap();
+        let expected = dunce::canonicalize(root_dir.path().join("lib.rs")).unwrap();
+        assert_eq!(
+            tool.file_access(&args, Some(&cwd)),
+            crate::tools::FileAccess::reads([expected])
+        );
+
+        let result = text_content(tool.call(args, &context).await.unwrap());
+        assert!(result.contains("00001| fn alpha()"));
     }
 
     #[tokio::test]

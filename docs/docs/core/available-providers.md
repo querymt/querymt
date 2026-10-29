@@ -297,6 +297,25 @@ adaptive_thinking = true   # force opt-in adaptive thinking
 
 The sampling and forced-tool-choice rules always use the parsed model ID and ignore this override.
 
+#### Strict tool use (`strict_tools`)
+
+Strict tool use makes the API enforce a tool's input schema during sampling. One optional provider setting controls it:
+
+```toml
+[providers.anthropic]
+strict_tools = ["edit", "multiedit", "replace_symbol"]
+```
+
+A tool is eligible when its definition sets `strict: true` or its unprefixed name is in `strict_tools` (names are matched before the OAuth `mcp_` prefix is applied). The provider itself has no default list: when `strict_tools` is unset or empty, no tool is selected by name, but tools whose definitions explicitly set `strict: true` stay eligible. The QueryMT agent fills in `["edit", "multiedit", "replace_symbol"]` for Anthropic when you have not set `strict_tools`; set `strict_tools = []` to turn that off. Builtin tool definitions never set `strict`, so OpenAI Responses behaviour is unchanged.
+
+Eligible tools are sent with `"strict": true` only when every check passes:
+
+- **Model.** Opus and Sonnet 4.5 or later, Haiku 4.5 or later, and all Fable and Mythos models. Older or unrecognised model IDs send no `strict` field and the original schemas (logged at debug level).
+- **Schema.** Strict mode accepts a subset of JSON Schema, so the provider converts a *copy* of each schema: fixed-property objects are closed (`additionalProperties: false`), and numeric limits, string-length limits, `maxItems` and `minItems` above 1 move into the property description, for example `(minimum: 0)`. Required and optional properties are unchanged. The agent still validates calls against the original schema. A tool whose schema cannot be converted safely (external or recursive references, dictionaries or open objects, `pattern`, unsupported formats, `oneOf`/`allOf`/`not` and other unknown keywords) is sent non-strict with its original schema and a warning naming the tool and the unsupported feature. Other eligible tools stay strict. This applies to explicit and name-selected strictness alike.
+- **Budgets.** Counted over the successfully converted tools only: at most 20 strict tools, 24 optional properties and 16 union properties (`anyOf` or type arrays). If any limit is exceeded, *every* tool in that request is sent non-strict with its original schema and a warning names the limit.
+
+Strict tools work the same over API key and OAuth: OAuth strict requests were verified against the live API on `claude-sonnet-4-5` and `claude-sonnet-5-5` (see `scripts/verify-anthropic-strict.sh`).
+
 ### llama-cpp
 
 Wraps [llama.cpp](https://github.com/ggerganov/llama.cpp). Supports GGUF models, vision/multimodal models, and streaming. Broadest hardware support of the three native providers.

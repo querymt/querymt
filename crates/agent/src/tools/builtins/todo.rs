@@ -68,12 +68,14 @@ impl Tool for TodoWriteTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "todos": {
                             "type": "array",
                             "description": "The updated todo list",
                             "items": {
                                 "type": "object",
+                                "additionalProperties": false,
                                 "properties": {
                                     "id": {
                                         "type": "string",
@@ -172,6 +174,7 @@ impl Tool for TodoReadTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {},
                     "required": []
                 }),

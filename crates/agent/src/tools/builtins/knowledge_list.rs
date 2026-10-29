@@ -33,6 +33,7 @@ impl ToolTrait for KnowledgeListTool {
                 description: "List knowledge entries that have not been consolidated yet. Use this to find entries that need to be synthesized into higher-level insights.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "limit": {
                             "type": "integer",

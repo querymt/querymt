@@ -37,6 +37,7 @@ impl ToolTrait for DeleteFileTool {
                 description: "Delete a file or directory.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",

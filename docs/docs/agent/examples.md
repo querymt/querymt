@@ -953,7 +953,7 @@ src/tests.rs:25 - Test: #[test] fn test_my_struct()
 > replace_symbol(replacements=[{
     path: "src/lib.rs",
     symbol: "my_function",
-    newText: "fn my_function() -> i32 {\n    42\n}"
+    new_text: "fn my_function() -> i32 {\n    42\n}"
 }])
 ```
 

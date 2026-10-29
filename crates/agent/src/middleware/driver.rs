@@ -1,11 +1,43 @@
 use crate::agent::core::SessionRuntime;
 use crate::events::SessionLimits;
-use crate::middleware::{ExecutionState, Result};
+use crate::middleware::{ExecutionState, Result, ToolCall, ToolResult};
+use crate::tools::FileAccess;
 use async_trait::async_trait;
 use log::{debug, trace};
+use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, instrument};
+
+/// One prepared tool call as seen by middleware review.
+///
+/// `args` are the *effective* arguments (normalised and hook-adjusted) and
+/// `access` is the file access the tool declared for exactly those arguments.
+/// The model-emitted arguments on `call` must not be used for conflict
+/// decisions.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedToolCall<'a> {
+    pub call: &'a ToolCall,
+    pub args: &'a serde_json::Value,
+    pub access: &'a FileAccess,
+}
+
+/// The prepared, executable calls of one scheduling segment, in model order.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedBatch<'a> {
+    pub session_id: &'a str,
+    pub cwd: Option<&'a Path>,
+    pub calls: &'a [PreparedToolCall<'a>],
+}
+
+/// Outcome of reviewing one prepared call.
+#[derive(Debug)]
+pub enum PreparedCallVerdict {
+    /// The call may be scheduled and executed.
+    Proceed,
+    /// The call is not executed; this is its final result.
+    Reject(Box<ToolResult>),
+}
 
 /// Trait for middleware that runs at specific lifecycle phases
 ///
@@ -48,6 +80,21 @@ pub trait MiddlewareDriver: Send + Sync {
         _runtime: Option<&Arc<SessionRuntime>>,
     ) -> Result<ExecutionState> {
         Ok(state)
+    }
+
+    /// Reviews calls after argument preparation (normalisation, pre-tool hooks,
+    /// validation) and before scheduling. Conflict-aware middleware must decide
+    /// from `batch`'s effective arguments and accesses, never from raw model
+    /// output. Returns one verdict per call in `batch.calls`, in order.
+    async fn on_prepared_tool_calls(
+        &self,
+        batch: &PreparedBatch<'_>,
+    ) -> Result<Vec<PreparedCallVerdict>> {
+        Ok(batch
+            .calls
+            .iter()
+            .map(|_| PreparedCallVerdict::Proceed)
+            .collect())
     }
 
     /// Runs once when the turn is about to complete (state is Complete).
@@ -212,6 +259,44 @@ impl CompositeDriver {
             Some(cancellation_token),
         )
         .await
+    }
+
+    /// Run every driver's [`MiddlewareDriver::on_prepared_tool_calls`] review.
+    /// A call rejected by one driver is not shown to later drivers. Returns one
+    /// verdict per input call, in order.
+    pub async fn run_prepared_tool_calls(
+        &self,
+        batch: &PreparedBatch<'_>,
+    ) -> Result<Vec<PreparedCallVerdict>> {
+        let mut verdicts: Vec<PreparedCallVerdict> = batch
+            .calls
+            .iter()
+            .map(|_| PreparedCallVerdict::Proceed)
+            .collect();
+        for driver in &self.drivers {
+            let live: Vec<usize> = verdicts
+                .iter()
+                .enumerate()
+                .filter(|(_, verdict)| matches!(verdict, PreparedCallVerdict::Proceed))
+                .map(|(index, _)| index)
+                .collect();
+            if live.is_empty() {
+                break;
+            }
+            let subset: Vec<PreparedToolCall<'_>> =
+                live.iter().map(|&index| batch.calls[index]).collect();
+            let reviewed = driver
+                .on_prepared_tool_calls(&PreparedBatch {
+                    session_id: batch.session_id,
+                    cwd: batch.cwd,
+                    calls: &subset,
+                })
+                .await?;
+            for (&index, verdict) in live.iter().zip(reviewed) {
+                verdicts[index] = verdict;
+            }
+        }
+        Ok(verdicts)
     }
 
     pub async fn run_turn_end(

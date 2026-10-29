@@ -39,6 +39,7 @@ impl ToolTrait for DelegateTool {
                 description: "Delegate a task to another specialized agent.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "target_agent_id": {
                             "type": "string",

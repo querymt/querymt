@@ -550,6 +550,7 @@ pub(crate) async fn execute_cycle_state_machine(
                         .collect::<Vec<_>>();
                     let next = transitions::transition_processing_tool_calls(
                         config,
+                        &driver,
                         &Arc::from(Vec::new().into_boxed_slice()),
                         &Arc::from(skipped.into_boxed_slice()),
                         &steered_context,
@@ -601,6 +602,7 @@ pub(crate) async fn execute_cycle_state_machine(
                     } => {
                         transitions::transition_processing_tool_calls(
                             config,
+                            &driver,
                             remaining_calls,
                             results,
                             context,

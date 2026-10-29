@@ -8,16 +8,44 @@ use serde_json::{Value, json};
 use super::edit::EditTool;
 use crate::tools::builtins::edit_output;
 use crate::tools::{
-    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, single_path_write_access,
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
+    WrapRule, single_path_write_access,
+};
+
+const fn item_alias(from: &'static str, to: &'static str) -> ArgAlias {
+    ArgAlias {
+        scope: AliasScope::ArrayItems("edits"),
+        from,
+        to,
+    }
+}
+
+/// Compatibility spellings accepted for `multiedit`: top-level `filePath` and the
+/// per-item edit names (never advertised).
+const MULTIEDIT_ARG_ALIASES: &[ArgAlias] = &[
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "filePath",
+        to: "file_path",
+    },
+    item_alias("oldString", "old_string"),
+    item_alias("old_str", "old_string"),
+    item_alias("newString", "new_string"),
+    item_alias("new_str", "new_string"),
+    item_alias("replaceAll", "replace_all"),
+];
+
+/// A single edit may be sent flat, without the `edits` array.
+const MULTIEDIT_WRAP: WrapRule = WrapRule {
+    array: "edits",
+    fields: &["old_string", "new_string", "replace_all"],
+    required: &["old_string", "new_string"],
 };
 
 #[derive(Deserialize)]
 struct EditOperation {
-    #[serde(rename = "oldString")]
     old_string: String,
-    #[serde(rename = "newString")]
     new_string: String,
-    #[serde(rename = "replaceAll")]
     #[serde(default)]
     replace_all: bool,
 }
@@ -53,7 +81,7 @@ impl Tool for MultiEditTool {
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "filePath": {
+                        "file_path": {
                             "type": "string",
                             "description": "The absolute path to the file to modify"
                         },
@@ -63,25 +91,27 @@ impl Tool for MultiEditTool {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "oldString": {
+                                    "old_string": {
                                         "type": "string",
                                         "description": "The text to replace"
                                     },
-                                    "newString": {
+                                    "new_string": {
                                         "type": "string",
                                         "description": "The text to replace it with"
                                     },
-                                    "replaceAll": {
+                                    "replace_all": {
                                         "type": "boolean",
                                         "description": "Replace all occurrences (default false)",
                                         "default": false
                                     }
                                 },
-                                "required": ["oldString", "newString"]
+                                "required": ["old_string", "new_string"],
+                                "additionalProperties": false
                             }
                         }
                     },
-                    "required": ["filePath", "edits"]
+                    "required": ["file_path", "edits"],
+                    "additionalProperties": false
                 }),
                 strict: None,
             },
@@ -92,8 +122,16 @@ impl Tool for MultiEditTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn arg_aliases(&self) -> &'static [ArgAlias] {
+        MULTIEDIT_ARG_ALIASES
+    }
+
+    fn wrap_single_item(&self) -> Option<WrapRule> {
+        Some(MULTIEDIT_WRAP)
+    }
+
     fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
-        single_path_write_access(args, "filePath", cwd)
+        single_path_write_access(args, "file_path", cwd)
     }
 
     async fn call(
@@ -102,9 +140,9 @@ impl Tool for MultiEditTool {
         context: &dyn ToolContext,
     ) -> Result<Vec<ToolResultPart>, ToolError> {
         let file_path_str = args
-            .get("filePath")
+            .get("file_path")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("filePath is required".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidRequest("file_path is required".to_string()))?;
 
         let edits_val = args
             .get("edits")
@@ -126,13 +164,13 @@ impl Tool for MultiEditTool {
         for (index, edit) in edits.iter().enumerate() {
             if edit.old_string.is_empty() {
                 return Err(ToolError::InvalidRequest(format!(
-                    "edit {} has empty oldString",
+                    "edit {} has empty old_string",
                     index + 1
                 )));
             }
             if edit.old_string == edit.new_string {
                 return Err(ToolError::InvalidRequest(format!(
-                    "edit {} has identical oldString and newString",
+                    "edit {} has identical old_string and new_string",
                     index + 1
                 )));
             }
@@ -205,7 +243,7 @@ mod tests {
         let root = dunce::canonicalize(temp_dir.path()).unwrap();
         let tool = MultiEditTool::new();
 
-        let access = tool.file_access(&json!({"filePath": "docs/../a.md"}), Some(&root));
+        let access = tool.file_access(&json!({"file_path": "docs/../a.md"}), Some(&root));
 
         assert_eq!(access, FileAccess::writes([root.join("a.md")]));
     }
@@ -217,7 +255,7 @@ mod tests {
 
         assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
         assert_eq!(
-            tool.file_access(&json!({"filePath": null}), Some(&cwd)),
+            tool.file_access(&json!({"file_path": null}), Some(&cwd)),
             FileAccess::None
         );
     }
@@ -233,16 +271,16 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "hello",
-                    "newString": "hi"
+                    "old_string": "hello",
+                    "new_string": "hi"
                 },
                 {
-                    "oldString": "rust",
-                    "newString": "Rust",
-                    "replaceAll": true
+                    "old_string": "rust",
+                    "new_string": "Rust",
+                    "replace_all": true
                 }
             ]
         });
@@ -277,15 +315,15 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "hello",
-                    "newString": "hi"
+                    "old_string": "hello",
+                    "new_string": "hi"
                 },
                 {
-                    "oldString": "missing",
-                    "newString": "x"
+                    "old_string": "missing",
+                    "new_string": "x"
                 }
             ]
         });
@@ -307,15 +345,15 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "alpha",
-                    "newString": "beta"
+                    "old_string": "alpha",
+                    "new_string": "beta"
                 },
                 {
-                    "oldString": "beta",
-                    "newString": "gamma"
+                    "old_string": "beta",
+                    "new_string": "gamma"
                 }
             ]
         });
@@ -335,7 +373,7 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": []
         });
 
@@ -354,17 +392,17 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "",
-                    "newString": "x"
+                    "old_string": "",
+                    "new_string": "x"
                 }
             ]
         });
 
         let err = tool.call(args, &context).await.unwrap_err().to_string();
-        assert!(err.contains("edit 1 has empty oldString"));
+        assert!(err.contains("edit 1 has empty old_string"));
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello");
     }
 
@@ -379,17 +417,17 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "hello",
-                    "newString": "hello"
+                    "old_string": "hello",
+                    "new_string": "hello"
                 }
             ]
         });
 
         let err = tool.call(args, &context).await.unwrap_err().to_string();
-        assert!(err.contains("edit 1 has identical oldString and newString"));
+        assert!(err.contains("edit 1 has identical old_string and new_string"));
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "hello");
     }
 
@@ -404,15 +442,15 @@ mod tests {
         let tool = MultiEditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
+            "file_path": file_path.display().to_string(),
             "edits": [
                 {
-                    "oldString": "b",
-                    "newString": "B"
+                    "old_string": "b",
+                    "new_string": "B"
                 },
                 {
-                    "oldString": "j",
-                    "newString": "J"
+                    "old_string": "j",
+                    "new_string": "J"
                 }
             ]
         });

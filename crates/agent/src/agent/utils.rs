@@ -282,6 +282,64 @@ pub(crate) mod genai {
         span.set_status(Status::error(""));
     }
 
+    fn tool_meter() -> opentelemetry::metrics::Meter {
+        opentelemetry::global::meter("querymt-agent")
+    }
+
+    /// Record the argument repairs that were actually applied to one call.
+    ///
+    /// Increments `querymt.tool.args_repaired{tool, rule}` once per applied
+    /// mutation and lists the applied rules on `span` as
+    /// `querymt.tool.args_repairs`. Called once per prepared call, never for
+    /// scheduling inspections, so unchanged re-normalisation is not counted.
+    pub(crate) fn args_repaired(span: &Span, tool: &str, rules: &[&'static str]) {
+        if rules.is_empty() {
+            return;
+        }
+        let counter = tool_meter()
+            .u64_counter("querymt.tool.args_repaired")
+            .with_description("Tool argument repairs applied before validation")
+            .build();
+        for rule in rules {
+            counter.add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("tool", tool.to_owned()),
+                    opentelemetry::KeyValue::new("rule", *rule),
+                ],
+            );
+        }
+        span.set_attribute(
+            "querymt.tool.args_repairs",
+            Value::Array(Array::String(
+                rules.iter().map(|rule| (*rule).to_owned().into()).collect(),
+            )),
+        );
+    }
+
+    /// Record the final outcome of one call, independent of per-rule repair
+    /// counts: `querymt.tool.calls{tool, repaired, outcome}`.
+    ///
+    /// `outcome` is `success` (the tool ran and succeeded), `error` (the tool
+    /// ran or its pipeline failed) or `rejected` (never ran: validation
+    /// failure, hook block or middleware rejection). Querying
+    /// `repaired=true` by outcome separates repaired calls that succeed from
+    /// repaired calls that still fail.
+    pub(crate) fn tool_call_outcome(tool: &str, repaired: bool, outcome: &'static str) {
+        tool_meter()
+            .u64_counter("querymt.tool.calls")
+            .with_description("Tool calls by repaired indicator and final outcome")
+            .build()
+            .add(
+                1,
+                &[
+                    opentelemetry::KeyValue::new("tool", tool.to_owned()),
+                    opentelemetry::KeyValue::new("repaired", repaired),
+                    opentelemetry::KeyValue::new("outcome", outcome),
+                ],
+            );
+    }
+
     pub(crate) fn llm_error(error: &LLMError) {
         let error_type = match error {
             LLMError::Cancelled => return,
@@ -501,6 +559,9 @@ pub fn extract_locations(args: &serde_json::Value) -> Vec<ToolCallLocation> {
     if let Some(root) = map.get("root").and_then(|v| v.as_str()) {
         locations.push(ToolCallLocation::new(root));
     }
+    if let Some(file_path) = map.get("file_path").and_then(|v| v.as_str()) {
+        locations.push(ToolCallLocation::new(file_path));
+    }
     locations
 }
 
@@ -532,8 +593,21 @@ pub fn u32_from_usize(value: usize, field_name: &str, session_id: Option<&str>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{format_prompt_user_text_only, render_prompt_for_display};
-    use crate::acp::protocol::{ContentBlock, TextContent};
+    use super::{extract_locations, format_prompt_user_text_only, render_prompt_for_display};
+    use crate::acp::protocol::{ContentBlock, TextContent, ToolCallLocation};
+
+    #[test]
+    fn extract_locations_includes_file_path_path_and_root() {
+        assert_eq!(
+            extract_locations(&serde_json::json!({"file_path": "/a.rs", "old_string": "x"})),
+            vec![ToolCallLocation::new("/a.rs")]
+        );
+        assert_eq!(
+            extract_locations(&serde_json::json!({"path": "p", "root": "r"})),
+            vec![ToolCallLocation::new("p"), ToolCallLocation::new("r")]
+        );
+        assert!(extract_locations(&serde_json::json!("not an object")).is_empty());
+    }
 
     #[tokio::test]
     async fn genai_generation_settings_are_typed_bounded_and_provider_specific() {

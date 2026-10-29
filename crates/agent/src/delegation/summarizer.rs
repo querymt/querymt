@@ -460,7 +460,13 @@ planning conversation."#
         if let Some(pattern) = input.get("pattern").and_then(|v| v.as_str()) {
             return pattern.to_string();
         }
-        if let Some(file_path) = input.get("filePath").and_then(|v| v.as_str()) {
+        // Canonical `file_path`, plus historical camelCase `filePath`: this reads
+        // stored raw assistant calls, which keep whatever spelling the model emitted.
+        if let Some(file_path) = input
+            .get("file_path")
+            .or_else(|| input.get("filePath"))
+            .and_then(|v| v.as_str())
+        {
             return file_path.to_string();
         }
         if let Some(command) = input.get("command").and_then(|v| v.as_str()) {
@@ -1201,13 +1207,23 @@ mod tests {
     }
 
     #[test]
-    fn summarize_tool_args_extracts_file_path() {
+    fn summarize_tool_args_extracts_canonical_file_path() {
         let args = serde_json::json!({
-            "filePath": "test.txt",
+            "file_path": "test.txt",
             "other": "ignored"
         });
         let summary = DelegationSummarizer::summarize_tool_args(&args);
         assert_eq!(summary, "test.txt");
+    }
+
+    #[test]
+    fn summarize_tool_args_extracts_historical_camel_case_file_path() {
+        let args = serde_json::json!({
+            "filePath": "old.txt",
+            "other": "ignored"
+        });
+        let summary = DelegationSummarizer::summarize_tool_args(&args);
+        assert_eq!(summary, "old.txt");
     }
 
     #[test]

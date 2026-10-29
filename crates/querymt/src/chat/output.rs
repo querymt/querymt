@@ -10,6 +10,22 @@ use crate::{FunctionCall, ToolCall, Usage};
 /// Provider-specific fields retained by the structured chat contract.
 pub type Extensions = Map<String, Value>;
 
+/// Extension key a provider sets (to `true`) on a function-call item whose
+/// arguments must not execute even if they parse: for example a tool block
+/// that a token limit interrupted. Executors read it from the canonical item
+/// before the lossy projection to `ToolCall`.
+pub const INVALID_INPUT_EXTENSION: &str = "anthropic.invalid_input";
+
+impl ChatFunctionCallItem {
+    /// Whether the provider marked this call's input invalid.
+    pub fn is_marked_invalid(&self) -> bool {
+        self.extensions
+            .get(INVALID_INPUT_EXTENSION)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
 /// A validated concrete MIME type used by structured media.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct MediaType(mime::Mime);

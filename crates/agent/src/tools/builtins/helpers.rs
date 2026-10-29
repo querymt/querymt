@@ -16,19 +16,18 @@ pub fn resolve_root(
         .or_else(|| context.cwd().map(|p| p.to_path_buf()))
         .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))
 }
-/// Resolve a tool target path: if the resolved path is absolute, return it
-/// as-is; otherwise join it with `root`.
-pub fn resolve_target(
-    path_str: &str,
-    root: &Path,
-    context: &dyn ToolContext,
-) -> Result<PathBuf, ToolError> {
-    let resolved = context.resolve_path(path_str)?;
-    Ok(if resolved.is_absolute() {
-        resolved
+/// Resolve a tool target path: absolute paths are used as written; relative
+/// paths are joined with `root` (the caller's `root` argument, or the cwd).
+///
+/// Must stay in sync with the tools' `file_access`, which resolves targets
+/// against `crate::tools::effective_root` to predict the same path.
+pub fn resolve_target(path_str: &str, root: &Path) -> PathBuf {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        root.join(resolved)
-    })
+        root.join(path)
+    }
 }
 
 /// Parse a required `"paths"` JSON array argument into a `Vec<String>`.

@@ -360,6 +360,38 @@ where
     }
 }
 
+/// Where an [`ArgAlias`] applies within a call's arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasScope {
+    /// Keys of the top-level argument object.
+    TopLevel,
+    /// Keys of each object item of the named top-level array property.
+    ArrayItems(&'static str),
+}
+
+/// A compatibility spelling accepted for a canonical parameter name.
+///
+/// `to` must name a property of the tool's advertised (snake_case) schema.
+/// Aliases are never advertised to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArgAlias {
+    pub scope: AliasScope,
+    pub from: &'static str,
+    pub to: &'static str,
+}
+
+/// Allows a single item to be supplied without its wrapping array.
+///
+/// When the top-level `array` property is absent and every name in `required`
+/// is present at the top level (after item aliases), the top-level `fields`
+/// are moved into one object that becomes the only element of `array`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapRule {
+    pub array: &'static str,
+    pub fields: &'static [&'static str],
+    pub required: &'static [&'static str],
+}
+
 /// Unified tool trait that replaces BuiltInTool
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -385,6 +417,19 @@ pub trait Tool: Send + Sync {
 
     fn execution_class(&self) -> ToolExecutionClass {
         ToolExecutionClass::ParallelSafe
+    }
+
+    /// Compatibility aliases accepted for this tool's parameters. Builtin
+    /// tools only; the target of every alias is a canonical schema name.
+    /// Default: none.
+    fn arg_aliases(&self) -> &'static [ArgAlias] {
+        &[]
+    }
+
+    /// Optional rule allowing one item to be supplied without its wrapping
+    /// array. Builtin tools only. Default: none.
+    fn wrap_single_item(&self) -> Option<WrapRule> {
+        None
     }
 
     /// Declare the file access a call with these arguments will perform.

@@ -114,6 +114,23 @@ impl<'a> Sink for ContextSink<'a> {
     }
 }
 
+/// Read `exclude` as either one glob string or an array of glob strings.
+///
+/// A single string behaves like a one-element array. Shared by execution and the
+/// scheduling access filter so both see the same patterns.
+fn exclude_patterns(args: &Value) -> Option<Vec<String>> {
+    match args.get("exclude")? {
+        Value::String(pattern) => Some(vec![pattern.clone()]),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 pub struct SearchTextTool;
 
 impl Default for SearchTextTool {
@@ -389,6 +406,7 @@ impl ToolTrait for SearchTextTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "pattern": {
                             "type": "string",
@@ -403,9 +421,11 @@ impl ToolTrait for SearchTextTool {
                             "description": "File pattern to include in the search (e.g. \"*.js\", \"*.{ts,tsx}\")"
                         },
                         "exclude": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "File patterns to exclude from the search"
+                            "anyOf": [
+                                { "type": "string" },
+                                { "type": "array", "items": { "type": "string" } }
+                            ],
+                            "description": "File pattern or array of patterns to exclude from the search"
                         },
                         "max_results": {
                             "type": "integer",
@@ -464,8 +484,8 @@ impl ToolTrait for SearchTextTool {
         if let Some(include) = args.get("include").and_then(Value::as_str) {
             filter = filter.include(include);
         }
-        if let Some(exclude) = args.get("exclude").and_then(Value::as_array) {
-            filter = filter.exclude_all(exclude.iter().filter_map(Value::as_str));
+        if let Some(exclude) = exclude_patterns(args) {
+            filter = filter.exclude_all(exclude.iter().map(String::as_str));
         }
         if let Some(file_type) = args.get("file_type").and_then(Value::as_str) {
             filter = filter.file_type(file_type);
@@ -504,11 +524,7 @@ impl ToolTrait for SearchTextTool {
             .and_then(Value::as_str)
             .map(|s| s.to_string());
 
-        let exclude = args.get("exclude").and_then(Value::as_array).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        });
+        let exclude = exclude_patterns(&args);
 
         let max_results = args
             .get("max_results")
@@ -1014,6 +1030,63 @@ match again",
         // Should return no matches because file is excluded
         assert_eq!(file_count(&result), 0);
         assert_eq!(match_count(&result), 0);
+    }
+
+    #[tokio::test]
+    async fn scalar_and_array_exclude_give_identical_results() {
+        let temp_dir = TempDir::new().unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(temp_dir.path().to_path_buf()));
+        let tool = SearchTextTool::new();
+        fs::create_dir_all(temp_dir.path().join("tests")).unwrap();
+        fs::write(temp_dir.path().join("tests/a.rs"), "@@marker in tests\n").unwrap();
+        fs::write(temp_dir.path().join("b.rs"), "@@marker in src\n").unwrap();
+
+        let array = first_text_block(
+            tool.call(json!({"pattern": "@@", "exclude": ["tests/**"]}), &context)
+                .await
+                .unwrap(),
+        );
+        let scalar = first_text_block(
+            tool.call(json!({"pattern": "@@", "exclude": "tests/**"}), &context)
+                .await
+                .unwrap(),
+        );
+        let unfiltered =
+            first_text_block(tool.call(json!({"pattern": "@@"}), &context).await.unwrap());
+
+        assert_eq!(scalar, array);
+        assert_eq!(file_count(&scalar), 1, "{scalar}");
+        assert!(
+            scalar.contains("b.rs") && !scalar.contains("a.rs"),
+            "{scalar}"
+        );
+        assert_eq!(file_count(&unfiltered), 2, "exclude must actually filter");
+    }
+
+    #[test]
+    fn scalar_and_array_exclude_give_identical_scheduling_filters() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
+        let tool = SearchTextTool::new();
+        let scalar = tool.file_access(&json!({"pattern": "x", "exclude": "gen/**"}), Some(&root));
+        let array = tool.file_access(&json!({"pattern": "x", "exclude": ["gen/**"]}), Some(&root));
+        assert_eq!(scalar, array);
+        let [scope] = scalar.read_scopes_slice() else {
+            panic!("expected one scope: {scalar:?}");
+        };
+        assert!(scope.observes_write(&root.join("src/lib.rs")));
+        assert!(!scope.observes_write(&root.join("gen/out.rs")));
+    }
+
+    #[test]
+    fn exclude_schema_accepts_string_or_array() {
+        let schema = SearchTextTool::new().definition().function.parameters;
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"pattern": "x", "exclude": "a/**"})));
+        assert!(validator.is_valid(&json!({"pattern": "x", "exclude": ["a/**"]})));
+        assert!(!validator.is_valid(&json!({"pattern": "x", "exclude": 5})));
+        assert!(!validator.is_valid(&json!({"pattern": "x", "exclude": [5]})));
     }
 
     #[tokio::test]

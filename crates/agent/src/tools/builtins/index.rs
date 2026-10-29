@@ -11,9 +11,11 @@ use serde_json::{Value, json};
 use crate::index::outline_index::common::get_language_for_extension;
 use crate::index::outline_index::{IndexOptions, OutlineError, format_outline, index_file};
 use crate::tools::{
-    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError, resolve_arg_path,
-    root_arg_resolves,
+    CapabilityRequirement, FileAccess, Tool as ToolTrait, ToolContext, ToolError, effective_root,
+    resolve_arg_path,
 };
+
+use super::helpers::{resolve_root, resolve_target};
 
 pub struct IndexTool;
 
@@ -44,6 +46,7 @@ impl ToolTrait for IndexTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",
@@ -82,12 +85,12 @@ impl ToolTrait for IndexTool {
     }
 
     fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
-        if !root_arg_resolves(args, cwd) {
+        let Some(root) = effective_root(args, cwd) else {
             return FileAccess::None;
-        }
+        };
         args.get("path")
             .and_then(Value::as_str)
-            .and_then(|raw| resolve_arg_path(raw, cwd))
+            .and_then(|raw| resolve_arg_path(raw, Some(&root)))
             .map_or(FileAccess::None, |path| FileAccess::reads([path]))
     }
 
@@ -101,20 +104,8 @@ impl ToolTrait for IndexTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidRequest("path is required".to_string()))?;
 
-        let root = args
-            .get("root")
-            .and_then(Value::as_str)
-            .map(|s| context.resolve_path(s))
-            .transpose()?
-            .or_else(|| context.cwd().map(|p| p.to_path_buf()))
-            .ok_or_else(|| ToolError::InvalidRequest("No working directory available".into()))?;
-
-        let path = context.resolve_path(path_str)?;
-        let target = if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
-        };
+        let root = resolve_root(&args, context)?;
+        let target = resolve_target(path_str, &root);
 
         if !target.exists() {
             return Err(ToolError::InvalidRequest(format!(
@@ -195,6 +186,27 @@ mod tests {
             }
         }
         panic!("no ToolResultPart::Text block found");
+    }
+
+    #[tokio::test]
+    async fn relative_path_is_resolved_against_root_not_cwd() {
+        let cwd_dir = TempDir::new().unwrap();
+        let root_dir = TempDir::new().unwrap();
+        fs::write(root_dir.path().join("lib.rs"), "pub fn alpha() {}\n").unwrap();
+        let context =
+            AgentToolContext::basic("test".to_string(), Some(cwd_dir.path().to_path_buf()));
+        let tool = IndexTool::new();
+        let args = json!({"path": "lib.rs", "root": root_dir.path()});
+
+        let cwd = dunce::canonicalize(cwd_dir.path()).unwrap();
+        let expected = dunce::canonicalize(root_dir.path().join("lib.rs")).unwrap();
+        assert_eq!(
+            tool.file_access(&args, Some(&cwd)),
+            FileAccess::reads([expected])
+        );
+
+        let result = tool.call(args, &context).await.unwrap();
+        assert!(first_text(&result).contains("alpha"));
     }
 
     #[tokio::test]

@@ -34,6 +34,7 @@ impl ToolTrait for KnowledgeConsolidateTool {
                 description: "Consolidate multiple knowledge entries into a higher-level insight. This marks the source entries as consolidated and stores the synthesis.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "source_ids": {
                             "type": "array",

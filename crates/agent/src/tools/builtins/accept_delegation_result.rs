@@ -116,6 +116,7 @@ impl ToolTrait for AcceptDelegationResultTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "delegation_id": {
                             "type": "string",

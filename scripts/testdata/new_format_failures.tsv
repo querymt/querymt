@@ -1,0 +1,7 @@
+multiedit	{"file_path":"a.rs","edits":"[{\"old_string\": \"x\", "}	Error: invalid tool arguments: 1 violation:\n- /edits: expected array, got string: "[{\"old_string\": \"x\", "; hint: `edits` must be a JSON array of objects, not a string containing JSON	stringified_value
+edit	{"file_path":"a.rs","old_string":"x","new_string":"y","filePath":"a.rs"}	Error: invalid tool arguments: conflicting spellings of `file_path` at /: `file_path` and `filePath` were both given; send only `file_path`	alias_naming
+multiedit	{"file_path":"a.rs","edits":5}	Error: invalid tool arguments: 1 violation:\n- /edits: expected array, got integer: 5	scalar_for_array
+edit	{"file_path":"a.rs","old_string":"x","new_string":"y","replace_everything":true}	Error: invalid tool arguments: 1 violation:\n- /: property `replace_everything` is not allowed	unknown_key
+edit	{"file_path":"a.rs","old_string":"x"}	Error: invalid tool arguments: 1 violation:\n- /: missing required field `new_string`	other
+read_tool	{"path":"a.rs","offset":"abc"}	Error: invalid tool arguments: 1 violation:\n- /offset: expected integer, got string: "abc"	number_string
+multiedit	{"file_path":"a.rs","edits":[{"old_string":"x","new_string":"y","bogus":1}]}	Error: invalid tool arguments: 1 violation:\n- /edits/0: property `bogus` is not allowed	unknown_key

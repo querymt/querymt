@@ -39,6 +39,7 @@ impl ToolTrait for RouteDelegationToPeerTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "agent_id": {
                             "type": "string",

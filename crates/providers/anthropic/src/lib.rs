@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 mod model;
+mod strict_schema;
 use model::{ClaudeModel, ThinkingClass, parse_claude_model, resolve_thinking_class};
 
 /// Tool name prefix used for OAuth requests to avoid conflicts with server-side tools
@@ -146,6 +147,12 @@ pub struct Anthropic {
     /// rejects on Opus 4.7+ and every Claude 5 or later model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptive_thinking: Option<bool>,
+    /// Names of tools sent with `strict: true` (matched against the unprefixed
+    /// tool name). Unset or empty means no name-based selection; tool
+    /// definitions that explicitly set `strict: true` are still honoured. Every
+    /// strictness request is subject to schema, model and budget checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_tools: Option<Vec<String>>,
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
     #[schemars(skip)]
@@ -165,6 +172,63 @@ struct AnthropicToolUseState {
     arguments_buffer: String,
 }
 
+use querymt::chat::INVALID_INPUT_EXTENSION;
+
+impl AnthropicToolUseState {
+    /// Complete this block. `interrupted` is set when the response was cut off
+    /// while the block was still open. The raw buffer is preserved verbatim; only
+    /// a normally completed block with no input deltas becomes `{}`.
+    fn into_complete(self, index: usize, interrupted: bool) -> querymt::chat::StreamChunk {
+        let invalid = interrupted
+            || (!self.arguments_buffer.is_empty()
+                && !matches!(
+                    serde_json::from_str::<Value>(&self.arguments_buffer),
+                    Ok(Value::Object(_))
+                ));
+        let arguments = if self.arguments_buffer.is_empty() && !interrupted {
+            "{}".to_string()
+        } else {
+            self.arguments_buffer
+        };
+        let mut extensions = querymt::chat::Extensions::new();
+        if invalid {
+            extensions.insert(INVALID_INPUT_EXTENSION.to_string(), Value::Bool(true));
+        }
+        querymt::chat::StreamChunk::ToolUseComplete {
+            index,
+            tool_call: querymt::ToolCall {
+                id: self.id,
+                call_type: "function".to_string(),
+                function: querymt::FunctionCall {
+                    name: self.name,
+                    arguments,
+                },
+            },
+            extensions,
+        }
+    }
+}
+
+/// `input` for replaying a stored assistant tool call.
+///
+/// Anthropic requires `input` to be a JSON object. Stored arguments that do not
+/// parse to one are replayed as `{}`, a protocol placeholder only: the raw
+/// stored arguments are untouched (this only reads them), the agent answered the
+/// call with an error result instead of running it, and the placeholder is never
+/// executable input. The warning carries the call ID, never the argument text.
+fn replay_tool_input(call: &querymt::chat::ChatFunctionCallItem) -> Value {
+    match call.parse_arguments() {
+        Ok(input @ Value::Object(_)) => input,
+        _ => {
+            log::warn!(
+                "Replaying tool call {} with `input: {{}}`: its stored arguments are not a JSON object",
+                call.call_id
+            );
+            Value::Object(Default::default())
+        }
+    }
+}
+
 /// Per-block accumulator for Anthropic thinking signature deltas.
 #[derive(Debug, Default)]
 struct AnthropicThinkingState {
@@ -176,8 +240,11 @@ struct AnthropicThinkingState {
 struct AnthropicTool<'a> {
     name: String,
     description: &'a str,
+    /// Borrowed original schema, or an owned converted copy for strict tools.
     #[serde(rename = "input_schema")]
-    schema: &'a serde_json::Value,
+    schema: std::borrow::Cow<'a, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strict: Option<bool>,
 }
 
 /// Configuration for the thinking feature
@@ -1064,6 +1131,98 @@ impl Anthropic {
         cfg
     }
 
+    /// Builds the request tools, applying strictness where every check passes.
+    ///
+    /// A tool is eligible when its definition sets `strict: true` or its
+    /// unprefixed name is in `strict_tools`. Per-tool schema incompatibility
+    /// falls back for that tool only; unsupported models or exceeded budgets
+    /// fall back for the whole request. Every fallback sends the original,
+    /// unmodified schemas.
+    ///
+    /// Strict tool use works over OAuth as well (verified against the live
+    /// endpoint with `scripts/verify-anthropic-strict.sh`). OAuth only changes
+    /// tool names (see `TOOL_PREFIX`); `strict_tools` is matched against the
+    /// unprefixed name.
+    fn build_tools<'a>(&self, tools: &'a [Tool]) -> Vec<AnthropicTool<'a>> {
+        let plain = || -> Vec<AnthropicTool<'a>> {
+            tools
+                .iter()
+                .map(|tool| AnthropicTool {
+                    name: self.prefix_tool_name(&tool.function.name),
+                    description: &tool.function.description,
+                    schema: std::borrow::Cow::Borrowed(&tool.function.parameters),
+                    strict: None,
+                })
+                .collect()
+        };
+
+        let names: &[String] = self.strict_tools.as_deref().unwrap_or_default();
+        let eligible: Vec<bool> = tools
+            .iter()
+            .map(|tool| tool.function.strict == Some(true) || names.contains(&tool.function.name))
+            .collect();
+        if !eligible.iter().any(|e| *e) {
+            return plain();
+        }
+
+        if !self
+            .parsed_model()
+            .is_some_and(|model| model.supports_strict_tools())
+        {
+            log::debug!(target: "qmt_anthropic", "strict tools omitted: model {} does not support them", self.model);
+            return plain();
+        }
+
+        // Convert each eligible schema on a copy; incompatible tools fall back
+        // individually and are excluded from the budget counts.
+        let converted: Vec<Option<Value>> = tools
+            .iter()
+            .zip(&eligible)
+            .map(|(tool, eligible)| {
+                if !*eligible {
+                    return None;
+                }
+                match strict_schema::convert(&tool.function.parameters) {
+                    Ok(schema) => Some(schema),
+                    Err(err) => {
+                        log::warn!(
+                            target: "qmt_anthropic",
+                            "tool {} sent without strict: unsupported schema ({err})",
+                            tool.function.name
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        let strict_schemas: Vec<Value> = converted.iter().flatten().cloned().collect();
+        if strict_schemas.is_empty() {
+            return plain();
+        }
+        if let Err(limit) = strict_schema::budget(&strict_schemas) {
+            log::warn!(target: "qmt_anthropic", "strict tools omitted for this request: {limit}");
+            return plain();
+        }
+
+        tools
+            .iter()
+            .zip(converted)
+            .map(|(tool, converted)| {
+                let (schema, strict) = match converted {
+                    Some(schema) => (std::borrow::Cow::Owned(schema), Some(true)),
+                    None => (std::borrow::Cow::Borrowed(&tool.function.parameters), None),
+                };
+                AnthropicTool {
+                    name: self.prefix_tool_name(&tool.function.name),
+                    description: &tool.function.description,
+                    schema,
+                    strict,
+                }
+            })
+            .collect()
+    }
+
     /// Parsed Claude model, or `None` for IDs that aren't recognisable.
     fn parsed_model(&self) -> Option<ClaudeModel> {
         parse_claude_model(&self.model)
@@ -1377,13 +1536,7 @@ impl Anthropic {
                                 }
                             }
                             ChatOutputItem::FunctionCall(call) => {
-                                // Anthropic requires `input` to be a JSON object.
-                                let input = call.parse_arguments().unwrap_or(Value::Null);
-                                let input = if input.is_object() {
-                                    input
-                                } else {
-                                    Value::Object(Default::default())
-                                };
+                                let input = replay_tool_input(call);
                                 content.push(MessageContent::ToolUse {
                                     content_type: "tool_use",
                                     id: call.call_id.clone(),
@@ -1451,16 +1604,7 @@ impl Anthropic {
             .collect();
 
         let maybe_tool_slice: Option<&[Tool]> = tools.or(self.tools.as_deref());
-        let anthropic_tools = maybe_tool_slice.map(|slice| {
-            slice
-                .iter()
-                .map(|tool| AnthropicTool {
-                    name: self.prefix_tool_name(&tool.function.name),
-                    description: &tool.function.description,
-                    schema: &tool.function.parameters,
-                })
-                .collect::<Vec<_>>()
-        });
+        let anthropic_tools = maybe_tool_slice.map(|slice| self.build_tools(slice));
 
         let tool_choice = match self.tool_choice {
             Some(ToolChoice::Auto) => {
@@ -1738,22 +1882,7 @@ impl ChatStreamParser for AnthropicStreamParser {
                     "content_block_stop" => {
                         if let Some(index) = stream_resp.index {
                             if let Some(state) = self.tool_state_buffer.remove(&index) {
-                                chunks.push(querymt::chat::StreamChunk::ToolUseComplete {
-                                    index,
-                                    tool_call: querymt::ToolCall {
-                                        id: state.id,
-                                        call_type: "function".to_string(),
-                                        function: querymt::FunctionCall {
-                                            name: state.name,
-                                            arguments: if state.arguments_buffer.is_empty() {
-                                                "{}".to_string()
-                                            } else {
-                                                state.arguments_buffer
-                                            },
-                                        },
-                                    },
-                                    extensions: Default::default(),
-                                });
+                                chunks.push(state.into_complete(index, false));
                             }
 
                             if let Some(state) = self.thinking_state_buffer.remove(&index)
@@ -1777,6 +1906,19 @@ impl ChatStreamParser for AnthropicStreamParser {
                                 &stop_reason,
                                 delta.stop_details.as_ref(),
                             );
+                            // Truncation leaves tool blocks open. Complete each one
+                            // exactly once, marked invalid, before the terminal; a
+                            // late block stop then finds no state and emits nothing.
+                            if finish_reason == FinishReason::Length {
+                                let mut open: Vec<usize> =
+                                    self.tool_state_buffer.keys().copied().collect();
+                                open.sort_unstable();
+                                for index in open {
+                                    if let Some(state) = self.tool_state_buffer.remove(&index) {
+                                        chunks.push(state.into_complete(index, true));
+                                    }
+                                }
+                            }
                             chunks.push(querymt::chat::StreamChunk::Done { finish_reason });
                         }
                     }
@@ -1963,6 +2105,7 @@ mod tests {
             reasoning_effort: None,
             reasoning_budget_tokens: None,
             adaptive_thinking: None,
+            strict_tools: None,
             key_resolver: None,
         }
     }
@@ -2843,6 +2986,163 @@ mod tests {
         // Parser state is per-stream and dropped with the parser instance.
     }
 
+    fn start(index: usize, id: &str) -> String {
+        format!(
+            r#"data: {{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"{id}","name":"edit"}}}}"#
+        )
+    }
+    fn delta(index: usize, json: &str) -> String {
+        let partial = serde_json::to_string(json).unwrap();
+        format!(
+            r#"data: {{"type":"content_block_delta","index":{index},"delta":{{"type":"input_json_delta","partial_json":{partial}}}}}"#
+        )
+    }
+    fn stop(index: usize) -> String {
+        format!(r#"data: {{"type":"content_block_stop","index":{index}}}"#)
+    }
+    fn message_delta(reason: &str) -> String {
+        format!(r#"data: {{"type":"message_delta","delta":{{"stop_reason":"{reason}"}}}}"#)
+    }
+    /// `(call id, arguments, marked invalid)` for each completion, in order.
+    fn completions(chunks: &[querymt::chat::StreamChunk]) -> Vec<(String, String, bool)> {
+        chunks
+            .iter()
+            .filter_map(|c| match c {
+                querymt::chat::StreamChunk::ToolUseComplete {
+                    tool_call,
+                    extensions,
+                    ..
+                } => Some((
+                    tool_call.id.clone(),
+                    tool_call.function.arguments.clone(),
+                    extensions.contains_key(INVALID_INPUT_EXTENSION),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+    fn run(lines: Vec<String>) -> Vec<querymt::chat::StreamChunk> {
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        collect_chunks(&test_anthropic("sk-ant-api03-test"), &refs)
+    }
+
+    #[test]
+    fn normal_empty_input_completes_as_empty_object_unmarked() {
+        let chunks = run(vec![start(0, "t1"), stop(0), message_delta("tool_use")]);
+        assert_eq!(completions(&chunks), [("t1".into(), "{}".into(), false)]);
+    }
+
+    #[test]
+    fn valid_object_input_is_unmarked() {
+        let chunks = run(vec![
+            start(0, "t1"),
+            delta(0, r#"{"file_path":"a.rs"}"#),
+            stop(0),
+            message_delta("tool_use"),
+        ]);
+        assert_eq!(
+            completions(&chunks),
+            [("t1".into(), r#"{"file_path":"a.rs"}"#.into(), false)]
+        );
+    }
+
+    #[test]
+    fn malformed_and_non_object_input_is_marked_with_raw_buffer_preserved() {
+        let chunks = run(vec![
+            start(0, "bad"),
+            delta(0, r#"{"edits": ["#),
+            stop(0),
+            start(1, "arr"),
+            delta(1, "[1,2]"),
+            stop(1),
+            message_delta("tool_use"),
+        ]);
+        assert_eq!(
+            completions(&chunks),
+            [
+                ("bad".into(), r#"{"edits": ["#.into(), true),
+                ("arr".into(), "[1,2]".into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn max_tokens_marks_a_valid_object_block_that_was_still_open() {
+        let chunks = run(vec![
+            start(0, "t1"),
+            delta(0, r#"{"file_path":"a.rs"}"#),
+            message_delta("max_tokens"),
+        ]);
+        assert_eq!(
+            completions(&chunks),
+            [("t1".into(), r#"{"file_path":"a.rs"}"#.into(), true)]
+        );
+        let done = chunks
+            .iter()
+            .position(|c| matches!(c, querymt::chat::StreamChunk::Done { .. }))
+            .unwrap();
+        let complete = chunks
+            .iter()
+            .position(|c| matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. }))
+            .unwrap();
+        assert!(complete < done, "completion precedes Done");
+    }
+
+    #[test]
+    fn max_tokens_flushes_every_open_block_in_index_order_once() {
+        let chunks = run(vec![
+            start(1, "second"),
+            start(0, "first"),
+            delta(0, r#"{"file_path": "a"#),
+            message_delta("max_tokens"),
+            // Late stops for already-flushed blocks must not duplicate completions.
+            stop(0),
+            stop(1),
+        ]);
+        let done = chunks
+            .iter()
+            .position(|c| matches!(c, querymt::chat::StreamChunk::Done { .. }))
+            .unwrap();
+        assert_eq!(
+            completions(&chunks),
+            [
+                ("first".into(), r#"{"file_path": "a"#.into(), true),
+                ("second".into(), String::new(), true),
+            ]
+        );
+        assert!(
+            chunks[done..]
+                .iter()
+                .all(|c| !matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. })),
+            "no completion after Done"
+        );
+    }
+
+    #[test]
+    fn blocks_completed_before_max_tokens_are_not_invalidated() {
+        let chunks = run(vec![
+            start(0, "done"),
+            delta(0, r#"{"file_path":"a.rs"}"#),
+            stop(0),
+            start(1, "open"),
+            delta(1, r#"{"file_path":"#),
+            message_delta("max_tokens"),
+        ]);
+        assert_eq!(
+            completions(&chunks),
+            [
+                ("done".into(), r#"{"file_path":"a.rs"}"#.into(), false),
+                ("open".into(), r#"{"file_path":"#.into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_length_stop_reasons_do_not_flush_open_blocks() {
+        let chunks = run(vec![start(0, "t1"), message_delta("tool_use")]);
+        assert!(completions(&chunks).is_empty());
+    }
+
     #[test]
     fn test_streaming_message_start_usage() {
         // Full "Hello" response from the example in the Anthropic docs.
@@ -3523,6 +3823,84 @@ mod tests {
         b["messages"][1]["content"].as_array().unwrap().clone()
     }
 
+    static CAPTURED_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    struct CaptureLogger;
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+        fn log(&self, record: &log::Record) {
+            if record.level() == log::Level::Warn {
+                CAPTURED_WARNINGS
+                    .lock()
+                    .unwrap()
+                    .push(record.args().to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    fn unparseable_call_item(id: &str, arguments: &str) -> ChatOutputItem {
+        ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+            item_id: None,
+            call_id: id.to_string(),
+            name: "multiedit".into(),
+            arguments: arguments.into(),
+            status: None,
+            extensions: Default::default(),
+        })
+    }
+
+    #[test]
+    fn replay_of_unparseable_arguments_sends_empty_input_and_warns_with_call_id_only() {
+        let _ = log::set_logger(&CaptureLogger);
+        log::set_max_level(log::LevelFilter::Warn);
+        let secret = r#"{"edits": ["SECRET-CONTENT"#;
+
+        let raw = unparseable_call_item("toolu_bad", secret);
+        let content = replay_assistant_content(vec![raw.clone()]);
+
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "toolu_bad");
+        assert_eq!(content[0]["input"], serde_json::json!({}));
+        // The replay placeholder never rewrites the stored call.
+        let ChatOutputItem::FunctionCall(stored) = &raw else {
+            unreachable!()
+        };
+        assert_eq!(stored.arguments, secret);
+
+        let warnings = CAPTURED_WARNINGS.lock().unwrap();
+        let ours: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("toolu_bad"))
+            .collect();
+        assert_eq!(ours.len(), 1, "{warnings:?}");
+        assert!(
+            !ours[0].contains("SECRET-CONTENT"),
+            "raw arguments must not be logged: {}",
+            ours[0]
+        );
+    }
+
+    #[test]
+    fn replay_of_non_object_arguments_sends_empty_input() {
+        let content = replay_assistant_content(vec![unparseable_call_item("toolu_arr", "[1,2]")]);
+        assert_eq!(content[0]["input"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn replay_of_object_arguments_is_unchanged() {
+        let content = replay_assistant_content(vec![unparseable_call_item(
+            "toolu_ok",
+            r#"{"file_path":"a.rs"}"#,
+        )]);
+        assert_eq!(
+            content[0]["input"],
+            serde_json::json!({"file_path": "a.rs"})
+        );
+    }
+
     #[test]
     fn replay_sends_empty_signed_thinking_before_tool_use() {
         let content =
@@ -3798,5 +4176,393 @@ mod tests {
             let (out, _) = stream_output(&[delta.as_str()]);
             assert_eq!(out.finish_reason, Some(expected), "streaming {raw}");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Strict tool use
+    // ---------------------------------------------------------------------
+
+    fn simple_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "occurrence": {"type": "integer", "minimum": 0, "description": "0-based."}
+            },
+            "required": ["path"]
+        })
+    }
+
+    fn schema_tool(name: &str, schema: Value, strict: Option<bool>) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: querymt::chat::FunctionTool {
+                name: name.to_string(),
+                description: "d".to_string(),
+                parameters: schema,
+                strict,
+            },
+        }
+    }
+
+    /// Provider configured with a name-based strict list, as an embedding
+    /// application would supply it.
+    fn anthropic_strict(model: &str) -> Anthropic {
+        let mut a = anthropic_for(model, None, 4096);
+        a.strict_tools = Some(vec![
+            "edit".into(),
+            "multiedit".into(),
+            "replace_symbol".into(),
+        ]);
+        a
+    }
+
+    fn request_tools(a: &Anthropic, tools: &[Tool]) -> Vec<Value> {
+        let req = a
+            .build_chat_request(&user_msgs(), Some(tools))
+            .expect("request builds");
+        let body: Value = serde_json::from_slice(req.body()).unwrap();
+        body["tools"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn tool_named<'a>(tools: &'a [Value], name: &str) -> &'a Value {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("tool {name} missing in {tools:?}"))
+    }
+
+    fn strict_of(tool: &Value) -> Option<bool> {
+        tool.get("strict").and_then(Value::as_bool)
+    }
+
+    fn assert_all_original(tools: &[Value], originals: &[Tool]) {
+        for (sent, original) in tools.iter().zip(originals) {
+            assert!(sent.get("strict").is_none(), "{sent}");
+            assert_eq!(sent["input_schema"], original.function.parameters);
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_serializes_strict_only_when_set() {
+        let schema = simple_schema();
+        let plain = AnthropicTool {
+            name: "a".into(),
+            description: "d",
+            schema: std::borrow::Cow::Borrowed(&schema),
+            strict: None,
+        };
+        let strict = AnthropicTool {
+            name: "b".into(),
+            description: "d",
+            schema: std::borrow::Cow::Owned(serde_json::json!({"type": "object"})),
+            strict: Some(true),
+        };
+        let plain = serde_json::to_value(&plain).unwrap();
+        let strict = serde_json::to_value(&strict).unwrap();
+        assert!(plain.get("strict").is_none());
+        assert_eq!(plain["input_schema"], schema);
+        assert_eq!(strict["strict"], true);
+        assert_eq!(
+            strict["input_schema"],
+            serde_json::json!({"type": "object"})
+        );
+    }
+
+    #[test]
+    fn configured_list_is_strict_on_supported_model_with_converted_schema() {
+        let a = anthropic_strict("claude-sonnet-5-5");
+        let tools = vec![
+            schema_tool("edit", simple_schema(), None),
+            schema_tool("multiedit", simple_schema(), None),
+            schema_tool("replace_symbol", simple_schema(), None),
+            schema_tool("glob", simple_schema(), None),
+        ];
+        let before = tools.clone();
+        let sent = request_tools(&a, &tools);
+
+        for name in ["edit", "multiedit", "replace_symbol"] {
+            let tool = tool_named(&sent, name);
+            assert_eq!(strict_of(tool), Some(true), "{name}");
+            assert_eq!(tool["input_schema"]["additionalProperties"], false);
+            assert!(
+                tool["input_schema"]["properties"]["occurrence"]
+                    .get("minimum")
+                    .is_none()
+            );
+        }
+        let glob = tool_named(&sent, "glob");
+        assert!(glob.get("strict").is_none());
+        assert_eq!(glob["input_schema"], simple_schema());
+        // Source definitions are untouched by conversion.
+        for (tool, original) in tools.iter().zip(&before) {
+            assert_eq!(tool.function.parameters, original.function.parameters);
+        }
+    }
+
+    #[test]
+    fn definition_marked_strict_is_sent_strict_even_when_unlisted() {
+        let a = anthropic_for("claude-opus-4-8", None, 4096);
+        let sent = request_tools(
+            &a,
+            &[schema_tool("mcp_lookup", simple_schema(), Some(true))],
+        );
+        assert_eq!(strict_of(&sent[0]), Some(true));
+    }
+
+    #[test]
+    fn unset_strict_tools_selects_nothing_by_name() {
+        let a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        assert_eq!(a.strict_tools, None);
+        let tools = vec![
+            schema_tool("edit", simple_schema(), None),
+            schema_tool("explicit", simple_schema(), Some(true)),
+        ];
+        let sent = request_tools(&a, &tools);
+        assert!(tool_named(&sent, "edit").get("strict").is_none());
+        assert_eq!(strict_of(tool_named(&sent, "explicit")), Some(true));
+    }
+
+    #[test]
+    fn empty_strict_tools_disables_name_selection_but_not_explicit_strictness() {
+        let mut a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        a.strict_tools = Some(vec![]);
+        let tools = vec![
+            schema_tool("edit", simple_schema(), None),
+            schema_tool("explicit", simple_schema(), Some(true)),
+        ];
+        let sent = request_tools(&a, &tools);
+        assert!(tool_named(&sent, "edit").get("strict").is_none());
+        assert_eq!(strict_of(tool_named(&sent, "explicit")), Some(true));
+    }
+
+    #[test]
+    fn configured_list_selects_only_listed_tools() {
+        let mut a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        a.strict_tools = Some(vec!["glob".into()]);
+        let sent = request_tools(
+            &a,
+            &[
+                schema_tool("edit", simple_schema(), None),
+                schema_tool("glob", simple_schema(), None),
+            ],
+        );
+        assert!(tool_named(&sent, "edit").get("strict").is_none());
+        assert_eq!(strict_of(tool_named(&sent, "glob")), Some(true));
+    }
+
+    #[test]
+    fn unsupported_and_unrecognised_models_send_original_schemas_without_strict() {
+        let tools = vec![
+            schema_tool("edit", simple_schema(), None),
+            schema_tool("explicit", simple_schema(), Some(true)),
+        ];
+        for model in [
+            "claude-sonnet-4-0",
+            "claude-3-7-sonnet-20250219",
+            "my-proxy-model",
+        ] {
+            let a = anthropic_for(model, None, 4096);
+            assert_all_original(&request_tools(&a, &tools), &tools);
+        }
+    }
+
+    #[test]
+    fn unsupported_schema_falls_back_per_tool_and_keeps_compatible_tools_strict() {
+        let _ = log::set_logger(&CaptureLogger);
+        log::set_max_level(log::LevelFilter::Warn);
+        let a = anthropic_strict("claude-sonnet-5-5");
+        // Relaxes `count`'s minimum before hitting the dictionary.
+        let partial = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": {"type": "integer", "minimum": 0},
+                "meta": {"type": "object", "additionalProperties": {"type": "string"}}
+            }
+        });
+        let external = serde_json::json!({
+            "type": "object",
+            "properties": {"a": {"$ref": "https://example.com/x.json"}}
+        });
+        let tools = vec![
+            schema_tool("dict_tool_zz", partial.clone(), Some(true)),
+            schema_tool("ext_tool_zz", external.clone(), Some(true)),
+            schema_tool("edit", simple_schema(), None),
+        ];
+        let sent = request_tools(&a, &tools);
+
+        let dict = tool_named(&sent, "dict_tool_zz");
+        assert!(dict.get("strict").is_none());
+        assert_eq!(dict["input_schema"], partial, "no partial conversion leaks");
+        assert_eq!(tool_named(&sent, "ext_tool_zz")["input_schema"], external);
+        assert_eq!(strict_of(tool_named(&sent, "edit")), Some(true));
+
+        let warnings = CAPTURED_WARNINGS.lock().unwrap();
+        assert!(
+            warnings.iter().any(
+                |w| w.contains("dict_tool_zz") && w.contains("arbitrary keys")
+                    || w.contains("dict_tool_zz") && w.contains("extensible")
+            ),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("ext_tool_zz") && w.contains("external reference")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unsupported_tools_do_not_count_against_the_strict_budget() {
+        let a = anthropic_strict("claude-sonnet-5-5");
+        // 25 optional properties would exceed the budget, but the tool is
+        // unconvertible so it is not counted.
+        let mut props = serde_json::Map::new();
+        for i in 0..25 {
+            props.insert(format!("o{i}"), serde_json::json!({"type": "string"}));
+        }
+        props.insert(
+            "m".into(),
+            serde_json::json!({"type": "object", "additionalProperties": true}),
+        );
+        let big = serde_json::json!({"type": "object", "properties": props});
+        let sent = request_tools(
+            &a,
+            &[
+                schema_tool("big", big, Some(true)),
+                schema_tool("edit", simple_schema(), None),
+            ],
+        );
+        assert_eq!(strict_of(tool_named(&sent, "edit")), Some(true));
+        assert!(tool_named(&sent, "big").get("strict").is_none());
+    }
+
+    #[test]
+    fn exceeding_a_budget_sends_every_tool_non_strict_with_original_schemas() {
+        let _ = log::set_logger(&CaptureLogger);
+        log::set_max_level(log::LevelFilter::Warn);
+        let a = anthropic_strict("claude-sonnet-5-5");
+
+        let optional = |n: usize| {
+            let mut props = serde_json::Map::new();
+            for i in 0..n {
+                props.insert(format!("o{i}"), serde_json::json!({"type": "string"}));
+            }
+            serde_json::json!({"type": "object", "properties": props})
+        };
+
+        // 25 optional properties across two strict tools.
+        let tools = vec![
+            schema_tool("edit", optional(12), None),
+            schema_tool("multiedit", optional(13), None),
+            schema_tool("glob", simple_schema(), None),
+        ];
+        assert_all_original(&request_tools(&a, &tools), &tools);
+        assert!(
+            CAPTURED_WARNINGS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|w| w.contains("optional-property limit"))
+        );
+
+        // Exactly 24 is within the limit.
+        let tools = vec![
+            schema_tool("edit", optional(12), None),
+            schema_tool("multiedit", optional(12), None),
+        ];
+        let sent = request_tools(&a, &tools);
+        assert!(sent.iter().all(|t| strict_of(t) == Some(true)));
+
+        // 21 strict tools.
+        let many: Vec<Tool> = (0..21)
+            .map(|i| schema_tool(&format!("t{i}"), simple_schema(), Some(true)))
+            .collect();
+        assert_all_original(&request_tools(&a, &many), &many);
+        let twenty: Vec<Tool> = (0..20)
+            .map(|i| schema_tool(&format!("t{i}"), simple_schema(), Some(true)))
+            .collect();
+        assert!(
+            request_tools(&a, &twenty)
+                .iter()
+                .all(|t| strict_of(t) == Some(true))
+        );
+
+        // 17 union properties.
+        let union = |n: usize| {
+            let mut props = serde_json::Map::new();
+            for i in 0..n {
+                props.insert(
+                    format!("u{i}"),
+                    serde_json::json!({"anyOf": [{"type": "string"}, {"type": "integer"}]}),
+                );
+            }
+            let required: Vec<String> = (0..n).map(|i| format!("u{i}")).collect();
+            serde_json::json!({"type": "object", "properties": props, "required": required})
+        };
+        let over = vec![schema_tool("edit", union(17), None)];
+        assert_all_original(&request_tools(&a, &over), &over);
+        let at = vec![schema_tool("edit", union(16), None)];
+        assert_eq!(strict_of(&request_tools(&a, &at)[0]), Some(true));
+    }
+
+    #[test]
+    fn oauth_prefixes_names_but_matches_strict_tools_by_unprefixed_name() {
+        let mut a = anthropic_strict("claude-sonnet-5-5");
+        a.api_key = "sk-ant-oat01-test".into();
+        let sent = request_tools(
+            &a,
+            &[
+                schema_tool("edit", simple_schema(), None),
+                schema_tool("glob", simple_schema(), None),
+            ],
+        );
+        assert_eq!(strict_of(tool_named(&sent, "mcp_Edit")), Some(true));
+        assert!(tool_named(&sent, "mcp_Glob").get("strict").is_none());
+    }
+
+    #[test]
+    fn oauth_honours_explicit_strictness_like_api_key() {
+        let mut oauth = anthropic_for("claude-sonnet-5-5", None, 4096);
+        oauth.api_key = "sk-ant-oat01-test".into();
+        let sent = request_tools(
+            &oauth,
+            &[schema_tool("explicit", simple_schema(), Some(true))],
+        );
+        assert_eq!(strict_of(&sent[0]), Some(true));
+    }
+
+    #[test]
+    fn strict_settings_parse_from_documented_config() {
+        let a: Anthropic = serde_json::from_value(serde_json::json!({
+            "api_key": "sk-ant-api03-test",
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 4096,
+            "strict_tools": ["edit", "glob"]
+        }))
+        .unwrap();
+        assert_eq!(a.strict_tools, Some(vec!["edit".into(), "glob".into()]));
+
+        let empty: Anthropic = serde_json::from_value(serde_json::json!({
+            "api_key": "k", "model": "m", "max_tokens": 1, "strict_tools": []
+        }))
+        .unwrap();
+        assert_eq!(empty.strict_tools, Some(vec![]));
+
+        let default: Anthropic = serde_json::from_value(serde_json::json!({
+            "api_key": "k", "model": "m", "max_tokens": 1
+        }))
+        .unwrap();
+        assert_eq!(default.strict_tools, None);
+
+        let factory = create_http_factory();
+        let schema: Value = serde_json::from_str(&factory.config_schema()).unwrap();
+        assert!(schema["properties"]["strict_tools"].is_object());
+        factory
+            .from_config(
+                r#"{"api_key":"k","model":"claude-sonnet-5-5","max_tokens":1,"strict_tools":["edit"]}"#,
+            )
+            .expect("factory accepts strict_tools");
     }
 }

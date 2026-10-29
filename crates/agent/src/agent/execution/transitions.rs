@@ -6,6 +6,7 @@
 //! - AfterLlm → ProcessingToolCalls or Complete (response handling)
 //! - ProcessingToolCalls → BeforeLlmCall or WaitingForEvent (parallel tool execution)
 
+use super::tool_calls::{Disposition, PreparedCall};
 use super::wave_plan::{CallInfo, plan_waves, serialized_call_count};
 use crate::agent::agent_config::AgentConfig;
 use crate::agent::execution_context::ExecutionContext;
@@ -16,8 +17,9 @@ use crate::events::{
     reasoning_summary_part_id,
 };
 use crate::middleware::{
-    ExecutionState, LlmResponse, PreparedModelRequest, ToolCall as MiddlewareToolCall,
-    ToolFunction, ToolResult, apply_usage_to_stats, calculate_context_tokens,
+    CompositeDriver, ExecutionState, LlmResponse, PreparedBatch, PreparedCallVerdict,
+    PreparedModelRequest, PreparedToolCall, ToolCall as MiddlewareToolCall, ToolFunction,
+    ToolResult, apply_usage_to_stats, calculate_context_tokens,
 };
 use crate::model::{AgentMessage, MessagePart};
 use anyhow::Context as _;
@@ -566,6 +568,30 @@ fn dedupe_tool_calls_by_call_id(calls: Vec<ToolCall>) -> Vec<ToolCall> {
         .collect()
 }
 
+/// Executable calls of a canonical output, deduplicated by call identity.
+///
+/// Provider invalid-input markers live on the canonical function-call items and
+/// would be lost in the projection to `querymt::ToolCall`, so they are read from
+/// the items here and carried explicitly on the middleware call.
+fn middleware_calls_from_output(output: &ChatOutput) -> Vec<MiddlewareToolCall> {
+    let marked_invalid: std::collections::HashSet<&str> = output
+        .function_calls()
+        .filter(|call| call.is_marked_invalid())
+        .map(|call| call.call_id.as_str())
+        .collect();
+    dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default())
+        .into_iter()
+        .map(|tc| MiddlewareToolCall {
+            invalid_input: marked_invalid.contains(tc.id.as_str()),
+            id: tc.id,
+            function: ToolFunction {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+            },
+        })
+        .collect()
+}
+
 /// Split function calls into executable calls and synthesized error results.
 ///
 /// Local execution is gated on response validation: a call executes only when
@@ -587,26 +613,15 @@ fn gate_function_calls_for_execution(
             );
             continue;
         }
-        let valid_arguments = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-            .map(|value| value.is_object())
-            .unwrap_or(false);
-        if valid_arguments {
-            executable.push(call.clone());
-        } else {
+        if super::tool_calls::has_invalid_input(call) {
+            // Log the call identity only, never the raw arguments.
             warn!(
-                "Gating tool call {} ({}): arguments are not a JSON object",
+                "Gating tool call {} ({}): invalid input (provider-marked, malformed or not a JSON object)",
                 call.id, call.function.name
             );
-            gated_results.push(ToolResult::new(
-                call.id.clone(),
-                vec![querymt::chat::ToolResultPart::Text {
-                    text: "Error: function call arguments are not a valid JSON object; the call was not executed."
-                        .to_string(),
-                }],
-                true,
-                Some(call.function.name.clone()),
-                Some(call.function.arguments.clone()),
-            ));
+            gated_results.push(super::tool_calls::invalid_input_result(call));
+        } else {
+            executable.push(call.clone());
         }
     }
     (executable, gated_results)
@@ -1290,7 +1305,8 @@ pub(super) async fn transition_call_llm(
     let response_content = output.text().unwrap_or_default();
     let response_thinking = output.thinking();
     let response_thinking_signature = output.signature();
-    let tool_calls = dedupe_tool_calls_by_call_id(output.tool_calls().unwrap_or_default());
+    let llm_tool_calls = middleware_calls_from_output(&output);
+    let tool_calls = &llm_tool_calls;
     let usage = output.usage.clone();
     let finish_reason = output.finish_reason;
 
@@ -1344,17 +1360,6 @@ pub(super) async fn transition_call_llm(
             },
         },
     );
-
-    let llm_tool_calls: Vec<MiddlewareToolCall> = tool_calls
-        .into_iter()
-        .map(|tc| MiddlewareToolCall {
-            id: tc.id.clone(),
-            function: ToolFunction {
-                name: tc.function.name.clone(),
-                arguments: tc.function.arguments.clone(),
-            },
-        })
-        .collect();
 
     let mut llm_response = LlmResponse::new(response_content, llm_tool_calls, usage, finish_reason)
         .with_applied(options)
@@ -1736,7 +1741,7 @@ pub(super) async fn transition_after_llm(
 /// history invariant is always maintained.
 #[instrument(
     name = "agent.transition.processing_tool_calls",
-    skip(config, remaining_calls, results, context, exec_ctx),
+    skip(config, driver, remaining_calls, results, context, exec_ctx),
     fields(
         session_id = %exec_ctx.session_id,
         remaining_calls = remaining_calls.len(),
@@ -1748,6 +1753,7 @@ pub(super) async fn transition_after_llm(
 )]
 pub(super) async fn transition_processing_tool_calls(
     config: &AgentConfig,
+    driver: &CompositeDriver,
     remaining_calls: &Arc<[MiddlewareToolCall]>,
     results: &Arc<[ToolResult]>,
     context: &Arc<crate::middleware::ConversationContext>,
@@ -1781,42 +1787,26 @@ pub(super) async fn transition_processing_tool_calls(
         return Ok(next_state);
     }
 
-    // Plan the batch into ordered waves. Calls inside a wave never conflict on a
-    // file and run concurrently; waves (and execution barriers) run in order.
-    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
-    let accesses = config
-        .tool_registry
-        .file_access_batch(
-            remaining_calls
-                .iter()
-                .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
-                .collect(),
-            cwd,
-        )
-        .await;
-    let call_infos: Vec<CallInfo> = remaining_calls
+    // Calls are prepared (normalised, hooked, validated, access-declared) one
+    // execution-barrier-delimited segment at a time, in model order. A segment is
+    // a run of `ParallelSafe` calls or a single barrier call; nothing beyond a
+    // stateful or clarification barrier is prepared until the barrier has
+    // completed, so later hooks observe its effects.
+    let classes: Vec<crate::tools::ToolExecutionClass> = remaining_calls
         .iter()
-        .zip(accesses)
-        .map(|(call, access)| CallInfo {
-            class: config
+        .map(|call| {
+            config
                 .tool_registry
                 .find(&call.function.name)
                 .map(|tool| tool.execution_class())
-                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe),
-            access,
+                .unwrap_or(crate::tools::ToolExecutionClass::ParallelSafe)
         })
         .collect();
-    let waves = plan_waves(&call_infos);
-    let span = tracing::Span::current();
-    span.record("wave_count", waves.len() as u64);
-    span.record(
-        "serialized_calls",
-        serialized_call_count(&call_infos, &waves) as u64,
-    );
+    let segments = split_segments(&classes);
     debug!(
-        "Executing {} tool calls in {} wave(s) for session {}",
+        "Executing {} tool calls in {} segment(s) for session {}",
         remaining_calls.len(),
-        waves.len(),
+        segments.len(),
         exec_ctx.session_id
     );
 
@@ -1824,10 +1814,12 @@ pub(super) async fn transition_processing_tool_calls(
     // regardless of the order in which waves completed.
     let mut slots: Vec<Option<ToolResult>> = (0..remaining_calls.len()).map(|_| None).collect();
     let mut cancelled = already_cancelled;
-    let mut stateful_executed = false;
     let mut clarification_applied = false;
+    let mut wave_count = 0u64;
+    let mut serialized_calls = 0u64;
+    let mut state_reload_ms = 0u64;
 
-    for wave in &waves {
+    for segment in &segments {
         if cancelled || clarification_applied {
             break;
         }
@@ -1836,34 +1828,93 @@ pub(super) async fn transition_processing_tool_calls(
             break;
         }
 
-        let first = wave[0];
-        let class = call_infos[first].class;
-        if class == crate::tools::ToolExecutionClass::ParallelSafe {
-            // Reborrow immutably so the context can be shared across the wave;
-            // `execute_tool_call` only needs `&ExecutionContext`.
-            let exec_ctx_ref: &ExecutionContext = exec_ctx;
-            let futures = wave.iter().map(|&index| {
-                let call = &remaining_calls[index];
-                async move { (index, run_tool_call(config, call, exec_ctx_ref).await) }
+        let indices: Vec<usize> = match segment {
+            Segment::Parallel(indices) => indices.clone(),
+            Segment::Barrier(index) => vec![*index],
+        };
+        let segment_plan =
+            prepare_segment(config, driver, remaining_calls, &indices, exec_ctx).await?;
+        for (index, result) in segment_plan.immediate {
+            slots[index] = Some(result);
+        }
+        let mut prepared: Vec<Option<(PreparedCall, crate::tools::FileAccess)>> =
+            (0..remaining_calls.len()).map(|_| None).collect();
+        let mut call_infos: Vec<CallInfo> = Vec::with_capacity(segment_plan.ready.len());
+        let mut ready_indices: Vec<usize> = Vec::with_capacity(segment_plan.ready.len());
+        for (index, call, access) in segment_plan.ready {
+            call_infos.push(CallInfo {
+                class: classes[index],
+                access: access.clone(),
             });
-            for (index, result) in join_all(futures).await {
-                slots[index] = Some(result);
+            ready_indices.push(index);
+            prepared[index] = Some((call, access));
+        }
+
+        match segment {
+            Segment::Parallel(_) => {
+                // Plan the prepared calls into waves; calls inside a wave never
+                // conflict on a file and run concurrently.
+                let waves = plan_waves(&call_infos);
+                wave_count += waves.len() as u64;
+                serialized_calls += serialized_call_count(&call_infos, &waves) as u64;
+                for wave in &waves {
+                    if exec_ctx.cancellation_token.is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                    // Reborrow immutably so the context can be shared across the
+                    // wave; execution only needs `&ExecutionContext`.
+                    let exec_ctx_ref: &ExecutionContext = exec_ctx;
+                    let futures = wave.iter().map(|&position| {
+                        let index = ready_indices[position];
+                        let call = &remaining_calls[index];
+                        let (prepared_call, _) =
+                            prepared[index].take().expect("prepared call executes once");
+                        async move {
+                            (
+                                index,
+                                run_prepared_tool_call(config, call, prepared_call, exec_ctx_ref)
+                                    .await,
+                            )
+                        }
+                    });
+                    for (index, result) in join_all(futures).await {
+                        slots[index] = Some(result);
+                    }
+                }
             }
-        } else {
-            let call = &remaining_calls[first];
-            stateful_executed |= class == crate::tools::ToolExecutionClass::SerialStateful;
-            let result = run_tool_call(config, call, exec_ctx).await;
-            if class == crate::tools::ToolExecutionClass::ClarificationBoundary && !result.is_error
-            {
-                clarification_applied = apply_clarification_answer(exec_ctx, call, &result).await;
+            Segment::Barrier(index) => {
+                let index = *index;
+                if let Some((prepared_call, _)) = prepared[index].take() {
+                    wave_count += 1;
+                    let class = classes[index];
+                    let call = &remaining_calls[index];
+                    let result =
+                        run_prepared_tool_call(config, call, prepared_call, exec_ctx).await;
+                    if class == crate::tools::ToolExecutionClass::ClarificationBoundary
+                        && !result.is_error
+                    {
+                        clarification_applied =
+                            apply_clarification_answer(exec_ctx, call, &result).await;
+                    }
+                    slots[index] = Some(result);
+                    if class == crate::tools::ToolExecutionClass::SerialStateful {
+                        // Following calls are prepared against the updated state.
+                        state_reload_ms += reload_working_context(exec_ctx).await;
+                    }
+                }
             }
-            slots[first] = Some(result);
         }
 
         if exec_ctx.cancellation_token.is_cancelled() {
             cancelled = true;
         }
     }
+
+    let span = tracing::Span::current();
+    span.record("wave_count", wave_count);
+    span.record("serialized_calls", serialized_calls);
+    span.record("state_reload_ms", state_reload_ms);
 
     let was_cancelled = cancelled || exec_ctx.cancellation_token.is_cancelled();
 
@@ -1880,28 +1931,6 @@ pub(super) async fn transition_processing_tool_calls(
             };
             synthetic_error_result(call, message)
         }));
-    }
-
-    if stateful_executed {
-        let reload_started = std::time::Instant::now();
-        match exec_ctx.state.load_working_context().await {
-            Ok(()) => {
-                if let Some(objective) = exec_ctx.run_objective.as_mut() {
-                    objective.set_task(
-                        exec_ctx.state.active_task.as_ref(),
-                        crate::agent::objective::ObjectiveSource::TaskUpdated,
-                    );
-                }
-            }
-            Err(error) => warn!(
-                "Failed to refresh working context after stateful tool execution: {}",
-                error
-            ),
-        }
-        tracing::Span::current().record(
-            "state_reload_ms",
-            reload_started.elapsed().as_millis() as u64,
-        );
     }
 
     debug!(
@@ -1934,6 +1963,162 @@ pub(super) async fn transition_processing_tool_calls(
     Ok(next_state)
 }
 
+/// A run of calls prepared together: either consecutive `ParallelSafe` calls or
+/// one execution-barrier call (stateful or clarification).
+#[derive(Debug, PartialEq, Eq)]
+enum Segment {
+    Parallel(Vec<usize>),
+    Barrier(usize),
+}
+
+/// Split a batch (by execution class, in model order) into barrier-delimited
+/// segments. Every call index appears in exactly one segment, in order.
+fn split_segments(classes: &[crate::tools::ToolExecutionClass]) -> Vec<Segment> {
+    let mut segments: Vec<Segment> = Vec::new();
+    for (index, class) in classes.iter().enumerate() {
+        if *class == crate::tools::ToolExecutionClass::ParallelSafe {
+            match segments.last_mut() {
+                Some(Segment::Parallel(indices)) => indices.push(index),
+                _ => segments.push(Segment::Parallel(vec![index])),
+            }
+        } else {
+            segments.push(Segment::Barrier(index));
+        }
+    }
+    segments
+}
+
+/// Outcome of preparing one segment.
+struct SegmentPlan {
+    /// Calls whose final result is already known (rejected or failed during
+    /// preparation, or rejected by middleware review): `(call index, result)`.
+    immediate: Vec<(usize, ToolResult)>,
+    /// Executable calls with the file access declared for their effective
+    /// arguments, in model order: `(call index, prepared call, access)`.
+    ready: Vec<(usize, PreparedCall, crate::tools::FileAccess)>,
+}
+
+/// Prepare the calls of one segment in model order, declare their file access
+/// from the effective arguments and let middleware review the prepared batch.
+///
+/// Cancellation is observed before each call is prepared; calls not reached keep
+/// no result here and receive the ordered cancellation result later. Their
+/// pre-tool hooks do not run.
+async fn prepare_segment(
+    config: &AgentConfig,
+    driver: &CompositeDriver,
+    calls: &[MiddlewareToolCall],
+    indices: &[usize],
+    exec_ctx: &ExecutionContext,
+) -> Result<SegmentPlan, anyhow::Error> {
+    let mut immediate: Vec<(usize, ToolResult)> = Vec::new();
+    let mut prepared: Vec<(usize, PreparedCall)> = Vec::new();
+
+    for &index in indices {
+        if exec_ctx.cancellation_token.is_cancelled() {
+            break;
+        }
+        let call = &calls[index];
+        let outcome = tokio::select! {
+            biased;
+            _ = exec_ctx.cancellation_token.cancelled() => break,
+            outcome = super::tool_calls::prepare_tool_call(config, call, exec_ctx) => outcome,
+        };
+        match outcome {
+            Ok(prepared_call) => match prepared_call.disposition {
+                Disposition::Rejected(ref result) => {
+                    super::tool_calls::record_rejected_outcome(
+                        call,
+                        !prepared_call.repairs.is_empty(),
+                    );
+                    immediate.push((index, (**result).clone()));
+                }
+                Disposition::Ready => prepared.push((index, prepared_call)),
+            },
+            Err(error) => {
+                warn!(
+                    "Tool call {} ({}) failed during preparation: {}. \
+                     Synthesizing error result to maintain tool_use/tool_result invariant.",
+                    call.id, call.function.name, error
+                );
+                immediate.push((
+                    index,
+                    synthetic_error_result(
+                        call,
+                        &format!("Error: internal tool execution failed: {error}"),
+                    ),
+                ));
+            }
+        }
+    }
+
+    // File access is declared once, for the final effective arguments.
+    let cwd = exec_ctx.cwd().map(|path| path.to_path_buf());
+    let accesses = config
+        .tool_registry
+        .file_access_batch(
+            prepared
+                .iter()
+                .map(|(index, call)| (calls[*index].function.name.clone(), call.args.clone()))
+                .collect(),
+            cwd.clone(),
+        )
+        .await;
+
+    let verdicts = {
+        let views: Vec<PreparedToolCall<'_>> = prepared
+            .iter()
+            .zip(&accesses)
+            .map(|((index, call), access)| PreparedToolCall {
+                call: &calls[*index],
+                args: &call.args,
+                access,
+            })
+            .collect();
+        driver
+            .run_prepared_tool_calls(&PreparedBatch {
+                session_id: &exec_ctx.session_id,
+                cwd: cwd.as_deref(),
+                calls: &views,
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("Middleware error: {error}"))?
+    };
+
+    let mut ready = Vec::with_capacity(prepared.len());
+    for (((index, call), access), verdict) in prepared.into_iter().zip(accesses).zip(verdicts) {
+        match verdict {
+            PreparedCallVerdict::Proceed => ready.push((index, call, access)),
+            PreparedCallVerdict::Reject(result) => {
+                super::tool_calls::record_rejected_outcome(&calls[index], !call.repairs.is_empty());
+                immediate.push((index, *result));
+            }
+        }
+    }
+    Ok(SegmentPlan { immediate, ready })
+}
+
+/// Reload the working context after a stateful tool ran so later calls are
+/// prepared against the updated state. Returns the elapsed milliseconds.
+async fn reload_working_context(exec_ctx: &mut ExecutionContext) -> u64 {
+    let started = Instant::now();
+    match exec_ctx.state.load_working_context().await {
+        Ok(()) => {
+            if let Some(objective) = exec_ctx.run_objective.as_mut() {
+                objective.set_task(
+                    exec_ctx.state.active_task.as_ref(),
+                    crate::agent::objective::ObjectiveSource::TaskUpdated,
+                );
+            }
+        }
+        Err(error) => warn!(
+            "Failed to refresh working context after stateful tool execution: {}",
+            error
+        ),
+    }
+    started.elapsed().as_millis() as u64
+}
+
 /// Build a synthetic error result for a call that did not produce one.
 fn synthetic_error_result(call: &MiddlewareToolCall, text: &str) -> ToolResult {
     ToolResult::new(
@@ -1947,19 +2132,21 @@ fn synthetic_error_result(call: &MiddlewareToolCall, text: &str) -> ToolResult {
     )
 }
 
-/// Run one tool call, racing it against the cancellation token.
+/// Execute one prepared call, racing it against the cancellation token.
 ///
 /// A cancelled call resolves immediately with a synthetic `"Cancelled by user"`
 /// result, and an infrastructure error becomes an error result, so the
-/// `tool_use` → `tool_result` history invariant always holds.
-async fn run_tool_call(
+/// `tool_use` → `tool_result` history invariant always holds. The prepared
+/// call is consumed: arguments are never re-parsed and hooks never re-run.
+async fn run_prepared_tool_call(
     config: &AgentConfig,
     call: &MiddlewareToolCall,
+    prepared: PreparedCall,
     exec_ctx: &ExecutionContext,
 ) -> ToolResult {
     let cancel = exec_ctx.cancellation_token.clone();
     tokio::select! {
-        result = super::tool_calls::execute_tool_call(config, call, exec_ctx) => {
+        result = super::tool_calls::execute_prepared_tool_call(config, call, prepared, exec_ctx) => {
             match result {
                 Ok(tool_result) => tool_result,
                 Err(error) => {
@@ -4162,6 +4349,7 @@ mod tests {
                 name: "lookup".into(),
                 arguments: arguments.into(),
             },
+            invalid_input: false,
         }
     }
 
@@ -4245,11 +4433,76 @@ mod tests {
                     name: tc.function.name,
                     arguments: tc.function.arguments,
                 },
+                invalid_input: false,
             })
             .collect();
         let (executable, gated) = gate_function_calls_for_execution(&middleware_calls);
         assert!(executable.is_empty(), "invalid call must not execute");
         assert_eq!(gated.len(), 1);
+    }
+
+    /// Assemble a stream the way the provider emits it, then project to middleware calls.
+    fn assembled_calls(chunks: Vec<querymt::chat::StreamChunk>) -> Vec<MiddlewareToolCall> {
+        let mut accumulator = querymt::chat::streaming::ChatStreamAccumulator::new();
+        for chunk in &chunks {
+            accumulator.push(chunk).unwrap();
+        }
+        middleware_calls_from_output(&accumulator.output())
+    }
+
+    fn complete_chunk(id: &str, arguments: &str, invalid: bool) -> querymt::chat::StreamChunk {
+        let mut extensions = querymt::chat::Extensions::new();
+        if invalid {
+            extensions.insert(
+                querymt::chat::INVALID_INPUT_EXTENSION.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        querymt::chat::StreamChunk::ToolUseComplete {
+            index: 0,
+            tool_call: querymt::ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: querymt::FunctionCall {
+                    name: "lookup".into(),
+                    arguments: arguments.into(),
+                },
+            },
+            extensions,
+        }
+    }
+
+    #[test]
+    fn invalid_marker_survives_assembly_even_when_the_buffer_is_valid_json() {
+        let calls = assembled_calls(vec![complete_chunk("c1", r#"{"q":1}"#, true)]);
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].invalid_input,
+            "marker carried onto middleware call"
+        );
+        assert_eq!(
+            calls[0].function.arguments, r#"{"q":1}"#,
+            "raw arguments kept"
+        );
+
+        // The gate rejects it with one INVALID_JSON result and does not dispatch it.
+        let (executable, gated) = gate_function_calls_for_execution(&calls);
+        assert!(executable.is_empty());
+        assert_eq!(gated.len(), 1);
+        assert!(gated[0].is_error);
+    }
+
+    #[test]
+    fn unmarked_valid_call_is_executable_and_marker_is_per_call() {
+        let calls = assembled_calls(vec![
+            complete_chunk("ok", r#"{"q":1}"#, false),
+            complete_chunk("bad", r#"{"q":1}"#, true),
+        ]);
+        let (executable, gated) = gate_function_calls_for_execution(&calls);
+        assert_eq!(executable.len(), 1);
+        assert_eq!(executable[0].id, "ok");
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].call_id, "bad");
     }
 
     // ── map_failed_llm_call ───────────────────────────────────────────────────
