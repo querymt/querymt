@@ -180,12 +180,13 @@ pub(crate) async fn replay_loaded_session(
         },
         // A read-only previous owner has no actor: read the journal and the
         // history store directly, as the actor handlers do.
-        // Only a transferred owner may replay without an actor; for any other
-        // session a missing ref is a real materialization bug.
+        // Only a read-only session (transferred owner, archived workspace) may
+        // replay without an actor; for any other session a missing ref is a
+        // real materialization bug.
         None => {
             let sources = if agent
                 .session_materializer
-                .transferred_owner(session_id)
+                .read_only_reason(session_id)
                 .await?
                 .is_some()
             {

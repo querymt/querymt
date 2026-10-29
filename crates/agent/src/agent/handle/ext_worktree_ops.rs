@@ -15,17 +15,19 @@ use super::utils::ext_json_response;
 use super::*;
 use crate::acp::delivery::with_event_tip;
 use crate::acp::protocol::{ContentBlock, StopReason};
+use crate::agent::session_materializer::ReadOnlyReason;
 use crate::events::AgentEventKind;
 use crate::worktree::{
-    HandoffHost, HandoffOptions, IsolatedSessionSpawner, WorkspaceTarget, WorktreeCreateRequest,
-    WorktreeError, WorktreeOpError, WorktreeOps, WorktreeRecoverResponse,
+    HandoffHost, HandoffOptions, IsolatedSessionSpawner, OwnerHost, WorkspaceTarget,
+    WorktreeCreateRequest, WorktreeError, WorktreeOpError, WorktreeOps, WorktreeRecoverResponse,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 const NATIVE_USAGE: &str = "usage: /worktree create [ref] [name] | create --include-local-changes [name], \
-     handoff [name] [--summary], list, status [id], result [id], publish [id], remove <id>, \
-     recover <id>, archive <id>; no force removal";
+     handoff [name] [--summary], list, status [id], result [id], publish [id], archive [id], \
+     remove [id] [--archive], recover <id>; no force removal";
+const REMOVE_USAGE: &str = "usage: /worktree remove [id] [--archive]";
 const HANDOFF_USAGE: &str = "usage: /worktree handoff [name] [--summary]";
 const CREATE_USAGE: &str =
     "usage: /worktree create [ref] [name] OR /worktree create --include-local-changes [name]";
@@ -39,6 +41,9 @@ fn parse_workspace_op_request<T: serde::de::DeserializeOwned>(req: ExtRequest) -
 /// travels in the error data on every failure; the message stays readable.
 fn op_error_to_acp(err: WorktreeOpError) -> Error {
     let base = match &err {
+        WorktreeOpError::RemovalRefused { source, .. } if source.is_typed_refusal() => {
+            Error::invalid_request()
+        }
         WorktreeOpError::ServiceUnavailable
         | WorktreeOpError::Internal(_)
         | WorktreeOpError::SessionStart(_) => Error::internal_error(),
@@ -56,7 +61,7 @@ fn op_error_to_acp(err: WorktreeOpError) -> Error {
             _ => Error::invalid_request(),
         },
     };
-    base.data(serde_json::json!({ "code": err.code(), "message": err.to_string() }))
+    base.data(err.error_data())
 }
 
 /// Render a typed outcome as an ACP extension response.
@@ -69,6 +74,18 @@ fn render<T: Serialize>(outcome: Result<T, WorktreeOpError>) -> Result<ExtRespon
 #[derive(Debug, Deserialize)]
 struct WorktreeIdRequest {
     workspace_id: String,
+}
+
+/// Archive/remove target: a workspace id, or the id of the session that owns
+/// it. `archive` (remove only) archives an owned workspace first.
+#[derive(Debug, Deserialize)]
+struct WorktreeTargetRequest {
+    #[serde(default, alias = "workspaceId")]
+    workspace_id: Option<String>,
+    #[serde(default, alias = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default)]
+    archive: bool,
 }
 
 /// Explicit publication target: a workspace id, or (defaulting to the
@@ -119,15 +136,28 @@ enum NativeCommand {
     Status(Option<String>),
     Result(Option<String>),
     Publish(Option<String>),
-    Remove(String),
+    Remove {
+        id: Option<String>,
+        archive: bool,
+    },
     Recover(String),
-    Archive(String),
+    Archive(Option<String>),
 }
 
 impl NativeCommand {
-    fn parse(words: &[String]) -> Result<Self, Error> {
+    /// Whether the command changes the session's own workspace or starts new
+    /// work, so an archived (read-only) session must refuse it. Inspection and
+    /// cleanup stay available.
+    fn is_mutating(&self) -> bool {
+        matches!(
+            self,
+            Self::Create { .. } | Self::Handoff(_) | Self::Publish(_) | Self::Archive(_)
+        )
+    }
+
+    fn parse(words: &[String]) -> Result<Self, WorktreeOpError> {
         const INCLUDE: &str = "--include-local-changes";
-        let usage = || Error::invalid_params().data(NATIVE_USAGE);
+        let usage = || WorktreeOpError::InvalidOptions(NATIVE_USAGE.into());
         let operation = words.first().map(String::as_str).unwrap_or("");
         let args = &words[words.len().min(1)..];
         let single_id = || match args {
@@ -150,7 +180,7 @@ impl NativeCommand {
                     || positional.len() > max_positional
                     || positional.iter().any(|a| a.starts_with('-'))
                 {
-                    return Err(Error::invalid_params().data(CREATE_USAGE));
+                    return Err(WorktreeOpError::InvalidOptions(CREATE_USAGE.into()));
                 }
                 let (base_ref, name) = if include {
                     (None, positional.first())
@@ -172,7 +202,7 @@ impl NativeCommand {
                     || positional.len() > 1
                     || positional.iter().any(|a| a.starts_with('-'))
                 {
-                    return Err(Error::invalid_params().data(HANDOFF_USAGE));
+                    return Err(WorktreeOpError::InvalidOptions(HANDOFF_USAGE.into()));
                 }
                 Ok(Self::Handoff(HandoffOptions {
                     name: positional.first().map(|n| (*n).clone()),
@@ -183,9 +213,28 @@ impl NativeCommand {
             "status" => optional_id().map(Self::Status),
             "result" => optional_id().map(Self::Result),
             "publish" => optional_id().map(Self::Publish),
-            "remove" => single_id().map(Self::Remove),
+            "remove" => {
+                const ARCHIVE: &str = "--archive";
+                let flags = args.iter().filter(|a| a.as_str() == ARCHIVE).count();
+                let positional: Vec<&String> =
+                    args.iter().filter(|a| a.as_str() != ARCHIVE).collect();
+                if flags > 1
+                    || positional.len() > 1
+                    || positional.iter().any(|a| a.starts_with('-'))
+                {
+                    return Err(WorktreeOpError::InvalidOptions(REMOVE_USAGE.into()));
+                }
+                Ok(Self::Remove {
+                    id: positional.first().map(|id| (*id).clone()),
+                    archive: flags == 1,
+                })
+            }
             "recover" => single_id().map(Self::Recover),
-            "archive" => single_id().map(Self::Archive),
+            "archive" => match args {
+                [] => Ok(Self::Archive(None)),
+                [id] if !id.starts_with('-') => Ok(Self::Archive(Some(id.clone()))),
+                _ => Err(usage()),
+            },
             _ => Err(usage()),
         }
     }
@@ -269,6 +318,14 @@ impl IsolatedSessionSpawner for LocalAgentHandle {
     }
 }
 
+/// A native command without an id targets the issuing session's workspace.
+fn native_target(id: Option<String>, session_id: &str) -> WorkspaceTarget {
+    id.map_or_else(
+        || WorkspaceTarget::Session(session_id.to_owned()),
+        WorkspaceTarget::Workspace,
+    )
+}
+
 /// State held while a handoff successor is recovered.
 struct HandoffRecoveryGuard {
     previous: String,
@@ -288,9 +345,9 @@ impl HandoffRecoveryGuard {
     }
 }
 
-/// Session-layer steps of an ownership handoff (see [`HandoffHost`]).
+/// Session-layer steps shared by handoff, archive and removal.
 #[async_trait::async_trait]
-impl HandoffHost for LocalAgentHandle {
+impl OwnerHost for LocalAgentHandle {
     async fn is_local(&self, session_id: &str) -> Result<bool, WorktreeOpError> {
         if let Ok(actor) = self.session_ref_for_agent_session(session_id).await
             && actor.is_remote()
@@ -320,6 +377,37 @@ impl HandoffHost for LocalAgentHandle {
         Ok(())
     }
 
+    async fn announce_archived(
+        &self,
+        owner: &str,
+        workspace_id: &str,
+        by_session_id: Option<&str>,
+    ) -> Option<i64> {
+        let config = self.hosting_config(owner).await?;
+        let event = config
+            .emit_event_persisted(
+                owner,
+                AgentEventKind::WorktreeArchived {
+                    workspace_id: workspace_id.to_string(),
+                    by_session_id: by_session_id.map(str::to_owned),
+                },
+            )
+            .await;
+        // The owner was unloaded by the quiesce step: no actor retires its stream.
+        config.event_sink.retire_session_stream(owner).await;
+        match event {
+            Ok(event) => Some(event.session_seq),
+            Err(err) => {
+                tracing::warn!(owner, error = %err, "failed to record archive announcement");
+                None
+            }
+        }
+    }
+}
+
+/// Session-layer steps of an ownership handoff (see [`HandoffHost`]).
+#[async_trait::async_trait]
+impl HandoffHost for LocalAgentHandle {
     async fn summarize(&self, previous: &str) -> Result<Option<String>, WorktreeOpError> {
         let hosted = self.hosting_handle(previous).await?;
         self.runtime_of(&hosted)
@@ -655,36 +743,80 @@ impl LocalAgentHandle {
             return Ok(None);
         };
         let session_id = req.session_id.to_string();
-        // Require an accessible, locally hosted session before any administration.
-        let actor = self.session_ref_for_agent_session(&session_id).await?;
-        if actor.is_remote() {
+        // Require an accessible, locally hosted session before any
+        // administration. A read-only session has no actor, so locality comes
+        // from the session store rather than the actor registry.
+        if !OwnerHost::is_local(self, &session_id)
+            .await
+            .map_err(op_error_to_acp)?
+        {
             return Err(Error::invalid_request()
                 .data("worktree administration requires local filesystem execution"));
         }
-        let command = NativeCommand::parse(&words)?;
-        let (value, announced_tip) = self
-            .run_native_command(&session_id, command)
-            .await
-            .map_err(op_error_to_acp)?;
+        // A previous owner has no workspace left to administer.
+        let read_only = self
+            .session_materializer
+            .read_only_reason(&session_id)
+            .await?;
+        if let Some(reason @ ReadOnlyReason::OwnerTransferred { .. }) = &read_only {
+            return Err(reason.error(&session_id));
+        }
+
+        // Every failure below, usage errors included, is a visible reply: a
+        // successful turn carrying the error code, never a bare JSON-RPC error.
+        let outcome = async {
+            let command = NativeCommand::parse(&words)?;
+            if let Some(ReadOnlyReason::WorkspaceArchived { workspace_id }) = read_only
+                && command.is_mutating()
+            {
+                return Err(WorktreeOpError::Worktree(
+                    WorktreeError::WorkspaceArchived { workspace_id },
+                ));
+            }
+            self.run_native_command(&session_id, command).await
+        }
+        .await;
+
+        let (payload, text, announced_tip) = match outcome {
+            Ok((value, tip)) => {
+                let text = value.to_string();
+                (value, text, tip)
+            }
+            Err(err) => (
+                serde_json::json!({ "error": err.error_data() }),
+                err.to_string(),
+                None,
+            ),
+        };
 
         // Output is a session update on the issuing session's ordered stream,
         // so the transport's event-tip hold delivers it before the response on
-        // every connection attached to the session. A handoff's output is its
-        // durable announcement instead (already emitted, tip supplied).
+        // every connection attached to the session. An announcement already
+        // emitted on this stream (handoff, self-archive) is the output.
         let tip = match announced_tip {
             Some(tip) => tip,
             None => match self.hosting_config(&session_id).await {
-                Some(config) => config.emit_ephemeral_event(
-                    &session_id,
-                    AgentEventKind::WorktreeCommandOutput {
-                        text: value.to_string(),
-                    },
-                ),
+                Some(config) => {
+                    let tip = config.emit_ephemeral_event(
+                        &session_id,
+                        AgentEventKind::WorktreeCommandOutput { text },
+                    );
+                    // A session without an actor has nothing else to retire
+                    // its stream.
+                    if self
+                        .session_ref_for_agent_session(&session_id)
+                        .await
+                        .is_err()
+                    {
+                        config.event_sink.retire_session_stream(&session_id).await;
+                    }
+                    tip
+                }
                 None => 0,
             },
         };
         let mut meta = serde_json::Map::new();
-        meta.insert("querymt.worktree".into(), value);
+        meta.insert("querymt.worktree".into(), payload);
         let response = PromptResponse::new(StopReason::EndTurn).meta(meta);
         Ok(Some(with_event_tip(response, tip)))
     }
@@ -769,9 +901,27 @@ impl LocalAgentHandle {
                 &ops.publish(&WorkspaceTarget::Session(session_id.to_string()))
                     .await?,
             ),
-            NativeCommand::Remove(id) => to_value(&ops.remove(&id).await?),
+            NativeCommand::Remove { id, archive } => {
+                let target = native_target(id, session_id);
+                let (response, _) = ops
+                    .remove_announced(self, &target, archive, Some(session_id))
+                    .await?;
+                to_value(&response)
+            }
             NativeCommand::Recover(id) => to_value(&ops.recover(&id).await?),
-            NativeCommand::Archive(id) => to_value(&ops.archive(&id).await?),
+            // The owner is unloaded by the archive, so when the issuing session
+            // is the owner the reply is the durable announcement on its stream.
+            NativeCommand::Archive(id) => {
+                let target = native_target(id, session_id);
+                let outcome = ops
+                    .archive_announced(self, &target, Some(session_id))
+                    .await?;
+                let tip = outcome
+                    .announcement
+                    .filter(|announcement| announcement.session_id == session_id)
+                    .map(|announcement| announcement.seq);
+                return Ok((to_value(&outcome.summary)?, tip));
+            }
         }?;
         Ok((value, None))
     }
@@ -853,8 +1003,16 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        render(async { self.worktree_ops()?.remove(&parsed.workspace_id).await }.await)
+        let parsed: WorktreeTargetRequest = parse_workspace_op_request(req)?;
+        render(
+            async {
+                let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
+                self.worktree_ops()?
+                    .remove(self, &target, parsed.archive)
+                    .await
+            }
+            .await,
+        )
     }
 
     /// Archive inactive execution while preserving the durable session binding.
@@ -862,8 +1020,14 @@ impl LocalAgentHandle {
         &self,
         req: ExtRequest,
     ) -> Result<ExtResponse, Error> {
-        let parsed: WorktreeIdRequest = parse_workspace_op_request(req)?;
-        render(async { self.worktree_ops()?.archive(&parsed.workspace_id).await }.await)
+        let parsed: WorktreeTargetRequest = parse_workspace_op_request(req)?;
+        render(
+            async {
+                let target = WorkspaceTarget::from_parts(parsed.workspace_id, parsed.session_id)?;
+                self.worktree_ops()?.archive(self, &target).await
+            }
+            .await,
+        )
     }
 
     /// Explicitly recover persisted allocation/removal intent, or release a
@@ -934,7 +1098,7 @@ impl LocalAgentHandle {
 mod native_command_tests {
     use super::*;
 
-    fn parse(line: &str) -> Result<NativeCommand, Error> {
+    fn parse(line: &str) -> Result<NativeCommand, WorktreeOpError> {
         let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
         NativeCommand::parse(&words)
     }
@@ -982,8 +1146,36 @@ mod native_command_tests {
         );
         assert_eq!(
             parse("remove ws-1").unwrap(),
-            NativeCommand::Remove("ws-1".into())
+            NativeCommand::Remove {
+                id: Some("ws-1".into()),
+                archive: false
+            }
         );
+        assert_eq!(
+            parse("remove --archive").unwrap(),
+            NativeCommand::Remove {
+                id: None,
+                archive: true
+            }
+        );
+        assert_eq!(
+            parse("remove ws-1 --archive").unwrap(),
+            NativeCommand::Remove {
+                id: Some("ws-1".into()),
+                archive: true
+            }
+        );
+        assert_eq!(parse("archive").unwrap(), NativeCommand::Archive(None));
+        assert_eq!(
+            parse("archive ws-1").unwrap(),
+            NativeCommand::Archive(Some("ws-1".into()))
+        );
+        for mutating in ["create", "handoff", "publish", "archive"] {
+            assert!(parse(mutating).unwrap().is_mutating(), "{mutating}");
+        }
+        for allowed in ["list", "status", "result", "remove", "recover ws-1"] {
+            assert!(!parse(allowed).unwrap().is_mutating(), "{allowed}");
+        }
     }
 
     #[test]
@@ -998,8 +1190,11 @@ mod native_command_tests {
             "create HEAD name extra",
             "create --include-local-changes HEAD name",
             "create --include-local-changes --include-local-changes",
-            "remove",
+            "remove a b",
+            "remove --archive --archive",
             "remove --force",
+            "archive a b",
+            "archive --force",
             "status a b",
             "bogus",
         ] {

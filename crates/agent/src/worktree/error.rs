@@ -2,6 +2,41 @@
 
 use thiserror::Error;
 
+/// Most paths named in a refusal diagnostic; the rest are only counted.
+const PATH_SAMPLE_LIMIT: usize = 10;
+
+/// A bounded sample of paths plus the total count, so diagnostics stay small
+/// for checkouts with thousands of changed files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathSample {
+    /// Boxed slice: keeps `WorktreeError` small (it is returned everywhere).
+    pub paths: Box<[String]>,
+    pub total: usize,
+}
+
+impl PathSample {
+    pub fn new(all: &[String]) -> Self {
+        Self {
+            paths: all.iter().take(PATH_SAMPLE_LIMIT).cloned().collect(),
+            total: all.len(),
+        }
+    }
+}
+
+impl std::fmt::Display for PathSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.total)?;
+        if self.total > 0 {
+            write!(f, " ({}", self.paths.join(", "))?;
+            if self.total > self.paths.len() {
+                write!(f, ", +{} more", self.total - self.paths.len())?;
+            }
+            write!(f, ")")?;
+        }
+        Ok(())
+    }
+}
+
 /// Errors raised while resolving, provisioning, or administrating managed
 /// worktree workspaces.
 #[derive(Debug, Error)]
@@ -99,6 +134,50 @@ pub enum WorktreeError {
         workspace_id: String,
         checkout: std::path::PathBuf,
     },
+
+    /// The checkout still has an executing owner, shared delegates, or
+    /// activity in another process.
+    #[error("{0}")]
+    OwnerActive(String),
+
+    /// Removal needs the workspace archived first because a session owns it.
+    #[error(
+        "workspace {workspace_id} is active (owned by session {owner}); archive it first \
+         (`/worktree archive`, or `/worktree remove --archive`) before removal"
+    )]
+    WorkspaceNotArchived { workspace_id: String, owner: String },
+
+    /// Removal would discard working files that no ref preserves.
+    #[error(
+        "workspace {workspace_id} has unpreserved working state: uncommitted {uncommitted}, \
+         untracked {untracked}, ignored {ignored}; commit or delete the listed files \
+         before removal"
+    )]
+    UnpreservedContent {
+        workspace_id: String,
+        uncommitted: PathSample,
+        untracked: PathSample,
+        ignored: PathSample,
+    },
+
+    /// Removal would discard commits beyond the baseline that no retained ref
+    /// contains.
+    #[error(
+        "workspace {workspace_id} has commits beyond its baseline without a retained \
+         recovery reference: {commits}; publish the result or integrate the commits \
+         before removal"
+    )]
+    UnpreservedCommits {
+        workspace_id: String,
+        commits: PathSample,
+    },
+
+    /// The workspace is archived, so the requested operation is refused.
+    #[error(
+        "workspace {workspace_id} is archived; it can only be inspected or removed \
+         (`/worktree remove`)"
+    )]
+    WorkspaceArchived { workspace_id: String },
 }
 
 impl WorktreeError {
@@ -123,7 +202,25 @@ impl WorktreeError {
             | Self::GitTimeout { .. }
             | Self::GitSpawn { .. } => "repository_error",
             Self::InvalidOperation(_) => "operation_refused",
+            Self::OwnerActive(_) => "owner_active",
+            Self::WorkspaceNotArchived { .. } => "workspace_not_archived",
+            Self::UnpreservedContent { .. } => "unpreserved_content",
+            Self::UnpreservedCommits { .. } => "unpreserved_commits",
+            Self::WorkspaceArchived { .. } => "workspace_archived",
         }
+    }
+
+    /// Whether this is one of the specific, actionable removal/archive
+    /// refusals whose code replaces the generic `removal_refused`.
+    pub fn is_typed_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::OwnerActive(_)
+                | Self::WorkspaceNotArchived { .. }
+                | Self::UnpreservedContent { .. }
+                | Self::UnpreservedCommits { .. }
+                | Self::WorkspaceArchived { .. }
+        )
     }
 }
 

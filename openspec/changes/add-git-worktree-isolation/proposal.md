@@ -21,6 +21,7 @@ Concurrent coding sessions and parallel delegates currently share writable check
 
 - List isolated sessions under the cwd they were started from and nest them under their source session (fork origin `worktree`), disclosing their workspace on list and load, instead of grouping by repository identity.
 - Add an explicit ownership handoff that starts a fresh conversation in an existing managed checkout (clean by default, optionally seeded with a summary); the previous owner stays loadable read-only.
+- Make archival usable from any session: archive unloads an idle owner (including the issuing session) instead of requiring a session close the UI cannot perform, the archived owner stays loadable read-only, `remove --archive` archives and removes in one step, archiving or resolving an owner session unloads its idle actor, and native `/worktree` refusals are shown in the conversation with specific codes instead of a bare "Invalid request".
 
 ## Capabilities
 

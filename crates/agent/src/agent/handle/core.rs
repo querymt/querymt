@@ -150,9 +150,9 @@ impl LocalAgentHandle {
                 .available_commands
                 .retain(|cmd| cmd.name != "/worktree");
             update.available_commands.push(crate::acp::protocol::AvailableCommand::new(
-                "/worktree", "Create and inspect isolated sessions; conservative removal, no automatic integration",
+                "/worktree", "Create, hand off, archive and inspect isolated sessions; conservative removal, no automatic integration",
             ).input(crate::acp::protocol::AvailableCommandInput::Unstructured(
-                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | remove <id> | recover <id> | archive <id>"),
+                crate::acp::protocol::UnstructuredCommandInput::new("create [ref] [name] | create --include-local-changes [name] | list | status [id] | result [id] | publish [id] | handoff [name] [--summary] | archive [id] | remove [id] [--archive] | recover <id>"),
             )));
         }
         if update.available_commands.is_empty() {
@@ -822,11 +822,12 @@ impl LocalAgentHandle {
                 .meta(meta));
         }
 
-        // A previous owner replays its history but never materializes: no
-        // actor, no lease, no cwd inside the checkout it handed away.
-        if let Some(owner) = self
+        // A read-only session (previous owner, archived workspace) replays its
+        // history but never materializes: no actor, no lease, no cwd inside a
+        // checkout it no longer owns.
+        if let Some(reason) = self
             .session_materializer
-            .transferred_owner(&session_id)
+            .read_only_reason(&session_id)
             .await?
         {
             // Snapshot and workspace disclosure come from the runtime that
@@ -844,14 +845,7 @@ impl LocalAgentHandle {
                 .entry(crate::acp::shared::QUERYMT_META_NAMESPACE.to_string())
                 .or_insert_with(|| serde_json::json!({}));
             if let Some(namespace) = namespace.as_object_mut() {
-                namespace.insert(
-                    "sessionAccess".to_string(),
-                    serde_json::json!({
-                        "mode": "read_only",
-                        "reason": "owner_transferred",
-                        "ownerSessionId": owner,
-                    }),
-                );
+                namespace.insert("sessionAccess".to_string(), reason.access_meta());
             }
             return Ok(LoadSessionResponse::new().meta(meta));
         }
@@ -1054,7 +1048,15 @@ impl LocalAgentHandle {
             meta.insert("querymt/sessionLoadSnapshot.v1".to_string(), snapshot);
         }
 
-        if let Some(service) = self.config.workspace_service()
+        // A read-only session has no attachable binding (its workspace is
+        // archived or was handed off); `sessionAccess` discloses its state.
+        let read_only = self
+            .session_materializer
+            .read_only_reason(session_id)
+            .await?
+            .is_some();
+        if !read_only
+            && let Some(service) = self.config.workspace_service()
             && let Some(binding) = service
                 .resolve_existing_session(session_id, None)
                 .await

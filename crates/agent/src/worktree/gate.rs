@@ -81,6 +81,7 @@ impl CheckoutMutationGate {
 #[derive(Debug)]
 pub(crate) struct CheckoutActivityLease {
     _file: std::fs::File,
+    exclusive: bool,
 }
 
 impl Drop for CheckoutActivityLease {
@@ -90,6 +91,11 @@ impl Drop for CheckoutActivityLease {
 }
 
 impl CheckoutActivityLease {
+    /// Whether this lease excludes every other activity on the checkout.
+    pub(crate) fn is_exclusive(&self) -> bool {
+        self.exclusive
+    }
+
     pub(crate) fn acquire(
         storage: &Path,
         checkout: &Path,
@@ -121,7 +127,10 @@ impl CheckoutActivityLease {
             file.try_lock_shared()
         };
         result.map_err(|err| crate::worktree::WorktreeError::InvalidOperation(format!("checkout {} has active execution or administration: {err}; close its sessions first", checkout.display())))?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            exclusive,
+        })
     }
 }
 

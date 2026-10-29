@@ -23,7 +23,7 @@ use crate::worktree::allocate::worktree_registered;
 use crate::worktree::domain::{
     ManagedBranch, WorkspaceId, WorkspaceLifecycle, WorkspaceRecord, baseline_ref_for,
 };
-use crate::worktree::error::{WorktreeError, WorktreeResult};
+use crate::worktree::error::{PathSample, WorktreeError, WorktreeResult};
 use crate::worktree::repo_ops::{RepositoryOps, validate_ref_name};
 use crate::worktree::repo_workspace::WorkspaceRepository;
 use std::fmt;
@@ -193,26 +193,44 @@ impl WorkspaceManager {
         Ok(updated)
     }
 
-    /// Explicitly and conservatively remove a managed workspace.
+    /// Take the checkout's exclusive activity lease without waiting.
     ///
-    /// Refuses (without deleting anything):
-    /// - records still provisioning or already removed;
-    /// - workspaces with an active session owner;
-    /// - checkouts containing uncommitted, untracked, or ignored files;
-    /// - directories Git does not know as the managed checkout (externally
-    ///   owned or unknown pre-existing content);
-    /// - commits beyond the baseline with no retained recovery reference.
-    ///
-    /// On success the checkout is removed through Git administration, the
-    /// managed branch is deleted only when it adds nothing beyond the
-    /// baseline, and the report discloses every retained ref.
-    /// Retire execution without dropping ownership or conversation history.
-    pub async fn archive(&self, record: &WorkspaceRecord) -> WorktreeResult<WorkspaceRecord> {
-        let _activity = crate::worktree::gate::CheckoutActivityLease::acquire(
+    /// Callers that must quiesce an owner first (see `WorktreeOps`) acquire
+    /// the lease themselves and use the `*_held` operations.
+    fn try_exclusive_lease(
+        &self,
+        record: &WorkspaceRecord,
+    ) -> WorktreeResult<crate::worktree::gate::CheckoutActivityLease> {
+        crate::worktree::gate::CheckoutActivityLease::acquire(
             &self.storage_root,
             &record.checkout_path,
             true,
-        )?;
+        )
+        .map_err(|err| WorktreeError::OwnerActive(err.to_string()))
+    }
+
+    /// [`Self::archive_held`] with a non-waiting exclusive lease.
+    pub async fn archive(&self, record: &WorkspaceRecord) -> WorktreeResult<WorkspaceRecord> {
+        let lease = self.try_exclusive_lease(record)?;
+        self.archive_held(record, &lease).await
+    }
+
+    /// [`Self::remove_held`] with a non-waiting exclusive lease.
+    pub async fn remove(&self, record: &WorkspaceRecord) -> WorktreeResult<RemovalReport> {
+        let lease = self.try_exclusive_lease(record)?;
+        self.remove_held(record, &lease).await
+    }
+
+    /// Retire execution without dropping ownership or conversation history.
+    ///
+    /// `lease` proves the caller holds the checkout's exclusive activity
+    /// lease, so no actor, shared delegate or other process is executing in it.
+    pub(crate) async fn archive_held(
+        &self,
+        record: &WorkspaceRecord,
+        lease: &crate::worktree::gate::CheckoutActivityLease,
+    ) -> WorktreeResult<WorkspaceRecord> {
+        debug_assert!(lease.is_exclusive(), "archive requires the exclusive lease");
         crate::worktree::lock::with_admin_lock(
             &self.storage_root,
             &record.repository.common_dir,
@@ -259,7 +277,28 @@ impl WorkspaceManager {
         .await
     }
 
-    pub async fn remove(&self, record: &WorkspaceRecord) -> WorktreeResult<RemovalReport> {
+    /// Explicitly and conservatively remove a managed workspace.
+    ///
+    /// Refuses (without deleting anything):
+    /// - records still provisioning or already removed;
+    /// - workspaces with an active session owner (`workspace_not_archived`);
+    /// - checkouts containing uncommitted, untracked, or ignored files
+    ///   (`unpreserved_content`);
+    /// - directories Git does not know as the managed checkout (externally
+    ///   owned or unknown pre-existing content);
+    /// - commits beyond the baseline with no retained recovery reference
+    ///   (`unpreserved_commits`).
+    ///
+    /// On success the checkout is removed through Git administration, the
+    /// managed branch is deleted only when it adds nothing beyond the
+    /// baseline, and the report discloses every retained ref. `lease` is the
+    /// caller's already-held exclusive activity lease.
+    pub(crate) async fn remove_held(
+        &self,
+        record: &WorkspaceRecord,
+        lease: &crate::worktree::gate::CheckoutActivityLease,
+    ) -> WorktreeResult<RemovalReport> {
+        debug_assert!(lease.is_exclusive(), "removal requires the exclusive lease");
         Self::ensure_removable(record)?;
 
         // Authoritative durable state: the caller's copy may be stale.
@@ -281,17 +320,12 @@ impl WorkspaceManager {
                 WorkspaceLifecycle::Archived | WorkspaceLifecycle::Removing
             )
         {
-            return Err(WorktreeError::InvalidOperation(format!(
-                "workspace {} is active (owned by session {owner}); detach the owner session before removal",
-                record.id
-            )));
+            return Err(WorktreeError::WorkspaceNotArchived {
+                workspace_id: record.id.to_string(),
+                owner: owner.clone(),
+            });
         }
 
-        let _activity = crate::worktree::gate::CheckoutActivityLease::acquire(
-            &self.storage_root,
-            &current.checkout_path,
-            true,
-        )?;
         let common_dir = current.repository.common_dir.clone();
         let report =
             crate::worktree::lock::with_admin_lock(&self.storage_root, &common_dir, async {
@@ -381,13 +415,12 @@ impl WorkspaceManager {
         if checkout_exists {
             let live = self.observe(record).await?;
             if !live.is_clean_for_removal() {
-                return Err(WorktreeError::InvalidOperation(format!(
-                    "workspace {} has unpreserved working state: {} uncommitted, {} untracked, {} ignored file(s); commit or remove them explicitly before removal",
-                    record.id,
-                    live.uncommitted.len(),
-                    live.untracked.len(),
-                    live.ignored.len()
-                )));
+                return Err(WorktreeError::UnpreservedContent {
+                    workspace_id: record.id.to_string(),
+                    uncommitted: PathSample::new(&live.uncommitted),
+                    untracked: PathSample::new(&live.untracked),
+                    ignored: PathSample::new(&live.ignored),
+                });
             }
         }
 
@@ -426,12 +459,10 @@ impl WorkspaceManager {
                     }
                 }
                 if !preserved {
-                    return Err(WorktreeError::InvalidOperation(format!(
-                        "workspace {} has {} commit(s) beyond its baseline without a retained recovery reference: [{}]; retain the result or integrate the commits before removal",
-                        record.id,
-                        commits.len(),
-                        preview_commits(&commits)
-                    )));
+                    return Err(WorktreeError::UnpreservedCommits {
+                        workspace_id: record.id.to_string(),
+                        commits: PathSample::new(&commits),
+                    });
                 }
                 commits_preserved = true;
                 retained_refs.push(record.branch.as_str().to_string());
@@ -617,19 +648,6 @@ impl WorkspaceManager {
     pub(crate) fn registry(&self) -> &Arc<dyn WorkspaceRepository> {
         &self.registry
     }
-}
-
-/// Bounded commit list for removal-refusal diagnostics.
-fn preview_commits(commits: &[String]) -> String {
-    const MAX: usize = 5;
-    if commits.len() <= MAX {
-        return commits.join(", ");
-    }
-    format!(
-        "{} (+{} more)",
-        commits[..MAX].join(", "),
-        commits.len() - MAX
-    )
 }
 
 #[cfg(test)]

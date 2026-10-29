@@ -252,11 +252,11 @@ Managed workspaces SHALL use durable storage, survive session completion/cancell
 - **THEN** removal is refused and the blocking state is reported without deleting files
 
 #### Scenario: History-preserving explicit archival
-- **WHEN** a user explicitly archives a workspace after all checkout actors have stopped
+- **WHEN** a user explicitly archives a workspace whose owner is idle
 - **THEN** its session history and durable binding remain available for inspection
-- **AND** future load/resume is refused rather than running in another checkout
+- **AND** the owner session loads read-only and resume, prompts, and mutations are refused rather than running in another checkout
 - **AND** conservative removal can proceed without deleting the owning conversation
-- **AND** archive and removal are refused while any cooperating actor holds a checkout activity lease, including in another process
+- **AND** archive and removal are refused with `owner_active` while a turn runs, input is queued, or any other cooperating actor holds a checkout activity lease, including in another process
 
 #### Scenario: Interrupted removal
 - **WHEN** deletion is interrupted after Removing intent was persisted
@@ -286,6 +286,75 @@ Managed workspaces SHALL use durable storage, survive session completion/cancell
 - **WHEN** allocation stops after binding a baseline but before publishing its retained reference or checkout
 - **THEN** recovery preserves that exact baseline and restores the missing reference before marking the workspace ready
 - **AND** a conflicting existing reference is diagnosed rather than overwritten
+
+### Requirement: Archive from any session
+Archival SHALL succeed from the owning session and from any other local session whenever the owner is idle, unloading an idle locally hosted owner actor before taking the exclusive activity lease. It SHALL refuse with `owner_active` only for active execution and with `owner_not_local` for a remotely hosted owner. The native command SHALL default to the issuing session's workspace.
+
+#### Scenario: Archive from the owning session
+- **WHEN** `/worktree archive` is issued without an id from the session that owns a ready workspace and no turn is running
+- **THEN** the workspace is archived, the session's actor is unloaded, and every attached client receives the archived update before the prompt response
+- **AND** a later prompt in that session is refused with `workspace_archived`
+
+#### Scenario: Archive from another session while the owner is loaded and idle
+- **WHEN** another session archives a workspace whose owner actor is loaded but idle
+- **THEN** the owner is unloaded and the archive succeeds without any client closing the owner session
+
+#### Scenario: Owner busy
+- **WHEN** the owner has a running turn, queued or steering input, shared delegates, or execution in another process
+- **THEN** archive is refused with `owner_active` and a message naming the reason, the actor stays loaded, and nothing changes
+
+#### Scenario: Repeated archive
+- **WHEN** an archived workspace is archived again
+- **THEN** the operation succeeds and reports the archived workspace without emitting a second update
+
+#### Scenario: Remotely hosted owner
+- **WHEN** the owner session is hosted on another node
+- **THEN** archive is refused with `owner_not_local` and nothing changes
+
+#### Scenario: Archived update cannot be recorded
+- **WHEN** the durable archived update on the owner's session stream fails to record
+- **THEN** the failure is logged and the archive remains committed
+
+### Requirement: Archived owners are read-only
+An archived workspace's owner session SHALL remain listable and loadable. Load SHALL replay history without materializing an actor and disclose `sessionAccess = { mode: "read_only", reason: "workspace_archived" }` with the workspace identity. Prompts, queued or steered input, undo/redo, forks, configuration changes, and mutating worktree commands SHALL be refused with `workspace_archived`. Status, result, list, remove, and recover SHALL remain available from that session.
+
+#### Scenario: Load an archived owner
+- **WHEN** a client loads the owner session of an archived workspace
+- **THEN** history and the archived update are replayed, the response discloses read-only access with reason `workspace_archived`, and no configuration-option update is replayed
+
+#### Scenario: Clean up from the archived conversation
+- **WHEN** `/worktree remove` is issued from the archived owner session
+- **THEN** removal runs with the same safety checks as from any other session
+
+### Requirement: Archive-and-remove convenience
+Removal SHALL accept an explicit archive option (native `--archive`) that archives the workspace under the archival rules and then removes it. If removal is refused after a successful archive, the workspace SHALL stay archived and the response SHALL report both outcomes. Without the option, removing a non-archived owned workspace SHALL be refused with `workspace_not_archived` and a message pointing to archive.
+
+#### Scenario: One-step cleanup
+- **WHEN** `/worktree remove --archive` targets a clean workspace with an idle owner
+- **THEN** the workspace is archived and removed, and retained refs are reported
+
+#### Scenario: Archive succeeds, removal refused
+- **WHEN** `/worktree remove --archive` targets a workspace with untracked or ignored files
+- **THEN** the workspace is archived, removal is refused with `unpreserved_content` listing the blocking paths, and no files are deleted
+
+### Requirement: Visible native command failures
+A refused or failed native `/worktree` command, including a usage error, SHALL complete the prompt successfully with `_meta["querymt.worktree"].error = { code, message }` and SHALL emit its message as a session update before the response. Refusal messages SHALL name the next action. ACP extension methods SHALL keep returning errors with `data.code` and `data.message`.
+
+#### Scenario: Refusal is shown in the conversation
+- **WHEN** a native `/worktree archive` is refused because the owner is busy
+- **THEN** the client shows a message with `owner_active` and the reason instead of a generic "Invalid request"
+- **AND** the prompt response carries the same code and message in its metadata
+
+#### Scenario: Specific removal refusal codes
+- **WHEN** removal is blocked by an active owner, a non-archived owner, uncommitted/untracked/ignored files, or unpreserved commits
+- **THEN** it is refused with `owner_active`, `workspace_not_archived`, `unpreserved_content` (listing paths), or `unpreserved_commits` respectively, each message naming the next action
+
+### Requirement: Session archival releases the owner actor
+Setting a session's lifecycle to archived or resolved SHALL unload that session's actor when it owns a managed workspace and is idle, releasing its activity lease. It SHALL NOT archive the workspace, and a busy actor SHALL NOT prevent the lifecycle change.
+
+#### Scenario: Archive the session, then the worktree elsewhere
+- **WHEN** a user archives an idle owner session from the session list and then runs `/worktree archive <id>` from another session
+- **THEN** the worktree archive succeeds
 
 ### Requirement: Supported repository administration layouts
 For a usable non-bare source checkout, workspace creation, inspection, capture, review, recovery, and removal SHALL use its actual Git common-directory and checkout identities. Separate Git-directory layouts and linked checkouts backed by bare common repositories SHALL NOT be misinterpreted as ordinary directories. A bare source without a working checkout SHALL be rejected explicitly.

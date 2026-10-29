@@ -59,7 +59,7 @@ pub use domain::{
     WorkspaceId, WorkspaceLifecycle, WorkspaceOwnership, WorkspaceRecord, baseline_ref_for,
     normalize_cwd, resolve_delegation_isolation, resolve_delegation_policy, source_cwd_from,
 };
-pub use error::{WorktreeError, WorktreeResult};
+pub use error::{PathSample, WorktreeError, WorktreeResult};
 pub use gate::CheckoutMutationGate;
 #[cfg(test)]
 pub(crate) use git::{CliGit, GitRunner};
@@ -77,10 +77,11 @@ pub use integrate::{
 pub use lifecycle::{RemovalReport, WorkspaceManager, WorkspaceStatus};
 pub use lock::{admin_lock_path, with_admin_lock};
 pub use ops::{
-    HandoffHost, HandoffOptions, IsolatedSessionSpawner, WorkspaceTarget, WorktreeCreateRequest,
-    WorktreeCreateResponse, WorktreeHandoffResponse, WorktreeListResponse, WorktreeOpError,
-    WorktreeOps, WorktreePublishResponse, WorktreeRecoverResponse, WorktreeRemoveResponse,
-    WorktreeResultEntry, WorktreeResultResponse, WorktreeStatusResponse, WorktreeSummary,
+    Announcement, ArchiveOutcome, HandoffHost, HandoffOptions, IsolatedSessionSpawner, OwnerHost,
+    WorkspaceTarget, WorktreeCreateRequest, WorktreeCreateResponse, WorktreeHandoffResponse,
+    WorktreeListResponse, WorktreeOpError, WorktreeOps, WorktreePublishResponse,
+    WorktreeRecoverResponse, WorktreeRemoveResponse, WorktreeResultEntry, WorktreeResultResponse,
+    WorktreeStatusResponse, WorktreeSummary,
 };
 pub use protect::IndexLock;
 pub use repo_ops::{
