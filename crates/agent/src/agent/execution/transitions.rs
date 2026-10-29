@@ -179,6 +179,20 @@ pub(super) async fn transition_before_llm_call(
         );
     }
     messages = hook_result.messages.unwrap_or_default();
+    // Providers reject a tool call without its result. Reaching this point
+    // with one is a bug upstream; answer it so the run survives, and make it loud.
+    let unanswered = crate::model::answer_unanswered_tool_calls(&mut messages);
+    if !unanswered.is_empty() {
+        log::error!(
+            "Session {}: request had unanswered tool call(s) {:?}; answered them as cancelled",
+            exec_ctx.session_id,
+            unanswered
+        );
+        debug_assert!(
+            unanswered.is_empty(),
+            "request had unanswered tool calls: {unanswered:?}"
+        );
+    }
     // Tool definitions are model input; reuse the serialization already used for their hash.
     let tool_tokens = if tools.is_empty() {
         0
@@ -1599,26 +1613,29 @@ pub(super) async fn transition_after_llm(
     let (mut executable_calls, mut gated_results) =
         gate_function_calls_for_execution(&response.tool_calls);
 
-    if output_status == Some(ChatOutputStatus::Incomplete) {
-        // An incomplete terminal never authorizes execution, even when some
-        // items completed. Synthesize skipped results for every call and stop.
+    // A length finish reason is a cut-off whatever status the provider
+    // reported: Anthropic flushes interrupted tool blocks as completed (but
+    // invalid) calls, so such a reply arrives as `Completed` + `Length`.
+    let is_length_cutoff = response.is_length_cutoff();
+    if output_status == Some(ChatOutputStatus::Incomplete) || is_length_cutoff {
+        // An incomplete or cut-off terminal never authorizes execution, even
+        // when some items completed. Every call gets exactly one error result:
+        // invalid calls keep their `INVALID_JSON` result, the rest are skipped.
         let detail = response
             .output
             .as_ref()
             .map(|_| "response is incomplete".to_string())
             .unwrap_or_default();
         let skipped_text = skipped_call_text(response.finish_reason, &detail);
-        let is_length_cutoff = response.finish_reason == Some(FinishReason::Length);
-        // A call cut off mid-arguments fails JSON gating; for a length cut-off
-        // every call gets the split-the-write guidance instead of the generic
-        // "invalid arguments" text. (`tool_calls` is already de-duplicated.)
-        let to_skip: Vec<MiddlewareToolCall> = if is_length_cutoff {
-            gated_results.clear();
-            executable_calls.clear();
-            response.tool_calls.clone()
-        } else {
-            std::mem::take(&mut executable_calls)
-        };
+        if is_length_cutoff {
+            // Invalid calls also get the split-the-write guidance.
+            for result in &mut gated_results {
+                result.content.push(querymt::chat::ToolResultPart::Text {
+                    text: skipped_text.clone(),
+                });
+            }
+        }
+        let to_skip: Vec<MiddlewareToolCall> = std::mem::take(&mut executable_calls);
         gated_results.extend(to_skip.into_iter().map(|call| {
             ToolResult::new(
                 call.id,
@@ -1686,11 +1703,15 @@ pub(super) async fn transition_after_llm(
             context: new_context,
         }),
 
-        Some(FinishReason::Length) => Ok(ExecutionState::Stopped {
-            message: "Model hit token limit".into(),
-            stop_type: StopType::ModelTokenLimit,
-            context: Some(new_context),
-        }),
+        Some(FinishReason::Length) => {
+            // Cut-offs with tool calls were answered and stopped above.
+            debug_assert!(!has_dispatchable_calls);
+            Ok(ExecutionState::Stopped {
+                message: "Model hit token limit".into(),
+                stop_type: StopType::ModelTokenLimit,
+                context: Some(new_context),
+            })
+        }
 
         Some(FinishReason::ContentFilter) => Ok(ExecutionState::Stopped {
             message: "Response blocked by content filter".into(),
@@ -2731,6 +2752,128 @@ mod tests {
             );
         }
 
+        fn flushed_call(index: usize, id: &str, arguments: &str, invalid: bool) -> StreamChunk {
+            let mut extensions = querymt::chat::Extensions::new();
+            if invalid {
+                extensions.insert(
+                    querymt::chat::INVALID_INPUT_EXTENSION.to_string(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+            StreamChunk::ToolUseComplete {
+                index,
+                tool_call: ToolCall {
+                    id: id.into(),
+                    call_type: "function".into(),
+                    function: querymt::FunctionCall {
+                        name: "write_file".into(),
+                        arguments: arguments.into(),
+                    },
+                },
+                extensions,
+            }
+        }
+
+        /// The stopped context's tool results, keyed by call id.
+        fn stopped_results(state: ExecutionState) -> (Vec<querymt::chat::ChatMessage>, HashMap<String, String>) {
+            let ExecutionState::Stopped {
+                stop_type, context, ..
+            } = state
+            else {
+                panic!("expected Stopped, got {}", state.name());
+            };
+            assert_eq!(stop_type, StopType::ModelTokenLimit);
+            let messages = context.expect("context kept").messages.to_vec();
+            let results = messages
+                .iter()
+                .flat_map(|message| message.input().unwrap_or_default().to_vec())
+                .filter_map(|part| part.as_tool_result().cloned())
+                .map(|result| {
+                    assert!(result.is_error, "cut-off results are errors");
+                    let text = result
+                        .parts
+                        .iter()
+                        .filter_map(|part| match part {
+                            querymt::chat::ToolResultPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (result.call_id, text)
+                })
+                .collect();
+            (messages, results)
+        }
+
+        /// Session 01a16d18: Anthropic flushes the interrupted block as a
+        /// completed call marked invalid, so the reply is `Completed` +
+        /// `Length`. The call must still be answered, with `INVALID_JSON`.
+        #[tokio::test]
+        async fn completed_length_reply_with_flushed_invalid_call_answers_it() {
+            let (state, _, _) = run_streamed_reply(vec![
+                StreamChunk::Text("Writing reconcile.rs now.".into()),
+                StreamChunk::ToolUseStart {
+                    index: 1,
+                    id: "toolu_cut".into(),
+                    name: "write_file".into(),
+                },
+                flushed_call(1, "toolu_cut", r#"{"path": "reconcile.rs""#, true),
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Length,
+                },
+            ])
+            .await;
+
+            let (messages, results) = stopped_results(state);
+            assert_eq!(results.len(), 1, "exactly one result: {results:?}");
+            let text = &results["toolu_cut"];
+            assert!(text.contains("INVALID_JSON"), "{text}");
+            assert!(text.contains("split the write"), "{text}");
+            // The result directly follows the assistant call.
+            let call_at = messages
+                .iter()
+                .position(|m| m.has_tool_use())
+                .expect("assistant call kept");
+            assert!(messages[call_at + 1].has_tool_result());
+        }
+
+        #[tokio::test]
+        async fn valid_call_before_a_length_cutoff_is_skipped_not_run() {
+            let (state, _, factory) = run_streamed_reply(vec![
+                StreamChunk::ToolUseStart {
+                    index: 0,
+                    id: "call_ok".into(),
+                    name: "write_file".into(),
+                },
+                flushed_call(0, "call_ok", r#"{"path":"a.rs","content":"x"}"#, false),
+                StreamChunk::ToolUseStart {
+                    index: 1,
+                    id: "call_cut".into(),
+                    name: "write_file".into(),
+                },
+                flushed_call(1, "call_cut", r#"{"path":"b.rs""#, true),
+                StreamChunk::Done {
+                    finish_reason: FinishReason::Length,
+                },
+            ])
+            .await;
+
+            assert!(factory.provider.attempts.lock().unwrap().is_empty());
+            let (_, results) = stopped_results(state);
+            assert_eq!(results.len(), 2, "{results:?}");
+            assert!(!results["call_ok"].contains("INVALID_JSON"));
+            assert!(results["call_ok"].contains("split the write"));
+            assert!(results["call_cut"].contains("INVALID_JSON"));
+            assert!(results["call_cut"].contains("split the write"));
+        }
+
+        #[test]
+        fn length_cutoff_is_classified_by_finish_reason_only() {
+            let reply = |finish| LlmResponse::new(String::new(), Vec::new(), None, Some(finish));
+            assert!(reply(FinishReason::Length).is_length_cutoff());
+            assert!(!reply(FinishReason::ToolCalls).is_length_cutoff());
+        }
+
         fn write_file_tool() -> querymt::chat::Tool {
             serde_json::from_value(serde_json::json!({
                 "type": "function",
@@ -3292,6 +3435,161 @@ mod tests {
             assert!(
                 !history.contains("pondering the file"),
                 "thinking-only replies must not be stored: {history}"
+            );
+        }
+
+        /// One model step as the execution loop runs it: step-start middleware,
+        /// request preparation, the call, and after-llm middleware. Asserts the
+        /// prepared request answers every tool call.
+        async fn model_step(
+            config: &Arc<AgentConfig>,
+            exec: &ExecutionContext,
+            middleware: &crate::middleware::OutputLimitRecoveryMiddleware,
+            tools: &Arc<[querymt::chat::Tool]>,
+            context: Arc<crate::middleware::ConversationContext>,
+        ) -> ExecutionState {
+            use crate::middleware::MiddlewareDriver;
+            let state = middleware
+                .on_step_start(ExecutionState::BeforeLlmCall { context }, None)
+                .await
+                .unwrap();
+            let ExecutionState::BeforeLlmCall { context } = state else {
+                panic!("expected BeforeLlmCall");
+            };
+            let state = transition_before_llm_call(config, &context, exec)
+                .await
+                .expect("before llm call");
+            let ExecutionState::CallLlm { context, request } = state else {
+                panic!("expected CallLlm, got {}", state.name());
+            };
+            let mut probe = request.messages.to_vec();
+            assert!(
+                crate::model::answer_unanswered_tool_calls(&mut probe).is_empty(),
+                "request must answer every call"
+            );
+            let mut request = (*request).clone();
+            request.tools = tools.clone();
+            let state = transition_call_llm(config, &context, &Arc::new(request), exec)
+                .await
+                .expect("call llm");
+            middleware.on_after_llm(state, None).await.unwrap()
+        }
+
+        /// Replays session 01a16d18: escalation succeeds, a later step of the
+        /// same turn is cut off inside a flushed (invalid) `write_file`, and
+        /// the continuation must keep the escalated cap and answer the call.
+        #[tokio::test]
+        async fn later_cutoff_in_an_escalated_turn_keeps_the_cap_and_answers_the_call() {
+            use crate::middleware::MiddlewareDriver;
+            use querymt::chat::GenerationOptions;
+
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![
+                    text_reply("first, cut off", FinishReason::Length),
+                    text_reply("researching", FinishReason::Stop),
+                    Ok(vec![
+                        (0, Ok(StreamChunk::Text("Writing reconcile.rs now.".into()))),
+                        (
+                            0,
+                            Ok(StreamChunk::ToolUseStart {
+                                index: 1,
+                                id: "toolu_cut".into(),
+                                name: "write_file".into(),
+                            }),
+                        ),
+                        (
+                            0,
+                            Ok(flushed_call(1, "toolu_cut", r#"{"path": "reconcile.rs""#, true)),
+                        ),
+                        (
+                            0,
+                            Ok(StreamChunk::Done {
+                                finish_reason: FinishReason::Length,
+                            }),
+                        ),
+                    ]),
+                    text_reply("continued", FinishReason::Stop),
+                ],
+                "openai",
+                None,
+            )
+            .await;
+            *factory.provider.support.lock().unwrap() = querymt::chat::GenerationOptionSupport::ALL;
+            let mut exec = fixture.execution_context().await;
+            let middleware = crate::middleware::OutputLimitRecoveryMiddleware::default();
+            let tools: Arc<[querymt::chat::Tool]> = vec![write_file_tool()].into();
+            let context = profiled_context(
+                &exec.session_id,
+                profile_with(
+                    querymt::chat::GenerationOptionSupport::ALL,
+                    Some(crate::model_heuristics::OutputCaps {
+                        initial: 32_000,
+                        ceiling: 128_000,
+                    }),
+                ),
+            );
+
+            let config = fixture.config.clone();
+            let mw = &middleware;
+
+            // 1: cut off at 32k -> escalate.
+            let ExecutionState::BeforeLlmCall { context } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("expected escalation");
+            };
+            // 2: escalated retry succeeds.
+            let ExecutionState::AfterLlm { response, context } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("expected AfterLlm");
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .unwrap();
+            let context = state.context().expect("context").clone();
+            // 3: a later step of the same turn starts without overrides, is sent at
+            // 128k, and is cut off inside a flushed invalid call.
+            assert!(context.request_overrides.is_empty());
+            let ExecutionState::AfterLlm { response, context } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("a second cut-off must not escalate again");
+            };
+            let state = transition_after_llm(&fixture.config, &response, &context, &mut exec)
+                .await
+                .unwrap();
+            assert!(matches!(
+                state,
+                ExecutionState::Stopped {
+                    stop_type: StopType::ModelTokenLimit,
+                    ..
+                }
+            ));
+            // 4: continuation at the escalated cap, with the call answered.
+            let ExecutionState::BeforeLlmCall { context } =
+                middleware.on_stopped(state, None).await.unwrap()
+            else {
+                panic!("expected continuation");
+            };
+            let ExecutionState::AfterLlm { .. } =
+                model_step(&config, &exec, mw, &tools, context).await
+            else {
+                panic!("expected AfterLlm");
+            };
+
+            let max_tokens: Vec<_> = factory
+                .provider
+                .options_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|options: &GenerationOptions| options.max_tokens)
+                .collect();
+            assert_eq!(
+                max_tokens,
+                vec![None, Some(128_000), Some(128_000), Some(128_000)]
             );
         }
 
