@@ -1419,6 +1419,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Middleware Driver Trait">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#reviewing-prepared-tool-calls" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Reviewing prepared tool calls
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -2152,6 +2169,15 @@
 <a id="__codelineno-0-15" name="__codelineno-0-15"></a><span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">process_tool_result</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">result</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">ToolResult</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">()</span><span class="o">&gt;</span><span class="p">;</span>
 <a id="__codelineno-0-16" name="__codelineno-0-16"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
+<h3 id="reviewing-prepared-tool-calls">Reviewing prepared tool calls</h3>
+<p>Middleware that needs to reason about what a tool call will do should implement
+<code>on_prepared_tool_calls(&amp;PreparedBatch)</code> rather than parse <code>ToolCall</code> arguments. Each
+<code>PreparedToolCall</code> carries the call, its <strong>effective</strong> arguments and the file access
+declared for them; the raw model text on <code>ToolCall.function.arguments</code> must not be
+used for conflict decisions. Return one <code>PreparedCallVerdict</code> per call: <code>Proceed</code>, or
+<code>Reject(result)</code> with the call's final error result. Rejected calls are not executed
+and still produce exactly one result. See
+<a href="../configuration/#raw-and-effective-arguments">Raw and effective arguments</a>.</p>
 <h2 id="built-in-middleware">Built-in Middleware</h2>
 <h3 id="limitsmiddleware">LimitsMiddleware</h3>
 <p>Enforces execution limits on agent operations.</p>
@@ -2247,6 +2273,14 @@
 <p>Same-file writes in one batch are always executed one after another in the model's
 order, so no edit is lost, whether or not this middleware is active. The guard only
 changes what the model is told.</p>
+<p>The guard reviews <em>prepared</em> calls (<code>MiddlewareDriver::on_prepared_tool_calls</code>): the
+file access it inspects was declared for each call's final effective arguments, after
+alias normalisation and pre-tool hook updates, and is the same access the scheduler
+plans from. Two calls that only look disjoint in the model's raw arguments, but are
+redirected to one file by a hook, are therefore treated as writing the same file. The
+review runs once per execution segment; writes separated by a stateful or
+clarification barrier are not compared with each other because the barrier already
+orders them.</p>
 <p><strong>Configuration:</strong>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
 <span class="normal"><a href="#__codelineno-5-2">2</a></span>

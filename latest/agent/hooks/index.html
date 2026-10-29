@@ -1421,6 +1421,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="pre_tool_use rewrite">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tool-input-uses-canonical-parameter-names" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Tool input uses canonical parameter names
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
         
           <li class="md-nav__item">
@@ -2260,7 +2277,18 @@
 <a id="__codelineno-5-8" name="__codelineno-5-8"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-5-9" name="__codelineno-5-9"></a><span class="p">}</span>
 </code></pre></div></td></tr></table></div>
-<p>Multiple matching <code>pre_tool_use</code> handlers see this rewritten object in order. A rewrite is accepted only with <code>permission_decision: "allow"</code>; <code>ask</code> follows normal interactive permission handling.</p>
+<p>Multiple matching <code>pre_tool_use</code> handlers see this rewritten object in order. A rewrite is accepted only with <code>permission_decision: \"allow\"</code>; <code>ask</code> follows normal interactive permission handling.</p>
+<h4 id="tool-input-uses-canonical-parameter-names">Tool input uses canonical parameter names</h4>
+<p><code>pre_tool_use</code> handlers receive the tool input with canonical <code>snake_case</code> names, after
+alias and shape normalisation. For the edit tools this means <code>file_path</code>, <code>old_string</code>,
+<code>new_string</code> and <code>replace_all</code> (and <code>new_text</code> / <code>expected_hash</code> for <code>replace_symbol</code>),
+even if the model sent <code>filePath</code> or <code>newString</code>. <strong>Hooks that read <code>filePath</code>,
+<code>oldString</code> or <code>newString</code> must switch to the snake_case names.</strong> An <code>updated_input</code>
+replacement is normalised the same way (legacy spellings are still accepted) and is
+validated before the tool runs. Hooks run once per call, and calls that follow a
+stateful tool (such as a task update) are prepared after it completed, so their hooks see
+its effects. See <a href="../configuration/#tool-argument-handling">Tool Argument Handling</a> for
+the raw versus effective argument rules.</p>
 <h3 id="post_tool_use-patch">post_tool_use patch</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1"> 1</a></span>
 <span class="normal"><a href="#__codelineno-6-2"> 2</a></span>

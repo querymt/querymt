@@ -609,6 +609,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Metrics
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#logs" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2208,6 +2219,65 @@ arguments/results, file contents, or API keys. This is not a blanket privacy
 guarantee for preexisting diagnostic logs or span events: verbose logging
 can include payload previews, so use it only with appropriate data controls.</p>
 </div>
+<h3 id="metrics">Metrics</h3>
+<p>The agent exports two counters through the same OTLP endpoint as traces and logs
+(periodic export; <code>QMT_NO_TELEMETRY</code> disables them as well).</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Attributes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>querymt.tool.args_repaired</code></td>
+<td><code>tool</code>, <code>rule</code></td>
+<td>One increment per argument repair actually applied before validation. <code>rule</code> is <code>alias</code>, <code>wrap</code>, <code>json_string</code>, <code>int_string</code> or <code>scalar_to_array</code>.</td>
+</tr>
+<tr>
+<td><code>querymt.tool.calls</code></td>
+<td><code>tool</code>, <code>repaired</code>, <code>outcome</code></td>
+<td>One increment per tool call. <code>repaired</code> is <code>true</code> when at least one repair was applied. <code>outcome</code> is <code>success</code>, <code>error</code> (the tool ran or its pipeline failed) or <code>rejected</code> (never ran: conflicting spellings, hook block, validation failure or middleware rejection).</td>
+</tr>
+</tbody>
+</table>
+<p>Repairs are counted once per call, when its arguments are prepared: both the
+normalisation of the model's arguments and the normalisation of a pre-tool hook
+replacement count, but scheduling, middleware review, execution and re-normalising an
+already canonical value do not. A repaired call is also marked on its
+<code>execute_tool</code> span with <code>querymt.tool.args_repairs</code>, the list of applied rule
+names (never argument values).</p>
+<p>Rule counters alone cannot tell whether a repair helped, because a call can be
+repaired and still fail. Use <code>querymt.tool.calls</code> for that:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span>
+<span class="normal"><a href="#__codelineno-0-2">2</a></span>
+<span class="normal"><a href="#__codelineno-0-3">3</a></span>
+<span class="normal"><a href="#__codelineno-0-4">4</a></span>
+<span class="normal"><a href="#__codelineno-0-5">5</a></span>
+<span class="normal"><a href="#__codelineno-0-6">6</a></span>
+<span class="normal"><a href="#__codelineno-0-7">7</a></span>
+<span class="normal"><a href="#__codelineno-0-8">8</a></span>
+<span class="normal"><a href="#__codelineno-0-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a># repaired calls that ran fine vs. repaired calls that still failed, per tool
+<a id="__codelineno-0-2" name="__codelineno-0-2"></a>sum by (tool, outcome) (querymt_tool_calls_total{repaired="true"})
+<a id="__codelineno-0-3" name="__codelineno-0-3"></a>
+<a id="__codelineno-0-4" name="__codelineno-0-4"></a># share of repaired calls that did not succeed
+<a id="__codelineno-0-5" name="__codelineno-0-5"></a>sum(querymt_tool_calls_total{repaired="true", outcome!="success"})
+<a id="__codelineno-0-6" name="__codelineno-0-6"></a>  / sum(querymt_tool_calls_total{repaired="true"})
+<a id="__codelineno-0-7" name="__codelineno-0-7"></a>
+<a id="__codelineno-0-8" name="__codelineno-0-8"></a># which repairs fire most
+<a id="__codelineno-0-9" name="__codelineno-0-9"></a>sum by (tool, rule) (increase(querymt_tool_args_repaired_total[7d]))
+</code></pre></div></td></tr></table></div>
+<p>(Metric names are shown in Prometheus form; other backends may render dots
+differently.)</p>
+<p><strong>Retention.</strong> QueryMT does not retain metrics itself. Counters are cumulative and
+kept for as long as your collector/backend keeps them; choose a window of at least
+seven days to compare release periods. Failure and volume figures that must be
+independent of telemetry come from the session execution records (stored tool
+results, with <code>is_error</code> and the effective arguments), which live as long as the
+session history. If the metrics backend is unavailable, report repair outcomes as
+unavailable instead of inferring them from failed calls.</p>
 <h3 id="logs">Logs</h3>
 <p>Application log messages at the configured level and above are exported
 alongside traces. These include operational events such as:</p>
@@ -2247,7 +2317,7 @@ output such as streaming-chunk sizes and abbreviated tool-result previews.</p>
 <h2 id="where-telemetry-is-sent">Where Telemetry Is Sent</h2>
 <p>By default, both traces and logs are exported via gRPC to the QueryMT
 project's OpenTelemetry collector:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-0-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1"></a>https://otel.query.mt
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a>https://otel.query.mt
 </code></pre></div></td></tr></table></div>
 <p>This is a standard <a href="https://opentelemetry.io/docs/specs/otlp/#otlpgrpc">OTLP/gRPC</a>
 endpoint. You can redirect telemetry to your own collector by setting the
@@ -2287,42 +2357,42 @@ endpoint. You can redirect telemetry to your own collector by setting the
 </tbody>
 </table>
 <h3 id="disabling-telemetry-entirely">Disabling telemetry entirely</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-1-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_NO_TELEMETRY</span><span class="o">=</span><span class="m">1</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_NO_TELEMETRY</span><span class="o">=</span><span class="m">1</span>
 </code></pre></div></td></tr></table></div>
 <p>When this variable is set (to any value), <strong>no data is sent to any remote
 endpoint</strong>. The only active logging layer is the local console formatter,
 controlled by <code>RUST_LOG</code>.</p>
 <h3 id="sending-telemetry-to-your-own-collector">Sending telemetry to your own collector</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-2-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OTEL_EXPORTER_OTLP_ENDPOINT</span><span class="o">=</span>http://localhost:4317
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">OTEL_EXPORTER_OTLP_ENDPOINT</span><span class="o">=</span>http://localhost:4317
 </code></pre></div></td></tr></table></div>
 <p>Any OTLP-compatible collector (Jaeger, Grafana Alloy, the OpenTelemetry
 Collector, etc.) will work.</p>
 <h3 id="adjusting-verbosity">Adjusting verbosity</h3>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-3-1">1</a></span>
-<span class="normal"><a href="#__codelineno-3-2">2</a></span>
-<span class="normal"><a href="#__codelineno-3-3">3</a></span>
-<span class="normal"><a href="#__codelineno-3-4">4</a></span>
-<span class="normal"><a href="#__codelineno-3-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1"></a><span class="c1"># Only export warnings and errors</span>
-<a id="__codelineno-3-2" name="__codelineno-3-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>warn
-<a id="__codelineno-3-3" name="__codelineno-3-3"></a>
-<a id="__codelineno-3-4" name="__codelineno-3-4"></a><span class="c1"># Include debug-level spans and logs (more verbose)</span>
-<a id="__codelineno-3-5" name="__codelineno-3-5"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>debug
-</code></pre></div></td></tr></table></div>
-<p>The console filter (<code>RUST_LOG</code>) is independent — you can keep the console
-quiet while still exporting detailed telemetry, or vice versa:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
 <span class="normal"><a href="#__codelineno-4-2">2</a></span>
 <span class="normal"><a href="#__codelineno-4-3">3</a></span>
 <span class="normal"><a href="#__codelineno-4-4">4</a></span>
-<span class="normal"><a href="#__codelineno-4-5">5</a></span>
-<span class="normal"><a href="#__codelineno-4-6">6</a></span>
-<span class="normal"><a href="#__codelineno-4-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="c1"># Verbose console, minimal telemetry</span>
-<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>debug
-<a id="__codelineno-4-3" name="__codelineno-4-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>error
-<a id="__codelineno-4-4" name="__codelineno-4-4"></a>
-<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="c1"># Quiet console, detailed telemetry</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>error
-<a id="__codelineno-4-7" name="__codelineno-4-7"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>debug
+<span class="normal"><a href="#__codelineno-4-5">5</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1"></a><span class="c1"># Only export warnings and errors</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>warn
+<a id="__codelineno-4-3" name="__codelineno-4-3"></a>
+<a id="__codelineno-4-4" name="__codelineno-4-4"></a><span class="c1"># Include debug-level spans and logs (more verbose)</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>debug
+</code></pre></div></td></tr></table></div>
+<p>The console filter (<code>RUST_LOG</code>) is independent — you can keep the console
+quiet while still exporting detailed telemetry, or vice versa:</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-5-1">1</a></span>
+<span class="normal"><a href="#__codelineno-5-2">2</a></span>
+<span class="normal"><a href="#__codelineno-5-3">3</a></span>
+<span class="normal"><a href="#__codelineno-5-4">4</a></span>
+<span class="normal"><a href="#__codelineno-5-5">5</a></span>
+<span class="normal"><a href="#__codelineno-5-6">6</a></span>
+<span class="normal"><a href="#__codelineno-5-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="c1"># Verbose console, minimal telemetry</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>debug
+<a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>error
+<a id="__codelineno-5-4" name="__codelineno-5-4"></a>
+<a id="__codelineno-5-5" name="__codelineno-5-5"></a><span class="c1"># Quiet console, detailed telemetry</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6"></a><span class="nb">export</span><span class="w"> </span><span class="nv">RUST_LOG</span><span class="o">=</span>error
+<a id="__codelineno-5-7" name="__codelineno-5-7"></a><span class="nb">export</span><span class="w"> </span><span class="nv">QMT_TELEMETRY_LEVEL</span><span class="o">=</span>debug
 </code></pre></div></td></tr></table></div>
 
 
