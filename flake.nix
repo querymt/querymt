@@ -6,7 +6,7 @@
     rust-overlay.url = "github:oxalica/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
     querymt-desktop = {
-      url = "github:querymt/querymt-desktop/46f708c0c0fef4c70773ab877d98c397d3b61d32";
+      url = "github:querymt/querymt-desktop/413b43726ed720fee4aae48676f43b8f64394b69";
       flake = false;
     };
   };
