@@ -157,7 +157,7 @@ impl LocalAgentHandle {
     ) -> Result<ExtResponse, Error> {
         let parsed: SubmitInputRequest = parse_session_op_request(req)?;
         self.session_materializer
-            .ensure_not_transferred(&parsed.session_id)
+            .ensure_writable(&parsed.session_id)
             .await?;
         if super::ext_worktree_ops::native_worktree_command(&parsed.prompt)?.is_some() {
             return Err(Error::invalid_request().data(
@@ -249,7 +249,7 @@ impl LocalAgentHandle {
     ) -> Result<ExtResponse, Error> {
         let parsed: UndoSessionRequest = parse_session_op_request(req)?;
         self.session_materializer
-            .ensure_not_transferred(&parsed.session_id)
+            .ensure_writable(&parsed.session_id)
             .await?;
         let profile_handle = self.profile_session_op_handle(&parsed.session_id).await?;
         let session_handle = profile_handle.as_deref().unwrap_or(self);
@@ -282,7 +282,7 @@ impl LocalAgentHandle {
     ) -> Result<ExtResponse, Error> {
         let parsed: SessionIdRequest = parse_session_op_request(req)?;
         self.session_materializer
-            .ensure_not_transferred(&parsed.session_id)
+            .ensure_writable(&parsed.session_id)
             .await?;
         let profile_handle = self.profile_session_op_handle(&parsed.session_id).await?;
         let session_handle = profile_handle.as_deref().unwrap_or(self);

@@ -440,9 +440,10 @@ impl SessionMaterializer {
         session_id: &str,
         requested_cwd: Option<&std::path::Path>,
     ) -> Result<Option<WorkspaceBinding>, Error> {
-        // A previous owner never materializes again, so it cannot reload as a
-        // local or shared session inside the checkout it gave away.
-        self.ensure_not_transferred(session_id).await?;
+        // A read-only session (previous owner, archived workspace) never
+        // materializes again, so it cannot reload as a local or shared
+        // session inside a checkout it no longer owns.
+        self.ensure_writable(session_id).await?;
         if self
             .config
             .provider
@@ -476,32 +477,51 @@ impl SessionMaterializer {
             .map_err(worktree_error_to_acp)
     }
 
-    /// Refuse any operation that would run or mutate a session whose
-    /// workspace was handed off. The marker is durable, so the answer is the
-    /// same after a restart and for every entry point.
+    /// Refuse any operation that would run or mutate a read-only session:
+    /// one whose workspace was handed off or archived. Both markers are
+    /// durable, so the answer is the same after a restart and for every
+    /// entry point.
     ///
     /// # Errors
-    /// `owner_transferred` (naming the current owner) for a previous owner;
+    /// `owner_transferred` (naming the current owner) or `workspace_archived`;
     /// an internal error when the registry cannot be read.
-    pub(crate) async fn ensure_not_transferred(&self, session_id: &str) -> Result<(), Error> {
-        match self.transferred_owner(session_id).await? {
-            Some(owner) => Err(owner_transferred_error(session_id, &owner)),
+    pub(crate) async fn ensure_writable(&self, session_id: &str) -> Result<(), Error> {
+        match self.read_only_reason(session_id).await? {
+            Some(reason) => Err(reason.error(session_id)),
             None => Ok(()),
         }
     }
 
-    /// The current owner of the workspace `session_id` handed off, if any.
-    pub(crate) async fn transferred_owner(
+    /// Why `session_id` is read-only, if it is.
+    ///
+    /// A handed-off session wins over an archived workspace: the successor,
+    /// not the archive, is the more useful pointer.
+    pub(crate) async fn read_only_reason(
         &self,
         session_id: &str,
-    ) -> Result<Option<String>, Error> {
+    ) -> Result<Option<ReadOnlyReason>, Error> {
         let Some(registry) = self.config.storage.workspace_repository() else {
             return Ok(None);
         };
-        registry
+        let internal = |err: crate::session::error::SessionError| {
+            Error::internal_error().data(err.to_string())
+        };
+        if let Some(owner) = registry
             .current_owner_after_handoff(session_id)
             .await
-            .map_err(|err| Error::internal_error().data(err.to_string()))
+            .map_err(internal)?
+        {
+            return Ok(Some(ReadOnlyReason::OwnerTransferred { owner }));
+        }
+        let workspace = registry
+            .get_workspace_by_session(session_id)
+            .await
+            .map_err(internal)?;
+        Ok(workspace.filter(|w| w.lifecycle.is_retired()).map(|w| {
+            ReadOnlyReason::WorkspaceArchived {
+                workspace_id: w.id.to_string(),
+            }
+        }))
     }
 
     // ── Public materialization ─────────────────────────────────────────────
@@ -1928,15 +1948,65 @@ fn workspace_view(
     }
 }
 
-/// Stable refusal for operations on a session that handed its workspace off.
-pub(crate) fn owner_transferred_error(session_id: &str, owner: &str) -> Error {
-    Error::invalid_request().data(serde_json::json!({
-        "code": "owner_transferred",
-        "message": format!(
-            "session {session_id} handed its workspace to {owner} and is read-only"
-        ),
-        "ownerSessionId": owner,
-    }))
+/// Why a session may be loaded for replay but never run or mutated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadOnlyReason {
+    /// The session handed its workspace to `owner`.
+    OwnerTransferred { owner: String },
+    /// The session's workspace was archived (or is being, or was, removed).
+    WorkspaceArchived { workspace_id: String },
+}
+
+impl ReadOnlyReason {
+    /// Stable machine-readable code, shared by errors and load disclosure.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::OwnerTransferred { .. } => "owner_transferred",
+            Self::WorkspaceArchived { .. } => "workspace_archived",
+        }
+    }
+
+    /// The `_meta.querymt.sessionAccess` value disclosed on `session/load`.
+    pub(crate) fn access_meta(&self) -> serde_json::Value {
+        match self {
+            Self::OwnerTransferred { owner } => serde_json::json!({
+                "mode": "read_only",
+                "reason": self.code(),
+                "ownerSessionId": owner,
+            }),
+            Self::WorkspaceArchived { workspace_id } => serde_json::json!({
+                "mode": "read_only",
+                "reason": self.code(),
+                "workspaceId": workspace_id,
+            }),
+        }
+    }
+
+    /// Human-readable refusal text.
+    pub(crate) fn message(&self, session_id: &str) -> String {
+        match self {
+            Self::OwnerTransferred { owner } => {
+                format!("session {session_id} handed its workspace to {owner} and is read-only")
+            }
+            Self::WorkspaceArchived { workspace_id } => format!(
+                "session {session_id}'s workspace {workspace_id} is archived and the \
+                 session is read-only; use /worktree remove to delete the checkout"
+            ),
+        }
+    }
+
+    /// Stable refusal for an operation on a read-only session.
+    pub(crate) fn error(&self, session_id: &str) -> Error {
+        let mut data = match self {
+            Self::OwnerTransferred { owner } => serde_json::json!({ "ownerSessionId": owner }),
+            Self::WorkspaceArchived { workspace_id } => {
+                serde_json::json!({ "workspaceId": workspace_id })
+            }
+        };
+        data["message"] = self.message(session_id).into();
+        data["code"] = self.code().into();
+        Error::invalid_request().data(data)
+    }
 }
 
 /// A malformed workspace request (options or missing cwd) is invalid params.

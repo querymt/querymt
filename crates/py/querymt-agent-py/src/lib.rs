@@ -19,7 +19,9 @@ pyo3::create_exception!(
     PyRuntimeError,
     "A managed-worktree operation failed. `.code` is a stable machine-readable \
      identifier (for example `workspace_service_unavailable`, `invalid_options`, \
-     `removal_refused`, `workspace_not_found`, `isolation_unsupported_layout`)."
+     `removal_refused`, `owner_active`, `workspace_not_archived`, `unpreserved_content`, \
+     `unpreserved_commits`, `workspace_archived`, `workspace_not_found`, \
+     `isolation_unsupported_layout`)."
 );
 
 #[pyclass(name = "Worktrees")]
@@ -383,13 +385,33 @@ impl PyWorktrees {
         worktree_future!(py, self.inner, |w| w.publish(target))
     }
 
-    fn archive<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
-        worktree_future!(py, self.inner, |w| w.archive(&workspace_id))
+    /// Retire a workspace's execution, from any session. Provide exactly one
+    /// of `workspace_id` or `session_id` (the owner). An idle owner is
+    /// unloaded; a busy one raises `WorktreeError` with code `owner_active`.
+    #[pyo3(signature = (workspace_id=None, session_id=None))]
+    fn archive<'py>(
+        &self,
+        py: Python<'py>,
+        workspace_id: Option<String>,
+        session_id: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = WorkspaceTarget::from_parts(workspace_id, session_id).map_err(worktree_err)?;
+        worktree_future!(py, self.inner, |w| w.archive(target))
     }
 
-    /// Conservative removal; there is no force option.
-    fn remove<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {
-        worktree_future!(py, self.inner, |w| w.remove(&workspace_id))
+    /// Conservative removal; there is no force option. Provide exactly one of
+    /// `workspace_id` or `session_id`. `archive=True` archives an owned
+    /// workspace first (it stays archived if removal is then refused).
+    #[pyo3(signature = (workspace_id=None, session_id=None, archive=false))]
+    fn remove<'py>(
+        &self,
+        py: Python<'py>,
+        workspace_id: Option<String>,
+        session_id: Option<String>,
+        archive: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let target = WorkspaceTarget::from_parts(workspace_id, session_id).map_err(worktree_err)?;
+        worktree_future!(py, self.inner, |w| w.remove(target, archive))
     }
 
     fn recover<'py>(&self, py: Python<'py>, workspace_id: String) -> PyResult<Bound<'py, PyAny>> {

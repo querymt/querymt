@@ -37,11 +37,14 @@ pub enum WorktreeOpError {
     #[error("unknown workspace: {0}")]
     UnknownWorkspace(String),
     /// Removal was refused or only partially performed; nothing was force-deleted.
-    #[error("workspace {workspace_id} was not removed: {source}")]
+    /// `archived` is set when the same request had already archived the
+    /// workspace (`remove --archive`): the archive is never rolled back.
+    #[error("workspace {workspace_id} {}: {source}", removal_state(.archived))]
     RemovalRefused {
         workspace_id: String,
+        archived: bool,
         #[source]
-        source: WorktreeError,
+        source: Box<WorktreeError>,
     },
     /// The session that should hold the new workspace could not be started.
     #[error("{0}")]
@@ -56,6 +59,14 @@ pub enum WorktreeOpError {
     /// An invariant of the operation was violated.
     #[error("{0}")]
     Internal(String),
+}
+
+fn removal_state(archived: &bool) -> &'static str {
+    if *archived {
+        "was archived but not removed"
+    } else {
+        "was not removed"
+    }
 }
 
 impl WorktreeOpError {
@@ -74,11 +85,25 @@ impl WorktreeOpError {
             Self::ServiceUnavailable => "workspace_service_unavailable",
             Self::InvalidOptions(_) => "invalid_options",
             Self::UnknownWorkspace(_) => "workspace_not_found",
+            // A specific refusal (unpreserved content, owner still active, ...)
+            // keeps its own actionable code; anything else is generic.
+            Self::RemovalRefused { source, .. } if source.is_typed_refusal() => source.code(),
             Self::RemovalRefused { .. } => "removal_refused",
             Self::SessionStart(_) => "session_start_failed",
             Self::Worktree(err) => err.code(),
             Self::Internal(_) => "internal_error",
         }
+    }
+
+    /// The machine-readable error body shared by ACP error data and native
+    /// command responses: `{ code, message }`, plus `archived: true` when a
+    /// refused removal followed a successful archive.
+    pub fn error_data(&self) -> serde_json::Value {
+        let mut data = serde_json::json!({ "code": self.code(), "message": self.to_string() });
+        if matches!(self, Self::RemovalRefused { archived: true, .. }) {
+            data["archived"] = true.into();
+        }
+        data
     }
 }
 
@@ -323,6 +348,36 @@ pub struct WorktreeHandoffResponse {
     pub summary_seeded: bool,
 }
 
+/// A durable announcement recorded on a session's event stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Announcement {
+    /// The session whose stream carries the event.
+    pub session_id: String,
+    /// Its `session_seq`, so a prompt response can wait for delivery.
+    pub seq: i64,
+}
+
+/// Result of [`WorktreeOps::archive_announced`].
+#[derive(Debug, Clone)]
+pub struct ArchiveOutcome {
+    pub summary: WorktreeSummary,
+    /// `None` for an already-archived workspace, an unowned one, or when the
+    /// announcement could not be recorded.
+    pub announcement: Option<Announcement>,
+}
+
+fn removal_response(report: crate::worktree::RemovalReport) -> WorktreeRemoveResponse {
+    WorktreeRemoveResponse {
+        workspace_id: report.workspace_id.to_string(),
+        checkout_removed: report.checkout_removed,
+        removed_branch: report.removed_branch.map(|b| b.as_str().to_string()),
+        branch_moved_during_removal: report
+            .branch_moved_during_removal
+            .map(|b| b.as_str().to_string()),
+        retained_refs: report.retained_refs,
+    }
+}
+
 /// Optional inputs of [`WorktreeOps::handoff`]. The default is a clean,
 /// unnamed handoff with no history.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -335,11 +390,10 @@ pub struct HandoffOptions {
     pub summary: bool,
 }
 
-/// The session-layer steps of an ownership handoff. Implemented by the agent
-/// handle; the ordering and the ownership transfer itself live in
-/// [`WorktreeOps::handoff`] so every surface shares them.
+/// The session-layer steps every operation that must stop a workspace's
+/// owner shares: handoff, archive and removal.
 #[async_trait::async_trait]
-pub trait HandoffHost: Send + Sync {
+pub trait OwnerHost: Send + Sync {
     /// Whether `session_id` is hosted on this node's filesystem.
     async fn is_local(&self, session_id: &str) -> Result<bool, WorktreeOpError>;
 
@@ -348,6 +402,23 @@ pub trait HandoffHost: Send + Sync {
     /// refused with `owner_active` and the actor is left untouched.
     async fn quiesce_owner(&self, session_id: &str) -> Result<(), WorktreeOpError>;
 
+    /// Announce a committed archive on the owner's event stream.
+    ///
+    /// Best effort: a failure is logged by the host and never fails the
+    /// archive, which is already committed. Returns the event's `session_seq`.
+    async fn announce_archived(
+        &self,
+        owner: &str,
+        workspace_id: &str,
+        by_session_id: Option<&str>,
+    ) -> Option<i64>;
+}
+
+/// The session-layer steps of an ownership handoff. Implemented by the agent
+/// handle; the ordering and the ownership transfer itself live in
+/// [`WorktreeOps::handoff`] so every surface shares them.
+#[async_trait::async_trait]
+pub trait HandoffHost: OwnerHost {
     /// Summarize `previous`'s conversation with the compaction summarizer.
     /// `None` when there is no history to summarize. Any failure is
     /// `summary_failed` and aborts the handoff before anything is created.
@@ -662,6 +733,46 @@ impl WorktreeOps {
         }
     }
 
+    /// Stop a workspace's owner (when it has one) and take the checkout's
+    /// exclusive activity lease: the owner must be local and idle, and nothing
+    /// else (shared delegates, another process) may be executing in it.
+    /// Returns the record re-read under the lease, which proves ownership did
+    /// not move while the owner was being unloaded.
+    ///
+    /// # Errors
+    /// `owner_not_local`, `owner_active` and `not_owner`; nothing is changed.
+    async fn quiesce(
+        &self,
+        host: &dyn OwnerHost,
+        record: WorkspaceRecord,
+    ) -> Result<
+        (
+            WorkspaceRecord,
+            crate::worktree::gate::CheckoutActivityLease,
+        ),
+        WorktreeOpError,
+    > {
+        let owner = record.ownership.owner_session_id.clone();
+        if let Some(owner) = owner.as_deref() {
+            if !host.is_local(owner).await? {
+                return Err(WorktreeOpError::rejected(
+                    "owner_not_local",
+                    format!("owner session {owner} is not hosted on this node"),
+                ));
+            }
+            host.quiesce_owner(owner).await?;
+        }
+        let lease = self.acquire_exclusive_activity(&record).await?;
+        let fresh = self.lookup(record.id.as_str()).await?;
+        if fresh.ownership.owner_session_id != owner {
+            return Err(WorktreeOpError::rejected(
+                "not_owner",
+                "workspace ownership changed while the owner was being stopped",
+            ));
+        }
+        Ok((fresh, lease))
+    }
+
     /// Hand ownership of a ready workspace to a new session in the same
     /// checkout. Files, branch, index and baseline are untouched.
     ///
@@ -712,24 +823,11 @@ impl WorktreeOps {
                 format!("workspace {} is {}", record.id, record.lifecycle),
             ));
         }
-        if !host.is_local(&previous).await? {
+        let (record, lease) = self.quiesce(host, record).await?;
+        if record.lifecycle != WorkspaceLifecycle::Ready {
             return Err(WorktreeOpError::rejected(
-                "owner_not_local",
-                format!("owner session {previous} is not hosted on this node"),
-            ));
-        }
-
-        host.quiesce_owner(&previous).await?;
-        let lease = self.acquire_exclusive_activity(&record).await?;
-
-        // The record may have moved while the owner was being unloaded.
-        let record = self.lookup(record.id.as_str()).await?;
-        if record.ownership.owner_session_id.as_deref() != Some(previous.as_str())
-            || record.lifecycle != WorkspaceLifecycle::Ready
-        {
-            return Err(WorktreeOpError::rejected(
-                "not_owner",
-                "workspace ownership changed while the handoff was starting",
+                "workspace_not_ready",
+                format!("workspace {} is {}", record.id, record.lifecycle),
             ));
         }
 
@@ -924,42 +1022,169 @@ impl WorktreeOps {
         })
     }
 
-    /// Retire inactive execution while preserving history and ownership.
-    pub async fn archive(&self, workspace_id: &str) -> Result<WorktreeSummary, WorktreeOpError> {
-        let record = self.lookup(workspace_id).await?;
-        let archived = self.service.manager().archive(&record).await?;
-        Ok(WorktreeSummary::from(&archived))
+    /// Retire a workspace's execution while preserving history and ownership.
+    ///
+    /// Works from any session: the owner is unloaded when idle (`owner_active`
+    /// when it has a running turn, queued input or steering), then the
+    /// exclusive activity lease is taken (`owner_active` when shared delegates
+    /// or another process hold the checkout). An already-archived workspace
+    /// succeeds unchanged.
+    ///
+    /// # Errors
+    /// `owner_not_local`, `owner_active`, `not_owner`, or the workspace's
+    /// lifecycle refusal; a refused archive changes nothing.
+    pub async fn archive(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+    ) -> Result<WorktreeSummary, WorktreeOpError> {
+        self.archive_announced(host, target, None)
+            .await
+            .map(|outcome| outcome.summary)
+    }
+
+    /// [`Self::archive`], additionally returning the owner-stream announcement
+    /// (`by_session` names the session that issued the command). Used by the
+    /// native command to hold its response for the update.
+    ///
+    /// # Errors
+    /// Same as [`Self::archive`].
+    pub async fn archive_announced(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        by_session: Option<&str>,
+    ) -> Result<ArchiveOutcome, WorktreeOpError> {
+        let record = self.resolve(target).await?;
+        let unchanged = |record: &WorkspaceRecord| ArchiveOutcome {
+            summary: WorktreeSummary::from(record),
+            announcement: None,
+        };
+        if record.lifecycle == WorkspaceLifecycle::Archived {
+            return Ok(unchanged(&record));
+        }
+        let (record, lease) = self.quiesce(host, record).await?;
+        if record.lifecycle == WorkspaceLifecycle::Archived {
+            return Ok(unchanged(&record));
+        }
+        let archived = self.service.manager().archive_held(&record, &lease).await?;
+        drop(lease);
+        let announcement = self.announce_archive(host, &archived, by_session).await;
+        Ok(ArchiveOutcome {
+            summary: WorktreeSummary::from(&archived),
+            announcement,
+        })
+    }
+
+    async fn announce_archive(
+        &self,
+        host: &dyn OwnerHost,
+        archived: &WorkspaceRecord,
+        by_session: Option<&str>,
+    ) -> Option<Announcement> {
+        let owner = archived.ownership.owner_session_id.as_deref()?;
+        let seq = host
+            .announce_archived(owner, archived.id.as_str(), by_session)
+            .await?;
+        Some(Announcement {
+            session_id: owner.to_owned(),
+            seq,
+        })
     }
 
     /// Conservative removal. Refuses active ownership or any content that
     /// would be lost, and reports exactly which refs remain.
+    ///
+    /// With `archive`, an owned workspace is archived first (same quiesce path
+    /// as [`Self::archive`]); a removal refused afterwards leaves the
+    /// workspace archived and says so.
+    ///
+    /// # Errors
+    /// `workspace_not_archived`, `unpreserved_content`, `unpreserved_commits`,
+    /// `owner_active` and the archive refusals; nothing is force-deleted.
     pub async fn remove(
         &self,
-        workspace_id: &str,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        archive: bool,
     ) -> Result<WorktreeRemoveResponse, WorktreeOpError> {
-        let record = self.lookup(workspace_id).await?;
-        self.remove_record(&record)
+        self.remove_announced(host, target, archive, None)
             .await
-            .map_err(|source| WorktreeOpError::RemovalRefused {
-                workspace_id: workspace_id.to_string(),
-                source,
-            })
+            .map(|(response, _)| response)
+    }
+
+    /// [`Self::remove`], additionally returning the archive announcement made
+    /// by `archive`, if any.
+    ///
+    /// # Errors
+    /// Same as [`Self::remove`].
+    pub async fn remove_announced(
+        &self,
+        host: &dyn OwnerHost,
+        target: &WorkspaceTarget,
+        archive: bool,
+        by_session: Option<&str>,
+    ) -> Result<(WorktreeRemoveResponse, Option<Announcement>), WorktreeOpError> {
+        let record = self.resolve(target).await?;
+        let refused = |archived: bool, source: WorktreeError| WorktreeOpError::RemovalRefused {
+            workspace_id: record.id.to_string(),
+            archived,
+            source: Box::new(source),
+        };
+        let needs_archive = record.ownership.owner_session_id.is_some()
+            && !matches!(
+                record.lifecycle,
+                WorkspaceLifecycle::Archived | WorkspaceLifecycle::Removing
+            );
+        if needs_archive && !archive {
+            return Err(refused(
+                false,
+                WorktreeError::WorkspaceNotArchived {
+                    workspace_id: record.id.to_string(),
+                    owner: record
+                        .ownership
+                        .owner_session_id
+                        .clone()
+                        .unwrap_or_default(),
+                },
+            ));
+        }
+
+        let (mut current, lease) = if needs_archive {
+            self.quiesce(host, record.clone()).await?
+        } else {
+            let lease = self.acquire_exclusive_activity(&record).await?;
+            (self.lookup(record.id.as_str()).await?, lease)
+        };
+        let mut announcement = None;
+        let mut archived = false;
+        if needs_archive && current.lifecycle != WorkspaceLifecycle::Archived {
+            current = self
+                .service
+                .manager()
+                .archive_held(&current, &lease)
+                .await?;
+            archived = true;
+            announcement = self.announce_archive(host, &current, by_session).await;
+        }
+        let report = self
+            .service
+            .manager()
+            .remove_held(&current, &lease)
+            .await
+            .map_err(|source| refused(archived, source))?;
+        Ok((removal_response(report), announcement))
     }
 
     async fn remove_record(
         &self,
         record: &WorkspaceRecord,
     ) -> Result<WorktreeRemoveResponse, WorktreeError> {
-        let report = self.service.manager().remove(record).await?;
-        Ok(WorktreeRemoveResponse {
-            workspace_id: report.workspace_id.to_string(),
-            checkout_removed: report.checkout_removed,
-            removed_branch: report.removed_branch.map(|b| b.as_str().to_string()),
-            branch_moved_during_removal: report
-                .branch_moved_during_removal
-                .map(|b| b.as_str().to_string()),
-            retained_refs: report.retained_refs,
-        })
+        self.service
+            .manager()
+            .remove(record)
+            .await
+            .map(removal_response)
     }
 
     /// Complete an interrupted provisioning or removal. Never launches an
@@ -1029,10 +1254,40 @@ mod tests {
         );
         let refused = WorktreeOpError::RemovalRefused {
             workspace_id: "w".into(),
-            source: WorktreeError::InvalidOperation("dirty".into()),
+            archived: false,
+            source: Box::new(WorktreeError::InvalidOperation("dirty".into())),
         };
         assert_eq!(refused.code(), "removal_refused");
         assert!(refused.to_string().contains("dirty"));
+        let typed = WorktreeOpError::RemovalRefused {
+            workspace_id: "w".into(),
+            archived: true,
+            source: Box::new(WorktreeError::UnpreservedCommits {
+                workspace_id: "w".into(),
+                commits: crate::worktree::PathSample::new(&["abc".to_string()]),
+            }),
+        };
+        assert_eq!(typed.code(), "unpreserved_commits");
+        assert_eq!(typed.error_data()["archived"], true);
+        assert!(typed.to_string().contains("archived but not removed"));
+        for (err, code) in [
+            (WorktreeError::OwnerActive("x".into()), "owner_active"),
+            (
+                WorktreeError::WorkspaceNotArchived {
+                    workspace_id: "w".into(),
+                    owner: "s".into(),
+                },
+                "workspace_not_archived",
+            ),
+            (
+                WorktreeError::WorkspaceArchived {
+                    workspace_id: "w".into(),
+                },
+                "workspace_archived",
+            ),
+        ] {
+            assert_eq!(err.code(), code);
+        }
         assert_eq!(
             WorktreeOpError::from(WorktreeError::NotGitRepository { path: "/x".into() }).code(),
             "isolation_unsupported_layout"

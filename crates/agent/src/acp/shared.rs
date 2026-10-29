@@ -2194,8 +2194,34 @@ fn translate_replayable_updates(event: &EventEnvelope) -> Vec<SessionUpdate> {
             successor_session_id,
             *summary_seeded,
         ))],
+        AgentEventKind::WorktreeArchived {
+            workspace_id,
+            by_session_id,
+        } => vec![SessionUpdate::AgentMessageChunk(worktree_archived_chunk(
+            workspace_id,
+            by_session_id.as_deref(),
+        ))],
         _ => Vec::new(),
     }
+}
+
+/// Announcement of an archived workspace. The `message_id` is derived from the
+/// workspace so live delivery and replay agree on identity.
+fn worktree_archived_chunk(workspace_id: &str, by_session_id: Option<&str>) -> ContentChunk {
+    let text = format!(
+        "This session's workspace {workspace_id} was archived. This session is now \
+         read-only; run `/worktree remove` to delete the checkout."
+    );
+    let mut details = serde_json::json!({ "workspaceId": workspace_id });
+    if let Some(by) = by_session_id {
+        details["bySessionId"] = by.into();
+    }
+    ContentChunk::new(ContentBlock::Text(TextContent::new(text)))
+        .message_id(MessageId::from(format!("worktree-archived-{workspace_id}")))
+        .meta(serde_json::Map::from_iter([(
+            QUERYMT_META_NAMESPACE.to_string(),
+            serde_json::json!({ "worktreeArchived": details }),
+        )]))
 }
 
 /// Announcement of an ownership handoff. The `message_id` is derived from the

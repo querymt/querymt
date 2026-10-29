@@ -41,19 +41,6 @@ def repo(tmp_path: Path) -> Path:
     return path
 
 
-async def archive_when_released(agent: Agent, workspace_id: str, timeout: float = 10.0):
-    """The owner actor releases its checkout lease asynchronously after a
-    session is deleted; archival is refused until then (bounded retry)."""
-    deadline = asyncio.get_running_loop().time() + timeout
-    while True:
-        try:
-            return await agent.worktrees.archive(workspace_id)
-        except WorktreeError as err:
-            if err.code != "operation_refused" or asyncio.get_running_loop().time() > deadline:
-                raise
-            await asyncio.sleep(0.1)
-
-
 async def make_agent(repo: Path, tmp_path: Path, **kwargs) -> Agent:
     return await Agent.single(
         provider="openai",
@@ -125,7 +112,7 @@ def test_explicit_worktree_session_and_lifecycle(repo, tmp_path):
         # An actively owned workspace is never removed; nothing is lost.
         with pytest.raises(WorktreeError) as refused:
             await agent.worktrees.remove(workspace_id)
-        assert refused.value.code == "removal_refused"
+        assert refused.value.code == "workspace_not_archived"
         assert cwd.exists()
 
         with pytest.raises(WorktreeError) as unknown:
@@ -181,25 +168,41 @@ def test_worktrees_facade_create_archive_remove(repo, tmp_path):
         assert Path(created["session_cwd"]).is_dir()
         assert created["baseline_mode"] == "commit"
 
-        # A live owner session keeps the workspace active: neither removal nor
-        # archival may pull the checkout out from under it, and nothing is lost.
-        for refused_call, code in (
-            (agent.worktrees.remove, "removal_refused"),
-            (agent.worktrees.archive, "operation_refused"),
-        ):
-            with pytest.raises(WorktreeError) as refused:
-                await refused_call(workspace_id)
-            assert refused.value.code == code
+        # Removal of an owned workspace needs it archived first; nothing is lost.
+        with pytest.raises(WorktreeError) as refused:
+            await agent.worktrees.remove(workspace_id)
+        assert refused.value.code == "workspace_not_archived"
         assert Path(created["checkout_path"]).is_dir()
 
-        # Once the owner is gone the workspace can be archived and removed;
-        # removal still never force-deletes.
-        await agent.delete_session(created["session_id"])
-        archived = await archive_when_released(agent, workspace_id)
+        # Exactly one of workspace_id / session_id is required.
+        with pytest.raises(WorktreeError) as ambiguous:
+            await agent.worktrees.archive(workspace_id=workspace_id, session_id="s")
+        assert ambiguous.value.code == "invalid_options"
+
+        # Archive works from outside the owner session: an idle owner is
+        # unloaded, and removal still never force-deletes.
+        archived = await agent.worktrees.archive(workspace_id=workspace_id)
         assert archived["lifecycle"] == "archived"
-        removed = await agent.worktrees.remove(workspace_id)
+        removed = await agent.worktrees.remove(workspace_id=workspace_id)
         assert removed["checkout_removed"] is True
         assert not Path(created["checkout_path"]).exists()
+
+        # `archive=True` archives an owned workspace and removes it in one call.
+        second = await agent.worktrees.create(name="second")
+        removed = await agent.worktrees.remove(
+            session_id=second["session_id"], archive=True
+        )
+        assert removed["checkout_removed"] is True
+
+        # A dirty checkout stays archived, with the paths in the refusal.
+        third = await agent.worktrees.create(name="third")
+        (Path(third["checkout_path"]) / "scratch.txt").write_text("work\n")
+        with pytest.raises(WorktreeError) as dirty:
+            await agent.worktrees.remove(workspace_id=third["workspace_id"], archive=True)
+        assert dirty.value.code == "unpreserved_content"
+        assert "scratch.txt" in str(dirty.value)
+        status = await agent.worktrees.status(third["workspace_id"])
+        assert status["lifecycle"] == "archived"
 
     run(scenario())
 

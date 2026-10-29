@@ -9,7 +9,8 @@ class WorktreeError(RuntimeError):
 
     ``code`` is a stable machine-readable identifier, for example
     ``workspace_service_unavailable``, ``invalid_options``, ``removal_refused``,
-    ``workspace_not_found``, ``owner_conflict``, ``conflicting_cwd`` or
+    ``owner_active``, ``workspace_not_archived``, ``unpreserved_content``,
+    ``unpreserved_commits``, ``workspace_archived``, ``workspace_not_found``, ``owner_conflict``, ``conflicting_cwd`` or
     ``isolation_unsupported_layout``.
     """
 
@@ -49,8 +50,17 @@ class Worktrees:
         name: str | None = None,
         summary: bool = False,
     ) -> dict[str, Any]: ...
-    async def archive(self, workspace_id: str) -> dict[str, Any]: ...
-    async def remove(self, workspace_id: str) -> dict[str, Any]: ...
+    async def archive(
+        self,
+        workspace_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]: ...
+    async def remove(
+        self,
+        workspace_id: str | None = None,
+        session_id: str | None = None,
+        archive: bool = False,
+    ) -> dict[str, Any]: ...
     async def recover(self, workspace_id: str) -> dict[str, Any]: ...
 
 class AgentSession:

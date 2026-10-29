@@ -267,6 +267,14 @@ impl WorkspaceLifecycle {
     }
 }
 
+impl WorkspaceLifecycle {
+    /// Whether execution in the workspace has been retired for good: archived,
+    /// or on its way to / already past removal. The owner session is read-only.
+    pub fn is_retired(self) -> bool {
+        matches!(self, Self::Archived | Self::Removing | Self::Removed)
+    }
+}
+
 impl fmt::Display for WorkspaceLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {

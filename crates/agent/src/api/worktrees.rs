@@ -257,17 +257,27 @@ impl AgentWorktrees {
         self.ops.publish(&target).await
     }
 
-    /// Retire inactive execution, preserving history and ownership.
-    pub async fn archive(&self, workspace_id: &str) -> Result<WorktreeSummary, WorktreeOpError> {
-        self.ops.archive(workspace_id).await
+    /// Retire a workspace's execution, preserving history and ownership.
+    /// Works from any session: an idle owner is unloaded, a busy one is
+    /// refused with `owner_active`.
+    pub async fn archive(
+        &self,
+        target: WorkspaceTarget,
+    ) -> Result<WorktreeSummary, WorktreeOpError> {
+        self.ops.archive(self.handle.as_ref(), &target).await
     }
 
-    /// Conservative removal; there is no force option.
+    /// Conservative removal; there is no force option. With `archive`, an
+    /// owned workspace is archived first (and stays archived if removal is
+    /// then refused).
     pub async fn remove(
         &self,
-        workspace_id: &str,
+        target: WorkspaceTarget,
+        archive: bool,
     ) -> Result<WorktreeRemoveResponse, WorktreeOpError> {
-        self.ops.remove(workspace_id).await
+        self.ops
+            .remove(self.handle.as_ref(), &target, archive)
+            .await
     }
 
     /// Complete an interrupted provisioning or removal.
