@@ -90,6 +90,28 @@ impl super::LocalAgentHandle {
         }
     }
 
+    /// Unload an idle actor that owns a ready managed workspace, so it stops
+    /// holding the checkout's shared activity lease and a later worktree
+    /// archive from another session can succeed.
+    ///
+    /// Best effort and never blocking: a busy actor stays loaded, and the
+    /// workspace itself is not archived (that is an explicit worktree action).
+    async fn release_managed_owner_lease(&self, session_id: &str) {
+        let Some(registry) = self.config.storage.workspace_repository() else {
+            return;
+        };
+        let owns_ready = matches!(
+            registry.get_workspace_by_session(session_id).await,
+            Ok(Some(record)) if record.lifecycle == crate::worktree::WorkspaceLifecycle::Ready
+        );
+        if !owns_ready {
+            return;
+        }
+        if let Err(err) = self.unload_session_if_idle(session_id).await {
+            tracing::warn!(session_id, error = %err, "failed to unload session owning a managed workspace");
+        }
+    }
+
     pub(crate) async fn patch_session_lifecycle_unloaded(
         &self,
         session_id: &str,
@@ -106,7 +128,12 @@ impl super::LocalAgentHandle {
             }
             crate::session::location::SessionLocation::Local
             | crate::session::location::SessionLocation::NotFound => {
-                patch_stored_session_lifecycle(store.as_ref(), session_id, patch).await
+                let lifecycle =
+                    patch_stored_session_lifecycle(store.as_ref(), session_id, patch).await?;
+                if patch.archived == Some(true) || patch.resolved == Some(true) {
+                    self.release_managed_owner_lease(session_id).await;
+                }
+                Ok(lifecycle)
             }
             crate::session::location::SessionLocation::Remote { bookmark } => {
                 #[cfg(feature = "remote")]

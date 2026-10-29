@@ -271,8 +271,8 @@ to run Git commands:
 /worktree status <workspace-id>
 /worktree result <workspace-id>
 /worktree publish [workspace-id]
-/worktree archive <workspace-id>
-/worktree remove <workspace-id>
+/worktree archive [workspace-id]
+/worktree remove [workspace-id] [--archive]
 /worktree recover <workspace-id>
 ```
 
@@ -304,8 +304,8 @@ The same service backs additive ACP extension methods:
 | `querymt/worktree/status` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/result` | `{"workspace_id":"<id>"}` |
 | `querymt/worktree/publish` | `{"workspace_id":"<id>"}` or `{"session_id":"<id>"}` |
-| `querymt/worktree/archive` | `{"workspace_id":"<id>"}` |
-| `querymt/worktree/remove` | `{"workspace_id":"<id>"}` |
+| `querymt/worktree/archive` | `{"workspace_id":"<id>"}` or `{"session_id":"<owner>"}` |
+| `querymt/worktree/remove` | `{"workspace_id":"<id>"}` or `{"session_id":"<owner>"}`, optional `"archive":true` |
 | `querymt/worktree/recover` | `{"workspace_id":"<id>"}` or `{"session_id":"<id>"}` (pending isolated forks) |
 
 Commit-based creation also accepts `base_ref` (or `baseRef`). Result responses
@@ -360,7 +360,9 @@ cannot drift between surfaces. Existing ACP JSON shapes are unchanged.
 
     wt = agent.worktrees                         # None when not enabled
     await wt.list(); await wt.status(wid); await wt.result(wid)
-    await wt.publish(workspace_id=wid); await wt.archive(wid); await wt.remove(wid)
+    await wt.publish(workspace_id=wid)
+    await wt.archive(workspace_id=wid)            # or archive(session_id=owner)
+    await wt.remove(workspace_id=wid)             # or remove(session_id=owner, archive=True)
     ```
 
     Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) carrying a
@@ -381,12 +383,16 @@ readable messages may be reworded; codes do not change.
 | `workspace_missing` | the bound checkout is gone; there is no fallback to the source |
 | `conflicting_cwd` | load/resume with a cwd that contradicts the persisted binding |
 | `owner_conflict` | another session already owns the writable workspace |
-| `owner_active` | handoff refused: the owner has a running turn, queued input, shared delegates, or execution in another process |
+| `owner_active` | handoff, archive or removal refused: the owner has a running turn, queued input or steering, or shared delegates / another process are using the checkout |
+| `workspace_not_archived` | removal of an owned workspace before it was archived; run `archive` (or `remove --archive`) |
+| `unpreserved_content` | removal would discard uncommitted, untracked or ignored files; the (bounded) path lists are in the message |
+| `unpreserved_commits` | removal would discard commits beyond the baseline that no retained ref contains; publish or integrate them |
+| `workspace_archived` | the session's workspace is archived: the session is read-only and only inspection and cleanup commands are accepted |
 | `owner_transferred` | the session handed its workspace off and is read-only; the current owner is in `ownerSessionId` |
 | `not_owner`, `workspace_not_ready`, `owner_not_local` | handoff refused: the target does not own a ready, locally hosted workspace (nothing is created) |
 | `summary_failed` | handoff with `summary` failed before the transfer; ownership is unchanged |
 | `handoff_incomplete` | ownership moved but the successor is not runnable yet; run `recover` with its `session_id` |
-| `removal_refused` | removal refused (active owner, dirty/untracked/ignored content, unpreserved commits) |
+| `removal_refused` | removal refused for a reason without a more specific code (for example externally owned content) |
 | `operation_refused` | another lifecycle operation was refused in the current state |
 | `repository_error`, `storage_error`, `session_start_failed`, `internal_error` | infrastructure failures |
 
@@ -403,13 +409,11 @@ readable messages may be reworded; codes do not change.
    and commands never merge it for you; for delegates the parent session accepts
    it explicitly (see [Accepting a delegate result](#accepting-a-delegate-result)).
    A top-level workspace's delta is integrated manually.
-5. Close the owning session and any explicitly shared delegates. From another
-   local conversation, run `/worktree archive <id>`, then `/worktree remove <id>`.
-   Archive permanently retires execution while preserving conversation history
-   and its durable binding. Resume/load of an archived or removed workspace
-   fails explicitly; archive is not a temporary pause. Checkout activity leases
-   prevent archive/removal while any cooperating actor still runs, including
-   actors in another process. Closing alone preserves normal resumability.
+5. From the owning session or any other local conversation, run
+   `/worktree archive [id]`, then `/worktree remove [id]` (or
+   `/worktree remove [id] --archive` for both). Without an id the command
+   targets the issuing session's own workspace. See
+   [Archiving from any session](#archiving-from-any-session).
    Dirty, untracked, ignored, externally owned, or unpreserved-result checkouts
    remain protected. There is no `--force`; successful removal reports retained refs.
 
@@ -694,6 +698,70 @@ before using handoff. Profile runtimes built from one `AgentInfra` share its
 event fanout and storage journal, so announcements reach connections served by
 the root agent; runtimes given separate fanouts are only forwarded if they are
 registered as event sources.
+
+## Archiving from any session
+
+`archive` permanently retires execution in a managed checkout while preserving
+the conversation history and the durable binding. It works from the owning
+session itself or from any other local session; there is no need to close or
+detach anything first.
+
+```text
+/worktree archive              # this session's workspace
+/worktree archive <id>         # any workspace
+/worktree remove               # this session's workspace (must be archived)
+/worktree remove --archive     # archive, then remove, in one request
+```
+
+**Order.** Resolve the target (a workspace id or its owner session), treat an
+already-archived workspace as success without a new event, require a locally
+hosted owner (`owner_not_local`), unload an idle owner actor (a running turn,
+queued input or steering refuses with `owner_active`), then take the exclusive
+activity lease (shared delegates or another process refuse with
+`owner_active`). The record is re-read under the lease before the lifecycle
+compare-and-swap, and archive and removal both run under that same lease. A
+refused archive changes nothing. A prompt that arrives first makes the owner
+busy; one that arrives after the lease is taken finds the workspace not `ready`.
+
+**`remove --archive`.** An owned workspace is archived first. If removal is then
+refused (`unpreserved_content`, `unpreserved_commits`), the workspace stays
+archived, the refusal says so, and the error data carries `archived: true`; the
+archive is never rolled back. Without `--archive`, removing an owned workspace
+returns `workspace_not_archived`.
+
+**Read-only archived owners.** Like a previous owner after a handoff, an archived
+owner stays listable and loadable but never materializes an actor:
+
+- `session/load` replays history and discloses `_meta.querymt.sessionAccess =
+  {"mode": "read_only", "reason": "workspace_archived", "workspaceId": "<id>"}`,
+  with no configuration update.
+- Prompts, queued or steered input, undo/redo, forks and model/mode/config changes
+  are refused with `workspace_archived`.
+- Native `create`, `publish`, `handoff` and `archive` are refused; `list`,
+  `status`, `result`, `remove` and `recover` stay available so cleanup can be
+  finished from the archived conversation. Removal keeps the read-only state.
+
+**Archive announcement.** Archiving an owned workspace records a durable
+`worktree_archived` event on the owner's stream, sent as an `agent_message_chunk`
+with the stable `message_id` `worktree-archived-<workspace_id>` and
+`_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}`. Every attached
+client receives it before the response of a native command issued from the owner,
+and it is replayed after the history on load. If it cannot be recorded the
+failure is logged and the archive still succeeds. Like the handoff event it makes
+the journal unreadable by older binaries; upgrade every node sharing a database
+first.
+
+**Session archive/resolve.** Patching a session's lifecycle with `archived` or
+`resolved` set to `true` unloads its idle actor when it owns a ready managed
+workspace, so a later worktree archive from elsewhere succeeds. It does not
+archive the workspace and never blocks on a busy actor; archiving the workspace
+is an explicit worktree action.
+
+**Visible native failures.** Every refused or failed native `/worktree` command,
+usage errors included, returns a successful prompt response whose
+`_meta["querymt.worktree"].error = {code, message}` and shows the message as a
+session update before the response. ACP extension methods keep returning
+JSON-RPC errors with `data.{code, message}`.
 
 ## Undo, snapshots, and workspace references
 

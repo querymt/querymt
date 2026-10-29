@@ -20,12 +20,14 @@ impl SendAgent for LocalAgentHandle {
 
     async fn prompt(&self, req: PromptRequest) -> Result<PromptResponse, Error> {
         let session_id = req.session_id.to_string();
-        self.session_materializer
-            .ensure_not_transferred(&session_id)
-            .await?;
+        // Native commands gate on the read-only reason themselves: an archived
+        // session may still inspect and remove its workspace.
         if let Some(response) = self.handle_native_worktree_prompt(&req).await? {
             return Ok(response);
         }
+        self.session_materializer
+            .ensure_writable(&session_id)
+            .await?;
         #[cfg(feature = "remote")]
         return self
             .execute_session_operation(

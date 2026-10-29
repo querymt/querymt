@@ -63,9 +63,24 @@ exposes `create`, `handoff`, `list`, `status`, `result`, `publish`, `archive`,
 `remove` and `recover`, each returning a dict with the same shape as the ACP
 `querymt/worktree/*` extensions. Removal is conservative and never forces.
 
+`archive` and `remove` work from any session and take exactly one of
+`workspace_id` or `session_id` (the owner). An idle owner is unloaded; a busy one
+raises `owner_active`. An owned workspace must be archived before removal:
+
+```python
+await agent.worktrees.archive(session_id=owner)          # owner becomes read-only
+await agent.worktrees.remove(session_id=owner)           # after archive
+await agent.worktrees.remove(session_id=owner, archive=True)  # both in one call
+```
+
+If `remove(..., archive=True)` is refused (for example `unpreserved_content`),
+the workspace stays archived.
+
 Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) with a stable
 `.code` such as `workspace_service_unavailable`, `invalid_options`,
-`removal_refused` or `workspace_not_found`. Unknown keys in the `worktrees`
+`owner_active`, `workspace_not_archived`, `unpreserved_content`,
+`unpreserved_commits`, `workspace_archived`, `removal_refused` or
+`workspace_not_found`. Unknown keys in the `worktrees`
 dict raise `ValueError`. Isolation is a separate checkout, not a sandbox.
 
 `Agent.from_config(path)` reads `[agent.workspace]` / `[quorum.workspace]` from

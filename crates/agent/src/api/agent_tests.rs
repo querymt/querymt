@@ -2351,6 +2351,7 @@ mod workspace_api {
     use super::*;
     use crate::api::SessionOptions;
     use crate::config::WorkspaceSettings;
+    use crate::worktree::WorkspaceTarget;
     use crate::worktree::test_support::{commit_files, init_repo, materialize};
 
     struct Fixture {
@@ -2468,8 +2469,11 @@ mod workspace_api {
         );
 
         // Removal of an actively owned workspace is refused with a stable code.
-        let err = worktrees.remove(&workspace_id).await.unwrap_err();
-        assert_eq!(err.code(), "removal_refused");
+        let err = worktrees
+            .remove(WorkspaceTarget::Workspace(workspace_id.clone()), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "workspace_not_archived");
         let err = worktrees.status("ws-unknown").await.unwrap_err();
         assert_eq!(err.code(), "workspace_not_found");
         assert_eq!(

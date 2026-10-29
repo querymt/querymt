@@ -663,6 +663,14 @@ pub enum AgentEventKind {
         successor_session_id: String,
         summary_seeded: bool,
     },
+    /// The session's managed workspace was archived: the session is now
+    /// read-only. Emitted on the owner's stream and replayed on load.
+    WorktreeArchived {
+        workspace_id: String,
+        /// The session that issued the archive, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by_session_id: Option<String>,
+    },
     DelegationRequested {
         delegation: Delegation,
         #[serde(default, skip_serializing_if = "Option::is_none")]
