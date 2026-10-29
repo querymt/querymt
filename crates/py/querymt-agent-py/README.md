@@ -68,13 +68,18 @@ exposes `create`, `handoff`, `list`, `status`, `result`, `publish`, `archive`,
 raises `owner_active`. An owned workspace must be archived before removal:
 
 ```python
-await agent.worktrees.archive(session_id=owner)          # owner becomes read-only
-await agent.worktrees.remove(session_id=owner)           # after archive
-await agent.worktrees.remove(session_id=owner, archive=True)  # both in one call
+workspace_id = isolated.workspace["workspaceId"]
+await agent.worktrees.archive(workspace_id=workspace_id)   # owner becomes read-only
+await agent.worktrees.remove(workspace_id=workspace_id)    # after archive
+
+# Alternatively, archive and remove in one call:
+# await agent.worktrees.remove(workspace_id=workspace_id, archive=True)
 ```
 
-If `remove(..., archive=True)` is refused (for example `unpreserved_content`),
-the workspace stays archived.
+If `remove(..., archive=True)` archives the workspace but removal is then refused
+(for example `unpreserved_content`), the workspace stays archived. If archival
+itself is refused (for example `owner_active`), nothing changes and the workspace
+is not archived.
 
 Failures raise `querymt_agent.WorktreeError` (a `RuntimeError`) with a stable
 `.code` such as `workspace_service_unavailable`, `invalid_options`,

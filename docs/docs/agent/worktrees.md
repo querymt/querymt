@@ -745,8 +745,10 @@ owner stays listable and loadable but never materializes an actor:
 `worktree_archived` event on the owner's stream, sent as an `agent_message_chunk`
 with the stable `message_id` `worktree-archived-<workspace_id>` and
 `_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}`. Every attached
-client receives it before the response of a native command issued from the owner,
-and it is replayed after the history on load. If it cannot be recorded the
+client receives it before the response of a native command issued from the owner
+(except over the legacy `AcpServer::run_stdio` forwarder, where the update may
+arrive after the response; clients must not rely on that ordering there), and it
+is replayed after the history on load. If it cannot be recorded the
 failure is logged and the archive still succeeds. Like the handoff event it makes
 the journal unreadable by older binaries; upgrade every node sharing a database
 first.
@@ -760,7 +762,9 @@ is an explicit worktree action.
 **Visible native failures.** Every refused or failed native `/worktree` command,
 usage errors included, returns a successful prompt response whose
 `_meta["querymt.worktree"].error = {code, message}` and shows the message as a
-session update before the response. ACP extension methods keep returning
+session update before the response (except over the legacy
+`AcpServer::run_stdio` forwarder, where the update may arrive after the response;
+clients must not rely on that ordering there). ACP extension methods keep returning
 JSON-RPC errors with `data.{code, message}`.
 
 ## Undo, snapshots, and workspace references

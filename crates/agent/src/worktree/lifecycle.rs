@@ -206,7 +206,10 @@ impl WorkspaceManager {
             &record.checkout_path,
             true,
         )
-        .map_err(|err| WorktreeError::OwnerActive(err.to_string()))
+        .map_err(|err| match err {
+            WorktreeError::InvalidOperation(message) => WorktreeError::OwnerActive(message),
+            other => other,
+        })
     }
 
     /// [`Self::archive_held`] with a non-waiting exclusive lease.
