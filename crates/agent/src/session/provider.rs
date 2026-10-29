@@ -1111,12 +1111,26 @@ impl SessionHandle {
     /// `Excluded` and never carry catalog pricing; a model with no catalog
     /// entry is `Unknown`.
     pub fn billing_basis(&self) -> BillingBasis {
+        self.billing_basis_inner(None)
+    }
+
+    /// Like [`Self::billing_basis`], but priced for `model` served by this
+    /// session's provider (for example a dedicated compaction model).
+    pub fn billing_basis_for_model(&self, model: &str) -> BillingBasis {
+        self.billing_basis_inner(Some(model))
+    }
+
+    fn billing_basis_inner(&self, model: Option<&str>) -> BillingBasis {
         let oauth_backed = self
             .cached_llm_provider
             .get()
             .is_some_and(|provider| provider.provider.key_resolver().is_some());
         match self.llm_config.as_ref() {
-            Some(config) => BillingBasis::resolve(&config.provider, &config.model, oauth_backed),
+            Some(config) => BillingBasis::resolve(
+                &config.provider,
+                model.unwrap_or(&config.model),
+                oauth_backed,
+            ),
             None => BillingBasis {
                 billing: if oauth_backed {
                     BillingClass::Excluded

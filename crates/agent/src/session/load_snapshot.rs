@@ -41,10 +41,6 @@ pub struct SessionLoadSnapshot {
     /// Authoritative replacement accounting at `cursor`, reduced from the same
     /// audit events by the shared accounting reducer. Present even when
     /// historical replay is skipped or the context limit is unknown.
-    ///
-    /// Optional on the wire only so snapshots from agents that predate
-    /// accounting still deserialize; absence means "no accounting reported".
-    #[serde(default)]
     #[typeshare(serialized_as = "AccountingSnapshot")]
     pub accounting: crate::accounting::AccountingSnapshot,
     #[serde(rename = "delegationUpdates")]
@@ -416,6 +412,9 @@ mod tests {
                 "generated_at": "1970-01-01T00:00:00Z"
             },
             "cursor": {"local_seq": 0, "remote_seq_by_source": {}},
+            "accounting": serde_json::to_value(
+                crate::accounting::AccountingSnapshot::default()
+            ).unwrap(),
             "delegationUpdates": []
         });
         let snapshot: SessionLoadSnapshot = serde_json::from_value(value).unwrap();

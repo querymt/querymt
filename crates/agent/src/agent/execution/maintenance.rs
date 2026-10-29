@@ -45,7 +45,8 @@ async fn emit_compaction_event(config: &AgentConfig, session_id: &str, kind: Age
 /// The accounting ledger for one compaction operation.
 ///
 /// Uses the cycle the compaction was initiated from. The billing basis is the
-/// session provider's, because that provider handles the request.
+/// session provider's (that provider handles the request), priced for the
+/// compaction model actually used.
 async fn compaction_ledger(
     config: &AgentConfig,
     exec_ctx: &ExecutionContext,
@@ -75,7 +76,7 @@ async fn compaction_ledger(
             .with_budget_pricing(config.budget_pricing())
             .with_budget_cap(config.budget_cap_usd()),
         ),
-        basis: exec_ctx.session_handle.billing_basis(),
+        basis: exec_ctx.session_handle.billing_basis_for_model(model),
     })
 }
 

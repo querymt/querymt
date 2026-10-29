@@ -581,17 +581,27 @@ impl LocalAgentHandle {
                 )
                 .with_budget_pricing(self.config.budget_pricing()),
             ),
-            basis: handle.billing_basis(),
+            basis: handle.billing_basis_for_model(&model),
         };
         let result = self
             .config
             .compaction
             .process(&messages, llm_provider, &model, &retry, None, &ledger)
             .await
-            .map_err(|err| failed(err.to_string()))?;
-        crate::session::compaction::SessionCompaction::validate_summary(&result.summary)
-            .map_err(|err| failed(err.to_string()))?;
-        Ok(Some(result.summary))
+            .map_err(|err| failed(err.to_string()))
+            .and_then(|result| {
+                crate::session::compaction::SessionCompaction::validate_summary(&result.summary)
+                    .map(|()| result.summary)
+                    .map_err(|err| failed(err.to_string()))
+            });
+        // The previous owner was unloaded by quiesce, so no actor retires the
+        // stream and accounting set up above. Release them now so no later
+        // failure leaks them; a successful announcement reopens the stream.
+        // The local holders must go first or the stream is not released.
+        drop(ledger);
+        drop(cycle);
+        self.config.event_sink.retire_session_stream(previous).await;
+        result.map(Some)
     }
 
     async fn seed_summary_in_runtime(
