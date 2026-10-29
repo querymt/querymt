@@ -1027,8 +1027,9 @@ pub(crate) fn answer_unanswered_tool_calls(
         match next_input.map(<[ChatInputPart]>::to_vec) {
             Some(existing) => {
                 // Results first, so no other part interrupts the batch.
-                let (mut parts, rest): (Vec<_>, Vec<_>) =
-                    existing.into_iter().partition(ChatInputPart::is_tool_result);
+                let (mut parts, rest): (Vec<_>, Vec<_>) = existing
+                    .into_iter()
+                    .partition(ChatInputPart::is_tool_result);
                 parts.extend(missing);
                 parts.extend(rest);
                 let cache = messages[next].cache.clone();
@@ -2125,7 +2126,10 @@ mod tests {
         assert_eq!(messages.len(), 2);
         let parts = messages[1].input().unwrap();
         assert_eq!(result_ids(&messages[1]), ["a", "b"]);
-        assert!(!parts.last().unwrap().is_tool_result(), "text stays after results");
+        assert!(
+            !parts.last().unwrap().is_tool_result(),
+            "text stays after results"
+        );
     }
 
     #[test]

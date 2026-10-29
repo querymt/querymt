@@ -2775,7 +2775,9 @@ mod tests {
         }
 
         /// The stopped context's tool results, keyed by call id.
-        fn stopped_results(state: ExecutionState) -> (Vec<querymt::chat::ChatMessage>, HashMap<String, String>) {
+        fn stopped_results(
+            state: ExecutionState,
+        ) -> (Vec<querymt::chat::ChatMessage>, HashMap<String, String>) {
             let ExecutionState::Stopped {
                 stop_type, context, ..
             } = state
@@ -3500,7 +3502,12 @@ mod tests {
                         ),
                         (
                             0,
-                            Ok(flushed_call(1, "toolu_cut", r#"{"path": "reconcile.rs""#, true)),
+                            Ok(flushed_call(
+                                1,
+                                "toolu_cut",
+                                r#"{"path": "reconcile.rs""#,
+                                true,
+                            )),
                         ),
                         (
                             0,
