@@ -942,6 +942,86 @@ async fn websocket_event_forwarder_emits_owned_delegation_update() {
 }
 
 #[tokio::test]
+async fn loaded_session_emits_live_delegation_completion_without_reloading() {
+    let fixture = crate::test_utils::TestAgent::new().await;
+    let session_id = fixture.create_session().await;
+    let stream = fixture.config.event_sink.session_stream(&session_id);
+    let delegation = crate::session::domain::Delegation {
+        isolation: Default::default(),
+        id: 0,
+        public_id: "delegation-1".into(),
+        session_id: 0,
+        task_id: None,
+        target_agent_id: "coder".into(),
+        objective: "Implement it".into(),
+        objective_hash: crate::hash::RapidHash::default(),
+        context: None,
+        constraints: None,
+        expected_output: None,
+        verification_spec: None,
+        planning_summary: None,
+        status: crate::session::domain::DelegationStatus::Requested,
+        retry_count: 0,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        completed_at: None,
+    };
+    stream.emit(AgentEventKind::DelegationRequested {
+        delegation,
+        tool_call_id: Some("call-1".into()),
+        batch_id: None,
+    });
+    stream.emit(AgentEventKind::SessionForked {
+        parent_session_id: session_id.clone(),
+        child_session_id: "child-1".into(),
+        target_agent_id: "coder".into(),
+        origin: crate::session::domain::ForkOrigin::Delegation,
+        fork_point_type: crate::session::domain::ForkPointType::ProgressEntry,
+        fork_point_ref: "delegation-1".into(),
+        instructions: None,
+        selected_model_id: None,
+        selected_provider_node_id: None,
+    });
+    timeout(Duration::from_secs(5), async {
+        while stream.published_tip() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delegation starts before the connection is opened");
+
+    let (mut connection, mut rx) =
+        super::websocket::EmbeddedAcpConnection::open(fixture.handle.clone(), None).await;
+    connection
+        .receive_json(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": "init", "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {
+                    "_meta": {"querymt": {"sessionLoadSnapshot": {"epoch": 1}}}
+                }}
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+    embedded_messages_until(&mut rx, |m| m["id"] == "init").await;
+    load_embedded_session(&connection, &mut rx, &session_id).await;
+
+    stream.emit(AgentEventKind::DelegationCompleted {
+        delegation_id: "delegation-1".into(),
+        result: Some("Done".into()),
+    });
+    let messages = embedded_messages_until(&mut rx, |m| {
+        m["method"] == "querymt/session/delegationUpdate" && m["params"]["state"] == "completed"
+    })
+    .await;
+    let update = &messages.last().unwrap()["params"];
+    assert_eq!(update["sessionId"], session_id);
+    assert_eq!(update["toolCallId"], "call-1");
+    assert_eq!(update["childSessionId"], "child-1");
+    connection.close().await;
+}
+
+#[tokio::test]
 async fn websocket_event_forwarder_emits_owned_input_state() {
     let fixture = crate::test_utils::TestAgent::new().await;
     let state = WsServerState::new(fixture.handle.clone());

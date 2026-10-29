@@ -805,6 +805,60 @@ mod tests {
     }
 
     #[test]
+    fn seeding_connection_history_preserves_live_delegation_completion() {
+        let history = vec![
+            event(
+                1,
+                AgentEventKind::DelegationRequested {
+                    delegation: delegation(),
+                    tool_call_id: Some("call-1".into()),
+                    batch_id: None,
+                },
+            ),
+            event(
+                2,
+                AgentEventKind::SessionForked {
+                    parent_session_id: "parent-1".into(),
+                    child_session_id: "child-1".into(),
+                    target_agent_id: "coder".into(),
+                    origin: ForkOrigin::Delegation,
+                    fork_point_type: ForkPointType::ProgressEntry,
+                    fork_point_ref: "delegation-1".into(),
+                    instructions: None,
+                    selected_model_id: None,
+                    selected_provider_node_id: None,
+                },
+            ),
+        ];
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".into(),
+            serde_json::json!({ "audit": { "events": history } }),
+        )]);
+        let completed = EventEnvelope::from(event(
+            3,
+            AgentEventKind::DelegationCompleted {
+                delegation_id: "delegation-1".into(),
+                result: Some("done".into()),
+            },
+        ));
+        // Completion can arrive while history is being read, before the request is seeded.
+        let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
+        assert!(translator.translate_notification(&completed).is_none());
+        assert!(translator.seed_history_from_meta("parent-1", Some(&meta)));
+        let update = translator.translate_notification(&completed).unwrap();
+        assert_eq!(update["params"]["state"], "completed");
+        assert_eq!(update["params"]["toolCallId"], "call-1");
+        assert_eq!(update["params"]["childSessionId"], "child-1");
+
+        // Repeated loads must not roll newer terminal state back to the historical fork.
+        assert!(translator.seed_history_from_meta("parent-1", Some(&meta)));
+        let repeated = translator
+            .translate_notification(&EventEnvelope::from(history[0].clone()))
+            .unwrap();
+        assert_eq!(repeated["params"]["state"], "completed");
+    }
+
+    #[test]
     fn historical_requested_event_without_tool_call_id_deserializes() {
         let value = serde_json::to_value(AgentEventKind::DelegationRequested {
             delegation: delegation(),

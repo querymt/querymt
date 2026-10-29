@@ -334,10 +334,10 @@ async fn load_session_and_enqueue_replay(
             if let Some(options) = outcome.response.config_options.as_ref() {
                 translator.seed_config_options(&session_id, options);
             }
-            translator.seed_usage_from_meta(&session_id, outcome.response.meta.as_ref())
+            translator.seed_history_from_meta(&session_id, outcome.response.meta.as_ref())
         };
         if !seeded {
-            crate::acp::shared::restore_session_usage(agent, &session_id, translator).await;
+            crate::acp::shared::restore_session_history(agent, &session_id, translator).await;
         }
         let enqueue_span = info_span!(
             "acp.replay.enqueue",

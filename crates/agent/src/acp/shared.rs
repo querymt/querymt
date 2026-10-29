@@ -465,7 +465,7 @@ async fn attach_rpc_session_locked<S: SendAgent>(
         return Ok(ownership_inserted);
     };
     if ownership_inserted && let Some(translator) = context.translator.as_ref() {
-        restore_session_usage(local_agent, session_id, translator).await;
+        restore_session_history(local_agent, session_id, translator).await;
     }
     if let Some(bridge) = context.session_bridge.as_ref()
         && let Err(error) = local_agent
@@ -501,7 +501,7 @@ async fn attach_rpc_session_locked<S: SendAgent>(
     Ok(ownership_inserted)
 }
 
-pub(crate) async fn restore_session_usage(
+pub(crate) async fn restore_session_history(
     agent: &AgentHandle,
     session_id: &str,
     translator: &Arc<std::sync::Mutex<AcpLiveEventTranslator>>,
@@ -543,7 +543,7 @@ pub(crate) async fn restore_session_usage(
         Ok(events) => translator
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .seed_usage(session_id, &events),
+            .seed_history(session_id, &events),
         Err(error) => {
             tracing::warn!(session.id = %session_id, %error, "failed to restore ACP usage totals");
             translator
@@ -1539,16 +1539,17 @@ impl AcpLiveEventTranslator {
     }
 
     /// Merge history with any events already observed during attachment.
-    fn seed_usage(&mut self, session_id: &str, events: &[AgentEvent]) {
+    fn seed_history(&mut self, session_id: &str, events: &[AgentEvent]) {
         let usage = self.usage.entry(session_id.to_owned()).or_default();
         for event in events {
             usage.observe(event.seq, &event.kind);
+            self.delegation_updates.project_event(event);
         }
         usage.history_loaded = true;
     }
 
     /// Reuse load snapshots rather than issuing a second full history read.
-    pub(crate) fn seed_usage_from_meta(
+    pub(crate) fn seed_history_from_meta(
         &mut self,
         session_id: &str,
         meta: Option<&serde_json::Map<String, serde_json::Value>>,
@@ -1565,12 +1566,24 @@ impl AcpLiveEventTranslator {
         for event in events {
             if !matches!(
                 event["kind"]["type"].as_str(),
-                Some("llm_request_end" | "provider_changed")
+                Some(
+                    "llm_request_end"
+                        | "provider_changed"
+                        | "delegation_requested"
+                        | "session_forked"
+                        | "delegation_completed"
+                        | "delegation_failed"
+                        | "delegation_cancelled"
+                )
             ) {
                 continue;
             }
             match serde_json::from_value::<AgentEvent>(event.clone()) {
-                Ok(event) => usage.observe(event.seq, &event.kind),
+                Ok(event) => {
+                    usage.observe(event.seq, &event.kind);
+                    // Seed the existing projector so duplicate history cannot regress live state.
+                    self.delegation_updates.project_event(&event);
+                }
                 Err(_) => usage.partial = true,
             }
         }
@@ -2508,7 +2521,7 @@ pub async fn handle_rpc_message_with_context<S: SendAgent>(
                                         if let Some(options) = r.config_options.as_ref() {
                                             translator.seed_config_options(&session_id, options);
                                         }
-                                        translator.seed_usage_from_meta(&session_id, r.meta.as_ref());
+                                        translator.seed_history_from_meta(&session_id, r.meta.as_ref());
                                     }
                                     let request_lock =
                                         session_owners.request_lock(&session_id, conn_id).await;
@@ -7079,8 +7092,8 @@ mod session_update_tests {
             agent_event(2, request_with_tokens(2).kind().clone()),
             agent_event(5, request_with_tokens(5).kind().clone()),
         ];
-        translator.seed_usage("s-1", &history);
-        translator.seed_usage("s-1", &history);
+        translator.seed_history("s-1", &history);
+        translator.seed_history("s-1", &history);
         let value =
             serde_json::to_value(translator.usage["s-1"].usage_update(100).unwrap()).unwrap();
         assert_eq!(value["size"], 200_000);
@@ -7127,8 +7140,8 @@ mod session_update_tests {
             serde_json::to_value(snapshot).unwrap(),
         )]);
         let mut translator = AcpLiveEventTranslator::new();
-        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
-        assert!(translator.seed_usage_from_meta(&session_id, Some(&meta)));
+        assert!(translator.seed_history_from_meta(&session_id, Some(&meta)));
+        assert!(translator.seed_history_from_meta(&session_id, Some(&meta)));
         let usage = &translator.usage[&session_id];
         assert!(usage.history_loaded);
         assert!(!usage.partial);
@@ -7148,15 +7161,15 @@ mod session_update_tests {
         )]);
         let mut translator = AcpLiveEventTranslator::new();
         translator.translate_updates(&usage_end(3, 100, None));
-        assert!(translator.seed_usage_from_meta("s-1", Some(&meta)));
-        assert!(translator.seed_usage_from_meta("s-1", Some(&meta)));
+        assert!(translator.seed_history_from_meta("s-1", Some(&meta)));
+        assert!(translator.seed_history_from_meta("s-1", Some(&meta)));
         let usage = &translator.usage["s-1"];
         assert!(usage.history_loaded);
         assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
         assert!(usage.latest_request.is_none());
         assert!(usage.partial);
         assert_eq!(usage.cumulative_cost_usd, Some(0.5));
-        assert!(!translator.seed_usage_from_meta("s-1", None));
+        assert!(!translator.seed_history_from_meta("s-1", None));
     }
 
     #[test]
@@ -7180,7 +7193,7 @@ mod session_update_tests {
             })
             .unwrap();
         let mut translator = AcpLiveEventTranslator::new();
-        translator.seed_usage("s-1", &events);
+        translator.seed_history("s-1", &events);
         let live_usage =
             serde_json::to_value(translator.usage["s-1"].usage_update(100).unwrap()).unwrap();
         assert_eq!(replay_usage, live_usage);
