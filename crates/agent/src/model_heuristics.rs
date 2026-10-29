@@ -322,7 +322,16 @@ fn default_provider_options(provider: &str, model: &str) -> HashMap<String, Valu
         opts.insert("usage".into(), json!({"include": true}));
     }
 
-    // Claude is intentionally absent here: session effort "auto" stays unset
+    // Strict tool use for the builtin edit tools. The provider has no
+    // built-in list; `apply_to` only fills it when the user hasn't set it.
+    if provider == "anthropic" {
+        opts.insert(
+            "strict_tools".into(),
+            json!(crate::tools::builtins::DEFAULT_STRICT_TOOLS),
+        );
+    }
+
+    // Claude thinking effort is intentionally absent here: session effort "auto" stays unset
     // and the Anthropic provider resolves it per model class (default-on
     // adaptive models keep API defaults, opt-in adaptive models get adaptive
     // thinking, budget models get none). Inserting an effort would turn "auto"
@@ -602,6 +611,28 @@ mod tests {
             );
             assert_eq!(d.temperature, None, "{model}");
         }
+    }
+
+    #[test]
+    fn anthropic_defaults_strict_tools_only_when_unset() {
+        let d = ModelDefaults::for_model("anthropic", "claude-sonnet-5-5", None);
+
+        let mut config = json!({});
+        d.apply_to(&mut config, "sid");
+        assert_eq!(
+            config["strict_tools"],
+            json!(["edit", "multiedit", "replace_symbol"])
+        );
+
+        // Explicit user values (including an empty list) win.
+        for explicit in [json!([]), json!(["glob"])] {
+            let mut config = json!({"strict_tools": explicit.clone()});
+            d.apply_to(&mut config, "sid");
+            assert_eq!(config["strict_tools"], explicit);
+        }
+
+        let other = ModelDefaults::for_model("openai", "gpt-4o", None);
+        assert!(!other.provider_options.contains_key("strict_tools"));
     }
 
     #[test]

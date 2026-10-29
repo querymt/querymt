@@ -70,6 +70,11 @@ pub use write_file::WriteFileTool;
 use crate::tools::Tool;
 use std::sync::Arc;
 
+/// Builtin tools whose schemas are sent with strict tool use on providers that
+/// support it (currently Anthropic's `strict_tools` option). Applied as a
+/// default only when the user has not configured the option.
+pub const DEFAULT_STRICT_TOOLS: &[&str] = &["edit", "multiedit", "replace_symbol"];
+
 /// Returns all builtin tools.
 ///
 /// This is the canonical source of truth for which tools are built-in.
@@ -175,45 +180,17 @@ mod schema_guard_tests {
 
 #[cfg(test)]
 mod anthropic_strict_defaults_tests {
-    use super::all_builtin_tools;
-    use serde_json::Value;
-
-    /// Fixture shared with the Anthropic provider; its keys are the provider's
-    /// default `strict_tools` list (the provider asserts that equivalence).
-    const FIXTURE: &str = include_str!("../../../../providers/anthropic/src/builtin_schemas.json");
-
-    /// Drop prose (`description` strings) so structure can be compared.
-    fn without_prose(value: &Value) -> Value {
-        match value {
-            Value::Object(map) => Value::Object(
-                map.iter()
-                    .filter(|(k, v)| !(k.as_str() == "description" && v.is_string()))
-                    .map(|(k, v)| (k.clone(), without_prose(v)))
-                    .collect(),
-            ),
-            Value::Array(items) => Value::Array(items.iter().map(without_prose).collect()),
-            other => other.clone(),
-        }
-    }
+    use super::{DEFAULT_STRICT_TOOLS, all_builtin_tools};
 
     #[test]
     fn default_strict_tool_names_exist_and_builtins_are_not_marked_strict() {
-        let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
-        let fixture = fixture.as_object().unwrap();
-        assert!(!fixture.is_empty());
+        assert!(!DEFAULT_STRICT_TOOLS.is_empty());
         let tools = all_builtin_tools();
 
-        for (name, expected) in fixture {
-            let tool = tools
-                .iter()
-                .find(|t| t.name() == name)
-                .unwrap_or_else(|| panic!("default strict tool `{name}` is not a builtin"));
-            let definition = tool.definition().function;
-            assert_eq!(definition.strict, None, "{name} must not be marked strict");
-            assert_eq!(
-                without_prose(&definition.parameters),
-                without_prose(expected),
-                "{name}: provider fixture drifted from the builtin schema"
+        for name in DEFAULT_STRICT_TOOLS {
+            assert!(
+                tools.iter().any(|t| t.name() == *name),
+                "default strict tool `{name}` is not a builtin"
             );
         }
         // OpenAI Responses rejects strict schemas with optional properties,

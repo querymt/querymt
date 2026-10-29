@@ -18,8 +18,6 @@ set -euo pipefail
 
 MODELS=("$@")
 [ ${#MODELS[@]} -eq 0 ] && MODELS=(claude-sonnet-4-5-20250929 claude-sonnet-5-5)
-HERE="$(cd "$(dirname "$0")" && pwd)"
-FIXTURE="$HERE/../crates/providers/anthropic/src/builtin_schemas.json"
 API=https://api.anthropic.com/v1/messages
 OAUTH_VERSION=2.1.284
 
@@ -35,10 +33,35 @@ print(d["access_token"])' )" || { echo "OAuth token missing or expired: run 'qmt
 
 # build_body <model> <converted|original> <prefix>
 build_body() {
-  python3 - "$FIXTURE" "$1" "$2" "$3" <<'EOF'
+  python3 - "$1" "$2" "$3" <<'EOF'
 import sys, json, copy
-fixture, model, which, prefix = sys.argv[1:5]
-schema = json.load(open(fixture))["replace_symbol"]
+model, which, prefix = sys.argv[1:4]
+# Shape of the agent's `replace_symbol` builtin parameters (descriptions shortened).
+schema = {
+    "type": "object",
+    "properties": {
+        "replacements": {
+            "type": "array",
+            "description": "reqs",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path."},
+                    "symbol": {"type": "string", "description": "sym"},
+                    "kind": {"type": "string", "description": "kind", "default": "any"},
+                    "occurrence": {"type": "integer", "description": "0-based occurrence when multiple symbols match.", "default": 0, "minimum": 0},
+                    "expected_hash": {"type": "string", "description": "hash"},
+                    "new_text": {"type": "string", "description": "body"},
+                },
+                "required": ["path", "symbol", "new_text"],
+                "additionalProperties": False,
+            },
+        },
+        "root": {"type": "string", "description": "Workspace root directory.", "default": "."},
+    },
+    "required": ["replacements"],
+    "additionalProperties": False,
+}
 if which == "converted":
     # Same transformation strict_schema::convert applies to this schema
     # (covered by a golden test): minimum moves into the description.

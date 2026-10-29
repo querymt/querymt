@@ -8,19 +8,6 @@ mod model;
 mod strict_schema;
 use model::{ClaudeModel, ThinkingClass, parse_claude_model, resolve_thinking_class};
 
-/// Tools sent with `strict: true` when `strict_tools` is not configured.
-const DEFAULT_STRICT_TOOLS: &[&str] = &["edit", "multiedit", "replace_symbol"];
-
-/// OAuth strict-tool capability gate.
-///
-/// Strict tool use over OAuth was verified against the live endpoint with
-/// `scripts/verify-anthropic-strict.sh` (see the 7.7 note in the
-/// harden-tool-argument-handling change), so the default is enabled. Setting
-/// `oauth_strict_tools = false` closes the gate: it overrides every strictness
-/// request on OAuth, including explicit `strict: true`. If verification ever
-/// regresses, flip this default to `false`.
-const OAUTH_STRICT_VERIFIED: bool = true;
-
 /// Tool name prefix used for OAuth requests to avoid conflicts with server-side tools
 const TOOL_PREFIX: &str = "mcp_";
 
@@ -161,17 +148,11 @@ pub struct Anthropic {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptive_thinking: Option<bool>,
     /// Names of tools sent with `strict: true` (matched against the unprefixed
-    /// tool name). Defaults to `["edit", "multiedit", "replace_symbol"]`; an
-    /// empty list disables name-based selection but not tool definitions that
-    /// explicitly set `strict: true`. Every strictness request is still subject
-    /// to schema, model, authentication and budget checks.
+    /// tool name). Unset or empty means no name-based selection; tool
+    /// definitions that explicitly set `strict: true` are still honoured. Every
+    /// strictness request is subject to schema, model and budget checks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_tools: Option<Vec<String>>,
-    /// Authentication capability gate for strict tools over OAuth. When unset
-    /// the built-in verification default applies (currently enabled). `false`
-    /// omits every strict flag on OAuth requests, including explicit ones.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oauth_strict_tools: Option<bool>,
     /// Optional resolver for dynamic credential refresh (e.g., OAuth tokens).
     #[serde(skip)]
     #[schemars(skip)]
@@ -1154,9 +1135,14 @@ impl Anthropic {
     ///
     /// A tool is eligible when its definition sets `strict: true` or its
     /// unprefixed name is in `strict_tools`. Per-tool schema incompatibility
-    /// falls back for that tool only; unsupported models, a closed OAuth gate
-    /// or exceeded budgets fall back for the whole request. Every fallback
-    /// sends the original, unmodified schemas.
+    /// falls back for that tool only; unsupported models or exceeded budgets
+    /// fall back for the whole request. Every fallback sends the original,
+    /// unmodified schemas.
+    ///
+    /// Strict tool use works over OAuth as well (verified against the live
+    /// endpoint with `scripts/verify-anthropic-strict.sh`). OAuth only changes
+    /// tool names (see `TOOL_PREFIX`); `strict_tools` is matched against the
+    /// unprefixed name.
     fn build_tools<'a>(&self, tools: &'a [Tool]) -> Vec<AnthropicTool<'a>> {
         let plain = || -> Vec<AnthropicTool<'a>> {
             tools
@@ -1170,14 +1156,7 @@ impl Anthropic {
                 .collect()
         };
 
-        let default_names: Vec<String>;
-        let names: &[String] = match &self.strict_tools {
-            Some(names) => names,
-            None => {
-                default_names = DEFAULT_STRICT_TOOLS.iter().map(|s| s.to_string()).collect();
-                &default_names
-            }
-        };
+        let names: &[String] = self.strict_tools.as_deref().unwrap_or_default();
         let eligible: Vec<bool> = tools
             .iter()
             .map(|tool| tool.function.strict == Some(true) || names.contains(&tool.function.name))
@@ -1191,10 +1170,6 @@ impl Anthropic {
             .is_some_and(|model| model.supports_strict_tools())
         {
             log::debug!(target: "qmt_anthropic", "strict tools omitted: model {} does not support them", self.model);
-            return plain();
-        }
-        if self.is_oauth() && !self.oauth_strict_tools.unwrap_or(OAUTH_STRICT_VERIFIED) {
-            log::debug!(target: "qmt_anthropic", "strict tools omitted: OAuth strict support is not enabled");
             return plain();
         }
 
@@ -2131,7 +2106,6 @@ mod tests {
             reasoning_budget_tokens: None,
             adaptive_thinking: None,
             strict_tools: None,
-            oauth_strict_tools: None,
             key_resolver: None,
         }
     }
@@ -4231,9 +4205,21 @@ mod tests {
         }
     }
 
+    /// Provider configured with a name-based strict list, as an embedding
+    /// application would supply it.
+    fn anthropic_strict(model: &str) -> Anthropic {
+        let mut a = anthropic_for(model, None, 4096);
+        a.strict_tools = Some(vec![
+            "edit".into(),
+            "multiedit".into(),
+            "replace_symbol".into(),
+        ]);
+        a
+    }
+
     fn request_tools(a: &Anthropic, tools: &[Tool]) -> Vec<Value> {
         let req = a
-            .chat_request(&user_msgs(), Some(tools))
+            .build_chat_request(&user_msgs(), Some(tools))
             .expect("request builds");
         let body: Value = serde_json::from_slice(req.body()).unwrap();
         body["tools"].as_array().cloned().unwrap_or_default()
@@ -4284,8 +4270,8 @@ mod tests {
     }
 
     #[test]
-    fn default_list_is_strict_on_supported_model_with_converted_schema() {
-        let a = anthropic_for("claude-sonnet-5-5", None, 4096);
+    fn configured_list_is_strict_on_supported_model_with_converted_schema() {
+        let a = anthropic_strict("claude-sonnet-5-5");
         let tools = vec![
             schema_tool("edit", simple_schema(), None),
             schema_tool("multiedit", simple_schema(), None),
@@ -4325,6 +4311,19 @@ mod tests {
     }
 
     #[test]
+    fn unset_strict_tools_selects_nothing_by_name() {
+        let a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        assert_eq!(a.strict_tools, None);
+        let tools = vec![
+            schema_tool("edit", simple_schema(), None),
+            schema_tool("explicit", simple_schema(), Some(true)),
+        ];
+        let sent = request_tools(&a, &tools);
+        assert!(tool_named(&sent, "edit").get("strict").is_none());
+        assert_eq!(strict_of(tool_named(&sent, "explicit")), Some(true));
+    }
+
+    #[test]
     fn empty_strict_tools_disables_name_selection_but_not_explicit_strictness() {
         let mut a = anthropic_for("claude-sonnet-5-5", None, 4096);
         a.strict_tools = Some(vec![]);
@@ -4338,7 +4337,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_list_replaces_the_default() {
+    fn configured_list_selects_only_listed_tools() {
         let mut a = anthropic_for("claude-sonnet-5-5", None, 4096);
         a.strict_tools = Some(vec!["glob".into()]);
         let sent = request_tools(
@@ -4372,7 +4371,7 @@ mod tests {
     fn unsupported_schema_falls_back_per_tool_and_keeps_compatible_tools_strict() {
         let _ = log::set_logger(&CaptureLogger);
         log::set_max_level(log::LevelFilter::Warn);
-        let a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        let a = anthropic_strict("claude-sonnet-5-5");
         // Relaxes `count`'s minimum before hitting the dictionary.
         let partial = serde_json::json!({
             "type": "object",
@@ -4416,7 +4415,7 @@ mod tests {
 
     #[test]
     fn unsupported_tools_do_not_count_against_the_strict_budget() {
-        let a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        let a = anthropic_strict("claude-sonnet-5-5");
         // 25 optional properties would exceed the budget, but the tool is
         // unconvertible so it is not counted.
         let mut props = serde_json::Map::new();
@@ -4443,7 +4442,7 @@ mod tests {
     fn exceeding_a_budget_sends_every_tool_non_strict_with_original_schemas() {
         let _ = log::set_logger(&CaptureLogger);
         log::set_max_level(log::LevelFilter::Warn);
-        let a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        let a = anthropic_strict("claude-sonnet-5-5");
 
         let optional = |n: usize| {
             let mut props = serde_json::Map::new();
@@ -4510,9 +4509,8 @@ mod tests {
 
     #[test]
     fn oauth_prefixes_names_but_matches_strict_tools_by_unprefixed_name() {
-        let mut a = anthropic_for("claude-sonnet-5-5", None, 4096);
+        let mut a = anthropic_strict("claude-sonnet-5-5");
         a.api_key = "sk-ant-oat01-test".into();
-        a.oauth_strict_tools = Some(true);
         let sent = request_tools(
             &a,
             &[
@@ -4525,56 +4523,14 @@ mod tests {
     }
 
     #[test]
-    fn oauth_gate_is_open_by_default_after_verification() {
-        assert!(OAUTH_STRICT_VERIFIED);
+    fn oauth_honours_explicit_strictness_like_api_key() {
         let mut oauth = anthropic_for("claude-sonnet-5-5", None, 4096);
         oauth.api_key = "sk-ant-oat01-test".into();
-        assert_eq!(oauth.oauth_strict_tools, None);
-        let sent = request_tools(&oauth, &[schema_tool("edit", simple_schema(), None)]);
+        let sent = request_tools(
+            &oauth,
+            &[schema_tool("explicit", simple_schema(), Some(true))],
+        );
         assert_eq!(strict_of(&sent[0]), Some(true));
-    }
-
-    #[test]
-    fn oauth_gate_disables_all_oauth_strictness_but_not_api_key() {
-        let tools = vec![
-            schema_tool("edit", simple_schema(), None),
-            schema_tool("explicit", simple_schema(), Some(true)),
-        ];
-
-        // A closed gate omits every OAuth strict flag, regardless of
-        // `strict_tools` or explicit strictness.
-        for gate in [Some(false)] {
-            let mut oauth = anthropic_for("claude-sonnet-5-5", None, 4096);
-            oauth.api_key = "sk-ant-oat01-test".into();
-            oauth.oauth_strict_tools = gate;
-            let sent = request_tools(&oauth, &tools);
-            assert_eq!(sent.len(), 2);
-            for (sent, original) in sent.iter().zip(&tools) {
-                assert!(sent.get("strict").is_none(), "{sent}");
-                assert_eq!(sent["input_schema"], original.function.parameters);
-            }
-        }
-
-        // API-key behaviour is independent of the OAuth gate.
-        let mut api = anthropic_for("claude-sonnet-5-5", None, 4096);
-        api.oauth_strict_tools = Some(false);
-        let sent = request_tools(&api, &tools);
-        assert!(sent.iter().all(|t| strict_of(t) == Some(true)));
-    }
-
-    #[test]
-    fn default_strict_list_matches_the_shared_builtin_fixture() {
-        let fixture: Value = serde_json::from_str(include_str!("builtin_schemas.json")).unwrap();
-        let mut keys: Vec<&str> = fixture
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        let mut defaults: Vec<&str> = DEFAULT_STRICT_TOOLS.to_vec();
-        keys.sort_unstable();
-        defaults.sort_unstable();
-        assert_eq!(keys, defaults);
     }
 
     #[test]
@@ -4583,12 +4539,10 @@ mod tests {
             "api_key": "sk-ant-api03-test",
             "model": "claude-sonnet-5-5",
             "max_tokens": 4096,
-            "strict_tools": ["edit", "glob"],
-            "oauth_strict_tools": true
+            "strict_tools": ["edit", "glob"]
         }))
         .unwrap();
         assert_eq!(a.strict_tools, Some(vec!["edit".into(), "glob".into()]));
-        assert_eq!(a.oauth_strict_tools, Some(true));
 
         let empty: Anthropic = serde_json::from_value(serde_json::json!({
             "api_key": "k", "model": "m", "max_tokens": 1, "strict_tools": []
@@ -4601,7 +4555,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(default.strict_tools, None);
-        assert_eq!(default.oauth_strict_tools, None);
 
         let factory = create_http_factory();
         let schema: Value = serde_json::from_str(&factory.config_schema()).unwrap();

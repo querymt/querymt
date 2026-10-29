@@ -481,37 +481,20 @@ mod tests {
         );
     }
 
-    /// Copies of the agent's builtin `edit`, `multiedit` and `replace_symbol`
-    /// parameter schemas (descriptions shortened). An agent-side test asserts
-    /// the structure stays in sync with the real definitions.
-    fn builtin_fixtures() -> Vec<(String, Value)> {
-        let all: Value = serde_json::from_str(include_str!("builtin_schemas.json")).unwrap();
-        all.as_object()
-            .unwrap()
-            .iter()
-            .map(|(name, schema)| (name.clone(), schema.clone()))
-            .collect()
-    }
-
     #[test]
-    fn builtin_default_strict_tools_convert_with_only_the_documented_change() {
-        for (name, original) in builtin_fixtures() {
-            let snapshot = original.clone();
-            let converted = convert(&original).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(original, snapshot, "{name}: original mutated");
-            if name == "replace_symbol" {
-                // Only the minimum moved into the description; all else identical.
-                let mut expected = original.clone();
-                let occurrence = &mut expected["properties"]["replacements"]["items"]["properties"]
-                    ["occurrence"];
-                occurrence.as_object_mut().unwrap().remove("minimum");
-                occurrence["description"] =
-                    json!("0-based occurrence when multiple symbols match. (minimum: 0)");
-                assert_eq!(converted, expected);
-            } else {
-                assert_eq!(converted, original, "{name}");
-            }
-        }
+    fn already_closed_schema_converts_unchanged_and_does_not_mutate_input() {
+        let original = json!({
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "path"},
+                "replace_all": {"type": "boolean", "default": false}
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        });
+        let snapshot = original.clone();
+        assert_eq!(convert(&original).unwrap(), original);
+        assert_eq!(original, snapshot);
     }
 
     #[test]

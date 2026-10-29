@@ -29,9 +29,9 @@ Each failure costs a model turn and tokens, and 12 of the retries failed again. 
   - sends `strict` for strict tools only after checked conversion to the subset Anthropic accepts; unsupported schemas follow an explicit failure or non-strict fallback policy, and fallback retains the original schema;
   - enforces Anthropic's strict-mode limits and falls back to non-strict when they are exceeded;
   - checks that the model supports strict tool use;
-  - adds a `strict_tools` setting listing which tools are sent strict (default `edit`, `multiedit`, `replace_symbol`; empty list turns name-based strictness off);
+  - adds a `strict_tools` setting listing which tools are sent strict (the provider has no built-in list; the agent defaults it to `edit`, `multiedit`, `replace_symbol` for Anthropic when unset; an empty list turns name-based strictness off);
   - reports invalid or truncated streamed tool input as a distinct error, carrying invalid-input metadata through stream assembly and execution preparation so an interrupted call cannot run merely because its buffered JSON happens to parse.
-- Builtin tool definitions are not marked strict in the agent, so the OpenAI Responses rule that rejects strict tools with optional properties is unaffected. Strictness for the edit tools is chosen by the Anthropic provider setting.
+- Builtin tool definitions are not marked strict in the agent, so the OpenAI Responses rule that rejects strict tools with optional properties is unaffected. Strictness for the edit tools is chosen by the Anthropic `strict_tools` setting, which the agent defaults.
 - Adds a repeatable tool-failure report with bounded baseline and post-release windows, total call counts and failure rates. Successful repair counts are reported separately through an explicitly identified telemetry source. The 108 historical schema failures are a baseline to reproduce, not a deterministic post-release acceptance criterion.
 
 ## Capabilities

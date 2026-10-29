@@ -18,7 +18,7 @@ A tool is eligible for strictness when its definition sets `strict: true` or its
 - **THEN** the request's `glob` tool has no `strict` field
 
 #### Scenario: OAuth tool-name prefix
-- **WHEN** OAuth strict support is verified, the provider sends `edit` as `mcp_edit`, `strict_tools` contains `edit`, and other eligibility checks pass
+- **WHEN** the provider sends `edit` as `mcp_edit` over OAuth, `strict_tools` contains `edit`, and other eligibility checks pass
 - **THEN** the request's `mcp_edit` tool contains `"strict": true`
 
 ### Requirement: Strict tool schemas use the subset Anthropic accepts
@@ -78,22 +78,26 @@ Before sending, the provider SHALL count eligible, successfully converted strict
 - **THEN** all three are sent with `"strict": true`
 
 ### Requirement: Strict tools are configured per provider
-The Anthropic provider SHALL accept a `strict_tools` setting: a list of tool names, defaulting to `["edit", "multiedit", "replace_symbol"]`. An empty list SHALL disable name-based strictness without overriding explicit `strict: true`. All strictness requests SHALL remain subject to schema, model, authentication and budget checks.
+The Anthropic provider SHALL accept a `strict_tools` setting: a list of tool names. The provider SHALL have no built-in list: an unset or empty list SHALL select no tool by name, without overriding explicit `strict: true`. The agent SHALL default `strict_tools` to `["edit", "multiedit", "replace_symbol"]` for Anthropic only when the option is not configured. All strictness requests SHALL remain subject to schema, model and budget checks.
 
-#### Scenario: Default list
-- **WHEN** `strict_tools` is not configured, the request includes `multiedit`, and all strict eligibility checks pass
-- **THEN** the request's `multiedit` tool contains `"strict": true`
+#### Scenario: Provider default is empty
+- **WHEN** `strict_tools` is not configured on the provider and the `edit` definition does not set `strict`
+- **THEN** the request's `edit` tool has no `strict` field
+
+#### Scenario: Agent default list
+- **WHEN** the agent builds an Anthropic configuration without `strict_tools`
+- **THEN** the configuration contains `["edit", "multiedit", "replace_symbol"]`, and a user-supplied value (including an empty list) is left unchanged
 
 #### Scenario: Disabled by configuration
 - **WHEN** `strict_tools = []` and the `edit` definition does not set `strict`
 - **THEN** the request's `edit` tool has no `strict` field
 
-### Requirement: OAuth strictness requires verified support
-Strict tools over OAuth SHALL be enabled only after support is verified for that authentication path. If verification fails, an authentication capability gate SHALL omit strictness for all OAuth tools, including explicit `strict: true`, while preserving original schemas. API-key strictness SHALL remain independently available.
+### Requirement: OAuth strictness matches API-key strictness
+Strict tool use over OAuth was verified against the live endpoint, so OAuth requests SHALL follow the same strictness rules as API-key requests. There SHALL be no separate OAuth capability gate.
 
-#### Scenario: OAuth strict verification fails
-- **WHEN** OAuth strict support is disabled and a definition explicitly requests `strict: true`
-- **THEN** the OAuth request omits `strict` and sends the original schema regardless of `strict_tools`
+#### Scenario: Explicit strictness over OAuth
+- **WHEN** a definition explicitly requests `strict: true` on an OAuth request and all other eligibility checks pass
+- **THEN** the OAuth request's tool contains `"strict": true`
 
 ### Requirement: Invalid streamed tool input is reported distinctly
 A streamed tool call SHALL NOT run if its completed input is not a JSON object or `max_tokens` interrupts its block, even when the buffer parses. Invalid status SHALL survive stream assembly and execution preparation. Before hooks or permissions, the call SHALL receive one error result containing `{"INVALID_JSON": "<raw input>"}`, with the diagnostic shortened to at most 2,000 Unicode scalar values.

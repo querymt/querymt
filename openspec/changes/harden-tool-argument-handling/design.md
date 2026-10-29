@@ -83,9 +83,9 @@ The failure report accepts explicit inclusive start and exclusive end timestamps
 - `strict_schema::convert(&Value) -> Result<Value, UnsupportedSchema>` (new module in the provider) works on a copy, closes fixed-property objects, removes supported-to-relax constraints and appends them to the description as `(minimum: 0)`-style text. It checks the complete supported subset, including references, recursion, formats, patterns, composition and object extensibility. Resolve supported local references with cycle detection; unsupported or external references, recursive schemas, dictionary objects and other constructs that cannot be converted safely produce `UnsupportedSchema`. Do not silently close dictionary schemas or discard unknown validation keywords. The original schema remains authoritative for local validation.
 - `strict_schema::budget(&[Value]) -> Result<(), StrictLimit>` counts strict tools, optional properties and union properties across the request.
 - `ClaudeModel::supports_strict_tools()` in `model.rs`.
-- A `strict_tools: Option<Vec<String>>` field on `Anthropic`, read in `factory.rs`; `None` means the default `["edit", "multiedit", "replace_symbol"]`.
+- A `strict_tools: Option<Vec<String>>` field on `Anthropic`, read in `factory.rs`; `None` selects no tool by name; the agent's model defaults fill in `["edit", "multiedit", "replace_symbol"]` for Anthropic when the user has not set it.
 - Request building: a tool is strict when `tool.function.strict == Some(true)` or its unprefixed name is in `strict_tools` (matched before `prefix_tool_name`). Convert each eligible schema with the checked converter. If conversion fails, send that tool non-strict with its original, unmodified schema and a warning identifying the tool and unsupported feature, without logging argument contents. Budget checks run over the tools that remain strict. If the model check or the budget fails, send all tools non-strict with their original schemas and log (debug for model, warn for budget). Test explicit `strict: true` as well as name-selected tools under this Anthropic-specific fallback policy.
-- The agent does **not** set `strict` on builtin definitions. The existing `openai-responses-protocol` spec requires a schema error when `strict=true` meets a schema with optional properties; marking the edit tools strict in the agent would break OpenAI Responses. Keeping the choice in the Anthropic provider avoids changing that spec.
+- The agent does **not** set `strict` on builtin definitions. The existing `openai-responses-protocol` spec requires a schema error when `strict=true` meets a schema with optional properties; marking the edit tools strict in the agent would break OpenAI Responses. Keeping the choice in the Anthropic `strict_tools` setting (defaulted by the agent, not the provider) avoids changing that spec.
 
 *Alternative:* mark builtins strict and make OpenAI fall back to non-strict. Rejected: it changes an accepted OpenAI requirement for an Anthropic-only benefit.
 
@@ -101,16 +101,16 @@ Keep immutable raw assistant output for diagnostics and provider replay. Verify 
 - [Repairs hide model weaknesses] → telemetry counter by rule; the failure report tracks repaired vs failed.
 - [Breaking rename for user hooks matching `filePath`] → changelog entry; hooks receive normalised (snake_case) input consistently.
 - [Desktop renders stored camelCase history] → desktop reads both forms; tests on recorded fixtures.
-- [Name-based strictness drifts from tool renames] → the default list uses canonical builtin names, and a provider test asserts each default name exists among the agent's builtin tools.
+- [Name-based strictness drifts from tool renames] → the agent's default list uses canonical builtin names, and an agent test asserts each default name exists among the builtin tools.
 - [Prompt cache invalidation and strict-schema compile latency] → ship schema changes in one release; Anthropic caches compiled grammars 24h.
-- [OAuth endpoint may reject `strict`] → manual verification task; `strict_tools = []` disables name-selected strictness, and a provider-level OAuth capability gate disables all strictness (including explicit flags) if verification fails.
+- [OAuth endpoint may reject `strict`] → manual verification task; verification succeeded on both paths, so OAuth follows the same rules as API-key requests and no OAuth gate exists; `strict_tools = []` disables name-selected strictness.
 - [Closed schemas reject keys some model habitually sends] → aliases cover observed drift; error hints point to the right name.
 
 ## Migration Plan
 
 1. Capture the bounded baseline and establish the telemetry queries. Generic normalisation machinery can be developed independently, but does not ship an intermediate canonical naming convention.
 2. Release canonical snake_case schemas, compatibility aliases, recursive repairs, prepared-call scheduling, error handling, closed schemas and `search_text`/`question` changes together with dependent consumers and the desktop update. Include the invalid-input metadata path and a changelog entry for hook authors. Verify the complete compatibility and scheduling test suite before release.
-3. Release Anthropic strict support with the default `strict_tools` list after OAuth and API-key verification. If OAuth verification fails, disable strictness for that authentication path, including explicitly requested strictness, and record why.
+3. Release Anthropic strict support with the default `strict_tools` list after OAuth and API-key verification (both verified).
 4. Capture preliminary three-day reports and a complete seven-day post-release window for each deployment. Compare rates and call volumes against the bounded baseline; report repair outcomes from the telemetry backend separately.
 
 Rollback: strictness selected by name can be disabled with `strict_tools = []`; explicit `FunctionTool.strict` requests require disabling their callers or reverting provider strict support. Roll back the canonical naming release as a coordinated unit with hook/desktop compatibility, preserving raw assistant history and accepting both historical spellings. Do not swap alias direction in isolation while leaving schemas, readers or scheduling on the other convention.
