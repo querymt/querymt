@@ -453,6 +453,13 @@ impl LlmResponse {
         self.finish_reason.unwrap_or(FinishReason::Unknown) == FinishReason::Stop
     }
 
+    /// A reply cut off by the output token limit, whatever output status the
+    /// provider reported. Providers that flush interrupted tool blocks as
+    /// completed (invalid) calls still report `Completed` here.
+    pub fn is_length_cutoff(&self) -> bool {
+        self.finish_reason == Some(FinishReason::Length)
+    }
+
     /// A reply cut off by the output token limit that produced no visible text
     /// and no tool calls, only reasoning (or nothing at all).
     ///

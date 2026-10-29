@@ -5,6 +5,8 @@
 //!
 //! 1. **Escalate** (`on_after_llm`): when a request below the model's output
 //!    ceiling is cut off, discard the reply and retry once at the ceiling.
+//!    The escalated cap then applies to every later request of the turn
+//!    (`on_step_start`), because request overrides last one request only.
 //! 2. **Continue** (`on_stopped`): when the reply is still cut off, resume with a
 //!    temporary instruction (no recap, split large writes), up to
 //!    `max_continuations` times per turn.
@@ -309,6 +311,34 @@ impl MiddlewareDriver for OutputLimitRecoveryMiddleware {
             }
             None => Ok(ExecutionState::AfterLlm { response, context }),
         }
+    }
+
+    /// Keep an escalated cap for the rest of the turn. Overrides last one
+    /// request, so without this the next tool-loop step would fall back to the
+    /// initial cap, and a cut-off there could no longer escalate. An override
+    /// another middleware already set wins. The request-time clamp to the
+    /// context room still applies.
+    async fn on_step_start(
+        &self,
+        state: ExecutionState,
+        _runtime: Option<&Arc<SessionRuntime>>,
+    ) -> Result<ExecutionState> {
+        let ExecutionState::BeforeLlmCall { context } = &state else {
+            return Ok(state);
+        };
+        if context.request_overrides.max_tokens.is_some()
+            || !context.profile.capabilities.options.max_tokens
+        {
+            return Ok(state);
+        }
+        let Some(cap) = self.with_turn(&context.session_id, |turn| turn.escalated_cap) else {
+            return Ok(state);
+        };
+        let mut overrides = context.request_overrides;
+        overrides.max_tokens = Some(cap);
+        Ok(ExecutionState::BeforeLlmCall {
+            context: Arc::new((**context).clone().with_request_overrides(overrides)),
+        })
     }
 
     async fn on_stopped(
@@ -616,6 +646,81 @@ mod tests {
         assert_eq!(context.request_overrides.max_tokens, Some(128_000));
         assert_eq!(context.stats.total_output_tokens, 32_000);
         assert_eq!(context.stats.total_input_tokens, 100);
+    }
+
+    async fn step_start(
+        mw: &OutputLimitRecoveryMiddleware,
+        context: Arc<ConversationContext>,
+    ) -> Arc<ConversationContext> {
+        match mw
+            .on_step_start(ExecutionState::BeforeLlmCall { context }, None)
+            .await
+            .unwrap()
+        {
+            ExecutionState::BeforeLlmCall { context } => context,
+            other => panic!("expected BeforeLlmCall, got {}", other.name()),
+        }
+    }
+
+    #[tokio::test]
+    async fn escalated_cap_applies_to_later_steps_of_the_turn() {
+        let mw = OutputLimitRecoveryMiddleware::default();
+        let profile = profile_for(32_000, 128_000);
+        // Before any escalation the step is untouched.
+        let fresh = step_start(&mw, context_with("s", profile.clone())).await;
+        assert_eq!(fresh.request_overrides.max_tokens, None);
+
+        after_llm(&mw, FinishReason::Length, &profile).await;
+        // A later tool-loop step starts from a context without overrides.
+        let next = step_start(&mw, context_with("s", profile.clone())).await;
+        assert_eq!(next.request_overrides.max_tokens, Some(128_000));
+
+        // A cut-off of that step can't escalate again: it goes to continuation.
+        let state = ExecutionState::AfterLlm {
+            response: Arc::new(
+                (*reply(FinishReason::Length))
+                    .clone()
+                    .with_applied(GenerationOptions::NONE.with_max_tokens(128_000)),
+            ),
+            context: next,
+        };
+        assert!(matches!(
+            mw.on_after_llm(state, None).await.unwrap(),
+            ExecutionState::AfterLlm { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_cap_override_wins_over_the_escalated_cap() {
+        let mw = OutputLimitRecoveryMiddleware::default();
+        let profile = profile_for(32_000, 128_000);
+        after_llm(&mw, FinishReason::Length, &profile).await;
+        let explicit = Arc::new(
+            (*context_with("s", profile))
+                .clone()
+                .with_request_overrides(GenerationOptions::NONE.with_max_tokens(1_000)),
+        );
+        assert_eq!(
+            step_start(&mw, explicit).await.request_overrides.max_tokens,
+            Some(1_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn next_turn_starts_at_the_initial_cap() {
+        let mw = OutputLimitRecoveryMiddleware::default();
+        let profile = profile_for(32_000, 128_000);
+        after_llm(&mw, FinishReason::Length, &profile).await;
+        mw.on_turn_start(
+            ExecutionState::BeforeLlmCall {
+                context: context_with("s", profile.clone()),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let next = step_start(&mw, context_with("s", profile)).await;
+        assert_eq!(next.request_overrides.max_tokens, None);
     }
 
     #[tokio::test]
