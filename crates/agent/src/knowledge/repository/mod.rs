@@ -8,10 +8,12 @@
 //! `.qmt/knowledge.toml` manifest. Nothing here enables itself: the host must
 //! opt in through [`RepositoryKnowledgeSettings`](crate::config::RepositoryKnowledgeSettings).
 
+pub mod browse;
 pub mod discovery;
 pub mod document;
 pub mod identity;
 pub mod manifest;
+pub mod query;
 pub mod reconcile;
 pub mod references;
 pub mod registry;
@@ -20,11 +22,15 @@ pub mod service;
 pub mod store;
 
 pub use store::{
-    GenerationUpdate, IndexDiagnostic, OpenOutcome, RebuildReason, RepositoryStore, SourceRecord,
-    SourceState, SourceTouch, StoreCounts, StoreError, StoreState, StoredDocument, StoredSection,
-    StoredSource,
+    FileRecord, GenerationUpdate, IndexDiagnostic, OpenOutcome, RebuildReason, RepositoryStore,
+    SearchPlan, SearchSnapshot, SectionMatch, SourceRecord, SourceState, SourceTouch, StoreCounts,
+    StoreError, StoreState, StoredDocument, StoredSection, StoredSource,
 };
 
+pub use browse::{
+    DocumentCatalog, EntryKind, Fetched, FileInfo, GetError, GetRequest, ListEntry, ListRequest,
+    ListResponse, SectionContent, SectionRef, StatsReport,
+};
 pub use discovery::{
     DiscoveredFile, Discovery, DiscoveryDiagnostic, DiscoveryOptions, FileStamp, discover,
 };
@@ -39,6 +45,10 @@ pub use identity::{
 pub use manifest::{
     Entrypoint, KnowledgeManifest, MANIFEST_RELATIVE_PATH, MANIFEST_VERSION, ManifestError,
     ManifestOutcome, SourceSelection, load_manifest,
+};
+pub use query::{
+    DEFAULT_LIMIT, HitKind, Lane, MAX_LIMIT, Provenance, QueryError, QueryHit, QueryRequest,
+    QueryResponse,
 };
 pub use reconcile::{
     ReconcileError, ReconcileOptions, ReconcileReport, ReconcileStatus, reconcile,
