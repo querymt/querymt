@@ -145,7 +145,21 @@ impl RepositoryService {
         options: ReconcileOptions,
         policy: RefreshPolicy,
     ) -> Result<Self, ServiceError> {
-        let store = RepositoryStore::open(index_path).map_err(ServiceError::unavailable)?;
+        // Creating the schema and switching to WAL can report `Busy` without
+        // waiting when another process creates the same index at the same
+        // moment, so opening gets the same bounded retry as refreshing.
+        let attempts = policy.max_attempts.max(1);
+        let mut attempt = 0;
+        let store = loop {
+            match RepositoryStore::open(index_path) {
+                Ok(store) => break store,
+                Err(StoreError::Busy) if attempt + 1 < attempts => {
+                    attempt += 1;
+                    std::thread::sleep(policy.retry_delay * attempt);
+                }
+                Err(error) => return Err(ServiceError::unavailable(error)),
+            }
+        };
         store
             .set_busy_timeout(policy.busy_timeout)
             .map_err(ServiceError::unavailable)?;
