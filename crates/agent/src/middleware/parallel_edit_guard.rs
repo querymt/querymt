@@ -498,10 +498,10 @@ mod tests {
     }
 
     /// `(ids that proceed, ids rejected with their result)`.
-    fn split<'a>(
-        calls: &'a [ToolCall],
+    fn split(
+        calls: &[ToolCall],
         verdicts: Vec<PreparedCallVerdict>,
-    ) -> (Vec<&'a str>, Vec<(&'a str, ToolResult)>) {
+    ) -> (Vec<&str>, Vec<(&str, ToolResult)>) {
         let mut proceed = Vec::new();
         let mut rejected = Vec::new();
         for (call, verdict) in calls.iter().zip(verdicts) {
@@ -916,7 +916,7 @@ mod tests {
     /// Whether the driver rejects the second same-file edit (deny) or not (warn).
     async fn denies_second_edit(driver: &Arc<dyn MiddlewareDriver>) -> bool {
         let (_dir, root) = temp_root();
-        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
+        let calls = [edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
         let args: Vec<Value> = calls.iter().map(effective_args).collect();
         let accesses = Arc::new(registry())
             .file_access_batch(
