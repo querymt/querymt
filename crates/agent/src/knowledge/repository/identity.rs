@@ -531,7 +531,11 @@ pub fn normalize_documents(batch: ParsedBatch) -> NormalizedBatch {
     }
 }
 
-pub(super) fn duplicate_diagnostic(path: &str, explicit_id: &str, claimants: &[String]) -> DocumentDiagnostic {
+pub(super) fn duplicate_diagnostic(
+    path: &str,
+    explicit_id: &str,
+    claimants: &[String],
+) -> DocumentDiagnostic {
     let others: Vec<&str> = claimants
         .iter()
         .map(String::as_str)
