@@ -659,7 +659,7 @@ impl RepositoryStore {
 
     /// Run `f` against one consistent snapshot and return it with that
     /// snapshot's generation.
-    fn read<T>(
+    pub(super) fn read<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, StoreError>,
     ) -> Result<(u64, T), StoreError> {
@@ -971,6 +971,178 @@ impl RepositoryStore {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+}
+
+// ─── Search ──────────────────────────────────────────────────────────────────
+
+/// What one retrieval pass reads from a single generation.
+#[derive(Debug, Clone, Default)]
+pub struct SearchPlan {
+    /// A complete, already-quoted FTS5 expression built by the caller from
+    /// tokens. Never user text.
+    pub fts_expression: Option<String>,
+    /// Normalized repository-relative file or directory the results are
+    /// confined to.
+    pub scope: Option<String>,
+    /// Normalized candidate paths named by the question; documents among them
+    /// contribute all their sections as exact matches.
+    pub exact_paths: Vec<String>,
+    /// Maximum ranked full-text rows to return.
+    pub fts_limit: usize,
+    /// Also list path-level code records in scope.
+    pub include_files: bool,
+}
+
+/// A section that matched, with the document facts retrieval needs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionMatch {
+    pub doc_path: String,
+    pub doc_id: String,
+    pub doc_title: String,
+    pub doc_status: Option<String>,
+    pub section: StoredSection,
+    /// The section belongs to a document the question named by path.
+    pub exact: bool,
+}
+
+/// A path-level code record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRecord {
+    pub path: String,
+    pub size: u64,
+}
+
+/// Everything one [`RepositoryStore::search`] read, from one generation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchSnapshot {
+    pub generation: u64,
+    /// Exact-path sections (path, ordinal order) followed by ranked full-text
+    /// sections (best first, ties by path then ordinal).
+    pub sections: Vec<SectionMatch>,
+    /// Whether the full-text query returned as many rows as it was allowed to.
+    pub fts_saturated: bool,
+    /// Code records in scope, sorted by path.
+    pub files: Vec<FileRecord>,
+}
+
+/// Whether `path` is `scope` itself or lies below it. `None` is everything.
+pub fn path_in_scope(path: &str, scope: Option<&str>) -> bool {
+    match scope {
+        None => true,
+        Some(scope) => {
+            path == scope
+                || path
+                    .strip_prefix(scope)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }
+    }
+}
+
+fn escape_like(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+const MATCH_COLUMNS: &str = "s.ordinal, s.section_key, s.level, s.title, s.breadcrumb_json, \
+     s.occurrence, s.start_line, s.end_line, s.body, s.from_metadata, \
+     s.doc_path, d.doc_id, d.title, d.status";
+
+fn match_from_row(row: &rusqlite::Row<'_>, exact: bool) -> rusqlite::Result<SectionMatch> {
+    Ok(SectionMatch {
+        section: section_from_row(row)?,
+        doc_path: row.get(10)?,
+        doc_id: row.get(11)?,
+        doc_title: row.get(12)?,
+        doc_status: row.get(13)?,
+        exact,
+    })
+}
+
+impl RepositoryStore {
+    /// Read the matching sections and code records from one snapshot, so a
+    /// commit cannot split a result across generations.
+    pub fn search(&self, plan: &SearchPlan) -> Result<SearchSnapshot, StoreError> {
+        let scope = plan.scope.as_deref();
+        let like = scope.map(|scope| format!("{}/%", escape_like(scope)));
+        let (generation, (sections, fts_saturated, files)) = self.read(|conn| {
+            let mut sections: Vec<SectionMatch> = Vec::new();
+            let mut seen = BTreeSet::new();
+
+            for path in &plan.exact_paths {
+                if !path_in_scope(path, scope) {
+                    continue;
+                }
+                let mut statement = conn.prepare(&format!(
+                    "SELECT {MATCH_COLUMNS} FROM sections s JOIN documents d ON d.path = s.doc_path \
+                     WHERE s.doc_path = ?1 ORDER BY s.ordinal"
+                ))?;
+                let rows = statement
+                    .query_map([path], |row| match_from_row(row, true))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for row in rows {
+                    if seen.insert(row.section.key.clone()) {
+                        sections.push(row);
+                    }
+                }
+            }
+
+            let mut saturated = false;
+            if let Some(expression) = &plan.fts_expression {
+                let limit = to_i64(plan.fts_limit.max(1));
+                let mut statement = conn.prepare(&format!(
+                    "SELECT {MATCH_COLUMNS} FROM sections_fts f \
+                     JOIN sections s ON s.id = f.rowid \
+                     JOIN documents d ON d.path = s.doc_path \
+                     WHERE sections_fts MATCH ?1 \
+                       AND (?2 IS NULL OR s.doc_path = ?2 OR s.doc_path LIKE ?3 ESCAPE '\\') \
+                     ORDER BY bm25(sections_fts, 10.0, 6.0, 4.0, 4.0, 1.0), s.doc_path, s.ordinal \
+                     LIMIT ?4"
+                ))?;
+                let rows = statement
+                    .query_map(params![expression, scope, like, limit], |row| {
+                        match_from_row(row, false)
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                saturated = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= limit;
+                for row in rows {
+                    if seen.insert(row.section.key.clone()) {
+                        sections.push(row);
+                    }
+                }
+            }
+
+            let mut files = Vec::new();
+            if plan.include_files {
+                let mut statement = conn.prepare(
+                    "SELECT path, size FROM sources \
+                     WHERE is_code = 1 \
+                       AND (?1 IS NULL OR path = ?1 OR path LIKE ?2 ESCAPE '\\') \
+                     ORDER BY path",
+                )?;
+                files = statement
+                    .query_map(params![scope, like], |row| {
+                        Ok(FileRecord {
+                            path: row.get(0)?,
+                            size: u64::try_from(row.get::<_, i64>(1)?).unwrap_or_default(),
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            Ok((sections, saturated, files))
+        })?;
+        Ok(SearchSnapshot {
+            generation,
+            sections,
+            fts_saturated,
+            files,
+        })
     }
 }
 
