@@ -157,6 +157,12 @@ mod session_actor_ref_remote_tests {
             .build(),
         );
         let fixture = TestAgent::new().await;
+        let local_control = fixture
+            .storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
         let (remote, local, _config, sid) =
             remote_session_ref_for_config("status-owner", config, "mock-model").await;
         let node = get_test_mesh().await.peer_id().to_string();
@@ -228,15 +234,37 @@ mod session_actor_ref_remote_tests {
             .list_sessions(list_request.clone())
             .await
             .unwrap();
-        let row = listed
+        let local_meta = listed
             .sessions
             .iter()
-            .find(|row| row.session_id.to_string() == sid)
+            .find(|row| row.session_id.to_string() == local_control.public_id)
+            .unwrap()
+            .meta
+            .as_ref()
             .unwrap();
-        assert_eq!(
-            row.meta.as_ref().unwrap()["runtimeStatus"],
-            serde_json::to_value(&owner).unwrap()
-        );
+        assert_eq!(local_meta["messageCount"], 0);
+        assert_eq!(local_meta["userMessageCount"], 0);
+        assert_eq!(local_meta["hasErrors"], false);
+        let cursor_listed = fixture
+            .handle
+            .list_sessions(list_request.clone().cursor("remote:0:0:bookmarks"))
+            .await
+            .unwrap();
+        for page in [&listed, &cursor_listed] {
+            let row = page
+                .sessions
+                .iter()
+                .find(|row| row.session_id.to_string() == sid)
+                .unwrap();
+            let meta = row.meta.as_ref().unwrap();
+            assert_eq!(meta["runtimeStatus"], serde_json::to_value(&owner).unwrap());
+            assert_eq!(meta["location"], "remote");
+            assert_eq!(meta["nodeId"], node);
+            assert_eq!(meta["nodeLabel"], "status-owner");
+            for field in ["messageCount", "userMessageCount", "hasErrors"] {
+                assert!(!meta.contains_key(field), "remote row fabricated {field}");
+            }
+        }
         let snapshot = crate::session::load_snapshot::load_session_snapshot(
             &fixture.handle,
             fixture.storage.view_store().unwrap(),

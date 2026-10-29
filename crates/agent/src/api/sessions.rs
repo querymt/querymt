@@ -1200,7 +1200,13 @@ impl AgentSessions {
             }
         }
 
-        let persisted_stats = view_store.get_session_list_meta_stats(&session_ids).await?;
+        let persisted_stats = if local_session_ids.is_empty() {
+            HashMap::new()
+        } else {
+            view_store
+                .get_session_list_meta_stats(&local_session_ids)
+                .await?
+        };
         let lifecycles = if view_store.supports_session_lifecycle() && !local_session_ids.is_empty()
         {
             view_store
@@ -1218,23 +1224,33 @@ impl AgentSessions {
 
         for info in sessions {
             let session_id = info.session_id.to_string();
-            let stats = persisted_stats
-                .get(&session_id)
-                .cloned()
-                .unwrap_or_default();
             let runtime_status = runtime_statuses
                 .get(&session_id)
                 .cloned()
                 .unwrap_or_else(|| SessionRuntimeStatus::unavailable("observation_unavailable"));
-            let has_errors = stats.last_finish_reason == Some(FinishReason::Error);
-            let meta = SessionMeta {
-                message_count: stats.message_count,
-                user_message_count: stats.user_message_count,
-                has_errors,
-                runtime_status,
-            };
             let mut acp_meta = info.meta.take().unwrap_or_default();
-            acp_meta.extend(meta.to_acp_meta());
+            if matches!(
+                locations.get(&session_id),
+                Some(crate::session::location::SessionLocation::Local)
+            ) {
+                let stats = persisted_stats
+                    .get(&session_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let meta = SessionMeta {
+                    message_count: stats.message_count,
+                    user_message_count: stats.user_message_count,
+                    has_errors: stats.last_finish_reason == Some(FinishReason::Error),
+                    runtime_status,
+                };
+                acp_meta.extend(meta.to_acp_meta());
+            } else {
+                // Viewer-local statistics cannot describe a remote or unknown owner.
+                acp_meta.insert(
+                    "runtimeStatus".into(),
+                    serde_json::to_value(runtime_status)?,
+                );
+            }
             if let Some(lifecycle) = lifecycles.get(&session_id) {
                 insert_acp_lifecycle_meta(&mut acp_meta, lifecycle);
             }
@@ -1878,6 +1894,96 @@ fn push_group_session(groups: &mut Vec<SessionGroup>, group_cwd: String, summary
 mod remote_page_tests {
     use super::*;
     use crate::agent::remote::{ListRemoteSessionsResponse, RemoteSessionSnapshot};
+
+    #[tokio::test]
+    async fn acp_hydration_preserves_nonlocal_metadata_and_local_statistics() {
+        use crate::session::backend::StorageBackend;
+        use crate::session::store::RemoteSessionBookmark;
+
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let store = fixture.storage.session_store();
+        let local = store.create_session(None, None, None, None).await.unwrap();
+        let remote_id = "owner-metadata".to_string();
+        let missing_id = "unbookmarked-owner".to_string();
+        store
+            .save_remote_session_bookmark(&RemoteSessionBookmark {
+                session_id: remote_id.clone(),
+                node_id: "owner-node".into(),
+                peer_label: "Owner".into(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+            })
+            .await
+            .unwrap();
+        let ids = vec![
+            local.public_id.clone(),
+            remote_id.clone(),
+            missing_id.clone(),
+        ];
+        let stats = fixture
+            .storage
+            .get_session_list_meta_stats(&ids)
+            .await
+            .unwrap();
+        assert!(
+            stats.contains_key(&remote_id),
+            "stats map membership is not locality"
+        );
+        assert!(stats.contains_key(&missing_id));
+        let incoming = serde_json::json!({
+            "messageCount": 17, "userMessageCount": 8, "hasErrors": true,
+            "location": "remote", "nodeId": "owner-node", "nodeLabel": "Owner",
+            "profileId": "coder", "profileLabel": "Coder", "connectionState": "available",
+            "parentSessionId": "parent", "forkOrigin": "delegation",
+            "querymt": {
+                "lifecycle": {"resolved": true, "archived": false},
+                "pin": {"pinned": true, "pinned_at": "owner-time"},
+                "workspace": {"owner": "preserved"}, "access": {"owner": "preserved"}
+            },
+            "runtimeStatus": {"phase": "idle"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let mut rows = vec![
+            SessionInfo::new(local.public_id.clone(), PathBuf::new()).meta(incoming.clone()),
+            SessionInfo::new(remote_id, PathBuf::new()).meta(incoming.clone()),
+            SessionInfo::new(missing_id, PathBuf::new()),
+        ];
+        AgentSessions::hydrate_acp_session_meta(
+            &fixture.handle,
+            fixture.storage.view_store().unwrap(),
+            &mut rows,
+        )
+        .await
+        .unwrap();
+        let local_meta = rows[0].meta.as_ref().unwrap();
+        assert_eq!(local_meta["messageCount"], 0);
+        assert_eq!(local_meta["userMessageCount"], 0);
+        assert_eq!(local_meta["hasErrors"], false);
+        let remote_meta = rows[1].meta.as_ref().unwrap();
+        for (key, value) in &incoming {
+            if key != "runtimeStatus" {
+                assert_eq!(remote_meta.get(key), Some(value), "lost owner field {key}");
+            }
+        }
+        for row in &rows[1..] {
+            let meta = row.meta.as_ref().unwrap();
+            assert_eq!(meta["runtimeStatus"]["phase"], "unknown");
+            assert_eq!(
+                meta["runtimeStatus"]["observation"]["availability"],
+                "unavailable"
+            );
+        }
+        let missing_meta = rows[2].meta.as_ref().unwrap();
+        for field in ["messageCount", "userMessageCount", "hasErrors"] {
+            assert!(
+                !missing_meta.contains_key(field),
+                "missing owner fabricated {field}"
+            );
+        }
+    }
 
     fn response(count: usize, next_offset: Option<u32>) -> ListRemoteSessionsResponse {
         ListRemoteSessionsResponse {

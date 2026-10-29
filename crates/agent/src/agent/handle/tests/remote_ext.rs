@@ -1660,6 +1660,35 @@ async fn test_acp_remote_listing_preserves_raw_offsets_across_filtered_pages() {
         .await
         .expect("ACP remote page");
         assert_eq!(page.sessions.len(), expected_size);
+        for session in &page.sessions {
+            let id = session.session_id.to_string();
+            assert!(matches!(
+                f.handle
+                    .config
+                    .provider
+                    .history_store()
+                    .resolve_session_locations(std::slice::from_ref(&id))
+                    .await
+                    .expect("viewer location")
+                    .get(&id),
+                Some(crate::session::location::SessionLocation::NotFound)
+            ));
+            let fields = session.meta.as_ref().expect("live remote metadata");
+            assert_eq!(fields["location"], "remote");
+            assert_eq!(fields["nodeId"], node_id);
+            assert_eq!(fields["connectionState"], "available");
+            assert_eq!(fields["runtimeStatus"]["phase"], "unknown");
+            assert_eq!(
+                fields["runtimeStatus"]["observation"]["availability"],
+                "unavailable"
+            );
+            for field in ["messageCount", "userMessageCount", "hasErrors"] {
+                assert!(
+                    !fields.contains_key(field),
+                    "unbookmarked live row fabricated {field}"
+                );
+            }
+        }
         ids.extend(
             page.sessions
                 .into_iter()
