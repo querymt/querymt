@@ -2951,8 +2951,10 @@ owner stays listable and loadable but never materializes an actor:</p>
 <code>worktree_archived</code> event on the owner's stream, sent as an <code>agent_message_chunk</code>
 with the stable <code>message_id</code> <code>worktree-archived-&lt;workspace_id&gt;</code> and
 <code>_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}</code>. Every attached
-client receives it before the response of a native command issued from the owner,
-and it is replayed after the history on load. If it cannot be recorded the
+client receives it before the response of a native command issued from the owner
+(except over the legacy <code>AcpServer::run_stdio</code> forwarder, where the update may
+arrive after the response; clients must not rely on that ordering there), and it
+is replayed after the history on load. If it cannot be recorded the
 failure is logged and the archive still succeeds. Like the handoff event it makes
 the journal unreadable by older binaries; upgrade every node sharing a database
 first.</p>
@@ -2964,7 +2966,9 @@ is an explicit worktree action.</p>
 <p><strong>Visible native failures.</strong> Every refused or failed native <code>/worktree</code> command,
 usage errors included, returns a successful prompt response whose
 <code>_meta["querymt.worktree"].error = {code, message}</code> and shows the message as a
-session update before the response. ACP extension methods keep returning
+session update before the response (except over the legacy
+<code>AcpServer::run_stdio</code> forwarder, where the update may arrive after the response;
+clients must not rely on that ordering there). ACP extension methods keep returning
 JSON-RPC errors with <code>data.{code, message}</code>.</p>
 <h2 id="undo-snapshots-and-workspace-references">Undo, snapshots, and workspace references</h2>
 <p>Undo and redo reuse the <strong>existing snapshot backend</strong>, unchanged. The
