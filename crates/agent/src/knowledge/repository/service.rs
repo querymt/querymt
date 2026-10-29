@@ -98,7 +98,7 @@ impl ServiceError {
         }
     }
 
-    fn unavailable(error: impl std::fmt::Display) -> Self {
+    pub(super) fn unavailable(error: impl std::fmt::Display) -> Self {
         Self::Unavailable {
             reason: error.to_string(),
         }
@@ -113,7 +113,7 @@ pub struct CurrentDocument {
     pub document: StoredDocument,
 }
 
-enum SourceCheck {
+pub(super) enum SourceCheck {
     /// The stored record matches the file.
     Current,
     /// The file differs from the record, or can no longer be read as one.
@@ -170,6 +170,11 @@ impl RepositoryService {
             policy,
             refresh_lock: Mutex::new(()),
         })
+    }
+
+    /// Attempts bounding refresh, revalidation and retrieval retries.
+    pub(super) fn attempts(&self) -> u32 {
+        self.policy.max_attempts.max(1)
     }
 
     pub fn root(&self) -> &ResolvedRoot {
@@ -276,7 +281,7 @@ impl RepositoryService {
     }
 
     /// Apply the reconciliation freshness rule to one source.
-    fn check_source(&self, path: &str) -> Result<SourceCheck, ServiceError> {
+    pub(super) fn check_source(&self, path: &str) -> Result<SourceCheck, ServiceError> {
         let (_, stored) = self.store.source(path).map_err(ServiceError::unavailable)?;
         // Only paths the index itself recorded are ever resolved against the
         // filesystem, so a caller cannot make this read an arbitrary file.
