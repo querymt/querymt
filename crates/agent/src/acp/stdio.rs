@@ -327,7 +327,7 @@ async fn load_session_and_enqueue_replay(
         };
         let session_id = req.session_id.to_string();
         let outcome = prepare_session_load(agent, req, &capabilities, &preferences).await?;
-        let seeded = {
+        let recovered = {
             let mut translator = translator
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -336,9 +336,12 @@ async fn load_session_and_enqueue_replay(
             }
             translator.seed_history_from_meta(&session_id, outcome.response.meta.as_ref())
         };
-        if !seeded {
-            crate::acp::shared::restore_session_history(agent, &session_id, translator).await;
-        }
+        let recovered = match recovered {
+            Some(updates) => updates,
+            None => {
+                crate::acp::shared::restore_session_history(agent, &session_id, translator).await
+            }
+        };
         let enqueue_span = info_span!(
             "acp.replay.enqueue",
             event_count = outcome.event_count,
@@ -348,6 +351,7 @@ async fn load_session_and_enqueue_replay(
             for notification in outcome.notifications {
                 bridge_sender.notify(notification).await?;
             }
+            crate::acp::shared::send_recovered_delegations(bridge_sender, recovered).await?;
             bridge_sender
                 .flush()
                 .instrument(info_span!("acp.replay.flush"))
