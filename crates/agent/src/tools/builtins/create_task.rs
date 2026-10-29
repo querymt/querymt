@@ -35,6 +35,7 @@ impl ToolTrait for CreateTaskTool {
                 description: "Create a new task for the current session. Use this when the user requests work that should be tracked with clear completion criteria.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "kind": {
                             "type": "string",

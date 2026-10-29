@@ -149,6 +149,7 @@ impl ToolTrait for LanguageQueryTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "required": ["action"],
                     "properties": {
                         "action": {

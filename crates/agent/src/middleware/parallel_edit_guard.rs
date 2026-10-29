@@ -12,11 +12,13 @@
 //! - `deny`: only the first writing call per file runs; later writers get an
 //!   error result telling the model to combine them into one `multiedit`.
 //!
-//! File access is read from the agent's tool registry: `bind_agent` (called
-//! when the `AgentConfig` is assembled) installs the same `Arc<ToolRegistry>`
-//! the scheduler uses, so both always agree on which tools exist and which
-//! paths they write. UI notices are emitted with the session's ordered event stream,
-//! so a slow event journal never delays tool execution.
+//! The guard reviews *prepared* calls (`on_prepared_tool_calls`): the file
+//! access it inspects was declared for the final effective arguments, after
+//! normalisation and pre-tool hook updates, and is the same access the
+//! scheduler plans from. Aliased, repaired or hook-redirected targets are
+//! therefore judged by where the call will actually write. UI notices are
+//! emitted with the session's ordered event stream, so a slow event journal
+//! never delays tool execution.
 //!
 //! # Example (TOML config)
 //!
@@ -29,7 +31,10 @@
 
 use crate::agent::core::SessionRuntime;
 use crate::middleware::factory::MiddlewareFactory;
-use crate::middleware::{ExecutionState, MiddlewareDriver, Result, ToolCall, ToolResult};
+use crate::middleware::{
+    ExecutionState, MiddlewareDriver, PreparedBatch, PreparedCallVerdict, Result, ToolCall,
+    ToolResult,
+};
 use crate::tools::{FileAccess, ToolRegistry};
 use anyhow::Result as AnyhowResult;
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -113,20 +118,6 @@ impl ParallelEditGuard {
         }
     }
 
-    /// Declared file access of every call (already path-normalised by the
-    /// tools), evaluated once off the async executor.
-    async fn accesses(&self, calls: &[ToolCall], cwd: Option<&Path>) -> Vec<FileAccess> {
-        self.registry()
-            .file_access_batch(
-                calls
-                    .iter()
-                    .map(|call| (call.function.name.clone(), call.function.arguments.clone()))
-                    .collect(),
-                cwd.map(Path::to_path_buf),
-            )
-            .await
-    }
-
     /// Distinct written paths of one call, in declaration order.
     fn call_writes(access: &FileAccess) -> Vec<&PathBuf> {
         let mut seen = HashSet::new();
@@ -138,7 +129,7 @@ impl ParallelEditGuard {
     }
 
     /// Files written by two or more calls, in first-seen order.
-    fn detect(accesses: &[FileAccess]) -> Vec<FlaggedFile> {
+    fn detect(accesses: &[&FileAccess]) -> Vec<FlaggedFile> {
         let mut order: Vec<&PathBuf> = Vec::new();
         let mut counts: HashMap<&PathBuf, usize> = HashMap::new();
         for access in accesses {
@@ -220,13 +211,13 @@ impl ParallelEditGuard {
         )
     }
 
-    fn deny_result(call: &ToolCall, text: String) -> ToolResult {
+    fn deny_result(call: &ToolCall, effective_args: &Value, text: String) -> ToolResult {
         ToolResult::new(
             call.id.clone(),
             vec![querymt::chat::ToolResultPart::Text { text }],
             true,
             Some(call.function.name.clone()),
-            Some(call.function.arguments.clone()),
+            Some(effective_args.to_string()),
         )
         .with_execution(true, "parallel_edit_guard")
     }
@@ -294,91 +285,70 @@ impl MiddlewareDriver for ParallelEditGuard {
         }
     }
 
-    async fn on_processing_tool_calls(
+    async fn on_prepared_tool_calls(
         &self,
-        state: ExecutionState,
-        runtime: Option<&Arc<SessionRuntime>>,
-    ) -> Result<ExecutionState> {
-        let ExecutionState::ProcessingToolCalls {
-            remaining_calls,
-            results,
-            context,
-        } = state
-        else {
-            return Ok(state);
-        };
+        batch: &PreparedBatch<'_>,
+    ) -> Result<Vec<PreparedCallVerdict>> {
+        let mut verdicts: Vec<PreparedCallVerdict> = batch
+            .calls
+            .iter()
+            .map(|_| PreparedCallVerdict::Proceed)
+            .collect();
 
-        // `results` may already hold outcomes for calls that never reach the
-        // scheduler (e.g. calls gated for invalid arguments). They do not change
-        // which of the remaining calls write the same file, so every batch is
-        // inspected.
-        let cwd = runtime.and_then(|r| r.cwd.as_deref());
-        let accesses = self.accesses(&remaining_calls, cwd).await;
+        // The accesses were declared for each call's final effective arguments
+        // (after normalisation and pre-tool hook updates), so aliased, repaired
+        // and hook-redirected targets are judged by where they will write.
+        let accesses: Vec<&FileAccess> = batch.calls.iter().map(|c| c.access).collect();
         let flagged = Self::detect(&accesses);
         if flagged.is_empty() {
-            return Ok(ExecutionState::ProcessingToolCalls {
-                remaining_calls,
-                results,
-                context,
-            });
+            return Ok(verdicts);
         }
+        let cwd = batch.cwd;
 
         match self.mode {
             ParallelEditMode::Warn => {
                 let note = Self::warn_note(&flagged, cwd);
                 self.notify(
-                    &context.session_id,
+                    batch.session_id,
                     format!(
                         "Several calls modified the same file in one response: {}. They ran in order; `multiedit` was recommended.",
                         Self::summary(&flagged, cwd)
                     ),
                 );
                 self.lock_pending()
-                    .insert(context.session_id.to_string(), note);
-                Ok(ExecutionState::ProcessingToolCalls {
-                    remaining_calls,
-                    results,
-                    context,
-                })
+                    .insert(batch.session_id.to_string(), note);
             }
             ParallelEditMode::Deny => {
                 let flagged_by_path: HashMap<&PathBuf, &FlaggedFile> =
                     flagged.iter().map(|f| (&f.path, f)).collect();
                 let mut claimed: HashSet<&PathBuf> = HashSet::new();
-                let mut kept: Vec<ToolCall> = Vec::with_capacity(remaining_calls.len());
-                let mut all_results: Vec<ToolResult> = results.to_vec();
 
-                for (call, access) in remaining_calls.iter().zip(&accesses) {
-                    let writes: Vec<&PathBuf> = Self::call_writes(access)
+                for (prepared, verdict) in batch.calls.iter().zip(verdicts.iter_mut()) {
+                    let writes: Vec<&PathBuf> = Self::call_writes(prepared.access)
                         .into_iter()
                         .filter(|path| flagged_by_path.contains_key(path))
                         .collect();
                     if let Some(conflict) = writes.iter().find(|path| claimed.contains(**path)) {
-                        all_results.push(Self::deny_result(
-                            call,
+                        *verdict = PreparedCallVerdict::Reject(Box::new(Self::deny_result(
+                            prepared.call,
+                            prepared.args,
                             Self::deny_message(flagged_by_path[*conflict], cwd),
-                        ));
+                        )));
                     } else {
                         claimed.extend(writes);
-                        kept.push(call.clone());
                     }
                 }
 
                 self.notify(
-                    &context.session_id,
+                    batch.session_id,
                     format!(
                         "Rejected redundant same-file writes in one response: {}. Only the first write per file ran.",
                         Self::summary(&flagged, cwd)
                     ),
                 );
-
-                Ok(ExecutionState::ProcessingToolCalls {
-                    remaining_calls: Arc::from(kept.into_boxed_slice()),
-                    results: Arc::from(all_results.into_boxed_slice()),
-                    context,
-                })
             }
         }
+        Ok(verdicts)
     }
 
     fn bind_agent(&self, registry: &Arc<ToolRegistry>, events: &Arc<EventSink>) {
@@ -469,6 +439,7 @@ mod tests {
                 name: name.to_string(),
                 arguments: args.to_string(),
             },
+            invalid_input: false,
         }
     }
 
@@ -476,27 +447,70 @@ mod tests {
         call(
             id,
             "edit",
-            json!({"filePath": path.to_string_lossy(), "oldString": "a", "newString": "b"}),
+            json!({"file_path": path.to_string_lossy(), "old_string": "a", "new_string": "b"}),
         )
     }
 
-    fn batch(calls: Vec<ToolCall>) -> ExecutionState {
-        ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from(calls.into_boxed_slice()),
-            results: Arc::from([]),
-            context: context(),
-        }
+    /// Effective arguments of a test call (its arguments are already canonical).
+    fn effective_args(call: &ToolCall) -> Value {
+        serde_json::from_str(&call.function.arguments).unwrap()
     }
 
-    fn unpack(state: ExecutionState) -> (Vec<ToolCall>, Vec<ToolResult>) {
-        match state {
-            ExecutionState::ProcessingToolCalls {
-                remaining_calls,
-                results,
-                ..
-            } => (remaining_calls.to_vec(), results.to_vec()),
-            other => panic!("unexpected state: {other:?}"),
+    /// Declare access for `calls` like the scheduler does (from effective
+    /// arguments) and run the guard's prepared-call review for `session_id`.
+    async fn review_in(
+        guard: &ParallelEditGuard,
+        session_id: &str,
+        calls: &[ToolCall],
+    ) -> Vec<PreparedCallVerdict> {
+        let args: Vec<Value> = calls.iter().map(effective_args).collect();
+        let accesses = guard
+            .registry()
+            .file_access_batch(
+                calls
+                    .iter()
+                    .zip(&args)
+                    .map(|(call, args)| (call.function.name.clone(), args.clone()))
+                    .collect(),
+                None,
+            )
+            .await;
+        let views: Vec<crate::middleware::PreparedToolCall<'_>> = calls
+            .iter()
+            .zip(&args)
+            .zip(&accesses)
+            .map(
+                |((call, args), access)| crate::middleware::PreparedToolCall { call, args, access },
+            )
+            .collect();
+        guard
+            .on_prepared_tool_calls(&PreparedBatch {
+                session_id,
+                cwd: None,
+                calls: &views,
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn review(guard: &ParallelEditGuard, calls: &[ToolCall]) -> Vec<PreparedCallVerdict> {
+        review_in(guard, "s1", calls).await
+    }
+
+    /// `(ids that proceed, ids rejected with their result)`.
+    fn split<'a>(
+        calls: &'a [ToolCall],
+        verdicts: Vec<PreparedCallVerdict>,
+    ) -> (Vec<&'a str>, Vec<(&'a str, ToolResult)>) {
+        let mut proceed = Vec::new();
+        let mut rejected = Vec::new();
+        for (call, verdict) in calls.iter().zip(verdicts) {
+            match verdict {
+                PreparedCallVerdict::Proceed => proceed.push(call.id.as_str()),
+                PreparedCallVerdict::Reject(result) => rejected.push((call.id.as_str(), *result)),
+            }
         }
+        (proceed, rejected)
     }
 
     fn temp_root() -> (TempDir, PathBuf) {
@@ -506,8 +520,20 @@ mod tests {
     }
 
     async fn detect_in(guard: &ParallelEditGuard, calls: &[ToolCall]) -> Vec<FlaggedFile> {
-        let accesses = guard.accesses(calls, None).await;
-        ParallelEditGuard::detect(&accesses)
+        let args: Vec<Value> = calls.iter().map(effective_args).collect();
+        let accesses = guard
+            .registry()
+            .file_access_batch(
+                calls
+                    .iter()
+                    .zip(&args)
+                    .map(|(call, args)| (call.function.name.clone(), args.clone()))
+                    .collect(),
+                None,
+            )
+            .await;
+        let refs: Vec<&FileAccess> = accesses.iter().collect();
+        ParallelEditGuard::detect(&refs)
     }
 
     #[tokio::test]
@@ -556,15 +582,14 @@ mod tests {
     async fn warn_mode_passes_state_through_and_injects_once_after_results() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
-        let state = batch(vec![
+        let calls = vec![
             edit("1", &root.join("design.md")),
             edit("2", &root.join("design.md")),
-        ]);
+        ];
 
-        let out = guard.on_processing_tool_calls(state, None).await.unwrap();
-        let (calls, results) = unpack(out);
-        assert_eq!(calls.len(), 2);
-        assert!(results.is_empty());
+        let (proceed, rejected) = split(&calls, review(&guard, &calls).await);
+        assert_eq!(proceed, ["1", "2"], "warn mode runs every call");
+        assert!(rejected.is_empty());
 
         // The step after the tool results gets the note appended as the last message.
         let before = ExecutionState::BeforeLlmCall { context: context() };
@@ -593,11 +618,8 @@ mod tests {
     async fn warn_mode_without_conflict_injects_nothing() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
-        let state = batch(vec![
-            edit("1", &root.join("a.md")),
-            edit("2", &root.join("b.md")),
-        ]);
-        guard.on_processing_tool_calls(state, None).await.unwrap();
+        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("b.md"))];
+        review(&guard, &calls).await;
 
         let before = ExecutionState::BeforeLlmCall { context: context() };
         let ExecutionState::BeforeLlmCall { context } =
@@ -612,11 +634,7 @@ mod tests {
     async fn reset_clears_pending_note() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
-        let state = batch(vec![
-            edit("1", &root.join("a.md")),
-            edit("2", &root.join("a.md")),
-        ]);
-        guard.on_processing_tool_calls(state, None).await.unwrap();
+        flag_same_file(&guard, &root).await;
         guard.reset();
 
         let before = ExecutionState::BeforeLlmCall { context: context() };
@@ -628,26 +646,85 @@ mod tests {
         assert!(context.messages.is_empty());
     }
 
+    /// Review a pair whose *raw* arguments and *effective* access disagree.
+    async fn review_with_access(
+        guard: &ParallelEditGuard,
+        raw_paths: [&Path; 2],
+        effective_paths: [&Path; 2],
+    ) -> Vec<PreparedCallVerdict> {
+        let calls = [edit("1", raw_paths[0]), edit("2", raw_paths[1])];
+        let args: Vec<Value> = calls.iter().map(effective_args).collect();
+        let accesses: Vec<FileAccess> = effective_paths
+            .iter()
+            .map(|path| FileAccess::writes([path.to_path_buf()]))
+            .collect();
+        let views: Vec<crate::middleware::PreparedToolCall<'_>> = calls
+            .iter()
+            .zip(&args)
+            .zip(&accesses)
+            .map(
+                |((call, args), access)| crate::middleware::PreparedToolCall { call, args, access },
+            )
+            .collect();
+        guard
+            .on_prepared_tool_calls(&PreparedBatch {
+                session_id: "s1",
+                cwd: None,
+                calls: &views,
+            })
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
-    async fn batches_with_prefilled_results_are_still_inspected_in_warn_mode() {
-        // e.g. one call was gated for invalid arguments before the batch got here.
+    async fn conflicts_are_judged_by_effective_access_not_raw_arguments() {
+        let (_dir, root) = temp_root();
+        let a = root.join("a.md");
+        let b = root.join("b.md");
+
+        // Raw arguments differ, but a hook redirected both calls to `a.md`.
+        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Deny);
+        let verdicts = review_with_access(&guard, [&a, &b], [&a, &a]).await;
+        assert!(matches!(verdicts[0], PreparedCallVerdict::Proceed));
+        let PreparedCallVerdict::Reject(rejected) = &verdicts[1] else {
+            panic!("redirected same-file writer must be rejected");
+        };
+        assert!(rejected.is_error);
+        assert!(rejected.text_content().contains("a.md"));
+        // The rejection records the effective arguments of the rejected call.
+        assert_eq!(
+            serde_json::from_str::<Value>(rejected.tool_arguments.as_deref().unwrap()).unwrap()["file_path"],
+            json!(b.to_string_lossy())
+        );
+
+        // Raw arguments name the same file, but the effective targets differ.
+        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Deny);
+        let verdicts = review_with_access(&guard, [&a, &a], [&a, &b]).await;
+        assert!(
+            verdicts
+                .iter()
+                .all(|v| matches!(v, PreparedCallVerdict::Proceed))
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_mode_notes_use_the_session_of_the_batch() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Warn);
-        let gated = ToolResult::new("0".into(), vec![], true, None, None);
-        let state = ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from(vec![
-                edit("1", &root.join("a.md")),
-                edit("2", &root.join("a.md")),
-            ]),
-            results: Arc::from(vec![gated]),
-            context: context(),
+        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
+        review_in(&guard, "other-session", &calls).await;
+
+        // The note is delivered to the batch's session only.
+        assert_eq!(injected_messages(&guard).await, 0);
+        let before = ExecutionState::BeforeLlmCall {
+            context: Arc::new(ConversationContext::new(
+                "other-session".into(),
+                Arc::from([]),
+                Arc::new(AgentStats::default()),
+                "mock".into(),
+                "mock".into(),
+            )),
         };
-
-        let (calls, results) = unpack(guard.on_processing_tool_calls(state, None).await.unwrap());
-        assert_eq!(calls.len(), 2);
-        assert_eq!(results.len(), 1);
-
-        let before = ExecutionState::BeforeLlmCall { context: context() };
         let ExecutionState::BeforeLlmCall { context } =
             guard.on_step_start(before, None).await.unwrap()
         else {
@@ -656,41 +733,9 @@ mod tests {
         assert_eq!(context.messages.len(), 1);
     }
 
-    #[tokio::test]
-    async fn deny_mode_keeps_prefilled_results_and_appends_rejections() {
-        let (_dir, root) = temp_root();
-        let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Deny);
-        let gated = ToolResult::new("0".into(), vec![], true, None, None);
-        let state = ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from(vec![
-                edit("1", &root.join("a.md")),
-                edit("2", &root.join("a.md")),
-            ]),
-            results: Arc::from(vec![gated]),
-            context: context(),
-        };
-
-        let (calls, results) = unpack(guard.on_processing_tool_calls(state, None).await.unwrap());
-        assert_eq!(
-            calls.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
-            ["1"]
-        );
-        assert_eq!(
-            results
-                .iter()
-                .map(|r| r.call_id.as_str())
-                .collect::<Vec<_>>(),
-            ["0", "2"]
-        );
-        assert!(results[1].text_content().contains("2 writes"));
-    }
-
     async fn flag_same_file(guard: &ParallelEditGuard, root: &Path) {
-        let state = batch(vec![
-            edit("1", &root.join("a.md")),
-            edit("2", &root.join("a.md")),
-        ]);
-        guard.on_processing_tool_calls(state, None).await.unwrap();
+        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
+        review(guard, &calls).await;
     }
 
     async fn injected_messages(guard: &ParallelEditGuard) -> usize {
@@ -771,22 +816,9 @@ mod tests {
 
         let guard = ParallelEditGuard::new(registry(), mode);
         guard.bind_agent(&Arc::new(registry()), &agent.config.event_sink);
-        let state = ExecutionState::ProcessingToolCalls {
-            remaining_calls: Arc::from(vec![
-                edit("1", &root.join("a.md")),
-                edit("2", &root.join("a.md")),
-            ]),
-            results: Arc::from([]),
-            context: Arc::new(ConversationContext::new(
-                session_id.as_str().into(),
-                Arc::from([]),
-                Arc::new(AgentStats::default()),
-                "mock".into(),
-                "mock".into(),
-            )),
-        };
+        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
         // Returns before the event is persisted: emission is detached.
-        guard.on_processing_tool_calls(state, None).await.unwrap();
+        review_in(&guard, session_id.as_str(), &calls).await;
 
         let deadline = std::time::Duration::from_secs(5);
         loop {
@@ -828,42 +860,39 @@ mod tests {
     async fn deny_mode_rejects_later_writers_and_keeps_unaffected_calls() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Deny);
-        let state = batch(vec![
+        let calls = vec![
             edit("1", &root.join("design.md")),
             edit("2", &root.join("design.md")),
             edit("3", &root.join("other.md")),
             call("4", "shell", json!({"command": "echo hi"})),
             edit("5", &root.join("design.md")),
-        ]);
+        ];
 
-        let (calls, results) = unpack(guard.on_processing_tool_calls(state, None).await.unwrap());
+        let (kept, rejected) = split(&calls, review(&guard, &calls).await);
 
-        let kept: Vec<&str> = calls.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(kept, ["1", "3", "4"]);
-        let rejected: Vec<&str> = results.iter().map(|r| r.call_id.as_str()).collect();
-        assert_eq!(rejected, ["2", "5"]);
-        for result in &results {
+        let rejected_ids: Vec<&str> = rejected.iter().map(|(id, _)| *id).collect();
+        assert_eq!(rejected_ids, ["2", "5"]);
+        for (id, result) in &rejected {
+            assert_eq!(&result.call_id, id);
             assert!(result.is_error);
             let text = result.text_content();
             assert!(text.contains("design.md"), "{text}");
             assert!(text.contains("multiedit"), "{text}");
         }
-        // Exactly one outcome (run or rejected) per original call.
-        assert_eq!(calls.len() + results.len(), 5);
+        // Exactly one verdict (proceed or reject) per original call.
+        assert_eq!(kept.len() + rejected.len(), 5);
     }
 
     #[tokio::test]
     async fn deny_mode_without_conflict_is_a_no_op() {
         let (_dir, root) = temp_root();
         let guard = ParallelEditGuard::new(registry(), ParallelEditMode::Deny);
-        let state = batch(vec![
-            edit("1", &root.join("a.md")),
-            edit("2", &root.join("b.md")),
-        ]);
+        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("b.md"))];
 
-        let (calls, results) = unpack(guard.on_processing_tool_calls(state, None).await.unwrap());
-        assert_eq!(calls.len(), 2);
-        assert!(results.is_empty());
+        let (kept, rejected) = split(&calls, review(&guard, &calls).await);
+        assert_eq!(kept, ["1", "2"]);
+        assert!(rejected.is_empty());
     }
 
     #[test]
@@ -887,12 +916,36 @@ mod tests {
     /// Whether the driver rejects the second same-file edit (deny) or not (warn).
     async fn denies_second_edit(driver: &Arc<dyn MiddlewareDriver>) -> bool {
         let (_dir, root) = temp_root();
-        let state = batch(vec![
-            edit("1", &root.join("a.md")),
-            edit("2", &root.join("a.md")),
-        ]);
-        let (calls, results) = unpack(driver.on_processing_tool_calls(state, None).await.unwrap());
-        calls.len() == 1 && results.len() == 1
+        let calls = vec![edit("1", &root.join("a.md")), edit("2", &root.join("a.md"))];
+        let args: Vec<Value> = calls.iter().map(effective_args).collect();
+        let accesses = Arc::new(registry())
+            .file_access_batch(
+                calls
+                    .iter()
+                    .zip(&args)
+                    .map(|(call, args)| (call.function.name.clone(), args.clone()))
+                    .collect(),
+                None,
+            )
+            .await;
+        let views: Vec<crate::middleware::PreparedToolCall<'_>> = calls
+            .iter()
+            .zip(&args)
+            .zip(&accesses)
+            .map(
+                |((call, args), access)| crate::middleware::PreparedToolCall { call, args, access },
+            )
+            .collect();
+        let verdicts = driver
+            .on_prepared_tool_calls(&PreparedBatch {
+                session_id: "s1",
+                cwd: None,
+                calls: &views,
+            })
+            .await
+            .unwrap();
+        matches!(verdicts[0], PreparedCallVerdict::Proceed)
+            && matches!(verdicts[1], PreparedCallVerdict::Reject(_))
     }
 
     #[tokio::test]

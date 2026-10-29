@@ -18,7 +18,9 @@ mod specialized;
 mod tasks;
 
 // Re-export new architecture types
-pub use driver::{CompositeDriver, MiddlewareDriver};
+pub use driver::{
+    CompositeDriver, MiddlewareDriver, PreparedBatch, PreparedCallVerdict, PreparedToolCall,
+};
 pub use error::{MiddlewareError, Result};
 pub use state::{
     AgentStats, ContextFragment, ContextPriority, ConversationContext, ExecutionState, LlmResponse,

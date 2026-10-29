@@ -11,6 +11,7 @@ use opentelemetry_sdk::{
     Resource,
     error::OTelSdkResult,
     logs::{LogExporter, LogProcessor, SdkLogRecord, SdkLoggerProvider},
+    metrics::SdkMeterProvider,
     trace::{IdGenerator, RandomIdGenerator, SdkTracerProvider},
 };
 use opentelemetry_semantic_conventions::{SCHEMA_URL, resource::SERVICE_VERSION};
@@ -83,6 +84,8 @@ pub enum TelemetryInitError {
     TracerProvider(String),
     /// Failed to create the OTLP logger provider (log exporter).
     LoggerProvider(String),
+    /// Failed to create the OTLP meter provider (metric exporter).
+    MeterProvider(String),
     /// Failed to install the global tracing subscriber
     /// (typically because one was already installed).
     Subscriber,
@@ -94,6 +97,7 @@ impl fmt::Display for TelemetryInitError {
             Self::LogTracer => write!(f, "failed to install LogTracer"),
             Self::TracerProvider(ctx) => write!(f, "failed to init OTLP tracer provider: {ctx}"),
             Self::LoggerProvider(ctx) => write!(f, "failed to init OTLP logger provider: {ctx}"),
+            Self::MeterProvider(ctx) => write!(f, "failed to init OTLP meter provider: {ctx}"),
             Self::Subscriber => write!(f, "failed to set global tracing subscriber"),
         }
     }
@@ -179,6 +183,29 @@ pub fn init_logger_provider(
         service_version,
         exporter,
     ))
+}
+
+/// Initialize an OTLP meter provider.
+///
+/// Counters recorded through `opentelemetry::global::meter` (for example
+/// `querymt.tool.args_repaired`) are exported by this provider.
+pub fn init_meter_provider(
+    service_name: &str,
+    service_version: &str,
+    endpoint: &str,
+) -> Result<SdkMeterProvider, TelemetryInitError> {
+    use opentelemetry_otlp::WithTonicConfig;
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .with_tls_config(tonic::transport::ClientTlsConfig::new().with_enabled_roots())
+        .build()
+        .map_err(|e| TelemetryInitError::MeterProvider(e.to_string()))?;
+
+    Ok(SdkMeterProvider::builder()
+        .with_resource(resource(service_name, service_version))
+        .with_periodic_exporter(exporter)
+        .build())
 }
 
 #[derive(Debug)]
@@ -310,6 +337,10 @@ pub fn try_setup_telemetry_with_layers(
             init_logger_provider(config.service_name, config.service_version, &endpoint)?;
         let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
 
+        let meter_provider =
+            init_meter_provider(config.service_name, config.service_version, &endpoint)?;
+        opentelemetry::global::set_meter_provider(meter_provider.clone());
+
         layers.push(
             OpenTelemetryLayer::new(tracer)
                 .with_filter(trace_filter)
@@ -326,7 +357,7 @@ pub fn try_setup_telemetry_with_layers(
 
         // Store the providers so [`flush_telemetry`] can flush them on shutdown.
         // The providers are kept alive for the entire process lifetime.
-        store_providers(tracer_provider, logger_provider);
+        store_providers(tracer_provider, logger_provider, meter_provider);
 
         return Ok(Some(endpoint));
     }
@@ -368,11 +399,12 @@ fn telemetry_trace_filter(level: &str) -> EnvFilter {
 // ─── Provider storage for shutdown flush ──────────────────────────────────────
 
 /// Global storage for the OTLP providers so they can be flushed on shutdown.
-static PROVIDERS: Mutex<Option<(SdkTracerProvider, SdkLoggerProvider)>> = Mutex::new(None);
+static PROVIDERS: Mutex<Option<(SdkTracerProvider, SdkLoggerProvider, SdkMeterProvider)>> =
+    Mutex::new(None);
 
-fn store_providers(tracer: SdkTracerProvider, logger: SdkLoggerProvider) {
+fn store_providers(tracer: SdkTracerProvider, logger: SdkLoggerProvider, meter: SdkMeterProvider) {
     match PROVIDERS.lock() {
-        Ok(mut guard) => *guard = Some((tracer, logger)),
+        Ok(mut guard) => *guard = Some((tracer, logger, meter)),
         Err(e) => {
             // Mutex poisoned — unlikely, but don't panic during init.
             log::warn!("Failed to store OTLP providers for later flush: {e}");
@@ -389,7 +421,7 @@ fn store_providers(tracer: SdkTracerProvider, logger: SdkLoggerProvider) {
 pub fn flush_telemetry() {
     let providers = PROVIDERS.lock().ok().and_then(|mut g| g.take());
     match providers {
-        Some((tracer_provider, logger_provider)) => {
+        Some((tracer_provider, logger_provider, meter_provider)) => {
             log::info!("Flushing OTLP telemetry providers…");
             if let Err(e) = tracer_provider.force_flush() {
                 log::warn!("OTLP tracer provider force_flush failed: {e}");
@@ -397,12 +429,18 @@ pub fn flush_telemetry() {
             if let Err(e) = logger_provider.force_flush() {
                 log::warn!("OTLP logger provider force_flush failed: {e}");
             }
+            if let Err(e) = meter_provider.force_flush() {
+                log::warn!("OTLP meter provider force_flush failed: {e}");
+            }
             // shutdown() internally flushes then releases resources.
             if let Err(e) = tracer_provider.shutdown() {
                 log::warn!("OTLP tracer provider shutdown failed: {e}");
             }
             if let Err(e) = logger_provider.shutdown() {
                 eprintln!("OTLP logger provider shutdown failed: {e}");
+            }
+            if let Err(e) = meter_provider.shutdown() {
+                log::warn!("OTLP meter provider shutdown failed: {e}");
             }
         }
         None => {

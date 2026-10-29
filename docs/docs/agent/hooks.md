@@ -195,7 +195,20 @@ Expected hook output:
 }
 ```
 
-Multiple matching `pre_tool_use` handlers see this rewritten object in order. A rewrite is accepted only with `permission_decision: "allow"`; `ask` follows normal interactive permission handling.
+Multiple matching `pre_tool_use` handlers see this rewritten object in order. A rewrite is accepted only with `permission_decision: \"allow\"`; `ask` follows normal interactive permission handling.
+
+#### Tool input uses canonical parameter names
+
+`pre_tool_use` handlers receive the tool input with canonical `snake_case` names, after
+alias and shape normalisation. For the edit tools this means `file_path`, `old_string`,
+`new_string` and `replace_all` (and `new_text` / `expected_hash` for `replace_symbol`),
+even if the model sent `filePath` or `newString`. **Hooks that read `filePath`,
+`oldString` or `newString` must switch to the snake_case names.** An `updated_input`
+replacement is normalised the same way (legacy spellings are still accepted) and is
+validated before the tool runs. Hooks run once per call, and calls that follow a
+stateful tool (such as a task update) are prepared after it completed, so their hooks see
+its effects. See [Tool Argument Handling](configuration.md#tool-argument-handling) for
+the raw versus effective argument rules.
 
 ### post_tool_use patch
 

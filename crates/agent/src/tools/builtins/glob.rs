@@ -99,6 +99,7 @@ impl Tool for GlobTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "pattern": {
                             "type": "string",

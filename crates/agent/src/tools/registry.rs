@@ -62,16 +62,23 @@ impl ToolRegistry {
     /// declared [`FileAccess::Any`], which conflicts with every other call
     /// that touches files, so it is fully serialized.
     ///
+    /// `arguments` must be the *effective* arguments of a prepared call
+    /// (normalised and hook-adjusted); this helper never parses or repairs
+    /// raw model output.
+    ///
     /// This may touch the file system (path canonicalization); from async code
     /// prefer [`Self::file_access_batch`].
-    pub fn file_access(&self, name: &str, arguments: &str, cwd: Option<&Path>) -> FileAccess {
+    pub fn file_access(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        cwd: Option<&Path>,
+    ) -> FileAccess {
         let Some(tool) = self.tools.get(name) else {
             return FileAccess::None;
         };
-        let args: serde_json::Value =
-            serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}));
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            tool.file_access(&args, cwd)
+            tool.file_access(arguments, cwd)
         }))
         .unwrap_or_else(|_| {
             log::warn!("file_access of tool `{name}` panicked; serializing the call");
@@ -79,16 +86,16 @@ impl ToolRegistry {
         })
     }
 
-    /// [`Self::file_access`] for a whole batch of `(tool name, raw arguments)`
-    /// pairs, evaluated on the blocking pool so canonicalization never stalls
-    /// the async executor. Results are in input order.
+    /// [`Self::file_access`] for a whole batch of `(tool name, effective
+    /// arguments)` pairs, evaluated on the blocking pool so canonicalization
+    /// never stalls the async executor. Results are in input order.
     ///
     /// Panics are contained per call (see [`Self::file_access`]). If the
     /// blocking task itself fails, every call is declared [`FileAccess::Any`],
     /// which the planner serializes against all file-touching calls.
     pub async fn file_access_batch(
         self: &Arc<Self>,
-        calls: Vec<(String, String)>,
+        calls: Vec<(String, serde_json::Value)>,
         cwd: Option<PathBuf>,
     ) -> Vec<FileAccess> {
         let count = calls.len();
@@ -168,9 +175,9 @@ mod tests {
         let accesses = registry
             .file_access_batch(
                 vec![
-                    ("read_tool".into(), r#"{"path":"a.md"}"#.into()),
-                    ("panics".into(), "{}".into()),
-                    ("unregistered".into(), "{}".into()),
+                    ("read_tool".into(), serde_json::json!({"path": "a.md"})),
+                    ("panics".into(), serde_json::json!({})),
+                    ("unregistered".into(), serde_json::json!({})),
                 ],
                 Some(cwd.clone()),
             )

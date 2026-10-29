@@ -241,18 +241,27 @@ impl TestHarness {
     }
 
     fn with_builtin_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
+        self.with_builtin_tools_and_hooks(tools, None);
+    }
+
+    fn with_builtin_tools_and_hooks(
+        &mut self,
+        tools: Vec<Arc<dyn AgentTool>>,
+        hooks: Option<crate::hooks::Hooks>,
+    ) {
         let mut registry = ToolRegistry::new();
         registry.extend(tools);
-        self.config = Arc::new(
-            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
-                self.config.storage.clone(),
-                self.config.provider.clone(),
-                self.config.event_sink.journal().clone(),
-            )
-            .with_tool_policy(ToolPolicy::BuiltInOnly)
-            .with_tool_registry(registry)
-            .build(),
-        );
+        let mut builder = crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+            self.config.storage.clone(),
+            self.config.provider.clone(),
+            self.config.event_sink.journal().clone(),
+        )
+        .with_tool_policy(ToolPolicy::BuiltInOnly)
+        .with_tool_registry(registry);
+        if let Some(hooks) = hooks {
+            builder = builder.with_hooks(hooks);
+        }
+        self.config = Arc::new(builder.build());
         self.exec_ctx.tool_config.policy = ToolPolicy::BuiltInOnly;
     }
 
@@ -403,6 +412,144 @@ fn writing_tool(
         cancel_on_start,
         write_path: Some(path.to_path_buf()),
     })
+}
+
+/// Test tool whose declared write target is the `path` argument it is given
+/// *after* preparation, so hooks can redirect it. Optionally creates a marker
+/// file and/or cancels the run when it starts.
+struct PathTool {
+    name: &'static str,
+    class: ToolExecutionClass,
+    delay_ms: u64,
+    log: Arc<StdMutex<Vec<String>>>,
+    /// Arguments of every invocation, in order.
+    seen_args: Arc<StdMutex<Vec<serde_json::Value>>>,
+    create_marker: Option<std::path::PathBuf>,
+    cancel_on_start: bool,
+}
+
+#[async_trait]
+impl AgentTool for PathTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn definition(&self) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionTool {
+                name: self.name.to_string(),
+                description: "path test tool".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}}
+                }),
+                strict: None,
+            },
+        }
+    }
+
+    fn execution_class(&self) -> ToolExecutionClass {
+        self.class
+    }
+
+    fn file_access(
+        &self,
+        args: &serde_json::Value,
+        _cwd: Option<&std::path::Path>,
+    ) -> crate::tools::FileAccess {
+        match args.get("path").and_then(|path| path.as_str()) {
+            Some(path) => crate::tools::FileAccess::writes([std::path::PathBuf::from(path)]),
+            None => crate::tools::FileAccess::None,
+        }
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        context: &dyn ToolContext,
+    ) -> Result<Vec<ToolResultPart>, ToolError> {
+        self.seen_args.lock().unwrap().push(args);
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("start:{}", self.name));
+        if let Some(marker) = &self.create_marker {
+            std::fs::write(marker, "x").unwrap();
+        }
+        if self.cancel_on_start {
+            context.cancellation_token().cancel();
+        }
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        }
+        self.log.lock().unwrap().push(format!("end:{}", self.name));
+        Ok(vec![ToolResultPart::text("ok")])
+    }
+}
+
+fn path_tool(
+    name: &'static str,
+    class: ToolExecutionClass,
+    delay_ms: u64,
+    log: &Arc<StdMutex<Vec<String>>>,
+) -> PathTool {
+    PathTool {
+        name,
+        class,
+        delay_ms,
+        log: log.clone(),
+        seen_args: Arc::new(StdMutex::new(Vec::new())),
+        create_marker: None,
+        cancel_on_start: false,
+    }
+}
+
+/// `pre_tool_use` hooks: `(tool name, shell command)`. Each command receives
+/// the hook input on stdin and must not print anything but a JSON object.
+fn pre_tool_hooks(entries: &[(&str, String)]) -> crate::hooks::Hooks {
+    let groups: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(tool, command)| {
+            json!({"matcher": format!("^{tool}$"), "hooks": [{
+                "type": "command", "command": command, "timeout_sec": 5
+            }]})
+        })
+        .collect();
+    crate::hooks::Hooks::new(
+        serde_json::from_value::<crate::hooks::HooksConfig>(
+            json!({"enabled": true, "pre_tool_use": groups}),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Hook command that rewrites the tool input to `{"path": target}`.
+fn redirect_hook(target: &std::path::Path) -> String {
+    let output = json!({"hook_specific_output": {
+        "hook_event_name": "pre_tool_use",
+        "permission_decision": "allow",
+        "updated_input": {"path": target.to_str().unwrap()}
+    }});
+    format!("cat >/dev/null; printf '%s' '{output}'")
+}
+
+/// Hook command that records `label` plus whether `marker` exists, in `log`.
+fn probe_hook(label: &str, marker: &std::path::Path, log: &std::path::Path) -> String {
+    format!(
+        "cat >/dev/null; if [ -f '{m}' ]; then echo '{label}:marker' >> '{l}'; else echo '{label}:no-marker' >> '{l}'; fi; printf '{{}}'",
+        m = marker.display(),
+        l = log.display(),
+    )
+}
+
+fn read_lines(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 fn provider_tool(name: &str) -> Tool {
@@ -1064,9 +1211,9 @@ fn stored_tool_results(harness: &TestHarness) -> Vec<(String, bool)> {
 
 fn edit_args(path: &std::path::Path, old: &str, new: &str) -> String {
     json!({
-        "filePath": path.to_str().unwrap(),
-        "oldString": old,
-        "newString": new,
+        "file_path": path.to_str().unwrap(),
+        "old_string": old,
+        "new_string": new,
     })
     .to_string()
 }
@@ -1108,7 +1255,7 @@ async fn same_file_edits_in_one_batch_all_persist() {
     assert_eq!(results, expected, "results must be in call order, all ok");
 }
 
-/// Edit B's `oldString` only exists once edit A has been applied, so the batch
+/// Edit B's `old_string` only exists once edit A has been applied, so the batch
 /// only succeeds if A runs to completion before B starts.
 #[tokio::test]
 async fn dependent_same_file_edits_run_in_model_order() {
@@ -1736,4 +1883,416 @@ async fn test_waiting_for_event_delegation() {
     let outcome = harness.run().await;
 
     assert_eq!(outcome, CycleOutcome::Completed);
+}
+
+/// An aliased spelling (`filePath`, `oldString`, ...) and the canonical spelling
+/// name the same file. Access is declared from the normalised arguments, so the
+/// dependent edits are serialized and applied in model order.
+#[tokio::test]
+async fn aliased_and_canonical_edits_on_one_file_run_in_order() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a.md");
+    std::fs::write(&path, "alpha\n").unwrap();
+
+    harness.with_builtin_tools(vec![Arc::new(crate::tools::builtins::EditTool::new())]);
+    let aliased = json!({
+        "filePath": path.to_str().unwrap(),
+        "oldString": "alpha",
+        "newString": "beta",
+    })
+    .to_string();
+    let calls = vec![
+        mock_querymt_tool_call("call-a", "edit", &aliased),
+        mock_querymt_tool_call("call-b", "edit", &edit_args(&path, "beta", "gamma")),
+    ];
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "gamma\n");
+    assert_eq!(
+        stored_tool_results(&harness),
+        vec![("call-a".to_string(), false), ("call-b".to_string(), false)]
+    );
+}
+
+/// Raw arguments name disjoint files, but a pre-tool hook redirects both calls
+/// to one file. The scheduler plans from the post-hook arguments, so the calls
+/// never overlap.
+#[tokio::test]
+async fn hook_redirected_disjoint_writes_never_run_concurrently() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let shared = dir.path().join("shared.md");
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let first = path_tool("pw1", ToolExecutionClass::ParallelSafe, 40, &log);
+    let second = path_tool("pw2", ToolExecutionClass::ParallelSafe, 0, &log);
+    let seen = second.seen_args.clone();
+    harness.with_builtin_tools_and_hooks(
+        vec![Arc::new(first), Arc::new(second)],
+        Some(pre_tool_hooks(&[
+            ("pw1", redirect_hook(&shared)),
+            ("pw2", redirect_hook(&shared)),
+        ])),
+    );
+    let calls = vec![
+        mock_querymt_tool_call(
+            "call-1",
+            "pw1",
+            &json!({"path": dir.path().join("a.md").to_str().unwrap()}).to_string(),
+        ),
+        mock_querymt_tool_call(
+            "call-2",
+            "pw2",
+            &json!({"path": dir.path().join("b.md").to_str().unwrap()}).to_string(),
+        ),
+    ];
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    let log = log.lock().unwrap().clone();
+    let position = |entry: &str| log.iter().position(|item| item == entry).unwrap();
+    assert!(
+        position("end:pw1") < position("start:pw2"),
+        "redirected writers must be serialized: {log:?}"
+    );
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        vec![json!({"path": shared.to_str().unwrap()})],
+        "the tool sees the hook-adjusted arguments"
+    );
+    assert_eq!(
+        stored_tool_results(&harness),
+        vec![("call-1".to_string(), false), ("call-2".to_string(), false)]
+    );
+}
+
+/// A configured `deny` guard inspects the final (post-hook) targets: the second
+/// writer is rejected even though the raw arguments looked disjoint.
+#[tokio::test]
+async fn deny_guard_inspects_hook_redirected_targets() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let shared = dir.path().join("shared.md");
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    harness.with_builtin_tools_and_hooks(
+        vec![
+            Arc::new(path_tool("pw1", ToolExecutionClass::ParallelSafe, 0, &log)),
+            Arc::new(path_tool("pw2", ToolExecutionClass::ParallelSafe, 0, &log)),
+        ],
+        Some(pre_tool_hooks(&[
+            ("pw1", redirect_hook(&shared)),
+            ("pw2", redirect_hook(&shared)),
+        ])),
+    );
+    let guard = Arc::new(crate::middleware::ParallelEditGuard::new(
+        harness.config.tool_registry.clone(),
+        crate::middleware::ParallelEditMode::Deny,
+    ));
+    harness.config = Arc::new((*harness.config).clone().with_middleware(vec![guard]));
+    let calls = vec![
+        mock_querymt_tool_call(
+            "call-1",
+            "pw1",
+            &json!({"path": dir.path().join("a.md").to_str().unwrap()}).to_string(),
+        ),
+        mock_querymt_tool_call(
+            "call-2",
+            "pw2",
+            &json!({"path": dir.path().join("b.md").to_str().unwrap()}).to_string(),
+        ),
+    ];
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["start:pw1".to_string(), "end:pw1".to_string()],
+        "only the first writer to the redirected file runs"
+    );
+    assert_eq!(
+        stored_tool_results(&harness),
+        vec![("call-1".to_string(), false), ("call-2".to_string(), true)],
+        "one result per call, in model order"
+    );
+}
+
+/// Calls after a stateful barrier are prepared (and their hooks run) only after
+/// the barrier completed, so they observe its effects. Calls before the barrier
+/// are prepared before it ran.
+#[tokio::test]
+async fn hooks_of_calls_after_a_stateful_barrier_observe_its_effects() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("state.marker");
+    let hook_log = dir.path().join("hooks.log");
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let mut barrier = path_tool("serial", ToolExecutionClass::SerialStateful, 0, &log);
+    barrier.create_marker = Some(marker.clone());
+    harness.with_builtin_tools_and_hooks(
+        vec![
+            Arc::new(path_tool(
+                "before",
+                ToolExecutionClass::ParallelSafe,
+                0,
+                &log,
+            )),
+            Arc::new(barrier),
+            Arc::new(path_tool(
+                "after",
+                ToolExecutionClass::ParallelSafe,
+                0,
+                &log,
+            )),
+        ],
+        Some(pre_tool_hooks(&[
+            ("before", probe_hook("before", &marker, &hook_log)),
+            ("after", probe_hook("after", &marker, &hook_log)),
+        ])),
+    );
+    let calls = vec![
+        mock_querymt_tool_call("call-1", "before", "{}"),
+        mock_querymt_tool_call("call-2", "serial", "{}"),
+        mock_querymt_tool_call("call-3", "after", "{}"),
+    ];
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    assert_eq!(
+        read_lines(&hook_log),
+        vec!["before:no-marker".to_string(), "after:marker".to_string()]
+    );
+    assert_eq!(
+        stored_tool_results(&harness),
+        vec![
+            ("call-1".to_string(), false),
+            ("call-2".to_string(), false),
+            ("call-3".to_string(), false)
+        ]
+    );
+}
+
+/// Calls skipped after a clarification boundary are never prepared: their
+/// hooks do not run and they get a synthetic result in model order.
+#[tokio::test]
+async fn clarification_skips_later_calls_without_running_their_hooks() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("never");
+    let hook_log = dir.path().join("hooks.log");
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    harness.with_builtin_tools_and_hooks(
+        vec![
+            scheduling_tool(
+                "clarify",
+                ToolExecutionClass::ClarificationBoundary,
+                0,
+                "use option b",
+                &log,
+            ),
+            Arc::new(path_tool(
+                "suffix",
+                ToolExecutionClass::ParallelSafe,
+                0,
+                &log,
+            )),
+        ],
+        Some(pre_tool_hooks(&[(
+            "suffix",
+            probe_hook("suffix", &marker, &hook_log),
+        )])),
+    );
+    let calls = vec![
+        mock_querymt_tool_call("call-q", "clarify", "{}"),
+        mock_querymt_tool_call("call-suffix", "suffix", "{}"),
+    ];
+    expect_tool_batch_then_done(&harness, calls, true).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    assert!(read_lines(&hook_log).is_empty(), "skipped call's hook ran");
+    assert!(!log.lock().unwrap().iter().any(|e| e.contains("suffix")));
+    let stored = stored_tool_results(&harness);
+    assert_eq!(
+        stored.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["call-q", "call-suffix"]
+    );
+}
+
+/// Cancellation inside a barrier leaves later calls unprepared (no hooks) but
+/// still yields exactly one cancelled result per call, in model order.
+#[tokio::test]
+async fn cancellation_leaves_later_calls_unprepared_with_ordered_results() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let marker = dir.path().join("never");
+    let hook_log = dir.path().join("hooks.log");
+    let log = Arc::new(StdMutex::new(Vec::new()));
+    let mut cancelling = path_tool("cancel", ToolExecutionClass::SerialStateful, 0, &log);
+    cancelling.cancel_on_start = true;
+    harness.with_builtin_tools_and_hooks(
+        vec![
+            Arc::new(cancelling),
+            Arc::new(path_tool(
+                "later",
+                ToolExecutionClass::ParallelSafe,
+                0,
+                &log,
+            )),
+        ],
+        Some(pre_tool_hooks(&[(
+            "later",
+            probe_hook("later", &marker, &hook_log),
+        )])),
+    );
+    let calls = vec![
+        mock_querymt_tool_call("call-1", "cancel", "{}"),
+        mock_querymt_tool_call("call-2", "later", "{}"),
+    ];
+    expect_tool_batch_then_done(&harness, calls, false).await;
+
+    assert_eq!(harness.run().await, CycleOutcome::Cancelled);
+
+    assert!(
+        read_lines(&hook_log).is_empty(),
+        "unprepared call's hook ran"
+    );
+    assert!(!log.lock().unwrap().iter().any(|e| e.contains("later")));
+    let stored = stored_tool_results(&harness);
+    assert_eq!(
+        stored.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["call-1", "call-2"]
+    );
+    assert!(stored[1].1, "unstarted call gets an error result");
+}
+
+/// Raw model arguments (aliased spellings, odd whitespace) stay byte-for-byte in
+/// the stored assistant output and are what the next provider request replays,
+/// while execution, events and the stored tool-result record use the canonical,
+/// hook-adjusted effective arguments.
+#[tokio::test]
+async fn raw_arguments_stay_in_history_while_execution_uses_effective_arguments() {
+    let mut harness = TestHarness::new(vec![], None).await;
+    let dir = TempDir::new().unwrap();
+    let requested = dir.path().join("requested.md");
+    let redirected = dir.path().join("redirected.md");
+    std::fs::write(&requested, "alpha\n").unwrap();
+    std::fs::write(&redirected, "alpha\n").unwrap();
+
+    let hook_output = json!({"hook_specific_output": {
+        "hook_event_name": "pre_tool_use",
+        "permission_decision": "allow",
+        "updated_input": {
+            "filePath": redirected.to_str().unwrap(),
+            "oldString": "alpha",
+            "newString": "beta"
+        }
+    }});
+    harness.with_builtin_tools_and_hooks(
+        vec![Arc::new(crate::tools::builtins::EditTool::new())],
+        Some(pre_tool_hooks(&[(
+            "edit",
+            format!("cat >/dev/null; printf '%s' '{hook_output}'"),
+        )])),
+    );
+    let mut events = harness.config.event_sink.fanout().subscribe();
+
+    // Aliased spellings plus irregular whitespace: only a byte-exact copy of the
+    // model output can reproduce this string.
+    let raw_arguments = format!(
+        "{{ \"filePath\" : {}, \"oldString\":\"alpha\" ,\"newString\" : \"gamma\" }}",
+        serde_json::to_string(requested.to_str().unwrap()).unwrap()
+    );
+    let calls = vec![mock_querymt_tool_call("call-1", "edit", &raw_arguments)];
+
+    // Capture what the second provider request replays for the assistant turn.
+    let replayed: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+    let captured = replayed.clone();
+    let mut seq = Sequence::new();
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |_, _| Ok(MockChatResponse::with_tools("", calls.clone()).into()));
+    harness
+        .provider_mut()
+        .await
+        .expect_chat_with_tools()
+        .times(1)
+        .in_sequence(&mut seq)
+        .returning(move |messages, _| {
+            *captured.lock().unwrap() = messages
+                .iter()
+                .flat_map(|m| m.function_calls())
+                .map(|call| (call.call_id.clone(), call.arguments.clone()))
+                .collect();
+            Ok(MockChatResponse::text_only("done").into())
+        });
+
+    assert_eq!(harness.run().await, CycleOutcome::Completed);
+
+    // Execution used the hook-adjusted effective target and values.
+    assert_eq!(std::fs::read_to_string(&redirected).unwrap(), "beta\n");
+    assert_eq!(std::fs::read_to_string(&requested).unwrap(), "alpha\n");
+
+    let effective = json!({
+        "file_path": redirected.to_str().unwrap(),
+        "old_string": "alpha",
+        "new_string": "beta",
+    });
+
+    let stored = harness.stored_messages.lock().unwrap().clone();
+    // The assistant record keeps the raw arguments exactly as emitted.
+    let stored_calls: Vec<_> = stored
+        .iter()
+        .flat_map(|message| message.function_calls())
+        .collect();
+    assert_eq!(stored_calls.len(), 1);
+    assert_eq!(stored_calls[0].function.arguments, raw_arguments);
+
+    // The tool-result record carries the canonical effective arguments.
+    let result_arguments: Vec<String> = stored
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .filter_map(|part| match part {
+            crate::model::MessagePart::ToolResult {
+                tool_arguments: Some(arguments),
+                ..
+            } => Some(arguments.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(result_arguments.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result_arguments[0]).unwrap(),
+        effective
+    );
+
+    // Provider replay reads the raw assistant output, not the effective record.
+    assert_eq!(
+        replayed.lock().unwrap().clone(),
+        vec![("call-1".to_string(), raw_arguments.clone())]
+    );
+
+    // The start event reports the effective arguments.
+    let deadline = Duration::from_secs(5);
+    let started = loop {
+        let envelope = tokio::time::timeout(deadline, events.recv())
+            .await
+            .expect("ToolCallStart published")
+            .expect("fanout open");
+        if let AgentEventKind::ToolCallStart { arguments, .. } = envelope.kind() {
+            break arguments.clone();
+        }
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&started).unwrap(),
+        effective
+    );
 }

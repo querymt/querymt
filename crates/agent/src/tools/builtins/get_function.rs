@@ -43,6 +43,7 @@ impl Tool for GetFunctionTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "paths": {
                             "type": "array",

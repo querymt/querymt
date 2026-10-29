@@ -58,6 +58,7 @@ impl ToolTrait for ShellTool {
                 description: "Run a shell command and return stdout/stderr.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "command": {
                             "type": "string",

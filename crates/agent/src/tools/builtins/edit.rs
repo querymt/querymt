@@ -6,8 +6,43 @@ use serde_json::{Value, json};
 
 use crate::tools::builtins::edit_output;
 use crate::tools::{
-    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, single_path_write_access,
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
+    single_path_write_access,
 };
+
+/// Compatibility spellings accepted for `edit` parameters (never advertised).
+pub(crate) const EDIT_ARG_ALIASES: &[ArgAlias] = &[
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "filePath",
+        to: "file_path",
+    },
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "oldString",
+        to: "old_string",
+    },
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "old_str",
+        to: "old_string",
+    },
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "newString",
+        to: "new_string",
+    },
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "new_str",
+        to: "new_string",
+    },
+    ArgAlias {
+        scope: AliasScope::TopLevel,
+        from: "replaceAll",
+        to: "replace_all",
+    },
+];
 
 /// Edit tool for precise string replacement with fuzzy matching
 pub struct EditTool;
@@ -424,7 +459,7 @@ impl EditTool {
         matches
     }
 
-    /// Multi-occurrence replacer (for replaceAll)
+    /// Multi-occurrence replacer (for replace_all)
     fn multi_occurrence_replacer(content: &str, find: &str) -> Vec<String> {
         let mut matches = Vec::new();
         let mut start = 0;
@@ -445,10 +480,10 @@ impl EditTool {
         replace_all: bool,
     ) -> Result<ReplacementResult, String> {
         if old_string.is_empty() {
-            return Err("oldString cannot be empty".to_string());
+            return Err("old_string cannot be empty".to_string());
         }
         if old_string == new_string {
-            return Err("oldString and newString must be different".to_string());
+            return Err("old_string and new_string must be different".to_string());
         }
 
         let replacers: Vec<fn(&str, &str) -> Vec<String>> = vec![
@@ -494,9 +529,9 @@ impl EditTool {
         }
 
         if !found_any {
-            Err("oldString not found in content".to_string())
+            Err("old_string not found in content".to_string())
         } else {
-            Err("oldString found multiple times and requires more code context to uniquely identify the intended match. Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`.".to_string())
+            Err("old_string found multiple times and requires more code context to uniquely identify the intended match. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.".to_string())
         }
     }
 
@@ -532,35 +567,36 @@ impl Tool for EditTool {
                 description: "Performs exact string replacements in files. \n\n\
                     Usage:\n\
                     - You must inspect the exact current text before editing using `get_function`, `get_symbol`, or `read_tool`. This tool will error if you attempt an edit without reading the file. \n\
-                    - When editing text from read_tool tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is '00001| ' (5 digits + pipe + space). Everything after '| ' is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.\n\
+                    - When editing text from read_tool tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is '00001| ' (5 digits + pipe + space). Everything after '| ' is the actual file content to match. Never include any part of the line number prefix in the old_string or new_string.\n\
                     - ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n\
                     - Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.\n\
-                    - The edit will FAIL if `oldString` is not found in the file with an error \"oldString not found in content\".\n\
-                    - The edit will FAIL if `oldString` is found multiple times in the file with an error \"oldString found multiple times and requires more code context to uniquely identify the intended match\". Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`. \n\
-                    - Use `replaceAll` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance."
+                    - The edit will FAIL if `old_string` is not found in the file with an error \"old_string not found in content\".\n\
+                    - The edit will FAIL if `old_string` is found multiple times in the file with an error \"old_string found multiple times and requires more code context to uniquely identify the intended match\". Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`. \n\
+                    - Use `replace_all` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance."
                     .to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "filePath": {
+                        "file_path": {
                             "type": "string",
                             "description": "The absolute path to the file to modify"
                         },
-                        "oldString": {
+                        "old_string": {
                             "type": "string",
                             "description": "The text to replace"
                         },
-                        "newString": {
+                        "new_string": {
                             "type": "string",
-                            "description": "The text to replace it with (must be different from oldString)"
+                            "description": "The text to replace it with (must be different from old_string)"
                         },
-                        "replaceAll": {
+                        "replace_all": {
                             "type": "boolean",
-                            "description": "Replace all occurrences of oldString (default false)",
+                            "description": "Replace all occurrences of old_string (default false)",
                             "default": false
                         }
                     },
-                    "required": ["filePath", "oldString", "newString"]
+                    "required": ["file_path", "old_string", "new_string"],
+                    "additionalProperties": false
                 }),
                 strict: None,
             },
@@ -571,8 +607,12 @@ impl Tool for EditTool {
         &[CapabilityRequirement::Filesystem]
     }
 
+    fn arg_aliases(&self) -> &'static [ArgAlias] {
+        EDIT_ARG_ALIASES
+    }
+
     fn file_access(&self, args: &Value, cwd: Option<&std::path::Path>) -> FileAccess {
-        single_path_write_access(args, "filePath", cwd)
+        single_path_write_access(args, "file_path", cwd)
     }
 
     async fn call(
@@ -581,28 +621,28 @@ impl Tool for EditTool {
         context: &dyn ToolContext,
     ) -> Result<Vec<ToolResultPart>, ToolError> {
         let file_path_str = args
-            .get("filePath")
+            .get("file_path")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("filePath is required".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidRequest("file_path is required".to_string()))?;
 
         let old_string = args
-            .get("oldString")
+            .get("old_string")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("oldString is required".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidRequest("old_string is required".to_string()))?;
 
         let new_string = args
-            .get("newString")
+            .get("new_string")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidRequest("newString is required".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidRequest("new_string is required".to_string()))?;
 
         let replace_all = args
-            .get("replaceAll")
+            .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
         if old_string == new_string {
             return Err(ToolError::InvalidRequest(
-                "oldString and newString must be different".to_string(),
+                "old_string and new_string must be different".to_string(),
             ));
         }
 
@@ -664,9 +704,9 @@ mod tests {
         let root = dunce::canonicalize(temp_dir.path()).unwrap();
         let tool = EditTool::new();
 
-        let relative = tool.file_access(&json!({"filePath": "./a.md"}), Some(&root));
+        let relative = tool.file_access(&json!({"file_path": "./a.md"}), Some(&root));
         let absolute = tool.file_access(
-            &json!({"filePath": root.join("a.md").to_str().unwrap()}),
+            &json!({"file_path": root.join("a.md").to_str().unwrap()}),
             Some(&root),
         );
 
@@ -681,12 +721,12 @@ mod tests {
 
         assert_eq!(tool.file_access(&json!({}), Some(&cwd)), FileAccess::None);
         assert_eq!(
-            tool.file_access(&json!({"filePath": 42}), Some(&cwd)),
+            tool.file_access(&json!({"file_path": 42}), Some(&cwd)),
             FileAccess::None
         );
         // Relative path with no cwd cannot be resolved; the call will fail.
         assert_eq!(
-            tool.file_access(&json!({"filePath": "a.md"}), None),
+            tool.file_access(&json!({"file_path": "a.md"}), None),
             FileAccess::None
         );
     }
@@ -702,9 +742,9 @@ mod tests {
         let tool = EditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
-            "oldString": "rust is great",
-            "newString": "rust is awesome"
+            "file_path": file_path.display().to_string(),
+            "old_string": "rust is great",
+            "new_string": "rust is awesome"
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
@@ -729,10 +769,10 @@ mod tests {
         let tool = EditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
-            "oldString": "foo",
-            "newString": "qux",
-            "replaceAll": true
+            "file_path": file_path.display().to_string(),
+            "old_string": "foo",
+            "new_string": "qux",
+            "replace_all": true
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
@@ -782,9 +822,9 @@ mod tests {
         .join("\n");
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
-            "oldString": original,
-            "newString": updated
+            "file_path": file_path.display().to_string(),
+            "old_string": original,
+            "new_string": updated
         });
 
         let result = first_text_block(tool.call(args, &context).await.unwrap());
@@ -903,13 +943,13 @@ mod tests {
         }
     }
 
-    // BUG #9: Empty oldString should be rejected
+    // BUG #9: Empty old_string should be rejected
     #[test]
     fn test_empty_old_string() {
         let content = "hello world";
         let result = EditTool::replace(content, "", "replacement", false);
         // Should return an error, not try to replace
-        assert!(result.is_err(), "Empty oldString should be rejected");
+        assert!(result.is_err(), "Empty old_string should be rejected");
         assert!(result.unwrap_err().contains("cannot be empty"));
     }
 
@@ -937,7 +977,7 @@ mod tests {
         // Should fail with "multiple occurrences" error
         assert!(
             result.is_err(),
-            "Should fail when multiple occurrences found without replaceAll"
+            "Should fail when multiple occurrences found without replace_all"
         );
         if let Err(e) = result {
             assert!(
@@ -965,7 +1005,7 @@ mod tests {
         assert!(result.unwrap_err().contains("not found"));
     }
 
-    // Test edge case: oldString same as newString
+    // Test edge case: old_string same as new_string
     #[test]
     fn test_same_old_and_new_string() {
         let content = "hello world";
@@ -974,11 +1014,11 @@ mod tests {
         assert!(
             result
                 .unwrap_err()
-                .contains("oldString and newString must be different")
+                .contains("old_string and new_string must be different")
         );
     }
 
-    // Test edge case: oldString not found at all
+    // Test edge case: old_string not found at all
     #[test]
     fn test_string_not_found() {
         let content = "hello world";
@@ -1039,9 +1079,9 @@ mod tests {
         let tool = EditTool::new();
 
         let args = json!({
-            "filePath": file_path.display().to_string(),
-            "oldString": "fn foo() {\n    println!(\"old\");\n    bar();\n}",
-            "newString": "fn foo() {\n    println!(\"new\");\n    bar();\n}"
+            "file_path": file_path.display().to_string(),
+            "old_string": "fn foo() {\n    println!(\"old\");\n    bar();\n}",
+            "new_string": "fn foo() {\n    println!(\"new\");\n    bar();\n}"
         });
 
         let result = tool.call(args, &context).await;

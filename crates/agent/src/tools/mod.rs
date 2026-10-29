@@ -1,9 +1,11 @@
+pub mod args;
 pub mod builtins;
 pub mod context;
 pub mod context_impl;
 pub mod path;
 pub mod read_scope;
 pub mod registry;
+pub mod validation;
 
 pub use builtins::{
     BrowseTool, CompleteTaskTool, CreateTaskTool, DelegateTool, DeleteFileTool, GetFunctionTool,
@@ -12,8 +14,8 @@ pub use builtins::{
     UpdateTaskTool, WebFetchTool, WriteFileTool,
 };
 pub use context::{
-    CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError, ToolExecutionClass,
-    run_under_mutation_gate,
+    AliasScope, ArgAlias, CapabilityRequirement, FileAccess, Tool, ToolContext, ToolError,
+    ToolExecutionClass, WrapRule, run_under_mutation_gate,
 };
 pub use context_impl::{AgentToolContext, ElicitationRequest};
 pub use path::{

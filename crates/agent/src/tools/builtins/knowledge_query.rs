@@ -34,6 +34,7 @@ impl ToolTrait for KnowledgeQueryTool {
                 description: "Query the knowledge store to retrieve relevant entries and consolidations. Returns information with citations that can be used to answer questions.".to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "question": {
                             "type": "string",

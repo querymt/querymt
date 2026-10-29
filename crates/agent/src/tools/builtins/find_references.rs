@@ -54,6 +54,7 @@ impl Tool for FindSymbolReferencesTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "paths": {
                             "type": "array",

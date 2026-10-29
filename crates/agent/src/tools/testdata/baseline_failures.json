@@ -1,0 +1,111 @@
+{
+  "provenance": "Argument shapes of the 111 `invalid tool arguments` failures for provider anthropic in [2026-10-21T00:00:00Z, 2026-10-28T00:00:00Z), read from a read-only snapshot of sessions.db (sha256 0f7d3b64...045f). Only key names, value types and nesting were kept; every string value is a placeholder. `baseline_count` is how many of the 111 had that shape. Entries with baseline_count 0 are synthetic and exercise combinations the baseline did not contain.",
+  "placeholders": ["<path>", "<old>", "<new>", "<symbol>", "<pattern>", "<glob>"],
+  "classes": [
+    {
+      "id": "edit_camelcase_filepath_oldstring",
+      "tool": "edit", "baseline_count": 14,
+      "args": {"filePath": "<path>", "oldString": "<old>", "new_string": "<new>"},
+      "expect": "success",
+      "effective": {"file_path": "<path>", "old_string": "<old>", "new_string": "<new>"}
+    },
+    {
+      "id": "edit_short_form_new_str",
+      "tool": "edit", "baseline_count": 5,
+      "args": {"filePath": "<path>", "oldString": "<old>", "new_str": "<new>"},
+      "expect": "success",
+      "effective": {"file_path": "<path>", "old_string": "<old>", "new_string": "<new>"}
+    },
+    {
+      "id": "edit_unknown_key_instead_of_new_string",
+      "tool": "edit", "baseline_count": 1,
+      "args": {"filePath": "<path>", "oldString": "<old>", "new_string_placeholder": "<new>"},
+      "expect": "fail",
+      "message_contains": ["missing required field `new_string`", "property `new_string_placeholder` is not allowed"]
+    },
+    {
+      "id": "multiedit_edits_as_malformed_json_string_with_stray_newstring",
+      "tool": "multiedit", "baseline_count": 30,
+      "args": {"filePath": "<path>", "newString": "<new>", "edits": "[{\"oldString\">\"x\", \"newString\":\"y\"}]"},
+      "expect": "fail",
+      "message_contains": ["/edits: expected array, got string", "hint: `edits` must be a JSON array of objects, not a string containing JSON"]
+    },
+    {
+      "id": "multiedit_edits_as_malformed_json_string",
+      "tool": "multiedit", "baseline_count": 27,
+      "args": {"filePath": "<path>", "edits": "[{\"oldString\">\"x\", \"newString\":\"y\"}]"},
+      "expect": "fail",
+      "message_contains": ["/edits: expected array, got string", "hint: `edits` must be a JSON array of objects, not a string containing JSON"]
+    },
+    {
+      "id": "multiedit_malformed_edits_string_and_both_new_string_spellings",
+      "tool": "multiedit", "baseline_count": 1,
+      "args": {"filePath": "<path>", "newString": "<new>", "new_string": "<new>", "edits": "[{\"oldString\">\"x\"}]"},
+      "expect": "fail",
+      "message_contains": ["hint: `edits` must be a JSON array of objects, not a string containing JSON", "property `newString` is not allowed", "property `new_string` is not allowed"]
+    },
+    {
+      "id": "multiedit_single_edit_without_edits_array",
+      "tool": "multiedit", "baseline_count": 1,
+      "args": {"filePath": "<path>", "oldString": "<old>", "newString": "<new>"},
+      "expect": "success",
+      "effective": {"file_path": "<path>", "edits": [{"old_string": "<old>", "new_string": "<new>"}]}
+    },
+    {
+      "id": "read_tool_offset_string_with_trailing_comma",
+      "tool": "read_tool", "baseline_count": 3,
+      "args": {"path": "<path>", "offset": "466, ", "limit": 75},
+      "expect": "success",
+      "effective": {"path": "<path>", "offset": 466, "limit": 75}
+    },
+    {
+      "id": "synthetic_read_tool_unrepairable_offset_string",
+      "tool": "read_tool", "baseline_count": 0,
+      "args": {"path": "<path>", "offset": "abc", "limit": 75},
+      "expect": "fail",
+      "message_contains": ["/offset: expected integer, got string"]
+    },
+    {
+      "id": "replace_symbol_single_replacement_without_array",
+      "tool": "replace_symbol", "baseline_count": 3,
+      "args": {"path": "<path>", "symbol": "<symbol>", "kind": "function", "newText": "<new>"},
+      "expect": "success",
+      "effective": {"replacements": [{"path": "<path>", "symbol": "<symbol>", "kind": "function", "new_text": "<new>"}]}
+    },
+    {
+      "id": "search_text_exclude_as_single_glob_string",
+      "tool": "search_text", "baseline_count": 26,
+      "args": {"pattern": "<pattern>", "path": "<path>", "exclude": "<glob>", "max_results": 20},
+      "expect": "success",
+      "effective": {"pattern": "<pattern>", "path": "<path>", "exclude": "<glob>", "max_results": 20}
+    },
+    {
+      "id": "synthetic_multiedit_valid_stringified_edits_with_camelcase_items",
+      "tool": "multiedit", "baseline_count": 0,
+      "args": {"filePath": "<path>", "edits": "[{\"oldString\":\"a\",\"newString\":\"b\",\"replaceAll\":true}]"},
+      "expect": "success",
+      "effective": {"file_path": "<path>", "edits": [{"old_string": "a", "new_string": "b", "replace_all": true}]}
+    },
+    {
+      "id": "synthetic_replace_symbol_flat_with_every_repair_composed",
+      "tool": "replace_symbol", "baseline_count": 0,
+      "args": {"path": "<path>", "symbol": "<symbol>", "newText": "<new>", "expectedHash": "abc", "occurrence": "2"},
+      "expect": "success",
+      "effective": {"replacements": [{"path": "<path>", "symbol": "<symbol>", "new_text": "<new>", "expected_hash": "abc", "occurrence": 2}]}
+    },
+    {
+      "id": "synthetic_read_tool_number_strings",
+      "tool": "read_tool", "baseline_count": 0,
+      "args": {"path": "<path>", "offset": "140", "limit": "75"},
+      "expect": "success",
+      "effective": {"path": "<path>", "offset": 140, "limit": 75}
+    },
+    {
+      "id": "synthetic_multiedit_truncated_edits_string",
+      "tool": "multiedit", "baseline_count": 0,
+      "args": {"file_path": "<path>", "edits": "[{\"old_string\": \"x\", "},
+      "expect": "fail",
+      "message_contains": ["hint: `edits` must be a JSON array of objects, not a string containing JSON"]
+    }
+  ]
+}

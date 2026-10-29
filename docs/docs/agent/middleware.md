@@ -48,6 +48,17 @@ pub trait MiddlewareDriver: Send + Sync {
 }
 ```
 
+### Reviewing prepared tool calls
+
+Middleware that needs to reason about what a tool call will do should implement
+`on_prepared_tool_calls(&PreparedBatch)` rather than parse `ToolCall` arguments. Each
+`PreparedToolCall` carries the call, its **effective** arguments and the file access
+declared for them; the raw model text on `ToolCall.function.arguments` must not be
+used for conflict decisions. Return one `PreparedCallVerdict` per call: `Proceed`, or
+`Reject(result)` with the call's final error result. Rejected calls are not executed
+and still produce exactly one result. See
+[Raw and effective arguments](configuration.md#raw-and-effective-arguments).
+
 ## Built-in Middleware
 
 ### LimitsMiddleware
@@ -152,6 +163,15 @@ Detects a single model response that writes the same file with several tool call
 Same-file writes in one batch are always executed one after another in the model's
 order, so no edit is lost, whether or not this middleware is active. The guard only
 changes what the model is told.
+
+The guard reviews *prepared* calls (`MiddlewareDriver::on_prepared_tool_calls`): the
+file access it inspects was declared for each call's final effective arguments, after
+alias normalisation and pre-tool hook updates, and is the same access the scheduler
+plans from. Two calls that only look disjoint in the model's raw arguments, but are
+redirected to one file by a hook, are therefore treated as writing the same file. The
+review runs once per execution segment; writes separated by a stateful or
+clarification barrier are not compared with each other because the barrier already
+orders them.
 
 **Configuration:**
 ```toml

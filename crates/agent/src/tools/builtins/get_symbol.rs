@@ -53,12 +53,14 @@ impl Tool for GetSymbolTool {
                     .to_string(),
                 parameters: json!({
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "requests": {
                             "type": "array",
                             "description": "Explicit per-symbol requests with optional kind and occurrence.",
                             "items": {
                                 "type": "object",
+                                "additionalProperties": false,
                                 "properties": {
                                     "path": { "type": "string", "description": "File path." },
                                     "symbol": { "type": "string", "description": "Symbol name or qualified name." },
