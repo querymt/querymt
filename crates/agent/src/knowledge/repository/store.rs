@@ -637,6 +637,13 @@ impl RepositoryStore {
     }
 
     /// Location of the database file.
+    /// How long this connection waits on another connection's write lock
+    /// before reporting [`StoreError::Busy`].
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<(), StoreError> {
+        self.lock()?.busy_timeout(timeout)?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

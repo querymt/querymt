@@ -15,6 +15,7 @@ pub mod manifest;
 pub mod reconcile;
 pub mod references;
 pub mod root;
+pub mod service;
 pub mod store;
 
 pub use store::{
@@ -49,3 +50,4 @@ pub use root::{
     CACHE_KEY_VERSION, ResolvedRoot, RootError, RootRequest, RootSource, default_config_dir,
     find_git_root, resolve_root,
 };
+pub use service::{CurrentDocument, RefreshPolicy, RepositoryService, ServiceError};
