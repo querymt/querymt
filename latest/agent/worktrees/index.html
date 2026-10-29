@@ -1677,6 +1677,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#archiving-from-any-session" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Archiving from any session
+      </span>
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#undo-snapshots-and-workspace-references" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2375,8 +2386,8 @@ to run Git commands:</p>
 <a id="__codelineno-5-6" name="__codelineno-5-6"></a>/worktree status &lt;workspace-id&gt;
 <a id="__codelineno-5-7" name="__codelineno-5-7"></a>/worktree result &lt;workspace-id&gt;
 <a id="__codelineno-5-8" name="__codelineno-5-8"></a>/worktree publish [workspace-id]
-<a id="__codelineno-5-9" name="__codelineno-5-9"></a>/worktree archive &lt;workspace-id&gt;
-<a id="__codelineno-5-10" name="__codelineno-5-10"></a>/worktree remove &lt;workspace-id&gt;
+<a id="__codelineno-5-9" name="__codelineno-5-9"></a>/worktree archive [workspace-id]
+<a id="__codelineno-5-10" name="__codelineno-5-10"></a>/worktree remove [workspace-id] [--archive]
 <a id="__codelineno-5-11" name="__codelineno-5-11"></a>/worktree recover &lt;workspace-id&gt;
 </code></pre></div></td></tr></table></div>
 <p><code>create</code> returns a <strong>new session ID</strong>, workspace ID, checkout path, branch,
@@ -2430,11 +2441,11 @@ guaranteed.</p>
 </tr>
 <tr>
 <td><code>querymt/worktree/archive</code></td>
-<td><code>{"workspace_id":"&lt;id&gt;"}</code></td>
+<td><code>{"workspace_id":"&lt;id&gt;"}</code> or <code>{"session_id":"&lt;owner&gt;"}</code></td>
 </tr>
 <tr>
 <td><code>querymt/worktree/remove</code></td>
-<td><code>{"workspace_id":"&lt;id&gt;"}</code></td>
+<td><code>{"workspace_id":"&lt;id&gt;"}</code> or <code>{"session_id":"&lt;owner&gt;"}</code>, optional <code>"archive":true</code></td>
 </tr>
 <tr>
 <td><code>querymt/worktree/recover</code></td>
@@ -2498,13 +2509,17 @@ cannot drift between surfaces. Existing ACP JSON shapes are unchanged.</p>
 <span class="normal"><a href="#__codelineno-7-4">4</a></span>
 <span class="normal"><a href="#__codelineno-7-5">5</a></span>
 <span class="normal"><a href="#__codelineno-7-6">6</a></span>
-<span class="normal"><a href="#__codelineno-7-7">7</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="n">session</span> <span class="o">=</span> <span class="k">await</span> <span class="n">agent</span><span class="o">.</span><span class="n">chat_session</span><span class="p">(</span><span class="n">workspace</span><span class="o">=</span><span class="s2">"worktree"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"refactor"</span><span class="p">,</span>
+<span class="normal"><a href="#__codelineno-7-7">7</a></span>
+<span class="normal"><a href="#__codelineno-7-8">8</a></span>
+<span class="normal"><a href="#__codelineno-7-9">9</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1"></a><span class="n">session</span> <span class="o">=</span> <span class="k">await</span> <span class="n">agent</span><span class="o">.</span><span class="n">chat_session</span><span class="p">(</span><span class="n">workspace</span><span class="o">=</span><span class="s2">"worktree"</span><span class="p">,</span> <span class="n">name</span><span class="o">=</span><span class="s2">"refactor"</span><span class="p">,</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2"></a>                                   <span class="n">include_local_changes</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 <a id="__codelineno-7-3" name="__codelineno-7-3"></a><span class="nb">print</span><span class="p">(</span><span class="n">session</span><span class="o">.</span><span class="n">workspace</span><span class="p">[</span><span class="s2">"sessionCwd"</span><span class="p">])</span>      <span class="c1"># None for a local session</span>
 <a id="__codelineno-7-4" name="__codelineno-7-4"></a>
 <a id="__codelineno-7-5" name="__codelineno-7-5"></a><span class="n">wt</span> <span class="o">=</span> <span class="n">agent</span><span class="o">.</span><span class="n">worktrees</span>                         <span class="c1"># None when not enabled</span>
 <a id="__codelineno-7-6" name="__codelineno-7-6"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">list</span><span class="p">();</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">status</span><span class="p">(</span><span class="n">wid</span><span class="p">);</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">result</span><span class="p">(</span><span class="n">wid</span><span class="p">)</span>
-<a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">);</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">archive</span><span class="p">(</span><span class="n">wid</span><span class="p">);</span> <span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">wid</span><span class="p">)</span>
+<a id="__codelineno-7-7" name="__codelineno-7-7"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">publish</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>
+<a id="__codelineno-7-8" name="__codelineno-7-8"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">archive</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>            <span class="c1"># or archive(session_id=owner)</span>
+<a id="__codelineno-7-9" name="__codelineno-7-9"></a><span class="k">await</span> <span class="n">wt</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="n">workspace_id</span><span class="o">=</span><span class="n">wid</span><span class="p">)</span>             <span class="c1"># or remove(session_id=owner, archive=True)</span>
 </code></pre></div></td></tr></table></div>
 <p>Failures raise <code>querymt_agent.WorktreeError</code> (a <code>RuntimeError</code>) carrying a
 <code>.code</code>.</p>
@@ -2553,7 +2568,23 @@ readable messages may be reworded; codes do not change.</p>
 </tr>
 <tr>
 <td><code>owner_active</code></td>
-<td>handoff refused: the owner has a running turn, queued input, shared delegates, or execution in another process</td>
+<td>handoff, archive or removal refused: the owner has a running turn, queued input or steering, or shared delegates / another process are using the checkout</td>
+</tr>
+<tr>
+<td><code>workspace_not_archived</code></td>
+<td>removal of an owned workspace before it was archived; run <code>archive</code> (or <code>remove --archive</code>)</td>
+</tr>
+<tr>
+<td><code>unpreserved_content</code></td>
+<td>removal would discard uncommitted, untracked or ignored files; the (bounded) path lists are in the message</td>
+</tr>
+<tr>
+<td><code>unpreserved_commits</code></td>
+<td>removal would discard commits beyond the baseline that no retained ref contains; publish or integrate them</td>
+</tr>
+<tr>
+<td><code>workspace_archived</code></td>
+<td>the session's workspace is archived: the session is read-only and only inspection and cleanup commands are accepted</td>
 </tr>
 <tr>
 <td><code>owner_transferred</code></td>
@@ -2573,7 +2604,7 @@ readable messages may be reworded; codes do not change.</p>
 </tr>
 <tr>
 <td><code>removal_refused</code></td>
-<td>removal refused (active owner, dirty/untracked/ignored content, unpreserved commits)</td>
+<td>removal refused for a reason without a more specific code (for example externally owned content)</td>
 </tr>
 <tr>
 <td><code>operation_refused</code></td>
@@ -2598,13 +2629,11 @@ readable messages may be reworded; codes do not change.</p>
    and commands never merge it for you; for delegates the parent session accepts
    it explicitly (see <a href="#accepting-a-delegate-result">Accepting a delegate result</a>).
    A top-level workspace's delta is integrated manually.</li>
-<li>Close the owning session and any explicitly shared delegates. From another
-   local conversation, run <code>/worktree archive &lt;id&gt;</code>, then <code>/worktree remove &lt;id&gt;</code>.
-   Archive permanently retires execution while preserving conversation history
-   and its durable binding. Resume/load of an archived or removed workspace
-   fails explicitly; archive is not a temporary pause. Checkout activity leases
-   prevent archive/removal while any cooperating actor still runs, including
-   actors in another process. Closing alone preserves normal resumability.
+<li>From the owning session or any other local conversation, run
+   <code>/worktree archive [id]</code>, then <code>/worktree remove [id]</code> (or
+   <code>/worktree remove [id] --archive</code> for both). Without an id the command
+   targets the issuing session's own workspace. See
+   <a href="#archiving-from-any-session">Archiving from any session</a>.
    Dirty, untracked, ignored, externally owned, or unpreserved-result checkouts
    remain protected. There is no <code>--force</code>; successful removal reports retained refs.</li>
 </ol>
@@ -2879,6 +2908,68 @@ before using handoff. Profile runtimes built from one <code>AgentInfra</code> sh
 event fanout and storage journal, so announcements reach connections served by
 the root agent; runtimes given separate fanouts are only forwarded if they are
 registered as event sources.</p>
+<h2 id="archiving-from-any-session">Archiving from any session</h2>
+<p><code>archive</code> permanently retires execution in a managed checkout while preserving
+the conversation history and the durable binding. It works from the owning
+session itself or from any other local session; there is no need to close or
+detach anything first.</p>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span>
+<span class="normal"><a href="#__codelineno-13-2">2</a></span>
+<span class="normal"><a href="#__codelineno-13-3">3</a></span>
+<span class="normal"><a href="#__codelineno-13-4">4</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a>/worktree archive              # this session's workspace
+<a id="__codelineno-13-2" name="__codelineno-13-2"></a>/worktree archive &lt;id&gt;         # any workspace
+<a id="__codelineno-13-3" name="__codelineno-13-3"></a>/worktree remove               # this session's workspace (must be archived)
+<a id="__codelineno-13-4" name="__codelineno-13-4"></a>/worktree remove --archive     # archive, then remove, in one request
+</code></pre></div></td></tr></table></div>
+<p><strong>Order.</strong> Resolve the target (a workspace id or its owner session), treat an
+already-archived workspace as success without a new event, require a locally
+hosted owner (<code>owner_not_local</code>), unload an idle owner actor (a running turn,
+queued input or steering refuses with <code>owner_active</code>), then take the exclusive
+activity lease (shared delegates or another process refuse with
+<code>owner_active</code>). The record is re-read under the lease before the lifecycle
+compare-and-swap, and archive and removal both run under that same lease. A
+refused archive changes nothing. A prompt that arrives first makes the owner
+busy; one that arrives after the lease is taken finds the workspace not <code>ready</code>.</p>
+<p><strong><code>remove --archive</code>.</strong> An owned workspace is archived first. If removal is then
+refused (<code>unpreserved_content</code>, <code>unpreserved_commits</code>), the workspace stays
+archived, the refusal says so, and the error data carries <code>archived: true</code>; the
+archive is never rolled back. Without <code>--archive</code>, removing an owned workspace
+returns <code>workspace_not_archived</code>.</p>
+<p><strong>Read-only archived owners.</strong> Like a previous owner after a handoff, an archived
+owner stays listable and loadable but never materializes an actor:</p>
+<ul>
+<li><code>session/load</code> replays history and discloses <code>_meta.querymt.sessionAccess =
+  {"mode": "read_only", "reason": "workspace_archived", "workspaceId": "&lt;id&gt;"}</code>,
+  with no configuration update.</li>
+<li>Prompts, queued or steered input, undo/redo, forks and model/mode/config changes
+  are refused with <code>workspace_archived</code>.</li>
+<li>Native <code>create</code>, <code>publish</code>, <code>handoff</code> and <code>archive</code> are refused; <code>list</code>,
+  <code>status</code>, <code>result</code>, <code>remove</code> and <code>recover</code> stay available so cleanup can be
+  finished from the archived conversation. Removal keeps the read-only state.</li>
+</ul>
+<p><strong>Archive announcement.</strong> Archiving an owned workspace records a durable
+<code>worktree_archived</code> event on the owner's stream, sent as an <code>agent_message_chunk</code>
+with the stable <code>message_id</code> <code>worktree-archived-&lt;workspace_id&gt;</code> and
+<code>_meta.querymt.worktreeArchived = {workspaceId, bySessionId?}</code>. Every attached
+client receives it before the response of a native command issued from the owner
+(except over the legacy <code>AcpServer::run_stdio</code> forwarder, where the update may
+arrive after the response; clients must not rely on that ordering there), and it
+is replayed after the history on load. If it cannot be recorded the
+failure is logged and the archive still succeeds. Like the handoff event it makes
+the journal unreadable by older binaries; upgrade every node sharing a database
+first.</p>
+<p><strong>Session archive/resolve.</strong> Patching a session's lifecycle with <code>archived</code> or
+<code>resolved</code> set to <code>true</code> unloads its idle actor when it owns a ready managed
+workspace, so a later worktree archive from elsewhere succeeds. It does not
+archive the workspace and never blocks on a busy actor; archiving the workspace
+is an explicit worktree action.</p>
+<p><strong>Visible native failures.</strong> Every refused or failed native <code>/worktree</code> command,
+usage errors included, returns a successful prompt response whose
+<code>_meta["querymt.worktree"].error = {code, message}</code> and shows the message as a
+session update before the response (except over the legacy
+<code>AcpServer::run_stdio</code> forwarder, where the update may arrive after the response;
+clients must not rely on that ordering there). ACP extension methods keep returning
+JSON-RPC errors with <code>data.{code, message}</code>.</p>
 <h2 id="undo-snapshots-and-workspace-references">Undo, snapshots, and workspace references</h2>
 <p>Undo and redo reuse the <strong>existing snapshot backend</strong>, unchanged. The
 backend is bound to the session's effective cwd, so each workspace keeps
@@ -3108,9 +3199,9 @@ consulting the live checkout:</p>
   create-only ref.</li>
 </ul>
 <p>You can also reproduce the delta with Git directly:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-13-1">1</a></span>
-<span class="normal"><a href="#__codelineno-13-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-13-2" name="__codelineno-13-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
+<span class="normal"><a href="#__codelineno-14-2">2</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a>git<span class="w"> </span>diff<span class="w"> </span>--name-status<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2"></a><span class="w">                        </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span>
 </code></pre></div></td></tr></table></div>
 <p>Example: a parent with uncommitted edits to <code>config.rs</code> dispatches an
 isolated delegate that changes <code>auth.rs</code> and leaves <code>notes.md</code> untracked.
@@ -3127,11 +3218,11 @@ workspace's changes since its baseline.</p>
 baseline, so <code>git merge &lt;managed-branch&gt;</code> (or cherry-picking its tip
 wholesale) can bring the parent's baseline edits along with the
 workspace's work. Integrate the delta deliberately instead:</p>
-<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-14-1">1</a></span>
-<span class="normal"><a href="#__codelineno-14-2">2</a></span>
-<span class="normal"><a href="#__codelineno-14-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
-<a id="__codelineno-14-2" name="__codelineno-14-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-14-3" name="__codelineno-14-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
+<div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
+<span class="normal"><a href="#__codelineno-15-2">2</a></span>
+<span class="normal"><a href="#__codelineno-15-3">3</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1"></a><span class="c1"># Apply only the published delta onto your current branch:</span>
+<a id="__codelineno-15-2" name="__codelineno-15-2"></a>git<span class="w"> </span>diff<span class="w"> </span><span class="s2">"refs/qmt/baselines/&lt;workspace-id&gt;"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-15-3" name="__codelineno-15-3"></a><span class="w">         </span><span class="s2">"refs/qmt/results/&lt;workspace-id&gt;/&lt;result-id&gt;"</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>git<span class="w"> </span>apply
 </code></pre></div></td></tr></table></div>
 <p>or, if the workspace produced real commits and the parent was clean,
 cherry-pick the commit range. If the parent was dirty, either commit the
