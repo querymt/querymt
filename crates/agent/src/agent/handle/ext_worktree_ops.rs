@@ -579,7 +579,8 @@ impl LocalAgentHandle {
                     provider_name,
                     model.clone(),
                 )
-                .with_budget_pricing(self.config.budget_pricing()),
+                .with_budget_pricing(self.config.budget_pricing())
+                .with_budget_cap(self.config.budget_cap_usd()),
             ),
             basis: handle.billing_basis_for_model(&model),
         };
