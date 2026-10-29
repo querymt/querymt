@@ -76,6 +76,7 @@ pub struct AgentConfigBuilder {
     slash_commands_config: Option<crate::config::SlashCommandsConfig>,
     hooks: Hooks,
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    repository_knowledge: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
 }
 
 impl AgentConfigBuilder {
@@ -136,6 +137,7 @@ impl AgentConfigBuilder {
             slash_commands_config: None,
             hooks: Hooks::disabled(),
             workspace_service: None,
+            repository_knowledge: None,
         }
     }
 
@@ -190,6 +192,7 @@ impl AgentConfigBuilder {
             slash_commands_config: None,
             hooks: Hooks::disabled(),
             workspace_service: None,
+            repository_knowledge: None,
         }
     }
 
@@ -240,6 +243,7 @@ impl AgentConfigBuilder {
             slash_commands_config: self.slash_commands_config,
             hooks: self.hooks,
             workspace_service: self.workspace_service,
+            repository_knowledge: self.repository_knowledge,
         }
     }
 
@@ -531,6 +535,17 @@ impl AgentConfigBuilder {
         service: Arc<crate::worktree::WorkspaceService>,
     ) -> Self {
         self.workspace_service = Some(service);
+        self
+    }
+
+    /// Bind portable repository knowledge. Pass the registry only when the
+    /// host enabled the feature; omitted (default) means no repository reads,
+    /// writes, tools, or prompt changes. Nothing is resolved or opened here.
+    pub fn with_repository_knowledge(
+        mut self,
+        registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    ) -> Self {
+        self.repository_knowledge = registry;
         self
     }
 

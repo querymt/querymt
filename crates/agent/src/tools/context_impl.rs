@@ -85,6 +85,7 @@ pub struct AgentToolContext {
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     session_store: Option<Arc<dyn crate::session::store::SessionStore>>,
     todo_store: Option<Arc<crate::tools::builtins::todo::TodoStore>>,
+    repository_knowledge: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
 }
 
 impl AgentToolContext {
@@ -109,12 +110,22 @@ impl AgentToolContext {
             workspace_service: None,
             session_store: None,
             todo_store: None,
+            repository_knowledge: None,
         }
     }
 
     /// Attach the agent's per-session todo store.
     pub fn with_todo_store(mut self, store: Arc<crate::tools::builtins::todo::TodoStore>) -> Self {
         self.todo_store = Some(store);
+        self
+    }
+
+    /// Attach repository knowledge (only when the host enabled it).
+    pub fn with_repository_knowledge(
+        mut self,
+        registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    ) -> Self {
+        self.repository_knowledge = registry;
         self
     }
 
@@ -322,6 +333,12 @@ impl ToolContext for AgentToolContext {
 
     fn session_store(&self) -> Option<Arc<dyn crate::session::store::SessionStore>> {
         self.session_store.clone()
+    }
+
+    fn repository_knowledge(
+        &self,
+    ) -> Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>> {
+        self.repository_knowledge.clone()
     }
 
     fn as_any(&self) -> &dyn Any {
