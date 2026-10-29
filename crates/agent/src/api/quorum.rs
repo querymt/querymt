@@ -483,6 +483,13 @@ impl QuorumBuilder {
                 None => None,
             },
         };
+        // One lazy registry for the whole quorum, so planner and delegates
+        // sharing a checkout share one serialized service. Nothing is resolved
+        // or opened until a session uses it.
+        let repository_knowledge = self
+            .repository_knowledge
+            .as_ref()
+            .and_then(crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings);
         if workspace_service.is_none()
             && let Some(delegate) = self
                 .delegates
@@ -576,6 +583,7 @@ impl QuorumBuilder {
             let delegation_wait_timeout_for_delegate = self.delegation_wait_timeout_secs;
             let delegation_cancel_grace_for_delegate = self.delegation_cancel_grace_secs;
             let workspace_for_delegate = workspace_service.clone();
+            let repository_for_delegate = repository_knowledge.clone();
             builder = builder.add_delegate_agent(agent_info, move |storage, event_fanout| {
                 let mut b =
                     AgentConfigBuilder::new(registry.clone(), storage.clone(), llm_config.clone())
@@ -636,6 +644,7 @@ impl QuorumBuilder {
                 if let Some(service) = workspace_for_delegate.clone() {
                     b = b.with_workspace_service(service);
                 }
+                b = b.with_repository_knowledge(repository_for_delegate.clone());
 
                 let config = Arc::new(b.build());
                 Arc::new(AgentHandle::from_config(config)) as Arc<dyn AgentHandleTrait>
@@ -807,6 +816,7 @@ impl QuorumBuilder {
         let delegation_wait_timeout_for_planner = self.delegation_wait_timeout_secs;
         let delegation_cancel_grace_for_planner = self.delegation_cancel_grace_secs;
         let workspace_for_planner = workspace_service.clone();
+        let repository_for_planner = repository_knowledge.clone();
         builder = builder.with_planner(move |storage, agent_registry, event_fanout| {
             let mut b = AgentConfigBuilder::new(
                 registry_for_planner.clone(),
@@ -883,6 +893,7 @@ impl QuorumBuilder {
             if let Some(service) = workspace_for_planner.clone() {
                 b = b.with_workspace_service(service);
             }
+            b = b.with_repository_knowledge(repository_for_planner.clone());
 
             // Wire schedule repository and knowledge store into the planner config.
             if let Some(ref repo) = schedule_repo_for_planner {
@@ -2314,6 +2325,56 @@ model = "gpt-4"
             isolation("reviewer"),
             crate::worktree::DelegationIsolation::Inherit
         );
+    }
+
+    /// 2.4: planner and every delegate share one lazy repository registry when
+    /// the host enabled it, so sessions on one checkout share one service; a
+    /// quorum without the setting binds nothing. Building resolves nothing.
+    #[tokio::test]
+    async fn quorum_shares_one_lazy_repository_registry_only_when_enabled() {
+        let root = tempfile::TempDir::new().unwrap();
+        let registry_of = |agent: &crate::api::agent::Agent, id: Option<&str>| {
+            let handle = match id {
+                None => agent.planner().expect("planner"),
+                Some(id) => agent.delegate(id).expect("delegate"),
+            };
+            handle
+                .as_any()
+                .downcast_ref::<AgentHandle>()
+                .expect("local handle")
+                .config
+                .repository_knowledge()
+        };
+
+        let (infra, _dir) = quorum_infra().await;
+        let enabled = crate::api::agent::Agent::builder_from_quorum_config(
+            workspace_quorum_config(root.path(), ""),
+            None,
+        )
+        .expect("builder")
+        .infra(infra)
+        .repository_knowledge(crate::config::RepositoryKnowledgeSettings::enabled())
+        .build()
+        .await
+        .expect("quorum builds");
+        let planner = registry_of(&enabled, None).expect("planner has registry");
+        let coder = registry_of(&enabled, Some("coder")).expect("coder has registry");
+        let reviewer = registry_of(&enabled, Some("reviewer")).expect("reviewer has registry");
+        assert!(Arc::ptr_eq(&planner, &coder) && Arc::ptr_eq(&planner, &reviewer));
+        assert_eq!(planner.open_services(), 0, "no builder-time discovery");
+
+        let (infra, _dir) = quorum_infra().await;
+        let disabled = crate::api::agent::Agent::builder_from_quorum_config(
+            workspace_quorum_config(root.path(), ""),
+            None,
+        )
+        .expect("builder")
+        .infra(infra)
+        .build()
+        .await
+        .expect("quorum builds");
+        assert!(registry_of(&disabled, None).is_none());
+        assert!(registry_of(&disabled, Some("coder")).is_none());
     }
 
     /// 21.6/21.8: a quorum without workspace settings builds without a

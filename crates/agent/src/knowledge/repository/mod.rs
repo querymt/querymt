@@ -14,6 +14,7 @@ pub mod identity;
 pub mod manifest;
 pub mod reconcile;
 pub mod references;
+pub mod registry;
 pub mod root;
 pub mod service;
 pub mod store;
@@ -46,6 +47,7 @@ pub use references::{
     DocumentReference, LinkKind, RawLink, Reference, RejectReason, TargetStatus,
     document_references, extract_links, reference_diagnostics, resolve_reference, verify_local,
 };
+pub use registry::{BindingError, RepositoryKnowledgeRegistry};
 pub use root::{
     CACHE_KEY_VERSION, ResolvedRoot, RootError, RootRequest, RootSource, default_config_dir,
     find_git_root, resolve_root,

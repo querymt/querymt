@@ -56,6 +56,15 @@ pub trait ToolContext: Send + Sync {
         None
     }
 
+    /// Portable repository knowledge for this session's checkout, when the
+    /// host enabled it. Resolution is lazy and uses only [`cwd`](Self::cwd);
+    /// callers cannot select another checkout.
+    fn repository_knowledge(
+        &self,
+    ) -> Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>> {
+        None
+    }
+
     /// Scope policy for knowledge tools. Defaults to permissive (allow all scopes).
     fn scope_policy(&self) -> Arc<dyn ScopePolicy> {
         Arc::new(crate::knowledge::PermissiveScopePolicy)

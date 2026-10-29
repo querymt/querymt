@@ -632,6 +632,13 @@ impl AgentBuilder {
             builder = builder.with_workspace_service(service);
         }
 
+        // Repository knowledge: a lazy registry only when the host enabled it.
+        // Nothing is resolved, created or read until a session uses it.
+        builder =
+            builder.with_repository_knowledge(self.repository_knowledge.as_ref().and_then(
+                crate::knowledge::repository::RepositoryKnowledgeRegistry::from_settings,
+            ));
+
         // Wire schedule repository and knowledge store from the storage backend.
         // These are optional — backends that don't support them return None.
         if let Some(repo) = backend.schedule_repository() {

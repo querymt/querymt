@@ -2877,6 +2877,7 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     .with_cancellation_token(cancel_token.clone())
     .with_execution_origin(execution_origin)
     .with_knowledge_store(config.knowledge_store())
+    .with_repository_knowledge(config.repository_knowledge())
     .with_event_sink(config.event_sink.clone())
     .with_workspace_query_bridge(editor_bridge_for_workspace(
         runtime.managed_checkout.get().copied().unwrap_or(false),

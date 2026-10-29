@@ -78,6 +78,10 @@ pub(crate) struct ExecutionContext {
 
     /// Optional knowledge store, propagated into tool contexts so knowledge tools can access it.
     pub knowledge_store: Option<Arc<dyn KnowledgeStore>>,
+    /// Lazy per-checkout repository knowledge; `None` unless host-enabled.
+    /// The checkout is resolved from this session's effective cwd on use.
+    pub repository_knowledge:
+        Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
 
     /// Optional event sink, propagated into tool contexts so tools can emit agent events.
     pub event_sink: Option<Arc<crate::event_sink::EventSink>>,
@@ -127,6 +131,7 @@ impl ExecutionContext {
             tool_config,
             execution_origin: ExecutionOrigin::Interactive,
             knowledge_store: None,
+            repository_knowledge: None,
             event_sink: None,
             workspace_query_bridge: None,
             turn_id: None,
@@ -156,6 +161,15 @@ impl ExecutionContext {
     /// Set the knowledge store for this context.
     pub fn with_knowledge_store(mut self, store: Option<Arc<dyn KnowledgeStore>>) -> Self {
         self.knowledge_store = store;
+        self
+    }
+
+    /// Set the repository knowledge registry for this context.
+    pub fn with_repository_knowledge(
+        mut self,
+        registry: Option<Arc<crate::knowledge::repository::RepositoryKnowledgeRegistry>>,
+    ) -> Self {
+        self.repository_knowledge = registry;
         self
     }
 
@@ -282,6 +296,7 @@ impl ExecutionContext {
         if let Some(ref ks) = self.knowledge_store {
             ctx.with_knowledge_store(ks.clone());
         }
+        ctx = ctx.with_repository_knowledge(self.repository_knowledge.clone());
         if let Some(ref sink) = self.event_sink {
             ctx.with_event_sink(sink.clone());
         }
@@ -489,6 +504,38 @@ mod tests {
             None,
         );
         assert!(Arc::ptr_eq(&gate, &tools.checkout_mutation_gate().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn tool_context_propagates_repository_knowledge_only_when_set() {
+        use crate::config::RepositoryKnowledgeSettings;
+        use crate::knowledge::repository::RepositoryKnowledgeRegistry;
+        use crate::tools::context::ToolContext;
+
+        let (runtime, runtime_ctx, handle) = make_context_parts().await;
+        let ctx = ExecutionContext::new(
+            handle.session().public_id.clone(),
+            runtime,
+            runtime_ctx,
+            handle,
+            ToolConfig::default(),
+        );
+        let registry = |ctx: &ExecutionContext| {
+            ctx.tool_context(
+                Arc::new(crate::delegation::DefaultAgentRegistry::new()),
+                None,
+            )
+            .repository_knowledge()
+        };
+        assert!(registry(&ctx).is_none(), "absent unless host-enabled");
+
+        let enabled =
+            RepositoryKnowledgeRegistry::from_settings(&RepositoryKnowledgeSettings::enabled());
+        let ctx = ctx.with_repository_knowledge(enabled.clone());
+        assert!(Arc::ptr_eq(
+            &registry(&ctx).expect("propagated"),
+            enabled.as_ref().unwrap()
+        ));
     }
 
     #[tokio::test]
