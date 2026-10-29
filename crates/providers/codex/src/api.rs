@@ -346,6 +346,7 @@ impl CodexRawUsage {
             reasoning_tokens: reasoning,
             cache_read,
             cache_write,
+            cache_write_tiers: None,
         }
     }
 }

@@ -144,6 +144,13 @@ pub trait MiddlewareDriver: Send + Sync {
     fn get_limits(&self) -> Option<SessionLimits> {
         None
     }
+
+    /// Manual budget pricing this middleware wants snapshotted onto every
+    /// paid attempt, if any. It is valued separately from reported API spend
+    /// and never replaces it. Default: none.
+    fn budget_pricing(&self) -> Option<querymt::providers::ModelPricing> {
+        None
+    }
 }
 
 /// Composite driver that runs multiple middleware drivers in sequence
@@ -364,6 +371,13 @@ impl CompositeDriver {
 
     pub fn name(&self) -> &'static str {
         "CompositeDriver"
+    }
+
+    /// The first manual budget pricing any driver configures.
+    pub fn budget_pricing(&self) -> Option<querymt::providers::ModelPricing> {
+        self.drivers
+            .iter()
+            .find_map(|driver| driver.budget_pricing())
     }
 
     pub fn get_limits(&self) -> Option<SessionLimits> {

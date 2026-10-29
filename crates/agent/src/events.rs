@@ -493,6 +493,10 @@ pub enum AgentEventKind {
         context_tokens: u64,
         /// Execution progress metrics (steps/turns)
         metrics: ExecutionMetrics,
+        /// Operation/attempt identities and known subtotal behind `cost_usd`.
+        /// Absent on events written before accounting records existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accounting: Option<crate::accounting::RequestAccounting>,
     },
     ProviderChanged {
         provider: String,
@@ -677,6 +681,11 @@ pub enum AgentEventKind {
         batch_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_call_id: Option<String>,
+        /// Parent execution cycle that requested the delegation. Auxiliary
+        /// generation (the planning summary) is charged to this cycle even if
+        /// it settles after a newer cycle began. Absent on older events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cycle_id: Option<String>,
     },
     DelegationCompleted {
         delegation_id: String,
@@ -930,6 +939,19 @@ pub enum AgentEventKind {
         #[typeshare(serialized_as = "number")]
         source_count: u32,
     },
+
+    // ── LLM accounting lifecycle ─────────────────────────────────────────
+    // Durable ledger records. Start is appended before dispatch, settlement
+    // once usage is known. See `crate::accounting`.
+    /// A provider attempt is about to be dispatched. An unmatched start is
+    /// unresolved spend, not proof of a charge.
+    LlmAttemptStarted {
+        start: crate::accounting::AttemptStart,
+    },
+    /// Accounting for a dispatched attempt (identified by `attempt_id`).
+    LlmAttemptSettled {
+        settlement: crate::accounting::AttemptSettlement,
+    },
 }
 
 // ============================================================================
@@ -1137,6 +1159,13 @@ pub fn classify_durability(kind: &AgentEventKind) -> Durability {
         // Rationale: command output is a transient reply to one prompt; the
         // registry is authoritative and the handoff has its own durable event.
         AgentEventKind::WorktreeCommandOutput { .. } => Durability::Ephemeral,
+
+        // ── Durable: accounting ledger ──────────────────────────────
+        // Rationale: the start must survive a crash to expose unresolved
+        // spend, and settlements are the only source of recorded charges.
+        // They must never be downgraded to ephemeral.
+        AgentEventKind::LlmAttemptStarted { .. } => Durability::Durable,
+        AgentEventKind::LlmAttemptSettled { .. } => Durability::Durable,
 
         // Everything else is durable by default.
         _ => Durability::Durable,

@@ -438,6 +438,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
+                cycle_id: None,
             },
         );
         let forked = event(
@@ -497,6 +498,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
             },
         ));
         let update = projector
@@ -530,6 +532,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
+                cycle_id: None,
             },
         ));
         projector.project_event(&event(
@@ -538,6 +541,7 @@ mod tests {
                 delegation: second,
                 tool_call_id: Some("call-2".into()),
                 batch_id: None,
+                cycle_id: None,
             },
         ));
 
@@ -556,6 +560,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
             },
         ));
         let update = projector
@@ -598,6 +603,7 @@ mod tests {
                     delegation: delegation(),
                     tool_call_id: Some("call-1".into()),
                     batch_id: None,
+                    cycle_id: None,
                 },
             ))
             .unwrap();
@@ -639,6 +645,7 @@ mod tests {
                     delegation: delegation(),
                     tool_call_id: Some("call-1".into()),
                     batch_id: None,
+                    cycle_id: None,
                 },
             ))
             .unwrap();
@@ -658,6 +665,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
+                cycle_id: None,
             },
         ));
         let completed = projector
@@ -711,6 +719,7 @@ mod tests {
                     delegation: requested,
                     tool_call_id: None,
                     batch_id: None,
+                    cycle_id: None,
                 },
             ));
         }
@@ -738,6 +747,7 @@ mod tests {
                     delegation: delegation(),
                     tool_call_id: Some("call-1".into()),
                     batch_id: None,
+                    cycle_id: None,
                 },
             ),
             event(
@@ -787,6 +797,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
+                cycle_id: None,
             },
         ));
         let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
@@ -813,6 +824,7 @@ mod tests {
                     delegation: delegation(),
                     tool_call_id: Some("call-1".into()),
                     batch_id: None,
+                    cycle_id: None,
                 },
             ),
             event(
@@ -874,6 +886,7 @@ mod tests {
             delegation: delegation(),
             tool_call_id: Some("call-1".into()),
             batch_id: None,
+            cycle_id: None,
         });
         stream.emit(AgentEventKind::SessionForked {
             parent_session_id: session_id.clone(),
@@ -972,6 +985,7 @@ mod tests {
             delegation: delegation(),
             tool_call_id: None,
             batch_id: None,
+            cycle_id: None,
         })
         .unwrap();
         let mut value = value.as_object().unwrap().clone();
@@ -984,6 +998,7 @@ mod tests {
             AgentEventKind::DelegationRequested {
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
                 ..
             }
         ));

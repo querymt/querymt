@@ -759,6 +759,7 @@ mod tests {
                 reasoning_tokens,
                 cache_read: 20,
                 cache_write: 30,
+                cache_write_tiers: None,
             });
             let (_, spans) = capture(async {
                 let chat = tracing::info_span!("chat");

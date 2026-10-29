@@ -617,6 +617,7 @@ mod item_aware_tests {
 mod rmp_wire_tests {
     use super::*;
     use querymt::chat::{CacheHint, ChatInputPart};
+    use serde_json::json;
 
     fn assert_rmp_round_trip_equal<T>(value: &T)
     where
@@ -799,6 +800,78 @@ mod rmp_wire_tests {
             decoded
         };
         assert_eq!(decoded.output.text().as_deref(), Some("hello"));
+    }
+
+    fn usage_with_tiers(tiers: Option<querymt::CacheWriteTiers>) -> Usage {
+        Usage {
+            input_tokens: 12,
+            output_tokens: 3,
+            reasoning_tokens: 5,
+            cache_read: 30,
+            cache_write: 300,
+            cache_write_tiers: tiers,
+        }
+    }
+
+    #[test]
+    fn cache_write_tiers_survive_remote_response_and_stream_transport() {
+        let cases = [
+            // Breakdown absent: must not turn into zeros.
+            None,
+            // Explicit zero one-hour count stays distinct from absent.
+            Some(querymt::CacheWriteTiers {
+                five_minute: Some(300),
+                one_hour: Some(0),
+            }),
+            // Only one side reported.
+            Some(querymt::CacheWriteTiers {
+                five_minute: None,
+                one_hour: Some(100),
+            }),
+            Some(querymt::CacheWriteTiers {
+                five_minute: Some(200),
+                one_hour: Some(100),
+            }),
+        ];
+        for tiers in cases {
+            let usage = usage_with_tiers(tiers);
+
+            let response = ProviderChatResponse::from(ChatOutput::from_projections(
+                None,
+                Some("hi".to_string()),
+                None,
+                Some(usage.clone()),
+                None,
+            ));
+            let rmp = rmp_serde::to_vec_named(&response).expect("encode response");
+            let decoded: ProviderChatResponse = rmp_serde::decode::from_slice(&rmp).unwrap();
+            assert_eq!(decoded.output.usage, Some(usage.clone()), "rmp {tiers:?}");
+            let json = serde_json::to_vec(&response).expect("json response");
+            let decoded: ProviderChatResponse = serde_json::from_slice(&json).unwrap();
+            assert_eq!(decoded.output.usage, Some(usage.clone()), "json {tiers:?}");
+
+            let relay = StreamRelayMessage::Chunk(StreamChunk::Usage(usage.clone()));
+            let rmp = rmp_serde::to_vec_named(&relay).expect("encode chunk");
+            let decoded: StreamRelayMessage = rmp_serde::decode::from_slice(&rmp).unwrap();
+            let StreamRelayMessage::Chunk(StreamChunk::Usage(decoded)) = decoded else {
+                panic!("expected usage chunk")
+            };
+            assert_eq!(decoded, usage, "stream {tiers:?}");
+            assert_eq!(decoded.cache_write_tiers, tiers);
+        }
+    }
+
+    #[test]
+    fn legacy_usage_without_tiers_decodes_as_absent_over_the_remote_wire() {
+        let response: ProviderChatResponse = serde_json::from_value(json!({
+            "text": "legacy",
+            "usage": {"input_tokens": 1, "output_tokens": 2, "cache_write": 7},
+            "finish_reason": "Stop"
+        }))
+        .expect("usage without tiers");
+        let usage = response.output.usage.expect("usage");
+        assert_eq!(usage.cache_write, 7);
+        assert_eq!(usage.cache_write_tiers, None);
     }
 
     #[test]

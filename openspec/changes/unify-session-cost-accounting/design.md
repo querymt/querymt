@@ -55,12 +55,14 @@ For Anthropic, accumulate raw, presence-aware usage fields before normalization,
 
 ### 2. Value usage with a pure typed result, not mutable totals
 
-Extend `ModelPricing` and its ingestion to represent supported cache-read, aggregate-write, and duration-specific write rates, pricing applicability, and source metadata. Preserve recognized extra pricing dimensions when loading and reserializing the registry instead of silently dropping information needed to identify an unsupported modifier. Do not synthesize TTL rates using universal multipliers; use explicit applicable catalog/provider metadata or manual configuration. Missing trustworthy rates produce partial valuation, not a network dependency in the request path.
+Extend `ModelPricing` and its ingestion to represent the cache-read and cache-write rates the models.dev `cost` schema actually carries (`input`, `output`, `reasoning`, `cache_read`, `cache_write`, audio rates, and `tiers`/`context_over_200k` context tiers), plus pricing applicability and source metadata. Preserve recognized extra pricing dimensions when loading and reserializing the registry instead of silently dropping information needed to identify an unsupported modifier.
+
+The catalog has no per-TTL cache-write rates. Its `cache_write` is the provider's base write price (for Anthropic, the five-minute price), so it prices five-minute writes and writes without a duration breakdown. The only additional rate is an optional explicit one-hour write rate, available solely through manual configuration (or a future catalog field). Nonzero one-hour writes without that rate make only the one-hour portion incomplete. Do not synthesize the one-hour rate from a universal multiplier. Missing trustworthy rates produce partial valuation, not a network dependency in the request path.
 
 Introduce a pure valuation result with:
-- USD component amounts for ordinary input, output including reasoning, cache reads, and write tiers/aggregate writes.
+- USD component amounts for ordinary input, output including reasoning, cache reads, base-rate cache writes, and one-hour cache writes.
 - A finite nonnegative `known_subtotal_usd` and optional `complete_total_usd`.
-- Completeness reasons such as missing usage/rate/duration, contradictory usage, invalid pricing, unsupported known modifier, or unresolved attempt.
+- Completeness reasons such as missing usage, missing rate (including a missing one-hour write rate), contradictory write detail, invalid pricing, unsupported known modifier, or unresolved attempt.
 - Billing scope/classification that distinguishes metered API, explicitly zero-priced, excluded subscription/OAuth, and unknown.
 
 Conceptually, with rates per million tokens:
@@ -69,11 +71,12 @@ Conceptually, with rates per million tokens:
 input       = uncached_input * applicable_input_rate / 1e6
 output      = (ordinary_output + reasoning) * applicable_output_rate / 1e6
 cache_read  = cache_read_tokens * applicable_cache_read_rate / 1e6
-cache_write = sum(write_tier_tokens * applicable_tier_rate / 1e6)
+cache_write = (cache_write - one_hour_writes) * cache_write_rate / 1e6
+            + one_hour_writes * one_hour_write_rate / 1e6   # one-hour term only when reported
 known_subtotal = sum(independently known components)
 ```
 
-Use an aggregate write rate only when it authoritatively covers the reported writes. For contradictory tier counts, do not claim a write charge derived from a purported partition is independently known. Preserve unrelated known components. Required rates depend on nonzero usage; a zero-token component is known zero without needing a rate.
+Writes without a breakdown, or with an absent one-hour count, are valued entirely at the base rate; a reported one-hour count of zero needs no one-hour rate. For contradictory tier counts, do not claim a write charge derived from a purported partition is independently known. Preserve unrelated known components. Required rates depend on nonzero usage; a zero-token component is known zero without needing a rate.
 
 Use validated finite nonnegative `f64` amounts consistent with current USD DTOs, widened/checked token arithmetic, deterministic event order, and tolerance-based tests. Do not round each request to cents. Overflow or invalid external rates become explicit invalid valuation; invalid manual configuration fails validation. This is not an accounting-grade fixed-point currency subsystem.
 
@@ -137,7 +140,7 @@ For a logical main request with retries, `LlmRequestEnd.cost_usd` represents the
 
 ### 8. Budgets warn on missing prices, not on accounting-storage failure
 
-Both limits middleware paths consume cycle budget valuation from the shared handle. Extend `ModelInfoSource::Manual` and price-limit configuration with explicit cache/tier rates and input validation, or route both through an equivalent typed pricing configuration. Preserve per-cycle scope and existing price-limit outcomes. Do not apply uncached input rates to cache tokens as an implicit fallback.
+Both limits middleware paths consume cycle budget valuation from the shared handle. Extend `ModelInfoSource::Manual` and price-limit configuration with explicit cache-read, cache-write, and optional one-hour cache-write rates and input validation, or route both through an equivalent typed pricing configuration. Preserve per-cycle scope and existing price-limit outcomes. Do not apply uncached input rates to cache tokens as an implicit fallback.
 
 Before the next paid main/auxiliary attempt, stop when known cycle spend reaches the cap. Otherwise allow incomplete budgets to continue with a deduplicated warning that enforcement is best-effort. Deduplicate by cycle and material reason set; new missing categories can produce a new warning, repeated streaming snapshots cannot. Ordinary active in-flight attempts are pending, not a reason to spam price warnings; interrupted or settled-incomplete attempts and uncertain prices are reportable conditions.
 
@@ -145,18 +148,28 @@ Use existing advisory capability gating and user-visible fallback channels, not 
 
 ### 9. Publish replacement accounting state and export the ledger once
 
-Add an accounting snapshot alongside existing token metadata, under the existing QueryMT metadata namespace rather than replacing `usage`. The snapshot contains a schema version, API-spend scope, session and active-cycle known subtotals, nullable complete totals, completeness state/reasons, unresolved count, exclusion count, and best-effort-budget status. Complete totals are explicitly null in the snapshot when unavailable, so replacement can clear a prior complete value.
+Preserve `_meta.querymt.usage` v1, including its current main-request token scope and JSON shape. Its latest-request and session token totals are telemetry, not the all-attempt monetary ledger. Do not silently broaden them to include auxiliary/retry attempt tokens or replace them with accounting token sums; any future all-attempt token display needs an explicitly labeled scope.
 
-Populate standard ACP `cost` only from a complete session metered-token estimate. An all-excluded session has no standard provider invoice amount. Mixed sessions disclose that the amount covers metered API attempts and excludes subscriptions. Extend both the normal projection and snapshot event paths; remove the `Some`-only update behavior. Accounting-only changes can emit a usage update using the last valid main context measurement; if context size is unknown, retain accounting in snapshots and advisory metadata without fabricating `used` or `size`.
+Add `_meta.querymt.accounting` version 1 alongside that token metadata. Use one typed replacement DTO for live updates, remote/replayed projections, and an authoritative `accounting` field in the existing `SessionLoadSnapshot`. It contains API-spend scope, session and identified active-cycle known subtotals, nullable complete totals, completeness state/reasons, unresolved/incomplete/excluded counts and historical coverage. Represent no active cycle explicitly rather than guessing from the last attempt to settle; delayed auxiliary settlement must not select an old cycle as active. The cycle also exposes separately labeled budget valuation, budget-specific reasons, and best-effort-budget status so manual budget rates do not masquerade as API charges. Complete totals are explicitly null when unavailable, never omitted by DTO serialization or generated types.
+
+Presence of the accounting payload replaces the previous accounting state atomically, including explicit nulls. Absence of that payload means the message does not update accounting; omission of standard ACP `cost` alone is not a QueryMT clearing signal. Read and serialize totals from the shared reducer, not from request-end convenience costs. Pending attempts may temporarily prevent a complete total but are distinct from settled missing-price/usage reasons and do not alone trigger budget warnings.
+
+Populate standard ACP `cost` only from a complete session metered-token estimate. An all-excluded session has no standard dollar total; explicit zero-priced metered usage remains distinct. Mixed sessions disclose that the amount covers metered API attempts and excludes subscriptions. These are supported estimates, not reconciled invoices. Extend both the normal projection and snapshot event paths; remove the `Some`-only update behavior.
+
+Use `usage_update` as the primary carrier when reliable main-context occupancy and the active model's effective limit are available. Accounting-only changes reuse the last reliable main measurement without replacing it with auxiliary tokens. Validate or invalidate that measurement across model switches rather than combining a stale reading with an unrelated limit. If no reliable measurement/limit pair exists, emit metadata-only `session_info_update._meta.querymt.accounting` with the identical DTO; do not fabricate zero/estimated context or reuse an obsolete limit. Accounting state delivery is independent of notice capability. This fallback does not change the title or activity timestamp solely to carry accounting. Budget notices remain separately capability-gated and deduplicated.
+
+Include authoritative reducer-derived accounting directly in load snapshots even when historical notification replay is disabled or context is unknown. Associate it with the existing snapshot cursor and preserve ordering through the existing local/remote cursor machinery. Applying captured live records after the snapshot must not double count, and an older snapshot must not overwrite newer accounting. Do not introduce a second monetary reducer in the desktop.
 
 Snapshots and remote replay reduce the same records as live handling. Request-end fields remain convenience projections, not accounting inputs for newly recorded attempts. In exports, associate main operation costs with turns and expose auxiliary/unassociated attempt records and session totals separately. ATIF totals must consume one accounting scope and expose incomplete totals as unavailable plus known-subtotal metadata; never use `unwrap_or(0)` to imply complete spend. Do not invent assistant turns for auxiliary charges. Preserve uncertainty when the chosen external export format cannot express all components, using its supported extension mechanism or an explicit omission.
 
-Update generated types and affected Python projections in this repository. Specify the new accounting metadata and stale-value invalidation for `querymt-desktop` follow-up, but do not edit UI implementation here.
+Update generated types and affected Python projections in this repository. Generate types with `PATH=/Users/wiking/.cargo/bin:$PATH ./scripts/generate-types.sh` and verify explicit-null serialization fixtures against generated types.
+
+Document the required `querymt-desktop` follow-up, but do not edit UI implementation here. Both live/replay notification handlers and snapshot hydration must consume authoritative accounting, distinguish an absent payload from a present null complete total, and replace state atomically. `mergeMissingSessionUsage` must not interpret an intentionally cleared cost as a hole to refill from an older candidate; merge precedence must honor existing snapshot/live cursors. Do not derive monetary totals from `llm_request_end` history. Read the same accounting DTO from either update carrier, and avoid scheduling catalog refreshes for accounting-only `session_info_update` messages. Preserve current token-history telemetry separately. Use labels such as "Estimated API cost", "Known API subtotal - incomplete", and "Subscription usage excluded"; show manual-rate cycle budgets separately. Release the desktop follow-up with the backend contract change.
 
 ## Risks / Trade-offs
 
 - [Broad DTO change] -> Coordinate core/provider/plugin/remote/binding updates and run serialization tests; mark source/wire changes as breaking instead of layering legacy adapters.
-- [Missing catalog TTL or modifier rates] -> Preserve details and report partial valuation; warn-and-continue is intentional and does not guarantee a strict cap.
+- [Catalog lacks a one-hour write rate] -> Price base-duration writes with catalog `cache_write`; report only one-hour writes as partial unless a manual one-hour rate is configured. Missing modifier rates likewise report partial valuation; warn-and-continue is intentional and does not guarantee a strict cap.
 - [Extra persistence at attempt start] -> Reuse ordered batching and perform no per-token writes; test latency with existing event infrastructure if the added boundary is measurable.
 - [Unbounded historical identity state] -> Retire projections with session runtimes, hydrate in pages, and avoid copying full events into the reducer; measure before proposing persisted compaction/indexes.
 - [Crash between intent and dispatch] -> Report unresolved spend conservatively; never claim that an unmatched start proves a provider charge or zero cost.
@@ -164,7 +177,8 @@ Update generated types and affected Python projections in this repository. Speci
 - [Old sessions cannot have exact lifetime totals] -> Explicit unaccounted coverage with no historical repricing/backfill.
 - [History deletion erases accounting evidence] -> Protect accounting and coverage evidence in range-deletion/rewind tests while retaining explicit full-session deletion semantics.
 - [Overlapping event-stream work] -> Reuse the current awaited per-session API and confirm behavior against `ordered-session-events`; do not alter its ordering or transport contracts.
-- [Legacy clients retain stale display cost] -> Publish replacement metadata, mark the client contract change, and require coordinated client updates; standard omitted cost alone cannot clear every external client's cache.
+- [Legacy clients retain stale display cost] -> Publish replacement metadata, mark the client contract change, and require coordinated client updates; standard omitted cost alone cannot clear every external client's cache. Preserve intentional nulls through load/snapshot merges and use existing cursors to reject stale accounting.
+- [Accounting-only metadata causes UI refresh churn] -> Document that desktop catalog refreshes depend on actual session-summary changes, not merely receipt of a metadata-only `session_info_update`.
 
 ## Migration Plan
 
@@ -179,6 +193,6 @@ Update generated types and affected Python projections in this repository. Speci
 
 Use production entry points and existing test fixtures to protect distinct behaviors, not a second implementation of pricing in tests. First expose the reasoning/cumulative regression with mock provider requests, then add the shared calculator and test cache/tier/uncertainty boundaries. Cover a first reasoning response followed by zero reasoning, explicit-zero rate/counter cases, final ordinary output below provisional output, mixed TTLs, partial rates, and invalid arithmetic.
 
-Exercise start/settlement persistence, duplicate/conflicting events, journal failure before dispatch, interrupted/cancelled attempts, response-storage failure, auxiliary validation retries, delayed cycle attribution, model switching, multi-cycle restart, rewind/fork isolation, and remote delivery with fresh databases. Assert that main context/steps stay independent from auxiliary usage. Compare live ACP snapshots, replay, budget state, and exports from the same recorded fixture, including complete-to-partial invalidation and all-excluded billing.
+Exercise start/settlement persistence, duplicate/conflicting events, journal failure before dispatch, interrupted/cancelled attempts, response-storage failure, auxiliary validation retries, delayed cycle attribution, model switching, multi-cycle restart, rewind/fork isolation, and remote delivery with fresh databases. Assert that main context/steps stay independent from auxiliary usage. Compare live ACP snapshots, replay, budget state, and exports from the same recorded fixture, including complete-to-partial invalidation and all-excluded billing. Add serialization fixtures for both update carriers and the load snapshot, unchanged usage v1 token scope, distinct API/budget reasons, unknown-context accounting without notices, model-switch context invalidation, and snapshot/captured-live cursor precedence without stale-cost resurrection. Backend fixtures specify the separate desktop acceptance contract; they do not claim desktop implementation is complete.
 
-Detect Nix and use the project dev environment when available. After edits, run package-scoped `cargo check` before formatting, focused tests, formatting checks and Clippy; expand to affected bindings and agent `oauth`/`remote`/`dashboard` combinations from CI. Use the dashboard fixture from `.github/workflows/test-agent.yml` and native provider features rather than default Extism test linking. Do not run indiscriminate all-features or model-download tests. Report commands actually run and remaining gaps. No code builds are required for these planning artifacts.
+Detect Nix and use the project dev environment when available. After edits, run package-scoped `cargo check` before formatting, focused tests with `cargo nextest run`, formatting checks and Clippy; expand to affected bindings and agent `oauth`/`remote`/`dashboard` combinations from CI. Use the dashboard fixture from `.github/workflows/test-agent.yml` and native provider features rather than default Extism test linking. Do not run indiscriminate all-features or model-download tests. Report commands actually run and remaining gaps. No code builds are required for these planning artifacts.

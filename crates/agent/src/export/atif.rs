@@ -3,7 +3,8 @@
 //! This module implements the ATIF specification for exporting agent trajectories
 //! in a standardized JSON format. See: https://github.com/laude-institute/harbor
 
-use crate::events::AgentEvent;
+use crate::accounting::{AccountingSnapshot, AttemptOutcome, AttemptPurpose};
+use crate::events::{AgentEvent, AgentEventKind};
 use crate::export::turns::{self, Turn};
 use crate::session::projection::AuditView;
 use querymt::chat::ReasoningEffort;
@@ -190,6 +191,28 @@ fn tools_to_atif(tools: &[querymt::chat::Tool]) -> Vec<AtifToolDefinition> {
         .collect()
 }
 
+/// One provider attempt in the exported ledger. Main-response attempts link
+/// to the step whose cost they feed (`step_id`); auxiliary attempts
+/// (compaction, delegation summaries) and attempts that never produced a
+/// request end have no step, and no assistant step is invented for them.
+#[derive(Debug, Clone, Serialize)]
+struct AtifAttempt {
+    attempt_id: String,
+    operation_id: String,
+    cycle_id: String,
+    purpose: AttemptPurpose,
+    /// `settled`, or `unresolved` when no settlement was recorded.
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<AttemptOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    billing: Option<querymt::providers::BillingClass>,
+    known_subtotal_usd: f64,
+    complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    step_id: Option<u32>,
+}
+
 /// Builder for constructing ATIF trajectories from agent events
 pub struct ATIFBuilder {
     session_id: String,
@@ -204,7 +227,12 @@ pub struct ATIFBuilder {
     total_prompt_tokens: u32,
     total_completion_tokens: u32,
     total_cached_tokens: u32,
-    total_cost_usd: f64,
+    /// Session accounting reduced from the recorded attempts. The only source
+    /// of exported monetary totals.
+    accounting: Option<AccountingSnapshot>,
+    attempts: Vec<AtifAttempt>,
+    /// attempt id -> exported step id, for attempts that fed a turn's cost.
+    attempt_steps: std::collections::HashMap<String, u32>,
 }
 
 impl ATIFBuilder {
@@ -228,7 +256,76 @@ impl ATIFBuilder {
             total_prompt_tokens: 0,
             total_completion_tokens: 0,
             total_cached_tokens: 0,
-            total_cost_usd: 0.0,
+            accounting: None,
+            attempts: Vec::new(),
+            attempt_steps: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Reduce the session's recorded attempts once, with the shared reducer,
+    /// and list every attempt. Attempts owned by another session (a delegated
+    /// child included in the audit view) are not this session's spend.
+    fn record_accounting(&mut self, events: &[AgentEvent]) {
+        let session_id = self.session_id.clone();
+        let own = |event: &&AgentEvent| event.session_id == session_id;
+        let snapshot = AccountingSnapshot::from_events(
+            &session_id,
+            events.iter().filter(own).map(|e| &e.kind),
+        );
+        let has_evidence = snapshot.session.priced_attempts > 0
+            || snapshot.session.excluded_attempts > 0
+            || snapshot.session.unresolved_attempts > 0
+            || snapshot.session.unaccounted_generations > 0;
+        self.accounting = has_evidence.then_some(snapshot);
+
+        let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for event in events.iter().filter(own) {
+            match &event.kind {
+                AgentEventKind::LlmAttemptStarted { start } => {
+                    let attempt = &start.attempt;
+                    index.entry(attempt.attempt_id.clone()).or_insert_with(|| {
+                        self.attempts.push(AtifAttempt {
+                            attempt_id: attempt.attempt_id.clone(),
+                            operation_id: attempt.operation_id.clone(),
+                            cycle_id: attempt.cycle_id.clone(),
+                            purpose: attempt.purpose,
+                            state: "unresolved",
+                            outcome: None,
+                            billing: Some(start.billing),
+                            known_subtotal_usd: 0.0,
+                            complete: false,
+                            step_id: self.attempt_steps.get(&attempt.attempt_id).copied(),
+                        });
+                        self.attempts.len() - 1
+                    });
+                }
+                AgentEventKind::LlmAttemptSettled { settlement } => {
+                    let attempt = &settlement.attempt;
+                    let record = AtifAttempt {
+                        attempt_id: attempt.attempt_id.clone(),
+                        operation_id: attempt.operation_id.clone(),
+                        cycle_id: attempt.cycle_id.clone(),
+                        purpose: attempt.purpose,
+                        state: "settled",
+                        outcome: Some(settlement.outcome),
+                        billing: Some(settlement.valuation.billing),
+                        known_subtotal_usd: settlement.valuation.known_subtotal_usd,
+                        complete: settlement.valuation.complete_total_usd.is_some(),
+                        step_id: self.attempt_steps.get(&attempt.attempt_id).copied(),
+                    };
+                    match index.get(&attempt.attempt_id) {
+                        // The first settlement wins; an identical redelivery
+                        // must not add or change anything.
+                        Some(&i) if self.attempts[i].state == "settled" => {}
+                        Some(&i) => self.attempts[i] = record,
+                        None => {
+                            index.insert(attempt.attempt_id.clone(), self.attempts.len());
+                            self.attempts.push(record);
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -264,6 +361,7 @@ impl ATIFBuilder {
 
             builder.add_agent_step_from_turn(turn);
         }
+        builder.record_accounting(&view.events);
 
         builder
     }
@@ -303,12 +401,28 @@ impl ATIFBuilder {
             }
             self.add_agent_step_from_turn(turn);
         }
+        self.record_accounting(events);
     }
 
     /// Convert a materialized [`Turn`] into an ATIF agent step.
     fn add_agent_step_from_turn(&mut self, turn: &Turn) {
-        // Build metrics from usage
+        if let Some(accounting) = &turn.accounting {
+            for attempt_id in &accounting.attempt_ids {
+                self.attempt_steps
+                    .insert(attempt_id.clone(), self.current_step_id);
+            }
+        }
+        // Build metrics from usage. `cost_usd` is the operation's complete
+        // supported cost, or absent; an incomplete operation reports its
+        // known subtotal and reasons in `extra` instead of a zero.
         let metrics = turn.usage.as_ref().map(|u| {
+            let extra = turn.accounting.as_ref().filter(|a| !a.complete).map(|a| {
+                serde_json::json!({ "accounting": {
+                    "complete": false,
+                    "known_subtotal_usd": a.known_subtotal_usd,
+                    "reasons": a.reasons,
+                }})
+            });
             let m = AtifMetrics {
                 prompt_tokens: Some(u.input_tokens),
                 completion_tokens: Some(u.output_tokens),
@@ -317,11 +431,10 @@ impl ATIFBuilder {
                 prompt_token_ids: None,
                 completion_token_ids: None,
                 logprobs: None,
-                extra: None,
+                extra,
             };
             self.total_prompt_tokens += m.prompt_tokens.unwrap_or(0);
             self.total_completion_tokens += m.completion_tokens.unwrap_or(0);
-            self.total_cost_usd += m.cost_usd.unwrap_or(0.0);
             m
         });
 
@@ -441,14 +554,28 @@ impl ATIFBuilder {
 
     /// Build the final trajectory
     pub fn build(self) -> ATIF {
-        let final_metrics = if self.total_prompt_tokens > 0 || self.total_completion_tokens > 0 {
+        let has_tokens = self.total_prompt_tokens > 0 || self.total_completion_tokens > 0;
+        let final_metrics = if has_tokens || self.accounting.is_some() {
+            // One accounting scope: the reducer's session total. It is
+            // `None` unless complete, so unknown costs never become a zero
+            // total; the known subtotal and reasons travel in `extra`.
+            let total_cost_usd = self
+                .accounting
+                .as_ref()
+                .and_then(|a| a.session.complete_total_usd);
+            let extra = self.accounting.as_ref().map(|accounting| {
+                serde_json::json!({
+                    "accounting": accounting,
+                    "attempts": self.attempts,
+                })
+            });
             Some(AtifFinalMetrics {
                 total_prompt_tokens: Some(self.total_prompt_tokens),
                 total_completion_tokens: Some(self.total_completion_tokens),
                 total_cached_tokens: Some(self.total_cached_tokens),
-                total_cost_usd: Some(self.total_cost_usd),
+                total_cost_usd,
                 total_steps: Some(self.steps.len() as u32),
-                extra: None,
+                extra,
             })
         } else {
             None
@@ -587,6 +714,7 @@ mod tests {
                     cumulative_cost_usd: None,
                     context_tokens: 100,
                     metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                    accounting: None,
                 },
             },
         ];
@@ -778,6 +906,7 @@ mod tests {
                         reasoning_tokens: 0,
                         cache_read: 0,
                         cache_write: 0,
+                        cache_write_tiers: None,
                     }),
                     tool_calls: 0,
                     finish_reason: None,
@@ -785,6 +914,7 @@ mod tests {
                     cumulative_cost_usd: Some(0.01),
                     context_tokens: 150,
                     metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                    accounting: None,
                 },
             },
         ];
@@ -797,6 +927,191 @@ mod tests {
         let metrics = atif.final_metrics.unwrap();
         assert_eq!(metrics.total_prompt_tokens, Some(100));
         assert_eq!(metrics.total_completion_tokens, Some(50));
-        assert_eq!(metrics.total_cost_usd, Some(0.01));
+        // Legacy request end: no accounting basis, so no dollar total.
+        assert_eq!(metrics.total_cost_usd, None);
+        assert_eq!(atif.steps[0].metrics.as_ref().unwrap().cost_usd, None);
+    }
+
+    // ── Shared-ledger accounting ───────────────────────────────────────────
+
+    fn ev(seq: i64, kind: AgentEventKind) -> AgentEvent {
+        AgentEvent {
+            session_seq: 0,
+            seq,
+            timestamp: 1_000 + seq,
+            session_id: "sess-1".to_string(),
+            origin: EventOrigin::Local,
+            source_node: None,
+            kind,
+        }
+    }
+
+    /// start + settlement for one attempt of `sess-1`.
+    fn attempt(seq: i64, id: &str, purpose: AttemptPurpose, complete: bool) -> Vec<AgentEvent> {
+        use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
+        let mut start = sample_start();
+        start.attempt.attempt_id = id.into();
+        start.attempt.operation_id = format!("op-{id}");
+        start.attempt.session_id = "sess-1".into();
+        start.attempt.purpose = purpose;
+        let mut settlement = sample_settlement();
+        settlement.attempt = start.attempt.clone();
+        if !complete {
+            let mut pricing = sample_pricing();
+            pricing.cache_write = None;
+            settlement.valuation =
+                querymt::providers::value_usage(Some(&pricing), settlement.usage.as_ref());
+            settlement.pricing = Some(pricing);
+        }
+        vec![
+            ev(seq, AgentEventKind::LlmAttemptStarted { start }),
+            ev(seq + 1, AgentEventKind::LlmAttemptSettled { settlement }),
+        ]
+    }
+
+    fn request(seq: i64, attempt_id: &str, cost: f64, complete: bool) -> Vec<AgentEvent> {
+        vec![
+            ev(seq, AgentEventKind::LlmRequestStart { message_count: 1 }),
+            ev(
+                seq + 1,
+                AgentEventKind::LlmRequestEnd {
+                    usage: Some(querymt::Usage {
+                        input_tokens: 100,
+                        output_tokens: 10,
+                        ..Default::default()
+                    }),
+                    tool_calls: 0,
+                    finish_reason: None,
+                    cost_usd: complete.then_some(cost),
+                    cumulative_cost_usd: None,
+                    context_tokens: 110,
+                    metrics: crate::events::ExecutionMetrics { steps: 1, turns: 1 },
+                    accounting: Some(crate::accounting::RequestAccounting {
+                        operation_id: format!("op-{attempt_id}"),
+                        attempt_ids: vec![attempt_id.into()],
+                        known_subtotal_usd: cost,
+                        complete,
+                        reasons: vec![],
+                    }),
+                },
+            ),
+        ]
+    }
+
+    fn export(events: &[AgentEvent]) -> serde_json::Value {
+        let mut builder = ATIFBuilder::new("sess-1".to_string(), &AtifExportOptions::default());
+        builder.process_events(events);
+        builder.build().to_json_value().unwrap()
+    }
+
+    fn sample_cost() -> f64 {
+        (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6
+    }
+
+    #[test]
+    fn export_total_matches_reducer_and_includes_auxiliary_without_fabricating_steps() {
+        let mut events = attempt(1, "a1", AttemptPurpose::MainResponse, true);
+        events.extend(request(3, "a1", sample_cost(), true));
+        events.extend(attempt(5, "a2", AttemptPurpose::Compaction, true));
+        let json = export(&events);
+
+        let total = json["final_metrics"]["total_cost_usd"].as_f64().unwrap();
+        assert!((total - 2.0 * sample_cost()).abs() < 1e-12);
+        // One agent step for the one main request; compaction has none.
+        assert_eq!(json["steps"].as_array().unwrap().len(), 1);
+        let attempts = json["final_metrics"]["extra"]["attempts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        let main = attempts.iter().find(|a| a["attempt_id"] == "a1").unwrap();
+        assert_eq!(main["step_id"], 1);
+        let aux = attempts.iter().find(|a| a["attempt_id"] == "a2").unwrap();
+        assert!(aux.get("step_id").is_none());
+        assert_eq!(aux["purpose"], "compaction");
+        // The step cost is the operation cost, not added again to the total.
+        let step = json["steps"][0]["metrics"]["cost_usd"].as_f64().unwrap();
+        assert!((step - sample_cost()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn unknown_cost_is_not_a_complete_zero_total() {
+        let mut events = attempt(1, "a1", AttemptPurpose::MainResponse, true);
+        events.extend(attempt(3, "a2", AttemptPurpose::MainResponse, false));
+        events.extend(request(5, "a2", 0.001, false));
+        let json = export(&events);
+        let metrics = &json["final_metrics"];
+        assert!(metrics.get("total_cost_usd").is_none_or(|v| v.is_null()));
+        let accounting = &metrics["extra"]["accounting"]["session"];
+        assert_eq!(accounting["complete"], false);
+        assert!(accounting["knownSubtotalUsd"].as_f64().unwrap() > sample_cost());
+        assert_eq!(accounting["incompleteAttempts"], 1);
+        // The step reports its known subtotal and incompleteness, no cost.
+        let step = &json["steps"][0]["metrics"];
+        assert!(step.get("cost_usd").is_none_or(|v| v.is_null()));
+        assert_eq!(step["extra"]["accounting"]["complete"], false);
+    }
+
+    #[test]
+    fn failed_and_unresolved_attempts_stay_represented() {
+        use crate::accounting::tests::sample_start;
+        let mut events = attempt(1, "a1", AttemptPurpose::MainResponse, true);
+        // Started but never settled (interrupted before final accounting).
+        let mut start = sample_start();
+        start.attempt.attempt_id = "a2".into();
+        start.attempt.session_id = "sess-1".into();
+        events.push(ev(3, AgentEventKind::LlmAttemptStarted { start }));
+        let json = export(&events);
+        let metrics = &json["final_metrics"];
+        assert!(metrics.get("total_cost_usd").is_none_or(|v| v.is_null()));
+        assert_eq!(
+            metrics["extra"]["accounting"]["session"]["unresolvedAttempts"],
+            1
+        );
+        let attempts = metrics["extra"]["attempts"].as_array().unwrap();
+        let open = attempts.iter().find(|a| a["attempt_id"] == "a2").unwrap();
+        assert_eq!(open["state"], "unresolved");
+    }
+
+    #[test]
+    fn duplicate_records_do_not_double_count() {
+        let once = attempt(1, "a1", AttemptPurpose::MainResponse, true);
+        let mut twice = once.clone();
+        twice.extend(once.iter().cloned());
+        assert_eq!(
+            export(&once)["final_metrics"]["total_cost_usd"],
+            export(&twice)["final_metrics"]["total_cost_usd"]
+        );
+        let attempts = export(&twice)["final_metrics"]["extra"]["attempts"].clone();
+        assert_eq!(attempts.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn another_sessions_attempts_are_not_this_sessions_spend() {
+        let mut events = attempt(1, "a1", AttemptPurpose::MainResponse, true);
+        let mut child = attempt(3, "c1", AttemptPurpose::MainResponse, true);
+        for e in &mut child {
+            e.session_id = "child".into();
+        }
+        events.extend(child);
+        let json = export(&events);
+        let total = json["final_metrics"]["total_cost_usd"].as_f64().unwrap();
+        assert!((total - sample_cost()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn all_excluded_session_has_no_dollar_total() {
+        let mut events = attempt(1, "a1", AttemptPurpose::MainResponse, true);
+        for e in &mut events {
+            if let AgentEventKind::LlmAttemptSettled { settlement } = &mut e.kind {
+                settlement.valuation = querymt::providers::UsageValuation::excluded();
+            }
+        }
+        let json = export(&events);
+        let metrics = &json["final_metrics"];
+        assert!(metrics.get("total_cost_usd").is_none_or(|v| v.is_null()));
+        assert_eq!(
+            metrics["extra"]["accounting"]["session"]["billing"],
+            "excluded"
+        );
     }
 }

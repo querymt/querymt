@@ -38,6 +38,15 @@ pub struct UserPromptRecord {
 pub struct SessionLoadSnapshot {
     pub audit: AuditView,
     pub cursor: StreamCursor,
+    /// Authoritative replacement accounting at `cursor`, reduced from the same
+    /// audit events by the shared accounting reducer. Present even when
+    /// historical replay is skipped or the context limit is unknown.
+    ///
+    /// Optional on the wire only so snapshots from agents that predate
+    /// accounting still deserialize; absence means "no accounting reported".
+    #[serde(default)]
+    #[typeshare(serialized_as = "AccountingSnapshot")]
+    pub accounting: crate::accounting::AccountingSnapshot,
     #[serde(rename = "delegationUpdates")]
     pub delegation_updates:
         Vec<crate::control::delegation_notifications::DelegationUpdateNotification>,
@@ -117,6 +126,10 @@ pub async fn load_session_snapshot(
         view_store.get_audit_view(session_id, false).await?
     };
     let cursor = cursor_from_events(&audit.events);
+    let accounting = crate::accounting::AccountingSnapshot::from_events(
+        session_id,
+        audit.events.iter().map(|event| &event.kind),
+    );
     let delegation_updates =
         crate::control::delegation_notifications::delegation_updates_from_events(&audit.events);
     // Journal-backed sessions (remote attached, or merely bookmarked while
@@ -144,6 +157,7 @@ pub async fn load_session_snapshot(
     Ok(SessionLoadSnapshot {
         audit,
         cursor,
+        accounting,
         delegation_updates,
         user_prompts,
     })

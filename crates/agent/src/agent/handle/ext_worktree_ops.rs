@@ -553,10 +553,40 @@ impl LocalAgentHandle {
             initial_backoff_ms: policy.retry.initial_backoff_ms,
             backoff_multiplier: policy.retry.backoff_multiplier,
         };
+        // The handoff summary is a paid request outside any prompt: charge it
+        // to a maintenance cycle of the previous session.
+        let accounting = self
+            .config
+            .event_sink
+            .session_accounting(previous)
+            .await
+            .map_err(|err| failed(format!("accounting unavailable: {err}")))?;
+        let cycle = crate::accounting::CycleAccounting::begin_maintenance(accounting);
+        let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
+            self.config.event_sink.session_stream(previous),
+            cycle.session_accounting().clone(),
+        ));
+        let provider_name = handle
+            .llm_config()
+            .map(|config| config.provider.clone())
+            .unwrap_or_default();
+        let ledger = crate::accounting::DispatchLedger {
+            operation: Arc::new(
+                crate::accounting::AttemptOperation::new(
+                    recorder,
+                    &cycle,
+                    crate::accounting::AttemptPurpose::Compaction,
+                    provider_name,
+                    model.clone(),
+                )
+                .with_budget_pricing(self.config.budget_pricing()),
+            ),
+            basis: handle.billing_basis(),
+        };
         let result = self
             .config
             .compaction
-            .process(&messages, llm_provider, &model, &retry, None)
+            .process(&messages, llm_provider, &model, &retry, None, &ledger)
             .await
             .map_err(|err| failed(err.to_string()))?;
         crate::session::compaction::SessionCompaction::validate_summary(&result.summary)

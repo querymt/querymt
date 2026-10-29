@@ -960,6 +960,11 @@ impl SessionStore for SqliteStorage {
                 }
             }
 
+            // Accounting ownership is never inherited: `llm_attempt_started` /
+            // `llm_attempt_settled` stay with the session that dispatched the
+            // attempt, so a fork starts its own spend scope and copied
+            // assistant messages (and their usage) create no fork charges.
+            // The filter above is an allowlist; do not widen it to accounting.
             // Copy only conversational durable events into the fork timeline.
             // Risk/tradeoff: operational events (tool calls, llm lifecycle, provider/task/progress/
             // delegation telemetry) are intentionally excluded because replaying them in a fork can

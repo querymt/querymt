@@ -30,6 +30,15 @@ pub struct EventSink {
     journal: Arc<dyn EventJournal>,
     fanout: Arc<EventFanout>,
     streams: Mutex<StreamRegistry>,
+    /// One shared accounting projection per live session, so every component
+    /// that records or reads spend (execution, compaction, delegation
+    /// summaries) sees the same totals. Released with the session's stream.
+    accounting: Mutex<
+        std::collections::HashMap<
+            String,
+            Arc<tokio::sync::OnceCell<Arc<crate::accounting::SessionAccounting>>>,
+        >,
+    >,
 }
 
 #[derive(Default)]
@@ -48,7 +57,27 @@ impl EventSink {
             journal,
             fanout,
             streams: Mutex::new(StreamRegistry::default()),
+            accounting: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// The session's shared accounting projection, hydrated from the journal
+    /// on first use. Concurrent callers share one hydration.
+    pub async fn session_accounting(
+        &self,
+        session_id: &str,
+    ) -> Result<Arc<crate::accounting::SessionAccounting>, crate::accounting::AccountingError> {
+        let cell = self
+            .accounting
+            .lock()
+            .entry(session_id.to_string())
+            .or_default()
+            .clone();
+        cell.get_or_try_init(|| {
+            crate::accounting::SessionAccounting::hydrate(session_id, self.journal.clone())
+        })
+        .await
+        .cloned()
     }
 
     /// The ordered emit handle of a session, created on first use.
@@ -93,6 +122,9 @@ impl EventSink {
     /// stream was released.
     pub async fn retire_session_stream(&self, session_id: &str) -> bool {
         let Some(stream) = self.streams.lock().live.get(session_id).cloned() else {
+            // No ordered stream, but the accounting projection must not outlive
+            // the session's retirement.
+            self.accounting.lock().remove(session_id);
             return false;
         };
         stream.flush().await;
@@ -106,6 +138,7 @@ impl EventSink {
             && stream.is_idle()
             && Arc::strong_count(&stream) == 2;
         if released {
+            self.accounting.lock().remove(session_id);
             registry.live.remove(session_id);
             registry
                 .retired_tips

@@ -227,19 +227,17 @@ impl Default for OutputLimitRecoveryMiddleware {
 impl OutputLimitRecoveryMiddleware {
     /// Discard a cut-off reply and retry the same request at `target`.
     ///
-    /// The discarded attempt was billed, so its usage is folded into the stats
-    /// the retried request starts from.
+    /// The discarded attempt was billed, so its token usage is folded into the
+    /// stats the retried request starts from. Its cost is already recorded by
+    /// accounting and reaches the monetary stats fields when they are refreshed
+    /// from the cycle totals before the next model step.
     fn escalate_to(
         context: &ConversationContext,
         response: &LlmResponse,
         target: u32,
     ) -> ExecutionState {
         let mut stats = (*context.stats).clone();
-        apply_usage_to_stats(
-            &mut stats,
-            response.usage.as_ref(),
-            context.profile.pricing.as_ref(),
-        );
+        apply_usage_to_stats(&mut stats, response.usage.as_ref());
         let mut next = context
             .clone()
             .with_request_overrides(GenerationOptions::NONE.with_max_tokens(target));
@@ -568,7 +566,6 @@ mod tests {
             capabilities: querymt::chat::ChatCapabilities::NONE
                 .with_options(querymt::chat::GenerationOptionSupport::ALL),
             reasoning_effort: None,
-            pricing: None,
         })
     }
 
@@ -582,6 +579,7 @@ mod tests {
                 reasoning_tokens: 0,
                 cache_read: 0,
                 cache_write: 0,
+                cache_write_tiers: None,
             }),
             Some(finish),
         ))

@@ -20,17 +20,22 @@ Canonical usage SHALL distinguish uncached input, non-reasoning output, reasonin
 - **AND** the categories survive serialization without adding the cached counts to the input total again
 
 ### Requirement: Cache-write tiers partition aggregate writes
-Accounting SHALL retain returned cache-write tiers as a breakdown of aggregate writes, not additional tokens. Tier-sensitive pricing SHALL use the actual returned counts. Missing or contradictory tier data SHALL be identified as uncertainty; requested cache controls alone SHALL NOT establish actual writes. A single aggregate write rate SHALL apply only when authoritative pricing states it covers those writes.
+Returned cache-write tiers SHALL be a breakdown of aggregate writes, not additional tokens. The catalog `cache_write` rate SHALL price five-minute writes and writes without duration detail. Returned one-hour writes SHALL use an explicit one-hour rate; without one, only that portion SHALL be incomplete. One-hour rates SHALL NOT be synthesized, and contradictory tier data SHALL be reported as uncertainty.
 
-#### Scenario: Mixed-duration cache writes
-- **WHEN** usage reports 300 writes comprising 200 five-minute writes and 100 one-hour writes
-- **THEN** the write charge is calculated from the two tier counts and their respective rates
+#### Scenario: Writes priced at the catalog base rate
+- **WHEN** usage reports 300 cache writes with no duration breakdown, or a breakdown of 300 five-minute writes, and the catalog provides a `cache_write` rate
+- **THEN** the write charge is 300 tokens at the catalog `cache_write` rate
+- **AND** the estimate can be complete
+
+#### Scenario: Mixed-duration cache writes with a one-hour rate
+- **WHEN** usage reports 300 writes comprising 200 five-minute and 100 one-hour writes and an explicit one-hour rate is configured
+- **THEN** the write charge is 200 tokens at the base rate plus 100 tokens at the one-hour rate
 - **AND** total input-token accounting includes 300 writes, not 600
 
-#### Scenario: Write duration is unknown
-- **WHEN** writes require duration-sensitive rates but the response lacks the necessary breakdown
-- **THEN** accounting marks the unresolved write charge incomplete
-- **AND** it retains all independently calculable charges without assuming the cheapest duration
+#### Scenario: One-hour writes without a one-hour rate
+- **WHEN** usage reports 100 one-hour writes and no explicit one-hour rate is available
+- **THEN** accounting marks the one-hour write charge incomplete while retaining the base-rate five-minute charge and all other components
+- **AND** it does not price the one-hour writes at the base rate
 
 #### Scenario: Inconsistent breakdown
 - **WHEN** the returned write-tier counts disagree with the returned aggregate write count

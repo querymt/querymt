@@ -315,6 +315,7 @@ async fn seed_scenario(spec: SyntheticSessionSpec) -> Scenario {
                     steps: index as u32 + 1,
                     turns: index as u32 + 1,
                 },
+                accounting: None,
             },
         )
         .await;

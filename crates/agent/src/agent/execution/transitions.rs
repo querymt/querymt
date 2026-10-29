@@ -274,6 +274,55 @@ fn contextualize_llm_error(
 /// Map a failed LLM setup/call into either `Cancelled` or a contextualized error.
 ///
 /// Cancel must never bubble as `Err`; it is an execution state, not a provider failure.
+fn accounting_failure(error: crate::accounting::AccountingError) -> anyhow::Error {
+    anyhow::anyhow!("accounting failure: {error}")
+}
+
+/// The logical accounting operation for one main model request. Its retries
+/// are separate attempts. Failing to open accounting is an execution error:
+/// no paid request may be sent without a ledger.
+async fn main_attempt_operation(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+) -> Result<crate::accounting::AttemptOperation, anyhow::Error> {
+    let cycle = exec_ctx
+        .cycle_accounting(&config.event_sink)
+        .await
+        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?;
+    let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
+        config.event_sink.session_stream(&exec_ctx.session_id),
+        cycle.session_accounting().clone(),
+    ));
+    let (provider, model) = exec_ctx
+        .llm_config()
+        .map(|c| (c.provider.clone(), c.model.clone()))
+        .unwrap_or_default();
+    Ok(crate::accounting::AttemptOperation::new(
+        recorder,
+        cycle,
+        crate::accounting::AttemptPurpose::MainResponse,
+        provider,
+        model,
+    )
+    .with_budget_pricing(config.budget_pricing())
+    .with_budget_cap(config.budget_cap_usd()))
+}
+
+/// A paid dispatch the cycle budget gate refused ends the cycle as a
+/// price-limit stop, not an execution failure. Nothing was sent.
+fn budget_stop(
+    operation: &crate::accounting::AttemptOperation,
+    context: &Arc<crate::middleware::ConversationContext>,
+) -> Option<ExecutionState> {
+    operation
+        .budget_refusal()
+        .map(|(cap, spent)| ExecutionState::Stopped {
+            message: format!("Price limit reached: ${spent:.4} >= ${cap:.2}").into(),
+            stop_type: StopType::PriceLimit,
+            context: Some(context.clone()),
+        })
+}
+
 fn map_failed_llm_call(
     error: LLMError,
     streaming: bool,
@@ -715,6 +764,7 @@ pub(super) async fn transition_call_llm(
 
     let session_handle = &exec_ctx.session_handle;
     let messages_with_cache = request_messages;
+    let operation = main_attempt_operation(config, exec_ctx).await?;
 
     // Pre-allocated message_id for streaming path so that delta events and the
     // final AssistantMessageStored share the same ID.
@@ -733,16 +783,25 @@ pub(super) async fn transition_call_llm(
             || {
                 let messages_with_cache = &messages_with_cache;
                 let cancel = cancel.clone();
+                let operation = &operation;
                 async move {
+                    // Provider resolution is local: a failure here is not a
+                    // paid attempt. Billing is bound once it is resolved.
+                    let provider = tokio::select! {
+                        result = session_handle.provider() => result.map_err(LLMError::from)?,
+                        _ = cancel.cancelled() => return Err(LLMError::Cancelled),
+                    };
+                    // Per-request options the provider does not honour are dropped.
+                    let options =
+                        crate::session::provider::supported_overrides(provider.as_ref(), options);
                     let call = ChatCall::new(messages_with_cache).options(options);
-                    tokio::select! {
-                        result = session_handle.submit_request(&call) => {
-                            result
-                        }
-                        _ = cancel.cancelled() => {
-                            Err(querymt::error::LLMError::Cancelled)
-                        }
-                    }
+                    crate::accounting::run_attempt(
+                        operation,
+                        session_handle.billing_basis(),
+                        &cancel,
+                        || provider.chat(&call),
+                    )
+                    .await
                 }
             },
         )
@@ -754,6 +813,9 @@ pub(super) async fn transition_call_llm(
             }
             Err(e) => {
                 session_handle.record_generation_settings(&chat_span, options);
+                if let Some(stop) = budget_stop(&operation, context) {
+                    return Ok(stop);
+                }
                 return map_failed_llm_call(e, false, context);
             }
         }
@@ -910,6 +972,25 @@ pub(super) async fn transition_call_llm(
                     return Ok(ExecutionState::Cancelled);
                 }
 
+                // Durable start before the request is sent; a failure here
+                // means nothing was dispatched.
+                let mut attempt = match operation
+                    .begin(
+                        crate::accounting::DispatchMode::Streaming,
+                        session_handle.billing_basis(),
+                    )
+                    .await
+                {
+                    Ok(attempt) => attempt,
+                    Err(error) => {
+                        if let Some(stop) = budget_stop(&operation, context) {
+                            return Ok(stop);
+                        }
+                        return Err(accounting_failure(error));
+                    }
+                };
+                let mut response_started = false;
+
                 first_chunk.start();
                 let mut stream = match provider
                     .chat_stream(
@@ -923,7 +1004,13 @@ pub(super) async fn transition_call_llm(
                     Err(error) => match super::llm_retry::handle_stream_failure(
                         config,
                         session_id,
-                        error,
+                        {
+                            attempt
+                                .settle_error(&error, false, None)
+                                .await
+                                .map_err(accounting_failure)?;
+                            error
+                        },
                         &mut retry_budget,
                         false,
                         Some(message_id.clone()),
@@ -975,7 +1062,17 @@ pub(super) async fn transition_call_llm(
                         Err(error) => match super::llm_retry::handle_stream_failure(
                             config,
                             session_id,
-                            error,
+                            {
+                                attempt
+                                    .settle_error(
+                                        &error,
+                                        response_started,
+                                        accumulator.output().usage,
+                                    )
+                                    .await
+                                    .map_err(accounting_failure)?;
+                                error
+                            },
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
@@ -994,6 +1091,7 @@ pub(super) async fn transition_call_llm(
                     };
 
                     first_chunk.received(&chat_span);
+                    response_started = true;
                     semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
                     // Canonical accumulation. Accumulator violations are provider
@@ -1006,7 +1104,14 @@ pub(super) async fn transition_call_llm(
                         match super::llm_retry::handle_stream_failure(
                             config,
                             session_id,
-                            stream_accumulation_error(error),
+                            {
+                                let error = stream_accumulation_error(error);
+                                attempt
+                                    .settle_error(&error, true, accumulator.output().usage)
+                                    .await
+                                    .map_err(accounting_failure)?;
+                                error
+                            },
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
@@ -1067,6 +1172,14 @@ pub(super) async fn transition_call_llm(
                                     drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
                                         .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
+                                    let partial = crate::accounting::merge_usage(
+                                        accumulator.output().usage,
+                                        drained_usage.take(),
+                                    );
+                                    attempt
+                                        .settle_error(&LLMError::Cancelled, true, partial)
+                                        .await
+                                        .map_err(accounting_failure)?;
                                     return Ok(ExecutionState::Cancelled);
                                 }
                                 break;
@@ -1126,6 +1239,8 @@ pub(super) async fn transition_call_llm(
                             flush_buffers!(true);
                         }
                         StreamChunk::Usage(u) => {
+                            // Keep streamed usage so an abandoned attempt settles with it.
+                            attempt.observe_usage(Some(u.clone()));
                             trace!(
                                 "stream chunk: session={} message_id={} type=usage input={} output={} reasoning={}",
                                 session_id,
@@ -1154,6 +1269,14 @@ pub(super) async fn transition_call_llm(
                                     drain_trailing_usage(&mut stream, &exec_ctx.cancellation_token)
                                         .await;
                                 if exec_ctx.cancellation_token.is_cancelled() {
+                                    let partial = crate::accounting::merge_usage(
+                                        accumulator.output().usage,
+                                        drained_usage.take(),
+                                    );
+                                    attempt
+                                        .settle_error(&LLMError::Cancelled, true, partial)
+                                        .await
+                                        .map_err(accounting_failure)?;
                                     return Ok(ExecutionState::Cancelled);
                                 }
 
@@ -1165,7 +1288,17 @@ pub(super) async fn transition_call_llm(
                                     match super::llm_retry::handle_stream_failure(
                                         config,
                                         session_id,
-                                        error,
+                                        {
+                                            let rejected = merge_drained_usage(
+                                                accumulator.output(),
+                                                drained_usage.take(),
+                                            );
+                                            attempt
+                                                .settle_rejected_output(&rejected, false)
+                                                .await
+                                                .map_err(accounting_failure)?;
+                                            error
+                                        },
                                         &mut retry_budget,
                                         semantic_output_seen,
                                         Some(message_id.clone()),
@@ -1210,7 +1343,12 @@ pub(super) async fn transition_call_llm(
                 // calls are attempt failures and never dispatch tools.
                 match accumulator.finish() {
                     ChatStreamFinish::Completed(output) => {
-                        break 'stream merge_drained_usage(output, drained_usage.take());
+                        let output = merge_drained_usage(output, drained_usage.take());
+                        attempt
+                            .settle_output(&output)
+                            .await
+                            .map_err(accounting_failure)?;
+                        break 'stream output;
                     }
                     ChatStreamFinish::Incomplete { output, .. } => {
                         warn!(
@@ -1219,9 +1357,14 @@ pub(super) async fn transition_call_llm(
                         );
                         // Preserve partial output and the terminal status; the
                         // incomplete cause is handled downstream without retries.
-                        break 'stream merge_drained_usage(output, drained_usage.take());
+                        let output = merge_drained_usage(output, drained_usage.take());
+                        attempt
+                            .settle_output(&output)
+                            .await
+                            .map_err(accounting_failure)?;
+                        break 'stream output;
                     }
-                    ChatStreamFinish::Failed { error, .. } => {
+                    ChatStreamFinish::Failed { output, error } => {
                         debug!(
                             "Stream failed terminal validation: session={} message_id={}",
                             session_id, message_id
@@ -1229,7 +1372,15 @@ pub(super) async fn transition_call_llm(
                         match super::llm_retry::handle_stream_failure(
                             config,
                             session_id,
-                            stream_accumulation_error(error),
+                            {
+                                let error = stream_accumulation_error(error);
+                                let rejected = merge_drained_usage(output, drained_usage.take());
+                                attempt
+                                    .settle_rejected_output(&rejected, true)
+                                    .await
+                                    .map_err(accounting_failure)?;
+                                error
+                            },
                             &mut retry_budget,
                             semantic_output_seen,
                             Some(message_id.clone()),
@@ -1290,25 +1441,30 @@ pub(super) async fn transition_call_llm(
                     let messages_with_cache = &messages_with_cache;
                     let tools = tools.as_ref();
                     let cancel = cancel.clone();
+                    let operation = &operation;
                     async move {
                         let call = ChatCall::new(messages_with_cache)
                             .tools(tools)
                             .options(options);
-                        tokio::select! {
-                            result = provider.chat(&call) => {
-                                result
-                            }
-                            _ = cancel.cancelled() => {
-                                Err(querymt::error::LLMError::Cancelled)
-                            }
-                        }
+                        crate::accounting::run_attempt(
+                            operation,
+                            session_handle.billing_basis(),
+                            &cancel,
+                            || provider.chat(&call),
+                        )
+                        .await
                     }
                 },
             )
             .await
             {
                 Ok(resp) => resp,
-                Err(e) => return map_failed_llm_call(e, false, context),
+                Err(e) => {
+                    if let Some(stop) = budget_stop(&operation, context) {
+                        return Ok(stop);
+                    }
+                    return map_failed_llm_call(e, false, context);
+                }
             }
         }
     };
@@ -1324,25 +1480,17 @@ pub(super) async fn transition_call_llm(
     let usage = output.usage.clone();
     let finish_reason = output.finish_reason;
 
-    let (request_cost, cumulative_cost) = if let Some(usage_info) = &usage {
-        let pricing = session_handle.get_pricing();
-        // Reasoning tokens are billed at the output rate (no separate pricing).
-        let billable_output = usage_info.output_tokens as u64 + usage_info.reasoning_tokens as u64;
-        let request_cost = pricing
-            .as_ref()
-            .and_then(|p| p.calculate_cost(usage_info.input_tokens as u64, billable_output));
-        let cumulative_cost = pricing.as_ref().and_then(|p| {
-            p.calculate_cost(
-                context.stats.total_input_tokens + usage_info.input_tokens as u64,
-                context.stats.total_output_tokens
-                    + usage_info.reasoning_tokens as u64
-                    + billable_output,
-            )
-        });
-        (request_cost, cumulative_cost)
-    } else {
-        (None, None)
-    };
+    // Presentation only: both figures are views of recorded settlements. The
+    // request cost covers every attempt of this logical operation (retries
+    // included) and the cumulative figure is the session's recorded total.
+    // Each is `None` unless it is a complete supported estimate.
+    let request_cost = operation.totals().complete_total_usd();
+    let cumulative_cost = exec_ctx
+        .cycle_accounting(&config.event_sink)
+        .await
+        .map_err(|error| anyhow::anyhow!("accounting unavailable: {error}"))?
+        .session_totals()
+        .complete_total_usd();
 
     debug!(
         "Session {} received provider response ({} chars, {} tool call(s), finish: {:?}, cost: ${:.4?})",
@@ -1372,6 +1520,7 @@ pub(super) async fn transition_call_llm(
                 ),
                 turns: u32_from_usize(context.stats.turns, "context.stats.turns", Some(session_id)),
             },
+            accounting: Some(operation.request_accounting()),
         },
     );
 
@@ -1572,15 +1721,13 @@ pub(super) async fn transition_after_llm(
 
     let mut updated_stats = (*context.stats).clone();
     updated_stats.steps += 1;
-    let pricing = response
-        .usage
-        .as_ref()
-        .and_then(|_| exec_ctx.session_handle.get_pricing());
-    apply_usage_to_stats(
-        &mut updated_stats,
-        response.usage.as_ref(),
-        pricing.as_ref(),
-    );
+    apply_usage_to_stats(&mut updated_stats, response.usage.as_ref());
+    // Monetary fields are a view of this cycle's recorded components, never a
+    // revaluation of token counters at current rates. Applied even when this
+    // response reported no usage, so recorded charges stay visible.
+    if let Some(cycle) = exec_ctx.cycle_accounting.get() {
+        updated_stats.apply_recorded_costs(&cycle.cycle_totals());
+    }
 
     let new_context = Arc::new(
         crate::middleware::ConversationContext::new(
@@ -2448,7 +2595,7 @@ mod tests {
             }
         }
 
-        type TimedChunks = Result<Vec<(u64, Result<StreamChunk, LLMError>)>, LLMError>;
+        pub(super) type TimedChunks = Result<Vec<(u64, Result<StreamChunk, LLMError>)>, LLMError>;
 
         #[derive(Clone)]
         struct TimedProvider {
@@ -2535,7 +2682,7 @@ mod tests {
         }
         impl querymt::LLMProvider for TimedProvider {}
 
-        struct TimedFactory {
+        pub(super) struct TimedFactory {
             provider: TimedProvider,
             binding: std::sync::Mutex<serde_json::Value>,
             configs: std::sync::Mutex<Vec<serde_json::Value>>,
@@ -2587,7 +2734,7 @@ mod tests {
                 })
             }
         }
-        async fn timed_fixture(
+        pub(super) async fn timed_fixture(
             streaming: bool,
             attempts: Vec<TimedChunks>,
             name: &'static str,
@@ -4126,6 +4273,7 @@ mod tests {
                     cache_read: 5,
                     cache_write: 7,
                     reasoning_tokens: 9,
+                    cache_write_tiers: None,
                 });
                 output.provenance = Some(ChatOutputProvenance {
                     provider: "codex".into(),
@@ -4988,6 +5136,1009 @@ mod tests {
                 assert!(ttl_seconds.is_none(), "ttl should be None");
             }
             other => panic!("expected Ephemeral cache hint, got: {:?}", other),
+        }
+    }
+
+    mod cost_accounting_tests {
+        use super::*;
+        use crate::middleware::AgentStats;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt::Usage;
+        use querymt::chat::{ChatOutput, FinishReason};
+        use querymt::providers::{ModelInfo, ModelPricing, ProviderInfo, ProvidersRegistry};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Serializes mutation of the process-wide provider-cache location.
+        pub(super) static CACHE_ENV_LOCK: tokio::sync::Mutex<()> =
+            tokio::sync::Mutex::const_new(());
+
+        /// Points the provider cache at a temporary registry that prices
+        /// `mock/mock-model`, so no user cache or network fetch is involved.
+        pub(super) struct InjectedPricing {
+            _dir: tempfile::TempDir,
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl InjectedPricing {
+            pub(super) fn install(pricing: ModelPricing) -> Self {
+                Self::install_for("mock", pricing)
+            }
+
+            pub(super) fn install_for(provider_id: &str, pricing: ModelPricing) -> Self {
+                let dir = tempfile::TempDir::new().unwrap();
+                let model = ModelInfo {
+                    id: "mock-model".into(),
+                    name: "mock-model".into(),
+                    pricing,
+                    ..Default::default()
+                };
+                let provider = ProviderInfo {
+                    id: provider_id.into(),
+                    name: provider_id.into(),
+                    models: [("mock-model".to_string(), model)].into(),
+                    ..Default::default()
+                };
+                let registry = ProvidersRegistry {
+                    providers: [(provider_id.to_string(), provider)].into(),
+                };
+                std::fs::write(
+                    dir.path().join("models.dev.json"),
+                    serde_json::to_string(&registry).unwrap(),
+                )
+                .unwrap();
+                let previous = std::env::var_os("QMT_PROVIDER_CACHE_DIR");
+                // SAFETY: test-only mutation serialized by CACHE_ENV_LOCK and
+                // restored in Drop.
+                unsafe { std::env::set_var("QMT_PROVIDER_CACHE_DIR", dir.path()) };
+                Self {
+                    _dir: dir,
+                    previous,
+                }
+            }
+        }
+
+        impl Drop for InjectedPricing {
+            fn drop(&mut self) {
+                // SAFETY: see `install`.
+                unsafe {
+                    match self.previous.take() {
+                        Some(value) => std::env::set_var("QMT_PROVIDER_CACHE_DIR", value),
+                        None => std::env::remove_var("QMT_PROVIDER_CACHE_DIR"),
+                    }
+                }
+            }
+        }
+
+        fn usage_response(usage: Usage) -> ChatOutput {
+            let mut output = ChatOutput::from_projections(
+                None,
+                Some("ok".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            output.usage = Some(usage);
+            output
+        }
+
+        async fn request_end_costs(
+            events: &mut tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>,
+        ) -> (Option<f64>, Option<f64>) {
+            loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .expect("timed out waiting for LlmRequestEnd")
+                    .expect("event channel closed");
+                if let AgentEventKind::LlmRequestEnd {
+                    cost_usd,
+                    cumulative_cost_usd,
+                    ..
+                } = envelope.kind()
+                {
+                    return (*cost_usd, *cumulative_cost_usd);
+                }
+            }
+        }
+
+        /// Records a mismatch instead of panicking so one run reports every
+        /// accounting defect.
+        fn expect_usd(failures: &mut Vec<String>, actual: Option<f64>, expected: f64, what: &str) {
+            match actual {
+                Some(actual) if (actual - expected).abs() < 1e-9 => {}
+                other => failures.push(format!("{what}: expected {expected}, got {other:?}")),
+            }
+        }
+
+        /// Rates per million tokens: input 3, output 15, cache read 0.3,
+        /// aggregate cache write 3.75.
+        #[tokio::test]
+        async fn request_end_costs_price_reasoning_once_and_keep_cache_and_history() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(ModelPricing {
+                input: Some(3.0),
+                output: Some(15.0),
+                cache_read: Some(0.3),
+                cache_write: Some(3.75),
+                ..Default::default()
+            });
+
+            let call = Arc::new(AtomicUsize::new(0));
+            let counter = call.clone();
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(move |_| {
+                Ok(usage_response(
+                    match counter.fetch_add(1, Ordering::SeqCst) {
+                        0 => Usage {
+                            input_tokens: 1_000,
+                            output_tokens: 100,
+                            reasoning_tokens: 900,
+                            cache_read: 2_000,
+                            cache_write: 500,
+                            cache_write_tiers: None,
+                        },
+                        _ => Usage {
+                            input_tokens: 200,
+                            output_tokens: 100,
+                            reasoning_tokens: 0,
+                            cache_read: 3_000,
+                            cache_write: 0,
+                            cache_write_tiers: None,
+                        },
+                    },
+                ))
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            let mut events = fixture.config.subscribe_events();
+            let request = Arc::new(PreparedModelRequest {
+                messages: vec![ChatMessage::user().text("hi").build()].into(),
+                tools: Arc::from([]),
+                estimated_tokens: 1,
+                options: querymt::chat::GenerationOptions::NONE,
+            });
+            let context_with = |stats: AgentStats| {
+                Arc::new(ConversationContext::new(
+                    exec.session_id.as_str().into(),
+                    Arc::from([]),
+                    Arc::new(stats),
+                    "mock".into(),
+                    "mock-model".into(),
+                ))
+            };
+
+            // First request: 1000 input + (100 + 900) output + 2000 reads + 500 writes.
+            transition_call_llm(
+                &fixture.config,
+                &context_with(AgentStats::default()),
+                &request,
+                &exec,
+            )
+            .await
+            .unwrap();
+            let first = request_end_costs(&mut events).await;
+            let first_cost = (3_000.0 + 15_000.0 + 600.0 + 1_875.0) / 1e6;
+            let mut failures = Vec::new();
+            expect_usd(
+                &mut failures,
+                first.0,
+                first_cost,
+                "first request cost includes cache",
+            );
+            expect_usd(
+                &mut failures,
+                first.1,
+                first_cost,
+                "first cumulative prices reasoning once, not twice",
+            );
+
+            // Second request starts from the stats the first request leaves behind.
+            let after_first = AgentStats {
+                total_input_tokens: 1_000,
+                total_output_tokens: 100,
+                reasoning_tokens: 900,
+                cache_read_tokens: 2_000,
+                cache_write_tokens: 500,
+                ..Default::default()
+            };
+            transition_call_llm(&fixture.config, &context_with(after_first), &request, &exec)
+                .await
+                .unwrap();
+            let second = request_end_costs(&mut events).await;
+            let second_cost = (600.0 + 1_500.0 + 900.0) / 1e6;
+            expect_usd(
+                &mut failures,
+                second.0,
+                second_cost,
+                "second request cost includes cache",
+            );
+            expect_usd(
+                &mut failures,
+                second.1,
+                first_cost + second_cost,
+                "second cumulative keeps earlier reasoning and cache charges",
+            );
+            assert!(
+                failures.is_empty(),
+                "accounting defects:\n{}",
+                failures.join("\n")
+            );
+        }
+    }
+
+    mod attempt_accounting_tests {
+        use super::cost_accounting_tests::{CACHE_ENV_LOCK, InjectedPricing};
+        use super::genai_trace_tests::{TimedChunks, timed_fixture};
+        use super::*;
+        use crate::accounting::{AccountingReason, AttemptOutcome, UsageDisposition};
+        use crate::session::backend::StorageBackend;
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt::Usage;
+        use querymt::providers::ModelPricing;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn pricing() -> ModelPricing {
+            ModelPricing {
+                input: Some(3.0),
+                output: Some(15.0),
+                cache_read: Some(0.3),
+                cache_write: Some(3.75),
+                ..Default::default()
+            }
+        }
+
+        fn cost_value() -> f64 {
+            cost()
+        }
+
+        fn usage() -> Usage {
+            Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                reasoning_tokens: 5,
+                cache_read: 50,
+                cache_write: 20,
+                cache_write_tiers: None,
+            }
+        }
+
+        fn cost() -> f64 {
+            (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6
+        }
+
+        fn output() -> ChatOutput {
+            let mut out = ChatOutput::from_projections(
+                None,
+                Some("ok".into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            out.usage = Some(usage());
+            out
+        }
+
+        fn prepared(with_tools: bool) -> Arc<PreparedModelRequest> {
+            let tools: Vec<querymt::chat::Tool> = if with_tools {
+                vec![
+                    serde_json::from_value(serde_json::json!({"type":"function","function":{
+                        "name":"safe","description":"","parameters":{"type":"object"}}}))
+                    .unwrap(),
+                ]
+            } else {
+                Vec::new()
+            };
+            Arc::new(PreparedModelRequest {
+                messages: vec![ChatMessage::user().text("hi").build()].into(),
+                tools: tools.into(),
+                estimated_tokens: 1,
+                options: querymt::chat::GenerationOptions::NONE,
+            })
+        }
+
+        fn context(exec: &ExecutionContext, provider: &str) -> Arc<ConversationContext> {
+            Arc::new(ConversationContext::new(
+                exec.session_id.as_str().into(),
+                Arc::from([]),
+                Arc::new(crate::middleware::AgentStats::default()),
+                provider.into(),
+                "mock-model".into(),
+            ))
+        }
+
+        /// Accounting records persisted for the session, in journal order.
+        async fn ledger(agent: &TestAgent, session_id: &str) -> Vec<AgentEventKind> {
+            agent
+                .storage
+                .event_journal()
+                .load_session_stream(session_id, None, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .filter(|k| {
+                    matches!(
+                        k,
+                        AgentEventKind::LlmAttemptStarted { .. }
+                            | AgentEventKind::LlmAttemptSettled { .. }
+                    )
+                })
+                .collect()
+        }
+
+        fn settlements(ledger: &[AgentEventKind]) -> Vec<&crate::accounting::AttemptSettlement> {
+            ledger
+                .iter()
+                .filter_map(|k| match k {
+                    AgentEventKind::LlmAttemptSettled { settlement } => Some(settlement),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn starts(ledger: &[AgentEventKind]) -> usize {
+            ledger
+                .iter()
+                .filter(|k| matches!(k, AgentEventKind::LlmAttemptStarted { .. }))
+                .count()
+        }
+
+        async fn session_totals(exec: &ExecutionContext) -> crate::accounting::ScopeTotals {
+            exec.cycle_accounting
+                .get()
+                .expect("cycle accounting is created on first dispatch")
+                .session_totals()
+        }
+
+        fn rate_limited() -> LLMError {
+            LLMError::RateLimited {
+                message: "slow down".into(),
+                retry_after_secs: Some(0),
+            }
+        }
+
+        #[tokio::test]
+        async fn non_streaming_retry_records_two_attempts_and_prices_only_the_success() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(move |_| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(rate_limited())
+                } else {
+                    Ok(output())
+                }
+            });
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(starts(&ledger), 2, "each retry is its own attempt");
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 2);
+            assert_eq!(settled[0].disposition, UsageDisposition::NotBillable);
+            assert_eq!(settled[0].attempt.attempt_index, 0);
+            assert_eq!(settled[1].disposition, UsageDisposition::Final);
+            assert_eq!(settled[1].attempt.attempt_index, 1);
+            assert_eq!(
+                settled[0].attempt.operation_id,
+                settled[1].attempt.operation_id
+            );
+            assert_ne!(settled[0].attempt.attempt_id, settled[1].attempt.attempt_id);
+
+            let totals = session_totals(&exec).await;
+            assert_eq!(totals.priced_attempts, 1);
+            assert_eq!(totals.unresolved_attempts, 0);
+            assert!((totals.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn non_streaming_with_tools_is_recorded_on_the_same_boundary() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat_with_tools().returning(|_, _| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let totals = session_totals(&exec).await;
+            assert!((totals.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn unconfirmed_failure_stays_uncertain_and_confirmed_rejection_does_not() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            for (error, uncertain) in [
+                (LLMError::ProviderError("connection reset".into()), true),
+                (LLMError::AuthError("bad key".into()), false),
+            ] {
+                let mut mock = MockLlmProvider::new();
+                let message = error.to_string();
+                mock.expect_chat().returning(move |_| {
+                    Err(if uncertain {
+                        LLMError::ProviderError(message.clone())
+                    } else {
+                        LLMError::AuthError(message.clone())
+                    })
+                });
+                let fixture =
+                    TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+                let exec = fixture.execution_context().await;
+                let result = transition_call_llm(
+                    &fixture.config,
+                    &context(&exec, "mock"),
+                    &prepared(false),
+                    &exec,
+                )
+                .await;
+                assert!(result.is_err());
+                let totals = session_totals(&exec).await;
+                assert_eq!(totals.unresolved_attempts, 0, "failure is settled");
+                // An unconfirmed failure is a metered attempt with unknown
+                // cost (incomplete); a confirmed rejection adds nothing.
+                assert_eq!(totals.priced_attempts, u32::from(uncertain));
+                assert_eq!(totals.incomplete_attempts, u32::from(uncertain));
+                assert_eq!(totals.known_subtotal_usd, 0.0);
+                assert_eq!(totals.complete_total_usd(), None);
+                assert_eq!(
+                    totals
+                        .reasons()
+                        .contains(&AccountingReason::UsageUnavailable),
+                    uncertain
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn cancelled_before_dispatch_creates_no_paid_attempt() {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().times(0);
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            exec.cancellation_token.cancel();
+            let state = transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(state, ExecutionState::Cancelled));
+            assert!(ledger(&fixture, &exec.session_id).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn budget_refusal_ends_the_main_path_as_a_price_limit_stop() {
+            for with_tools in [false, true] {
+                let mut mock = MockLlmProvider::new();
+                mock.expect_chat().times(0);
+                mock.expect_chat_with_tools().times(0);
+                let fixture =
+                    TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+                // A zero cap is already reached by a cycle with no spend.
+                let mut config = (*fixture.config).clone();
+                config
+                    .middleware_drivers
+                    .push(Arc::new(crate::middleware::LimitsMiddleware::new(
+                        crate::middleware::LimitsConfig::default().max_price_usd(0.0),
+                    )));
+                let exec = fixture.execution_context().await;
+                let state = transition_call_llm(
+                    &config,
+                    &context(&exec, "mock"),
+                    &prepared(with_tools),
+                    &exec,
+                )
+                .await
+                .expect("a refused dispatch is a stop, not an error");
+                let ExecutionState::Stopped {
+                    stop_type, message, ..
+                } = state
+                else {
+                    panic!("expected a price-limit stop, got {state:?}");
+                };
+                assert_eq!(stop_type, StopType::PriceLimit, "tools={with_tools}");
+                assert!(message.contains("Price limit reached"), "{message}");
+                assert!(
+                    ledger(&fixture, &exec.session_id).await.is_empty(),
+                    "a refused dispatch records no paid attempt"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn catalog_refresh_and_model_switch_never_reprice_earlier_attempts() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(|_| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+
+            let first_pricing = InjectedPricing::install(pricing());
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let first_cost = cost();
+            drop(first_pricing);
+
+            // The catalog is refreshed with doubled rates before the next call.
+            let doubled = ModelPricing {
+                input: Some(6.0),
+                output: Some(30.0),
+                cache_read: Some(0.6),
+                cache_write: Some(7.5),
+                ..Default::default()
+            };
+            let _second_pricing = InjectedPricing::install(doubled);
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 2);
+            assert_eq!(
+                settled[0].pricing,
+                Some(pricing()),
+                "first keeps its snapshot"
+            );
+            assert_eq!(settled[1].pricing.as_ref().unwrap().input, Some(6.0));
+
+            let totals = session_totals(&exec).await;
+            assert!(
+                (totals.known_subtotal_usd - (first_cost + 2.0 * first_cost)).abs() < 1e-12,
+                "earlier attempt must not be revalued: {}",
+                totals.known_subtotal_usd
+            );
+
+            // Replay from the journal alone reproduces the same totals.
+            let replayed = crate::accounting::SessionAccounting::hydrate(
+                &exec.session_id,
+                fixture.storage.event_journal(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed.read(|r| r.session().clone()), totals);
+        }
+
+        #[tokio::test]
+        async fn unpriced_model_is_recorded_as_incomplete_not_free() {
+            // No registry entry for this provider: billing class is unknown.
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("someone-else", pricing());
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(|_| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let exec = fixture.execution_context().await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let totals = session_totals(&exec).await;
+            assert_eq!(totals.known_subtotal_usd, 0.0);
+            assert_eq!(totals.complete_total_usd(), None);
+            assert!(totals.reasons().contains(&AccountingReason::Valuation {
+                reason: querymt::providers::IncompleteReason::PricingUnavailable
+            }));
+        }
+
+        #[tokio::test]
+        async fn history_save_failure_after_settlement_keeps_the_recorded_charge() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install(pricing());
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().returning(|_| Ok(output()));
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            let mut exec = fixture.execution_context().await;
+
+            let state = transition_call_llm(
+                &fixture.config,
+                &context(&exec, "mock"),
+                &prepared(false),
+                &exec,
+            )
+            .await
+            .unwrap();
+            let ExecutionState::AfterLlm { response, context } = state else {
+                panic!("expected AfterLlm");
+            };
+            let recorded = session_totals(&exec).await;
+            assert!((recorded.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+
+            // Make storing the assistant message fail.
+            fixture
+                .storage
+                .session_store()
+                .delete_session(&exec.session_id)
+                .await
+                .unwrap();
+            let result =
+                transition_after_llm(&fixture.config, &response, &context, &mut exec).await;
+            assert!(result.is_err(), "history save must fail");
+
+            // The charge is unaffected, live and from the journal alone.
+            assert_eq!(session_totals(&exec).await, recorded);
+            let replayed = crate::accounting::SessionAccounting::hydrate(
+                &exec.session_id,
+                fixture.storage.event_journal(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed.read(|r| r.session().clone()), recorded);
+        }
+
+        #[tokio::test]
+        async fn accounting_storage_failure_is_an_execution_error_not_a_budget_outcome() {
+            let mut mock = MockLlmProvider::new();
+            mock.expect_chat().times(0);
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(mock, vec![])).await;
+            // A cap is configured, so a budget stop would be possible.
+            let mut config = (*fixture.config).clone();
+            config
+                .middleware_drivers
+                .push(Arc::new(crate::middleware::LimitsMiddleware::new(
+                    crate::middleware::LimitsConfig::default().max_price_usd(100.0),
+                )));
+            let exec = fixture.execution_context().await;
+            // Open accounting first, then make the journal unwritable so the
+            // durable attempt start cannot be recorded.
+            exec.cycle_accounting(&config.event_sink).await.unwrap();
+            fixture
+                .storage
+                .conn_for_test()
+                .lock()
+                .unwrap()
+                .execute_batch("DROP TABLE event_journal")
+                .unwrap();
+            let result =
+                transition_call_llm(&config, &context(&exec, "mock"), &prepared(false), &exec)
+                    .await;
+            let error = result.expect_err("storage failure must be an execution error");
+            assert!(error.to_string().contains("accounting"), "{error:#}");
+        }
+
+        type Events = tokio::sync::broadcast::Receiver<crate::events::EventEnvelope>;
+
+        /// The next `LlmRequestEnd` as (cost, accounting), or `None` if none
+        /// arrives within the window.
+        async fn next_request_end(
+            events: &mut Events,
+            wait: Duration,
+        ) -> Option<(Option<f64>, Option<crate::accounting::RequestAccounting>)> {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let envelope = tokio::time::timeout(remaining, events.recv())
+                    .await
+                    .ok()?
+                    .ok()?;
+                if let AgentEventKind::LlmRequestEnd {
+                    cost_usd,
+                    accounting,
+                    ..
+                } = envelope.kind()
+                {
+                    return Some((*cost_usd, accounting.clone()));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn request_end_cost_spans_retries_and_includes_cache_charges() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![
+                Err(rate_limited()),
+                Ok(vec![
+                    (0, Ok(StreamChunk::Text("hello".into()))),
+                    (0, Ok(chunk_usage())),
+                    (
+                        0,
+                        Ok(StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        }),
+                    ),
+                ]),
+            ])
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let (cost, accounting) = next_request_end(&mut events, Duration::from_secs(1))
+                .await
+                .expect("request end");
+            // cost() includes cache read and write charges; the rejected retry adds none.
+            assert!((cost.unwrap() - cost_value()).abs() < 1e-12);
+            let accounting = accounting.expect("accounting detail");
+            assert!(accounting.complete);
+            assert_eq!(accounting.attempt_ids.len(), 2);
+            assert!((accounting.known_subtotal_usd - cost_value()).abs() < 1e-12);
+
+            // The identifiers match the durable attempt records.
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let recorded: Vec<_> = settlements(&ledger)
+                .into_iter()
+                .map(|s| s.attempt.attempt_id.clone())
+                .collect();
+            assert_eq!(accounting.attempt_ids, recorded);
+            let operation_ids: std::collections::HashSet<_> = settlements(&ledger)
+                .into_iter()
+                .map(|s| s.attempt.operation_id.clone())
+                .collect();
+            assert_eq!(operation_ids.len(), 1);
+            assert_eq!(operation_ids.iter().next(), Some(&accounting.operation_id));
+        }
+
+        #[tokio::test]
+        async fn usage_bearing_retry_counts_once_and_marks_operation_partial() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![
+                // First attempt reports usage, then the connection drops.
+                Ok(vec![
+                    (0, Ok(chunk_usage())),
+                    (0, Err(LLMError::HttpError("reset".into()))),
+                ]),
+                Ok(vec![
+                    (0, Ok(StreamChunk::Text("hello".into()))),
+                    (0, Ok(chunk_usage())),
+                    (
+                        0,
+                        Ok(StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        }),
+                    ),
+                ]),
+            ])
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let (cost, accounting) = next_request_end(&mut events, Duration::from_secs(1))
+                .await
+                .expect("request end");
+            let accounting = accounting.unwrap();
+            assert_eq!(accounting.attempt_ids.len(), 2);
+            // Both attempts' usage is charged exactly once each ...
+            assert!((accounting.known_subtotal_usd - 2.0 * cost_value()).abs() < 1e-12);
+            // ... but the interrupted attempt keeps the operation partial.
+            assert_eq!(
+                cost, None,
+                "a partial operation total is never published as complete"
+            );
+            assert!(!accounting.complete);
+            assert!(accounting.reasons.contains(&AccountingReason::PartialUsage));
+        }
+
+        #[tokio::test]
+        async fn cancelled_execution_is_accounted_without_a_request_end_event() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+                (0, Ok(chunk_usage())),
+                (0, Ok(StreamChunk::Text("part".into()))),
+            ])])
+            .await;
+            let mut events = fixture.config.subscribe_events();
+            let context = context(&exec, "alias");
+            let request = prepared(true);
+            let mut future = Box::pin(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request,
+                &exec,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), &mut future)
+                    .await
+                    .is_err()
+            );
+            exec.cancellation_token.cancel();
+            assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+
+            assert!(
+                next_request_end(&mut events, Duration::from_millis(300))
+                    .await
+                    .is_none(),
+                "no normal request end for cancelled execution"
+            );
+            let totals = session_totals(&exec).await;
+            assert!((totals.known_subtotal_usd - cost_value()).abs() < 1e-12);
+            assert_eq!(totals.unresolved_attempts, 0);
+            assert_eq!(totals.complete_total_usd(), None);
+        }
+
+        fn chunk_usage() -> StreamChunk {
+            StreamChunk::Usage(usage())
+        }
+
+        async fn stream_fixture(attempts: Vec<TimedChunks>) -> (TestAgent, ExecutionContext) {
+            let (fixture, _factory) = timed_fixture(true, attempts, "openai", None).await;
+            let exec = fixture.execution_context().await;
+            (fixture, exec)
+        }
+
+        #[tokio::test]
+        async fn streaming_retry_after_setup_rejection_keeps_separate_accumulators() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![
+                Err(rate_limited()),
+                Ok(vec![
+                    (0, Ok(StreamChunk::Text("hello".into()))),
+                    (0, Ok(chunk_usage())),
+                    (
+                        0,
+                        Ok(StreamChunk::Done {
+                            finish_reason: FinishReason::Stop,
+                        }),
+                    ),
+                ]),
+            ])
+            .await;
+            transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await
+            .unwrap();
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            assert_eq!(starts(&ledger), 2);
+            let settled = settlements(&ledger);
+            assert_eq!(settled[0].disposition, UsageDisposition::NotBillable);
+            assert!(settled[0].usage.is_none(), "retry must not inherit usage");
+            assert_eq!(settled[1].disposition, UsageDisposition::Final);
+            assert_eq!(settled[1].usage.as_ref(), Some(&usage()));
+            let totals = session_totals(&exec).await;
+            assert!((totals.complete_total_usd().unwrap() - cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn streaming_failure_after_usage_is_partial_and_priced() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+                (0, Ok(chunk_usage())),
+                (0, Ok(StreamChunk::Text("part".into()))),
+                (0, Err(LLMError::ProviderError("stream broke".into()))),
+            ])])
+            .await;
+            let result = transition_call_llm(
+                &fixture.config,
+                &context(&exec, "alias"),
+                &prepared(true),
+                &exec,
+            )
+            .await;
+            assert!(result.is_err());
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 1);
+            assert_eq!(settled[0].disposition, UsageDisposition::Partial);
+            assert_eq!(settled[0].usage.as_ref(), Some(&usage()));
+            let totals = session_totals(&exec).await;
+            assert!((totals.known_subtotal_usd - cost()).abs() < 1e-12);
+            assert_eq!(totals.complete_total_usd(), None);
+            assert!(totals.reasons().contains(&AccountingReason::PartialUsage));
+        }
+
+        #[tokio::test]
+        async fn streaming_cancellation_preserves_available_partial_usage() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            // No terminal chunk: the provider stream stays pending.
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![
+                (0, Ok(chunk_usage())),
+                (0, Ok(StreamChunk::Text("part".into()))),
+            ])])
+            .await;
+            let context = context(&exec, "alias");
+            let request = prepared(true);
+            let mut future = Box::pin(transition_call_llm(
+                &fixture.config,
+                &context,
+                &request,
+                &exec,
+            ));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(400), &mut future)
+                    .await
+                    .is_err()
+            );
+            exec.cancellation_token.cancel();
+            assert!(matches!(future.await.unwrap(), ExecutionState::Cancelled));
+
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            let settled = settlements(&ledger);
+            assert_eq!(settled.len(), 1);
+            assert_eq!(settled[0].outcome, AttemptOutcome::Cancelled);
+            assert_eq!(settled[0].disposition, UsageDisposition::Partial);
+            assert_eq!(settled[0].usage.as_ref(), Some(&usage()));
+            assert_eq!(session_totals(&exec).await.unresolved_attempts, 0);
+        }
+
+        #[tokio::test]
+        async fn dropped_streaming_request_settles_instead_of_staying_unresolved() {
+            let _guard = CACHE_ENV_LOCK.lock().await;
+            let _pricing = InjectedPricing::install_for("alias", pricing());
+            let (fixture, exec) = stream_fixture(vec![Ok(vec![(0, Ok(chunk_usage()))])]).await;
+            {
+                let context = context(&exec, "alias");
+                let request = prepared(true);
+                let mut future = Box::pin(transition_call_llm(
+                    &fixture.config,
+                    &context,
+                    &request,
+                    &exec,
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(400), &mut future)
+                        .await
+                        .is_err()
+                );
+                // Owning future dropped, as when a turn task is aborted.
+            }
+            for _ in 0..200 {
+                if session_totals(&exec).await.unresolved_attempts == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let ledger = ledger(&fixture, &exec.session_id).await;
+            assert_eq!(starts(&ledger), 1);
+            assert_eq!(settlements(&ledger)[0].outcome, AttemptOutcome::Cancelled);
+            assert_eq!(settlements(&ledger)[0].usage.as_ref(), Some(&usage()));
         }
     }
 }

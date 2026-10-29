@@ -1075,6 +1075,7 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
                 cumulative_cost_usd: None,
                 context_tokens: 0,
                 metrics: ExecutionMetrics::default(),
+                accounting: None,
             },
         })
         .await?;

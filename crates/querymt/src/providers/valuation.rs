@@ -12,7 +12,10 @@
 //!   plus reasoning is priced once at the output rate, `input_tokens` is the
 //!   uncached portion, and `cache_read` / `cache_write` are separate.
 //! * Cache-write duration tiers *partition* `cache_write`; they are never added
-//!   to it.
+//!   to it. The catalog `cache_write` rate is the base write rate: it prices
+//!   five-minute writes and writes with no (or no one-hour) breakdown. Only
+//!   reported one-hour writes need the explicit `cache_write_1h` rate, which
+//!   the catalog does not publish; without it just that portion is missing.
 //! * A `None` component means "unavailable"; `Some(0.0)` means "known zero". A
 //!   category with zero tokens is always known zero and needs no rate.
 //! * Valuation is a pure function of its inputs: repeating it never
@@ -21,7 +24,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::types::ModelPricing;
-use crate::Usage;
+use crate::{CacheWriteTiers, Usage};
 
 const TOKENS_PER_RATE_UNIT: f64 = 1_000_000.0;
 
@@ -32,10 +35,9 @@ pub enum PricingCategory {
     Input,
     Output,
     CacheRead,
-    /// Aggregate cache writes, regardless of duration.
+    /// Base-rate cache writes (five-minute or unknown duration).
     CacheWrite,
-    #[serde(rename = "cache_write_5m")]
-    CacheWrite5m,
+    /// Reported one-hour cache writes.
     #[serde(rename = "cache_write_1h")]
     CacheWrite1h,
 }
@@ -67,22 +69,15 @@ pub enum IncompleteReason {
     MissingRate { category: PricingCategory },
     /// A category with nonzero usage has a negative or non-finite rate.
     InvalidRate { category: PricingCategory },
-    /// Writes are priced per duration but the response gave no usable breakdown.
-    MissingWriteDuration,
     /// Returned write-tier counts disagree with the aggregate write count.
     ContradictoryWriteDetail,
     /// The pricing is known to carry a modifier or charge that cannot be valued.
     UnsupportedDimension { dimension: String },
     /// A monetary amount was not representable as a finite value.
     AmountOverflow,
-}
-
-/// Returned cache-write duration breakdown. `None` is *absent*, which is
-/// distinct from an explicit `Some(0)`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CacheWriteTiers {
-    pub five_minute: Option<u32>,
-    pub one_hour: Option<u32>,
+    /// The provider served a different model than the one the pricing was
+    /// bound for, and no applicable pricing basis is known for it.
+    PricingInapplicable { effective_model: String },
 }
 
 /// USD charge per category. See the module docs for `None` vs `Some(0.0)`.
@@ -92,17 +87,20 @@ pub struct ComponentCharges {
     /// Ordinary output plus reasoning, priced once.
     pub output_usd: Option<f64>,
     pub cache_read_usd: Option<f64>,
-    /// Aggregate write charge, derived from tier counts when they are resolved.
+    /// Base-rate writes: `cache_write` minus reported one-hour writes.
     pub cache_write_usd: Option<f64>,
+    /// Reported one-hour writes at the explicit one-hour rate.
+    pub cache_write_1h_usd: Option<f64>,
 }
 
 impl ComponentCharges {
-    fn each(&self) -> [Option<f64>; 4] {
+    fn each(&self) -> [Option<f64>; 5] {
         [
             self.input_usd,
             self.output_usd,
             self.cache_read_usd,
             self.cache_write_usd,
+            self.cache_write_1h_usd,
         ]
     }
 }
@@ -180,109 +178,53 @@ fn charge(
     }
 }
 
-/// How the returned tier counts relate to the aggregate write count.
-enum WriteSplit {
-    /// No usable breakdown; price the aggregate if authoritative.
-    Aggregate,
-    /// Consistent partition of the aggregate.
-    Tiers {
-        five_minute: u32,
-        one_hour: u32,
-    },
-    Contradictory,
-}
-
-fn resolve_write_split(total: u32, tiers: CacheWriteTiers) -> WriteSplit {
-    let known = u64::from(tiers.five_minute.unwrap_or(0)) + u64::from(tiers.one_hour.unwrap_or(0));
+/// Split `cache_write` into (base-rate tokens, one-hour tokens), or `None`
+/// when the returned breakdown contradicts the aggregate.
+///
+/// Absent detail is not a contradiction: writes without a one-hour count are
+/// base-rate writes. A five-minute count is only checked for consistency;
+/// any remainder of unknown duration is still priced at the base rate.
+fn split_writes(total: u32, tiers: CacheWriteTiers) -> Option<(u64, u64)> {
     let total = u64::from(total);
-    match (tiers.five_minute, tiers.one_hour) {
-        (None, None) => WriteSplit::Aggregate,
-        _ if known > total => WriteSplit::Contradictory,
-        (Some(five_minute), Some(one_hour)) if known == total => WriteSplit::Tiers {
-            five_minute,
-            one_hour,
-        },
-        (Some(_), Some(_)) => WriteSplit::Contradictory,
-        // One tier absent: the remainder is provably zero only if the known
-        // tier already covers the aggregate; otherwise the breakdown is unusable.
-        (five_minute, one_hour) if known == total => WriteSplit::Tiers {
-            five_minute: five_minute.unwrap_or(0),
-            one_hour: one_hour.unwrap_or(0),
-        },
-        _ => WriteSplit::Aggregate,
-    }
+    let five = tiers.five_minute.map(u64::from);
+    let hour = tiers.one_hour.map(u64::from);
+    let consistent = match (five, hour) {
+        (Some(f), Some(h)) => f + h == total,
+        (Some(t), None) | (None, Some(t)) => t <= total,
+        (None, None) => true,
+    };
+    consistent.then(|| {
+        let hour = hour.unwrap_or(0);
+        (total - hour, hour)
+    })
 }
 
+/// Value cache writes as (base-rate charge, one-hour charge).
 fn value_writes(
     pricing: &ModelPricing,
     total: u32,
     tiers: CacheWriteTiers,
     reasons: &mut Reasons,
-) -> Option<f64> {
-    match resolve_write_split(total, tiers) {
-        WriteSplit::Contradictory => {
-            reasons.note(IncompleteReason::ContradictoryWriteDetail);
-            None
-        }
-        WriteSplit::Aggregate if total == 0 => Some(0.0),
-        WriteSplit::Aggregate => {
-            if pricing.cache_write_covers_all_durations {
-                charge(
-                    u64::from(total),
-                    pricing.cache_write,
-                    PricingCategory::CacheWrite,
-                    reasons,
-                )
-            } else if pricing.has_write_rate() {
-                reasons.note(IncompleteReason::MissingWriteDuration);
-                None
-            } else {
-                reasons.note(IncompleteReason::MissingRate {
-                    category: PricingCategory::CacheWrite,
-                });
-                None
-            }
-        }
-        WriteSplit::Tiers {
-            five_minute,
-            one_hour,
-        } => {
-            // Evaluate both tiers so every reason is reported.
-            let five = charge_tier(
-                pricing,
-                five_minute,
-                pricing.cache_write_5m,
-                PricingCategory::CacheWrite5m,
-                reasons,
-            );
-            let hour = charge_tier(
-                pricing,
-                one_hour,
-                pricing.cache_write_1h,
-                PricingCategory::CacheWrite1h,
-                reasons,
-            );
-            Some(five? + hour?)
-        }
-    }
-}
-
-fn charge_tier(
-    pricing: &ModelPricing,
-    tokens: u32,
-    tier_rate: Option<f64>,
-    tier_category: PricingCategory,
-    reasons: &mut Reasons,
-) -> Option<f64> {
-    let (rate, category) = match tier_rate {
-        Some(_) => (tier_rate, tier_category),
-        // An aggregate rate substitutes only when pricing says it covers every duration.
-        None if pricing.cache_write_covers_all_durations => {
-            (pricing.cache_write, PricingCategory::CacheWrite)
-        }
-        None => (None, tier_category),
+) -> (Option<f64>, Option<f64>) {
+    let Some((base, hour)) = split_writes(total, tiers) else {
+        reasons.note(IncompleteReason::ContradictoryWriteDetail);
+        return (None, None);
     };
-    charge(u64::from(tokens), rate, category, reasons)
+    // Evaluate both so every reason is reported. The one-hour portion never
+    // falls back to the base rate: that would understate it.
+    let base_usd = charge(
+        base,
+        pricing.cache_write,
+        PricingCategory::CacheWrite,
+        reasons,
+    );
+    let hour_usd = charge(
+        hour,
+        pricing.cache_write_1h,
+        PricingCategory::CacheWrite1h,
+        reasons,
+    );
+    (base_usd, hour_usd)
 }
 
 fn classify(pricing: Option<&ModelPricing>) -> BillingClass {
@@ -299,11 +241,7 @@ fn classify(pricing: Option<&ModelPricing>) -> BillingClass {
 /// * `usage = None` yields no charges and [`IncompleteReason::UsageUnavailable`].
 ///
 /// For excluded billing use [`UsageValuation::excluded`] instead.
-pub fn value_usage(
-    pricing: Option<&ModelPricing>,
-    usage: Option<&Usage>,
-    write_tiers: CacheWriteTiers,
-) -> UsageValuation {
+pub fn value_usage(pricing: Option<&ModelPricing>, usage: Option<&Usage>) -> UsageValuation {
     let billing = classify(pricing);
     let mut reasons = Reasons::default();
     let default_pricing;
@@ -321,33 +259,53 @@ pub fn value_usage(
         });
     }
 
+    if let Some(u) = usage {
+        // Prompt size is the sum of the exclusive prompt-side categories.
+        let prompt_tokens =
+            u64::from(u.input_tokens) + u64::from(u.cache_read) + u64::from(u.cache_write);
+        for name in rates.triggered_dimensions(prompt_tokens, u64::from(u.reasoning_tokens)) {
+            reasons.note(IncompleteReason::UnsupportedDimension {
+                dimension: name.to_string(),
+            });
+        }
+    }
+
     let components = match usage {
         None => {
             reasons.note(IncompleteReason::UsageUnavailable);
             ComponentCharges::default()
         }
-        Some(u) => ComponentCharges {
-            input_usd: charge(
-                u64::from(u.input_tokens),
-                rates.input,
-                PricingCategory::Input,
+        Some(u) => {
+            let (cache_write_usd, cache_write_1h_usd) = value_writes(
+                rates,
+                u.cache_write,
+                u.cache_write_tiers.unwrap_or_default(),
                 &mut reasons,
-            ),
-            // Widened before adding: u32 + u32 cannot wrap in u64.
-            output_usd: charge(
-                u64::from(u.output_tokens) + u64::from(u.reasoning_tokens),
-                rates.output,
-                PricingCategory::Output,
-                &mut reasons,
-            ),
-            cache_read_usd: charge(
-                u64::from(u.cache_read),
-                rates.cache_read,
-                PricingCategory::CacheRead,
-                &mut reasons,
-            ),
-            cache_write_usd: value_writes(rates, u.cache_write, write_tiers, &mut reasons),
-        },
+            );
+            ComponentCharges {
+                input_usd: charge(
+                    u64::from(u.input_tokens),
+                    rates.input,
+                    PricingCategory::Input,
+                    &mut reasons,
+                ),
+                // Widened before adding: u32 + u32 cannot wrap in u64.
+                output_usd: charge(
+                    u64::from(u.output_tokens) + u64::from(u.reasoning_tokens),
+                    rates.output,
+                    PricingCategory::Output,
+                    &mut reasons,
+                ),
+                cache_read_usd: charge(
+                    u64::from(u.cache_read),
+                    rates.cache_read,
+                    PricingCategory::CacheRead,
+                    &mut reasons,
+                ),
+                cache_write_usd,
+                cache_write_1h_usd,
+            }
+        }
     };
 
     // With no pricing basis the per-category "missing rate" reasons are noise;
@@ -394,7 +352,6 @@ mod tests {
             output: Some(15.0),
             cache_read: Some(0.3),
             cache_write: Some(3.75),
-            cache_write_5m: Some(3.75),
             cache_write_1h: Some(6.0),
             ..Default::default()
         }
@@ -407,7 +364,13 @@ mod tests {
             reasoning_tokens: reasoning,
             cache_read: read,
             cache_write: write,
+            cache_write_tiers: None,
         }
+    }
+
+    fn tiered(mut usage: Usage, tiers: CacheWriteTiers) -> Usage {
+        usage.cache_write_tiers = Some(tiers);
+        usage
     }
 
     fn approx(actual: f64, expected: f64) {
@@ -421,24 +384,16 @@ mod tests {
 
     #[test]
     fn reasoning_is_priced_once_at_the_output_rate() {
-        let v = value_usage(
-            Some(&pricing()),
-            Some(&usage(0, 100, 900, 0, 0)),
-            Default::default(),
-        );
+        let v = value_usage(Some(&pricing()), Some(&usage(0, 100, 900, 0, 0)));
         approx(v.components.output_usd.unwrap(), 1000.0 * 15.0 / 1e6);
         assert!(v.is_complete());
     }
 
     #[test]
-    fn prices_uncached_input_cache_reads_and_authoritative_aggregate_writes() {
-        let mut p = pricing();
-        p.cache_write_covers_all_durations = true;
-        let v = value_usage(
-            Some(&p),
-            Some(&usage(100, 0, 0, 600, 300)),
-            Default::default(),
-        );
+    fn prices_uncached_input_cache_reads_and_base_rate_writes() {
+        // No duration breakdown: all writes are priced at the catalog base rate.
+        let p = pricing();
+        let v = value_usage(Some(&p), Some(&usage(100, 0, 0, 600, 300)));
         approx(v.components.input_usd.unwrap(), 100.0 * 3.0 / 1e6);
         approx(v.components.cache_read_usd.unwrap(), 600.0 * 0.3 / 1e6);
         approx(v.components.cache_write_usd.unwrap(), 300.0 * 3.75 / 1e6);
@@ -454,15 +409,16 @@ mod tests {
             five_minute: Some(200),
             one_hour: Some(100),
         };
-        // Even with an authoritative aggregate rate, tiers take precedence.
-        let mut p = pricing();
-        p.cache_write_covers_all_durations = true;
-        let v = value_usage(Some(&p), Some(&usage(0, 0, 0, 0, 300)), tiers);
+        let v = value_usage(
+            Some(&pricing()),
+            Some(&tiered(usage(0, 0, 0, 0, 300), tiers)),
+        );
+        approx(v.components.cache_write_usd.unwrap(), 200.0 * 3.75 / 1e6);
+        approx(v.components.cache_write_1h_usd.unwrap(), 100.0 * 6.0 / 1e6);
         approx(
-            v.components.cache_write_usd.unwrap(),
+            v.complete_total_usd.unwrap(),
             (200.0 * 3.75 + 100.0 * 6.0) / 1e6,
         );
-        assert!(v.is_complete());
     }
 
     #[test]
@@ -471,7 +427,10 @@ mod tests {
             five_minute: Some(300),
             one_hour: None,
         };
-        let v = value_usage(Some(&pricing()), Some(&usage(0, 0, 0, 0, 300)), tiers);
+        let v = value_usage(
+            Some(&pricing()),
+            Some(&tiered(usage(0, 0, 0, 0, 300), tiers)),
+        );
         approx(v.components.cache_write_usd.unwrap(), 300.0 * 3.75 / 1e6);
         assert!(v.is_complete());
     }
@@ -483,7 +442,7 @@ mod tests {
             output: Some(15.0),
             ..Default::default()
         };
-        let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)), Default::default());
+        let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)));
         assert!(v.is_complete());
         assert_eq!(v.components.cache_write_usd, Some(0.0));
     }
@@ -495,11 +454,7 @@ mod tests {
             output: Some(15.0),
             ..Default::default()
         };
-        let v = value_usage(
-            Some(&p),
-            Some(&usage(100, 100, 0, 50, 0)),
-            Default::default(),
-        );
+        let v = value_usage(Some(&p), Some(&usage(100, 100, 0, 50, 0)));
         approx(v.known_subtotal_usd, (300.0 + 1500.0) / 1e6);
         assert_eq!(v.complete_total_usd, None);
         assert_eq!(v.components.cache_read_usd, None);
@@ -519,7 +474,7 @@ mod tests {
             cache_read: Some(0.0),
             ..Default::default()
         };
-        let v = value_usage(Some(&p), Some(&usage(0, 0, 0, 500, 0)), Default::default());
+        let v = value_usage(Some(&p), Some(&usage(0, 0, 0, 500, 0)));
         assert_eq!(v.components.cache_read_usd, Some(0.0));
         assert!(v.is_complete());
     }
@@ -530,7 +485,10 @@ mod tests {
             five_minute: Some(200),
             one_hour: Some(200),
         };
-        let v = value_usage(Some(&pricing()), Some(&usage(100, 0, 0, 0, 300)), tiers);
+        let v = value_usage(
+            Some(&pricing()),
+            Some(&tiered(usage(100, 0, 0, 0, 300), tiers)),
+        );
         assert_eq!(v.components.cache_write_usd, None);
         assert_eq!(
             v.incomplete,
@@ -544,7 +502,10 @@ mod tests {
             five_minute: Some(100),
             one_hour: Some(100),
         };
-        let v = value_usage(Some(&pricing()), Some(&usage(0, 0, 0, 0, 300)), tiers);
+        let v = value_usage(
+            Some(&pricing()),
+            Some(&tiered(usage(0, 0, 0, 0, 300), tiers)),
+        );
         assert_eq!(
             v.incomplete,
             vec![IncompleteReason::ContradictoryWriteDetail]
@@ -552,23 +513,32 @@ mod tests {
     }
 
     #[test]
-    fn missing_write_detail_is_unresolved_not_assumed_cheapest() {
-        let v = value_usage(
-            Some(&pricing()),
-            Some(&usage(100, 0, 0, 0, 300)),
-            Default::default(),
-        );
-        assert_eq!(v.components.cache_write_usd, None);
-        assert_eq!(v.incomplete, vec![IncompleteReason::MissingWriteDuration]);
-        approx(v.known_subtotal_usd, 100.0 * 3.0 / 1e6);
+    fn writes_without_one_hour_detail_need_only_the_catalog_rate() {
+        // Catalog-shaped pricing: base write rate, no one-hour rate.
+        let mut p = pricing();
+        p.cache_write_1h = None;
+        let v = value_usage(Some(&p), Some(&usage(100, 0, 0, 0, 300)));
+        approx(v.components.cache_write_usd.unwrap(), 300.0 * 3.75 / 1e6);
+        assert_eq!(v.components.cache_write_1h_usd, Some(0.0));
+        assert!(v.is_complete());
 
-        // A partial breakdown that does not cover the aggregate is also unusable.
+        // A five-minute count below the aggregate leaves a remainder of
+        // unknown duration, still priced at the base rate.
         let tiers = CacheWriteTiers {
             five_minute: Some(100),
             one_hour: None,
         };
-        let v = value_usage(Some(&pricing()), Some(&usage(0, 0, 0, 0, 300)), tiers);
-        assert_eq!(v.incomplete, vec![IncompleteReason::MissingWriteDuration]);
+        let v = value_usage(Some(&p), Some(&tiered(usage(0, 0, 0, 0, 300), tiers)));
+        approx(v.components.cache_write_usd.unwrap(), 300.0 * 3.75 / 1e6);
+        assert!(v.is_complete());
+
+        // An explicit zero one-hour count needs no one-hour rate.
+        let tiers = CacheWriteTiers {
+            five_minute: Some(300),
+            one_hour: Some(0),
+        };
+        let v = value_usage(Some(&p), Some(&tiered(usage(0, 0, 0, 0, 300), tiers)));
+        assert!(v.is_complete());
     }
 
     #[test]
@@ -578,7 +548,7 @@ mod tests {
             output: Some(1.0),
             ..Default::default()
         };
-        let v = value_usage(Some(&p), Some(&usage(0, 0, 0, 0, 10)), Default::default());
+        let v = value_usage(Some(&p), Some(&usage(0, 0, 0, 0, 10)));
         assert_eq!(
             v.incomplete,
             vec![IncompleteReason::MissingRate {
@@ -588,15 +558,19 @@ mod tests {
     }
 
     #[test]
-    fn missing_tier_rate_is_not_replaced_by_a_non_authoritative_aggregate() {
+    fn one_hour_writes_without_a_one_hour_rate_are_partial_not_base_priced() {
         let mut p = pricing();
         p.cache_write_1h = None;
         let tiers = CacheWriteTiers {
             five_minute: Some(200),
             one_hour: Some(100),
         };
-        let v = value_usage(Some(&p), Some(&usage(0, 0, 0, 0, 300)), tiers);
-        assert_eq!(v.components.cache_write_usd, None);
+        let v = value_usage(Some(&p), Some(&tiered(usage(10, 0, 0, 0, 300), tiers)));
+        // The five-minute portion and other components stay known.
+        approx(v.components.cache_write_usd.unwrap(), 200.0 * 3.75 / 1e6);
+        assert_eq!(v.components.cache_write_1h_usd, None);
+        approx(v.known_subtotal_usd, (10.0 * 3.0 + 200.0 * 3.75) / 1e6);
+        assert_eq!(v.complete_total_usd, None);
         assert_eq!(
             v.incomplete,
             vec![IncompleteReason::MissingRate {
@@ -606,10 +580,32 @@ mod tests {
     }
 
     #[test]
+    fn registry_dimensions_block_completeness_only_when_usage_triggers_them() {
+        use crate::providers::types::{DimensionApplicability, PricingDimension};
+        let mut p = pricing();
+        p.dimensions = vec![PricingDimension {
+            name: "context_over_200k".into(),
+            applies: DimensionApplicability::ContextOver { tokens: 200_000 },
+        }];
+        // Prompt = input + cache reads + cache writes, at the threshold.
+        let below = value_usage(Some(&p), Some(&usage(100_000, 10, 0, 100_000, 0)));
+        assert!(below.is_complete());
+        let above = value_usage(Some(&p), Some(&usage(100_001, 10, 0, 100_000, 0)));
+        assert_eq!(above.complete_total_usd, None);
+        assert!(above.known_subtotal_usd > 0.0);
+        assert_eq!(
+            above.incomplete,
+            vec![IncompleteReason::UnsupportedDimension {
+                dimension: "context_over_200k".into()
+            }]
+        );
+    }
+
+    #[test]
     fn known_unsupported_dimension_blocks_a_complete_total() {
         let mut p = pricing();
         p.unsupported_dimensions = vec!["long_context".into()];
-        let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)), Default::default());
+        let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)));
         assert_eq!(v.complete_total_usd, None);
         assert!(v.known_subtotal_usd > 0.0);
         assert_eq!(
@@ -625,7 +621,7 @@ mod tests {
         for bad in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut p = pricing();
             p.output = Some(bad);
-            let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)), Default::default());
+            let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)));
             assert_eq!(v.complete_total_usd, None, "rate {bad}");
             assert_eq!(v.components.output_usd, None);
             assert!(v.known_subtotal_usd.is_finite() && v.known_subtotal_usd >= 0.0);
@@ -641,11 +637,7 @@ mod tests {
     #[test]
     fn token_sums_are_widened_and_monetary_overflow_is_explicit() {
         // u32::MAX + u32::MAX must not wrap.
-        let v = value_usage(
-            Some(&pricing()),
-            Some(&usage(0, u32::MAX, u32::MAX, 0, 0)),
-            Default::default(),
-        );
+        let v = value_usage(Some(&pricing()), Some(&usage(0, u32::MAX, u32::MAX, 0, 0)));
         approx(
             v.components.output_usd.unwrap(),
             (u64::from(u32::MAX) * 2) as f64 * 15.0 / 1e6,
@@ -653,11 +645,7 @@ mod tests {
 
         let mut p = pricing();
         p.output = Some(f64::MAX);
-        let v = value_usage(
-            Some(&p),
-            Some(&usage(0, u32::MAX, u32::MAX, 0, 0)),
-            Default::default(),
-        );
+        let v = value_usage(Some(&p), Some(&usage(0, u32::MAX, u32::MAX, 0, 0)));
         assert_eq!(v.components.output_usd, None);
         assert_eq!(v.complete_total_usd, None);
         assert!(v.incomplete.contains(&IncompleteReason::AmountOverflow));
@@ -672,11 +660,10 @@ mod tests {
             output: Some(f64::MAX / 8_000.0),
             cache_read: Some(f64::MAX / 8_000.0),
             cache_write: Some(f64::MAX / 8_000.0),
-            cache_write_covers_all_durations: true,
             ..Default::default()
         };
         let u = usage(u32::MAX, u32::MAX, 0, u32::MAX, u32::MAX);
-        let v = value_usage(Some(&p), Some(&u), Default::default());
+        let v = value_usage(Some(&p), Some(&u));
         assert!(v.known_subtotal_usd.is_finite());
         assert_eq!(v.complete_total_usd, None);
         assert!(v.incomplete.contains(&IncompleteReason::AmountOverflow));
@@ -685,8 +672,8 @@ mod tests {
     #[test]
     fn repeated_valuation_is_identical() {
         let u = usage(10, 20, 30, 40, 0);
-        let first = value_usage(Some(&pricing()), Some(&u), Default::default());
-        let second = value_usage(Some(&pricing()), Some(&u), Default::default());
+        let first = value_usage(Some(&pricing()), Some(&u));
+        let second = value_usage(Some(&pricing()), Some(&u));
         assert_eq!(first, second);
         approx(first.components.cache_read_usd.unwrap(), 40.0 * 0.3 / 1e6);
     }
@@ -703,12 +690,12 @@ mod tests {
     #[test]
     fn unknown_pricing_and_missing_usage_are_distinct_reasons() {
         let u = usage(10, 10, 0, 0, 0);
-        let v = value_usage(None, Some(&u), Default::default());
+        let v = value_usage(None, Some(&u));
         assert_eq!(v.billing, BillingClass::Unknown);
         assert_eq!(v.complete_total_usd, None);
         assert_eq!(v.incomplete, vec![IncompleteReason::PricingUnavailable]);
 
-        let v = value_usage(Some(&pricing()), None, Default::default());
+        let v = value_usage(Some(&pricing()), None);
         assert_eq!(v.complete_total_usd, None);
         assert_eq!(v.known_subtotal_usd, 0.0);
         assert_eq!(v.incomplete, vec![IncompleteReason::UsageUnavailable]);
@@ -721,20 +708,16 @@ mod tests {
             output: Some(0.0),
             ..Default::default()
         };
-        let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)), Default::default());
+        let v = value_usage(Some(&p), Some(&usage(10, 10, 0, 0, 0)));
         assert_eq!(v.billing, BillingClass::ZeroPriced);
         assert_eq!(v.complete_total_usd, Some(0.0));
     }
 
     #[test]
     fn valuation_round_trips_through_json() {
-        let v = value_usage(
-            Some(&pricing()),
-            Some(&usage(1, 2, 3, 4, 5)),
-            Default::default(),
-        );
+        let v = value_usage(Some(&pricing()), Some(&usage(1, 2, 3, 4, 5)));
         let json = serde_json::to_string(&v).unwrap();
-        assert!(json.contains("\"missing_write_duration\""));
+        assert!(json.contains("\"cache_write_1h_usd\""));
         assert_eq!(serde_json::from_str::<UsageValuation>(&json).unwrap(), v);
     }
 }

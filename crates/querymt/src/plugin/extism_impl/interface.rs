@@ -523,6 +523,52 @@ mod item_aware_tests {
     }
 
     #[test]
+    fn cache_write_tiers_round_trip_through_plugin_response_and_chunk() {
+        use crate::{CacheWriteTiers, Usage, chat::StreamChunk};
+        for tiers in [
+            None,
+            Some(CacheWriteTiers {
+                five_minute: Some(300),
+                one_hour: Some(0),
+            }),
+            Some(CacheWriteTiers {
+                five_minute: Some(200),
+                one_hour: Some(100),
+            }),
+        ] {
+            let usage = Usage {
+                input_tokens: 12,
+                cache_read: 30,
+                cache_write: 300,
+                cache_write_tiers: tiers,
+                ..Usage::default()
+            };
+            let response = ExtismChatResponse {
+                output: ChatOutput::from_projections(
+                    None,
+                    Some("hi".into()),
+                    None,
+                    Some(usage.clone()),
+                    None,
+                ),
+            };
+            let decoded: ExtismChatResponse =
+                serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+            assert_eq!(decoded.output.usage, Some(usage.clone()), "{tiers:?}");
+
+            let chunk = ExtismChatChunk {
+                chunk: StreamChunk::Usage(usage.clone()),
+            };
+            let decoded: ExtismChatChunk =
+                serde_json::from_slice(&serde_json::to_vec(&chunk).unwrap()).unwrap();
+            let StreamChunk::Usage(decoded) = decoded.chunk else {
+                panic!("expected usage chunk")
+            };
+            assert_eq!(decoded, usage, "{tiers:?}");
+        }
+    }
+
+    #[test]
     fn legacy_extism_payloads_default_item_aware_fields() {
         let request: ExtismChatRequest<serde_json::Value> = serde_json::from_value(json!({
             "cfg": {},

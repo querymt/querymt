@@ -326,7 +326,46 @@ struct GoogleChatResponse {
     /// Generated completion candidates
     candidates: Vec<GoogleCandidate>,
     #[serde(rename = "usageMetadata")]
-    usage: Option<Usage>,
+    usage: Option<GoogleUsageMetadata>,
+}
+
+/// Gemini `usageMetadata`, before normalization.
+///
+/// Per the API reference, `promptTokenCount` is the total effective prompt
+/// *including* `cachedContentTokenCount`, and `totalTokenCount` is prompt +
+/// tool-use prompt + thoughts + candidates, so `candidatesTokenCount`
+/// excludes thoughts. QueryMT categories are exclusive, so cached tokens are
+/// subtracted from the prompt and thoughts are reported as reasoning.
+/// Gemini reports no cache-write counter, so `cache_write` stays 0.
+#[derive(Deserialize, Debug, Clone, Default)]
+struct GoogleUsageMetadata {
+    #[serde(default, rename = "promptTokenCount")]
+    prompt_tokens: u32,
+    #[serde(default, rename = "cachedContentTokenCount")]
+    cached_tokens: u32,
+    #[serde(default, rename = "candidatesTokenCount")]
+    candidate_tokens: u32,
+    #[serde(default, rename = "toolUsePromptTokenCount")]
+    tool_use_prompt_tokens: u32,
+    #[serde(default, rename = "thoughtsTokenCount")]
+    thought_tokens: u32,
+}
+
+impl From<GoogleUsageMetadata> for Usage {
+    fn from(usage: GoogleUsageMetadata) -> Self {
+        Usage {
+            // Tool-use prompt tokens are input-side and not part of the prompt count.
+            input_tokens: usage
+                .prompt_tokens
+                .saturating_sub(usage.cached_tokens)
+                .saturating_add(usage.tool_use_prompt_tokens),
+            output_tokens: usage.candidate_tokens,
+            reasoning_tokens: usage.thought_tokens,
+            cache_read: usage.cached_tokens,
+            cache_write: 0,
+            cache_write_tiers: None,
+        }
+    }
 }
 
 impl std::fmt::Display for GoogleChatResponse {
@@ -546,7 +585,7 @@ impl From<GoogleChatResponse> for ChatOutput {
     fn from(response: GoogleChatResponse) -> Self {
         let text = response.text_projection();
         let thinking = response.thinking_projection();
-        let usage = response.usage.clone();
+        let usage = response.usage.clone().map(Usage::from);
         let finish_reason = response.finish_reason_projection();
 
         // Function calls are appended canonically so their provider-only
@@ -1502,7 +1541,7 @@ fn extract_google_stream_chunks(response: GoogleChatResponse) -> Vec<querymt::ch
         // capture Usage.  Google includes usage only in the final response
         // alongside finish_reason.
         if let Some(usage) = response.usage {
-            chunks.push(querymt::chat::StreamChunk::Usage(usage));
+            chunks.push(querymt::chat::StreamChunk::Usage(usage.into()));
         }
 
         // Check for finish reason (only in final chunk)
@@ -1828,6 +1867,90 @@ mod tests {
             }
             other => panic!("expected ProviderResponseError, got {other}"),
         }
+    }
+
+    /// `usageMetadata` shape from the Gemini API reference: the prompt count
+    /// includes cached content; `totalTokenCount` = prompt + tool-use +
+    /// thoughts + candidates, so candidates exclude thoughts.
+    const GEMINI_RESPONSE_WITH_USAGE: &str = r#"{
+        "candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP", "index": 0}],
+        "usageMetadata": {
+            "promptTokenCount": 1000, "cachedContentTokenCount": 600,
+            "candidatesTokenCount": 100, "thoughtsTokenCount": 40,
+            "toolUsePromptTokenCount": 7, "totalTokenCount": 1147
+        }
+    }"#;
+
+    fn expected_gemini_usage() -> Usage {
+        Usage {
+            // 1000 prompt - 600 cached + 7 tool-use prompt.
+            input_tokens: 407,
+            output_tokens: 100,
+            reasoning_tokens: 40,
+            cache_read: 600,
+            cache_write: 0,
+            cache_write_tiers: None,
+        }
+    }
+
+    #[test]
+    fn non_streaming_usage_subtracts_cache_and_reports_thoughts_as_reasoning() {
+        let google = test_google();
+        let response = Response::builder()
+            .status(200)
+            .body(GEMINI_RESPONSE_WITH_USAGE.as_bytes().to_vec())
+            .unwrap();
+        let output = google
+            .parse_chat(response, serde_json::Value::Null)
+            .unwrap();
+        let usage = output.usage.unwrap();
+        assert_eq!(usage, expected_gemini_usage());
+        // Exclusive categories add back to the provider's total once.
+        let total = usage.input_tokens
+            + usage.output_tokens
+            + usage.reasoning_tokens
+            + usage.cache_read
+            + usage.cache_write;
+        assert_eq!(total, 1147);
+    }
+
+    #[test]
+    fn streaming_final_usage_matches_non_streaming() {
+        let google = test_google();
+        let mut parser = google.chat_stream_parser(serde_json::Value::Null).unwrap();
+        let chunks = parser
+            .parse_chunk(GEMINI_RESPONSE_WITH_USAGE.as_bytes())
+            .unwrap();
+        let usage: Vec<_> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                querymt::chat::StreamChunk::Usage(u) => Some(u.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage, vec![expected_gemini_usage()]);
+    }
+
+    #[test]
+    fn usage_without_cache_or_thought_fields_defaults_to_zero() {
+        let google = test_google();
+        let body = br#"{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP","index":0}],
+            "usageMetadata":{"promptTokenCount":50,"candidatesTokenCount":5,"totalTokenCount":55}}"#;
+        let response = Response::builder().status(200).body(body.to_vec()).unwrap();
+        let usage = google
+            .parse_chat(response, serde_json::Value::Null)
+            .unwrap()
+            .usage
+            .unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.reasoning_tokens,
+                usage.cache_read
+            ),
+            (50, 5, 0, 0)
+        );
     }
 
     #[test]

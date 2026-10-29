@@ -1029,10 +1029,15 @@ where
     }
 
     // 3. Latest valid usage snapshot.
-    if let Some(used) = materialized.usage_used
-        && let Some(update) = materialized.usage.usage_update(used)
-    {
+    // Without a reliable context measurement/limit pair, accounting is still
+    // delivered through the metadata-only fallback.
+    let usage_update = materialized
+        .usage_used
+        .and_then(|used| materialized.usage.usage_update(used));
+    if let Some(update) = usage_update {
         push(SessionUpdate::UsageUpdate(update), &mut notifications);
+    } else if let Some(update) = materialized.usage.accounting_only_update() {
+        push(update, &mut notifications);
     }
 
     // 4. Current todo plan (retained only when non-empty).
@@ -1121,7 +1126,9 @@ fn materialize_replay_state(
     let mut legacy_counter: usize = 0;
 
     for event in events {
-        state.usage.observe(event.seq, &event.kind);
+        state
+            .usage
+            .observe(&event.session_id, event.seq, &event.kind);
         state.config.observe(&event.kind);
         let envelope = EventEnvelope::from(event.clone());
         match event.kind.clone() {
@@ -1142,15 +1149,13 @@ fn materialize_replay_state(
             }
             AgentEventKind::ProviderChanged { context_limit, .. } => {
                 state.usage.context_limit = context_limit;
+                // A measurement taken for the previous model is not validated
+                // for this one; live delivery invalidates it the same way.
+                state.usage_used = None;
             }
-            AgentEventKind::LlmRequestEnd {
-                context_tokens,
-                cumulative_cost_usd,
-                ..
-            } => {
-                if let Some(cost) = cumulative_cost_usd {
-                    state.usage.cumulative_cost_usd = Some(cost);
-                }
+            AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
+                // Money comes from the shared reducer (observed above), never
+                // from the request-end cumulative cost.
                 if state.usage.context_limit.is_some() {
                     state.usage_used = Some(context_tokens);
                 } else {
@@ -1343,18 +1348,29 @@ impl AcpSessionUpdateCapabilities {
     }
 }
 
+/// `_meta.querymt.accounting` key carrying the replacement accounting DTO.
+pub const QUERYMT_ACCOUNTING_META_KEY: &str = "accounting";
+
 /// Per-session usage projection state for the live context meter.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Token telemetry (`_meta.querymt.usage` v1) is derived from main-request
+/// `LlmRequestEnd` events and keeps its scope. Money is derived only from the
+/// shared accounting reducer; request-end cumulative costs are never read.
+#[derive(Debug, Clone, Default)]
 struct SessionUsageProjection {
     context_limit: Option<u64>,
-    cumulative_cost_usd: Option<f64>,
+    /// Shared reducer over attempt records; created on first accounting
+    /// evidence so a session with none publishes no accounting payload.
+    accounting: Option<crate::accounting::AccountingReducer>,
+    /// Last main-context occupancy and the journal sequence that reported it.
+    context_used: Option<u64>,
+    used_seq: Option<i64>,
     latest_request: Option<TokenUsageBreakdown>,
     session_totals: Option<TokenUsageBreakdown>,
     partial: bool,
     request_seqs: HashSet<i64>,
     latest_request_seq: Option<i64>,
     provider_seq: Option<i64>,
-    cost_seq: Option<i64>,
     history_loaded: bool,
 }
 
@@ -1382,22 +1398,86 @@ impl From<&querymt::Usage> for TokenUsageBreakdown {
 }
 
 impl SessionUsageProjection {
-    fn observe(&mut self, seq: i64, kind: &AgentEventKind) {
+    /// Apply an accounting record. Returns whether it changed accounting
+    /// state (an identical redelivery does not).
+    fn apply_accounting(&mut self, session_id: &str, seq: i64, kind: &AgentEventKind) -> bool {
+        let reducer = self
+            .accounting
+            .get_or_insert_with(|| crate::accounting::AccountingReducer::new(session_id));
+        match reducer.apply_at(seq, kind) {
+            Ok(crate::accounting::Applied::New) => true,
+            Ok(_) => false,
+            Err(conflict) => {
+                tracing::warn!(
+                    session.id = %session_id,
+                    attempt.id = %conflict.attempt_id,
+                    detail = conflict.detail,
+                    "ignoring conflicting accounting record"
+                );
+                false
+            }
+        }
+    }
+
+    /// Record a main-context measurement (request end or compaction).
+    fn observe_context_used(&mut self, seq: i64, tokens: u64) {
+        if self.used_seq.is_none_or(|previous| seq > previous) {
+            self.context_used = Some(tokens);
+            self.used_seq = Some(seq);
+        }
+    }
+
+    /// The last main-context measurement, unless the active model changed
+    /// after it was taken (it was not validated for the new model).
+    fn reliable_used(&self) -> Option<u64> {
+        let used_seq = self.used_seq?;
+        self.provider_seq
+            .is_none_or(|provider| used_seq > provider)
+            .then_some(self.context_used)
+            .flatten()
+    }
+
+    fn accounting_snapshot(&self) -> Option<crate::accounting::AccountingSnapshot> {
+        self.accounting
+            .as_ref()
+            .map(crate::accounting::AccountingSnapshot::from_reducer)
+    }
+
+    /// Observe one event. Returns `true` when an accounting *settlement* (or a
+    /// legacy generation record) changed accounting state and the caller
+    /// should publish it. Attempt starts only update the reducer: publishing
+    /// them would flash an incomplete total during every in-flight request.
+    fn observe(&mut self, session_id: &str, seq: i64, kind: &AgentEventKind) -> bool {
         match kind {
+            AgentEventKind::LlmAttemptStarted { .. } => {
+                self.apply_accounting(session_id, seq, kind);
+                false
+            }
+            AgentEventKind::LlmAttemptSettled { .. } => {
+                self.apply_accounting(session_id, seq, kind)
+            }
             AgentEventKind::ProviderChanged { context_limit, .. } => {
                 if self.provider_seq.is_none_or(|previous| seq > previous) {
                     self.context_limit = *context_limit;
                     self.provider_seq = Some(seq);
                 }
+                false
             }
             AgentEventKind::LlmRequestEnd {
                 usage,
-                cumulative_cost_usd,
+                context_tokens,
+                accounting,
                 ..
             } => {
                 if !self.request_seqs.insert(seq) {
-                    return;
+                    return false;
                 }
+                self.observe_context_used(seq, *context_tokens);
+                let legacy_changed = if accounting.is_none() {
+                    self.apply_accounting(session_id, seq, kind)
+                } else {
+                    false
+                };
                 let request = usage.as_ref().map(TokenUsageBreakdown::from);
                 if let Some(request) = request.as_ref() {
                     let totals = self.session_totals.get_or_insert_default();
@@ -1423,37 +1503,83 @@ impl SessionUsageProjection {
                     self.latest_request = request;
                     self.latest_request_seq = Some(seq);
                 }
-                if let Some(cost) = cumulative_cost_usd
-                    && self.cost_seq.is_none_or(|previous| seq > previous)
-                {
-                    self.cumulative_cost_usd = Some(*cost);
-                    self.cost_seq = Some(seq);
-                }
+                legacy_changed
             }
-            _ => {}
+            _ => false,
         }
     }
 
-    /// Builds a `usage_update` for the given current context occupancy, or
-    /// `None` when the effective context limit is unknown or meaningless.
-    fn usage_update(&self, used: u64) -> Option<UsageUpdate> {
-        let size = self.context_limit.filter(|size| *size > 0)?;
-        let mut update = UsageUpdate::new(used, size);
-        if let Some(amount) = self.cumulative_cost_usd {
-            update = update.cost(crate::acp::protocol::Cost::new(amount, "USD"));
-        }
-        if !self.request_seqs.is_empty() {
-            update = update.meta(serde_json::Map::from_iter([(
-                QUERYMT_META_NAMESPACE.to_string(),
-                serde_json::json!({ "usage": {
+    /// `_meta.querymt` namespace object: token telemetry (unchanged v1) and,
+    /// once accounting evidence exists, the replacement accounting DTO.
+    fn querymt_meta(
+        &self,
+        include_usage: bool,
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let mut querymt = serde_json::Map::new();
+        if include_usage && !self.request_seqs.is_empty() {
+            querymt.insert(
+                "usage".to_string(),
+                serde_json::json!({
                     "version": 1,
                     "latestRequest": self.latest_request,
                     "sessionTotals": self.session_totals,
                     "partial": self.partial,
-                }}),
-            )]));
+                }),
+            );
+        }
+        if let Some(snapshot) = self.accounting_snapshot()
+            && let Ok(value) = serde_json::to_value(snapshot)
+        {
+            querymt.insert(QUERYMT_ACCOUNTING_META_KEY.to_string(), value);
+        }
+        (!querymt.is_empty()).then(|| {
+            serde_json::Map::from_iter([(
+                QUERYMT_META_NAMESPACE.to_string(),
+                serde_json::Value::Object(querymt),
+            )])
+        })
+    }
+
+    /// Builds a `usage_update` for the given current context occupancy, or
+    /// `None` when the effective context limit is unknown or meaningless.
+    ///
+    /// Standard `cost` is the session's complete supported estimate only; it
+    /// is omitted whenever that total is unavailable (partial, unresolved,
+    /// all-excluded or legacy history).
+    fn usage_update(&self, used: u64) -> Option<UsageUpdate> {
+        let size = self.context_limit.filter(|size| *size > 0)?;
+        let mut update = UsageUpdate::new(used, size);
+        if let Some(amount) = self
+            .accounting_snapshot()
+            .and_then(|snapshot| snapshot.session.complete_total_usd)
+        {
+            update = update.cost(crate::acp::protocol::Cost::new(amount, "USD"));
+        }
+        if let Some(meta) = self.querymt_meta(true) {
+            update = update.meta(meta);
         }
         Some(update)
+    }
+
+    /// Metadata-only accounting carrier for when no reliable context
+    /// measurement/limit pair exists. It never changes the title or the
+    /// activity timestamp and fabricates no context numbers.
+    fn accounting_only_update(&self) -> Option<SessionUpdate> {
+        let meta = self.querymt_meta(false)?;
+        meta.get(QUERYMT_META_NAMESPACE)?
+            .get(QUERYMT_ACCOUNTING_META_KEY)?;
+        let update = SessionInfoUpdate::new();
+        Some(SessionUpdate::SessionInfoUpdate(update.meta(meta)))
+    }
+
+    /// The carrier for an accounting change: `usage_update` when a reliable
+    /// main-context measurement and the active limit are available,
+    /// otherwise the metadata-only fallback. Independent of notice support.
+    fn accounting_update(&self) -> Option<SessionUpdate> {
+        self.reliable_used()
+            .and_then(|used| self.usage_update(used))
+            .map(SessionUpdate::UsageUpdate)
+            .or_else(|| self.accounting_only_update())
     }
 }
 
@@ -1582,7 +1708,7 @@ impl AcpLiveEventTranslator {
             .collect();
         let usage = self.usage.entry(session_id.to_owned()).or_default();
         for event in events {
-            usage.observe(event.seq, &event.kind);
+            usage.observe(session_id, event.seq, &event.kind);
             self.delegation_updates.project_event(event);
         }
         usage.history_loaded = true;
@@ -1618,6 +1744,8 @@ impl AcpLiveEventTranslator {
                 Some(
                     "llm_request_end"
                         | "provider_changed"
+                        | "llm_attempt_started"
+                        | "llm_attempt_settled"
                         | "delegation_requested"
                         | "session_forked"
                         | "delegation_completed"
@@ -1842,10 +1970,11 @@ impl AcpLiveEventTranslator {
                 vec![SessionUpdate::SessionInfoUpdate(update)]
             }
             AgentEventKind::ProviderChanged { .. } => {
-                self.usage
-                    .entry(session_id.clone())
-                    .or_default()
-                    .observe(event.seq(), event.kind());
+                self.usage.entry(session_id.clone()).or_default().observe(
+                    &session_id,
+                    event.seq(),
+                    event.kind(),
+                );
                 let config = self.config.entry(session_id).or_default();
                 config.observe(event.kind());
                 config
@@ -1858,12 +1987,32 @@ impl AcpLiveEventTranslator {
                     .unwrap_or_default()
             }
             AgentEventKind::LlmRequestEnd { context_tokens, .. } => {
-                let usage = self.usage.entry(session_id).or_default();
-                usage.observe(event.seq(), event.kind());
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                usage.observe(&session_id, event.seq(), event.kind());
                 usage
                     .usage_update(*context_tokens)
                     .map(|update| vec![SessionUpdate::UsageUpdate(update)])
                     .unwrap_or_default()
+            }
+            // An attempt start only updates the reducer: publishing it would
+            // flash an incomplete total during every in-flight request.
+            AgentEventKind::LlmAttemptStarted { .. } => {
+                self.usage.entry(session_id.clone()).or_default().observe(
+                    &session_id,
+                    event.seq(),
+                    event.kind(),
+                );
+                Vec::new()
+            }
+            // A settlement changes accounting. Deliver it independently of
+            // notice support and of context size.
+            AgentEventKind::LlmAttemptSettled { .. } => {
+                let usage = self.usage.entry(session_id.clone()).or_default();
+                if usage.observe(&session_id, event.seq(), event.kind()) {
+                    usage.accounting_update().into_iter().collect()
+                } else {
+                    Vec::new()
+                }
             }
             AgentEventKind::HookNotice {
                 event_name,
@@ -1962,12 +2111,12 @@ impl AcpLiveEventTranslator {
                 }
                 // Post-compaction usage snapshots are stable, ungated updates.
                 if let Some(tokens) = context_tokens
-                    && let Some(update) = self
-                        .usage
-                        .get(&session_id)
-                        .and_then(|usage| usage.usage_update(*tokens))
+                    && let Some(usage) = self.usage.get_mut(&session_id)
                 {
-                    updates.push(SessionUpdate::UsageUpdate(update));
+                    usage.observe_context_used(event.seq(), *tokens);
+                    if let Some(update) = usage.usage_update(*tokens) {
+                        updates.push(SessionUpdate::UsageUpdate(update));
+                    }
                 }
                 updates
             }
@@ -6600,8 +6749,72 @@ mod session_update_tests {
                 cumulative_cost_usd: cumulative_cost,
                 context_tokens,
                 metrics: Default::default(),
+                accounting: None,
             },
         )
+    }
+
+    /// A request end that carries accounting (not a legacy generation record).
+    fn accounted_end(seq: i64, context_tokens: u64) -> EventEnvelope {
+        envelope(seq, accounted_end_kind(context_tokens))
+    }
+
+    fn accounted_end_accounting() -> Option<crate::accounting::RequestAccounting> {
+        Some(crate::accounting::RequestAccounting {
+            operation_id: "op-1".into(),
+            attempt_ids: vec![],
+            known_subtotal_usd: 0.0,
+            complete: true,
+            reasons: vec![],
+        })
+    }
+
+    fn accounted_end_kind(context_tokens: u64) -> AgentEventKind {
+        AgentEventKind::LlmRequestEnd {
+            usage: None,
+            tool_calls: 0,
+            finish_reason: None,
+            cost_usd: None,
+            // Never read: money comes from the reducer.
+            cumulative_cost_usd: Some(999.0),
+            context_tokens,
+            metrics: Default::default(),
+            accounting: accounted_end_accounting(),
+        }
+    }
+
+    /// Cost of one complete `sample_settlement` attempt.
+    fn sample_cost() -> f64 {
+        (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6
+    }
+
+    /// Settled main-response attempt (start + settlement events) for `cycle`.
+    fn attempt_events(
+        seq: i64,
+        id: &str,
+        cycle: &str,
+        purpose: crate::accounting::AttemptPurpose,
+        complete: bool,
+    ) -> Vec<EventEnvelope> {
+        use crate::accounting::tests::{sample_pricing, sample_settlement, sample_start};
+        let mut start = sample_start();
+        start.attempt.attempt_id = id.into();
+        start.attempt.session_id = "s-1".into();
+        start.attempt.cycle_id = cycle.into();
+        start.attempt.purpose = purpose;
+        let mut settlement = sample_settlement();
+        settlement.attempt = start.attempt.clone();
+        if !complete {
+            let mut pricing = sample_pricing();
+            pricing.cache_write = None;
+            settlement.valuation =
+                querymt::providers::value_usage(Some(&pricing), settlement.usage.as_ref());
+            settlement.pricing = Some(pricing);
+        }
+        vec![
+            envelope(seq, AgentEventKind::LlmAttemptStarted { start }),
+            envelope(seq + 1, AgentEventKind::LlmAttemptSettled { settlement }),
+        ]
     }
 
     fn provider_changed(seq: i64, limit: Option<u64>) -> EventEnvelope {
@@ -6985,8 +7198,8 @@ mod session_update_tests {
         assert_eq!(usage_json["sessionUpdate"], "usage_update");
         assert_eq!(usage_json["used"], 42);
         assert_eq!(usage_json["size"], 100);
-        assert_eq!(usage_json["cost"]["amount"], 0.5);
-        assert_eq!(usage_json["cost"]["currency"], "USD");
+        // A legacy request-end cumulative cost is never trusted.
+        assert!(usage_json.get("cost").is_none_or(|cost| cost.is_null()));
 
         let plan_json = serde_json::to_value(
             translator
@@ -7117,6 +7330,7 @@ mod session_update_tests {
                     reasoning_tokens: 1024,
                     cache_read: 500,
                     cache_write: 20,
+                    cache_write_tiers: None,
                 }),
                 context_tokens: 1781,
                 cumulative_cost_usd: Some(0.5),
@@ -7124,6 +7338,7 @@ mod session_update_tests {
                 tool_calls: 0,
                 finish_reason: None,
                 metrics: Default::default(),
+                accounting: None,
             },
         )
     }
@@ -7230,6 +7445,113 @@ mod session_update_tests {
         assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
     }
 
+    #[tokio::test]
+    async fn load_snapshot_carries_authoritative_accounting_without_context_or_replay() {
+        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        use crate::session::backend::StorageBackend;
+        use crate::session::projection::NewDurableEvent;
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let session_id = fixture.create_session().await;
+        let journal = fixture.storage.event_journal();
+        // No provider_changed: the context limit is unknown. A complete main
+        // attempt, then a compaction attempt with an unpriced category.
+        let mut records = attempt_events(1, "a1", "c1", MainResponse, true);
+        records.extend(attempt_events(3, "a2", "c1", Compaction, false));
+        for record in records {
+            let mut kind = record.kind().clone();
+            match &mut kind {
+                AgentEventKind::LlmAttemptStarted { start } => {
+                    start.attempt.session_id = session_id.clone()
+                }
+                AgentEventKind::LlmAttemptSettled { settlement } => {
+                    settlement.attempt.session_id = session_id.clone()
+                }
+                _ => {}
+            }
+            journal
+                .append_durable(&NewDurableEvent {
+                    session_seq: None,
+                    session_id: session_id.clone(),
+                    origin: EventOrigin::Local,
+                    source_node: None,
+                    source_node_id: None,
+                    source_seq: None,
+                    kind,
+                })
+                .await
+                .unwrap();
+        }
+        let snapshot = crate::session::load_session_snapshot(
+            fixture.handle.as_ref(),
+            fixture.storage.view_store().unwrap(),
+            &session_id,
+        )
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let accounting = &json["accounting"];
+        assert_eq!(accounting["version"], 1);
+        assert!(accounting["session"]["completeTotalUsd"].is_null());
+        assert_eq!(accounting["session"]["pricedAttempts"], 2);
+        assert_eq!(accounting["session"]["incompleteAttempts"], 1);
+        assert_eq!(accounting["cycle"]["cycleId"], "c1");
+
+        // Seeding a connection from that snapshot reproduces the same state
+        // and, applied again together with captured-live duplicates, never
+        // double counts.
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            json.clone(),
+        )]);
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(
+            translator
+                .seed_history_from_meta(&session_id, Some(&meta))
+                .is_some()
+        );
+        let seeded = translator.usage[&session_id].accounting_snapshot().unwrap();
+        assert_eq!(serde_json::to_value(&seeded).unwrap(), *accounting);
+        assert!(
+            translator
+                .seed_history_from_meta(&session_id, Some(&meta))
+                .is_some()
+        );
+        let again = translator.usage[&session_id].accounting_snapshot().unwrap();
+        assert_eq!(seeded, again);
+    }
+
+    #[test]
+    fn older_snapshot_cannot_resurrect_a_cleared_complete_total() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        // Live delivery already cleared the total (partial attempt seq 3-4).
+        let mut translator = AcpLiveEventTranslator::new();
+        settle_all(
+            &mut translator,
+            attempt_events(1, "a1", "c1", MainResponse, true),
+        );
+        settle_all(
+            &mut translator,
+            attempt_events(3, "a2", "c1", MainResponse, false),
+        );
+        // A stale snapshot taken after only the first (complete) attempt.
+        let stale: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            serde_json::json!({ "audit": { "events": stale } }),
+        )]);
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
+        assert!(snapshot.session.complete_total_usd.is_none());
+        assert_eq!(snapshot.session.priced_attempts, 2);
+    }
+
     #[test]
     fn usage_restores_from_load_snapshot_without_resetting_live_state() {
         let events = vec![
@@ -7257,7 +7579,11 @@ mod session_update_tests {
         assert_eq!(usage.session_totals.as_ref().unwrap().output_tokens, 162);
         assert!(usage.latest_request.is_none());
         assert!(usage.partial);
-        assert_eq!(usage.cumulative_cost_usd, Some(0.5));
+        // Legacy request-ends carry no accounting basis: their cumulative cost
+        // is not trusted and no complete total is claimed.
+        let snapshot = usage.accounting_snapshot().expect("legacy disclosure");
+        assert!(snapshot.session.complete_total_usd.is_none());
+        assert_eq!(snapshot.session.unaccounted_generations, 2);
         assert!(translator.seed_history_from_meta("s-1", None).is_none());
     }
 
@@ -7297,27 +7623,45 @@ mod session_update_tests {
     #[test]
     fn usage_uses_latest_limit_and_includes_cost_and_cached_tokens() {
         let mut translator = AcpLiveEventTranslator::new();
+        use crate::accounting::AttemptPurpose::MainResponse;
         translator.translate_updates(&provider_changed(1, Some(100_000)));
+        for event in attempt_events(2, "a1", "c1", MainResponse, true) {
+            translator.translate_updates(&event);
+        }
         // Cached tokens are already included in context_tokens.
-        let updates = translator.translate_updates(&usage_end(2, 12_345, Some(1.25)));
+        let updates = translator.translate_updates(&accounted_end(4, 12_345));
         let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
             panic!("expected usage update");
         };
         assert_eq!(usage.used, 12_345);
         assert_eq!(usage.size, 100_000);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
 
-        // A different known limit applies to the next snapshot. A request
-        // without a fresh cost value keeps the last cumulative session cost.
-        translator.translate_updates(&provider_changed(3, Some(50_000)));
-        let updates = translator.translate_updates(&usage_end(4, 100, None));
+        // A different known limit applies to the next snapshot; the complete
+        // session total comes from the reducer and is retained.
+        translator.translate_updates(&provider_changed(5, Some(50_000)));
+        let updates = translator.translate_updates(&accounted_end(6, 100));
         let SessionUpdate::UsageUpdate(usage) = &updates[0] else {
             panic!("expected usage update");
         };
         assert_eq!(usage.size, 50_000);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 1.25);
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
 
-        // With no cost observed anywhere, the cost field stays omitted.
+        // An unpriced nonzero category makes the session partial: standard
+        // cost is omitted instead of retaining the previous complete value,
+        // and the accounting metadata clears the total with an explicit null.
+        let mut last = Vec::new();
+        for event in attempt_events(7, "a2", "c1", MainResponse, false) {
+            last = translator.translate_updates(&event);
+        }
+        let partial = serde_json::to_value(&last[0]).unwrap();
+        assert!(partial.get("cost").is_none_or(|cost| cost.is_null()));
+        let accounting = &partial["_meta"]["querymt"]["accounting"]["session"];
+        assert!(accounting["completeTotalUsd"].is_null());
+        assert_eq!(accounting["complete"], false);
+        assert!(accounting["knownSubtotalUsd"].as_f64().unwrap() > sample_cost());
+
+        // With no accounting observed anywhere, no cost or accounting appears.
         let mut fresh = AcpLiveEventTranslator::new();
         fresh.translate_updates(&provider_changed(1, Some(50_000)));
         let updates = fresh.translate_updates(&usage_end(2, 100, None));
@@ -7325,6 +7669,274 @@ mod session_update_tests {
             panic!("expected usage update");
         };
         assert!(usage.cost.is_none());
+    }
+
+    fn settle_all(
+        translator: &mut AcpLiveEventTranslator,
+        events: Vec<EventEnvelope>,
+    ) -> Vec<SessionUpdate> {
+        let mut last = Vec::new();
+        for event in events {
+            last = translator.translate_updates(&event);
+        }
+        last
+    }
+
+    #[test]
+    fn attempt_start_alone_publishes_nothing() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        let start = attempt_events(1, "a1", "c1", MainResponse, true).remove(0);
+        assert!(translator.translate_updates(&start).is_empty());
+    }
+
+    #[test]
+    fn unknown_context_delivers_accounting_through_metadata_only_session_info() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        // No notice/compaction capability and no known context limit.
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(!translator.capabilities().notices);
+        let updates = settle_all(
+            &mut translator,
+            attempt_events(1, "a1", "c1", MainResponse, true),
+        );
+        let [SessionUpdate::SessionInfoUpdate(_)] = updates.as_slice() else {
+            panic!("expected one metadata-only session_info_update, got {updates:?}");
+        };
+        let json = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(json["sessionUpdate"], "session_info_update");
+        // No session-summary fields change, and no context is fabricated.
+        assert!(json.get("title").is_none());
+        assert!(json.get("updatedAt").is_none());
+        assert!(json.get("used").is_none());
+        let accounting = &json["_meta"]["querymt"]["accounting"];
+        assert_eq!(accounting["version"], 1);
+        assert_eq!(accounting["session"]["complete"], true);
+        assert_eq!(accounting["cycle"]["cycleId"], "c1");
+        assert!(json["_meta"]["querymt"].get("usage").is_none());
+    }
+
+    #[test]
+    fn auxiliary_settlement_reuses_valid_main_context_and_keeps_usage_v1() {
+        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        settle_all(
+            &mut translator,
+            attempt_events(2, "a1", "c1", MainResponse, true),
+        );
+        let main = translator.translate_updates(&request_with_tokens(4));
+        let main = serde_json::to_value(&main[0]).unwrap();
+        let aux = settle_all(
+            &mut translator,
+            attempt_events(5, "a2", "c1", Compaction, true),
+        );
+        let aux = serde_json::to_value(&aux[0]).unwrap();
+        assert_eq!(aux["sessionUpdate"], "usage_update");
+        // Main-context occupancy is not replaced by auxiliary tokens, and the
+        // main-request token telemetry keeps its v1 scope.
+        assert_eq!(aux["used"], main["used"]);
+        assert_eq!(
+            aux["_meta"]["querymt"]["usage"],
+            main["_meta"]["querymt"]["usage"]
+        );
+        assert_eq!(
+            aux["_meta"]["querymt"]["accounting"]["session"]["pricedAttempts"],
+            2
+        );
+    }
+
+    #[test]
+    fn model_switch_invalidates_prior_context_measurement() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        translator.translate_updates(&accounted_end(2, 5_000));
+        translator.translate_updates(&provider_changed(3, Some(200_000)));
+        // The 5_000 measurement predates the switch; it is not paired with the
+        // new limit. Accounting still arrives through the fallback.
+        let updates = settle_all(
+            &mut translator,
+            attempt_events(4, "a1", "c1", MainResponse, true),
+        );
+        let json = serde_json::to_value(&updates[0]).unwrap();
+        assert_eq!(json["sessionUpdate"], "session_info_update");
+        assert!(json["_meta"]["querymt"]["accounting"].is_object());
+    }
+
+    #[test]
+    fn partial_budget_warning_follows_notice_capability_but_accounting_always_arrives() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let notice = envelope(
+            9,
+            AgentEventKind::HookNotice {
+                event_name: "price_limit".to_string(),
+                message: "best-effort budget".to_string(),
+                is_error: false,
+            },
+        );
+        // Manual budget rates cannot price the used cache-write category.
+        let mut events = attempt_events(1, "a1", "c1", MainResponse, true);
+        let EventEnvelope::Durable(durable) = &mut events[1] else {
+            unreachable!()
+        };
+        let AgentEventKind::LlmAttemptSettled { settlement } = &mut durable.kind else {
+            unreachable!()
+        };
+        let mut manual = crate::accounting::tests::sample_pricing();
+        manual.cache_write = None;
+        settlement.budget_valuation = Some(querymt::providers::value_usage(
+            Some(&manual),
+            settlement.usage.as_ref(),
+        ));
+
+        // Capable client: the advisory notice is delivered, not an error.
+        let mut capable = AcpLiveEventTranslator::new();
+        capable.set_capabilities(plan_ops());
+        let delivered = capable.translate_updates(&notice);
+        let [SessionUpdate::Notice(n)] = delivered.as_slice() else {
+            panic!("capable client must receive the notice");
+        };
+        assert_eq!(n.severity, NoticeSeverity::Info);
+
+        // Client without notice support: no unsupported notice is sent, yet
+        // the best-effort condition is still carried by the accounting
+        // metadata, and the API estimate stays complete.
+        let mut legacy = AcpLiveEventTranslator::new();
+        assert!(legacy.translate_updates(&notice).is_empty());
+        let updates = settle_all(&mut legacy, events);
+        let json = serde_json::to_value(&updates[0]).unwrap();
+        let budget = &json["_meta"]["querymt"]["accounting"]["cycle"]["budget"];
+        assert_eq!(budget["bestEffort"], true);
+        assert!(budget["completeTotalUsd"].is_null());
+        assert_eq!(
+            json["_meta"]["querymt"]["accounting"]["session"]["complete"],
+            true
+        );
+    }
+
+    #[test]
+    fn duplicate_settlement_delivery_publishes_once() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        let events = attempt_events(1, "a1", "c1", MainResponse, true);
+        let first = settle_all(&mut translator, events.clone());
+        assert_eq!(first.len(), 1);
+        let again = settle_all(&mut translator, events);
+        assert!(again.is_empty(), "identical redelivery changes nothing");
+    }
+
+    #[test]
+    fn replay_accounting_matches_live_for_the_same_records() {
+        use crate::accounting::AttemptPurpose::{Compaction, MainResponse};
+        let mut envelopes = vec![provider_changed(1, Some(100_000))];
+        envelopes.extend(attempt_events(2, "a1", "c1", MainResponse, true));
+        envelopes.push(accounted_end(4, 7_000));
+        envelopes.extend(attempt_events(5, "a2", "c1", Compaction, false));
+
+        let mut live = AcpLiveEventTranslator::new();
+        let mut live_update = Vec::new();
+        for event in &envelopes {
+            let updates = live.translate_updates(event);
+            if let Some(update) = updates.into_iter().next_back() {
+                live_update = vec![update];
+            }
+        }
+        let live_json = serde_json::to_value(&live_update[0]).unwrap();
+
+        let events: Vec<AgentEvent> = envelopes
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let replay = replay_updates(events, Default::default());
+        let replay_json = replay
+            .iter()
+            .find_map(|u| match u {
+                SessionUpdate::UsageUpdate(_) => Some(serde_json::to_value(u).unwrap()),
+                _ => None,
+            })
+            .expect("replayed usage update");
+        assert_eq!(
+            replay_json["_meta"]["querymt"]["accounting"],
+            live_json["_meta"]["querymt"]["accounting"]
+        );
+        assert_eq!(replay_json["used"], live_json["used"]);
+        // The partial compaction attempt clears the standard cost both ways.
+        assert!(replay_json.get("cost").is_none_or(|c| c.is_null()));
+        assert!(live_json.get("cost").is_none_or(|c| c.is_null()));
+    }
+
+    #[test]
+    fn replay_without_context_still_carries_accounting() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let replay = replay_updates(events, Default::default());
+        let info = replay
+            .iter()
+            .find_map(|u| match u {
+                SessionUpdate::SessionInfoUpdate(_) => Some(serde_json::to_value(u).unwrap()),
+                _ => None,
+            })
+            .expect("metadata-only accounting update");
+        assert!(info["_meta"]["querymt"]["accounting"]["session"]["complete"] == true);
+        assert!(
+            !replay
+                .iter()
+                .any(|u| matches!(u, SessionUpdate::UsageUpdate(_)))
+        );
+    }
+
+    #[test]
+    fn seeding_from_load_snapshot_restores_reducer_accounting() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let events: Vec<AgentEvent> = attempt_events(1, "a1", "c1", MainResponse, true)
+            .iter()
+            .map(|e| agent_event(e.seq(), e.kind().clone()))
+            .collect();
+        let meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".to_string(),
+            serde_json::json!({ "audit": { "events": events } }),
+        )]);
+        let mut translator = AcpLiveEventTranslator::new();
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
+        assert!(
+            translator
+                .seed_history_from_meta("s-1", Some(&meta))
+                .is_some()
+        );
+        let snapshot = translator.usage["s-1"].accounting_snapshot().unwrap();
+        assert_eq!(snapshot.session.priced_attempts, 1);
+        assert!(snapshot.session.complete);
+    }
+
+    #[test]
+    fn excluded_only_session_has_no_standard_cost() {
+        use crate::accounting::AttemptPurpose::MainResponse;
+        let mut translator = AcpLiveEventTranslator::new();
+        translator.translate_updates(&provider_changed(1, Some(100_000)));
+        let mut events = attempt_events(2, "a1", "c1", MainResponse, true);
+        let EventEnvelope::Durable(durable) = &mut events[1] else {
+            unreachable!()
+        };
+        let AgentEventKind::LlmAttemptSettled { settlement } = &mut durable.kind else {
+            unreachable!()
+        };
+        settlement.valuation = querymt::providers::UsageValuation::excluded();
+        settle_all(&mut translator, events);
+        let update = translator.translate_updates(&accounted_end(4, 100));
+        let json = serde_json::to_value(&update[0]).unwrap();
+        assert!(json.get("cost").is_none_or(|c| c.is_null()));
+        assert_eq!(
+            json["_meta"]["querymt"]["accounting"]["session"]["billing"],
+            "excluded"
+        );
     }
 
     #[test]
@@ -7377,10 +7989,19 @@ mod session_update_tests {
         let mut translator = AcpLiveEventTranslator::new();
         translator.set_capabilities(plan_ops());
         translator.translate_updates(&provider_changed(1, Some(100_000)));
-        translator.translate_updates(&usage_end(2, 90_000, Some(2.0)));
+        for event in attempt_events(
+            2,
+            "a1",
+            "c1",
+            crate::accounting::AttemptPurpose::MainResponse,
+            true,
+        ) {
+            translator.translate_updates(&event);
+        }
+        translator.translate_updates(&accounted_end(4, 90_000));
 
         let updates = translator.translate_updates(&envelope(
-            3,
+            5,
             AgentEventKind::CompactionEnd {
                 summary: "s".to_string(),
                 summary_len: 1,
@@ -7393,7 +8014,7 @@ mod session_update_tests {
         };
         assert_eq!(usage.used, 1_000);
         assert_eq!(usage.size, 100_000);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 2.0);
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
     }
 
     // ── 4.1/4.2 Plan lifecycle ─────────────────────────────────────────────
@@ -7827,6 +8448,7 @@ mod session_update_tests {
                     cumulative_cost_usd: Some(3.0),
                     context_tokens: 50,
                     metrics: Default::default(),
+                    accounting: accounted_end_accounting(),
                 },
             ),
             agent_event(
@@ -7866,6 +8488,26 @@ mod session_update_tests {
                     event_name: "hook".to_string(),
                     message: "noisy".to_string(),
                     is_error: false,
+                },
+            ),
+            agent_event(
+                12,
+                AgentEventKind::LlmAttemptStarted {
+                    start: {
+                        let mut start = crate::accounting::tests::sample_start();
+                        start.attempt.session_id = "s-1".into();
+                        start
+                    },
+                },
+            ),
+            agent_event(
+                13,
+                AgentEventKind::LlmAttemptSettled {
+                    settlement: {
+                        let mut settlement = crate::accounting::tests::sample_settlement();
+                        settlement.attempt.session_id = "s-1".into();
+                        settlement
+                    },
                 },
             ),
         ];
@@ -7910,7 +8552,9 @@ mod session_update_tests {
             unreachable!()
         };
         assert_eq!(usage.used, 5);
-        assert_eq!(usage.cost.as_ref().unwrap().amount, 3.0);
+        // Replay prices from the shared reducer, never from the request-end
+        // cumulative cost (3.0 here).
+        assert!((usage.cost.as_ref().unwrap().amount - sample_cost()).abs() < 1e-12);
 
         let plans: Vec<&SessionUpdate> = updates
             .iter()

@@ -1497,6 +1497,10 @@ pub(super) async fn record_tool_side_effects(
                     delegation: delegation.clone(),
                     tool_call_id: Some(result.call_id.clone()),
                     batch_id: batch_id.map(str::to_owned),
+                    cycle_id: exec_ctx
+                        .cycle_accounting
+                        .get()
+                        .map(|cycle| cycle.cycle_id().to_string()),
                 },
             );
             return Ok(Some(WaitCondition::delegation(

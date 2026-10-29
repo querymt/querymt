@@ -318,4 +318,11 @@ ATIF trajectories contain:
 - **Tool calls and observations**: with argument/result correlation
 - **Metrics**: per-step and aggregate token usage and cost
 
-See the [ATIF specification](https://github.com/laude-institute/harbor) for the full schema.
+Costs come from the recorded accounting ledger, not from per-request convenience fields:
+
+- `final_metrics.total_cost_usd` is the session's complete supported estimate, and is **absent** when any attempt is unresolved, partially priced or unpriced (never a sum of the priced ones shown as complete) and for an all-excluded (subscription) session.
+- `final_metrics.extra.accounting` holds the known subtotal, completeness reasons and counts. `final_metrics.extra.attempts` lists every attempt (main, compaction, delegation summary, failed, unresolved) once, linked to a step through `step_id` when it fed a turn's cost. Compaction and summaries never create assistant steps.
+- A step's `metrics.cost_usd` is its logical operation's complete cost (all retries) or absent; an incomplete operation puts its known subtotal and reasons in `metrics.extra.accounting`. Step costs are not added to the total again.
+- Attempts of another session in the same audit view (a delegated child) are not counted as this session's spend. Request ends from before accounting existed export no cost.
+
+See the Cost accounting section of the [API reference](api_reference.md#cost-accounting) for the metadata contract, and the [ATIF specification](https://github.com/laude-institute/harbor) for the full schema.

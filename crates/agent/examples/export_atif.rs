@@ -98,6 +98,7 @@ fn main() {
                 cumulative_cost_usd: Some(0.00123),
                 context_tokens: 195,
                 metrics: ExecutionMetrics { steps: 1, turns: 1 },
+                accounting: None,
             },
         },
         AgentEvent {
@@ -142,6 +143,7 @@ fn main() {
                 cumulative_cost_usd: Some(0.00201),
                 context_tokens: 205,
                 metrics: ExecutionMetrics { steps: 2, turns: 1 },
+                accounting: None,
             },
         },
     ];
