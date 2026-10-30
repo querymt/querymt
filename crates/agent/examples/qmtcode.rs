@@ -561,6 +561,9 @@ async fn run(
     // OTLP export (traces + logs over gRPC) is active in all modes.
     querymt_utils::telemetry::setup_telemetry("qmtcode", env!("QMT_BUILD_VERSION"), is_acp);
 
+    #[cfg(target_os = "linux")]
+    querymt_utils::secret_store::SecretStore::new_async().await?;
+
     let shared_infra = AgentInfra::shared_with_db_path(cli.db.clone()).await?;
 
     #[cfg(feature = "remote")]

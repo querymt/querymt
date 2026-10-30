@@ -15,12 +15,12 @@ pub fn split_provider(s: &str) -> (String, Option<String>) {
 }
 
 /// Retrieves provider and model information from CLI args or default store
-pub fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
+pub async fn get_provider_info(args: &CliArgs) -> Option<(String, Option<String>)> {
     if let Some(ref s) = args.backend {
         return Some(split_provider(s));
     }
-    if let Ok(store) = SecretStore::new()
-        && let Some(default) = store.get_default_provider()
+    if let Ok(store) = SecretStore::new_async().await
+        && let Ok(Some(default)) = store.run(|store| Ok(store.get_default_provider())).await
     {
         return Some(split_provider(&default));
     }
@@ -69,7 +69,7 @@ pub async fn get_api_key(
 
     // 3. Check for OAuth tokens (prefer OAuth over API keys when no explicit config key exists)
     if let Ok(oauth_provider) = querymt_utils::oauth::get_oauth_provider(provider, None)
-        && let Ok(mut store) = SecretStore::new()
+        && let Ok(mut store) = SecretStore::new_async().await
     {
         // Try to get a valid OAuth token (will refresh if needed)
         if let Ok(token) =
@@ -85,10 +85,17 @@ pub async fn get_api_key(
         && let Some(http_factory) = factory.as_http()
         && let Some(name) = http_factory.api_key_name()
     {
-        return SecretStore::new()
-            .ok()
-            .and_then(|store| store.get(&name))
-            .or_else(|| std::env::var(name).ok());
+        let stored_name = name.clone();
+        let key = if let Ok(store) = SecretStore::new_async().await {
+            store
+                .run(move |store| store.try_get(&stored_name))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        return key.or_else(|| std::env::var(name).ok());
     }
     None
 }

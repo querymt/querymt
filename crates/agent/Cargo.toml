@@ -23,8 +23,7 @@ dashboard = ["api", "plugin-loaders", "dep:flate2", "dep:tar", "dep:ureq"]
 # Enables OAuth token support for authentication (reads tokens from system keyring)
 oauth = ["querymt-utils/oauth"]
 
-# Enable DBus Secret Service backend for keyring on Linux.
-# This mirrors the CLI's `dbus-secret-service` feature, but is wired through the agent crate.
+# Compatibility alias: Linux credential backends are selected at runtime.
 dbus-secret-service = ["querymt-utils/dbus-secret-service"]
 
 # Enables kameo remote actor support for cross-machine session management.

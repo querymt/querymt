@@ -772,28 +772,29 @@ pub async fn authenticate(
     // login tokens (in the cache or the keyring) after we store them.
     let token_guard = lock_provider_tokens(provider.name()).await;
 
-    // Store tokens
-    store.set_oauth_tokens(provider.name(), &tokens)?;
-    // A fresh login supersedes anything cached in this process.
-    invalidate_cached_tokens(provider.name());
+    let provider_name = provider.name().to_owned();
+    let key_name = provider.api_key_name().map(str::to_owned);
+    let has_api_key = api_key.is_some();
+    store
+        .run(move |store| {
+            let _guard = token_guard;
+            store.set_oauth_tokens(&provider_name, &tokens)?;
+            invalidate_cached_tokens(&provider_name);
+            if let (Some(key_name), Some(api_key)) = (key_name, api_key) {
+                store.set(key_name, api_key)?;
+            }
+            Ok(())
+        })
+        .await?;
     ui.success("Successfully authenticated!");
 
-    // Store API key if we got one
-    if let Some(api_key) = api_key {
-        ui.status("Creating API key...");
-
-        if let Some(key_name) = provider.api_key_name() {
-            store.set(key_name, &api_key)?;
-        }
-        drop(token_guard);
-
+    if has_api_key {
         ui.success("API key created and stored!");
         ui.status(&format!(
             "Your API key has been securely stored in your system keychain.\nYou can now use it with: qmt -p {} \"your prompt\"",
             provider.name()
         ));
     } else {
-        drop(token_guard);
         ui.status(&format!(
             "Your OAuth tokens have been securely stored in your system keychain.\nYou can now use {} with: qmt -p {} \"your prompt\"",
             provider.display_name(),
@@ -843,14 +844,16 @@ pub async fn refresh_tokens(
     provider: &dyn OAuthProvider,
     store: &mut SecretStore,
 ) -> Result<TokenSet> {
-    let tokens = read_stored_tokens(provider, store)?;
+    let tokens = read_stored_tokens(provider, store).await?;
     refresh_with_tokens(provider, store, &tokens).await
 }
 
 /// Read stored tokens, reporting keyring failures distinctly from "not logged in".
-fn read_stored_tokens(provider: &dyn OAuthProvider, store: &SecretStore) -> Result<TokenSet> {
+async fn read_stored_tokens(provider: &dyn OAuthProvider, store: &SecretStore) -> Result<TokenSet> {
+    let name = provider.name().to_owned();
     store
-        .try_get_oauth_tokens(provider.name())
+        .run(move |store| store.try_get_oauth_tokens(&name))
+        .await
         .map_err(|e| {
             anyhow!(
                 "Keyring access failed while reading {} OAuth tokens: {}",
@@ -924,8 +927,12 @@ async fn refresh_with_tokens(
     tokens: &TokenSet,
 ) -> Result<TokenSet> {
     let refreshed = refresh_remote(provider, &tokens.refresh_token).await?;
-    if let Err(error) =
-        persist_refreshed(store, provider.name(), provider.api_key_name(), &refreshed)
+    let tokens = refreshed.tokens.clone();
+    let name = provider.name().to_owned();
+    let key_name = provider.api_key_name().map(str::to_owned);
+    if let Err(error) = store
+        .run(move |store| persist_refreshed(store, &name, key_name.as_deref(), &refreshed))
+        .await
     {
         log::warn!(
             "Refreshed {} OAuth tokens but could not save them to the keyring: {}. \
@@ -934,7 +941,7 @@ async fn refresh_with_tokens(
             error
         );
     }
-    Ok(refreshed.tokens)
+    Ok(tokens)
 }
 
 /// Get a valid access token for a provider, refreshing if necessary
@@ -952,7 +959,7 @@ pub async fn get_valid_token(
     store: &mut SecretStore,
 ) -> Result<String> {
     // Single keyring read; the same token set feeds the refresh if needed.
-    let tokens = read_stored_tokens(provider, store)?;
+    let tokens = read_stored_tokens(provider, store).await?;
     if !tokens.is_expired() {
         return Ok(tokens.access_token);
     }
@@ -1004,7 +1011,11 @@ pub async fn show_auth_status(
     for p in providers_to_check {
         let status_msg = format!("{}: ", p);
 
-        if let Some(tokens) = store.get_oauth_tokens(&p) {
+        let name = p.clone();
+        if let Some(tokens) = store
+            .run(move |store| Ok(store.get_oauth_tokens(&name)))
+            .await?
+        {
             if tokens.is_expired() {
                 // Try to refresh if enabled
                 if try_refresh {

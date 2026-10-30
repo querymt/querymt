@@ -80,6 +80,33 @@ path = "oci://ghcr.io/querymt/openai:latest"
 
 For a full examples-oriented setup (GHCR providers, local wasm provider builds, and run commands), see `crates/querymt/examples/README.md`.
 
+### Linux Credential Storage
+
+Linux CLI/agent builds include the Rust-based zbus Secret Service client and kernel keyutils;
+TPM 2.0 support is also enabled by default. Selection happens once per process:
+Secret Service, then an accessible TPM, then temporary kernel storage. The chosen
+backend is logged at startup. A locked Secret Service wallet stays selected and
+can prompt for unlocking on credential access. Kernel credentials are lost on
+reboot and may expire earlier. If no backend works, initialization fails.
+
+Set `QMT_SECRET_STORE=auto|secret-service|tpm|keyutils` to choose a backend, or put
+one of those names in the `secret-store` file under `QMT_CONFIG_DIR`, `QMT_HOME`,
+or `~/.qmt` (in that order). An explicit backend must work; it does not silently
+fall back. Invalid environment values are warned about and ignored. Select `tpm`
+for a stable store shared by desktop and SSH sessions when Secret Service is not
+available in both. Credentials are not automatically copied between backends;
+existing keyutils users can select `keyutils` to keep accessing their kernel keys.
+The old `dbus-secret-service` Cargo feature remains an alias.
+
+TPM storage uses `purecrypto-tpm` (no C TPM stack) to seal an AES-256-GCM key under
+the owner hierarchy, with encrypted files in `tpm-secrets/`. Device access must be
+configured separately; QueryMT never provisions or clears the TPM. No PCR policy
+is used, so ordinary boot updates do not invalidate credentials. TPM clearing or
+replacement does; back up ciphertext and sealed-key files together, but they are
+not portable to another TPM. This early TPM library does not yet encrypt transport
+parameters: protection is against offline disk copying, not physical TPM-bus
+interception or processes authorized to read the files and use the original TPM.
+
 ## Agent
 
 The `querymt-agent` crate (in `crates/agent`) is the high-level agent runtime for QueryMaTe.
