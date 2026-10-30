@@ -1,0 +1,5 @@
+blocked_by:
+  - change: add-git-worktree-isolation
+    reason: Workflow runs reuse managed workspaces, publish, handoff and result integration.
+related:
+  - add-acp-flow-driver

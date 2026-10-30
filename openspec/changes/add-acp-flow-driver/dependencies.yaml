@@ -1,0 +1,5 @@
+blocked_by:
+  - change: add-git-worktree-isolation
+    reason: The QueryMT backend uses the querymt/worktree/* ACP extensions for change workspaces.
+related:
+  - add-native-change-workflows
