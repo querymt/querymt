@@ -53,8 +53,8 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
                             .get("claude_code_version")
                             .and_then(Value::as_str)
                             .map(str::trim)
-                            .unwrap_or(crate::CLAUDE_CODE_VERSION);
-                        crate::validate_client_version(version)?;
+                            .unwrap_or(crate::auth::CLAUDE_CODE_VERSION);
+                        crate::auth::validate_client_version(version)?;
                         builder
                             .header("Authorization", format!("Bearer {}", api_key))
                             .header(
@@ -108,6 +108,7 @@ impl HTTPLLMProviderFactory for AnthropicFactory {
 
 #[cfg(feature = "native")]
 #[unsafe(no_mangle)]
+#[allow(improper_ctypes_definitions)]
 pub extern "C" fn plugin_http_factory() -> *mut dyn HTTPLLMProviderFactory {
     Box::into_raw(Box::new(AnthropicFactory)) as *mut _
 }
