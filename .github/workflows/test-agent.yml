@@ -21,7 +21,7 @@ permissions:
   contents: read
 
 env:
-  features: 'dashboard,oauth,remote'
+  features: 'dashboard,oauth,zbus-secret-service,remote'
 
 jobs:
   # Job 1: Check formatting (fast, fails first)
