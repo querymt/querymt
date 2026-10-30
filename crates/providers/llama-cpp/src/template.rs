@@ -4,6 +4,7 @@ use crate::config::LlamaCppConfig;
 use crate::messages;
 use llama_cpp_2::model::LlamaModel;
 use minijinja::Environment;
+use minijinja::value::Serde;
 use querymt::chat::{ChatMessage, ReasoningEffort, Tool};
 use querymt::error::LLMError;
 use querymt_utils::str_utils::truncate_str_tail;
@@ -138,7 +139,7 @@ fn render_template_source(
     MINIJINJA_ENV
         .template_from_str(template)
         .map_err(|e| LLMError::ProviderError(format!("Failed to compile chat template: {e}")))?
-        .render(context)
+        .render(Serde(context))
         .map_err(|e| LLMError::ProviderError(format!("Failed to render chat template: {e}")))
 }
 

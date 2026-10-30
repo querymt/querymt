@@ -34,8 +34,8 @@ querymt-provider-common = { path = "../../provider-common" }
 querymt-utils = { path = "../../querymt-utils" }
 log.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-minijinja = { version = "2", default-features = false, features = ["adjacent_loop_items", "builtins", "json", "loop_controls", "macros", "serde"] }
-minijinja-contrib = { version = "2", default-features = false, features = ["pycompat"] }
+minijinja = { version = "3", default-features = false, features = ["adjacent_loop_items", "builtins", "json", "loop_controls", "macros", "serde"] }
+minijinja-contrib = { version = "3", default-features = false, features = ["pycompat"] }
 querymt = { path = "../../querymt", default-features = false, optional = true }
 regex = "1"
 schemars.workspace = true
