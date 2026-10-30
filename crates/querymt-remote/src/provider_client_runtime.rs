@@ -53,7 +53,7 @@ pub trait RemoteProviderClientTransport: Send + Sync {
         &self,
         session_id: &str,
         request_id: &str,
-        consumer_tx: tokio::sync::mpsc::Sender<StreamRelayMessage>,
+        consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,
     ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError>;
     async fn send_chat_request(
         &self,
@@ -367,7 +367,7 @@ where
         &self,
         session_id: &str,
         request_id: &str,
-        consumer_tx: tokio::sync::mpsc::Sender<StreamRelayMessage>,
+        consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,
     ) -> Result<(TTransport::RouterRef, TTransport::RemoteRouterRef), LLMError> {
         self.transport
             .prepare_stream_router(session_id, request_id, consumer_tx)
@@ -679,7 +679,7 @@ mod tests {
             &self,
             _session_id: &str,
             _request_id: &str,
-            _consumer_tx: tokio::sync::mpsc::Sender<StreamRelayMessage>,
+            _consumer_tx: tokio::sync::mpsc::UnboundedSender<StreamRelayMessage>,
         ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError> {
             unreachable!("not used by contract tests")
         }
@@ -755,6 +755,38 @@ mod tests {
             RemoteProviderClientConfig::new("peer", "llama_cpp", "model"),
         );
         (transport, core)
+    }
+
+    #[test]
+    fn relay_sequence_gap_failure_maps_to_retryable_transport_error() {
+        let mut stream_state = crate::RemoteProviderStreamState::new();
+        let gap = LLMError::Transport {
+            kind: TransportErrorKind::Other,
+            message: "relay sequence gap: missing seq 3 (held 2)".to_string(),
+        };
+        let context = PollStreamContext {
+            setup_span: tracing::Span::none(),
+            stream_start: std::time::Instant::now(),
+            session_id: "s",
+            request_id: "r",
+            local_peer_id: "local",
+            target_peer_id: "remote",
+            provider_name: "p",
+            model: "m",
+            target_name: "t",
+        };
+        let result = RemoteProviderClientCore::<TestTransport>::poll_stream_message(
+            context,
+            Some(StreamRelayMessage::TransportFailed {
+                error: gap.to_payload(),
+            }),
+            &mut stream_state,
+            true,
+        );
+        let error = result.expect_err("gap failure must be an error");
+        assert!(matches!(error, LLMError::Transport { .. }), "{error:?}");
+        assert!(error.is_retryable());
+        assert!(error.to_string().contains("missing seq 3"), "{error}");
     }
 
     #[tokio::test]

@@ -1,0 +1,251 @@
+[
+  {
+    "structured": {
+      "type": "response_metadata",
+      "response_id": "msg_fixture",
+      "status": "in_progress",
+      "usage": {
+        "input_tokens": 25,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read": 0,
+        "cache_write": 0
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_started",
+      "output_index": 0,
+      "item": {
+        "type": "reasoning",
+        "summary": [],
+        "content": []
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "reasoning_part_started",
+      "output_index": 0,
+      "part": "content",
+      "part_index": 0
+    }
+  },
+  {
+    "structured": {
+      "type": "reasoning_part_delta",
+      "output_index": 0,
+      "part": "content",
+      "part_index": 0,
+      "delta": "let me "
+    }
+  },
+  {
+    "structured": {
+      "type": "reasoning_part_delta",
+      "output_index": 0,
+      "part": "content",
+      "part_index": 0,
+      "delta": "look"
+    }
+  },
+  {
+    "structured": {
+      "type": "item_completed",
+      "output_index": 0,
+      "item": {
+        "type": "reasoning",
+        "summary": [],
+        "content": [
+          {
+            "text": "let me look"
+          }
+        ],
+        "signature": "SIG"
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_started",
+      "output_index": 1,
+      "item": {
+        "type": "message",
+        "role": "Assistant",
+        "parts": [
+          {
+            "type": "text",
+            "text": ""
+          }
+        ]
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "message_part_started",
+      "output_index": 1,
+      "content_index": 0,
+      "part": {
+        "type": "text",
+        "text": ""
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "message_part_delta",
+      "output_index": 1,
+      "content_index": 0,
+      "delta": {
+        "type": "text",
+        "delta": "Checking "
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "message_part_delta",
+      "output_index": 1,
+      "content_index": 0,
+      "delta": {
+        "type": "text",
+        "delta": "both files."
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_completed",
+      "output_index": 1,
+      "item": {
+        "type": "message",
+        "role": "Assistant",
+        "parts": [
+          {
+            "type": "text",
+            "text": "Checking both files."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_started",
+      "output_index": 2,
+      "item": {
+        "type": "opaque",
+        "original_type": "server_tool_use",
+        "payload": {
+          "input": {},
+          "type": "server_tool_use",
+          "id": "srv_1",
+          "name": "web_search"
+        }
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_completed",
+      "output_index": 2,
+      "item": {
+        "type": "opaque",
+        "original_type": "server_tool_use",
+        "payload": {
+          "input": {
+            "query": "rust"
+          },
+          "type": "server_tool_use",
+          "id": "srv_1",
+          "name": "web_search"
+        }
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_started",
+      "output_index": 3,
+      "item": {
+        "type": "function_call",
+        "call_id": "toolu_a",
+        "name": "write_file",
+        "arguments": ""
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "function_arguments_delta",
+      "output_index": 3,
+      "delta": "{\"path\":"
+    }
+  },
+  {
+    "structured": {
+      "type": "function_arguments_delta",
+      "output_index": 3,
+      "delta": "\"a.rs\"}"
+    }
+  },
+  {
+    "structured": {
+      "type": "item_completed",
+      "output_index": 3,
+      "item": {
+        "type": "function_call",
+        "call_id": "toolu_a",
+        "name": "write_file",
+        "arguments": "{\"path\":\"a.rs\"}"
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "item_started",
+      "output_index": 4,
+      "item": {
+        "type": "function_call",
+        "call_id": "toolu_b",
+        "name": "write_file",
+        "arguments": ""
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "function_arguments_delta",
+      "output_index": 4,
+      "delta": "{\"path\":\"b.rs\"}"
+    }
+  },
+  {
+    "structured": {
+      "type": "item_completed",
+      "output_index": 4,
+      "item": {
+        "type": "function_call",
+        "call_id": "toolu_b",
+        "name": "write_file",
+        "arguments": "{\"path\":\"b.rs\"}"
+      }
+    }
+  },
+  {
+    "structured": {
+      "type": "response_terminal",
+      "status": "completed",
+      "usage": {
+        "input_tokens": 25,
+        "output_tokens": 40,
+        "reasoning_tokens": 0,
+        "cache_read": 0,
+        "cache_write": 0
+      },
+      "finish_reason": "ToolCalls"
+    }
+  }
+]

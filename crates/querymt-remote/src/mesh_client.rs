@@ -195,7 +195,7 @@ impl RemoteProviderClientTransport for KameoMeshClientTransport {
         &self,
         session_id: &str,
         request_id: &str,
-        consumer_tx: mpsc::Sender<StreamRelayMessage>,
+        consumer_tx: mpsc::UnboundedSender<StreamRelayMessage>,
     ) -> Result<(Self::RouterRef, Self::RemoteRouterRef), LLMError> {
         let router = self.get_or_create_stream_router(session_id).await;
         router

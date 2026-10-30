@@ -146,12 +146,11 @@ where
             "remote provider host lookup completed"
         );
 
-        let (tx, rx) = mpsc::channel::<crate::StreamRelayMessage>(64);
+        let (tx, rx) = mpsc::unbounded_channel::<crate::StreamRelayMessage>();
         tracing::debug!(
             target: "querymt_remote::provider::stream",
             session_id = %session_id,
             request_id = %request_id,
-            channel_capacity = 64,
             "registering and attaching stream router consumer"
         );
         let (_router_ref, remote_router_ref) = self
@@ -220,7 +219,7 @@ where
             "remote provider stream request acknowledged"
         );
 
-        let raw_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let raw_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         let session_id_for_stream = session_id.clone();
         let request_id_for_stream = request_id.clone();
         let provider_for_stream = provider_name.clone();
