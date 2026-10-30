@@ -104,6 +104,8 @@ pub(crate) struct ExecutionContext {
     /// Budget-uncertainty reasons already reported for this cycle, so
     /// repeated step-start snapshots never repeat a warning.
     pub budget_warnings: crate::accounting::BudgetWarnings,
+    /// Retains a supplementary terminal read across bounded BeforeModel reconciliation.
+    pub suspended_recovery: tokio::sync::Mutex<Option<crate::agent::execution::DelegationRecovery>>,
 }
 
 impl ExecutionContext {
@@ -135,6 +137,7 @@ impl ExecutionContext {
             suspended_delegations: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             cycle_accounting: tokio::sync::OnceCell::new(),
             budget_warnings: Default::default(),
+            suspended_recovery: tokio::sync::Mutex::new(None),
         }
     }
 

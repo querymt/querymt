@@ -12,6 +12,107 @@ const OBSERVATION_CONCURRENCY: usize = 16;
 type ActorMap = HashMap<String, SessionActorRef>;
 type ProfileActors = HashMap<(String, Option<String>), ActorMap>;
 
+// Observation probes must not mistake one another for execution owners. Stripes
+// bound lock storage; canonical roots also serialize aliases of the same lease.
+static PROBE_LOCKS: std::sync::LazyLock<[parking_lot::Mutex<()>; 64]> =
+    std::sync::LazyLock::new(|| std::array::from_fn(|_| parking_lot::Mutex::new(())));
+
+fn probe_lock_index(root: &std::path::Path, session_id: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    session_id.hash(&mut hasher);
+    (hasher.finish() % PROBE_LOCKS.len() as u64) as usize
+}
+
+async fn observe_lease_free(root: RunLeaseRoot, session_id: &str) -> std::io::Result<bool> {
+    let worker_root = root.clone();
+    let id = session_id.to_string();
+    let free = tokio::task::spawn_blocking(move || {
+        worker_root.lease_path(&id)?;
+        std::fs::create_dir_all(worker_root.path())?;
+        let canonical = std::fs::canonicalize(worker_root.path())?;
+        let _probe = PROBE_LOCKS[probe_lock_index(&canonical, &id)].lock();
+        // Return only a verdict: the actual lease is dropped before the worker
+        // releases its probe lock, never at a delayed async result handoff.
+        Ok::<_, std::io::Error>(worker_root.try_acquire(&id)?.is_some())
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    #[cfg(test)]
+    pause_probe_result(root.path(), session_id).await;
+    Ok(free)
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ProbePause {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+type ProbePauses = HashMap<(std::path::PathBuf, String), Arc<ProbePause>>;
+#[cfg(test)]
+static PROBE_PAUSES: std::sync::LazyLock<parking_lot::Mutex<ProbePauses>> =
+    std::sync::LazyLock::new(Default::default);
+#[cfg(test)]
+pub(crate) fn pause_next_probe(root: &std::path::Path, session_id: &str) -> Arc<ProbePause> {
+    let pause = Arc::new(ProbePause::default());
+    PROBE_PAUSES
+        .lock()
+        .insert((root.to_path_buf(), session_id.to_string()), pause.clone());
+    pause
+}
+#[cfg(test)]
+async fn pause_probe_result(root: &std::path::Path, session_id: &str) {
+    let pause = PROBE_PAUSES
+        .lock()
+        .remove(&(root.to_path_buf(), session_id.to_string()));
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        pause.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn probe_workers_serialize_canonical_roots_before_trying_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(dir.path()).unwrap();
+    let sid = "probe-worker-overlap";
+    let (release, held) = std::sync::mpsc::channel();
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = PROBE_LOCKS[probe_lock_index(&canonical, sid)].lock();
+        entered.send(()).unwrap();
+        held.recv_timeout(Duration::from_secs(2)).unwrap();
+    });
+    ready.await.unwrap();
+    let root = RunLeaseRoot::new(dir.path().to_path_buf());
+    let alias = RunLeaseRoot::new(dir.path().join("."));
+    let probes = async {
+        tokio::join!(
+            observe_lease_free(root, sid),
+            observe_lease_free(alias, sid)
+        )
+    };
+    tokio::pin!(probes);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut probes)
+            .await
+            .is_err(),
+        "same-root probes must serialize before acquiring any lease"
+    );
+    release.send(()).unwrap();
+    let (first, second) = tokio::time::timeout(Duration::from_secs(1), probes)
+        .await
+        .unwrap();
+    holder.join().unwrap();
+    assert!(first.unwrap());
+    assert!(second.unwrap());
+}
+
 impl LocalAgentHandle {
     pub(crate) async fn observe_session_runtimes(
         &self,
@@ -161,9 +262,9 @@ impl LocalAgentHandle {
                 && matches!(location, SessionLocation::Local)
                 && let Some(root) = self.config.storage.run_lease_root()
             {
-                match RunLeaseRoot::new(root).acquire(session_id).await {
-                    Ok(Some(_lease)) => {}
-                    Ok(None) => return SessionRuntimeStatus::unavailable("live_owner_elsewhere"),
+                match observe_lease_free(RunLeaseRoot::new(root), session_id).await {
+                    Ok(true) => {}
+                    Ok(false) => return SessionRuntimeStatus::unavailable("live_owner_elsewhere"),
                     Err(_) => return SessionRuntimeStatus::unavailable("lease_unavailable"),
                 }
             }
@@ -174,9 +275,9 @@ impl LocalAgentHandle {
         }
         // A missing registry entry is not proof of idle: another process may own the lease.
         let mut status = if let Some(root) = self.config.storage.run_lease_root() {
-            match RunLeaseRoot::new(root).acquire(session_id).await {
-                Ok(Some(_lease)) => SessionRuntimeStatus::Idle,
-                Ok(None) => SessionRuntimeStatus::unavailable("live_owner_elsewhere"),
+            match observe_lease_free(RunLeaseRoot::new(root), session_id).await {
+                Ok(true) => SessionRuntimeStatus::Idle,
+                Ok(false) => SessionRuntimeStatus::unavailable("live_owner_elsewhere"),
                 Err(_) => SessionRuntimeStatus::unavailable("lease_unavailable"),
             }
         } else {

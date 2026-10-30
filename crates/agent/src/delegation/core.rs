@@ -648,6 +648,10 @@ impl DelegationOrchestrator {
                                     "Delegation queue closed before execution could start",
                                 )
                                 .await;
+                                active_delegations_for_spawn
+                                    .lock()
+                                    .await
+                                    .remove(&delegation.public_id);
                                 return;
                             }
                         };
@@ -817,21 +821,25 @@ impl DelegationOrchestrator {
 struct WorkflowActivity(Arc<WorkflowActivityInner>);
 
 struct WorkflowActivityInner {
-    cancelled: AtomicBool,
+    cancelled: parking_lot::Mutex<bool>,
     sink: Arc<EventSink>,
     parent: String,
     delegation: String,
     epoch: String,
+    #[cfg(test)]
+    before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl WorkflowActivity {
     fn new(sink: Arc<EventSink>, parent: String, delegation: String) -> Self {
         let activity = Self(Arc::new(WorkflowActivityInner {
-            cancelled: AtomicBool::new(false),
+            cancelled: parking_lot::Mutex::new(false),
             sink,
             parent,
             delegation,
             epoch: uuid::Uuid::new_v4().to_string(),
+            #[cfg(test)]
+            before_publish: parking_lot::Mutex::new(None),
         }));
         activity.stage(Some(
             crate::control::delegation_notifications::DelegationStage::Queued,
@@ -840,18 +848,31 @@ impl WorkflowActivity {
     }
 
     fn request_cancel(&self) {
-        self.0.cancelled.store(true, Ordering::Release);
         self.stage(Some(
             crate::control::delegation_notifications::DelegationStage::CancelRequested,
         ));
     }
 
     fn stage(&self, stage: Option<crate::control::delegation_notifications::DelegationStage>) {
-        let stage = if stage.is_some() && self.0.cancelled.load(Ordering::Acquire) {
+        // Stage choice and ordered publication must be one operation: an older
+        // normal choice must never publish after a cancellation at a newer seq.
+        let mut cancelled = self.0.cancelled.lock();
+        if stage == Some(crate::control::delegation_notifications::DelegationStage::CancelRequested)
+        {
+            *cancelled = true;
+        }
+        let stage = if stage.is_some() && *cancelled {
             Some(crate::control::delegation_notifications::DelegationStage::CancelRequested)
         } else {
             stage
         };
+        #[cfg(test)]
+        {
+            let hook = self.0.before_publish.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         self.0.sink.session_stream(&self.0.parent).emit_ephemeral(
             AgentEventKind::DelegationStageChanged {
                 delegation_id: self.0.delegation.clone(),
@@ -2011,6 +2032,7 @@ async fn execute_delegation(
                     &error_message,
                 )
                 .await;
+                ctx.active_delegations.lock().await.remove(&delegation_id);
                 return;
             }
 
@@ -2856,7 +2878,30 @@ mod tests {
                 delegation_id: "workflow-1".into(),
             },
         );
-        activity.stage(Some(DelegationStage::CancelRequested));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let enter_hook = entered.clone();
+        let release_hook = release.clone();
+        *activity.0.before_publish.lock() = Some(Box::new(move || {
+            enter_hook.wait();
+            release_hook.wait();
+        }));
+        let normal = activity.clone();
+        let normal_thread =
+            std::thread::spawn(move || normal.stage(Some(DelegationStage::Finalizing)));
+        entered.wait();
+        let cancel = activity.clone();
+        let (published, observed) = std::sync::mpsc::channel();
+        let cancel_thread = std::thread::spawn(move || {
+            cancel.request_cancel();
+            let _ = published.send(());
+        });
+        // Old producer can publish cancel while the selected normal stage is paused.
+        // A serialized producer instead keeps cancel waiting for that publication.
+        let _ = observed.recv_timeout(std::time::Duration::from_millis(100));
+        release.wait();
+        normal_thread.join().unwrap();
+        cancel_thread.join().unwrap();
         config
             .event_sink
             .session_stream(&session.public_id)
@@ -2900,7 +2945,7 @@ mod tests {
                 seqs.push(event.session_seq());
             }
         }
-        assert_eq!(seqs.len(), 5);
+        assert_eq!(seqs.len(), 6);
         assert!(seqs[0] > 0 && seqs.windows(2).all(|pair| pair[0] < pair[1]));
         actor.kill();
         actor.wait_for_shutdown().await;

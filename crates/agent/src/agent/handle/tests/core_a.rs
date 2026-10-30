@@ -81,6 +81,71 @@ async fn status_consistency_idle_actor_does_not_mask_external_lease() {
 }
 
 #[tokio::test]
+async fn status_observer_probes_do_not_report_each_other_as_execution() {
+    for materialized in [false, true] {
+        let f = RealStorageHandleFixture::new().await;
+        let sid = seed_session_with_reasoning(&f, None).await;
+        if materialized {
+            f.handle
+                .load_session(LoadSessionRequest::new(
+                    sid.clone(),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .unwrap();
+        }
+        let root = f.storage.run_lease_root().unwrap();
+        let pause = crate::agent::handle::runtime_observation::pause_next_probe(&root, &sid);
+        let ids = [sid.clone()];
+        let first = f.handle.observe_session_runtimes(&ids);
+        tokio::pin!(first);
+        tokio::select! { _ = pause.entered.notified() => {}, _ = &mut first => panic!("probe did not pause") }
+        let (listed, direct, snapshot) = tokio::join!(
+            f.handle.list_sessions(ListSessionsRequest::new()),
+            f.handle.observe_session_runtimes(&ids),
+            crate::session::load_snapshot::load_session_snapshot(
+                &f.handle,
+                f.storage.view_store().unwrap(),
+                &sid
+            ),
+        );
+        pause.release.notify_one();
+        let first = first.await;
+        assert_eq!(
+            first[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        assert_eq!(
+            direct[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle,
+            "observer's completed probe must not masquerade as a live run"
+        );
+        assert_eq!(
+            snapshot.unwrap().runtime_status.phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        let row = listed
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|row| row.session_id.to_string() == sid)
+            .unwrap();
+        assert_eq!(row.meta.unwrap()["runtimeStatus"]["phase"], "idle");
+        let lease = crate::session::run_lease::RunLeaseRoot::new(root)
+            .acquire(&sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let external = f.handle.observe_session_runtimes(&ids).await;
+        assert_eq!(
+            external[&sid].observation.reason.as_deref(),
+            Some("live_owner_elsewhere")
+        );
+        drop(lease);
+    }
+}
+
+#[tokio::test]
 async fn status_observation_page_uses_one_deadline_including_owner_locks() {
     let f = RealStorageHandleFixture::new().await;
     let ids: Vec<_> = (0..100).map(|id| format!("blocked-page-{id}")).collect();

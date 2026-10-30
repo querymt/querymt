@@ -47,6 +47,7 @@ mod tool_calls;
 mod transitions;
 mod wait;
 mod wave_plan;
+pub(crate) use wait::DelegationRecovery;
 #[cfg(test)]
 pub(crate) use wait::cleanup_timed_out_delegations;
 

@@ -2400,6 +2400,117 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
         crate::agent::messages::SessionRuntimePhase::Idle
     );
     assert_eq!(activity[0].stage, Some(DelegationStage::Verifying));
+    #[cfg(feature = "remote")]
+    {
+        use crate::send_agent::SendAgent;
+        use crate::session::backend::StorageBackend;
+        use kameo::actor::Spawn;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let owner = crate::agent::LocalAgentHandle::from_config(config.clone());
+        owner.set_mesh(mesh.clone());
+        owner
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                parent_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let expected = owner
+            .observe_session_runtimes(std::slice::from_ref(&parent_id))
+            .await
+            .remove(&parent_id)
+            .unwrap();
+        assert_eq!(
+            expected.phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        assert_eq!(
+            expected.delegation_activity[0].stage,
+            Some(DelegationStage::Verifying)
+        );
+        let manager = crate::agent::remote::RemoteNodeManager::spawn(
+            crate::agent::remote::RemoteNodeManager::new(
+                config.clone(),
+                owner.registry.clone(),
+                Some(mesh.clone()),
+                owner.scheduler_handle.clone(),
+            )
+            .with_node_name("verifier-owner".to_string()),
+        );
+        mesh.register_actor(
+            manager.clone(),
+            crate::agent::remote::scope::scoped_node_manager_for_peer(
+                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                mesh.peer_id(),
+            ),
+        )
+        .await;
+        let viewer = crate::test_utils::TestAgent::new().await;
+        viewer.handle.set_mesh(mesh.clone());
+        let node = mesh.peer_id().to_string();
+        viewer
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: parent_id.clone(),
+                node_id: node.clone(),
+                peer_label: "verifier-owner".into(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+            })
+            .await
+            .unwrap();
+        let loaded = viewer
+            .handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                parent_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let attached = viewer
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/remote/attachSession",
+                Arc::from(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({"node_id": node, "session_id": parent_id}),
+                    )
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let attached: serde_json::Value = serde_json::from_str(attached.0.get()).unwrap();
+        for snapshot in [
+            &loaded.meta.as_ref().unwrap()["querymt/sessionLoadSnapshot.v1"],
+            &attached["snapshot"],
+        ] {
+            assert_eq!(
+                snapshot["runtimeStatus"],
+                serde_json::to_value(&expected).unwrap(),
+                "actual remote route omitted existing live verifier"
+            );
+            let live = snapshot["delegationUpdates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["delegationId"] == delegation.public_id)
+                .unwrap();
+            assert_eq!(live["activity"], "live");
+            assert_eq!(live["stage"], "verifying");
+            assert_eq!(
+                live["sessionSeq"],
+                serde_json::to_value(activity[0].session_seq).unwrap()
+            );
+            assert!(!snapshot["audit"]["events"].as_array().unwrap().is_empty());
+        }
+        viewer.handle.shutdown().await;
+        manager.kill();
+        manager.wait_for_shutdown().await;
+        owner.shutdown().await;
+    }
     assert!(
         store
             .transition_delegation_status(
@@ -2562,6 +2673,20 @@ async fn verification_failure_resolves_terminal_delegate_child() {
     })
     .await
     .expect("verification failure did not resolve its child");
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            if config
+                .event_sink
+                .live_delegation_activity(&parent_session_id)
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finished failed verification must release live workflow ownership");
     listener.abort();
 
     let child_lifecycle = harness.session_lifecycle(&child_session_id).await;

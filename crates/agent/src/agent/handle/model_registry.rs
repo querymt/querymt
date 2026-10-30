@@ -115,8 +115,25 @@ impl LocalAgentHandle {
             events.len()
         );
         let cursor = crate::session::cursor_from_events(&events);
-        let delegation_updates =
+        let mut delegation_updates =
             crate::control::delegation_notifications::delegation_updates_from_events(&events);
+        let runtime_status = self
+            .observe_session_runtimes(&[session_id.to_string()])
+            .await
+            .remove(session_id)
+            .unwrap_or_else(|| {
+                crate::agent::messages::SessionRuntimeStatus::unavailable("observation_unavailable")
+            });
+        for live in &runtime_status.delegation_activity {
+            if let Some(previous) = delegation_updates
+                .iter_mut()
+                .find(|entry| entry.delegation_id == live.delegation_id)
+            {
+                *previous = live.clone();
+            } else {
+                delegation_updates.push(live.clone());
+            }
+        }
         let audit = crate::session::projection::AuditView {
             session_id: session_id.to_string(),
             events,
@@ -133,6 +150,7 @@ impl LocalAgentHandle {
             "audit": audit,
             "cursor": cursor,
             "delegationUpdates": delegation_updates,
+            "runtimeStatus": runtime_status,
         }))
     }
 }

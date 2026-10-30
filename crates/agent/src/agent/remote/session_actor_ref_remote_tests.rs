@@ -120,8 +120,11 @@ mod session_actor_ref_remote_tests {
         use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
         use crate::tools::{Tool, ToolRegistry, builtins::ShellTool};
         use std::sync::Arc;
+        let tool_dir = tempfile::tempdir().unwrap();
+        let release_file = tool_dir.path().join("remote-tool-release");
+        let release_for_tool = release_file.clone();
         let mut mock = MockLlmProvider::new();
-        let respond = |messages: &[querymt::chat::ChatMessage]| {
+        let respond = move |messages: &[querymt::chat::ChatMessage]| {
             if messages.last().is_some_and(|message| {
                 message
                     .portable_input_parts()
@@ -132,12 +135,14 @@ mod session_actor_ref_remote_tests {
             } else {
                 MockChatResponse::with_tools("remote tool running", vec![querymt::ToolCall {
                     id: "remote-status-tool".into(), call_type: "function".into(),
-                    function: querymt::FunctionCall { name: "shell".into(), arguments: serde_json::json!({"command":"sleep", "args":["2"], "workdir":std::env::temp_dir()}).to_string() },
+                    function: querymt::FunctionCall { name: "shell".into(), arguments: serde_json::json!({"command":"sh", "args":["-c", "i=0; while test ! -f \"$1\" && test $i -lt 1000; do i=$((i+1)); sleep 0.01; done; test -f \"$1\"", "qmt-remote-tool", release_for_tool], "workdir":std::env::temp_dir()}).to_string() },
                 }])
             }
         };
+        let respond = Arc::new(respond);
+        let tool_response = respond.clone();
         mock.expect_chat_with_tools()
-            .returning(move |messages, _| Ok(respond(messages).into()));
+            .returning(move |messages, _| Ok(tool_response(messages).into()));
         mock.expect_chat()
             .returning(move |messages| Ok(respond(messages).into()));
         let host = TestAgent::with_mock_provider(SharedLlmProvider::new(
@@ -163,9 +168,34 @@ mod session_actor_ref_remote_tests {
             .create_session(None, None, None, None)
             .await
             .unwrap();
-        let (remote, local, _config, sid) =
+        let (remote, local, owner_config, sid) =
             remote_session_ref_for_config("status-owner", config, "mock-model").await;
-        let node = get_test_mesh().await.peer_id().to_string();
+        let mesh = get_test_mesh().await;
+        fixture.handle.set_mesh(mesh.clone());
+        let owner_handle = crate::agent::LocalAgentHandle::from_config(owner_config.clone());
+        owner_handle
+            .registry
+            .lock()
+            .await
+            .insert(sid.clone(), SessionActorRef::Local(local.clone()));
+        let manager = crate::agent::remote::RemoteNodeManager::spawn(
+            crate::agent::remote::RemoteNodeManager::new(
+                owner_config.clone(),
+                owner_handle.registry.clone(),
+                Some(mesh.clone()),
+                owner_handle.scheduler_handle.clone(),
+            )
+            .with_node_name("status-owner".to_string()),
+        );
+        mesh.register_actor(
+            manager.clone(),
+            crate::agent::remote::scope::scoped_node_manager_for_peer(
+                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                mesh.peer_id(),
+            ),
+        )
+        .await;
+        let node = mesh.peer_id().to_string();
         fixture
             .storage
             .session_store()
@@ -265,6 +295,45 @@ mod session_actor_ref_remote_tests {
                 assert!(!meta.contains_key(field), "remote row fabricated {field}");
             }
         }
+        let loaded = fixture
+            .handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                sid.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let load_snapshot = &loaded.meta.as_ref().unwrap()["querymt/sessionLoadSnapshot.v1"];
+        let attached = fixture
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/remote/attachSession",
+                Arc::from(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({"node_id": node, "session_id": sid}),
+                    )
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let attached: serde_json::Value = serde_json::from_str(attached.0.get()).unwrap();
+        for snapshot in [load_snapshot, &attached["snapshot"]] {
+            assert_eq!(
+                snapshot["runtimeStatus"],
+                serde_json::to_value(&owner).unwrap(),
+                "actual remote route must include owner runtime"
+            );
+            assert!(
+                snapshot["audit"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"]["type"] == "prompt_received"),
+                "owner history must remain present"
+            );
+            assert!(snapshot["cursor"]["local_seq"].as_i64().unwrap() > 0);
+        }
         let snapshot = crate::session::load_snapshot::load_session_snapshot(
             &fixture.handle,
             fixture.storage.view_store().unwrap(),
@@ -273,6 +342,7 @@ mod session_actor_ref_remote_tests {
         .await
         .unwrap();
         assert_eq!(snapshot.runtime_status, owner);
+        tokio::fs::write(&release_file, "release").await.unwrap();
         let completed = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
             .await
             .unwrap()
@@ -345,6 +415,8 @@ mod session_actor_ref_remote_tests {
             fixture.handle.registry.lock().await.get(&sid).is_none(),
             "observation must not attach an unavailable owner"
         );
+        manager.kill();
+        manager.wait_for_shutdown().await;
     }
 
     #[tokio::test]
