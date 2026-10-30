@@ -1972,6 +1972,58 @@ produces a tree of child spans describing every step that was executed.</p>
 <td>Loading session history</td>
 </tr>
 <tr>
+<td><code>agent.execution.driver_create</code></td>
+<td>Building the middleware driver for the turn</td>
+</tr>
+<tr>
+<td><code>agent.execution.profile</code></td>
+<td>Resolving the turn's model profile (builds the provider on first use)</td>
+</tr>
+<tr>
+<td><code>agent.execution.context_init</code></td>
+<td>Building the initial conversation context</td>
+</tr>
+<tr>
+<td><code>agent.provider.build</code></td>
+<td>Cold provider build for the turn (once per turn; later steps reuse it)</td>
+</tr>
+<tr>
+<td><code>agent.llm.call_with_retry</code></td>
+<td>Retry wrapper; <code>operation</code> is <code>provider_init</code> or <code>chat</code></td>
+</tr>
+<tr>
+<td><code>agent.tools.collect</code></td>
+<td>Collecting and hashing tool definitions (<code>tool_count</code>, <code>tools_bytes</code>)</td>
+</tr>
+<tr>
+<td><code>agent.hooks.context</code></td>
+<td>Running context hooks before the request</td>
+</tr>
+<tr>
+<td><code>agent.request.cache_breakpoints</code></td>
+<td>Applying cache hints to the request messages</td>
+</tr>
+<tr>
+<td><code>agent.accounting.open</code></td>
+<td>Opening the durable accounting record before dispatch</td>
+</tr>
+<tr>
+<td><code>providers.registry.load</code></td>
+<td>(Re)parsing the models.dev registry (<code>reason</code>: <code>cold</code> or <code>changed</code>, <code>bytes</code>, <code>parse_ms</code>)</td>
+</tr>
+<tr>
+<td><code>http_adapter.credential_refresh</code></td>
+<td>Refreshing the provider credential</td>
+</tr>
+<tr>
+<td><code>http_adapter.prepare_request</code></td>
+<td>Building the HTTP request (<code>http.request.body.size</code>)</td>
+</tr>
+<tr>
+<td><code>http_adapter.send</code></td>
+<td>Sending the request, up to response headers</td>
+</tr>
+<tr>
 <td><code>agent.execution.middleware.*</code></td>
 <td>Middleware phases (<code>turn_start</code>, <code>step_start</code>, <code>after_llm</code>, <code>processing_tool_calls</code>)</td>
 </tr>
@@ -2200,9 +2252,38 @@ not globally unique.</p>
 <code>process.executable.name</code>, or <code>process.exit.code</code>, and refine the tool span name.</p>
 <p>Normal chat adds <code>gen_ai.conversation.compacted=true</code> when the request retains
 a verified compaction summary.</p>
-<p>Unavailable fields are omitted. For streaming, <code>gen_ai.response.time_to_first_chunk</code>
-is measured in seconds from the first generation request to the first received
-chunk, not the first visible token.</p>
+<p>Unavailable fields are omitted. For streaming, these are measured in seconds from
+the first generation request (request setup and retry waits count; provider
+construction does not):</p>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>llm.time_to_first_byte</code></td>
+<td>The response headers arrived</td>
+</tr>
+<tr>
+<td><code>gen_ai.response.time_to_first_chunk</code></td>
+<td>The first stream chunk of any kind, including metadata</td>
+</tr>
+<tr>
+<td><code>llm.time_to_first_token</code></td>
+<td>The first chunk carrying model output (text, reasoning or tool-call data)</td>
+</tr>
+<tr>
+<td><code>qmt.stream.chunk_count</code>, <code>qmt.stream.wait_ms</code>, <code>qmt.stream.process_ms</code>, <code>qmt.stream.max_gap_ms</code></td>
+<td>Aggregates: time waiting on the network vs. handling chunks locally, and the longest gap between chunks</td>
+</tr>
+</tbody>
+</table>
+<p><code>llm.time_to_first_token</code> is the client-side time. It is intentionally not named
+<code>gen_ai.server.time_to_first_token</code>, which the GenAI conventions reserve for
+server-side measurements. Otelite reads <code>llm.time_to_first_token</code> for its TTFT column.</p>
 <h4 id="what-metadata-is-attached-to-spans">What metadata is attached to spans</h4>
 <p>Spans may carry lightweight metadata such as:</p>
 <ul>
@@ -2220,8 +2301,41 @@ guarantee for preexisting diagnostic logs or span events: verbose logging
 can include payload previews, so use it only with appropriate data controls.</p>
 </div>
 <h3 id="metrics">Metrics</h3>
-<p>The agent exports two counters through the same OTLP endpoint as traces and logs
-(periodic export; <code>QMT_NO_TELEMETRY</code> disables them as well).</p>
+<p>The agent exports counters and histograms through the same OTLP endpoint as traces and
+logs (periodic export; <code>QMT_NO_TELEMETRY</code> disables them as well).</p>
+<p><strong>Latency histograms</strong> (seconds; attributes <code>gen_ai.operation.name</code>,
+<code>gen_ai.provider.name</code>, <code>gen_ai.request.model</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Extra attributes</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gen_ai.client.operation.duration</code></td>
+<td><code>error.type</code> on failure (<code>cancelled</code> or <code>_OTHER</code>)</td>
+<td>One logical model request, retries included</td>
+</tr>
+<tr>
+<td><code>qmt.gen_ai.client.time_to_first_byte</code></td>
+<td></td>
+<td>Request dispatch to response headers (streaming only)</td>
+</tr>
+<tr>
+<td><code>qmt.gen_ai.client.time_to_first_token</code></td>
+<td></td>
+<td>Request dispatch to the first model-output chunk (streaming only)</td>
+</tr>
+<tr>
+<td><code>qmt.agent.step.overhead</code></td>
+<td><code>phase=pre_request</code></td>
+<td>Agent time between starting a step and dispatching its request</td>
+</tr>
+</tbody>
+</table>
 <table>
 <thead>
 <tr>
