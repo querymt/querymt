@@ -871,14 +871,21 @@ mod tests {
                 None
             };
             self.entered.notify_one();
-            if self
-                .failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                return Err(crate::session::error::SessionError::DatabaseError(
-                    "transient terminal read".into(),
-                ));
+            let mut failures = self.failures.load(Ordering::SeqCst);
+            while failures > 0 {
+                match self.failures.compare_exchange_weak(
+                    failures,
+                    failures - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => {
+                        return Err(crate::session::error::SessionError::DatabaseError(
+                            "transient terminal read".into(),
+                        ));
+                    }
+                    Err(current) => failures = current,
+                }
             }
             if read >= self.block_after && self.blocking.load(Ordering::SeqCst) {
                 self.release.notified().await;
