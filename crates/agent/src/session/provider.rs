@@ -832,8 +832,12 @@ pub struct SessionHandle {
     provider_node_id: Option<String>,
     /// Session execution config resolved once at construction time (turn-pinned).
     execution_config: Option<SessionExecutionConfig>,
-    /// Lazily cached LLM provider for this turn.
-    cached_llm_provider: tokio::sync::OnceCell<ProviderSnapshot>,
+    /// Lazily cached LLM provider for this turn, shared by every clone of the
+    /// handle. The handle is turn-pinned (config and route are immutable), so
+    /// all clones resolve the same provider; sharing means it is built once per
+    /// turn instead of once per clone (the state machine clones the handle on
+    /// every step). A failed init is not cached, so retries still rebuild.
+    cached_llm_provider: Arc<tokio::sync::OnceCell<ProviderSnapshot>>,
 }
 
 impl Clone for SessionHandle {
@@ -844,10 +848,7 @@ impl Clone for SessionHandle {
             llm_config: self.llm_config.clone(),
             provider_node_id: self.provider_node_id.clone(),
             execution_config: self.execution_config.clone(),
-            // Each clone gets its own OnceCell; the first `.provider()` call
-            // will still hit the global cache (cheap Arc::clone on hit) so
-            // this is fine — it just won't share the local cell.
-            cached_llm_provider: tokio::sync::OnceCell::new(),
+            cached_llm_provider: Arc::clone(&self.cached_llm_provider),
         }
     }
 }
@@ -888,7 +889,7 @@ impl SessionHandle {
             llm_config,
             provider_node_id,
             execution_config,
-            cached_llm_provider: tokio::sync::OnceCell::new(),
+            cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -918,7 +919,18 @@ impl SessionHandle {
                     .with_session_id(&self.session.public_id);
                 #[cfg(feature = "remote")]
                 let request = request.with_provider_node_id(self.provider_node_id.as_deref());
-                self.provider.build_provider_snapshot(request).await
+                // Only the cold build is traced: the cached path is a pointer
+                // read and must not add a span to every step.
+                let span = tracing::info_span!(
+                    "agent.provider.build",
+                    provider = %config.provider,
+                    model = %config.model,
+                );
+                tracing::Instrument::instrument(
+                    self.provider.build_provider_snapshot(request),
+                    span,
+                )
+                .await
             })
             .await
             .map(|built| Arc::clone(&built.provider))
@@ -1719,7 +1731,7 @@ pub mod tests {
             llm_config: Some(mock_llm_config()),
             provider_node_id: None,
             execution_config: None,
-            cached_llm_provider: tokio::sync::OnceCell::new(),
+            cached_llm_provider: Arc::new(tokio::sync::OnceCell::new()),
         };
 
         let ledger = crate::accounting::test_ledger().await;

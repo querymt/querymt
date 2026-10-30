@@ -197,7 +197,7 @@ impl SessionCompaction {
         // Provider identity is unavailable on ChatProvider; canonical provenance can supply it.
         genai::finish_reason("error");
         let chat_span = tracing::Span::current();
-        let mut first_chunk = genai::FirstChunk::default();
+        let mut timing = genai::StreamTiming::default();
         let mut last_error = None;
         let mut backoff_ms = retry_config.initial_backoff_ms;
 
@@ -233,7 +233,7 @@ impl SessionCompaction {
                 .map_err(accounting_failure)?;
 
             let raw = if streaming {
-                Self::call_streaming(messages, &provider, &mut first_chunk, &chat_span).await
+                Self::call_streaming(messages, &provider, &mut timing, &chat_span).await
             } else {
                 provider
                     .chat(&ChatCall::new(messages))
@@ -316,10 +316,10 @@ impl SessionCompaction {
     async fn call_streaming(
         messages: &[querymt::chat::ChatMessage],
         provider: &Arc<dyn querymt::chat::ChatProvider>,
-        first_chunk: &mut genai::FirstChunk,
+        timing: &mut genai::StreamTiming,
         chat_span: &tracing::Span,
     ) -> std::result::Result<ChatOutput, StreamFailure> {
-        first_chunk.start();
+        timing.start();
         let mut stream = provider
             .chat_stream(&ChatCall::new(messages))
             .await
@@ -329,10 +329,15 @@ impl SessionCompaction {
                 usage: None,
                 output: None,
             })?;
+        timing.headers_received(chat_span);
         let mut accumulator = ChatStreamAccumulator::new();
         let mut response_started = false;
         let mut terminal_seen = false;
-        while let Some(chunk) = stream.next().await {
+        loop {
+            timing.wait_begin();
+            let next = stream.next().await;
+            timing.wait_end();
+            let Some(chunk) = next else { break };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -345,7 +350,7 @@ impl SessionCompaction {
                 }
             };
             response_started = true;
-            first_chunk.received(chat_span);
+            timing.chunk_received(chat_span, genai::chunk_commits_output(&chunk));
             if let Err(error) = accumulator.push(&chunk) {
                 return Err(StreamFailure {
                     error: LLMError::GenericError(format!("Invalid compaction stream: {error}")),
@@ -369,6 +374,7 @@ impl SessionCompaction {
                 output: None,
             });
         }
+        timing.finish(chat_span);
         // Only collect already-buffered usage; post-terminal events must bypass validation.
         let mut trailing: Option<querymt::Usage> = None;
         while let Some(Some(Ok(querymt::chat::StreamChunk::Usage(extra)))) =

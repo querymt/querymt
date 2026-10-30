@@ -321,7 +321,7 @@ pub(crate) async fn execute_cycle_state_machine(
         exec_ctx.session_id
     );
 
-    let driver = config.create_driver();
+    let driver = info_span!("agent.execution.driver_create").in_scope(|| config.create_driver());
 
     debug!(
         "Session {}: state machine loading history, cancelled={}",
@@ -377,17 +377,25 @@ pub(crate) async fn execute_cycle_state_machine(
         exec_ctx.session_id, llm_config.provider, llm_config.model
     );
 
-    let initial_context = Arc::new(
-        crate::middleware::ConversationContext::new(
-            exec_ctx.session_id.as_str().into(),
-            messages,
-            stats,
-            llm_config.provider.as_str().into(),
-            llm_config.model.as_str().into(),
+    // Builds the provider for the turn on first use, so this is where cold-start cost lands.
+    let profile = exec_ctx
+        .session_handle
+        .profile()
+        .instrument(info_span!("agent.execution.profile"))
+        .await;
+    let initial_context = info_span!("agent.execution.context_init").in_scope(|| {
+        Arc::new(
+            crate::middleware::ConversationContext::new(
+                exec_ctx.session_id.as_str().into(),
+                messages,
+                stats,
+                llm_config.provider.as_str().into(),
+                llm_config.model.as_str().into(),
+            )
+            .with_session_mode(session_mode)
+            .with_profile(profile),
         )
-        .with_session_mode(session_mode)
-        .with_profile(exec_ctx.session_handle.profile().await),
-    );
+    });
 
     let mut state = ExecutionState::BeforeLlmCall {
         context: initial_context.clone(),
@@ -434,6 +442,8 @@ pub(crate) async fn execute_cycle_state_machine(
 
         state = match state {
             ExecutionState::BeforeLlmCall { context } => {
+                // Everything from here to request dispatch is agent overhead, not model time.
+                let step_started = std::time::Instant::now();
                 exec_ctx.report_phase(crate::agent::turn_control::RunPhase::Model);
                 let context = wait::reconcile_suspended_delegations(
                     config,
@@ -524,8 +534,16 @@ pub(crate) async fn execute_cycle_state_machine(
                     ExecutionState::BeforeLlmCall {
                         context: ref conv_context,
                     } => {
-                        transitions::transition_before_llm_call(config, conv_context, exec_ctx)
-                            .await?
+                        let next =
+                            transitions::transition_before_llm_call(config, conv_context, exec_ctx)
+                                .await?;
+                        crate::agent::utils::llm_metrics::step_overhead(
+                            "pre_request",
+                            step_started.elapsed().as_secs_f64(),
+                            crate::agent::utils::genai::provider_name(&conv_context.provider),
+                            &conv_context.model,
+                        );
+                        next
                     }
                     other => other,
                 }

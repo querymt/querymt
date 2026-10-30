@@ -11,7 +11,24 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
 #[cfg(feature = "tracing")]
-use tracing::instrument;
+use tracing::{Instrument, instrument};
+
+/// Await `$fut` inside a child span named `$name` when tracing is enabled.
+///
+/// The streaming request is split into credential refresh, request building and
+/// the HTTP send so a slow first byte can be attributed to one of them.
+macro_rules! phase {
+    ($name:literal, $fut:expr) => {{
+        #[cfg(feature = "tracing")]
+        {
+            $fut.instrument(tracing::info_span!($name)).await
+        }
+        #[cfg(not(feature = "tracing"))]
+        {
+            $fut.await
+        }
+    }};
+}
 
 pub struct LLMProviderFromHTTP {
     inner: Box<dyn HTTPLLMProvider>,
@@ -66,11 +83,34 @@ impl ChatProvider for LLMProviderFromHTTP {
             ));
         }
 
-        self.ensure_credential_fresh().await?;
+        phase!(
+            "http_adapter.credential_refresh",
+            self.ensure_credential_fresh()
+        )?;
 
-        let prepared = self.inner.prepare_chat_request(call, true)?;
+        let prepared = {
+            #[cfg(feature = "tracing")]
+            let span = tracing::info_span!(
+                "http_adapter.prepare_request",
+                http.request.body.size = tracing::field::Empty
+            );
+            #[cfg(feature = "tracing")]
+            let _entered = span.enter();
+            let prepared = self.inner.prepare_chat_request(call, true)?;
+            #[cfg(feature = "tracing")]
+            span.record(
+                "http.request.body.size",
+                prepared.request.body().len() as u64,
+            );
+            prepared
+        };
 
-        let stream = match call_outbound_stream_raw(prepared.request).await? {
+        // Covers the network round trip up to response headers; the body is
+        // consumed later by the caller, so this is effectively time to first byte.
+        let stream = match phase!(
+            "http_adapter.send",
+            call_outbound_stream_raw(prepared.request)
+        )? {
             OutboundStreamResult::Failure { response } => {
                 return Err(self.inner.classify_chat_error_async(&response).await);
             }

@@ -1,5 +1,5 @@
 use log::warn;
-use querymt::providers::{ModelInfo, ModelPricing, PricingSource, read_providers_from_cache};
+use querymt::providers::{ModelInfo, ModelPricing, PricingSource, providers_registry};
 
 /// A manual pricing rate that is negative or not finite.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -188,7 +188,7 @@ impl ModelInfoSource {
 /// This is a convenience function that handles cache reading and logging.
 /// Returns None if registry can't be loaded or model not found.
 pub fn get_model_info(provider: &str, model: &str) -> Option<ModelInfo> {
-    match read_providers_from_cache() {
+    match providers_registry() {
         Ok(registry) => registry.get_model(provider, model).cloned(),
         Err(e) => {
             warn!("Failed to load providers registry: {}", e);

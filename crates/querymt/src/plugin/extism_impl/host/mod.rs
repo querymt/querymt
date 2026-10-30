@@ -219,14 +219,14 @@ impl ExtismFactory {
         let mut env_map: HashMap<_, _> = std::env::vars().collect();
 
         #[cfg(feature = "model-registry")]
-        let providers_registry = crate::providers::read_providers_from_cache()?;
+        let providers_registry = crate::providers::providers_registry()?;
         #[cfg(not(feature = "model-registry"))]
-        let providers_registry = ProvidersRegistry {
+        let providers_registry = std::sync::Arc::new(ProvidersRegistry {
             providers: HashMap::new(),
-        };
+        });
         env_map.insert(
             "PROVIDERS_REGISTRY_DATA".to_string(),
-            serde_json::to_string(&providers_registry)?,
+            serde_json::to_string(&*providers_registry)?,
         );
 
         let initial_manifest =

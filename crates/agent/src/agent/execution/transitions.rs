@@ -74,6 +74,7 @@ pub(super) async fn transition_before_llm_call(
     let provider = match super::llm_retry::call_with_retry(
         config,
         &exec_ctx.session_id,
+        "provider_init",
         &exec_ctx.cancellation_token,
         || {
             let session_handle = exec_ctx.session_handle.clone();
@@ -111,15 +112,26 @@ pub(super) async fn transition_before_llm_call(
         context.clone()
     };
 
-    let tools = config.collect_tools(
-        provider,
-        Some(exec_ctx.runtime.as_ref()),
-        Some(&exec_ctx.tool_config),
+    let collect_span = info_span!(
+        "agent.tools.collect",
+        tool_count = tracing::field::Empty,
+        tools_bytes = tracing::field::Empty
     );
-
-    let tools_json =
-        serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
-    let new_hash = crate::hash::RapidHash::new(&tools_json);
+    let (tools, tools_json, new_hash) = {
+        // Synchronous block: the guard never crosses an await.
+        let _guard = collect_span.enter();
+        let tools = config.collect_tools(
+            provider,
+            Some(exec_ctx.runtime.as_ref()),
+            Some(&exec_ctx.tool_config),
+        );
+        let tools_json =
+            serde_json::to_vec(&tools).context("Failed to serialize tools for hash computation")?;
+        let new_hash = crate::hash::RapidHash::new(&tools_json);
+        collect_span.record("tool_count", tools.len() as u64);
+        collect_span.record("tools_bytes", tools_json.len() as u64);
+        (tools, tools_json, new_hash)
+    };
 
     let current_hash = exec_ctx.runtime.mcp_tool_state.load().tools_hash;
     let changed = current_hash.is_none_or(|h| h != new_hash);
@@ -154,6 +166,11 @@ pub(super) async fn transition_before_llm_call(
         .and_then(|info| info.limits.context)
         .unwrap_or(u32::MAX as u64)
         .min(u32::MAX as u64) as u32;
+    let hook_span = info_span!(
+        "agent.hooks.context",
+        trigger,
+        message_count = messages.len() as u64
+    );
     let hook_result = config
         .hooks
         .run_context(crate::hooks::ContextHookRequest {
@@ -167,6 +184,7 @@ pub(super) async fn transition_before_llm_call(
             context_window,
             messages,
         })
+        .instrument(hook_span)
         .await?;
     for notice in hook_result.notices {
         config.emit_event(
@@ -212,7 +230,12 @@ pub(super) async fn transition_before_llm_call(
             context: Some(context.clone()),
         });
     }
-    let messages = apply_cache_breakpoints(&messages);
+    // Clones the whole history, so its cost grows with the conversation.
+    let messages = info_span!(
+        "agent.request.cache_breakpoints",
+        message_count = messages.len() as u64
+    )
+    .in_scope(|| apply_cache_breakpoints(&messages));
     // Re-evaluate room after history, steering, tools, and context hooks are prepared.
     let mut options = context.request_overrides;
     if let Some(cap) = options.max_tokens {
@@ -764,7 +787,15 @@ pub(super) async fn transition_call_llm(
 
     let session_handle = &exec_ctx.session_handle;
     let messages_with_cache = request_messages;
-    let operation = main_attempt_operation(config, exec_ctx).await?;
+    // Recorded on every exit path (success, error, cancel) when dropped.
+    let chat_timer = crate::agent::utils::llm_metrics::ChatTimer::start(
+        genai::provider_name(&context.provider),
+        &context.model,
+        &exec_ctx.cancellation_token,
+    );
+    let operation = main_attempt_operation(config, exec_ctx)
+        .instrument(info_span!("agent.accounting.open"))
+        .await?;
 
     // Pre-allocated message_id for streaming path so that delta events and the
     // final AssistantMessageStored share the same ID.
@@ -779,6 +810,7 @@ pub(super) async fn transition_call_llm(
         match super::llm_retry::call_with_retry(
             config,
             session_id,
+            "chat",
             &exec_ctx.cancellation_token,
             || {
                 let messages_with_cache = &messages_with_cache;
@@ -823,6 +855,7 @@ pub(super) async fn transition_call_llm(
         let provider = match super::llm_retry::call_with_retry(
             config,
             session_id,
+            "provider_init",
             &exec_ctx.cancellation_token,
             || {
                 let cancel = exec_ctx.cancellation_token.clone();
@@ -939,7 +972,7 @@ pub(super) async fn transition_call_llm(
                 max_stream_retries,
                 config.execution_policy.rate_limit.max_attempts(),
             );
-            let mut first_chunk = genai::FirstChunk::default();
+            let mut timing = genai::StreamTiming::default();
             let streamed_output: ChatOutput = 'stream: loop {
                 let mut semantic_output_seen = false;
 
@@ -991,7 +1024,7 @@ pub(super) async fn transition_call_llm(
                 };
                 let mut response_started = false;
 
-                first_chunk.start();
+                timing.start();
                 let mut stream = match provider
                     .chat_stream(
                         &ChatCall::new(messages_with_cache)
@@ -1000,7 +1033,10 @@ pub(super) async fn transition_call_llm(
                     )
                     .await
                 {
-                    Ok(stream) => stream,
+                    Ok(stream) => {
+                        timing.headers_received(&chat_span);
+                        stream
+                    }
                     Err(error) => match super::llm_retry::handle_stream_failure(
                         config,
                         session_id,
@@ -1030,11 +1066,13 @@ pub(super) async fn transition_call_llm(
 
                 // ── Inner consume loop ───────────────────────────────────────
                 loop {
+                    timing.wait_begin();
                     let item = super::llm_retry::next_stream_chunk(
                         &mut stream,
                         &exec_ctx.cancellation_token,
                     )
                     .await;
+                    timing.wait_end();
 
                     let chunk = match item {
                         Ok(chunk) => chunk,
@@ -1090,7 +1128,7 @@ pub(super) async fn transition_call_llm(
                         },
                     };
 
-                    first_chunk.received(&chat_span);
+                    timing.chunk_received(&chat_span, genai::chunk_commits_output(&chunk));
                     response_started = true;
                     semantic_output_seen |= super::llm_retry::stream_chunk_commits_output(&chunk);
 
@@ -1400,6 +1438,14 @@ pub(super) async fn transition_call_llm(
                 }
             }; // end outer retry loop ('stream)
 
+            timing.finish(&chat_span);
+            crate::agent::utils::llm_metrics::stream_latency(
+                genai::provider_name(&context.provider),
+                &context.model,
+                timing.first_byte_secs(),
+                timing.first_token_secs(),
+            );
+
             // Final flush of any remaining buffered content (no timer reset needed)
             flush_buffers!(false);
             let structured_stream = streamed_output.provenance.is_some()
@@ -1435,6 +1481,7 @@ pub(super) async fn transition_call_llm(
             match super::llm_retry::call_with_retry(
                 config,
                 session_id,
+                "chat",
                 &exec_ctx.cancellation_token,
                 || {
                     let provider = &provider;
@@ -1471,6 +1518,8 @@ pub(super) async fn transition_call_llm(
 
     // Canonical output is authoritative; the flattened fields below are
     // compatibility projections of it.
+    // Stop the clock at the end of the model round trip, not after the bookkeeping below.
+    chat_timer.succeeded();
     genai::output(&output);
     let response_content = output.text().unwrap_or_default();
     let response_thinking = output.thinking();
@@ -4343,6 +4392,16 @@ mod tests {
                             attr(chat, "gen_ai.response.time_to_first_chunk").is_some(),
                             streaming
                         );
+                        // TTFT and TTFB use the names Otelite reads, never the server-side spec name.
+                        assert_eq!(attr(chat, "llm.time_to_first_token").is_some(), streaming);
+                        assert_eq!(attr(chat, "llm.time_to_first_byte").is_some(), streaming);
+                        assert!(attr(chat, "gen_ai.server.time_to_first_token").is_none());
+                        if let (Some(Value::F64(chunk)), Some(Value::F64(token))) = (
+                            attr(chat, "gen_ai.response.time_to_first_chunk"),
+                            attr(chat, "llm.time_to_first_token"),
+                        ) {
+                            assert!(token >= chunk, "token={token} chunk={chunk}");
+                        }
                         assert_eq!(
                             attr(chat, "gen_ai.request.stream"),
                             streaming.then_some(&Value::Bool(true))
@@ -4379,6 +4438,82 @@ mod tests {
                     assert_private(&spans);
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn cloned_session_handles_share_one_provider_build() {
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 0);
+
+            // The state machine clones the handle on every step; each clone must
+            // reuse the turn's provider instead of rebuilding it.
+            let first = exec.session_handle.provider().await.unwrap();
+            for _ in 0..3 {
+                let clone = exec.session_handle.clone();
+                let again = clone.provider().await.unwrap();
+                assert!(Arc::ptr_eq(&first, &again));
+            }
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
+
+            // A clone taken before the first build shares the same cell.
+            let (fixture, factory) = timed_fixture(
+                true,
+                vec![],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            let early_clone = exec.session_handle.clone();
+            let from_clone = early_clone.provider().await.unwrap();
+            let from_original = exec.session_handle.provider().await.unwrap();
+            assert!(Arc::ptr_eq(&from_clone, &from_original));
+            assert_eq!(factory.resolutions.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn pre_request_phases_are_traced_and_provider_init_is_not_a_chat_retry() {
+            let (fixture, _factory) = timed_fixture(
+                true,
+                vec![],
+                "openai",
+                Some("oci://ghcr.io/querymt/openai:latest"),
+            )
+            .await;
+            let exec = fixture.execution_context().await;
+            let context = crate::test_utils::test_context(&exec.session_id, 0);
+            let (_, spans) = capture(async {
+                let _ = transition_before_llm_call(&fixture.config, &context, &exec).await;
+            })
+            .await;
+            let names: Vec<&str> = spans.iter().map(|s| s.name.as_ref()).collect();
+            for expected in [
+                "agent.transition.before_llm_call",
+                "agent.provider.build",
+                "agent.tools.collect",
+                "agent.hooks.context",
+                "agent.request.cache_breakpoints",
+            ] {
+                assert!(names.contains(&expected), "missing {expected}: {names:?}");
+            }
+            let init = spans
+                .iter()
+                .find(|s| s.name == "agent.llm.call_with_retry")
+                .expect("provider init retry span");
+            assert_eq!(attr(init, "operation"), Some(&Value::from("provider_init")));
+            let tools = spans
+                .iter()
+                .find(|s| s.name == "agent.tools.collect")
+                .unwrap();
+            assert!(attr(tools, "tool_count").is_some());
+            assert!(attr(tools, "tools_bytes").is_some());
         }
 
         #[tokio::test]
