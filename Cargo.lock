@@ -8390,6 +8390,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "minijinja-contrib"
+version = "3.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f804cfd81c146ff898cbf3455071c417e8745907c77f3d5058bd9691b9ace3b8"
+dependencies = [
+ "minijinja 3.0.5",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8531,7 +8540,7 @@ dependencies = [
  "metrics",
  "mime_guess",
  "minijinja 2.24.0",
- "minijinja-contrib",
+ "minijinja-contrib 2.24.0",
  "mistralrs-audio",
  "mistralrs-code-exec",
  "mistralrs-flash-attn",
@@ -11570,7 +11579,7 @@ dependencies = [
  "llguidance",
  "log",
  "minijinja 3.0.5",
- "minijinja-contrib",
+ "minijinja-contrib 3.0.5",
  "querymt",
  "querymt-provider-common",
  "querymt-utils",
