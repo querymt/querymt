@@ -299,9 +299,14 @@ pub fn try_setup_telemetry_with_layers(
     // Bridge log → tracing so `log::info!` etc. also flow through.
     LogTracer::init().map_err(|_| TelemetryInitError::LogTracer)?;
 
-    // Console filter: default ERROR, overridden by RUST_LOG.
-    let console_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error"));
+    // Keep Linux backend decisions and temporary-storage warnings visible.
+    let default_console_filter = if cfg!(target_os = "linux") {
+        "error,querymt_utils::secret_store=info"
+    } else {
+        "error"
+    };
+    let console_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(default_console_filter));
     let writer: BoxMakeWriter = if config.use_stderr {
         BoxMakeWriter::new(std::io::stderr)
     } else {

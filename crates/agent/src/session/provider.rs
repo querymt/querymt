@@ -1295,14 +1295,21 @@ impl std::str::FromStr for AuthMethod {
 }
 
 /// Read the preferred auth method for a provider from SecretStore.
-pub(crate) fn preferred_auth_method(provider_name: &str) -> SessionResult<Option<AuthMethod>> {
+pub(crate) async fn preferred_auth_method(
+    provider_name: &str,
+) -> SessionResult<Option<AuthMethod>> {
     let key = format!("auth_method_{provider_name}");
-    let store = querymt_utils::secret_store::SecretStore::new().map_err(|error| {
-        SessionError::InvalidOperation(format!("Failed to open secret store: {error}"))
-    })?;
-    let value = store.try_get(&key).map_err(|error| {
-        SessionError::InvalidOperation(format!("Failed to read auth preference: {error}"))
-    })?;
+    let store = querymt_utils::secret_store::SecretStore::new_async()
+        .await
+        .map_err(|error| {
+            SessionError::InvalidOperation(format!("Failed to open secret store: {error}"))
+        })?;
+    let value = store
+        .run(move |store| store.try_get(&key))
+        .await
+        .map_err(|error| {
+            SessionError::InvalidOperation(format!("Failed to read auth preference: {error}"))
+        })?;
     Ok(value.and_then(|value| value.parse::<AuthMethod>().ok()))
 }
 
@@ -1345,12 +1352,13 @@ pub(crate) async fn resolve_api_key_with_preference(
             AuthMethod::ApiKey => {
                 if let Some(name) = env_var_name {
                     let store =
-                        querymt_utils::secret_store::SecretStore::new().map_err(|error| {
+                        querymt_utils::secret_store::SecretStore::new_async().await.map_err(|error| {
                             SessionError::InvalidOperation(format!(
                                 "Failed to open secret store: {error}"
                             ))
                         })?;
-                    if let Some(key) = store.try_get(name).map_err(|error| {
+                    let stored_name = name.to_owned();
+                    if let Some(key) = store.run(move |store| store.try_get(&stored_name)).await.map_err(|error| {
                         SessionError::InvalidOperation(format!(
                             "Failed to read stored API key for provider '{provider_name}': {error}"
                         ))
