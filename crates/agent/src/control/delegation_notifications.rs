@@ -217,6 +217,91 @@ impl DelegationUpdateProjector {
         self.project_envelope(&event.clone().into())
     }
 
+    /// Hydrate durable lifecycle facts without treating the latest live stage
+    /// watermark as evidence that older, not-yet-seeded metadata was observed.
+    pub(crate) fn seed_history(&mut self, session_id: &str, events: &[AgentEvent]) {
+        for event in events.iter().filter(|event| event.session_id == session_id) {
+            if let AgentEventKind::SessionForked {
+                parent_session_id, ..
+            } = &event.kind
+                && parent_session_id != session_id
+            {
+                continue;
+            }
+            let id = match &event.kind {
+                AgentEventKind::DelegationRequested { delegation, .. } => &delegation.public_id,
+                AgentEventKind::SessionForked {
+                    origin: ForkOrigin::Delegation,
+                    fork_point_ref,
+                    ..
+                } => fork_point_ref,
+                AgentEventKind::DelegationCompleted { delegation_id, .. }
+                | AgentEventKind::DelegationFailed { delegation_id, .. }
+                | AgentEventKind::DelegationCancelled { delegation_id } => delegation_id,
+                _ => continue,
+            };
+            let previous = self.snapshots.get(id).cloned();
+            if let Some(current) = &previous {
+                if current.session_id != event.session_id {
+                    continue;
+                }
+                match &event.kind {
+                    AgentEventKind::DelegationRequested {
+                        delegation,
+                        tool_call_id,
+                        ..
+                    } if current.target_agent_id != delegation.target_agent_id
+                        || current.objective != delegation.objective
+                        || current
+                            .tool_call_id
+                            .as_ref()
+                            .zip(tool_call_id.as_ref())
+                            .is_some_and(|(current, incoming)| current != incoming) =>
+                    {
+                        continue;
+                    }
+                    AgentEventKind::SessionForked {
+                        child_session_id,
+                        target_agent_id,
+                        ..
+                    } if current.target_agent_id != *target_agent_id
+                        || current
+                            .child_session_id
+                            .as_ref()
+                            .is_some_and(|id| id != child_session_id) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            // This path accepts only persisted lifecycle history. Live envelopes
+            // still use project_envelope's sequence and epoch rejection guards.
+            self.project(&event.session_id, event.timestamp, &event.kind);
+            if let Some(snapshot) = self.snapshots.get_mut(id) {
+                if let Some(previous) = previous {
+                    snapshot.child_session_id = previous
+                        .child_session_id
+                        .or(snapshot.child_session_id.take());
+                    snapshot.selected_model_id = previous
+                        .selected_model_id
+                        .or(snapshot.selected_model_id.take());
+                    snapshot.selected_provider_node_id = previous
+                        .selected_provider_node_id
+                        .or(snapshot.selected_provider_node_id.take());
+                }
+                let stage_seq = self.stage_order.get(id).map_or(0, |(_, seq)| *seq);
+                let seq = event
+                    .session_seq
+                    .max(stage_seq)
+                    .max(snapshot.session_seq.unwrap_or(0));
+                if seq > 0 {
+                    snapshot.session_seq = Some(seq);
+                }
+            }
+        }
+    }
+
     pub(crate) fn restore_observation(&mut self, update: DelegationUpdateNotification) {
         if self
             .snapshots
@@ -1085,6 +1170,163 @@ mod tests {
     }
 
     #[test]
+    fn seeding_history_enriches_lifecycle_behind_live_stage_watermark() {
+        let mut requested = event(
+            1,
+            AgentEventKind::DelegationRequested {
+                delegation: delegation(),
+                tool_call_id: Some("call-1".into()),
+                batch_id: None,
+                cycle_id: None,
+            },
+        );
+        requested.session_seq = 1;
+        let mut forked = event(
+            2,
+            AgentEventKind::SessionForked {
+                parent_session_id: "parent-1".into(),
+                child_session_id: "child-1".into(),
+                target_agent_id: "coder".into(),
+                origin: ForkOrigin::Delegation,
+                fork_point_type: ForkPointType::ProgressEntry,
+                fork_point_ref: "delegation-1".into(),
+                instructions: None,
+                selected_model_id: Some("confirmed-model".into()),
+                selected_provider_node_id: None,
+            },
+        );
+        forked.session_seq = 2;
+        let mut completed = event(
+            3,
+            AgentEventKind::DelegationCompleted {
+                delegation_id: "delegation-1".into(),
+                result: Some("durable outcome".into()),
+            },
+        );
+        completed.session_seq = 3;
+        let mut stage = event(
+            50,
+            AgentEventKind::DelegationStageChanged {
+                delegation_id: "delegation-1".into(),
+                stage: Some(DelegationStage::Verifying),
+                source_epoch: "current-owner".into(),
+            },
+        );
+        stage.session_seq = 50;
+        for (terminal, expected) in [
+            (None, DelegationUpdateState::Forked),
+            (
+                Some(completed.kind.clone()),
+                DelegationUpdateState::Completed,
+            ),
+            (
+                Some(AgentEventKind::DelegationFailed {
+                    delegation_id: "delegation-1".into(),
+                    error: "durable failure".into(),
+                }),
+                DelegationUpdateState::Failed,
+            ),
+            (
+                Some(AgentEventKind::DelegationCancelled {
+                    delegation_id: "delegation-1".into(),
+                }),
+                DelegationUpdateState::Cancelled,
+            ),
+        ] {
+            let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
+            assert!(
+                translator
+                    .translate_notification(&EventEnvelope::from(stage.clone()))
+                    .is_none()
+            );
+            let mut history = vec![requested.clone(), forked.clone()];
+            if let Some(kind) = terminal {
+                let mut terminal = completed.clone();
+                terminal.kind = kind;
+                history.push(terminal);
+            }
+            let meta = serde_json::Map::from_iter([(
+                "querymt/sessionLoadSnapshot.v1".into(),
+                serde_json::json!({"audit":{"events":history}}),
+            )]);
+            let recovered = translator
+                .seed_history_from_meta("parent-1", Some(&meta))
+                .unwrap();
+            assert_eq!(
+                recovered.len(),
+                1,
+                "actual seed_history must deliver enriched lifecycle behind a live watermark, including a live fork"
+            );
+            assert_eq!(recovered[0].state, expected);
+            assert_eq!(
+                recovered[0].result_summary.as_deref(),
+                (expected == DelegationUpdateState::Completed).then_some("durable outcome")
+            );
+            assert_eq!(
+                recovered[0].error.as_deref(),
+                (expected == DelegationUpdateState::Failed).then_some("durable failure")
+            );
+            assert_eq!(recovered[0].child_session_id.as_deref(), Some("child-1"));
+            assert_eq!(
+                recovered[0].selected_model_id.as_deref(),
+                Some("confirmed-model")
+            );
+            assert_eq!(recovered[0].session_seq, Some(50));
+            assert_eq!(recovered[0].stage, Some(DelegationStage::Verifying));
+            let mut next_stage = stage.clone();
+            next_stage.session_seq = 51;
+            let observed = translator
+                .translate_notification(&EventEnvelope::from(next_stage.clone()))
+                .unwrap();
+            assert_eq!(
+                observed["params"]["childSessionId"], "child-1",
+                "queued stage must not prevent fork identity hydration"
+            );
+            assert_eq!(observed["params"]["selectedModelId"], "confirmed-model");
+            assert_eq!(
+                observed["params"]["state"],
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(observed["params"]["stage"], "verifying");
+            assert_eq!(observed["params"]["sourceEpoch"], "current-owner");
+            assert!(
+                translator
+                    .translate_notification(&EventEnvelope::from(stage.clone()))
+                    .is_none(),
+                "real stale live stage must still be rejected"
+            );
+            let mut wrong_epoch = next_stage.clone();
+            wrong_epoch.session_seq = 100;
+            if let AgentEventKind::DelegationStageChanged { source_epoch, .. } =
+                &mut wrong_epoch.kind
+            {
+                *source_epoch = "other-owner".into();
+            }
+            assert!(
+                translator
+                    .translate_notification(&EventEnvelope::from(wrong_epoch))
+                    .is_none(),
+                "history must not weaken epoch rejection"
+            );
+            next_stage.session_seq = 52;
+            if let AgentEventKind::DelegationStageChanged { stage, .. } = &mut next_stage.kind {
+                *stage = None;
+            }
+            let cleaned = translator
+                .translate_notification(&EventEnvelope::from(next_stage))
+                .unwrap();
+            assert_eq!(cleaned["params"]["activity"], "historical");
+            assert!(
+                translator
+                    .seed_history_from_meta("parent-1", Some(&meta))
+                    .unwrap()
+                    .is_empty(),
+                "repeat history must not revive activity or reemit terminal"
+            );
+        }
+    }
+
+    #[test]
     fn seeding_connection_history_preserves_live_delegation_completion() {
         let history = vec![
             event(
@@ -1144,6 +1386,110 @@ mod tests {
             .translate_notification(&EventEnvelope::from(history[0].clone()))
             .unwrap();
         assert_eq!(repeated["params"]["state"], "completed");
+
+        let mut cleanup = event(
+            50,
+            AgentEventKind::DelegationStageChanged {
+                delegation_id: "delegation-1".into(),
+                stage: None,
+                source_epoch: "current-owner".into(),
+            },
+        );
+        cleanup.session_seq = 50;
+        translator.translate_notification(&cleanup.into()).unwrap();
+        let mut enriched_fork = history[1].clone();
+        if let AgentEventKind::SessionForked {
+            selected_model_id,
+            selected_provider_node_id,
+            ..
+        } = &mut enriched_fork.kind
+        {
+            *selected_model_id = Some("confirmed-model".into());
+            *selected_provider_node_id = Some("confirmed-node".into());
+        }
+        let mut conflicts = Vec::new();
+        let mut foreign = enriched_fork.clone();
+        foreign.session_id = "other-parent".into();
+        conflicts.push(foreign);
+        let mut wrong_parent = enriched_fork.clone();
+        if let AgentEventKind::SessionForked {
+            parent_session_id, ..
+        } = &mut wrong_parent.kind
+        {
+            *parent_session_id = "other-parent".into();
+        }
+        conflicts.push(wrong_parent);
+        let mut wrong_child = enriched_fork.clone();
+        if let AgentEventKind::SessionForked {
+            child_session_id, ..
+        } = &mut wrong_child.kind
+        {
+            *child_session_id = "other-child".into();
+        }
+        conflicts.push(wrong_child);
+        let mut wrong_request = history[0].clone();
+        if let AgentEventKind::DelegationRequested {
+            delegation,
+            tool_call_id,
+            ..
+        } = &mut wrong_request.kind
+        {
+            delegation.target_agent_id = "other-agent".into();
+            *tool_call_id = Some("other-tool".into());
+        }
+        conflicts.push(wrong_request);
+        let bad_meta = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".into(),
+            serde_json::json!({"audit":{"events":conflicts}}),
+        )]);
+        assert!(
+            translator
+                .seed_history_from_meta("parent-1", Some(&bad_meta))
+                .unwrap()
+                .is_empty(),
+            "conflicting identity is not enrichment"
+        );
+        let enrichment = serde_json::Map::from_iter([(
+            "querymt/sessionLoadSnapshot.v1".into(),
+            serde_json::json!({"audit":{"events":[enriched_fork, event(4, AgentEventKind::DelegationFailed { delegation_id: "delegation-1".into(), error: "must not replace outcome".into() })]}}),
+        )]);
+        let recovered = translator
+            .seed_history_from_meta("parent-1", Some(&enrichment))
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "late missing metadata must be delivered even after cleanup"
+        );
+        assert_eq!(recovered[0].state, DelegationUpdateState::Completed);
+        assert_eq!(recovered[0].result_summary.as_deref(), Some("done"));
+        assert_eq!(recovered[0].error, None);
+        assert_eq!(recovered[0].child_session_id.as_deref(), Some("child-1"));
+        assert_eq!(
+            recovered[0].selected_model_id.as_deref(),
+            Some("confirmed-model")
+        );
+        assert_eq!(
+            recovered[0].selected_provider_node_id.as_deref(),
+            Some("confirmed-node")
+        );
+        assert_eq!(recovered[0].session_seq, Some(50));
+        assert_eq!(recovered[0].source_epoch.as_deref(), Some("current-owner"));
+        assert_eq!(recovered[0].activity, DelegationActivity::Historical);
+        assert_eq!(recovered[0].stage, None);
+        assert!(
+            translator
+                .seed_history_from_meta("parent-1", Some(&meta))
+                .unwrap()
+                .is_empty(),
+            "old missing model metadata must not erase current identity"
+        );
+        assert!(
+            translator
+                .seed_history_from_meta("parent-1", Some(&enrichment))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

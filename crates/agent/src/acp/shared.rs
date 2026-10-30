@@ -1731,17 +1731,17 @@ impl AcpLiveEventTranslator {
         let usage = self.usage.entry(session_id.to_owned()).or_default();
         for event in events {
             usage.observe(session_id, event.seq, &event.kind);
-            self.delegation_updates.project_event(event);
         }
+        self.delegation_updates.seed_history(session_id, events);
         usage.history_loaded = true;
-        // A queued live completion can become projectable only during seeding.
-        // Return its final enriched snapshot once, not once per historical event.
+        // A queued observation can gain lifecycle or identity only during seeding.
+        // Deliver its enriched snapshot once, including a still-live fork.
         self.delegation_updates
             .snapshots()
             .into_iter()
             .filter(|update| {
                 update.session_id == session_id
-                    && update.finished_at.is_some()
+                    && (update.finished_at.is_some() || update.source_epoch.is_some())
                     && previous.get(&update.delegation_id) != Some(update)
             })
             .collect()
