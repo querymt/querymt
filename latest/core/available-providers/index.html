@@ -878,6 +878,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#usage-normalization-across-api-providers" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Usage normalization across API providers
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#llama-cpp" class="md-nav__link">
     <span class="md-ellipsis">
       <span class="md-typeset">
@@ -2559,7 +2570,7 @@
 <li>Other adaptive models: sent unchanged.</li>
 </ul>
 <h4 id="thinking-replay-usage-and-stop-reasons">Thinking replay, usage and stop reasons</h4>
-<p>Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default <code>display: "omitted"</code> on Opus 4.7+ and Claude 5). <code>redacted_thinking</code> blocks are kept and replayed with their opaque data. <code>output_tokens_details.thinking_tokens</code> is reported as <code>reasoning_tokens</code>. Stop reasons map as: <code>end_turn</code>/<code>stop_sequence</code> to stop, <code>tool_use</code> to tool calls, <code>max_tokens</code>/<code>model_context_window_exceeded</code> to length, <code>refusal</code> to content filter, <code>pause_turn</code> to other.</p>
+<p>Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default <code>display: "omitted"</code> on Opus 4.7+ and Claude 5). <code>redacted_thinking</code> blocks are kept and replayed with their opaque data. <code>output_tokens_details.thinking_tokens</code> is reported as <code>reasoning_tokens</code> and subtracted from the inclusive <code>output_tokens</code>, so ordinary output and reasoning never overlap. Streaming usage ends with the final <code>message_delta</code> values: the provisional output count in <code>message_start</code> is not emitted as ordinary output, fields a later event omits (input, cache) keep their earlier values, and an explicit zero replaces them. Cache writes keep the returned <code>cache_creation</code> five-minute and one-hour counts as a breakdown of the aggregate <code>cache_creation_input_tokens</code> (never added on top); with no breakdown the tiers stay absent rather than assumed. Stop reasons map as: <code>end_turn</code>/<code>stop_sequence</code> to stop, <code>tool_use</code> to tool calls, <code>max_tokens</code>/<code>model_context_window_exceeded</code> to length, <code>refusal</code> to content filter, <code>pause_turn</code> to other.</p>
 <h4 id="adaptive_thinking-override"><code>adaptive_thinking</code> override</h4>
 <p>An optional provider config field overrides the class derived from the model ID:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-15-1">1</a></span>
@@ -2585,6 +2596,51 @@
 <li><strong>Budgets.</strong> Counted over the successfully converted tools only: at most 20 strict tools, 24 optional properties and 16 union properties (<code>anyOf</code> or type arrays). If any limit is exceeded, <em>every</em> tool in that request is sent non-strict with its original schema and a warning names the limit.</li>
 </ul>
 <p>Strict tools work the same over API key and OAuth: OAuth strict requests were verified against the live API on <code>claude-sonnet-4-5</code> and <code>claude-sonnet-5-5</code> (see <code>scripts/verify-anthropic-strict.sh</code>).</p>
+<h3 id="usage-normalization-across-api-providers">Usage normalization across API providers</h3>
+<p>Every provider adapter reports usage in the same exclusive categories: uncached input, ordinary output, reasoning, cache reads and cache writes. Each token appears in one category, so totals and cost estimates never count it twice. What each wire format needs to get there:</p>
+<table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Wire shape</th>
+<th>Normalization</th>
+<th>Limitations</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OpenAI Chat, OpenRouter, xAI, Mistral, Alibaba</td>
+<td><code>prompt_tokens</code> includes <code>prompt_tokens_details.cached_tokens</code> and <code>cache_write_tokens</code>; <code>completion_tokens</code> includes <code>reasoning_tokens</code></td>
+<td>Cache reads and writes are subtracted from the prompt; reasoning is subtracted from the completion</td>
+<td>A missing detail object means zero, not unknown</td>
+</tr>
+<tr>
+<td>DeepSeek</td>
+<td>Flat <code>prompt_cache_hit_tokens</code> / <code>prompt_cache_miss_tokens</code></td>
+<td>An explicit miss count, including <code>0</code>, is used as uncached input instead of a derived value</td>
+<td>Cache writes are not reported (they are billed as ordinary input)</td>
+</tr>
+<tr>
+<td>OpenAI Responses, Codex</td>
+<td><code>input_tokens</code> includes <code>input_tokens_details.cached_tokens</code> and <code>cache_write_tokens</code>; <code>output_tokens</code> includes <code>reasoning_tokens</code></td>
+<td>Same subtraction as Chat</td>
+<td>Only terminal usage is authoritative; each attempt carries its own usage</td>
+</tr>
+<tr>
+<td>Google Gemini</td>
+<td><code>promptTokenCount</code> includes <code>cachedContentTokenCount</code>; <code>candidatesTokenCount</code> excludes <code>thoughtsTokenCount</code>; <code>toolUsePromptTokenCount</code> is separate</td>
+<td>Cached tokens are subtracted from the prompt, thoughts become reasoning, tool-use prompt tokens count as input</td>
+<td>Gemini reports no cache-write counter (implicit cache writes and cache storage time are not metered here)</td>
+</tr>
+<tr>
+<td>Anthropic</td>
+<td>See <a href="#thinking-replay-usage-and-stop-reasons">Thinking replay, usage and stop reasons</a></td>
+<td><code>input_tokens</code> is already uncached; thinking is subtracted from <code>output_tokens</code></td>
+<td>Catalog prices cover base-duration cache writes; one-hour writes need an explicit one-hour rate</td>
+</tr>
+</tbody>
+</table>
+<p>These adapters only report what the response states. They never infer a cache counter from the requested cache settings or the provider name.</p>
 <h3 id="llama-cpp">llama-cpp</h3>
 <p>Wraps <a href="https://github.com/ggerganov/llama.cpp">llama.cpp</a>. Supports GGUF models, vision/multimodal models, and streaming. Broadest hardware support of the three native providers.</p>
 <p><strong>Supported platforms:</strong></p>

@@ -2431,7 +2431,14 @@
 <li><strong>Tool calls and observations</strong>: with argument/result correlation</li>
 <li><strong>Metrics</strong>: per-step and aggregate token usage and cost</li>
 </ul>
-<p>See the <a href="https://github.com/laude-institute/harbor">ATIF specification</a> for the full schema.</p>
+<p>Costs come from the recorded accounting ledger, not from per-request convenience fields:</p>
+<ul>
+<li><code>final_metrics.total_cost_usd</code> is the session's complete supported estimate, and is <strong>absent</strong> when any attempt is unresolved, partially priced or unpriced (never a sum of the priced ones shown as complete) and for an all-excluded (subscription) session.</li>
+<li><code>final_metrics.extra.accounting</code> holds the known subtotal, completeness reasons and counts. <code>final_metrics.extra.attempts</code> lists every attempt (main, compaction, delegation summary, failed, unresolved) once, linked to a step through <code>step_id</code> when it fed a turn's cost. Compaction and summaries never create assistant steps.</li>
+<li>A step's <code>metrics.cost_usd</code> is its logical operation's complete cost (all retries) or absent; an incomplete operation puts its known subtotal and reasons in <code>metrics.extra.accounting</code>. Step costs are not added to the total again.</li>
+<li>Attempts of another session in the same audit view (a delegated child) are not counted as this session's spend. Request ends from before accounting existed export no cost.</li>
+</ul>
+<p>See the Cost accounting section of the <a href="../api_reference/#cost-accounting">API reference</a> for the metadata contract, and the <a href="https://github.com/laude-institute/harbor">ATIF specification</a> for the full schema.</p>
 
 
 

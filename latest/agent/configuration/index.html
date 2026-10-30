@@ -2630,7 +2630,12 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <span class="normal"><a href="#__codelineno-5-34">34</a></span>
 <span class="normal"><a href="#__codelineno-5-35">35</a></span>
 <span class="normal"><a href="#__codelineno-5-36">36</a></span>
-<span class="normal"><a href="#__codelineno-5-37">37</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
+<span class="normal"><a href="#__codelineno-5-37">37</a></span>
+<span class="normal"><a href="#__codelineno-5-38">38</a></span>
+<span class="normal"><a href="#__codelineno-5-39">39</a></span>
+<span class="normal"><a href="#__codelineno-5-40">40</a></span>
+<span class="normal"><a href="#__codelineno-5-41">41</a></span>
+<span class="normal"><a href="#__codelineno-5-42">42</a></span></pre></div></td><td class="code"><div><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1"></a><span class="k">[agent.execution]</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2"></a>
 <a id="__codelineno-5-3" name="__codelineno-5-3"></a><span class="c1"># Tool output truncation (Layer 1)</span>
 <a id="__codelineno-5-4" name="__codelineno-5-4"></a><span class="k">[agent.execution.tool_output]</span>
@@ -2656,17 +2661,22 @@ see <a href="../../core/providers/#prompt-cache-hints">Prompt Cache Hints</a>.</
 <a id="__codelineno-5-24" name="__codelineno-5-24"></a><span class="n">initial_backoff_ms</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1000</span>
 <a id="__codelineno-5-25" name="__codelineno-5-25"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
 <a id="__codelineno-5-26" name="__codelineno-5-26"></a>
-<a id="__codelineno-5-27" name="__codelineno-5-27"></a><span class="c1"># Snapshot backend (undo/redo support)</span>
-<a id="__codelineno-5-28" name="__codelineno-5-28"></a><span class="k">[agent.execution.snapshot]</span>
-<a id="__codelineno-5-29" name="__codelineno-5-29"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span><span class="w">           </span><span class="c1"># "git" or "none"</span>
-<a id="__codelineno-5-30" name="__codelineno-5-30"></a><span class="n">max_snapshots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">100</span><span class="w">       </span><span class="c1"># Maximum snapshots to keep</span>
-<a id="__codelineno-5-31" name="__codelineno-5-31"></a><span class="n">max_age_days</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">30</span><span class="w">         </span><span class="c1"># Maximum age of snapshots</span>
-<a id="__codelineno-5-32" name="__codelineno-5-32"></a>
-<a id="__codelineno-5-33" name="__codelineno-5-33"></a><span class="c1"># Rate limit retry configuration</span>
-<a id="__codelineno-5-34" name="__codelineno-5-34"></a><span class="k">[agent.execution.rate_limit]</span>
-<a id="__codelineno-5-35" name="__codelineno-5-35"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
-<a id="__codelineno-5-36" name="__codelineno-5-36"></a><span class="n">default_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span>
-<a id="__codelineno-5-37" name="__codelineno-5-37"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
+<a id="__codelineno-5-27" name="__codelineno-5-27"></a><span class="c1"># Compaction is a paid request. Every attempt (including a retry after a</span>
+<a id="__codelineno-5-28" name="__codelineno-5-28"></a><span class="c1"># rejected or empty summary) is recorded in the session's cost accounting</span>
+<a id="__codelineno-5-29" name="__codelineno-5-29"></a><span class="c1"># under the "compaction" purpose, charged to the cycle that triggered it.</span>
+<a id="__codelineno-5-30" name="__codelineno-5-30"></a><span class="c1"># See "Cost accounting" in api_reference.md.</span>
+<a id="__codelineno-5-31" name="__codelineno-5-31"></a>
+<a id="__codelineno-5-32" name="__codelineno-5-32"></a><span class="c1"># Snapshot backend (undo/redo support)</span>
+<a id="__codelineno-5-33" name="__codelineno-5-33"></a><span class="k">[agent.execution.snapshot]</span>
+<a id="__codelineno-5-34" name="__codelineno-5-34"></a><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">"git"</span><span class="w">           </span><span class="c1"># "git" or "none"</span>
+<a id="__codelineno-5-35" name="__codelineno-5-35"></a><span class="n">max_snapshots</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">100</span><span class="w">       </span><span class="c1"># Maximum snapshots to keep</span>
+<a id="__codelineno-5-36" name="__codelineno-5-36"></a><span class="n">max_age_days</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">30</span><span class="w">         </span><span class="c1"># Maximum age of snapshots</span>
+<a id="__codelineno-5-37" name="__codelineno-5-37"></a>
+<a id="__codelineno-5-38" name="__codelineno-5-38"></a><span class="c1"># Rate limit retry configuration</span>
+<a id="__codelineno-5-39" name="__codelineno-5-39"></a><span class="k">[agent.execution.rate_limit]</span>
+<a id="__codelineno-5-40" name="__codelineno-5-40"></a><span class="n">max_retries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">3</span>
+<a id="__codelineno-5-41" name="__codelineno-5-41"></a><span class="n">default_wait_secs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span>
+<a id="__codelineno-5-42" name="__codelineno-5-42"></a><span class="n">backoff_multiplier</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.0</span>
 </code></pre></div></td></tr></table></div>
 <h3 id="skills-configuration">Skills Configuration</h3>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-6-1">1</a></span>

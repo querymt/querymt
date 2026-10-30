@@ -1591,6 +1591,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="3. Context Injection">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#cost-of-the-planning-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      <span class="md-typeset">
+        Cost of the planning summary
+      </span>
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
         
           <li class="md-nav__item">
@@ -2610,6 +2627,15 @@ source identity and remote sync progress migrations already present on <code>mai
 <a id="__codelineno-10-3" name="__codelineno-10-3"></a><span class="w">    </span><span class="p">.</span><span class="n">set_planning_context</span><span class="p">(</span><span class="n">planning_summary</span><span class="p">)</span>
 <a id="__codelineno-10-4" name="__codelineno-10-4"></a><span class="w">    </span><span class="p">.</span><span class="k">await</span><span class="o">?</span><span class="p">;</span>
 </code></pre></div></td></tr></table></div>
+<h4 id="cost-of-the-planning-summary">Cost of the planning summary</h4>
+<p>Generating the planning summary is a paid request made by the <strong>parent</strong>. It is recorded in the parent session's cost accounting with the <code>delegation_summary</code> purpose and charged to the <strong>parent cycle that requested the delegation</strong>, even when the summary finishes after the parent has started a newer cycle. The delegated child's own generation is recorded under the child session and is never charged to the parent a second time.</p>
+<ul>
+<li>The summary uses its own configured provider and model, so its billing class and pricing come from that provider, not from the parent's.</li>
+<li>A refusal, truncated or empty summary still incurs whatever usage the provider reported; that cost is retained even though the summary is discarded.</li>
+<li>A timeout or transport failure leaves the cost uncertain rather than zero.</li>
+<li>When no provider request is made (the parent history already ends in a compaction summary, or is below the summarization threshold), nothing is recorded.</li>
+<li>If the accounting record cannot be written, the summary is skipped and the delegation proceeds without it. No paid request is made without a recorded start.</li>
+</ul>
 <h3 id="4-task-execution">4. Task Execution</h3>
 <p>The delegate receives the task and begins execution:</p>
 <div class="highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-11-1"> 1</a></span>
