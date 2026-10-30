@@ -2358,6 +2358,7 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
             delegation: delegation.clone(),
             tool_call_id: None,
             batch_id: None,
+            cycle_id: None,
         },
     );
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -2505,6 +2506,21 @@ async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct(
                 serde_json::to_value(activity[0].session_seq).unwrap()
             );
             assert!(!snapshot["audit"]["events"].as_array().unwrap().is_empty());
+            let events: Vec<crate::events::AgentEvent> =
+                serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
+            assert_eq!(
+                snapshot["cursor"],
+                serde_json::to_value(crate::session::cursor_from_events(&events)).unwrap()
+            );
+            assert_eq!(
+                snapshot["accounting"],
+                serde_json::to_value(crate::accounting::AccountingSnapshot::from_events(
+                    &parent_id,
+                    events.iter().map(|event| &event.kind),
+                ))
+                .unwrap(),
+                "idle/verifying owner snapshot must include accounting at its audit cursor"
+            );
         }
         viewer.handle.shutdown().await;
         manager.kill();

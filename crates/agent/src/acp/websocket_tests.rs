@@ -376,6 +376,7 @@ async fn status_consistency_lag_refreshes_ephemeral_runtime_and_cleanup() {
         delegation,
         tool_call_id: None,
         batch_id: None,
+        cycle_id: None,
     });
     stream.emit_ephemeral(AgentEventKind::DelegationStageChanged {
         delegation_id: "lag-workflow".into(),

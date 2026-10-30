@@ -2849,6 +2849,7 @@ mod tests {
                 delegation,
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
             },
         );
         let activity = WorkflowActivity::new(

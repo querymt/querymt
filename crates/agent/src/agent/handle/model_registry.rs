@@ -115,6 +115,10 @@ impl LocalAgentHandle {
             events.len()
         );
         let cursor = crate::session::cursor_from_events(&events);
+        let accounting = crate::accounting::AccountingSnapshot::from_events(
+            session_id,
+            events.iter().map(|event| &event.kind),
+        );
         let mut delegation_updates =
             crate::control::delegation_notifications::delegation_updates_from_events(&events);
         let runtime_status = self
@@ -149,6 +153,7 @@ impl LocalAgentHandle {
         Ok(serde_json::json!({
             "audit": audit,
             "cursor": cursor,
+            "accounting": accounting,
             "delegationUpdates": delegation_updates,
             "runtimeStatus": runtime_status,
         }))

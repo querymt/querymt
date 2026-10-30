@@ -1521,8 +1521,15 @@ mod tests {
             Ok((record.agent.handle(), record.view_store.clone().unwrap()))
         })
         .unwrap();
+        let mut accounting = querymt_agent::accounting::AccountingSnapshot::default();
+        accounting.session.known_subtotal_usd = 0.75;
+        accounting.session.complete_total_usd = Some(0.75);
+        accounting.session.complete = true;
+        accounting.session.priced_attempts = 1;
+        accounting.session.billing = querymt_agent::accounting::AccountingBillingScope::Metered;
         let snapshot = serde_json::json!({
             "audit": {"session_id": "remote", "events": [{"owner_history": "preserved"}]},
+            "accounting": accounting,
             "cursor": {"local_seq": 17, "remote_seq_by_source": {"owner": 9}},
             "runtimeStatus": {"phase": "idle", "observation": {"availability": "live", "epoch": "owner", "revision": 3},
                 "delegation_activity": [{"delegationId": "verifier", "activity": "live", "stage": "verifying", "sessionSeq": 11, "sourceEpoch": "workflow"}]},
@@ -1623,6 +1630,8 @@ mod tests {
         assert!(snapshot.get("old_incomplete").is_none());
         assert!(snapshot["delegationUpdates"].is_array());
         assert!(snapshot["audit"]["events"].is_array());
+        assert_eq!(snapshot["accounting"], attached["snapshot"]["accounting"]);
+        assert_eq!(snapshot["accounting"]["version"], 1);
         assert_eq!(loaded["_meta"]["sentinel"], true);
         state::remove_agent(agent_handle).unwrap();
     }

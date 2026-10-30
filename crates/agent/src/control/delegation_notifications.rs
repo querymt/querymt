@@ -594,6 +594,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
             },
         ));
         let mut stage = event(
@@ -655,6 +656,7 @@ mod tests {
                 delegation: delegation(),
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
             },
         ));
         let stage = |seq, value| {

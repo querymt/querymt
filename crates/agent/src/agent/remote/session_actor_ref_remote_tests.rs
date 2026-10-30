@@ -333,6 +333,35 @@ mod session_actor_ref_remote_tests {
                 "owner history must remain present"
             );
             assert!(snapshot["cursor"]["local_seq"].as_i64().unwrap() > 0);
+            let events: Vec<crate::events::AgentEvent> =
+                serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.kind,
+                    crate::events::AgentEventKind::LlmAttemptStarted { .. }
+                )),
+                "owner history must contain actual recorded accounting"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.kind,
+                    crate::events::AgentEventKind::LlmAttemptSettled { .. }
+                )),
+                "owner snapshot must include the actual attempt settlement"
+            );
+            assert_eq!(
+                snapshot["cursor"],
+                serde_json::to_value(crate::session::cursor_from_events(&events)).unwrap()
+            );
+            assert_eq!(
+                snapshot["accounting"],
+                serde_json::to_value(crate::accounting::AccountingSnapshot::from_events(
+                    &sid,
+                    events.iter().map(|event| &event.kind),
+                ))
+                .unwrap(),
+                "actual remote load/attach accounting must use the owner's exact audit cursor"
+            );
         }
         let snapshot = crate::session::load_snapshot::load_session_snapshot(
             &fixture.handle,
