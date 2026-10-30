@@ -142,6 +142,11 @@ max_retries = 3
 initial_backoff_ms = 1000
 backoff_multiplier = 2.0
 
+# Compaction is a paid request. Every attempt (including a retry after a
+# rejected or empty summary) is recorded in the session's cost accounting
+# under the "compaction" purpose, charged to the cycle that triggered it.
+# See "Cost accounting" in api_reference.md.
+
 # Snapshot backend (undo/redo support)
 [agent.execution.snapshot]
 backend = "git"           # "git" or "none"

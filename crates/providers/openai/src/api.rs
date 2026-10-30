@@ -454,11 +454,12 @@ struct OpenAICompletionTokensDetails {
 
 impl OpenAIRawUsage {
     fn into_usage(self) -> Usage {
-        // OpenAI/Anthropic: cached_tokens nested in prompt_tokens_details
-        let openai_cached = self
-            .prompt_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
+        // OpenAI/Anthropic: cached_tokens nested in prompt_tokens_details.
+        // `cache_write_tokens` (OpenAI GPT-5.6+, OpenRouter) is a separate
+        // category inside `prompt_tokens`, like cache reads.
+        let details = self.prompt_tokens_details.unwrap_or_default();
+        let openai_cached = details.cached_tokens;
+        let cache_write = details.cache_write_tokens;
         // DeepSeek: prompt_cache_hit_tokens at top level of usage
         let deepseek_cached = self.prompt_cache_hit_tokens.unwrap_or(0);
         let cache_read = openai_cached.max(deepseek_cached);
@@ -468,15 +469,18 @@ impl OpenAIRawUsage {
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0);
         // Prefer DeepSeek's reported uncached count, including zero, over a derived count.
-        let input_tokens = self
-            .prompt_cache_miss_tokens
-            .unwrap_or_else(|| self.prompt_tokens.saturating_sub(cache_read));
+        let input_tokens = self.prompt_cache_miss_tokens.unwrap_or_else(|| {
+            self.prompt_tokens
+                .saturating_sub(cache_read)
+                .saturating_sub(cache_write)
+        });
         Usage {
             input_tokens,
             output_tokens: self.completion_tokens.saturating_sub(reasoning),
             reasoning_tokens: reasoning,
             cache_read,
-            cache_write: 0,
+            cache_write,
+            cache_write_tiers: None,
         }
     }
 }
@@ -523,6 +527,7 @@ impl OpenAIResponsesRawUsage {
             reasoning_tokens: reasoning,
             cache_read,
             cache_write,
+            cache_write_tiers: None,
         }
     }
 }
@@ -5629,6 +5634,62 @@ data: [DONE]
         assert_eq!(usage.input_tokens, 2500); // 10000 - 7500
         assert_eq!(usage.output_tokens, 3000); // 5000 - 2000
         assert_eq!(usage.reasoning_tokens, 2000);
+    }
+
+    #[test]
+    fn chat_usage_separates_cache_writes_from_uncached_input() {
+        use super::OpenAIRawUsage;
+
+        // prompt_tokens includes both reads and writes (OpenRouter docs shape).
+        let raw: OpenAIRawUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 1000, "completion_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 600, "cache_write_tokens": 300},
+            "completion_tokens_details": {"reasoning_tokens": 40}
+        }))
+        .unwrap();
+        let usage = raw.into_usage();
+        assert_eq!(
+            (usage.input_tokens, usage.cache_read, usage.cache_write),
+            (100, 600, 300)
+        );
+        assert_eq!((usage.output_tokens, usage.reasoning_tokens), (60, 40));
+        // Categories add back to prompt + completion exactly once.
+        let total = usage.input_tokens
+            + usage.cache_read
+            + usage.cache_write
+            + usage.output_tokens
+            + usage.reasoning_tokens;
+        assert_eq!(total, 1100);
+        assert_eq!(usage.cache_write_tiers, None);
+
+        // Explicit zero write count is not a cache write.
+        let raw: OpenAIRawUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 10339, "completion_tokens": 60,
+            "prompt_tokens_details": {"cached_tokens": 10318, "cache_write_tokens": 0}
+        }))
+        .unwrap();
+        let usage = raw.into_usage();
+        assert_eq!(
+            (usage.input_tokens, usage.cache_read, usage.cache_write),
+            (21, 10318, 0)
+        );
+    }
+
+    #[test]
+    fn chat_stream_final_usage_carries_cache_writes() {
+        let mut tool_states = HashMap::new();
+        let chunk = br#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"prompt_tokens_details":{"cached_tokens":600,"cache_write_tokens":300}}}
+
+data: [DONE]
+"#;
+        let events = parse_openai_sse_chunk(chunk, &mut tool_states).unwrap();
+        let Some(StreamChunk::Usage(usage)) = events.first() else {
+            panic!("expected usage before completion, got {events:?}");
+        };
+        assert_eq!(
+            (usage.input_tokens, usage.cache_read, usage.cache_write),
+            (100, 600, 300)
+        );
     }
 
     #[test]

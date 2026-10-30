@@ -36,6 +36,25 @@ Relayed events keep the host's `session_seq` on the attached node, so one cursor
 - Pages served to other nodes (backfill and gap recovery) are read in raw journal insert order (`stream_seq`), which the receiving node uses as its cursor.
 - File databases now run in WAL mode with `synchronous=NORMAL`. This keeps streaming latency low while batching durable writes. After a power loss the most recent commits can be lost, but the database cannot be corrupted. In-memory databases are unchanged.
 
+## Accounting records
+
+LLM attempt accounting reuses this journal. `llm_attempt_started` is appended through the awaited per-session stream before a provider call is dispatched, and `llm_attempt_settled` is appended once usage is known, before derived events such as `llm_request_end`. Both are durable. No accounting tables or migration are involved; the in-memory totals are rebuilt from these events.
+
+- A start with no settlement is reported as unresolved. It does not prove a charge happened and does not mean the cost was zero.
+- If a record cannot be written, no further paid request is dispatched.
+- Because file databases use `synchronous=NORMAL`, the most recent commits can be lost after a power loss. Accounting is a supported token-cost estimate, not an invoice, and cannot promise exact billing after an unobservable crash.
+- Do not run an older binary against a journal containing these event kinds. Roll back by restoring a preserved pre-upgrade database copy with the matching binary.
+
+See the module documentation of `crates/agent/src/accounting.rs` for identity, retry, pricing-snapshot and uncertainty semantics.
+
+### Retention, forks and historical coverage
+
+- **Rewind and pruning keep spend.** Removing the tail of a conversation (undo followed by a new prompt) deletes conversation events but never `llm_attempt_started` / `llm_attempt_settled` records, so a session keeps the cost of turns that no longer appear in its history. Retained records keep their sequence numbers; the gaps are valid. Deleting the whole session is the only operation that removes its accounting.
+- **Forks start their own spend scope.** A fork copies conversation messages only. It does not copy attempt records or `llm_request_end` events, so inherited assistant messages create no fork charges, the source keeps its own spend, and new generation in the fork records attempts under the fork's session id. A delegated child is likewise separate and is not charged to the parent's budget.
+- **Older sessions are reported as incomplete, not repriced.** A retained `llm_request_end` with no `accounting` field was written before attempt records existed. It is counted as unaccounted local generation: its recorded cost is not trusted, no current rate is applied to it, and the session reports `unaccounted_history` instead of a complete total. New spend recorded on such a session is still known and additive, but the lifetime total stays unavailable. Empty sessions, and forks that contain only inherited history, report no uncertainty.
+- Reported spend can only be increased by new attempt records. There is no supported way to remove or edit an incurred charge, and none of the above requires rewriting an existing database.
+- Rollback: restore a preserved copy of the pre-upgrade database together with the matching binary. Do not delete accounting events to make an older binary load a journal.
+
 ## Upgrade notes
 
 - **All mesh nodes must be upgraded together.** The prompt reply and relayed events carry `session_seq` and `event_tip`. A node that does not send `event_tip` is treated as "no watermark" (the response is sent immediately), which is the only compatibility allowance; ordering across mixed versions is not guaranteed.

@@ -75,6 +75,12 @@ struct PyUsage {
     cache_read: u32,
     #[pyo3(get)]
     cache_write: u32,
+    /// Five-minute share of `cache_write`; `None` when the provider gave no breakdown.
+    #[pyo3(get)]
+    cache_write_5m_tokens: Option<u32>,
+    /// One-hour share of `cache_write`; `None` when the provider gave no breakdown.
+    #[pyo3(get)]
+    cache_write_1h_tokens: Option<u32>,
 }
 
 #[pyclass(name = "ToolCall", skip_from_py_object)]
@@ -478,6 +484,8 @@ fn usage_to_python(usage: Usage) -> PyUsage {
         reasoning_tokens: usage.reasoning_tokens,
         cache_read: usage.cache_read,
         cache_write: usage.cache_write,
+        cache_write_5m_tokens: usage.cache_write_tiers.and_then(|t| t.five_minute),
+        cache_write_1h_tokens: usage.cache_write_tiers.and_then(|t| t.one_hour),
     }
 }
 
@@ -564,6 +572,8 @@ fn stream_chunk_to_python(chunk: StreamChunk) -> PyStreamChunk {
                 "reasoning_tokens": usage.reasoning_tokens,
                 "cache_read": usage.cache_read,
                 "cache_write": usage.cache_write,
+                "cache_write_5m_tokens": usage.cache_write_tiers.and_then(|t| t.five_minute),
+                "cache_write_1h_tokens": usage.cache_write_tiers.and_then(|t| t.one_hour),
             }),
         ),
         StreamChunk::Done { finish_reason } => (
@@ -1329,6 +1339,38 @@ mod tests {
         assert_eq!(chunk.data["index"], 2);
         assert_eq!(chunk.data["id"], "call-1");
         assert_eq!(chunk.data["name"], "lookup");
+    }
+
+    #[test]
+    fn python_usage_projection_keeps_missing_tier_counts_distinct_from_zero() {
+        let base = Usage {
+            cache_write: 300,
+            ..Usage::default()
+        };
+        let absent = usage_to_python(base.clone());
+        assert_eq!(
+            (absent.cache_write_5m_tokens, absent.cache_write_1h_tokens),
+            (None, None)
+        );
+
+        let tiered = Usage {
+            cache_write_tiers: Some(::querymt::CacheWriteTiers {
+                five_minute: Some(300),
+                one_hour: Some(0),
+            }),
+            ..base
+        };
+        let py_usage = usage_to_python(tiered.clone());
+        assert_eq!(py_usage.cache_write, 300);
+        assert_eq!(py_usage.cache_write_5m_tokens, Some(300));
+        assert_eq!(py_usage.cache_write_1h_tokens, Some(0));
+
+        let chunk = stream_chunk_to_python(StreamChunk::Usage(tiered));
+        assert_eq!(chunk.kind, "usage");
+        assert_eq!(chunk.data["cache_write_5m_tokens"], 300);
+        assert_eq!(chunk.data["cache_write_1h_tokens"], 0);
+        let chunk = stream_chunk_to_python(StreamChunk::Usage(Usage::default()));
+        assert!(chunk.data["cache_write_5m_tokens"].is_null());
     }
 
     #[test]

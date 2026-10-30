@@ -926,6 +926,7 @@ async fn websocket_event_forwarder_emits_owned_delegation_update() {
                 delegation,
                 tool_call_id: Some("call-1".into()),
                 batch_id: None,
+                cycle_id: None,
             },
         }));
 
@@ -969,6 +970,7 @@ async fn loaded_session_emits_live_delegation_completion_without_reloading() {
         delegation,
         tool_call_id: Some("call-1".into()),
         batch_id: None,
+        cycle_id: None,
     });
     stream.emit(AgentEventKind::SessionForked {
         parent_session_id: session_id.clone(),

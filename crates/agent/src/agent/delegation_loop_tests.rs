@@ -438,6 +438,7 @@ async fn genai_delegation_absent_remote_and_replayed_events_do_not_inherit_consu
                 delegation: delegation.clone(),
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
             };
             let unrelated = tracing::info_span!(parent: None, "unrelated-relay");
             async {
@@ -1998,6 +1999,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
             delegation: completed_delegation,
             tool_call_id: None,
             batch_id: None,
+            cycle_id: None,
         },
     );
     let parent = store
@@ -2033,6 +2035,7 @@ async fn test_delegation_completion_message_format_and_replay_safety() {
             delegation: retry_delegation.clone(),
             tool_call_id: None,
             batch_id: None,
+            cycle_id: None,
         },
     );
     // The delegation status is persisted before the child session is resolved,
@@ -2186,6 +2189,7 @@ async fn wait_timeout_cancellation_resolves_child_and_preserves_reopen() {
             delegation,
             tool_call_id: None,
             batch_id: None,
+            cycle_id: None,
         },
     );
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2351,6 +2355,7 @@ async fn verification_failure_resolves_terminal_delegate_child() {
             delegation: delegation.clone(),
             tool_call_id: None,
             batch_id: None,
+            cycle_id: None,
         },
     );
 

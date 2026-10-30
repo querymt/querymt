@@ -166,6 +166,21 @@ impl AgentConfig {
         CompositeDriver::new(drivers)
     }
 
+    /// Manual budget pricing configured on the middleware chain, if any.
+    /// Snapshotted onto each paid attempt and valued separately from
+    /// reported API spend.
+    pub fn budget_pricing(&self) -> Option<querymt::providers::ModelPricing> {
+        self.create_driver().budget_pricing()
+    }
+
+    /// Per-cycle price cap (USD) from the configured middleware, if any.
+    /// Enforced before every paid attempt, best effort.
+    pub fn budget_cap_usd(&self) -> Option<f64> {
+        self.create_driver()
+            .get_limits()
+            .and_then(|limits| limits.max_cost_usd)
+    }
+
     /// Returns the session limits from configured middleware.
     pub fn get_session_limits(&self) -> Option<crate::events::SessionLimits> {
         self.create_driver().get_limits()

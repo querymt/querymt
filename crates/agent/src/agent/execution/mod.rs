@@ -89,6 +89,38 @@ fn mark_automatic_compaction(
     Ok(())
 }
 
+/// Warn once per cycle and reason when a configured price cap is only
+/// best-effort because the cycle's budget view is incomplete. Execution
+/// continues against the known subtotal. Independent of context-size
+/// knowledge. Uses the existing notice event, which clients without notice
+/// support never receive. Storage failures are not reported here: they are
+/// execution errors raised by the recorder.
+fn warn_incomplete_budget(
+    config: &AgentConfig,
+    exec_ctx: &ExecutionContext,
+    totals: &crate::accounting::ScopeTotals,
+) {
+    let Some(cap) = config.budget_cap_usd() else {
+        return;
+    };
+    let reasons = exec_ctx.budget_warnings.take_new(totals);
+    if reasons.is_empty() {
+        return;
+    }
+    config.emit_event(
+        &exec_ctx.session_id,
+        AgentEventKind::HookNotice {
+            event_name: "price_limit".to_string(),
+            message: crate::accounting::budget_warning_message(
+                &reasons,
+                totals.budget_known_subtotal_usd,
+                cap,
+            ),
+            is_error: false,
+        },
+    );
+}
+
 fn render_run_objective(exec_ctx: &ExecutionContext) -> String {
     exec_ctx
         .run_objective
@@ -455,6 +487,21 @@ pub(crate) async fn execute_cycle_state_machine(
                     objective.set_progress_review(None);
                 }
                 let context = refresh_objective_fragment(&context, exec_ctx);
+                // Price limits read this cycle's committed accounting, which
+                // includes cache and auxiliary (compaction/summary) attempts
+                // that settled since the last main response.
+                let context = match exec_ctx.cycle_accounting.get() {
+                    Some(cycle) => {
+                        let totals = cycle.cycle_totals();
+                        warn_incomplete_budget(config, exec_ctx, &totals);
+                        let mut stats = (*context.stats).clone();
+                        stats.apply_recorded_costs(&totals);
+                        let mut refreshed = (*context).clone();
+                        refreshed.stats = Arc::new(stats);
+                        Arc::new(refreshed)
+                    }
+                    None => context,
+                };
                 let state = ExecutionState::BeforeLlmCall { context };
                 let state = driver
                     .run_step_start_cancellable(
@@ -925,6 +972,136 @@ mod tests {
         mark_automatic_compaction(&mut last_compaction, 1).unwrap();
         assert_eq!(last_compaction, Some(1));
         assert!(mark_automatic_compaction(&mut last_compaction, 1).is_err());
+    }
+
+    mod budget_warning_tests {
+        use super::super::warn_incomplete_budget;
+        use crate::accounting::{AccountingReducer, ScopeTotals};
+        use crate::events::{AgentEventKind, EventEnvelope};
+        use crate::test_utils::{MockLlmProvider, SharedLlmProvider, TestAgent};
+        use querymt::providers::{IncompleteReason, PricingCategory};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        fn totals(settle: Option<IncompleteReason>) -> ScopeTotals {
+            let start = crate::accounting::tests::sample_start();
+            let mut reducer = AccountingReducer::new(start.attempt.session_id.clone());
+            reducer
+                .apply(&AgentEventKind::LlmAttemptStarted { start })
+                .unwrap();
+            if let Some(reason) = settle {
+                let mut settlement = crate::accounting::tests::sample_settlement();
+                settlement.valuation.complete_total_usd = None;
+                settlement.valuation.incomplete = vec![reason];
+                reducer
+                    .apply(&AgentEventKind::LlmAttemptSettled { settlement })
+                    .unwrap();
+            }
+            reducer.session().clone()
+        }
+
+        async fn agent(cap: Option<f64>) -> (TestAgent, crate::agent::agent_config::AgentConfig) {
+            let fixture = TestAgent::with_mock_provider(SharedLlmProvider::new(
+                MockLlmProvider::new(),
+                vec![],
+            ))
+            .await;
+            let mut config = (*fixture.config).clone();
+            if let Some(cap) = cap {
+                config
+                    .middleware_drivers
+                    .push(Arc::new(crate::middleware::LimitsMiddleware::new(
+                        crate::middleware::LimitsConfig::default().max_price_usd(cap),
+                    )));
+            }
+            (fixture, config)
+        }
+
+        /// `price_limit` notices published so far.
+        async fn notices(rx: &mut tokio::sync::broadcast::Receiver<EventEnvelope>) -> Vec<String> {
+            let mut out = Vec::new();
+            while let Ok(Ok(envelope)) =
+                tokio::time::timeout(Duration::from_millis(150), rx.recv()).await
+            {
+                if let EventEnvelope::Durable(event) = envelope
+                    && let AgentEventKind::HookNotice {
+                        event_name,
+                        message,
+                        is_error,
+                    } = event.kind
+                    && event_name == "price_limit"
+                {
+                    assert!(!is_error, "a best-effort warning is not an error");
+                    out.push(message);
+                }
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn repeated_snapshots_publish_one_warning_without_any_context_size() {
+            let (fixture, config) = agent(Some(1.0)).await;
+            let exec = fixture.execution_context().await;
+            let mut rx = config.subscribe_events();
+            let snapshot = totals(Some(IncompleteReason::MissingRate {
+                category: PricingCategory::CacheRead,
+            }));
+            // The warning depends only on cycle accounting, not on any
+            // context-size knowledge.
+            for _ in 0..5 {
+                warn_incomplete_budget(&config, &exec, &snapshot);
+            }
+            let sent = notices(&mut rx).await;
+            assert_eq!(sent.len(), 1, "{sent:?}");
+            assert!(sent[0].contains("best-effort"), "{}", sent[0]);
+            assert!(sent[0].contains("CacheRead"), "{}", sent[0]);
+        }
+
+        #[tokio::test]
+        async fn a_new_missing_category_warns_again() {
+            let (fixture, config) = agent(Some(1.0)).await;
+            let exec = fixture.execution_context().await;
+            let mut rx = config.subscribe_events();
+            warn_incomplete_budget(
+                &config,
+                &exec,
+                &totals(Some(IncompleteReason::MissingRate {
+                    category: PricingCategory::CacheRead,
+                })),
+            );
+            warn_incomplete_budget(
+                &config,
+                &exec,
+                &totals(Some(IncompleteReason::MissingRate {
+                    category: PricingCategory::CacheWrite,
+                })),
+            );
+            assert_eq!(notices(&mut rx).await.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_normal_in_flight_attempt_does_not_warn() {
+            let (fixture, config) = agent(Some(1.0)).await;
+            let exec = fixture.execution_context().await;
+            let mut rx = config.subscribe_events();
+            let pending = totals(None);
+            assert_eq!(pending.unresolved_attempts, 1);
+            warn_incomplete_budget(&config, &exec, &pending);
+            assert!(notices(&mut rx).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn no_price_cap_means_no_budget_warning() {
+            let (fixture, config) = agent(None).await;
+            let exec = fixture.execution_context().await;
+            let mut rx = config.subscribe_events();
+            warn_incomplete_budget(
+                &config,
+                &exec,
+                &totals(Some(IncompleteReason::PricingUnavailable)),
+            );
+            assert!(notices(&mut rx).await.is_empty());
+        }
     }
 
     fn tool(name: &str) -> Tool {

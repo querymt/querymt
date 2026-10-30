@@ -14,6 +14,7 @@ use crate::session::domain::ForkOrigin;
 use crate::session::projection::{EventJournal, NewDurableEvent};
 use crate::test_utils::UndoTestFixture;
 use anyhow::Result;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 // ==================== Test Suite: Basic Undo with Message History ====================
@@ -712,6 +713,87 @@ async fn test_cleanup_revert_prunes_event_journal() -> Result<()> {
         after.len()
     );
 
+    Ok(())
+}
+
+/// Rewinding past a turn that incurred charges prunes the conversation but
+/// keeps the accounting ledger, so session spend is unchanged and journal
+/// numbers are not reused or shifted.
+#[tokio::test]
+async fn test_cleanup_revert_keeps_accounting_for_undone_turn() -> Result<()> {
+    use crate::accounting::tests::{sample_settlement, sample_start};
+    use crate::accounting::{AttemptRecorder, SessionAccounting};
+    use crate::event_fanout::EventFanout;
+    use crate::session_event_stream::SessionEventStream;
+
+    let fixture = UndoTestFixture::new().await?;
+    let session_id = fixture.create_session().await?;
+    let journal = fixture.storage.event_journal();
+
+    let accounting = SessionAccounting::hydrate(&session_id, journal.clone()).await?;
+    let stream =
+        SessionEventStream::new(&session_id, journal.clone(), Arc::new(EventFanout::new()));
+    let recorder = AttemptRecorder::with_projection(stream.clone(), accounting.clone());
+
+    // Turn 1, then turn 2 which is generated (and charged) and then undone.
+    let msg1 = fixture.add_user_message(&session_id, "first").await?;
+    stream
+        .emit_persisted(AgentEventKind::PromptReceived {
+            content: "first".into(),
+            message_id: Some(msg1),
+        })
+        .await?;
+    let msg2 = fixture.add_user_message(&session_id, "second").await?;
+    let prompt2 = stream
+        .emit_persisted(AgentEventKind::PromptReceived {
+            content: "second".into(),
+            message_id: Some(msg2.clone()),
+        })
+        .await?;
+    let mut start = sample_start();
+    start.attempt.session_id = session_id.clone();
+    let handle = recorder
+        .begin(start)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut settled = sample_settlement();
+    settled.attempt.session_id = session_id.clone();
+    recorder
+        .settle(handle, settled)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let charged = accounting.read(|r| r.session().clone());
+    assert!(charged.complete_total_usd().is_some());
+
+    fixture.undo(&session_id, &msg2).await?;
+    crate::agent::undo::cleanup_revert_on_prompt(
+        &fixture.handle.config.provider,
+        &*journal,
+        &session_id,
+    )
+    .await
+    .expect("cleanup should succeed");
+
+    let after = journal.load_session_stream(&session_id, None, None).await?;
+    assert!(
+        !after.iter().any(|e| e.session_seq == prompt2.session_seq),
+        "the undone turn's prompt is pruned"
+    );
+    let ledger: Vec<_> = after
+        .iter()
+        .filter(|e| {
+            matches!(
+                e.kind,
+                AgentEventKind::LlmAttemptStarted { .. } | AgentEventKind::LlmAttemptSettled { .. }
+            )
+        })
+        .collect();
+    assert_eq!(ledger.len(), 2, "both ledger records survive the rewind");
+    assert!(ledger.iter().all(|e| e.session_seq > prompt2.session_seq));
+
+    // Reopening reproduces the same incurred totals from the journal alone.
+    let reopened = SessionAccounting::hydrate(&session_id, journal.clone()).await?;
+    assert_eq!(reopened.read(|r| r.session().clone()), charged);
     Ok(())
 }
 

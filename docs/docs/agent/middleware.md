@@ -76,12 +76,40 @@ max_turns = 50
 **Features:**
 - `max_steps`: Maximum tool calls per session
 - `max_turns`: Maximum conversation turns
-- `price_limit`: Maximum cost (if provider supports)
+- `max_price_usd`: Maximum USD spend per execution cycle (see [Price limits](#price-limits))
+- `input_cost_per_million`, `output_cost_per_million`, `cache_read_cost_per_million`, `cache_write_cost_per_million`, `cache_write_1h_cost_per_million`: optional manual budget rates
 
 **Behavior:**
 - Tracks step and turn counts
 - Rejects requests when limits exceeded
 - Provides clear error messages
+
+#### Price limits
+
+```toml
+[[middleware]]
+type = "limits"
+max_price_usd = 1.0
+
+# Optional manual budget rates, USD per million tokens.
+input_cost_per_million = 3.0
+output_cost_per_million = 15.0
+cache_read_cost_per_million = 0.3
+cache_write_cost_per_million = 3.75
+cache_write_1h_cost_per_million = 6.0   # only for 1-hour cache writes
+```
+
+**Scope.** The cap applies to one execution cycle (one prompt run). It counts every paid attempt attributed to that cycle: main responses, retries, compaction and delegation summaries, including cache read and write charges. Spend from earlier cycles of the same session does not count against a new cycle, and a charge that settles late stays with the cycle that started it. The session lifetime total is reported separately (see "Cost accounting" in the [API Reference](api_reference.md#cost-accounting)).
+
+**Best-effort enforcement.** The cap is checked before each paid attempt is dispatched. If the known spend of the cycle has reached the cap, the attempt is not sent and the run stops with a price-limit outcome. This is not a reservation: requests already in flight, including parallel ones, are not counted until they settle, so spend can overshoot the cap by the cost of those requests.
+
+**Incomplete pricing warns and continues.** If a used category cannot be priced (for example cache writes with no rate, or an interrupted request with no final usage), the run continues against the *known* subtotal and a `HookNotice` with `event_name = "price_limit"` (`is_error = false`) explains why enforcement is best-effort. It is sent once per cycle for each distinct reason, not on every usage update, and it does not need acknowledgement. A request that is still in flight is not an uncertainty and does not warn. Clients that did not negotiate notice support receive no notice; the condition is still carried in the accounting metadata. Failure to record accounting in the journal is different: it is an execution error and no further paid request is sent.
+
+**Manual rates.** Without manual rates the budget uses the same catalog-priced components as reported API spend. Setting any rate makes a separate *budget valuation*, computed with the same calculator and snapshotted per attempt when it is dispatched. Changing the rates later does not reprice earlier charges, and reported API cost keeps its own pricing basis. Rates must be finite and not negative, otherwise the configuration is rejected. A rate you do not set stays unset: cache reads and writes are never priced at the input rate, and one-hour writes are never derived from the base write rate. Non-zero usage in a category with no rate makes the budget valuation partial, while an explicit `0.0` rate is a known zero.
+
+**Unsupported dimensions.** Only token components are valued: uncached input, output including reasoning, cache reads, cache writes (base rate and an optional one-hour rate). Server-tool fees, cache storage or time charges, and other pricing modifiers are not valued. When one is known to apply, the cost is reported as incomplete instead of being treated as zero.
+
+**Exclusions.** Usage from providers that are not metered per token (Codex, kimi-code, and OAuth/subscription-backed providers) is recorded with an excluded billing class. It gets no catalog charge, and manual rates do not turn it into API spend, so it never counts toward `max_price_usd`. A session that is entirely excluded has no dollar total, which differs from a known zero.
 
 ### ContextMiddleware
 

@@ -24,7 +24,7 @@ use http::{
     header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
 };
 use querymt::{
-    HTTPLLMProvider, Usage,
+    CacheWriteTiers, HTTPLLMProvider, Usage,
     auth::ApiKeyResolver,
     chat::{
         ChatCall, ChatCapabilities, ChatFunctionCallItem, ChatInputPart, ChatMessage,
@@ -610,6 +610,17 @@ struct AnthropicOutputTokensDetails {
     thinking_tokens: Option<u32>,
 }
 
+/// Cache-write duration breakdown nested under `usage.cache_creation`.
+///
+/// These partition `cache_creation_input_tokens`; they are never extra input.
+#[derive(Deserialize, Debug, Clone, Default)]
+struct AnthropicCacheCreation {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: Option<u32>,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: Option<u32>,
+}
+
 /// Provider-local usage object.
 ///
 /// Anthropic nests the thinking-token count under
@@ -617,18 +628,70 @@ struct AnthropicOutputTokensDetails {
 /// cannot deserialize directly. `thinking_tokens` are already included in
 /// `output_tokens`; the `Usage` conversion subtracts them so the shared
 /// output and reasoning categories stay exclusive.
+///
+/// Every field is optional so a streaming event that omits a field is
+/// distinguishable from one that reports an explicit zero: an omitted field
+/// keeps the earlier event's value, an explicit zero replaces it.
 #[derive(Deserialize, Debug, Clone, Default)]
 struct AnthropicUsage {
     #[serde(default)]
-    input_tokens: u32,
+    input_tokens: Option<u32>,
     #[serde(default)]
-    output_tokens: u32,
+    output_tokens: Option<u32>,
     #[serde(default)]
-    cache_creation_input_tokens: u32,
+    cache_creation_input_tokens: Option<u32>,
     #[serde(default)]
-    cache_read_input_tokens: u32,
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation: Option<AnthropicCacheCreation>,
     #[serde(default)]
     output_tokens_details: Option<AnthropicOutputTokensDetails>,
+}
+
+impl AnthropicUsage {
+    /// Apply a later event's usage: fields it reports replace earlier ones,
+    /// fields it omits are retained. Re-applying the same event is a no-op.
+    fn overlay(&mut self, later: AnthropicUsage) {
+        self.input_tokens = later.input_tokens.or(self.input_tokens);
+        self.output_tokens = later.output_tokens.or(self.output_tokens);
+        self.cache_creation_input_tokens = later
+            .cache_creation_input_tokens
+            .or(self.cache_creation_input_tokens);
+        self.cache_read_input_tokens = later
+            .cache_read_input_tokens
+            .or(self.cache_read_input_tokens);
+        self.cache_creation = match (self.cache_creation.take(), later.cache_creation) {
+            (Some(earlier), Some(later)) => Some(AnthropicCacheCreation {
+                ephemeral_5m_input_tokens: later
+                    .ephemeral_5m_input_tokens
+                    .or(earlier.ephemeral_5m_input_tokens),
+                ephemeral_1h_input_tokens: later
+                    .ephemeral_1h_input_tokens
+                    .or(earlier.ephemeral_1h_input_tokens),
+            }),
+            (earlier, later) => later.or(earlier),
+        };
+        let thinking =
+            |u: &Option<AnthropicOutputTokensDetails>| u.as_ref().and_then(|d| d.thinking_tokens);
+        let thinking_tokens =
+            thinking(&later.output_tokens_details).or(thinking(&self.output_tokens_details));
+        self.output_tokens_details =
+            thinking_tokens.map(|thinking_tokens| AnthropicOutputTokensDetails {
+                thinking_tokens: Some(thinking_tokens),
+            });
+    }
+
+    /// Usage as known at `message_start`: input and cache categories are
+    /// final, but the output count is a provisional placeholder (typically
+    /// 1), so it is withheld. Emitting it would let a downstream max-merge keep
+    /// it as an extra ordinary token once the final inclusive output is split
+    /// into ordinary output and reasoning.
+    fn into_start_usage(self) -> Usage {
+        let mut usage = Usage::from(self);
+        usage.output_tokens = 0;
+        usage.reasoning_tokens = 0;
+        usage
+    }
 }
 
 impl From<AnthropicUsage> for Usage {
@@ -640,12 +703,31 @@ impl From<AnthropicUsage> for Usage {
             .output_tokens_details
             .and_then(|d| d.thinking_tokens)
             .unwrap_or(0);
+        let output = usage.output_tokens.unwrap_or(0);
+        // A breakdown with neither tier is no breakdown.
+        let tiers = usage
+            .cache_creation
+            .map(|c| CacheWriteTiers {
+                five_minute: c.ephemeral_5m_input_tokens,
+                one_hour: c.ephemeral_1h_input_tokens,
+            })
+            .filter(|t| t.five_minute.is_some() || t.one_hour.is_some());
+        // The aggregate is authoritative when reported. If only the breakdown
+        // arrived, its parts are the aggregate. Never both added.
+        let cache_write = usage.cache_creation_input_tokens.unwrap_or_else(|| {
+            tiers.map_or(0, |t| {
+                t.five_minute
+                    .unwrap_or(0)
+                    .saturating_add(t.one_hour.unwrap_or(0))
+            })
+        });
         Usage {
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens.saturating_sub(reasoning),
+            input_tokens: usage.input_tokens.unwrap_or(0),
+            output_tokens: output.saturating_sub(reasoning),
             reasoning_tokens: reasoning,
-            cache_read: usage.cache_read_input_tokens,
-            cache_write: usage.cache_creation_input_tokens,
+            cache_read: usage.cache_read_input_tokens.unwrap_or(0),
+            cache_write,
+            cache_write_tiers: tiers,
         }
     }
 }
@@ -1773,11 +1855,14 @@ impl HTTPChatProvider for Anthropic {
             tool_names: self.tool_names_from_context(context)?,
             tool_state_buffer: HashMap::new(),
             thinking_state_buffer: HashMap::new(),
+            usage: None,
         }))
     }
 }
 
 struct AnthropicStreamParser {
+    /// Raw, presence-aware usage accumulated across this attempt's events.
+    usage: Option<AnthropicUsage>,
     oauth: bool,
     /// Request-scoped wire-to-original tool-name mapping.
     tool_names: HashMap<String, String>,
@@ -1815,7 +1900,9 @@ impl ChatStreamParser for AnthropicStreamParser {
                     }
                     "message_start" => {
                         if let Some(usage) = stream_resp.message.and_then(|m| m.usage) {
-                            chunks.push(querymt::chat::StreamChunk::Usage(usage.into()));
+                            self.usage = Some(usage.clone());
+                            chunks
+                                .push(querymt::chat::StreamChunk::Usage(usage.into_start_usage()));
                         }
                     }
                     "content_block_start" => {
@@ -1896,7 +1983,17 @@ impl ChatStreamParser for AnthropicStreamParser {
                     }
                     "message_delta" => {
                         if let Some(usage) = stream_resp.usage {
-                            chunks.push(querymt::chat::StreamChunk::Usage(usage.into()));
+                            // Overlay onto the start event so fields this delta
+                            // omits (input, cache) keep their start values.
+                            let accumulated = match self.usage.take() {
+                                Some(mut earlier) => {
+                                    earlier.overlay(usage);
+                                    earlier
+                                }
+                                None => usage,
+                            };
+                            self.usage = Some(accumulated.clone());
+                            chunks.push(querymt::chat::StreamChunk::Usage(accumulated.into()));
                         }
 
                         if let Some(delta) = stream_resp.delta
@@ -3166,7 +3263,9 @@ mod tests {
         match &chunks[0] {
             querymt::chat::StreamChunk::Usage(u) => {
                 assert_eq!(u.input_tokens, 25);
-                assert_eq!(u.output_tokens, 1);
+                // The start event's output count is a provisional placeholder;
+                // it is withheld so it cannot survive a downstream max-merge.
+                assert_eq!(u.output_tokens, 0);
             }
             other => panic!("expected Usage from message_start, got {:?}", other),
         }
@@ -4146,6 +4245,166 @@ mod tests {
         assert_eq!(usage.output_tokens, 50);
         assert_eq!(usage.reasoning_tokens, 31_950);
         assert_eq!(output.finish_reason, Some(FinishReason::Length));
+    }
+
+    // Single line: `sse()` emits one `data:` line per entry.
+    const MIXED_TTL_CACHE: &str = r#""cache_creation_input_tokens":300,"cache_read_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":100}"#;
+
+    fn mixed_ttl_expected() -> Usage {
+        Usage {
+            input_tokens: 12,
+            output_tokens: 40,
+            reasoning_tokens: 0,
+            cache_read: 30,
+            cache_write: 300,
+            cache_write_tiers: Some(CacheWriteTiers {
+                five_minute: Some(200),
+                one_hour: Some(100),
+            }),
+        }
+    }
+
+    #[test]
+    fn mixed_ttl_cache_writes_match_between_streaming_and_non_streaming() {
+        let non_streaming = parse_response(serde_json::json!({
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": serde_json::from_str::<Value>(&format!(
+                r#"{{"input_tokens":12,"output_tokens":40,{MIXED_TTL_CACHE}}}"#
+            )).unwrap()
+        }));
+        assert_eq!(non_streaming.usage, Some(mixed_ttl_expected()));
+
+        // Start carries input/cache (with a provisional output of 1); the
+        // delta carries only the final output count.
+        let (streamed, _) = stream_output(&[
+            &format!(
+                r#"{{"type":"message_start","message":{{"usage":{{"input_tokens":12,"output_tokens":1,{MIXED_TTL_CACHE}}}}}}}"#
+            ),
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":40}}"#,
+        ]);
+        assert_eq!(streamed.usage, Some(mixed_ttl_expected()));
+        // Total input-side tokens count the writes once: 12 + 30 + 300.
+        let u = streamed.usage.unwrap();
+        assert_eq!(u.input_tokens + u.cache_read + u.cache_write, 342);
+    }
+
+    #[test]
+    fn aggregate_writes_without_breakdown_keep_tiers_absent() {
+        let usage: Usage = serde_json::from_str::<AnthropicUsage>(
+            r#"{"input_tokens":1,"output_tokens":2,"cache_creation_input_tokens":300}"#,
+        )
+        .unwrap()
+        .into();
+        assert_eq!(usage.cache_write, 300);
+        assert_eq!(usage.cache_write_tiers, None, "no invented 5m writes");
+
+        // An empty breakdown object is not a breakdown either.
+        let usage: Usage = serde_json::from_str::<AnthropicUsage>(
+            r#"{"cache_creation_input_tokens":300,"cache_creation":{}}"#,
+        )
+        .unwrap()
+        .into();
+        assert_eq!(usage.cache_write_tiers, None);
+
+        // An explicit zero tier stays distinct from an absent one.
+        let usage: Usage = serde_json::from_str::<AnthropicUsage>(
+            r#"{"cache_creation_input_tokens":300,
+                "cache_creation":{"ephemeral_5m_input_tokens":300,"ephemeral_1h_input_tokens":0}}"#,
+        )
+        .unwrap()
+        .into();
+        let tiers = usage.cache_write_tiers.unwrap();
+        assert_eq!((tiers.five_minute, tiers.one_hour), (Some(300), Some(0)));
+    }
+
+    #[test]
+    fn inconsistent_breakdown_is_retained_not_corrected() {
+        let usage: Usage = serde_json::from_str::<AnthropicUsage>(
+            r#"{"cache_creation_input_tokens":300,
+                "cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":200}}"#,
+        )
+        .unwrap()
+        .into();
+        // The aggregate stays authoritative; valuation reports the mismatch.
+        assert_eq!(usage.cache_write, 300);
+        let tiers = usage.cache_write_tiers.unwrap();
+        assert_eq!((tiers.five_minute, tiers.one_hour), (Some(200), Some(200)));
+    }
+
+    #[test]
+    fn final_ordinary_output_drops_below_the_provisional_count() {
+        // message_start reports a provisional output of 1; the final inclusive
+        // 100 is all thinking, so ordinary output must end at 0, not 1.
+        let (output, chunks) = stream_output(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":100,"output_tokens_details":{"thinking_tokens":100}}}"#,
+        ]);
+        let usage = output.usage.unwrap();
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 100);
+        assert_eq!(usage.input_tokens, 7);
+        // The provisional value is never emitted as ordinary output.
+        for chunk in &chunks {
+            if let querymt::chat::StreamChunk::Usage(u) = chunk {
+                assert_eq!(u.output_tokens, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn no_thinking_detail_keeps_reported_output_and_zero_reasoning() {
+        let (output, _) = stream_output(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":7,"output_tokens":1}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#,
+        ]);
+        let usage = output.usage.unwrap();
+        assert_eq!((usage.output_tokens, usage.reasoning_tokens), (15, 0));
+    }
+
+    #[test]
+    fn later_events_retain_omitted_fields_and_replace_reported_ones() {
+        // An omitted input field keeps the start value; an explicit zero replaces it.
+        let (output, _) = stream_output(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":25,"cache_read_input_tokens":9}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}"#,
+        ]);
+        let usage = output.usage.unwrap();
+        assert_eq!((usage.input_tokens, usage.cache_read), (25, 9));
+
+        // The parser's authoritative (last) usage chunk carries the replacement.
+        // The shared accumulator still max-merges chunks, so it cannot lower a
+        // value already emitted; that is a generic-merge limit this change
+        // deliberately leaves alone, so assert on the parser output here.
+        let (_, chunks) = stream_output(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":25,"cache_read_input_tokens":9}}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":25,"cache_read_input_tokens":0,"output_tokens":5}}"#,
+        ]);
+        let last = chunks
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                querymt::chat::StreamChunk::Usage(u) => Some(u),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!((last.input_tokens, last.cache_read), (25, 0));
+    }
+
+    #[test]
+    fn repeated_delta_events_do_not_duplicate_tokens() {
+        // A redelivered usage-only delta, then the terminal delta.
+        let usage_only = r#"{"type":"message_delta","delta":{},"usage":{"output_tokens":40}}"#;
+        let terminal = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":40}}"#;
+        let (output, _) = stream_output(&[
+            &format!(
+                r#"{{"type":"message_start","message":{{"usage":{{"input_tokens":12,"output_tokens":1,{MIXED_TTL_CACHE}}}}}}}"#
+            ),
+            usage_only,
+            usage_only,
+            terminal,
+        ]);
+        assert_eq!(output.usage, Some(mixed_ttl_expected()));
     }
 
     #[test]

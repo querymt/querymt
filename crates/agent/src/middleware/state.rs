@@ -12,7 +12,9 @@ pub struct AgentStats {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub context_tokens: usize,
-    /// Total cost in USD calculated from token usage and pricing
+    /// Known recorded spend of this cycle in USD: the sum of settled attempt
+    /// valuations (see [`AgentStats::apply_recorded_costs`]), never a
+    /// revaluation of the token counters.
     pub total_cost_usd: f64,
     /// Input cost in USD
     pub input_cost_usd: f64,
@@ -28,57 +30,39 @@ pub struct AgentStats {
     pub cache_read_cost_usd: f64,
     /// Cache write cost in USD
     pub cache_write_cost_usd: f64,
+    /// Known budget-view spend of this cycle (manual-rate valuation where
+    /// snapshotted, otherwise the reported API valuation), including cache
+    /// and auxiliary attempts. Read by price-limit middleware.
+    pub budget_cost_usd: f64,
 }
 
 impl AgentStats {
-    /// Update costs based on pricing information
+    /// Present this cycle's recorded charges.
     ///
-    /// This should be called whenever token counts are updated
-    pub fn update_costs(&mut self, pricing: &querymt::providers::ModelPricing) {
-        // Use ModelPricing methods directly
-        // Reasoning tokens are billed at the output rate (no separate reasoning pricing).
-        // output_tokens excludes reasoning, so we add it back for cost calculation.
-        let billable_output = self.total_output_tokens + self.reasoning_tokens;
-
-        // Calculate base token costs
-        if let Some(cost) = pricing.calculate_cost(self.total_input_tokens, billable_output) {
-            self.total_cost_usd = cost;
-
-            // Calculate individual components if pricing is available
-            if let Some(input_rate) = pricing.input {
-                self.input_cost_usd = (self.total_input_tokens as f64 / 1_000_000.0) * input_rate;
-            }
-            if let Some(output_rate) = pricing.output {
-                self.output_cost_usd = (billable_output as f64 / 1_000_000.0) * output_rate;
-            }
-        }
-
-        // Calculate cache costs if available using ModelPricing method
-        let (cache_read_cost, cache_write_cost) =
-            pricing.calculate_cache_cost(self.cache_read_tokens, self.cache_write_tokens);
-
-        if let Some(read_cost) = cache_read_cost {
-            self.cache_read_cost_usd = read_cost;
-            self.total_cost_usd += read_cost;
-        }
-
-        if let Some(write_cost) = cache_write_cost {
-            self.cache_write_cost_usd = write_cost;
-            self.total_cost_usd += write_cost;
-        }
+    /// The fields are a read-only view of settled accounting components, not
+    /// a valuation: nothing here prices token counters, so a model switch or
+    /// catalog refresh cannot change an earlier charge. Unknown components
+    /// contribute nothing; completeness lives in [`ScopeTotals`].
+    pub fn apply_recorded_costs(&mut self, totals: &crate::accounting::ScopeTotals) {
+        let c = &totals.components;
+        self.total_cost_usd = totals.known_subtotal_usd;
+        self.budget_cost_usd = totals.budget_known_subtotal_usd;
+        self.input_cost_usd = c.input_usd;
+        self.output_cost_usd = c.output_usd;
+        self.cache_read_cost_usd = c.cache_read_usd;
+        self.cache_write_cost_usd = c.cache_write_usd + c.cache_write_1h_usd;
     }
 }
 
-/// Fold one request's token usage (and cost, when pricing is known) into `stats`.
+/// Fold one request's token usage into `stats`.
+///
+/// Token counters only: monetary fields are a view of recorded accounting
+/// components (see [`AgentStats::apply_recorded_costs`]), never a revaluation.
 ///
 /// Shared by the normal reply path and by discarded attempts (for example an
 /// escalated retry), so every request that was billed is counted exactly once.
 /// Does not touch `steps`; callers decide whether the attempt counts as a step.
-pub fn apply_usage_to_stats(
-    stats: &mut AgentStats,
-    usage: Option<&querymt::Usage>,
-    pricing: Option<&querymt::providers::ModelPricing>,
-) {
+pub fn apply_usage_to_stats(stats: &mut AgentStats, usage: Option<&querymt::Usage>) {
     let Some(usage) = usage else {
         return;
     };
@@ -88,10 +72,6 @@ pub fn apply_usage_to_stats(
     stats.cache_read_tokens += u64::from(usage.cache_read);
     stats.cache_write_tokens += u64::from(usage.cache_write);
     stats.context_tokens = calculate_context_tokens(Some(usage)) as usize;
-
-    if let Some(pricing) = pricing {
-        stats.update_costs(pricing);
-    }
 }
 
 /// Calculate current context size from usage.
@@ -161,8 +141,6 @@ pub struct ModelProfile {
     pub capabilities: querymt::chat::ChatCapabilities,
     /// Reasoning effort the provider is configured with, when known.
     pub reasoning_effort: Option<querymt::chat::ReasoningEffort>,
-    /// Pricing used to account for this session's usage, when billable.
-    pub pricing: Option<querymt::providers::ModelPricing>,
 }
 
 /// Context passed to middleware during state transitions
@@ -792,6 +770,7 @@ mod tests {
             reasoning_tokens: 20,
             cache_read: 30,
             cache_write: 10,
+            cache_write_tiers: None,
         };
 
         // Should sum all: 100 + 50 + 20 + 30 + 10 = 210
@@ -807,6 +786,7 @@ mod tests {
             reasoning_tokens: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_write_tiers: None,
         };
 
         // Should sum: 100 + 50 + 0 + 0 + 0 = 150
@@ -822,10 +802,27 @@ mod tests {
             reasoning_tokens: 0,
             cache_read: 30,
             cache_write: 10,
+            cache_write_tiers: None,
         };
 
         // Should sum: 100 + 50 + 0 + 30 + 10 = 190
         assert_eq!(calculate_context_tokens(Some(&usage)), 190);
+    }
+
+    #[test]
+    fn cache_write_tier_detail_is_not_added_to_context_total() {
+        // Tiers partition `cache_write`; the aggregate is counted once.
+        let usage = querymt::Usage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_write: 300,
+            cache_write_tiers: Some(querymt::CacheWriteTiers {
+                five_minute: Some(200),
+                one_hour: Some(100),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(calculate_context_tokens(Some(&usage)), 100 + 50 + 300);
     }
 
     #[test]

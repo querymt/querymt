@@ -177,6 +177,10 @@ pub struct DelegationOrchestrator {
     /// execution: delegates resolving to `isolated` fail closed instead of
     /// silently sharing the parent's checkout.
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
+    /// Manual budget pricing snapshotted onto delegation-summary attempts.
+    budget_pricing: Option<querymt::providers::ModelPricing>,
+    /// Per-cycle price cap applied before each summary dispatch.
+    budget_cap_usd: Option<f64>,
 }
 
 impl DelegationOrchestrator {
@@ -205,7 +209,24 @@ impl DelegationOrchestrator {
             profile_id: None,
             routing_snapshot: None,
             workspace_service: None,
+            budget_pricing: None,
+            budget_cap_usd: None,
         }
+    }
+
+    /// Apply this per-cycle price cap before each delegation-summary dispatch.
+    pub fn with_budget_cap(mut self, cap_usd: Option<f64>) -> Self {
+        self.budget_cap_usd = cap_usd;
+        self
+    }
+
+    /// Snapshot this manual budget pricing onto delegation-summary attempts.
+    pub fn with_budget_pricing(
+        mut self,
+        pricing: Option<querymt::providers::ModelPricing>,
+    ) -> Self {
+        self.budget_pricing = pricing;
+        self
     }
 
     /// Legacy constructor for backward compatibility with QueryMTAgent.
@@ -448,6 +469,7 @@ impl DelegationOrchestrator {
             AgentEventKind::DelegationRequested {
                 delegation,
                 batch_id,
+                cycle_id,
                 ..
             } => {
                 tracing::Span::current().record("event_kind", "DelegationRequested");
@@ -582,6 +604,9 @@ impl DelegationOrchestrator {
                 let hooks = self.hooks.clone();
                 let workspace_service = self.workspace_service.clone();
                 let batch_id = batch_id.clone();
+                let requesting_cycle_id = cycle_id.clone();
+                let budget_pricing = self.budget_pricing.clone();
+                let budget_cap_usd = self.budget_cap_usd;
                 let (start_tx, start_rx) = oneshot::channel();
 
                 // Store the cancellation token and join handle
@@ -632,6 +657,9 @@ impl DelegationOrchestrator {
                             cancellation: cancellation_for_spawn,
                             workspace_service,
                             batch_id,
+                            requesting_cycle_id,
+                            budget_pricing,
+                            budget_cap_usd,
                         };
                         execute_delegation(
                             ctx,
@@ -778,6 +806,13 @@ struct DelegationContext {
     cancellation: Arc<DelegationCancellation>,
     workspace_service: Option<Arc<crate::worktree::WorkspaceService>>,
     batch_id: Option<String>,
+    /// Parent execution cycle that requested this delegation. The planning
+    /// summary is charged to it even if it settles after newer cycles begin.
+    requesting_cycle_id: Option<String>,
+    /// Manual budget pricing for the summary attempt, if configured.
+    budget_pricing: Option<querymt::providers::ModelPricing>,
+    /// Per-cycle price cap checked before the summary dispatch.
+    budget_cap_usd: Option<f64>,
 }
 
 struct DelegationFailureContext<'a> {
@@ -852,6 +887,28 @@ fn reasoning_effort_from_llm_config(
     };
 
     serde_json::from_value(value.clone())
+}
+
+/// Build the accounting operation for one delegation summary.
+async fn summary_operation(
+    ctx: &DelegationContext,
+    summarizer: &super::summarizer::DelegationSummarizer,
+    parent_session_id: &str,
+    cycle_id: Option<&str>,
+) -> Result<crate::accounting::AttemptOperation, crate::accounting::AccountingError> {
+    let accounting = ctx.event_sink.session_accounting(parent_session_id).await?;
+    let cycle = match cycle_id {
+        Some(id) => crate::accounting::CycleAccounting::with_id(accounting.clone(), id),
+        None => crate::accounting::CycleAccounting::begin_maintenance(accounting.clone()),
+    };
+    let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
+        ctx.event_sink.session_stream(parent_session_id),
+        accounting,
+    ));
+    Ok(summarizer
+        .attempt_operation(recorder, &cycle)
+        .with_budget_pricing(ctx.budget_pricing.clone())
+        .with_budget_cap(ctx.budget_cap_usd))
 }
 
 #[instrument(
@@ -1598,13 +1655,43 @@ async fn execute_delegation(
         .await;
 
         if let Some(history) = history {
+            // Explicit ownership: the summary charges the parent cycle that
+            // requested the delegation. Events from before cycle ids existed
+            // have none, so such a summary is charged to a dedicated
+            // maintenance cycle rather than to whichever cycle is current.
+            let operation = match summary_operation(
+                &ctx,
+                summarizer,
+                &parent_session_id,
+                ctx.requesting_cycle_id.as_deref(),
+            )
+            .await
+            {
+                Ok(operation) => Some(operation),
+                Err(error) => {
+                    warn!("Delegation summary skipped: accounting unavailable: {error}");
+                    None
+                }
+            };
             let summary = async {
-                match summarizer.summarize(&history, &delegation.objective).await {
+                let operation = operation.as_ref()?;
+                match summarizer
+                    .summarize(&history, &delegation.objective, operation)
+                    .await
+                {
                     Ok(summary) => {
                         tracing::Span::current().record("summary_bytes", summary.len() as u64);
                         Some(summary)
                     }
                     Err(_) => {
+                        // The parent cycle's price cap refused the paid summary
+                        // dispatch: nothing was sent. Not a generation failure.
+                        if let Some((cap, spent)) = operation.budget_refusal() {
+                            warn!(
+                                "Delegation summary skipped: price limit reached: ${spent:.4} >= ${cap:.2}"
+                            );
+                            return None;
+                        }
                         warn!("Delegation summary generation failed");
                         // Proceed without summary — graceful degradation
                         None
@@ -2893,6 +2980,7 @@ mod tests {
                     delegation: delegation.clone(),
                     tool_call_id: None,
                     batch_id: None,
+                    cycle_id: None,
                 },
             })
             .await
@@ -3207,6 +3295,7 @@ mod tests {
                 delegation,
                 tool_call_id: None,
                 batch_id: None,
+                cycle_id: None,
             },
         });
         orchestrator.handle_envelope(&envelope).await;

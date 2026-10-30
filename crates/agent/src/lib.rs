@@ -19,6 +19,7 @@ pub mod auth;
 // feature.  Dashboard and ACP builds use this for plain API-key storage.
 pub use querymt_utils::secret_store::SecretStore;
 
+pub mod accounting;
 pub mod acp;
 pub mod agent;
 pub mod delegation;

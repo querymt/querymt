@@ -280,6 +280,16 @@ session_ref
     .await?;
 ```
 
+#### Cost of the planning summary
+
+Generating the planning summary is a paid request made by the **parent**. It is recorded in the parent session's cost accounting with the `delegation_summary` purpose and charged to the **parent cycle that requested the delegation**, even when the summary finishes after the parent has started a newer cycle. The delegated child's own generation is recorded under the child session and is never charged to the parent a second time.
+
+- The summary uses its own configured provider and model, so its billing class and pricing come from that provider, not from the parent's.
+- A refusal, truncated or empty summary still incurs whatever usage the provider reported; that cost is retained even though the summary is discarded.
+- A timeout or transport failure leaves the cost uncertain rather than zero.
+- When no provider request is made (the parent history already ends in a compaction summary, or is below the summarization threshold), nothing is recorded.
+- If the accounting record cannot be written, the summary is skipped and the delegation proceeds without it. No paid request is made without a recorded start.
+
 ### 4. Task Execution
 
 The delegate receives the task and begins execution:

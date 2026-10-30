@@ -10,7 +10,7 @@ use crate::session::store::{LLMConfig, Session, SessionExecutionConfig, SessionS
 use arc_swap::ArcSwap;
 use querymt::LLMParams;
 use querymt::plugin::host::{PluginRegistry, ProviderResolver};
-use querymt::providers::ModelPricing;
+use querymt::providers::{BillingClass, ModelPricing};
 use querymt::{
     LLMProvider,
     chat::{ChatCall, ChatMessage, ChatOutput, ChatRole, GenerationOptions},
@@ -49,6 +49,33 @@ pub(crate) fn supported_overrides(
         );
     }
     supported
+}
+
+/// Billing class plus the pricing snapshot bound at dispatch.
+#[derive(Debug, Clone)]
+pub struct BillingBasis {
+    pub billing: BillingClass,
+    pub pricing: Option<ModelPricing>,
+}
+
+impl BillingBasis {
+    /// Classify `provider/model` from the current catalog. Subscription and
+    /// OAuth-backed providers are `Excluded` and never carry catalog pricing.
+    pub fn resolve(provider: &str, model: &str, oauth_backed: bool) -> Self {
+        if oauth_backed || is_non_billable_oauth_provider(provider) {
+            return Self {
+                billing: BillingClass::Excluded,
+                pricing: None,
+            };
+        }
+        let pricing = get_model_info(provider, model).map(|info| info.pricing);
+        let billing = match &pricing {
+            None => BillingClass::Unknown,
+            Some(p) if p.is_explicit_zero() => BillingClass::ZeroPriced,
+            Some(_) => BillingClass::Metered,
+        };
+        Self { billing, pricing }
+    }
 }
 
 fn is_non_billable_oauth_provider(provider: &str) -> bool {
@@ -913,7 +940,6 @@ impl SessionHandle {
             caps: built.and_then(|built| built.output_caps),
             capabilities: provider.capabilities(),
             reasoning_effort: built.and_then(|built| built.reasoning_effort),
-            pricing: self.get_pricing(),
         })
     }
 
@@ -1018,14 +1044,34 @@ impl SessionHandle {
     /// Per-request options the provider does not honour are dropped (see
     /// [`supported_overrides`]); the request then runs with the configured
     /// values.
-    pub async fn submit_request(&self, call: &ChatCall<'_>) -> Result<ChatOutput, LLMError> {
+    ///
+    /// This is a paid request, so the caller supplies the `ledger` that
+    /// records it: the start is durable before dispatch and the attempt is
+    /// settled with the reported usage (or its absence). There is no
+    /// unrecorded variant.
+    pub async fn submit_request(
+        &self,
+        call: &ChatCall<'_>,
+        ledger: &crate::accounting::DispatchLedger,
+    ) -> Result<ChatOutput, LLMError> {
         let provider = self.provider().await?;
         let options = supported_overrides(provider.as_ref(), call.options);
-        provider.chat(&call.options(options)).await
+        let call = call.options(options);
+        crate::accounting::run_attempt(
+            &ledger.operation,
+            ledger.basis.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            || provider.chat(&call),
+        )
+        .await
     }
 
     /// Higher-level chat interface (used by CLI) that handles conversion and storage
-    pub async fn chat(&self, messages: &[ChatMessage]) -> SessionResult<ChatOutput> {
+    pub async fn chat(
+        &self,
+        messages: &[ChatMessage],
+        ledger: &crate::accounting::DispatchLedger,
+    ) -> SessionResult<ChatOutput> {
         // 1. Store incoming messages (User or Tool Result)
         for msg in messages {
             let agent_msg = self.convert_chat_to_agent(msg);
@@ -1036,7 +1082,9 @@ impl SessionHandle {
         let llm_messages = self.history().await?;
 
         // 3. Call LLM
-        let response = self.submit_request(&ChatCall::new(&llm_messages)).await?;
+        let response = self
+            .submit_request(&ChatCall::new(&llm_messages), ledger)
+            .await?;
 
         // 4. Store response
         let response_msg: ChatMessage = response.clone().into();
@@ -1055,24 +1103,43 @@ impl SessionHandle {
     /// resolver attached — OAuth providers always do, static-key providers
     /// never do. This avoids threading a boolean through the provider stack.
     pub fn get_pricing(&self) -> Option<ModelPricing> {
-        if self
-            .llm_config
-            .as_ref()
-            .is_some_and(|config| is_non_billable_oauth_provider(&config.provider))
-        {
-            return None;
-        }
+        self.billing_basis().pricing
+    }
 
-        if let Some(provider) = self.cached_llm_provider.get()
-            && provider.provider.key_resolver().is_some()
-        {
-            return None;
-        }
+    /// Billing class and pricing snapshot that apply to this session's
+    /// provider/model right now. Subscription/OAuth-backed providers are
+    /// `Excluded` and never carry catalog pricing; a model with no catalog
+    /// entry is `Unknown`.
+    pub fn billing_basis(&self) -> BillingBasis {
+        self.billing_basis_inner(None)
+    }
 
-        self.llm_config
-            .as_ref()
-            .and_then(|config| get_model_info(&config.provider, &config.model))
-            .map(|info| info.pricing)
+    /// Like [`Self::billing_basis`], but priced for `model` served by this
+    /// session's provider (for example a dedicated compaction model).
+    pub fn billing_basis_for_model(&self, model: &str) -> BillingBasis {
+        self.billing_basis_inner(Some(model))
+    }
+
+    fn billing_basis_inner(&self, model: Option<&str>) -> BillingBasis {
+        let oauth_backed = self
+            .cached_llm_provider
+            .get()
+            .is_some_and(|provider| provider.provider.key_resolver().is_some());
+        match self.llm_config.as_ref() {
+            Some(config) => BillingBasis::resolve(
+                &config.provider,
+                model.unwrap_or(&config.model),
+                oauth_backed,
+            ),
+            None => BillingBasis {
+                billing: if oauth_backed {
+                    BillingClass::Excluded
+                } else {
+                    BillingClass::Unknown
+                },
+                pricing: None,
+            },
+        }
     }
 
     pub fn convert_chat_to_agent(&self, msg: &ChatMessage) -> AgentMessage {
@@ -1655,7 +1722,8 @@ pub mod tests {
             cached_llm_provider: tokio::sync::OnceCell::new(),
         };
 
-        let error = handle.chat(&[]).await.unwrap_err();
+        let ledger = crate::accounting::test_ledger().await;
+        let error = handle.chat(&[], &ledger).await.unwrap_err();
 
         assert!(matches!(error, SessionError::InvalidOperation(_)));
     }
@@ -1822,6 +1890,19 @@ pub mod tests {
     fn static_pricing_omits_non_billable_oauth_providers() {
         assert!(SessionProvider::get_pricing("codex", "gpt-5").is_none());
         assert!(SessionProvider::get_pricing("kimi-code", "kimi-k2.5").is_none());
+    }
+
+    #[test]
+    fn billing_basis_excludes_subscription_providers_without_catalog_pricing() {
+        for provider in ["codex", "kimi-code"] {
+            let basis = BillingBasis::resolve(provider, "any-model", false);
+            assert_eq!(basis.billing, BillingClass::Excluded);
+            assert!(basis.pricing.is_none());
+        }
+        // An OAuth-resolved key on an otherwise metered provider is excluded too.
+        let basis = BillingBasis::resolve("openai", "gpt-5", true);
+        assert_eq!(basis.billing, BillingClass::Excluded);
+        assert!(basis.pricing.is_none());
     }
 
     #[test]

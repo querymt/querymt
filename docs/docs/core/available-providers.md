@@ -281,7 +281,7 @@ A forced `tool_choice` is `any` or a named tool.
 
 #### Thinking replay, usage and stop reasons
 
-Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default `display: "omitted"` on Opus 4.7+ and Claude 5). `redacted_thinking` blocks are kept and replayed with their opaque data. `output_tokens_details.thinking_tokens` is reported as `reasoning_tokens`. Stop reasons map as: `end_turn`/`stop_sequence` to stop, `tool_use` to tool calls, `max_tokens`/`model_context_window_exceeded` to length, `refusal` to content filter, `pause_turn` to other.
+Each thinking block becomes its own reasoning item with its own signature. Signed blocks are replayed unchanged, even when their text is empty (the default `display: "omitted"` on Opus 4.7+ and Claude 5). `redacted_thinking` blocks are kept and replayed with their opaque data. `output_tokens_details.thinking_tokens` is reported as `reasoning_tokens` and subtracted from the inclusive `output_tokens`, so ordinary output and reasoning never overlap. Streaming usage ends with the final `message_delta` values: the provisional output count in `message_start` is not emitted as ordinary output, fields a later event omits (input, cache) keep their earlier values, and an explicit zero replaces them. Cache writes keep the returned `cache_creation` five-minute and one-hour counts as a breakdown of the aggregate `cache_creation_input_tokens` (never added on top); with no breakdown the tiers stay absent rather than assumed. Stop reasons map as: `end_turn`/`stop_sequence` to stop, `tool_use` to tool calls, `max_tokens`/`model_context_window_exceeded` to length, `refusal` to content filter, `pause_turn` to other.
 
 #### `adaptive_thinking` override
 
@@ -315,6 +315,20 @@ Eligible tools are sent with `"strict": true` only when every check passes:
 - **Budgets.** Counted over the successfully converted tools only: at most 20 strict tools, 24 optional properties and 16 union properties (`anyOf` or type arrays). If any limit is exceeded, *every* tool in that request is sent non-strict with its original schema and a warning names the limit.
 
 Strict tools work the same over API key and OAuth: OAuth strict requests were verified against the live API on `claude-sonnet-4-5` and `claude-sonnet-5-5` (see `scripts/verify-anthropic-strict.sh`).
+
+### Usage normalization across API providers
+
+Every provider adapter reports usage in the same exclusive categories: uncached input, ordinary output, reasoning, cache reads and cache writes. Each token appears in one category, so totals and cost estimates never count it twice. What each wire format needs to get there:
+
+| Provider | Wire shape | Normalization | Limitations |
+| --- | --- | --- | --- |
+| OpenAI Chat, OpenRouter, xAI, Mistral, Alibaba | `prompt_tokens` includes `prompt_tokens_details.cached_tokens` and `cache_write_tokens`; `completion_tokens` includes `reasoning_tokens` | Cache reads and writes are subtracted from the prompt; reasoning is subtracted from the completion | A missing detail object means zero, not unknown |
+| DeepSeek | Flat `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` | An explicit miss count, including `0`, is used as uncached input instead of a derived value | Cache writes are not reported (they are billed as ordinary input) |
+| OpenAI Responses, Codex | `input_tokens` includes `input_tokens_details.cached_tokens` and `cache_write_tokens`; `output_tokens` includes `reasoning_tokens` | Same subtraction as Chat | Only terminal usage is authoritative; each attempt carries its own usage |
+| Google Gemini | `promptTokenCount` includes `cachedContentTokenCount`; `candidatesTokenCount` excludes `thoughtsTokenCount`; `toolUsePromptTokenCount` is separate | Cached tokens are subtracted from the prompt, thoughts become reasoning, tool-use prompt tokens count as input | Gemini reports no cache-write counter (implicit cache writes and cache storage time are not metered here) |
+| Anthropic | See [Thinking replay, usage and stop reasons](#thinking-replay-usage-and-stop-reasons) | `input_tokens` is already uncached; thinking is subtracted from `output_tokens` | Catalog prices cover base-duration cache writes; one-hour writes need an explicit one-hour rate |
+
+These adapters only report what the response states. They never infer a cache counter from the requested cache settings or the provider name.
 
 ### llama-cpp
 

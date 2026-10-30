@@ -225,6 +225,7 @@ pub(crate) fn generate(
                 cache_read: 0,
                 cache_write: 0,
                 reasoning_tokens: 0,
+                cache_write_tiers: None,
             },
             termination: stats.termination,
         });
@@ -341,6 +342,7 @@ pub(crate) fn generate(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 termination: GenerationTermination::MaxTokens,
             });
@@ -391,6 +393,7 @@ pub(crate) fn generate(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 termination: GenerationTermination::MaxTokens,
             });
@@ -487,6 +490,7 @@ pub(crate) fn generate(
             cache_read: 0,
             cache_write: 0,
             reasoning_tokens: 0,
+            cache_write_tiers: None,
         },
         termination,
     })
@@ -553,6 +557,7 @@ pub(crate) fn generate_streaming_with_thinking(
                 cache_read: 0,
                 cache_write: 0,
                 reasoning_tokens: 0,
+                cache_write_tiers: None,
             },
             stats.termination,
         ));
@@ -659,6 +664,7 @@ pub(crate) fn generate_streaming_with_thinking(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 GenerationTermination::MaxTokens,
             ));
@@ -702,6 +708,7 @@ pub(crate) fn generate_streaming_with_thinking(
                     cache_read: 0,
                     cache_write: 0,
                     reasoning_tokens: 0,
+                    cache_write_tiers: None,
                 },
                 GenerationTermination::MaxTokens,
             ));
@@ -780,6 +787,7 @@ pub(crate) fn generate_streaming_with_thinking(
                         cache_read: 0,
                         cache_write: 0,
                         reasoning_tokens: 0,
+                        cache_write_tiers: None,
                     },
                     GenerationTermination::ConsumerClosed,
                 ));
@@ -814,6 +822,7 @@ pub(crate) fn generate_streaming_with_thinking(
             cache_read: 0,
             cache_write: 0,
             reasoning_tokens: 0,
+            cache_write_tiers: None,
         },
         termination,
     ))

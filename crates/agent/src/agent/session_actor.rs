@@ -2799,6 +2799,16 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
         .await
         .map_err(|e| AgentError::Internal(e.to_string()))?;
 
+    // Session accounting is hydrated once per runtime and retained across
+    // cycles; each cycle gets its own immutable handle with zero cycle spend.
+    // Failing to load it is an execution error: paid work must not proceed
+    // without a ledger.
+    let session_accounting = runtime
+        .accounting(&session_id, &config.event_sink)
+        .await
+        .map_err(|e| AgentError::Internal(format!("failed to load accounting: {e}")))?;
+    let cycle_accounting = crate::accounting::CycleAccounting::begin(session_accounting);
+
     // Create execution context — attach the cancellation token so it propagates
     // into individual tool calls for cooperative cancellation.
     // The knowledge store is propagated so knowledge tools can access it.
@@ -2820,7 +2830,8 @@ async fn execute_prompt_inner(exec: DetachedPromptExecution) -> Result<PromptRun
     .with_turn_id(run_id.clone())
     .with_turn_mode(mode)
     .with_steering(steering)
-    .with_phase_reporter(phase_reporter);
+    .with_phase_reporter(phase_reporter)
+    .with_cycle_accounting(cycle_accounting);
 
     if let Some(task) = &scheduled_task {
         exec_ctx.state.active_task = Some(task.clone());

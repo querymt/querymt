@@ -97,6 +97,13 @@ pub(crate) struct ExecutionContext {
         Option<tokio::sync::mpsc::UnboundedSender<crate::agent::turn_control::RunPhase>>,
     /// Delegations left running when steering interrupts a wait.
     pub suspended_delegations: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Immutable accounting handle for this execution cycle, created at the
+    /// cycle boundary. Cycle spend starts at zero; session spend is retained
+    /// by the session-owned projection it points at.
+    pub cycle_accounting: tokio::sync::OnceCell<crate::accounting::CycleAccounting>,
+    /// Budget-uncertainty reasons already reported for this cycle, so
+    /// repeated step-start snapshots never repeat a warning.
+    pub budget_warnings: crate::accounting::BudgetWarnings,
 }
 
 impl ExecutionContext {
@@ -126,6 +133,8 @@ impl ExecutionContext {
             run_objective: None,
             phase_reporter: None,
             suspended_delegations: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            cycle_accounting: tokio::sync::OnceCell::new(),
+            budget_warnings: Default::default(),
         }
     }
 
@@ -191,6 +200,25 @@ impl ExecutionContext {
     ) -> Self {
         self.phase_reporter = Some(reporter);
         self
+    }
+
+    pub fn with_cycle_accounting(self, cycle: crate::accounting::CycleAccounting) -> Self {
+        let _ = self.cycle_accounting.set(cycle);
+        self
+    }
+
+    /// This cycle's accounting handle, created on first use from the
+    /// session-owned projection. A cycle has exactly one identity.
+    pub(crate) async fn cycle_accounting(
+        &self,
+        sink: &crate::event_sink::EventSink,
+    ) -> Result<&crate::accounting::CycleAccounting, crate::accounting::AccountingError> {
+        self.cycle_accounting
+            .get_or_try_init(|| async {
+                let accounting = self.runtime.accounting(&self.session_id, sink).await?;
+                Ok(crate::accounting::CycleAccounting::begin(accounting))
+            })
+            .await
     }
 
     pub fn report_phase(&self, phase: crate::agent::turn_control::RunPhase) {

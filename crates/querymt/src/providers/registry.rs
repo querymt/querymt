@@ -68,9 +68,12 @@ async fn download_and_cache_providers(file_path: &Path) -> Result<ProvidersRegis
     }
 
     // API returns a top-level map of providers, convert into ProvidersRegistry
-    let map = response
+    let mut map = response
         .json::<std::collections::HashMap<String, super::types::ProviderInfo>>()
         .await?;
+    for model in map.values_mut().flat_map(|p| p.models.values_mut()) {
+        model.pricing.source = Some(super::types::PricingSource::Catalog);
+    }
 
     let registry: ProvidersRegistry = map.into();
 

@@ -274,6 +274,12 @@ pub trait EventJournal: Send + Sync {
     /// a new prompt after an undo so that the reverted turns do not reappear
     /// on page reload.
     ///
+    /// Accounting is exempt: `llm_attempt_started` / `llm_attempt_settled`
+    /// records, and legacy `llm_request_end` records that carry no
+    /// `accounting` detail (evidence of generation with no accounting basis),
+    /// are never deleted, so rewinding cannot erase incurred spend. Retained
+    /// records are not renumbered. Deleting the whole session is separate.
+    ///
     /// Returns the number of deleted rows.
     async fn delete_session_events_from(
         &self,

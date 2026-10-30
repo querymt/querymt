@@ -3,13 +3,15 @@
 //! This module implements the AI compaction layer of the 3-layer compaction system,
 //! which generates summaries when context threshold is reached.
 
+use crate::accounting::{AccountingError, DispatchLedger, DispatchMode};
 use crate::agent::utils::{genai, render_prompt_for_llm};
 use crate::model::{AgentMessage, MessagePart};
 use crate::session::pruning::{SimpleTokenEstimator, TokenEstimator};
 use anyhow::Result;
 use futures_util::{FutureExt, StreamExt};
 use querymt::chat::{
-    ChatCall, ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator, FinishReason,
+    ChatCall, ChatOutput, ChatOutputStatus, ChatRole, ChatStreamAccumulator,
+    ChatStreamAccumulatorError, ChatStreamFinish, FinishReason,
 };
 use querymt::error::LLMError;
 use std::sync::Arc;
@@ -94,6 +96,10 @@ impl SessionCompaction {
     /// * `messages` - The conversation history to summarize
     /// * `provider` - The LLM provider to use for summary generation
     /// * `retry_config` - Configuration for retry behavior
+    /// * `ledger` - Where every physical attempt is recorded. Required: the
+    ///   initiating session/cycle is explicit and never inferred from
+    ///   `messages`. Each retry is a separate attempt, settled before the
+    ///   summary is validated so a rejected summary keeps its cost.
     pub async fn process(
         &self,
         messages: &[AgentMessage],
@@ -101,6 +107,7 @@ impl SessionCompaction {
         model: &str,
         retry_config: &RetryConfig,
         max_prompt_bytes: Option<usize>,
+        ledger: &DispatchLedger,
     ) -> Result<CompactionResult> {
         // Estimate original token count
         let original_token_count = self.estimate_messages_tokens(messages, max_prompt_bytes);
@@ -119,6 +126,7 @@ impl SessionCompaction {
                     .first()
                     .map(|message| message.session_id.as_str())
                     .filter(|id| !id.is_empty()),
+                ledger,
             )
             .await?;
 
@@ -184,6 +192,7 @@ impl SessionCompaction {
         model: &str,
         retry_config: &RetryConfig,
         session_id: Option<&str>,
+        ledger: &DispatchLedger,
     ) -> Result<String> {
         // Provider identity is unavailable on ChatProvider; canonical provenance can supply it.
         genai::finish_reason("error");
@@ -207,17 +216,65 @@ impl SessionCompaction {
             // inference.  The streaming path uses per-chunk timeouts instead of
             // a single total-request timeout, keeping the connection alive
             // while the model generates.
-            let result = if provider.capabilities().streaming {
+            // The start is durable before the request is sent. Failing to
+            // record is fatal and never retried: no paid call without a ledger.
+            let streaming = provider.capabilities().streaming;
+            let attempt_record = ledger
+                .operation
+                .begin(
+                    if streaming {
+                        DispatchMode::Streaming
+                    } else {
+                        DispatchMode::NonStreaming
+                    },
+                    ledger.basis.clone(),
+                )
+                .await
+                .map_err(accounting_failure)?;
+
+            let raw = if streaming {
                 Self::call_streaming(messages, &provider, &mut first_chunk, &chat_span).await
             } else {
-                provider.chat(&ChatCall::new(messages)).await
-            }
-            .and_then(|output| {
-                // Failed attempts must not poison the eventual logical operation status.
-                let summary = Self::summary_from_output(&output)?;
-                genai::output(&output);
-                Ok(summary)
-            });
+                provider
+                    .chat(&ChatCall::new(messages))
+                    .await
+                    .map_err(|error| StreamFailure {
+                        error,
+                        response_started: false,
+                        usage: None,
+                        output: None,
+                    })
+            };
+
+            // Settle before validation: a refused, empty or incomplete summary
+            // still incurred whatever usage it reported.
+            let result = match raw {
+                Ok(output) => {
+                    let validated = Self::summary_from_output(&output);
+                    match &validated {
+                        Ok(_) => attempt_record.settle_output(&output).await,
+                        Err(_) => attempt_record.settle_rejected_output(&output, false).await,
+                    }
+                    .map_err(accounting_failure)?;
+                    validated.inspect(|_| genai::output(&output))
+                }
+                Err(failure) => {
+                    match &failure.output {
+                        Some(output) => attempt_record.settle_rejected_output(output, true).await,
+                        None => {
+                            attempt_record
+                                .settle_error(
+                                    &failure.error,
+                                    failure.response_started,
+                                    failure.usage.clone(),
+                                )
+                                .await
+                        }
+                    }
+                    .map_err(accounting_failure)?;
+                    Err(failure.error)
+                }
+            };
 
             match result {
                 Ok(text) => return Ok(text),
@@ -253,45 +310,108 @@ impl SessionCompaction {
     }
 
     /// Collect legacy or structured output, requiring a successful stream completion.
+    ///
+    /// Failures keep what accounting needs: whether any response bytes were
+    /// seen, the usage observed so far, and any partial output.
     async fn call_streaming(
         messages: &[querymt::chat::ChatMessage],
         provider: &Arc<dyn querymt::chat::ChatProvider>,
         first_chunk: &mut genai::FirstChunk,
         chat_span: &tracing::Span,
-    ) -> std::result::Result<ChatOutput, LLMError> {
+    ) -> std::result::Result<ChatOutput, StreamFailure> {
         first_chunk.start();
-        let mut stream = provider.chat_stream(&ChatCall::new(messages)).await?;
+        let mut stream = provider
+            .chat_stream(&ChatCall::new(messages))
+            .await
+            .map_err(|error| StreamFailure {
+                error,
+                response_started: false,
+                usage: None,
+                output: None,
+            })?;
         let mut accumulator = ChatStreamAccumulator::new();
+        let mut response_started = false;
         let mut terminal_seen = false;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    return Err(StreamFailure {
+                        error,
+                        response_started,
+                        usage: accumulator.output().usage,
+                        output: None,
+                    });
+                }
+            };
+            response_started = true;
             first_chunk.received(chat_span);
-            accumulator.push(&chunk).map_err(|error| {
-                LLMError::GenericError(format!("Invalid compaction stream: {error}"))
-            })?;
+            if let Err(error) = accumulator.push(&chunk) {
+                return Err(StreamFailure {
+                    error: LLMError::GenericError(format!("Invalid compaction stream: {error}")),
+                    response_started,
+                    usage: accumulator.output().usage,
+                    output: None,
+                });
+            }
             if querymt::chat::chunk_is_terminal(&chunk) {
                 terminal_seen = true;
                 break;
             }
         }
         if !terminal_seen {
-            return Err(LLMError::GenericError(
-                "Compaction stream ended without a terminal event".into(),
-            ));
+            return Err(StreamFailure {
+                error: LLMError::GenericError(
+                    "Compaction stream ended without a terminal event".into(),
+                ),
+                response_started,
+                usage: accumulator.output().usage,
+                output: None,
+            });
         }
-        let mut output = accumulator.finish_success().map_err(|error| {
-            LLMError::GenericError(format!("Invalid compaction stream: {error}"))
-        })?;
         // Only collect already-buffered usage; post-terminal events must bypass validation.
+        let mut trailing: Option<querymt::Usage> = None;
         while let Some(Some(Ok(querymt::chat::StreamChunk::Usage(extra)))) =
             stream.next().now_or_never()
         {
-            output.usage = Some(match output.usage.take() {
+            trailing = Some(match trailing.take() {
                 Some(previous) => previous.merge_max(extra),
                 None => extra,
             });
         }
-        Ok(output)
+        let mut merge = |mut output: ChatOutput| {
+            if let Some(extra) = trailing.take() {
+                output.usage = Some(match output.usage.take() {
+                    Some(previous) => previous.merge_max(extra),
+                    None => extra,
+                });
+            }
+            output
+        };
+        let invalid = |error: ChatStreamAccumulatorError| {
+            LLMError::GenericError(format!("Invalid compaction stream: {error}"))
+        };
+        match accumulator.finish() {
+            ChatStreamFinish::Completed(output) => Ok(merge(output)),
+            ChatStreamFinish::Incomplete { output, detail } => {
+                let output = merge(output);
+                Err(StreamFailure {
+                    error: invalid(ChatStreamAccumulatorError::IncompleteResponse(detail)),
+                    response_started,
+                    usage: output.usage.clone(),
+                    output: Some(Box::new(output)),
+                })
+            }
+            ChatStreamFinish::Failed { output, error } => {
+                let output = merge(output);
+                Err(StreamFailure {
+                    error: invalid(error),
+                    response_started,
+                    usage: output.usage.clone(),
+                    output: Some(Box::new(output)),
+                })
+            }
+        }
     }
 
     /// Partial output and tool calls cannot replace a conversation with a usable summary.
@@ -412,6 +532,22 @@ impl SessionCompaction {
 
         (request_msg, summary_msg)
     }
+}
+
+/// A failed physical attempt, with what accounting needs to settle it.
+struct StreamFailure {
+    error: LLMError,
+    /// True once any response bytes arrived: billing is then never
+    /// "confirmed not billable".
+    response_started: bool,
+    /// Usage observed before the failure.
+    usage: Option<querymt::Usage>,
+    /// Partial canonical output, when the stream reached finalization.
+    output: Option<Box<ChatOutput>>,
+}
+
+fn accounting_failure(error: AccountingError) -> anyhow::Error {
+    anyhow::anyhow!("Compaction accounting failure: {error}")
 }
 
 /// Check if an LLM error indicates a mesh timeout (remote node still processing).
@@ -557,6 +693,52 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A ledger over a fresh in-memory journal with no pricing.
+    async fn test_ledger() -> DispatchLedger {
+        ledger_with(querymt::providers::BillingClass::Unknown, None)
+            .await
+            .0
+    }
+
+    async fn ledger_with(
+        billing: querymt::providers::BillingClass,
+        pricing: Option<querymt::providers::ModelPricing>,
+    ) -> (DispatchLedger, Arc<crate::accounting::SessionAccounting>) {
+        use crate::session::backend::StorageBackend;
+        let storage = crate::session::sqlite_storage::SqliteStorage::connect(":memory:".into())
+            .await
+            .unwrap();
+        let journal = storage.event_journal();
+        let accounting =
+            crate::accounting::SessionAccounting::hydrate("compaction-session", journal.clone())
+                .await
+                .unwrap();
+        let stream = crate::session_event_stream::SessionEventStream::new(
+            "compaction-session",
+            journal,
+            Arc::new(crate::event_fanout::EventFanout::new()),
+        );
+        let recorder = Arc::new(crate::accounting::AttemptRecorder::with_projection(
+            stream,
+            accounting.clone(),
+        ));
+        let cycle = crate::accounting::CycleAccounting::with_id(accounting.clone(), "cycle-1");
+        let operation = crate::accounting::AttemptOperation::new(
+            recorder,
+            &cycle,
+            crate::accounting::AttemptPurpose::Compaction,
+            "p",
+            "model",
+        );
+        (
+            DispatchLedger {
+                operation: Arc::new(operation),
+                basis: crate::session::provider::BillingBasis { billing, pricing },
+            },
+            accounting,
+        )
+    }
+
     #[tokio::test]
     async fn genai_compaction_stream_retry_records_one_canonical_output_without_content() {
         use crate::test_utils::helpers::genai_trace::{assert_private, attr, capture};
@@ -591,6 +773,7 @@ mod tests {
                     cache_read: 30,
                     cache_write: 40,
                     reasoning_tokens: 5,
+                    cache_write_tiers: None,
                 });
             }
             let provider = ScriptedProvider::new(
@@ -606,7 +789,14 @@ mod tests {
                 .collect();
             let (result, spans) = capture(async {
                 SessionCompaction::new()
-                    .process(&history, provider.clone(), "model", &retry_config(1), None)
+                    .process(
+                        &history,
+                        provider.clone(),
+                        "model",
+                        &retry_config(1),
+                        None,
+                        &test_ledger().await,
+                    )
                     .instrument(tracing::info_span!(
                         "unrelated-parent",
                         session.id = "unrelated-session"
@@ -799,6 +989,7 @@ mod tests {
                     backoff_multiplier: 1.0,
                 },
                 None,
+                &test_ledger().await,
             ))
             .await;
             assert!(result.is_ok());
@@ -1026,7 +1217,14 @@ mod tests {
         max_retries: usize,
     ) -> Result<CompactionResult> {
         SessionCompaction::new()
-            .process(&[], provider, "model", &retry_config(max_retries), None)
+            .process(
+                &[],
+                provider,
+                "model",
+                &retry_config(max_retries),
+                None,
+                &test_ledger().await,
+            )
             .await
     }
 
@@ -1103,7 +1301,14 @@ mod tests {
             Ok("Valid continuation summary".into()),
         ]));
         let result = SessionCompaction::new()
-            .process(&[], provider.clone(), "model", &retry_config(1), None)
+            .process(
+                &[],
+                provider.clone(),
+                "model",
+                &retry_config(1),
+                None,
+                &test_ledger().await,
+            )
             .await
             .unwrap();
         assert_eq!(result.summary, "Valid continuation summary");
@@ -1475,6 +1680,7 @@ mod tests {
                     "test-model",
                     &RetryConfig::default(),
                     None,
+                    &test_ledger().await,
                 )
                 .await
         }
@@ -1964,6 +2170,7 @@ mod tests {
                 "model",
                 &RetryConfig::default(),
                 None,
+                &test_ledger().await,
             )
             .await;
 
@@ -2051,6 +2258,7 @@ mod tests {
                 "model",
                 &RetryConfig::default(),
                 None,
+                &test_ledger().await,
             )
             .await
             .expect("should succeed after retries");
@@ -2080,6 +2288,7 @@ mod tests {
                 "model",
                 &RetryConfig::default(),
                 None,
+                &test_ledger().await,
             )
             .await;
 
@@ -2106,7 +2315,14 @@ mod tests {
         let mock_arc = Arc::new(mock);
 
         let result = service
-            .process(&messages, mock_arc.clone(), "model", &custom_config, None)
+            .process(
+                &messages,
+                mock_arc.clone(),
+                "model",
+                &custom_config,
+                None,
+                &test_ledger().await,
+            )
             .await;
 
         assert!(result.is_err());
@@ -2312,6 +2528,7 @@ mod tests {
                 "model",
                 &RetryConfig::default(),
                 None,
+                &test_ledger().await,
             )
             .await;
 
@@ -2452,5 +2669,294 @@ mod tests {
             4,
             "2 split tool_result msgs should be merged into 1"
         );
+    }
+
+    mod accounting_tests {
+        use super::*;
+        use crate::accounting::{AccountingReason, UsageDisposition};
+        use querymt::providers::{BillingClass, ModelPricing};
+
+        fn pricing() -> ModelPricing {
+            ModelPricing {
+                input: Some(3.0),
+                output: Some(15.0),
+                cache_read: Some(0.3),
+                cache_write: Some(3.75),
+                ..Default::default()
+            }
+        }
+
+        fn usage() -> querymt::Usage {
+            querymt::Usage {
+                input_tokens: 100,
+                output_tokens: 10,
+                reasoning_tokens: 5,
+                cache_read: 50,
+                cache_write: 20,
+                cache_write_tiers: None,
+            }
+        }
+
+        fn cost() -> f64 {
+            (100.0 * 3.0 + 15.0 * 15.0 + 50.0 * 0.3 + 20.0 * 3.75) / 1e6
+        }
+
+        fn response(text: &str) -> ChatOutput {
+            let mut out = ChatOutput::from_projections(
+                None,
+                Some(text.into()),
+                None,
+                None,
+                Some(FinishReason::Stop),
+            );
+            out.usage = Some(usage());
+            out
+        }
+
+        fn legacy_stream(text: &str) -> Vec<std::result::Result<StreamChunk, LLMError>> {
+            vec![
+                Ok(StreamChunk::Text(text.into())),
+                Ok(StreamChunk::Usage(usage())),
+                Ok(StreamChunk::Done {
+                    finish_reason: FinishReason::Stop,
+                }),
+            ]
+        }
+
+        async fn run(
+            provider: Arc<ScriptedProvider>,
+            retries: usize,
+        ) -> (
+            Result<CompactionResult>,
+            Arc<crate::accounting::SessionAccounting>,
+        ) {
+            let (ledger, accounting) = ledger_with(BillingClass::Metered, Some(pricing())).await;
+            let history = [MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "hello",
+            )];
+            let result = SessionCompaction::new()
+                .process(
+                    &history,
+                    provider,
+                    "model",
+                    &retry_config(retries),
+                    None,
+                    &ledger,
+                )
+                .await;
+            (result, accounting)
+        }
+
+        #[tokio::test]
+        async fn non_streaming_rejected_summary_retries_and_both_attempts_are_charged() {
+            // First summary is empty (rejected by validation), second is usable.
+            let provider = ScriptedProvider::new(
+                false,
+                vec![
+                    Attempt::output(response("")),
+                    Attempt::output(response("a real summary")),
+                ],
+            );
+            let (result, accounting) = run(provider.clone(), 1).await;
+            assert_eq!(result.unwrap().summary, "a real summary");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+
+            let t = accounting.read(|r| r.session().clone());
+            assert_eq!(
+                t.priced_attempts, 2,
+                "the rejected summary still incurred cost"
+            );
+            assert_eq!(t.unresolved_attempts, 0);
+            // Cache read/write and reasoning are priced, once per attempt.
+            assert!((t.known_subtotal_usd - 2.0 * cost()).abs() < 1e-12);
+            assert!((t.complete_total_usd().unwrap() - 2.0 * cost()).abs() < 1e-12);
+            let compaction =
+                accounting.read(|r| r.purpose(crate::accounting::AttemptPurpose::Compaction));
+            assert_eq!(compaction.priced_attempts, 2);
+        }
+
+        #[tokio::test]
+        async fn streaming_rejected_summary_retries_and_both_attempts_are_charged() {
+            let provider = ScriptedProvider::new(
+                true,
+                vec![
+                    Attempt::Stream(legacy_stream("")),
+                    Attempt::Stream(legacy_stream("a real summary")),
+                ],
+            );
+            let (result, accounting) = run(provider.clone(), 1).await;
+            assert_eq!(result.unwrap().summary, "a real summary");
+            let t = accounting.read(|r| r.session().clone());
+            assert_eq!(t.priced_attempts, 2);
+            assert!((t.complete_total_usd().unwrap() - 2.0 * cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn exhausted_retries_keep_every_available_charge() {
+            let provider = ScriptedProvider::new(
+                false,
+                vec![
+                    Attempt::output(response("")),
+                    Attempt::output(response("  ")),
+                ],
+            );
+            let (result, accounting) = run(provider, 1).await;
+            assert!(result.is_err());
+            let t = accounting.read(|r| r.session().clone());
+            assert_eq!(t.priced_attempts, 2);
+            assert!((t.known_subtotal_usd - 2.0 * cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn interrupted_stream_keeps_partial_usage_and_stays_uncertain() {
+            let provider = ScriptedProvider::new(
+                true,
+                vec![Attempt::Stream(vec![
+                    Ok(StreamChunk::Usage(usage())),
+                    Ok(StreamChunk::Text("part".into())),
+                    Err(LLMError::ProviderError("stream broke".into())),
+                ])],
+            );
+            let (result, accounting) = run(provider, 0).await;
+            assert!(result.is_err());
+            let t = accounting.read(|r| r.session().clone());
+            assert!((t.known_subtotal_usd - cost()).abs() < 1e-12);
+            assert_eq!(t.complete_total_usd(), None);
+            assert!(t.reasons().contains(&AccountingReason::PartialUsage));
+        }
+
+        #[tokio::test]
+        async fn confirmed_rejection_adds_no_charge_and_transport_failure_is_uncertain() {
+            let (result, accounting) = run(
+                ScriptedProvider::new(
+                    true,
+                    vec![Attempt::SetupError(LLMError::AuthError("bad key".into()))],
+                ),
+                0,
+            )
+            .await;
+            assert!(result.is_err());
+            let t = accounting.read(|r| r.session().clone());
+            assert_eq!((t.priced_attempts, t.unresolved_attempts), (0, 0));
+            assert!(t.reasons().is_empty());
+
+            let (result, accounting) = run(
+                ScriptedProvider::new(
+                    true,
+                    vec![Attempt::SetupError(LLMError::HttpError("reset".into()))],
+                ),
+                0,
+            )
+            .await;
+            assert!(result.is_err());
+            let t = accounting.read(|r| r.session().clone());
+            assert_eq!(t.priced_attempts, 1);
+            assert!(t.reasons().contains(&AccountingReason::UsageUnavailable));
+        }
+
+        #[tokio::test]
+        async fn ownership_comes_from_the_ledger_not_from_history() {
+            // History carries a different session id; the charge still lands
+            // on the explicitly supplied cycle.
+            let provider = ScriptedProvider::new(false, vec![Attempt::output(response("ok"))]);
+            let (ledger, accounting) = ledger_with(BillingClass::Metered, Some(pricing())).await;
+            let history = [MessageFixture::user_message(
+                "m1",
+                "some-other-session",
+                "hello",
+            )];
+            SessionCompaction::new()
+                .process(&history, provider, "model", &retry_config(0), None, &ledger)
+                .await
+                .unwrap();
+            assert_eq!(accounting.read(|r| r.cycle("cycle-1").priced_attempts), 1);
+            assert_eq!(accounting.read(|r| r.session().priced_attempts), 1);
+        }
+
+        #[tokio::test]
+        async fn excluded_billing_records_usage_without_catalog_charges() {
+            let provider = ScriptedProvider::new(false, vec![Attempt::output(response("ok"))]);
+            let (ledger, accounting) = ledger_with(BillingClass::Excluded, None).await;
+            let history = [MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "hello",
+            )];
+            SessionCompaction::new()
+                .process(&history, provider, "model", &retry_config(0), None, &ledger)
+                .await
+                .unwrap();
+            let t = accounting.read(|r| r.session().clone());
+            assert_eq!((t.excluded_attempts, t.priced_attempts), (1, 0));
+            assert_eq!(t.known_subtotal_usd, 0.0);
+        }
+
+        #[tokio::test]
+        async fn accounting_failure_prevents_the_provider_call() {
+            let provider = ScriptedProvider::new(false, vec![Attempt::output(response("ok"))]);
+            let (ledger, _) = ledger_with(BillingClass::Metered, Some(pricing())).await;
+            // An attempt owned by another session is rejected by the recorder.
+            let foreign = crate::accounting::DispatchLedger {
+                operation: Arc::new(crate::accounting::AttemptOperation::new(
+                    Arc::new(crate::accounting::AttemptRecorder::new(
+                        crate::session_event_stream::SessionEventStream::new(
+                            "someone-else",
+                            {
+                                use crate::session::backend::StorageBackend;
+                                crate::session::sqlite_storage::SqliteStorage::connect(
+                                    ":memory:".into(),
+                                )
+                                .await
+                                .unwrap()
+                                .event_journal()
+                            },
+                            Arc::new(crate::event_fanout::EventFanout::new()),
+                        ),
+                    )),
+                    &crate::accounting::CycleAccounting::with_id(
+                        crate::accounting::SessionAccounting::hydrate("compaction-session", {
+                            use crate::session::backend::StorageBackend;
+                            crate::session::sqlite_storage::SqliteStorage::connect(
+                                ":memory:".into(),
+                            )
+                            .await
+                            .unwrap()
+                            .event_journal()
+                        })
+                        .await
+                        .unwrap(),
+                        "c",
+                    ),
+                    crate::accounting::AttemptPurpose::Compaction,
+                    "p",
+                    "model",
+                )),
+                basis: ledger.basis.clone(),
+            };
+            let history = [MessageFixture::user_message(
+                "m1",
+                "compaction-session",
+                "hello",
+            )];
+            let result = SessionCompaction::new()
+                .process(
+                    &history,
+                    provider.clone(),
+                    "model",
+                    &retry_config(2),
+                    None,
+                    &foreign,
+                )
+                .await;
+            assert!(result.is_err());
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                0,
+                "no paid request without a recorded start"
+            );
+            let _ = UsageDisposition::Final;
+        }
     }
 }

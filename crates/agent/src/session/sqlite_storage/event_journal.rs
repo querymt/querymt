@@ -253,8 +253,19 @@ impl EventJournal for SqliteStorage {
 
         tokio::task::spawn_blocking(move || -> Result<usize, rusqlite::Error> {
             let conn = conn_arc.lock().unwrap();
+            // Conversation-tail deletion must not erase incurred spend or the
+            // evidence that generation happened without an accounting basis:
+            // * attempt start/settlement records are the accounting ledger;
+            // * a request-end without `accounting` is a legacy generation
+            //   record whose cost cannot be reconstructed, so it is kept to
+            //   keep historical coverage honestly incomplete.
+            // Retained rows keep their numbers; the resulting gaps are valid.
             let deleted = conn.execute(
-                "DELETE FROM event_journal WHERE session_id = ? AND stream_seq >= ?",
+                "DELETE FROM event_journal \
+                 WHERE session_id = ? AND stream_seq >= ? \
+                   AND kind NOT IN ('llm_attempt_started', 'llm_attempt_settled') \
+                   AND NOT (kind = 'llm_request_end' \
+                            AND json_extract(payload_json, '$.data.accounting') IS NULL)",
                 params![session_id, from_seq],
             )?;
             Ok(deleted)

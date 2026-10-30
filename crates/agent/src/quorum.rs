@@ -419,7 +419,19 @@ impl AgentQuorumBuilder {
             .with_wait_timeout_secs(self.wait_timeout_secs)
             .with_cancel_grace_secs(self.cancel_grace_secs)
             .with_max_parallel_delegations(self.max_parallel_delegations)
-            .with_summarizer(self.delegation_summarizer.clone());
+            .with_summarizer(self.delegation_summarizer.clone())
+            .with_budget_pricing(
+                planner
+                    .as_any()
+                    .downcast_ref::<crate::agent::LocalAgentHandle>()
+                    .and_then(|handle| handle.config.budget_pricing()),
+            )
+            .with_budget_cap(
+                planner
+                    .as_any()
+                    .downcast_ref::<crate::agent::LocalAgentHandle>()
+                    .and_then(|handle| handle.config.budget_cap_usd()),
+            );
             if let Some(service) = workspace_service {
                 orch = orch.with_workspace_service(service);
             }
