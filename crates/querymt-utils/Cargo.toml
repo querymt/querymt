@@ -13,8 +13,7 @@ secret-store = [
     "dep:serde_json",
     "dep:tokio",
     "dep:dirs",
-    "dep:zbus-secret-service-keyring-store",
-    "dep:secret-service",
+    "zbus-secret-service",
     # Platform-native stores
     "dep:apple-native-keyring-store",
     "dep:windows-native-keyring-store",
@@ -22,8 +21,7 @@ secret-store = [
 ]
 oauth = ["secret-store", "serde", "dep:anthropic-auth", "dep:openai-auth", "dep:kimi-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio", "dep:reqwest", "dep:base64", "dep:sha2", "dep:getrandom"]
 providers = ["dep:reqwest", "dep:dirs", "dep:anyhow"]
-# Compatibility alias: Secret Service is always included with secret-store on Linux.
-dbus-secret-service = ["secret-store"]
+zbus-secret-service = ["dep:zbus-secret-service-keyring-store", "dep:secret-service"]
 # Pure-Rust TPM support; disable default features to build without it.
 tpm = ["dep:purecrypto-tpm", "dep:aes-gcm", "dep:zeroize", "dep:libc", "dep:getrandom", "dep:sha2"]
 

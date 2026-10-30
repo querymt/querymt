@@ -76,25 +76,27 @@ jobs:
             binary: qmt
             bin_name: qmt
             archive_ext: tar.gz
+            cargo_features: zbus-secret-service
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             binary: qmt
             bin_name: qmt
             archive_ext: tar.gz
+            cargo_features: zbus-secret-service
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             binary: qmtcode
             bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
-            cargo_features: oauth,dashboard,remote
+            cargo_features: oauth,dashboard,zbus-secret-service,remote
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             binary: qmtcode
             bin_name: qmtcode
             archive_ext: tar.gz
             cargo_package: querymt-agent
-            cargo_features: oauth,dashboard,remote
+            cargo_features: oauth,dashboard,zbus-secret-service,remote
 
           # ─── macOS ─────────────────────────────────────────────────────────
           - os: macos-14
@@ -200,7 +202,7 @@ jobs:
         env:
           QMT_VERSION: ${{ inputs.version_name }}
           RUSTFLAGS: ${{ matrix.rust_flags || '' }}
-        run: cargo build --release --bin qmt --target ${{ matrix.target }}
+        run: cargo build --release --bin qmt --features "${{ matrix.cargo_features }}" --target ${{ matrix.target }}
 
       # Build qmtcode example binary
       - name: Build qmtcode with Cargo
