@@ -2,7 +2,7 @@
 //!
 //! This module provides integration with Anthropic's Claude models through their API.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 mod model;
 mod strict_schema;
@@ -28,10 +28,11 @@ use querymt::{
     auth::ApiKeyResolver,
     chat::{
         ChatCall, ChatCapabilities, ChatFunctionCallItem, ChatInputPart, ChatMessage,
-        ChatMessageItem, ChatMessagePart, ChatOutput, ChatOutputItem, ChatOutputStatus,
-        ChatReasoningItem, ChatReasoningPart, ChatRole, FinishReason, GenerationOptionSupport,
-        GenerationOptions, MediaKind, MediaPart, MediaSource, ReasoningEffort, Tool, ToolChoice,
-        ToolResultPart,
+        ChatMessageItem, ChatMessagePart, ChatMessagePartDelta, ChatOpaqueItem, ChatOutput,
+        ChatOutputItem, ChatOutputStatus, ChatReasoningItem, ChatReasoningPart, ChatRole,
+        FinishReason, GenerationOptionSupport, GenerationOptions, LENGTH_CUTOFF_DETAIL, MediaKind,
+        MediaPart, MediaSource, ReasoningEffort, ReasoningPartKind, StructuredStreamEvent, Tool,
+        ToolChoice, ToolResultPart,
         http::{ChatStreamParser, HTTPChatProvider, PreparedChatRequest},
     },
     completion::{CompletionRequest, CompletionResponse, http::HTTPCompletionProvider},
@@ -163,8 +164,8 @@ pub struct Anthropic {
 ///
 /// Anthropic's SSE protocol emits tool arguments as a sequence of
 /// `input_json_delta` events followed by a `content_block_stop`.  We
-/// accumulate the partial JSON here and emit a `ToolUseComplete` chunk
-/// when the block closes.
+/// accumulate the partial JSON here and emit the authoritative function-call
+/// snapshot when the block closes.
 #[derive(Debug, Default)]
 struct AnthropicToolUseState {
     id: String,
@@ -175,10 +176,22 @@ struct AnthropicToolUseState {
 use querymt::chat::INVALID_INPUT_EXTENSION;
 
 impl AnthropicToolUseState {
+    /// The function-call item as announced at `content_block_start`.
+    fn started_item(&self) -> ChatOutputItem {
+        ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+            item_id: None,
+            call_id: self.id.clone(),
+            name: self.name.clone(),
+            arguments: String::new(),
+            status: None,
+            extensions: Default::default(),
+        })
+    }
+
     /// Complete this block. `interrupted` is set when the response was cut off
     /// while the block was still open. The raw buffer is preserved verbatim; only
     /// a normally completed block with no input deltas becomes `{}`.
-    fn into_complete(self, index: usize, interrupted: bool) -> querymt::chat::StreamChunk {
+    fn into_item(self, interrupted: bool) -> ChatOutputItem {
         let invalid = interrupted
             || (!self.arguments_buffer.is_empty()
                 && !matches!(
@@ -194,19 +207,115 @@ impl AnthropicToolUseState {
         if invalid {
             extensions.insert(INVALID_INPUT_EXTENSION.to_string(), Value::Bool(true));
         }
-        querymt::chat::StreamChunk::ToolUseComplete {
-            index,
-            tool_call: querymt::ToolCall {
-                id: self.id,
-                call_type: "function".to_string(),
-                function: querymt::FunctionCall {
-                    name: self.name,
-                    arguments,
-                },
-            },
+        ChatOutputItem::FunctionCall(ChatFunctionCallItem {
+            item_id: None,
+            call_id: self.id,
+            name: self.name,
+            arguments,
+            status: None,
             extensions,
+        })
+    }
+}
+
+/// Per-block state of an in-flight streamed content block, keyed by block index.
+#[derive(Debug)]
+enum AnthropicBlockState {
+    Text {
+        text: String,
+    },
+    /// Created at block start so an empty block (display "omitted") still
+    /// carries its signature in the completion snapshot.
+    Thinking {
+        text: String,
+        signature: String,
+    },
+    Tool(AnthropicToolUseState),
+    /// Any block type this provider does not model. Deltas are buffered here
+    /// because no structured delta targets opaque items.
+    Opaque {
+        original_type: String,
+        payload: serde_json::Map<String, Value>,
+        /// Raw `input_json_delta` text, recorded on the payload at stop.
+        input_json: String,
+    },
+}
+
+impl AnthropicBlockState {
+    /// Block kind for diagnostics.
+    fn kind(&self) -> &str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::Thinking { .. } => "thinking",
+            Self::Tool(_) => "tool_use",
+            Self::Opaque { original_type, .. } => original_type,
         }
     }
+
+    /// Authoritative snapshot of this block at `content_block_stop`.
+    fn into_item(self, interrupted: bool) -> ChatOutputItem {
+        match self {
+            Self::Text { text } => text_message_item(text),
+            Self::Thinking { text, signature } => thinking_item(text, signature),
+            Self::Tool(state) => state.into_item(interrupted),
+            Self::Opaque {
+                original_type,
+                mut payload,
+                input_json,
+            } => {
+                // Match the non-streaming block shape: parsed object input
+                // replaces `input`; anything else is kept verbatim and then
+                // takes precedence over `input`.
+                if !input_json.is_empty() {
+                    match serde_json::from_str::<Value>(&input_json) {
+                        Ok(input @ Value::Object(_)) => {
+                            payload.insert("input".into(), input);
+                        }
+                        _ => {
+                            payload.insert("input_json".into(), Value::String(input_json));
+                        }
+                    }
+                }
+                ChatOutputItem::Opaque(ChatOpaqueItem {
+                    original_type,
+                    payload: Value::Object(payload),
+                })
+            }
+        }
+    }
+}
+
+/// Assistant message item holding one text part.
+fn text_message_item(text: String) -> ChatOutputItem {
+    ChatOutputItem::Message(ChatMessageItem {
+        id: None,
+        role: ChatRole::Assistant,
+        phase: None,
+        status: None,
+        parts: vec![ChatMessagePart::Text {
+            text,
+            annotations: Vec::new(),
+            extensions: Default::default(),
+        }],
+        extensions: Default::default(),
+    })
+}
+
+/// Reasoning item for a `thinking` block; an empty signature is absent.
+fn thinking_item(text: String, signature: String) -> ChatOutputItem {
+    ChatOutputItem::Reasoning(ChatReasoningItem {
+        id: None,
+        summary: Vec::new(),
+        content: if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![ChatReasoningPart::text(text)]
+        },
+        encrypted_content: None,
+        signature: Some(signature).filter(|s| !s.is_empty()),
+        status: None,
+        extensions: Default::default(),
+    })
 }
 
 /// `input` for replaying a stored assistant tool call.
@@ -227,12 +336,6 @@ fn replay_tool_input(call: &querymt::chat::ChatFunctionCallItem) -> Value {
             Value::Object(Default::default())
         }
     }
-}
-
-/// Per-block accumulator for Anthropic thinking signature deltas.
-#[derive(Debug, Default)]
-struct AnthropicThinkingState {
-    signature: String,
 }
 
 /// Anthropic-specific tool format that matches their API structure
@@ -778,6 +881,9 @@ struct AnthropicApiErrorBody {
 /// Nested message object within an Anthropic `message_start` SSE event.
 #[derive(Deserialize, Debug)]
 struct AnthropicStreamMessage {
+    /// Provider message id.
+    #[serde(default)]
+    id: Option<String>,
     /// Usage information present in the initial message_start event.
     usage: Option<AnthropicUsage>,
 }
@@ -796,6 +902,9 @@ struct AnthropicStreamContentBlock {
     text: Option<String>,
     /// Opaque payload (for redacted_thinking blocks)
     data: Option<String>,
+    /// Remaining fields, kept so unmodelled block types round-trip as opaque items.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 /// Delta content within an Anthropic streaming response.
@@ -1853,21 +1962,272 @@ impl HTTPChatProvider for Anthropic {
         Ok(Box::new(AnthropicStreamParser {
             oauth: self.is_oauth(),
             tool_names: self.tool_names_from_context(context)?,
-            tool_state_buffer: HashMap::new(),
-            thinking_state_buffer: HashMap::new(),
+            blocks: BTreeMap::new(),
             usage: None,
+            final_usage: false,
+            metadata_sent: false,
+            terminated: false,
         }))
     }
+}
+
+/// Wrap a structured event as a stream chunk.
+fn structured(event: StructuredStreamEvent) -> querymt::chat::StreamChunk {
+    querymt::chat::StreamChunk::Structured(event)
 }
 
 struct AnthropicStreamParser {
     /// Raw, presence-aware usage accumulated across this attempt's events.
     usage: Option<AnthropicUsage>,
+    /// Whether a `message_delta` has reported usage for this response.
+    final_usage: bool,
+    /// Whether response metadata has been emitted (it must precede every item).
+    metadata_sent: bool,
+    /// Set once the response terminal is emitted; later block events emit nothing.
+    terminated: bool,
     oauth: bool,
     /// Request-scoped wire-to-original tool-name mapping.
     tool_names: HashMap<String, String>,
-    tool_state_buffer: HashMap<usize, AnthropicToolUseState>,
-    thinking_state_buffer: HashMap<usize, AnthropicThinkingState>,
+    /// In-flight content blocks keyed by block index (also the output index).
+    blocks: BTreeMap<usize, AnthropicBlockState>,
+}
+
+impl AnthropicStreamParser {
+    /// Emit in-progress metadata if no `message_start` has done so yet.
+    fn ensure_metadata(&mut self, chunks: &mut Vec<querymt::chat::StreamChunk>) {
+        if !self.metadata_sent {
+            self.metadata_sent = true;
+            chunks.push(in_progress_metadata(None, None));
+        }
+    }
+
+    /// Usage for the terminal: the overlaid final value when `message_delta`
+    /// reported usage, otherwise the start usage (output count withheld).
+    fn terminal_usage(&self) -> Option<Usage> {
+        let usage = self.usage.clone()?;
+        Some(if self.final_usage {
+            Usage::from(usage)
+        } else {
+            usage.into_start_usage()
+        })
+    }
+
+    fn start_block(
+        &mut self,
+        index: usize,
+        block: AnthropicStreamContentBlock,
+        chunks: &mut Vec<querymt::chat::StreamChunk>,
+    ) {
+        match block.block_type.as_str() {
+            "text" => {
+                let initial = block.text.unwrap_or_default();
+                chunks.push(structured(StructuredStreamEvent::ItemStarted {
+                    output_index: index,
+                    item: text_message_item(String::new()),
+                }));
+                chunks.push(structured(StructuredStreamEvent::MessagePartStarted {
+                    output_index: index,
+                    content_index: 0,
+                    part: ChatMessagePart::Text {
+                        text: String::new(),
+                        annotations: Vec::new(),
+                        extensions: Default::default(),
+                    },
+                }));
+                if !initial.is_empty() {
+                    chunks.push(structured(StructuredStreamEvent::MessagePartDelta {
+                        output_index: index,
+                        content_index: 0,
+                        delta: ChatMessagePartDelta::Text {
+                            delta: initial.clone(),
+                        },
+                    }));
+                }
+                self.blocks
+                    .insert(index, AnthropicBlockState::Text { text: initial });
+            }
+            "thinking" => {
+                // Created at block start so an empty block (display "omitted")
+                // still carries its signature in the completion snapshot.
+                chunks.push(structured(StructuredStreamEvent::ItemStarted {
+                    output_index: index,
+                    item: thinking_item(String::new(), String::new()),
+                }));
+                chunks.push(structured(StructuredStreamEvent::ReasoningPartStarted {
+                    output_index: index,
+                    part: ReasoningPartKind::Content,
+                    part_index: 0,
+                }));
+                self.blocks.insert(
+                    index,
+                    AnthropicBlockState::Thinking {
+                        text: String::new(),
+                        signature: String::new(),
+                    },
+                );
+            }
+            "redacted_thinking" => {
+                if let Some(data) = block.data.filter(|d| !d.is_empty()) {
+                    let item = redacted_reasoning_item(data);
+                    chunks.push(structured(StructuredStreamEvent::ItemStarted {
+                        output_index: index,
+                        item: item.clone(),
+                    }));
+                    chunks.push(structured(StructuredStreamEvent::ItemCompleted {
+                        output_index: index,
+                        item,
+                    }));
+                }
+            }
+            "tool_use" => {
+                let name = block.name.unwrap_or_default();
+                let name = if self.oauth {
+                    Anthropic::strip_tool_prefix(&name, Some(&self.tool_names))
+                } else {
+                    name
+                };
+                let state = AnthropicToolUseState {
+                    id: block.id.unwrap_or_default(),
+                    name,
+                    arguments_buffer: String::new(),
+                };
+                chunks.push(structured(StructuredStreamEvent::ItemStarted {
+                    output_index: index,
+                    item: state.started_item(),
+                }));
+                self.blocks.insert(index, AnthropicBlockState::Tool(state));
+            }
+            other => {
+                // Unmodelled block (e.g. `server_tool_use`): retained as a
+                // non-executable opaque item recording the start payload.
+                let original_type = other.to_string();
+                let mut payload = block.extra;
+                payload.insert("type".into(), Value::String(original_type.clone()));
+                for (key, value) in [
+                    ("id", block.id),
+                    ("name", block.name),
+                    ("text", block.text),
+                    ("data", block.data),
+                ] {
+                    if let Some(value) = value {
+                        payload.insert(key.into(), Value::String(value));
+                    }
+                }
+                chunks.push(structured(StructuredStreamEvent::ItemStarted {
+                    output_index: index,
+                    item: ChatOutputItem::Opaque(ChatOpaqueItem {
+                        original_type: original_type.clone(),
+                        payload: Value::Object(payload.clone()),
+                    }),
+                }));
+                self.blocks.insert(
+                    index,
+                    AnthropicBlockState::Opaque {
+                        original_type,
+                        payload,
+                        input_json: String::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn apply_delta(
+        &mut self,
+        index: usize,
+        delta: AnthropicDelta,
+        chunks: &mut Vec<querymt::chat::StreamChunk>,
+    ) {
+        let Some(state) = self.blocks.get_mut(&index) else {
+            // Index only: delta content is never logged.
+            log::warn!("Anthropic stream delta for content block {index} without a start");
+            return;
+        };
+        let delta_type = delta.delta_type.clone();
+        let consumed = match state {
+            AnthropicBlockState::Text { text } => {
+                let consumed = delta.text.is_some();
+                if let Some(delta) = delta.text.filter(|d| !d.is_empty()) {
+                    text.push_str(&delta);
+                    chunks.push(structured(StructuredStreamEvent::MessagePartDelta {
+                        output_index: index,
+                        content_index: 0,
+                        delta: ChatMessagePartDelta::Text { delta },
+                    }));
+                }
+                consumed
+            }
+            AnthropicBlockState::Thinking { text, signature } => {
+                let consumed = delta.thinking.is_some() || delta.signature.is_some();
+                if let Some(delta) = delta.thinking.filter(|d| !d.is_empty()) {
+                    text.push_str(&delta);
+                    chunks.push(structured(StructuredStreamEvent::ReasoningPartDelta {
+                        output_index: index,
+                        part: ReasoningPartKind::Content,
+                        part_index: 0,
+                        delta,
+                    }));
+                }
+                if let Some(delta) = delta.signature {
+                    signature.push_str(&delta);
+                }
+                consumed
+            }
+            AnthropicBlockState::Tool(state) => {
+                let consumed = delta.partial_json.is_some();
+                if let Some(delta) = delta.partial_json.filter(|d| !d.is_empty()) {
+                    state.arguments_buffer.push_str(&delta);
+                    chunks.push(structured(StructuredStreamEvent::FunctionArgumentsDelta {
+                        output_index: index,
+                        delta,
+                    }));
+                }
+                consumed
+            }
+            AnthropicBlockState::Opaque {
+                payload,
+                input_json,
+                ..
+            } => {
+                // No structured delta targets opaque items: buffer here.
+                // Other delta types are dropped, as in non-streaming.
+                if let Some(delta) = delta.partial_json {
+                    input_json.push_str(&delta);
+                }
+                if let Some(delta) = delta.text {
+                    match payload.get_mut("text") {
+                        Some(Value::String(existing)) => existing.push_str(&delta),
+                        _ => {
+                            payload.insert("text".into(), Value::String(delta));
+                        }
+                    }
+                }
+                true
+            }
+        };
+        if !consumed {
+            // Index, block kind and delta type only; never content.
+            log::debug!(
+                target: "qmt_anthropic",
+                "ignored {delta_type:?} delta for {} block {index}",
+                state.kind()
+            );
+        }
+    }
+}
+
+/// In-progress response metadata, optionally carrying start usage.
+fn in_progress_metadata(
+    response_id: Option<String>,
+    usage: Option<Usage>,
+) -> querymt::chat::StreamChunk {
+    structured(StructuredStreamEvent::ResponseMetadata {
+        response_id,
+        status: Some(ChatOutputStatus::InProgress),
+        usage,
+        finish_reason: None,
+        provenance: None,
+    })
 }
 
 impl ChatStreamParser for AnthropicStreamParser {
@@ -1898,125 +2258,108 @@ impl ChatStreamParser for AnthropicStreamParser {
                         )
                         .into());
                     }
+                    _ if self.terminated => {
+                        // Events after the terminal (late block stops, message_stop,
+                        // a repeated message_start) carry nothing the consumer can
+                        // still accept.
+                    }
+                    "message_start" if self.metadata_sent => {
+                        log::warn!(
+                            target: "qmt_anthropic",
+                            "ignoring repeated message_start within one response"
+                        );
+                    }
                     "message_start" => {
-                        if let Some(usage) = stream_resp.message.and_then(|m| m.usage) {
-                            self.usage = Some(usage.clone());
-                            chunks
-                                .push(querymt::chat::StreamChunk::Usage(usage.into_start_usage()));
+                        let message = stream_resp.message;
+                        let response_id = message.as_ref().and_then(|m| m.id.clone());
+                        let usage = message.and_then(|m| m.usage);
+                        let start_usage = usage.as_ref().map(|u| u.clone().into_start_usage());
+                        if usage.is_some() {
+                            self.usage = usage;
                         }
+                        self.metadata_sent = true;
+                        chunks.push(in_progress_metadata(response_id, start_usage));
                     }
                     "content_block_start" => {
                         if let (Some(index), Some(block)) =
                             (stream_resp.index, stream_resp.content_block)
                         {
-                            if block.block_type == "tool_use" {
-                                let name = block.name.unwrap_or_default();
-                                let name = if self.oauth {
-                                    Anthropic::strip_tool_prefix(&name, Some(&self.tool_names))
-                                } else {
-                                    name
-                                };
-                                let id = block.id.unwrap_or_default();
-
-                                self.tool_state_buffer.insert(
-                                    index,
-                                    AnthropicToolUseState {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        arguments_buffer: String::new(),
-                                    },
-                                );
-
-                                chunks.push(querymt::chat::StreamChunk::ToolUseStart {
-                                    index,
-                                    id,
-                                    name,
-                                });
-                            } else if block.block_type == "thinking" {
-                                // Created at block start so an empty block (display
-                                // "omitted") still emits its signature at block stop.
-                                self.thinking_state_buffer
-                                    .insert(index, AnthropicThinkingState::default());
-                            } else if block.block_type == "redacted_thinking"
-                                && let Some(data) = block.data.filter(|d| !d.is_empty())
-                            {
-                                chunks.push(querymt::chat::StreamChunk::RedactedThinking(data));
-                            }
+                            self.ensure_metadata(&mut chunks);
+                            self.start_block(index, block, &mut chunks);
                         }
                     }
                     "content_block_delta" => {
                         if let (Some(index), Some(delta)) = (stream_resp.index, stream_resp.delta) {
-                            if let Some(text) = delta.text {
-                                chunks.push(querymt::chat::StreamChunk::Text(text));
-                            } else if let Some(thinking) = delta.thinking {
-                                chunks.push(querymt::chat::StreamChunk::Thinking(thinking));
-                            } else if let Some(signature) = delta.signature {
-                                if let Some(state) = self.thinking_state_buffer.get_mut(&index) {
-                                    state.signature.push_str(&signature);
-                                }
-                            } else if let Some(partial_json) = delta.partial_json {
-                                if let Some(state) = self.tool_state_buffer.get_mut(&index) {
-                                    state.arguments_buffer.push_str(&partial_json);
-                                }
-
-                                chunks.push(querymt::chat::StreamChunk::ToolUseInputDelta {
-                                    index,
-                                    partial_json,
-                                });
-                            }
+                            self.apply_delta(index, delta, &mut chunks);
                         }
                     }
                     "content_block_stop" => {
-                        if let Some(index) = stream_resp.index {
-                            if let Some(state) = self.tool_state_buffer.remove(&index) {
-                                chunks.push(state.into_complete(index, false));
-                            }
-
-                            if let Some(state) = self.thinking_state_buffer.remove(&index)
-                                && !state.signature.is_empty()
-                            {
-                                chunks.push(querymt::chat::StreamChunk::ThinkingSignature(
-                                    state.signature,
-                                ));
-                            }
+                        if let Some(index) = stream_resp.index
+                            && let Some(state) = self.blocks.remove(&index)
+                        {
+                            chunks.push(structured(StructuredStreamEvent::ItemCompleted {
+                                output_index: index,
+                                item: state.into_item(false),
+                            }));
                         }
                     }
                     "message_delta" => {
                         if let Some(usage) = stream_resp.usage {
                             // Overlay onto the start event so fields this delta
                             // omits (input, cache) keep their start values.
-                            let accumulated = match self.usage.take() {
+                            self.usage = Some(match self.usage.take() {
                                 Some(mut earlier) => {
                                     earlier.overlay(usage);
                                     earlier
                                 }
                                 None => usage,
-                            };
-                            self.usage = Some(accumulated.clone());
-                            chunks.push(querymt::chat::StreamChunk::Usage(accumulated.into()));
+                            });
+                            self.final_usage = true;
                         }
 
                         if let Some(delta) = stream_resp.delta
                             && let Some(stop_reason) = delta.stop_reason
                         {
+                            self.ensure_metadata(&mut chunks);
                             let finish_reason = Anthropic::map_stop_reason_with_details(
                                 &stop_reason,
                                 delta.stop_details.as_ref(),
                             );
+                            let length = finish_reason == FinishReason::Length;
                             // Truncation leaves tool blocks open. Complete each one
-                            // exactly once, marked invalid, before the terminal; a
-                            // late block stop then finds no state and emits nothing.
-                            if finish_reason == FinishReason::Length {
-                                let mut open: Vec<usize> =
-                                    self.tool_state_buffer.keys().copied().collect();
-                                open.sort_unstable();
+                            // exactly once, in index order, marked invalid, before
+                            // the terminal.
+                            if length {
+                                let open: Vec<usize> = self
+                                    .blocks
+                                    .iter()
+                                    .filter(|(_, state)| {
+                                        matches!(state, AnthropicBlockState::Tool(_))
+                                    })
+                                    .map(|(index, _)| *index)
+                                    .collect();
                                 for index in open {
-                                    if let Some(state) = self.tool_state_buffer.remove(&index) {
-                                        chunks.push(state.into_complete(index, true));
+                                    if let Some(state) = self.blocks.remove(&index) {
+                                        chunks.push(structured(
+                                            StructuredStreamEvent::ItemCompleted {
+                                                output_index: index,
+                                                item: state.into_item(true),
+                                            },
+                                        ));
                                     }
                                 }
                             }
-                            chunks.push(querymt::chat::StreamChunk::Done { finish_reason });
+                            chunks.push(structured(StructuredStreamEvent::ResponseTerminal {
+                                status: if length {
+                                    ChatOutputStatus::Incomplete
+                                } else {
+                                    ChatOutputStatus::Completed
+                                },
+                                usage: self.terminal_usage(),
+                                finish_reason: Some(finish_reason),
+                                detail: length.then(|| LENGTH_CUTOFF_DETAIL.to_string()),
+                            }));
+                            self.terminated = true;
                         }
                     }
                     _ => {}
@@ -2764,9 +3107,7 @@ mod tests {
 "#;
         for (parser, expected) in [(&mut b, "getWeather"), (&mut a, "GetWeather")] {
             let chunks = parser.parse_chunk(frame).unwrap();
-            assert!(
-                matches!(&chunks[0], querymt::chat::StreamChunk::ToolUseStart { name, .. } if name == expected)
-            );
+            assert_eq!(started_call_names(&chunks), [expected]);
         }
     }
 
@@ -2902,15 +3243,9 @@ mod tests {
         ];
         let chunks = collect_chunks(&anthropic, &lines);
 
-        assert!(
-            matches!(
-                &chunks[0],
-                querymt::chat::StreamChunk::ToolUseStart { name, .. }
-                if name == "GetWeather"
-            ),
-            "expected ToolUseStart with exact name, got {:?}",
-            chunks[0]
-        );
+        assert_eq!(started_call_names(&chunks), ["GetWeather"]);
+        let calls = completions(&chunks);
+        assert_eq!(calls.len(), 1);
     }
 
     #[test]
@@ -2960,14 +3295,34 @@ mod tests {
         out
     }
 
+    /// The structured-event fixtures consumed by agent and remote-relay tests
+    /// are exactly what this parser emits for the checked-in SSE transcripts.
+    /// Regenerate with `UPDATE_ANTHROPIC_FIXTURES=1`.
+    #[test]
+    fn structured_event_fixtures_match_parser_output() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for name in ["structured_tool_turn", "structured_max_tokens"] {
+            let sse = std::fs::read_to_string(dir.join(format!("{name}.sse"))).unwrap();
+            let lines: Vec<&str> = sse.lines().collect();
+            let chunks = collect_chunks(&test_anthropic("sk-ant-api03-test"), &lines);
+            let actual = serde_json::to_string_pretty(&chunks).unwrap() + "\n";
+            let path = dir.join(format!("{name}.json"));
+            if std::env::var_os("UPDATE_ANTHROPIC_FIXTURES").is_some() {
+                std::fs::write(&path, &actual).unwrap();
+            }
+            let expected = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                actual, expected,
+                "{name}: parser output differs from fixture"
+            );
+        }
+    }
+
     #[test]
     fn test_streaming_tool_call_assembled() {
-        // Simulate the Anthropic SSE events for a single tool call streamed across
-        // multiple chunks:
-        //   content_block_start  → ToolUseStart
-        //   content_block_delta  → ToolUseInputDelta (×2)
-        //   content_block_stop   → ToolUseComplete  (with assembled JSON)
-        //   message_delta        → Done
+        // content_block_start -> ItemStarted(FunctionCall), input_json_delta ->
+        // FunctionArgumentsDelta, content_block_stop -> ItemCompleted, and
+        // message_delta -> ResponseTerminal.
         let anthropic = test_anthropic("sk-ant-api03-test");
 
         let lines = [
@@ -2980,62 +3335,42 @@ mod tests {
 
         let chunks = collect_chunks(&anthropic, &lines);
 
-        // ToolUseStart
+        assert!(matches!(
+            &chunks[0],
+            querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata { .. })
+        ));
+        let deltas: Vec<&str> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                querymt::chat::StreamChunk::Structured(
+                    StructuredStreamEvent::FunctionArgumentsDelta {
+                        output_index: 0,
+                        delta,
+                    },
+                ) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, [r#"{"path":"#, r#""foo.txt"}"#]);
         assert!(
-            matches!(
-                &chunks[0],
-                querymt::chat::StreamChunk::ToolUseStart { index: 0, id, name }
-                if id == "toolu_01" && name == "read_file"
-            ),
-            "expected ToolUseStart, got {:?}",
-            chunks[0]
+            chunks
+                .iter()
+                .all(|c| matches!(c, querymt::chat::StreamChunk::Structured(_)))
         );
 
-        // Two ToolUseInputDelta chunks
-        assert!(
-            matches!(
-                &chunks[1],
-                querymt::chat::StreamChunk::ToolUseInputDelta { index: 0, partial_json }
-                if partial_json == r#"{"path":"#
-            ),
-            "expected first ToolUseInputDelta, got {:?}",
-            chunks[1]
-        );
-        assert!(
-            matches!(
-                &chunks[2],
-                querymt::chat::StreamChunk::ToolUseInputDelta { index: 0, partial_json }
-                if partial_json == r#""foo.txt"}"#
-            ),
-            "expected second ToolUseInputDelta, got {:?}",
-            chunks[2]
-        );
-
-        // ToolUseComplete with fully assembled arguments
-        match &chunks[3] {
-            querymt::chat::StreamChunk::ToolUseComplete {
-                index, tool_call, ..
-            } => {
-                assert_eq!(*index, 0);
-                assert_eq!(tool_call.id, "toolu_01");
-                assert_eq!(tool_call.function.name, "read_file");
-                assert_eq!(tool_call.function.arguments, r#"{"path":"foo.txt"}"#);
+        match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Completed(output) => {
+                assert_eq!(output.items.len(), 1);
+                let ChatOutputItem::FunctionCall(call) = &output.items[0] else {
+                    panic!("expected function call: {:?}", output.items);
+                };
+                assert_eq!(call.call_id, "toolu_01");
+                assert_eq!(call.name, "read_file");
+                assert_eq!(call.arguments, r#"{"path":"foo.txt"}"#);
+                assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
             }
-            other => panic!("expected ToolUseComplete, got {:?}", other),
+            other => panic!("expected completed outcome, got {other:?}"),
         }
-
-        // Done
-        assert!(
-            matches!(
-                &chunks[4],
-                querymt::chat::StreamChunk::Done { finish_reason }
-                if *finish_reason == FinishReason::ToolCalls
-            ),
-            "expected Done, got {:?}",
-            chunks[4]
-        );
-
-        // Parser state is per-stream and dropped with the parser instance.
     }
 
     #[test]
@@ -3054,33 +3389,21 @@ mod tests {
         ];
 
         let chunks = collect_chunks(&anthropic, &lines);
+        assert_eq!(completions(&chunks).len(), 2, "expected 2 completed calls");
 
-        let complete_chunks: Vec<_> = chunks
+        let output = match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Completed(output) => output,
+            other => panic!("expected completed outcome, got {other:?}"),
+        };
+        let names: Vec<&str> = output
+            .items
             .iter()
-            .filter(|c| matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. }))
-            .collect();
-
-        assert_eq!(
-            complete_chunks.len(),
-            2,
-            "expected 2 ToolUseComplete chunks"
-        );
-
-        // Verify each complete chunk has the right tool
-        let names: std::collections::HashSet<&str> = complete_chunks
-            .iter()
-            .filter_map(|c| {
-                if let querymt::chat::StreamChunk::ToolUseComplete { tool_call, .. } = c {
-                    Some(tool_call.function.name.as_str())
-                } else {
-                    None
-                }
+            .filter_map(|item| match item {
+                ChatOutputItem::FunctionCall(call) => Some(call.name.as_str()),
+                _ => None,
             })
             .collect();
-        assert!(names.contains("read_file"));
-        assert!(names.contains("write_file"));
-
-        // Parser state is per-stream and dropped with the parser instance.
+        assert_eq!(names, ["read_file", "write_file"]);
     }
 
     fn start(index: usize, id: &str) -> String {
@@ -3105,18 +3428,51 @@ mod tests {
         chunks
             .iter()
             .filter_map(|c| match c {
-                querymt::chat::StreamChunk::ToolUseComplete {
-                    tool_call,
-                    extensions,
+                querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ItemCompleted {
+                    item: ChatOutputItem::FunctionCall(call),
                     ..
-                } => Some((
-                    tool_call.id.clone(),
-                    tool_call.function.arguments.clone(),
-                    extensions.contains_key(INVALID_INPUT_EXTENSION),
+                }) => Some((
+                    call.call_id.clone(),
+                    call.arguments.clone(),
+                    call.extensions.contains_key(INVALID_INPUT_EXTENSION),
                 )),
                 _ => None,
             })
             .collect()
+    }
+    /// Names of function calls announced by `ItemStarted` events.
+    fn started_call_names(chunks: &[querymt::chat::StreamChunk]) -> Vec<String> {
+        chunks
+            .iter()
+            .filter_map(|c| match c {
+                querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ItemStarted {
+                    item: ChatOutputItem::FunctionCall(call),
+                    ..
+                }) => Some(call.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    /// Push every chunk through a fresh accumulator and finalize it.
+    fn accumulate(chunks: &[querymt::chat::StreamChunk]) -> querymt::chat::ChatStreamFinish {
+        let mut acc = querymt::chat::ChatStreamAccumulator::new();
+        for chunk in chunks {
+            acc.push(chunk).unwrap();
+        }
+        acc.finish()
+    }
+    fn terminal_index(chunks: &[querymt::chat::StreamChunk]) -> usize {
+        chunks
+            .iter()
+            .position(|c| {
+                matches!(
+                    c,
+                    querymt::chat::StreamChunk::Structured(
+                        StructuredStreamEvent::ResponseTerminal { .. }
+                    )
+                )
+            })
+            .expect("terminal event")
     }
     fn run(lines: Vec<String>) -> Vec<querymt::chat::StreamChunk> {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -3174,15 +3530,28 @@ mod tests {
             completions(&chunks),
             [("t1".into(), r#"{"file_path":"a.rs"}"#.into(), true)]
         );
-        let done = chunks
-            .iter()
-            .position(|c| matches!(c, querymt::chat::StreamChunk::Done { .. }))
-            .unwrap();
+        let terminal = terminal_index(&chunks);
         let complete = chunks
             .iter()
-            .position(|c| matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. }))
+            .position(|c| {
+                matches!(
+                    c,
+                    querymt::chat::StreamChunk::Structured(
+                        StructuredStreamEvent::ItemCompleted { .. }
+                    )
+                )
+            })
             .unwrap();
-        assert!(complete < done, "completion precedes Done");
+        assert!(complete < terminal, "completion precedes the terminal");
+        assert!(matches!(
+            &chunks[terminal],
+            querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Incomplete,
+                finish_reason: Some(FinishReason::Length),
+                detail: Some(detail),
+                ..
+            }) if detail == LENGTH_CUTOFF_DETAIL
+        ));
     }
 
     #[test]
@@ -3196,10 +3565,7 @@ mod tests {
             stop(0),
             stop(1),
         ]);
-        let done = chunks
-            .iter()
-            .position(|c| matches!(c, querymt::chat::StreamChunk::Done { .. }))
-            .unwrap();
+        let terminal = terminal_index(&chunks);
         assert_eq!(
             completions(&chunks),
             [
@@ -3207,12 +3573,13 @@ mod tests {
                 ("second".into(), String::new(), true),
             ]
         );
-        assert!(
-            chunks[done..]
-                .iter()
-                .all(|c| !matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. })),
-            "no completion after Done"
-        );
+        assert_eq!(terminal, chunks.len() - 1, "nothing follows the terminal");
+        match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Incomplete { detail, .. } => {
+                assert_eq!(detail.as_deref(), Some(LENGTH_CUTOFF_DETAIL));
+            }
+            other => panic!("expected incomplete outcome, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3238,6 +3605,147 @@ mod tests {
     fn non_length_stop_reasons_do_not_flush_open_blocks() {
         let chunks = run(vec![start(0, "t1"), message_delta("tool_use")]);
         assert!(completions(&chunks).is_empty());
+        // The genuinely unfinished block is a protocol violation, not a pass.
+        assert!(matches!(
+            accumulate(&chunks),
+            querymt::chat::ChatStreamFinish::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn parallel_tool_calls_at_high_indexes_keep_their_own_identity() {
+        let chunks = run(vec![
+            start(2, "first"),
+            start(3, "second"),
+            delta(2, r#"{"a":1}"#),
+            delta(3, r#"{"b":2}"#),
+            stop(2),
+            stop(3),
+            message_delta("tool_use"),
+        ]);
+        let output = match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Completed(output) => output,
+            other => panic!("expected completed outcome, got {other:?}"),
+        };
+        let calls: Vec<(&str, &str)> = output
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ChatOutputItem::FunctionCall(c) => Some((c.call_id.as_str(), c.arguments.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, [("first", r#"{"a":1}"#), ("second", r#"{"b":2}"#)]);
+        assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+    }
+
+    #[test]
+    fn server_tool_block_is_opaque_and_does_not_fail_the_response() {
+        let chunks = run(vec![
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}}"#.to_string(),
+            delta(1, r#"{"query":"rust"}"#),
+            stop(1),
+            start(2, "local"),
+            delta(2, r#"{"path":"a"}"#),
+            stop(2),
+            message_delta("tool_use"),
+        ]);
+        let output = match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Completed(output) => output,
+            other => panic!("expected completed outcome, got {other:?}"),
+        };
+        assert_eq!(output.items.len(), 2);
+        let ChatOutputItem::Opaque(opaque) = &output.items[0] else {
+            panic!("expected opaque item: {:?}", output.items);
+        };
+        assert_eq!(opaque.original_type, "server_tool_use");
+        assert_eq!(opaque.payload["id"], "srv_1");
+        // Parsed input replaces the start's empty `input`, as in non-streaming.
+        assert_eq!(
+            opaque.payload["input"],
+            serde_json::json!({"query": "rust"})
+        );
+        assert!(opaque.payload.get("input_json").is_none());
+        let calls: Vec<&str> = output
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ChatOutputItem::FunctionCall(c) => Some(c.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["local"]);
+    }
+
+    #[test]
+    fn opaque_block_with_non_object_input_keeps_raw_input_json() {
+        let chunks = run(vec![
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv_1","input":{}}}"#.to_string(),
+            delta(0, r#"{"query":"#),
+            stop(0),
+            message_delta("end_turn"),
+        ]);
+        let output = match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Completed(output) => output,
+            other => panic!("expected completed outcome, got {other:?}"),
+        };
+        let ChatOutputItem::Opaque(opaque) = &output.items[0] else {
+            panic!("expected opaque item: {:?}", output.items);
+        };
+        assert_eq!(opaque.payload["input_json"], r#"{"query":"#);
+    }
+
+    #[test]
+    fn repeated_message_start_emits_no_second_metadata() {
+        let message_start =
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":5}}}"#
+                .to_string();
+        // Before the terminal and after it.
+        let chunks = run(vec![
+            message_start.clone(),
+            message_start.clone(),
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#.to_string(),
+            stop(0),
+            message_delta("end_turn"),
+            message_start,
+        ]);
+        let metadata = chunks
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    querymt::chat::StreamChunk::Structured(
+                        StructuredStreamEvent::ResponseMetadata { .. }
+                    )
+                )
+            })
+            .count();
+        assert_eq!(metadata, 1);
+        assert!(accumulate(&chunks).is_completed());
+    }
+
+    #[test]
+    fn consecutive_text_blocks_stay_separate_items() {
+        let (output, _) = stream_output(&[
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"A"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"B"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ]);
+        assert_eq!(
+            output.items,
+            [text_message_item("A".into()), text_message_item("B".into())]
+        );
+    }
+
+    #[test]
+    fn orphan_input_delta_for_unstarted_block_emits_nothing() {
+        let chunks = run(vec![delta(1, r#"{"x":1}"#), message_delta("end_turn")]);
+        assert!(completions(&chunks).is_empty());
+        assert!(accumulate(&chunks).is_completed());
     }
 
     #[test]
@@ -3259,74 +3767,74 @@ mod tests {
 
         let chunks = collect_chunks(&anthropic, &lines);
 
-        // First chunk must be Usage from message_start (input_tokens)
+        // The first chunk is structured metadata carrying the start usage.
         match &chunks[0] {
-            querymt::chat::StreamChunk::Usage(u) => {
+            querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ResponseMetadata {
+                response_id,
+                status,
+                usage: Some(u),
+                ..
+            }) => {
+                assert_eq!(*status, Some(ChatOutputStatus::InProgress));
+                assert_eq!(
+                    response_id.as_deref(),
+                    Some("msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY")
+                );
                 assert_eq!(u.input_tokens, 25);
                 // The start event's output count is a provisional placeholder;
-                // it is withheld so it cannot survive a downstream max-merge.
+                // it is withheld so it cannot survive into the final usage.
                 assert_eq!(u.output_tokens, 0);
             }
-            other => panic!("expected Usage from message_start, got {:?}", other),
+            other => panic!("expected metadata from message_start, got {other:?}"),
         }
 
-        // Exactly two Usage chunks total: one from message_start, one from message_delta
-        let usage_chunks: Vec<_> = chunks
-            .iter()
-            .filter(|c| matches!(c, querymt::chat::StreamChunk::Usage(_)))
-            .collect();
-        assert_eq!(usage_chunks.len(), 2, "expected 2 Usage chunks");
+        // No flat chunks are interleaved.
+        assert!(
+            chunks
+                .iter()
+                .all(|c| matches!(c, querymt::chat::StreamChunk::Structured(_)))
+        );
 
-        // The second Usage chunk comes from message_delta and carries output_tokens
-        match usage_chunks[1] {
-            querymt::chat::StreamChunk::Usage(u) => {
-                assert_eq!(u.output_tokens, 15);
+        // Exactly one terminal, carrying the final overlaid usage.
+        let terminal = terminal_index(&chunks);
+        match &chunks[terminal] {
+            querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ResponseTerminal {
+                status,
+                usage: Some(u),
+                finish_reason,
+                detail,
+            }) => {
+                assert_eq!(*status, ChatOutputStatus::Completed);
+                assert_eq!(*finish_reason, Some(FinishReason::Stop));
+                assert!(detail.is_none());
+                assert_eq!((u.input_tokens, u.output_tokens), (25, 15));
             }
-            other => panic!("expected second Usage from message_delta, got {:?}", other),
+            other => panic!("expected terminal with usage, got {other:?}"),
         }
 
-        // Text chunks should have been emitted
-        let text: String = chunks
-            .iter()
-            .filter_map(|c| {
-                if let querymt::chat::StreamChunk::Text(t) = c {
-                    Some(t.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(text, "Hello!");
+        // The finished text equals the concatenated deltas.
+        match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Completed(output) => {
+                assert_eq!(output.items.len(), 1);
+                assert_eq!(output.text().as_deref(), Some("Hello!"));
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
     }
 
     #[test]
     fn test_streaming_usage_merge_max_gives_correct_totals() {
-        // Verifies that applying Usage::merge_max across the two Usage chunks
-        // emitted by the Anthropic provider yields the correct final totals.
-        // This mirrors what transitions.rs now does for every streaming response.
-        let anthropic = test_anthropic("sk-ant-api03-test");
+        // The terminal carries the start usage overlaid with the final output
+        // count, so the accumulated usage is already correct.
+        let (output, _) = stream_output(&[
+            r#"{"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-opus-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}"#,
+        ]);
 
-        let lines = [
-            r#"data: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","content":[],"model":"claude-opus-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":1}}}"#,
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":15}}"#,
-        ];
-
-        let chunks = collect_chunks(&anthropic, &lines);
-
-        // Collect all Usage chunks and fold them with merge_max (same logic as transitions.rs)
-        let merged = chunks.iter().fold(None::<Usage>, |acc, chunk| {
-            if let querymt::chat::StreamChunk::Usage(u) = chunk {
-                Some(match acc {
-                    Some(prev) => prev.merge_max(u.clone()),
-                    None => u.clone(),
-                })
-            } else {
-                acc
-            }
-        });
-
-        let merged = merged.expect("at least one Usage chunk expected");
+        let merged = output.usage.expect("usage expected");
         assert_eq!(
             merged.input_tokens, 25,
             "input_tokens must come from message_start"
@@ -3341,7 +3849,7 @@ mod tests {
 
     #[test]
     fn test_streaming_text_only_no_tool_complete() {
-        // Pure text response — no ToolUseComplete should be emitted
+        // Pure text response: no function call completes, and no flat chunk is emitted.
         let anthropic = test_anthropic("sk-ant-api03-test");
 
         let lines = [
@@ -3353,19 +3861,19 @@ mod tests {
 
         let chunks = collect_chunks(&anthropic, &lines);
 
-        assert!(
-            !chunks
-                .iter()
-                .any(|c| matches!(c, querymt::chat::StreamChunk::ToolUseComplete { .. })),
-            "no ToolUseComplete expected for a text-only response"
-        );
+        assert!(completions(&chunks).is_empty());
         assert!(
             chunks
                 .iter()
-                .any(|c| matches!(c, querymt::chat::StreamChunk::Text(t) if t == "Hello!")),
-            "expected a Text chunk"
+                .all(|c| matches!(c, querymt::chat::StreamChunk::Structured(_)))
         );
-        // Parser state is per-stream and dropped with the parser instance.
+        match accumulate(&chunks) {
+            querymt::chat::ChatStreamFinish::Completed(output) => {
+                assert_eq!(output.text().as_deref(), Some("Hello!"));
+                assert_eq!(output.finish_reason, Some(FinishReason::Stop));
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4088,7 +4596,7 @@ mod tests {
 
     #[test]
     fn streaming_omitted_thinking_block_emits_signature() {
-        let (output, chunks) = stream_output(&[
+        let (output, _) = stream_output(&[
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG"}}"#,
@@ -4098,11 +4606,6 @@ mod tests {
             r#"{"type":"content_block_stop","index":1}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10}}"#,
         ]);
-        assert!(
-            chunks.iter().any(
-                |c| matches!(c, querymt::chat::StreamChunk::ThinkingSignature(s) if s == "SIG")
-            )
-        );
         let ChatOutputItem::Reasoning(r) = &output.items[0] else {
             panic!("expected reasoning first: {:?}", output.items);
         };
@@ -4145,9 +4648,20 @@ mod tests {
             r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read_file"}}"#,
             r#"{"type":"content_block_stop","index":1}"#,
         ]);
-        assert!(chunks.iter().any(
-            |c| matches!(c, querymt::chat::StreamChunk::RedactedThinking(d) if d == "OPAQUE")
-        ));
+        // Started and completed immediately, exactly once, despite the later stop.
+        let completed_reasoning = chunks
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    querymt::chat::StreamChunk::Structured(StructuredStreamEvent::ItemCompleted {
+                        output_index: 0,
+                        item: ChatOutputItem::Reasoning(_),
+                    })
+                )
+            })
+            .count();
+        assert_eq!(completed_reasoning, 1);
         let ChatOutputItem::Reasoning(r) = &output.items[0] else {
             panic!("expected reasoning");
         };
@@ -4344,12 +4858,20 @@ mod tests {
         assert_eq!(usage.output_tokens, 0);
         assert_eq!(usage.reasoning_tokens, 100);
         assert_eq!(usage.input_tokens, 7);
-        // The provisional value is never emitted as ordinary output.
+        // The provisional value is never emitted as ordinary output: neither
+        // the start metadata nor the terminal carries a non-zero ordinary count.
+        let mut seen = 0;
         for chunk in &chunks {
-            if let querymt::chat::StreamChunk::Usage(u) = chunk {
+            if let querymt::chat::StreamChunk::Structured(
+                StructuredStreamEvent::ResponseMetadata { usage: Some(u), .. }
+                | StructuredStreamEvent::ResponseTerminal { usage: Some(u), .. },
+            ) = chunk
+            {
                 assert_eq!(u.output_tokens, 0);
+                seen += 1;
             }
         }
+        assert_eq!(seen, 2, "start metadata and terminal both carry usage");
     }
 
     #[test]
@@ -4372,22 +4894,13 @@ mod tests {
         let usage = output.usage.unwrap();
         assert_eq!((usage.input_tokens, usage.cache_read), (25, 9));
 
-        // The parser's authoritative (last) usage chunk carries the replacement.
-        // The shared accumulator still max-merges chunks, so it cannot lower a
-        // value already emitted; that is a generic-merge limit this change
-        // deliberately leaves alone, so assert on the parser output here.
-        let (_, chunks) = stream_output(&[
+        // The terminal carries the overlaid value, and the accumulator takes the
+        // terminal usage as authoritative, so the replacement is visible.
+        let (output, _) = stream_output(&[
             r#"{"type":"message_start","message":{"usage":{"input_tokens":25,"cache_read_input_tokens":9}}}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":25,"cache_read_input_tokens":0,"output_tokens":5}}"#,
         ]);
-        let last = chunks
-            .iter()
-            .rev()
-            .find_map(|c| match c {
-                querymt::chat::StreamChunk::Usage(u) => Some(u),
-                _ => None,
-            })
-            .unwrap();
+        let last = output.usage.unwrap();
         assert_eq!((last.input_tokens, last.cache_read), (25, 0));
     }
 

@@ -3016,6 +3016,140 @@ mod tests {
             assert!(results["call_cut"].contains("split the write"));
         }
 
+        // ── Anthropic structured streams ────────────────────────────────────
+        // Fixtures are the exact output of the Anthropic stream parser for a
+        // checked-in SSE transcript; `qmt-anthropic` asserts they stay current.
+
+        fn anthropic_fixture(name: &str) -> Vec<StreamChunk> {
+            let path = format!(
+                "{}/../providers/anthropic/tests/fixtures/{name}.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture"))
+                .expect("fixture chunks")
+        }
+
+        fn has_retry_wait(events: &[crate::events::AgentEventKind]) -> bool {
+            events
+                .iter()
+                .any(|kind| matches!(kind, crate::events::AgentEventKind::LlmRetryWait { .. }))
+        }
+
+        /// Session 01a18903: an opaque server-tool block alongside local calls
+        /// used to fail every turn with unfinished tool call indexes and burn
+        /// retries. Both local calls dispatch once; the opaque block never does.
+        #[tokio::test]
+        async fn anthropic_structured_stream_dispatches_local_calls_once_and_stores_history() {
+            let (state, events, factory) =
+                run_streamed_reply(anthropic_fixture("structured_tool_turn")).await;
+
+            assert!(!has_retry_wait(&events), "no llm_retry_wait: {events:?}");
+            assert!(factory.provider.attempts.lock().unwrap().is_empty());
+            let ExecutionState::ProcessingToolCalls {
+                remaining_calls,
+                context,
+                ..
+            } = state
+            else {
+                panic!("expected ProcessingToolCalls, got {}", state.name());
+            };
+            let ids: Vec<&str> = remaining_calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                ["toolu_a", "toolu_b"],
+                "each local call dispatched once"
+            );
+
+            // Stored history keeps every block in order: signed reasoning, text,
+            // the opaque server block, then both calls.
+            let assistant = context
+                .messages
+                .iter()
+                .find(|message| message.has_tool_use())
+                .expect("assistant message in history");
+            let items = &assistant.output().expect("assistant output kept").items;
+            assert_eq!(items.len(), 5, "{items:?}");
+            let ChatOutputItem::Reasoning(reasoning) = &items[0] else {
+                panic!("expected reasoning first: {items:?}");
+            };
+            assert_eq!(reasoning.signature.as_deref(), Some("SIG"));
+            assert_eq!(reasoning.visible_text(), "let me look");
+            assert!(matches!(&items[1], ChatOutputItem::Message(_)));
+            assert!(
+                matches!(&items[2], ChatOutputItem::Opaque(o) if o.original_type == "server_tool_use")
+            );
+            let calls: Vec<(&str, &str)> = items[3..]
+                .iter()
+                .filter_map(|item| match item {
+                    ChatOutputItem::FunctionCall(c) => {
+                        Some((c.call_id.as_str(), c.arguments.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                calls,
+                [
+                    ("toolu_a", r#"{"path":"a.rs"}"#),
+                    ("toolu_b", r#"{"path":"b.rs"}"#)
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn anthropic_structured_stream_projects_text_and_thinking_to_the_ui() {
+            let (_, events, _) =
+                run_streamed_reply(anthropic_fixture("structured_tool_turn")).await;
+
+            let text: String = events
+                .iter()
+                .filter_map(|kind| match kind {
+                    crate::events::AgentEventKind::AssistantContentDelta { content, .. } => {
+                        Some(content.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(text, "Checking both files.");
+
+            let thinking: Vec<(&str, Option<&str>)> = events
+                .iter()
+                .filter_map(|kind| match kind {
+                    crate::events::AgentEventKind::AssistantThinkingDelta {
+                        content,
+                        part_id,
+                        ..
+                    } => Some((content.as_str(), part_id.as_deref())),
+                    _ => None,
+                })
+                .collect();
+            assert!(!thinking.is_empty(), "thinking deltas must reach the UI");
+            let joined: String = thinking.iter().map(|(content, _)| *content).collect();
+            assert_eq!(joined, "let me look");
+            assert!(
+                thinking.iter().all(|(_, part)| *part == thinking[0].1),
+                "one part id per reasoning item: {thinking:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn anthropic_max_tokens_with_open_tool_block_reaches_output_limit_recovery() {
+            let (state, events, factory) =
+                run_streamed_reply(anthropic_fixture("structured_max_tokens")).await;
+
+            assert!(!has_retry_wait(&events), "a length cut-off must not retry");
+            assert!(factory.provider.attempts.lock().unwrap().is_empty());
+            // `stopped_results` also asserts the stop type is the model token limit.
+            let (_, results) = stopped_results(state);
+            assert_eq!(results.len(), 1, "exactly one result: {results:?}");
+            let text = &results["toolu_cut"];
+            assert!(text.contains("INVALID_JSON"), "{text}");
+            assert!(text.contains("split the write"), "{text}");
+        }
+
         #[test]
         fn length_cutoff_is_classified_by_finish_reason_only() {
             let reply = |finish| LlmResponse::new(String::new(), Vec::new(), None, Some(finish));
