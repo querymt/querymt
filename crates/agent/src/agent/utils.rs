@@ -291,9 +291,14 @@ pub(crate) mod genai {
     impl StreamTiming {
         /// Call before each physical request attempt. Only the first call starts the clock.
         pub(crate) fn start(&mut self) {
-            // Gaps and local-processing time never span attempts.
+            // Aggregates describe the final attempt only; the first-byte/chunk/token
+            // latencies keep spanning the whole logical call.
             self.last_chunk = None;
             self.poll_ended = None;
+            self.chunks = 0;
+            self.max_gap = std::time::Duration::ZERO;
+            self.wait = std::time::Duration::ZERO;
+            self.process = std::time::Duration::ZERO;
             if self.started.is_none() {
                 self.started = Some(std::time::Instant::now());
             }
@@ -957,9 +962,8 @@ mod tests {
                 "{key} must be recorded once"
             );
         }
-        assert_eq!(attr(chat, "qmt.stream.chunk_count"), Some(&Value::I64(3)));
-        assert!(secs("qmt.stream.wait_ms") >= 35.0);
-        assert!(secs("qmt.stream.max_gap_ms") >= 15.0);
+        // Aggregates cover the final attempt only (one chunk after the retry start()).
+        assert_eq!(attr(chat, "qmt.stream.chunk_count"), Some(&Value::I64(1)));
         assert!(attr(chat, "gen_ai.server.time_to_first_token").is_none());
         assert_private(&spans);
     }

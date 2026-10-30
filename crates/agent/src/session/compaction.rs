@@ -374,6 +374,7 @@ impl SessionCompaction {
                 output: None,
             });
         }
+        timing.finish(chat_span);
         // Only collect already-buffered usage; post-terminal events must bypass validation.
         let mut trailing: Option<querymt::Usage> = None;
         while let Some(Some(Ok(querymt::chat::StreamChunk::Usage(extra)))) =

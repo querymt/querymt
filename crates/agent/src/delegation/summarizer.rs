@@ -394,6 +394,7 @@ impl DelegationSummarizer {
                 output: None,
             });
         }
+        timing.finish(&chat_span);
         // Keep failed/incomplete terminal metadata, but retain canonical item validation.
         let finish = accumulator.finish();
         let completed = finish.is_completed();
