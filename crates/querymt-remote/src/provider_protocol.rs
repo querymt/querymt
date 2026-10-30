@@ -468,6 +468,68 @@ mod item_aware_tests {
         assert_eq!(streamed.items, output.items);
     }
 
+    /// The Anthropic parser's structured output (metadata, signed reasoning,
+    /// text, an opaque server block, two local calls, a terminal) crosses the
+    /// relay encoding, is recognised as terminal only at `ResponseTerminal`, and
+    /// accumulates without any flat `Done` chunk. The fixture is asserted against
+    /// the parser in `qmt-anthropic`.
+    #[test]
+    fn anthropic_shaped_structured_stream_terminates_on_response_terminal() {
+        let path = format!(
+            "{}/../providers/anthropic/tests/fixtures/structured_tool_turn.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let events: Vec<StreamChunk> =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture"))
+                .expect("fixture chunks");
+        assert!(
+            events
+                .iter()
+                .all(|c| matches!(c, StreamChunk::Structured(_)))
+        );
+        let last = events.len() - 1;
+
+        let mut accumulator = ChatStreamAccumulator::new();
+        let expected = {
+            let mut accumulator = ChatStreamAccumulator::new();
+            for chunk in &events {
+                accumulator.push(chunk).expect("accumulate locally");
+            }
+            accumulator.finish_success().expect("complete locally")
+        };
+        for (position, chunk) in events.into_iter().enumerate() {
+            let relay = StreamRelayMessage::Chunk(chunk);
+            let decoded: StreamRelayMessage =
+                serde_json::from_slice(&serde_json::to_vec(&relay).expect("serialize"))
+                    .expect("deserialize");
+            assert_eq!(
+                relay_message_is_terminal(&decoded),
+                position == last,
+                "only the ResponseTerminal event closes the relay (event {position})"
+            );
+            let StreamRelayMessage::Chunk(chunk) = decoded else {
+                panic!("expected relayed chunk")
+            };
+            accumulator.push(&chunk).expect("accumulate chunk");
+        }
+
+        let output = accumulator.finish_success().expect("complete stream");
+        assert_eq!(output.items, expected.items, "relay preserves every item");
+        assert_eq!(output.items.len(), 5);
+        assert_eq!(output.finish_reason, Some(FinishReason::ToolCalls));
+
+        // A batched delivery containing the terminal is also recognised.
+        let batch = StreamRelayMessage::ChunkBatch(vec![StreamChunk::Structured(
+            StructuredStreamEvent::ResponseTerminal {
+                status: ChatOutputStatus::Completed,
+                usage: None,
+                finish_reason: Some(FinishReason::Stop),
+                detail: None,
+            },
+        )]);
+        assert!(relay_message_is_terminal(&batch));
+    }
+
     #[test]
     fn requests_advertise_item_aware_contract_only_when_needed() {
         let config = crate::RemoteProviderClientConfig::new("peer", "demo", "m1");

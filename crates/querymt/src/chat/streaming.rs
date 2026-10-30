@@ -214,6 +214,11 @@ pub struct ChatStreamAccumulator {
     structured_items: BTreeMap<usize, ChatOutputItem>,
     completed_items: BTreeSet<usize>,
     pending_legacy_calls: BTreeSet<usize>,
+    /// Every flat-chunk call index that received a start this attempt, so a
+    /// delta after completion is not mistaken for a delta without a start.
+    started_legacy_calls: BTreeSet<usize>,
+    /// Orphan delta indexes already reported, so each warns once per attempt.
+    warned_orphan_calls: BTreeSet<usize>,
     terminal_detail: Option<String>,
     terminal_seen: bool,
 }
@@ -226,6 +231,8 @@ impl Default for ChatStreamAccumulator {
             structured_items: BTreeMap::new(),
             completed_items: BTreeSet::new(),
             pending_legacy_calls: BTreeSet::new(),
+            started_legacy_calls: BTreeSet::new(),
+            warned_orphan_calls: BTreeSet::new(),
             terminal_detail: None,
             terminal_seen: false,
         }
@@ -321,11 +328,24 @@ impl ChatStreamAccumulator {
             }
             StreamChunk::ToolUseStart { index, .. } => {
                 self.select_legacy();
+                self.started_legacy_calls.insert(*index);
                 self.pending_legacy_calls.insert(*index);
             }
             StreamChunk::ToolUseInputDelta { index, .. } => {
                 self.select_legacy();
-                self.pending_legacy_calls.insert(*index);
+                // Only an explicit start opens a pending call. A delta for an
+                // index that was never started cannot become an executable
+                // call, so it is reported (index only, never argument text)
+                // and otherwise ignored, once per index.
+                if self.pending_legacy_calls.contains(index) {
+                    // Normal delta for an open call.
+                } else if self.started_legacy_calls.contains(index) {
+                    log::debug!("tool call argument delta for index {index} after completion");
+                } else if self.warned_orphan_calls.insert(*index) {
+                    log::warn!(
+                        "provider contract violation: tool call argument delta for index {index} without a start"
+                    );
+                }
             }
         }
         Ok(())
@@ -1270,6 +1290,100 @@ mod tests {
             })
             .unwrap();
         assert!(accumulator.finish().is_completed());
+    }
+
+    fn legacy_tool_complete(index: usize, id: &str) -> StreamChunk {
+        StreamChunk::ToolUseComplete {
+            index,
+            tool_call: ToolCall {
+                id: id.into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            extensions: Default::default(),
+        }
+    }
+
+    #[test]
+    fn legacy_orphan_argument_delta_does_not_fail_response() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::ToolUseStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "lookup".into(),
+            },
+            StreamChunk::ToolUseInputDelta {
+                index: 1,
+                partial_json: "{\"a\":".into(),
+            },
+            StreamChunk::ToolUseInputDelta {
+                index: 1,
+                partial_json: "1}".into(),
+            },
+            legacy_tool_complete(0, "call_0"),
+            // A late delta for a completed call is not an orphan.
+            StreamChunk::ToolUseInputDelta {
+                index: 0,
+                partial_json: "x".into(),
+            },
+            StreamChunk::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        // Index 1 is reported once; the late delta for 0 is not reported.
+        assert_eq!(
+            accumulator.warned_orphan_calls,
+            BTreeSet::from([1]),
+            "one orphan warning, for index 1 only"
+        );
+        match accumulator.finish() {
+            ChatStreamFinish::Completed(output) => {
+                let calls: Vec<_> = output
+                    .items
+                    .iter()
+                    .filter_map(|item| match item {
+                        ChatOutputItem::FunctionCall(call) => Some(call.arguments.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(calls, ["{}"], "completed call unchanged");
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_started_call_with_deltas_but_no_completion_still_fails() {
+        let mut accumulator = ChatStreamAccumulator::new();
+        for chunk in [
+            StreamChunk::ToolUseStart {
+                index: 1,
+                id: "call_1".into(),
+                name: "lookup".into(),
+            },
+            StreamChunk::ToolUseInputDelta {
+                index: 1,
+                partial_json: "{\"a\":1}".into(),
+            },
+            StreamChunk::Done {
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ] {
+            accumulator.push(&chunk).unwrap();
+        }
+        match accumulator.finish() {
+            ChatStreamFinish::Failed { error, .. } => assert_eq!(
+                error,
+                ChatStreamAccumulatorError::IncompleteToolCalls(vec![1])
+            ),
+            other => panic!("expected failed outcome, got {other:?}"),
+        }
     }
 
     #[test]
