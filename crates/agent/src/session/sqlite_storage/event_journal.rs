@@ -114,6 +114,31 @@ impl EventJournal for SqliteStorage {
         .map_err(SessionError::from)
     }
 
+    async fn load_delegation_terminals(
+        &self,
+        session_id: &str,
+        delegation_ids: &[String],
+    ) -> SessionResult<Vec<DurableEvent>> {
+        if delegation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let session_id = session_id.to_string();
+        let ids = serde_json::to_string(delegation_ids)
+            .map_err(|err| SessionError::Other(err.to_string()))?;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Vec<DurableEvent>, rusqlite::Error> {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT event_id, stream_seq, session_id, timestamp, origin, source_node, payload_json, session_seq \
+                 FROM event_journal WHERE session_id = ?1 \
+                 AND kind IN ('delegation_completed', 'delegation_failed', 'delegation_cancelled') \
+                 AND json_extract(payload_json, '$.data.delegation_id') IN (SELECT value FROM json_each(?2)) \
+                 ORDER BY stream_seq ASC"
+            )?;
+            stmt.query_map(params![session_id, ids], parse_journal_row)?.collect()
+        }).await.map_err(|err| SessionError::Other(err.to_string()))?.map_err(SessionError::from)
+    }
+
     async fn last_unfinished_run(&self, session_id: &str) -> SessionResult<Option<String>> {
         let session_id = session_id.to_string();
         let conn_arc = self.conn.clone();

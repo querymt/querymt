@@ -1704,7 +1704,7 @@ pub(crate) fn spawn_event_forwarders(
                             )
                             .await;
                             delivery.finish_lag_recovery();
-                            if !keep_going {
+                            if !keep_going || !refresh_session_observations(&state_events, &connection_events, &translator).await {
                                 break;
                             }
                             continue;
@@ -1717,6 +1717,62 @@ pub(crate) fn spawn_event_forwarders(
                 }
             }
         });
+    }
+}
+
+async fn refresh_session_observations(
+    state: &WsServerState,
+    connection: &ConnectionEventState,
+    translator: &Arc<StdMutex<AcpLiveEventTranslator>>,
+) -> bool {
+    let refresh = async {
+        let session_ids: Vec<_> = state
+            .session_owners
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, owners)| owners.contains(&connection.conn_id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let (mut notifications, updates) = crate::acp::shared::current_session_observations(
+            &state.agent,
+            &session_ids,
+            &state.event_sources,
+        )
+        .await;
+        translator
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .restore_delegation_observations(&updates);
+        notifications.extend(
+            updates
+                .into_iter()
+                .map(crate::acp::shared::delegation_update_notification),
+        );
+        for notification in notifications {
+            let session_id = notification["params"]["session_id"]
+                .as_str()
+                .or_else(|| notification["params"]["sessionId"].as_str())
+                .unwrap_or_default();
+            if !state
+                .session_owners
+                .lock()
+                .await
+                .get(session_id)
+                .is_some_and(|owners| owners.contains(&connection.conn_id))
+            {
+                continue;
+            }
+            if connection.tx.send(notification.to_string()).await.is_err() {
+                return false;
+            }
+        }
+        true
+    };
+    tokio::select! {
+        biased;
+        _ = connection.connection_cancel.cancelled() => false,
+        keep_going = refresh => keep_going,
     }
 }
 

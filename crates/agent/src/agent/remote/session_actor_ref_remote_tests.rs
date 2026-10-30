@@ -114,6 +114,341 @@ mod session_actor_ref_remote_tests {
     // ── E.1 ──────────────────────────────────────────────────────────────────
 
     #[tokio::test]
+    async fn status_consistency_attached_remote_owner_matches_direct_and_listing() {
+        use crate::send_agent::SendAgent;
+        use crate::session::backend::StorageBackend;
+        use crate::test_utils::{MockChatResponse, MockLlmProvider, SharedLlmProvider, TestAgent};
+        use crate::tools::{Tool, ToolRegistry, builtins::ShellTool};
+        use std::sync::Arc;
+        let tool_dir = tempfile::tempdir().unwrap();
+        let release_file = tool_dir.path().join("remote-tool-release");
+        let release_for_tool = release_file.clone();
+        let mut mock = MockLlmProvider::new();
+        let respond = move |messages: &[querymt::chat::ChatMessage]| {
+            if messages.last().is_some_and(|message| {
+                message
+                    .portable_input_parts()
+                    .iter()
+                    .any(|part| part.is_tool_result())
+            }) {
+                MockChatResponse::text_only("remote tool complete")
+            } else {
+                MockChatResponse::with_tools("remote tool running", vec![querymt::ToolCall {
+                    id: "remote-status-tool".into(), call_type: "function".into(),
+                    function: querymt::FunctionCall { name: "shell".into(), arguments: serde_json::json!({"command":"sh", "args":["-c", "i=0; while test ! -f \"$1\" && test $i -lt 1000; do i=$((i+1)); sleep 0.01; done; test -f \"$1\"", "qmt-remote-tool", release_for_tool], "workdir":std::env::temp_dir()}).to_string() },
+                }])
+            }
+        };
+        let respond = Arc::new(respond);
+        let tool_response = respond.clone();
+        mock.expect_chat_with_tools()
+            .returning(move |messages, _| Ok(tool_response(messages).into()));
+        mock.expect_chat()
+            .returning(move |messages| Ok(respond(messages).into()));
+        let host = TestAgent::with_mock_provider(SharedLlmProvider::new(
+            mock,
+            vec![ShellTool::new().definition()],
+        ))
+        .await;
+        let mut tools = ToolRegistry::new();
+        tools.add(Arc::new(ShellTool::new()));
+        let config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::from_provider(
+                host.storage.clone(),
+                host.config.provider.clone(),
+                host.storage.event_journal(),
+            )
+            .with_tool_registry(tools)
+            .build(),
+        );
+        let fixture = TestAgent::new().await;
+        let local_control = fixture
+            .storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let (remote, local, owner_config, sid) =
+            remote_session_ref_for_config("status-owner", config, "mock-model").await;
+        let mesh = get_test_mesh().await;
+        fixture.handle.set_mesh(mesh.clone());
+        let owner_handle = crate::agent::LocalAgentHandle::from_config(owner_config.clone());
+        owner_handle
+            .registry
+            .lock()
+            .await
+            .insert(sid.clone(), SessionActorRef::Local(local.clone()));
+        let manager = crate::agent::remote::RemoteNodeManager::spawn(
+            crate::agent::remote::RemoteNodeManager::new(
+                owner_config.clone(),
+                owner_handle.registry.clone(),
+                Some(mesh.clone()),
+                owner_handle.scheduler_handle.clone(),
+            )
+            .with_node_name("status-owner".to_string()),
+        );
+        mesh.register_actor(
+            manager.clone(),
+            crate::agent::remote::scope::scoped_node_manager_for_peer(
+                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                mesh.peer_id(),
+            ),
+        )
+        .await;
+        let node = mesh.peer_id().to_string();
+        fixture
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: sid.clone(),
+                node_id: node.clone(),
+                peer_label: "status-owner".into(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+            })
+            .await
+            .unwrap();
+        fixture
+            .handle
+            .registry
+            .lock()
+            .await
+            .insert(sid.clone(), remote.clone());
+        let executing = remote.clone();
+        let run_sid = sid.clone();
+        let prompt = tokio::spawn(async move {
+            executing
+                .prompt(crate::acp::protocol::PromptRequest::new(
+                    run_sid,
+                    vec![crate::acp::protocol::ContentBlock::Text(
+                        crate::acp::protocol::TextContent::new("run bounded remote tool"),
+                    )],
+                ))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if remote.get_runtime_status().await.unwrap().phase
+                    == crate::agent::messages::SessionRuntimePhase::Tools
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut list_request = crate::acp::protocol::ListSessionsRequest::new();
+        list_request.meta = Some(
+            serde_json::json!({"remoteNodeIds": [node]})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let owner = local
+            .ask(crate::agent::messages::GetRuntimeStatus)
+            .await
+            .unwrap();
+        let direct = remote.get_runtime_status().await.unwrap();
+        assert_eq!(direct, owner);
+        let observed = fixture
+            .handle
+            .observe_session_runtimes(std::slice::from_ref(&sid))
+            .await
+            .remove(&sid)
+            .unwrap();
+        assert_eq!(observed, owner);
+        let listed = fixture
+            .handle
+            .list_sessions(list_request.clone())
+            .await
+            .unwrap();
+        let local_meta = listed
+            .sessions
+            .iter()
+            .find(|row| row.session_id.to_string() == local_control.public_id)
+            .unwrap()
+            .meta
+            .as_ref()
+            .unwrap();
+        assert_eq!(local_meta["messageCount"], 0);
+        assert_eq!(local_meta["userMessageCount"], 0);
+        assert_eq!(local_meta["hasErrors"], false);
+        let cursor_listed = fixture
+            .handle
+            .list_sessions(list_request.clone().cursor("remote:0:0:bookmarks"))
+            .await
+            .unwrap();
+        for page in [&listed, &cursor_listed] {
+            let row = page
+                .sessions
+                .iter()
+                .find(|row| row.session_id.to_string() == sid)
+                .unwrap();
+            let meta = row.meta.as_ref().unwrap();
+            assert_eq!(meta["runtimeStatus"], serde_json::to_value(&owner).unwrap());
+            assert_eq!(meta["location"], "remote");
+            assert_eq!(meta["nodeId"], node);
+            assert_eq!(meta["nodeLabel"], "status-owner");
+            for field in ["messageCount", "userMessageCount", "hasErrors"] {
+                assert!(!meta.contains_key(field), "remote row fabricated {field}");
+            }
+        }
+        let loaded = fixture
+            .handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                sid.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let load_snapshot = &loaded.meta.as_ref().unwrap()["querymt/sessionLoadSnapshot.v1"];
+        let attached = fixture
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/remote/attachSession",
+                Arc::from(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({"node_id": node, "session_id": sid}),
+                    )
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let attached: serde_json::Value = serde_json::from_str(attached.0.get()).unwrap();
+        for snapshot in [load_snapshot, &attached["snapshot"]] {
+            assert_eq!(
+                snapshot["runtimeStatus"],
+                serde_json::to_value(&owner).unwrap(),
+                "actual remote route must include owner runtime"
+            );
+            assert!(
+                snapshot["audit"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"]["type"] == "prompt_received"),
+                "owner history must remain present"
+            );
+            assert!(snapshot["cursor"]["local_seq"].as_i64().unwrap() > 0);
+            let events: Vec<crate::events::AgentEvent> =
+                serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.kind,
+                    crate::events::AgentEventKind::LlmAttemptStarted { .. }
+                )),
+                "owner history must contain actual recorded accounting"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event.kind,
+                    crate::events::AgentEventKind::LlmAttemptSettled { .. }
+                )),
+                "owner snapshot must include the actual attempt settlement"
+            );
+            assert_eq!(
+                snapshot["cursor"],
+                serde_json::to_value(crate::session::cursor_from_events(&events)).unwrap()
+            );
+            assert_eq!(
+                snapshot["accounting"],
+                serde_json::to_value(crate::accounting::AccountingSnapshot::from_events(
+                    &sid,
+                    events.iter().map(|event| &event.kind),
+                ))
+                .unwrap(),
+                "actual remote load/attach accounting must use the owner's exact audit cursor"
+            );
+        }
+        let snapshot = crate::session::load_snapshot::load_session_snapshot(
+            &fixture.handle,
+            fixture.storage.view_store().unwrap(),
+            &sid,
+        )
+        .await
+        .unwrap();
+        assert_eq!(snapshot.runtime_status, owner);
+        tokio::fs::write(&release_file, "release").await.unwrap();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed.stop_reason,
+            crate::acp::protocol::StopReason::EndTurn
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if remote.get_runtime_status().await.unwrap().phase
+                    == crate::agent::messages::SessionRuntimePhase::Idle
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        local.kill();
+        local.wait_for_shutdown().await;
+        let stopped_owner = fixture
+            .handle
+            .observe_session_runtimes(std::slice::from_ref(&sid))
+            .await
+            .remove(&sid)
+            .unwrap();
+        assert_eq!(
+            stopped_owner.phase,
+            crate::agent::messages::SessionRuntimePhase::Unknown
+        );
+        assert_eq!(
+            stopped_owner.observation.availability,
+            crate::agent::messages::RuntimeAvailability::Unavailable
+        );
+        assert!(
+            fixture.handle.registry.lock().await.get(&sid).is_some(),
+            "an unavailable attachment must not become idle or be implicitly reattached"
+        );
+        fixture.handle.registry.lock().await.remove(&sid);
+        let unavailable = fixture
+            .handle
+            .observe_session_runtimes(std::slice::from_ref(&sid))
+            .await
+            .remove(&sid)
+            .unwrap();
+        assert_eq!(
+            unavailable.phase,
+            crate::agent::messages::SessionRuntimePhase::Unknown
+        );
+        let listed = fixture
+            .handle
+            .list_sessions(list_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            listed
+                .sessions
+                .iter()
+                .find(|row| row.session_id.to_string() == sid)
+                .unwrap()
+                .meta
+                .as_ref()
+                .unwrap()["runtimeStatus"],
+            serde_json::to_value(unavailable).unwrap()
+        );
+        assert!(
+            fixture.handle.registry.lock().await.get(&sid).is_none(),
+            "observation must not attach an unavailable owner"
+        );
+        manager.kill();
+        manager.wait_for_shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_remote_ref_is_remote_and_has_peer_label() {
         let (session_ref, _local) = remote_session_ref("e1").await;
         assert!(

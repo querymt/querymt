@@ -2294,6 +2294,309 @@ async fn cancelled_delegation_resolves_child_after_terminal_claim() {
 }
 
 #[tokio::test]
+async fn managed_verification_cancel_keeps_idle_child_and_live_cleanup_distinct() {
+    use crate::control::delegation_notifications::{DelegationActivity, DelegationStage};
+    let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
+    harness.stop_harness_orchestrator();
+    let config = harness.config.clone();
+    let store = config.provider.history_store();
+    let parent_id = harness.exec_ctx.session_id.clone();
+    let parent = store.get_session(&parent_id).await.unwrap().unwrap();
+    let release_file = harness._temp_dir.path().join("verification-release");
+    let entered_file = harness._temp_dir.path().join("verification-entered");
+    let delegation = store
+        .create_delegation(Delegation {
+            id: 0,
+            public_id: String::new(),
+            session_id: parent.id,
+            task_id: None,
+            target_agent_id: "agent".into(),
+            objective: "bounded verification cleanup".into(),
+            objective_hash: crate::hash::RapidHash::new(b"bounded verification cleanup"),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: Some(crate::verification::VerificationSpec {
+                description: "wait for test release".into(),
+                strategy: Default::default(),
+                steps: vec![crate::verification::VerificationStep::ToolCall {
+                    tool_name: "shell".into(),
+                    arguments: serde_json::json!({"command": "sh", "args": ["-c", ": > \"$2\"; i=0; while test ! -f \"$1\" && test $i -lt 500; do i=$((i+1)); sleep 0.01; done; test -f \"$1\"", "qmt-verification", release_file, entered_file], "workdir": harness._temp_dir.path()}),
+                    expectation: crate::verification::Expectation::Success,
+                    error_message: None,
+                }],
+            }),
+            status: DelegationStatus::Requested,
+            isolation: Default::default(),
+            retry_count: 0,
+            created_at: OffsetDateTime::now_utc(),
+            completed_at: None,
+            planning_summary: None,
+        })
+        .await
+        .unwrap();
+    let mut verification_tools = crate::tools::ToolRegistry::new();
+    verification_tools.add(Arc::new(crate::tools::builtins::ShellTool::new()));
+    let orchestrator = Arc::new(
+        DelegationOrchestrator::new(
+            Arc::new(crate::agent::LocalAgentHandle::from_config(config.clone())),
+            config.event_sink.clone(),
+            store.clone(),
+            config.agent_registry.clone(),
+            Arc::new(verification_tools),
+            config.hooks.clone(),
+            None,
+        )
+        .with_verification(true)
+        .with_cancel_grace_secs(2),
+    );
+    let listener = orchestrator.start_listening(config.event_sink.fanout());
+    let mut events = config.subscribe_events();
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationRequested {
+            delegation: delegation.clone(),
+            tool_call_id: None,
+            batch_id: None,
+            cycle_id: None,
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged {
+                    stage: Some(DelegationStage::Verifying),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !entered_file.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual verification shell must be waiting before cancellation");
+    let activity = config.event_sink.live_delegation_activity(&parent_id);
+    let child_id = activity[0].child_session_id.clone().unwrap();
+    let delegate = config.agent_registry.get_handle("agent").unwrap();
+    let local = delegate
+        .as_any()
+        .downcast_ref::<crate::agent::LocalAgentHandle>()
+        .unwrap();
+    let child = local
+        .observe_session_runtimes(std::slice::from_ref(&child_id))
+        .await
+        .remove(&child_id)
+        .unwrap();
+    assert_eq!(
+        child.phase,
+        crate::agent::messages::SessionRuntimePhase::Idle
+    );
+    assert_eq!(activity[0].stage, Some(DelegationStage::Verifying));
+    #[cfg(feature = "remote")]
+    {
+        use crate::send_agent::SendAgent;
+        use crate::session::backend::StorageBackend;
+        use kameo::actor::Spawn;
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh().await;
+        let owner = crate::agent::LocalAgentHandle::from_config(config.clone());
+        owner.set_mesh(mesh.clone());
+        owner
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                parent_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let expected = owner
+            .observe_session_runtimes(std::slice::from_ref(&parent_id))
+            .await
+            .remove(&parent_id)
+            .unwrap();
+        assert_eq!(
+            expected.phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        assert_eq!(
+            expected.delegation_activity[0].stage,
+            Some(DelegationStage::Verifying)
+        );
+        let manager = crate::agent::remote::RemoteNodeManager::spawn(
+            crate::agent::remote::RemoteNodeManager::new(
+                config.clone(),
+                owner.registry.clone(),
+                Some(mesh.clone()),
+                owner.scheduler_handle.clone(),
+            )
+            .with_node_name("verifier-owner".to_string()),
+        );
+        mesh.register_actor(
+            manager.clone(),
+            crate::agent::remote::scope::scoped_node_manager_for_peer(
+                &crate::agent::remote::scope::MeshScopeId::lan_default(),
+                mesh.peer_id(),
+            ),
+        )
+        .await;
+        let viewer = crate::test_utils::TestAgent::new().await;
+        viewer.handle.set_mesh(mesh.clone());
+        let node = mesh.peer_id().to_string();
+        viewer
+            .storage
+            .session_store()
+            .save_remote_session_bookmark(&crate::session::store::RemoteSessionBookmark {
+                session_id: parent_id.clone(),
+                node_id: node.clone(),
+                peer_label: "verifier-owner".into(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+            })
+            .await
+            .unwrap();
+        let loaded = viewer
+            .handle
+            .load_session(crate::acp::protocol::LoadSessionRequest::new(
+                parent_id.clone(),
+                std::path::PathBuf::new(),
+            ))
+            .await
+            .unwrap();
+        let attached = viewer
+            .handle
+            .ext_method(crate::acp::protocol::ExtRequest::new(
+                "querymt/remote/attachSession",
+                Arc::from(
+                    serde_json::value::to_raw_value(
+                        &serde_json::json!({"node_id": node, "session_id": parent_id}),
+                    )
+                    .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        let attached: serde_json::Value = serde_json::from_str(attached.0.get()).unwrap();
+        for snapshot in [
+            &loaded.meta.as_ref().unwrap()["querymt/sessionLoadSnapshot.v1"],
+            &attached["snapshot"],
+        ] {
+            assert_eq!(
+                snapshot["runtimeStatus"],
+                serde_json::to_value(&expected).unwrap(),
+                "actual remote route omitted existing live verifier"
+            );
+            let live = snapshot["delegationUpdates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["delegationId"] == delegation.public_id)
+                .unwrap();
+            assert_eq!(live["activity"], "live");
+            assert_eq!(live["stage"], "verifying");
+            assert_eq!(
+                live["sessionSeq"],
+                serde_json::to_value(activity[0].session_seq).unwrap()
+            );
+            assert!(!snapshot["audit"]["events"].as_array().unwrap().is_empty());
+            let events: Vec<crate::events::AgentEvent> =
+                serde_json::from_value(snapshot["audit"]["events"].clone()).unwrap();
+            assert_eq!(
+                snapshot["cursor"],
+                serde_json::to_value(crate::session::cursor_from_events(&events)).unwrap()
+            );
+            assert_eq!(
+                snapshot["accounting"],
+                serde_json::to_value(crate::accounting::AccountingSnapshot::from_events(
+                    &parent_id,
+                    events.iter().map(|event| &event.kind),
+                ))
+                .unwrap(),
+                "idle/verifying owner snapshot must include accounting at its audit cursor"
+            );
+        }
+        viewer.handle.shutdown().await;
+        manager.kill();
+        manager.wait_for_shutdown().await;
+        owner.shutdown().await;
+    }
+    assert!(
+        store
+            .transition_delegation_status(
+                &delegation.public_id,
+                DelegationStatus::Running,
+                DelegationStatus::Cancelled
+            )
+            .await
+            .unwrap()
+    );
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationCancelRequested {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+    config.emit_event(
+        &parent_id,
+        AgentEventKind::DelegationCancelled {
+            delegation_id: delegation.public_id.clone(),
+        },
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged {
+                    stage: Some(DelegationStage::CancelRequested),
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let during = config.event_sink.live_delegation_activity(&parent_id);
+    assert_eq!(during[0].activity, DelegationActivity::Live);
+    assert_eq!(
+        during[0].state,
+        crate::control::delegation_notifications::DelegationUpdateState::Cancelled
+    );
+    assert_eq!(during[0].stage, Some(DelegationStage::CancelRequested));
+    tokio::fs::write(release_file, "released").await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if matches!(
+                event.kind(),
+                AgentEventKind::DelegationStageChanged { stage: None, .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        config
+            .event_sink
+            .live_delegation_activity(&parent_id)
+            .is_empty()
+    );
+    orchestrator.cancel_active_delegations().await;
+    listener.abort();
+}
+
+#[tokio::test]
 async fn verification_failure_resolves_terminal_delegate_child() {
     let mut harness = TestHarness::new(vec![], DelegateBehavior::AlwaysOk).await;
     harness.stop_harness_orchestrator();
@@ -2386,6 +2689,20 @@ async fn verification_failure_resolves_terminal_delegate_child() {
     })
     .await
     .expect("verification failure did not resolve its child");
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            if config
+                .event_sink
+                .live_delegation_activity(&parent_session_id)
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("finished failed verification must release live workflow ownership");
     listener.abort();
 
     let child_lifecycle = harness.session_lifecycle(&child_session_id).await;

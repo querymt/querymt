@@ -384,10 +384,18 @@ impl AgentQuorumBuilder {
             let tool_registry = Arc::new(ToolRegistry::new());
 
             use crate::event_sink::EventSink;
-            let delegation_sink = Arc::new(EventSink::new(
-                self.storage.event_journal(),
-                self.event_fanout.clone(),
-            ));
+            // Lifecycle events use the local planner's emitter. Stages and
+            // summary accounting must reuse its stream registry AND projection.
+            let delegation_sink = planner
+                .as_any()
+                .downcast_ref::<crate::agent::LocalAgentHandle>()
+                .map(|handle| handle.config.event_sink.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(EventSink::new(
+                        self.storage.event_journal(),
+                        self.event_fanout.clone(),
+                    ))
+                });
 
             let planner_hooks = planner
                 .as_any()
@@ -470,6 +478,315 @@ mod tests {
     use crate::agent::{AgentConfigBuilder, LocalAgentHandle};
     use crate::test_utils::empty_plugin_registry;
     use querymt::LLMParams;
+
+    #[tokio::test]
+    async fn quorum_parent_clock_keeps_three_shell_delegations_terminal_on_wire() {
+        use crate::acp::protocol::NewSessionRequest;
+        use crate::control::delegation_notifications::{DelegationStage, DelegationUpdateState};
+        use crate::events::AgentEventKind;
+        use crate::session::domain::{Delegation, DelegationStatus};
+        use crate::test_utils::{
+            MockChatResponse, MockLlmProvider, SharedLlmProvider, TestProviderFactory,
+        };
+        use crate::tools::{Tool, ToolRegistry, builtins::ShellTool};
+        use std::collections::{HashMap, HashSet};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            SqliteStorage::connect(dir.path().join("quorum.db"))
+                .await
+                .unwrap(),
+        );
+        let release = dir.path().join("release");
+        let mut summary_mock = MockLlmProvider::new();
+        summary_mock
+            .expect_chat()
+            .times(3)
+            .returning(|_| Ok(MockChatResponse::text_only("fixture summary").into()));
+        let summary_factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(
+            summary_mock,
+            vec![],
+        )));
+        let summary_root = dir.path().join("summary");
+        std::fs::create_dir(&summary_root).unwrap();
+        let summary_registry =
+            crate::test_utils::mock_plugin_registry_in(&summary_root, summary_factory).unwrap();
+        let summary_provider = crate::session::provider::SessionProvider::new(
+            Arc::new(summary_registry),
+            storage.session_store(),
+            LLMParams::new().provider("mock").model("summary"),
+        );
+        let summarizer = crate::delegation::DelegationSummarizer::from_config(
+            &crate::config::DelegationSummaryConfig {
+                provider: "mock".into(),
+                model: "summary".into(),
+                min_history_tokens: 0,
+                ..Default::default()
+            },
+            &summary_provider,
+        )
+        .await
+        .unwrap();
+        let mut builder = AgentQuorumBuilder::from_backend(storage.clone())
+            .cwd(dir.path())
+            .with_verification(true)
+            .with_max_parallel_delegations(3)
+            .with_delegation_summarizer(Some(Arc::new(summarizer)));
+        for target in ["coder", "explorer", "linus"] {
+            let root = dir.path().to_path_buf();
+            let release = release.clone();
+            builder = builder.add_delegate_agent(AgentInfo {
+                id: target.into(), name: target.into(), description: String::new(),
+                capabilities: vec![], required_capabilities: vec![], meta: None, isolation: Default::default(),
+            }, move |storage, fanout| {
+                let mut mock = MockLlmProvider::new();
+                let command = serde_json::json!({"command":"sh", "args":["-c", ": > \"$2\"; i=0; while test ! -f \"$1\" && test $i -lt 2000; do i=$((i+1)); sleep 0.01; done; test -f \"$1\" && sleep 0.02 && printf done > \"$3\"", "qmt-quorum", release, root.join(format!("entered-{target}")), root.join(format!("done-{target}"))],"workdir":root});
+                let respond = Arc::new(move |messages: &[querymt::chat::ChatMessage]| {
+                    if messages.last().is_some_and(|message| message.portable_input_parts().iter().any(|part| part.is_tool_result())) {
+                        MockChatResponse::text_only("fixture child completed")
+                    } else {
+                        MockChatResponse::with_tools("fixture shell", vec![crate::test_utils::mock_querymt_tool_call(&format!("shell-{target}"), "shell", &command.to_string())])
+                    }
+                });
+                let tools_response = respond.clone();
+                mock.expect_chat_with_tools().returning(move |messages, _| Ok(tools_response(messages).into()));
+                mock.expect_chat().returning(move |messages| Ok(respond(messages).into()));
+                let factory = Arc::new(TestProviderFactory::new(SharedLlmProvider::new(mock, vec![ShellTool::new().definition()])));
+                let registry_root = root.join(target);
+                std::fs::create_dir(&registry_root).unwrap();
+                let registry = crate::test_utils::mock_plugin_registry_in(&registry_root, factory).unwrap();
+                let mut tools = ToolRegistry::new();
+                tools.add(Arc::new(ShellTool::new()));
+                let config = AgentConfigBuilder::new(Arc::new(registry), storage, LLMParams::new().provider("mock").model(format!("model-{target}")))
+                    .with_agent_id(target).with_event_fanout(fanout).with_tool_registry(tools).build();
+                Arc::new(LocalAgentHandle::from_config(Arc::new(config)))
+            });
+        }
+        let (registry, _registry_dir) = empty_plugin_registry().unwrap();
+        builder = builder.with_planner(move |storage, registry_agents, fanout| {
+            Arc::new(LocalAgentHandle::from_config(Arc::new(
+                AgentConfigBuilder::new(
+                    Arc::new(registry),
+                    storage,
+                    LLMParams::new().provider("mock").model("planner"),
+                )
+                .with_agent_registry(registry_agents)
+                .with_event_fanout(fanout)
+                .build(),
+            )))
+        });
+        // Do not construct an orchestrator here: exercise the production builder's wiring.
+        let quorum = builder.build().unwrap();
+        let planner = quorum.planner();
+        let local = planner.as_any().downcast_ref::<LocalAgentHandle>().unwrap();
+        let parent = planner
+            .new_session(NewSessionRequest::new(dir.path().to_path_buf()))
+            .await
+            .unwrap()
+            .session_id
+            .to_string();
+        let parent_row = quorum.store().get_session(&parent).await.unwrap().unwrap();
+        // Hold the planner's existing projection before the orchestrator records summaries.
+        let parent_accounting = local
+            .config
+            .event_sink
+            .session_accounting(&parent)
+            .await
+            .unwrap();
+        let mut rx = quorum.subscribe_events();
+        // A real planner stream already exists before the first delegation, as in a prompt.
+        for _ in 0..20 {
+            planner.emit_event(
+                &parent,
+                AgentEventKind::HookNotice {
+                    event_name: "fixture".into(),
+                    message: "planner progress".into(),
+                    is_error: false,
+                },
+            );
+        }
+        let mut ids = HashMap::new();
+        for target in ["coder", "explorer", "linus"] {
+            let delegation = quorum
+                .store()
+                .create_delegation(Delegation {
+                    id: 0,
+                    public_id: String::new(),
+                    session_id: parent_row.id,
+                    task_id: None,
+                    target_agent_id: target.into(),
+                    objective: format!("bounded fixture {target}"),
+                    objective_hash: Default::default(),
+                    context: None,
+                    constraints: None,
+                    expected_output: None,
+                    verification_spec: Some(crate::verification::VerificationSpec {
+                        description: "actual shell result exists".into(),
+                        strategy: Default::default(),
+                        steps: vec![crate::verification::VerificationStep::FileAssertion {
+                            path: dir.path().join(format!("done-{target}")),
+                            exists: true,
+                            contains: Some("done".into()),
+                            matches_regex: None,
+                        }],
+                    }),
+                    planning_summary: None,
+                    status: DelegationStatus::Requested,
+                    retry_count: 0,
+                    created_at: time::OffsetDateTime::now_utc(),
+                    completed_at: None,
+                    isolation: Default::default(),
+                })
+                .await
+                .unwrap();
+            ids.insert(delegation.public_id.clone(), target);
+            local
+                .config
+                .emit_event_persisted(
+                    &parent,
+                    AgentEventKind::DelegationRequested {
+                        delegation,
+                        tool_call_id: Some(format!("dispatch-{target}")),
+                        batch_id: None,
+                        cycle_id: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let entered = tokio::time::timeout(Duration::from_secs(20), async {
+            while !["coder", "explorer", "linus"]
+                .iter()
+                .all(|id| dir.path().join(format!("entered-{id}")).exists())
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        if entered.is_err() {
+            let mut diagnostic = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                diagnostic.push(serde_json::to_value(event).unwrap());
+            }
+            panic!("all three actual builtin shell tools must start: {diagnostic:?}");
+        }
+        tokio::fs::write(&release, "go").await.unwrap();
+        let (events, wire) = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut translator = crate::acp::shared::AcpLiveEventTranslator::new();
+            let mut events = Vec::new();
+            let mut wire = Vec::new();
+            let mut cleaned = HashSet::new();
+            while cleaned.len() < 3 {
+                let event = rx.recv().await.unwrap();
+                if event.session_id() != parent {
+                    continue;
+                }
+                wire.extend(translator.translate_notifications(&event));
+                if let AgentEventKind::DelegationStageChanged {
+                    delegation_id,
+                    stage: None,
+                    ..
+                } = event.kind()
+                {
+                    cleaned.insert(delegation_id.clone());
+                }
+                events.push(event);
+            }
+            (events, wire)
+        })
+        .await
+        .unwrap();
+        for delegation in quorum.store().list_delegations(&parent).await.unwrap() {
+            assert_eq!(
+                delegation.status,
+                DelegationStatus::Complete,
+                "actual durable execution must succeed before wire assertion"
+            );
+        }
+        let completed: Vec<_> = wire
+            .iter()
+            .filter(|message| message["params"]["state"] == "completed")
+            .collect();
+        assert_eq!(
+            completed
+                .iter()
+                .filter_map(|message| message["params"]["delegationId"].as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            3,
+            "real quorum composition dropped durable completions from the actual translator: {wire:?}"
+        );
+        for (id, target) in ids {
+            let observations: Vec<_> = wire
+                .iter()
+                .filter(|message| message["params"]["delegationId"] == id)
+                .map(|message| &message["params"])
+                .collect();
+            for stage in ["queued", "executing", "verifying", "finalizing"] {
+                assert!(
+                    observations.iter().any(|row| row["stage"] == stage),
+                    "missing {target} {stage}"
+                );
+            }
+            assert!(observations.iter().any(|row| row["state"] == "forked"));
+            let last = observations.last().unwrap();
+            assert_eq!(last["state"], "completed");
+            assert_eq!(last["activity"], "historical");
+            assert!(last["stage"].is_null());
+            assert!(last["childSessionId"].as_str().is_some());
+            assert_eq!(last["selectedModelId"], format!("mock/model-{target}"));
+            assert_eq!(last["toolCallId"], format!("dispatch-{target}"));
+            let cached = quorum
+                .event_fanout()
+                .delegation_snapshots(std::slice::from_ref(&parent))
+                .into_iter()
+                .find(|row| row.delegation_id == id)
+                .unwrap();
+            assert_eq!(cached.state, DelegationUpdateState::Completed);
+            assert_eq!(cached.stage, None);
+            assert!(events.iter().any(|event| matches!(event.kind(), AgentEventKind::DelegationStageChanged { delegation_id, stage: Some(DelegationStage::Verifying), .. } if delegation_id == &id)));
+        }
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[0].session_seq() < pair[1].session_seq()),
+            "parent stages/durable events must use one increasing clock: {:?}",
+            events
+                .iter()
+                .map(|event| event.session_seq())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(events.iter().filter(|event| matches!(event.kind(), AgentEventKind::LlmAttemptSettled { settlement } if settlement.attempt.purpose == crate::accounting::AttemptPurpose::DelegationSummary)).count(), 3);
+        parent_accounting.read(|reducer| {
+            assert_eq!(reducer.attempt_count(), 3, "summary attempts must update the already-held planner projection without catch_up or rehydration");
+            assert!(reducer.unresolved().is_empty());
+        });
+        quorum.shutdown().await;
+    }
+
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn quorum_preserves_nonlocal_planner_construction_acceptance() {
+        let storage = Arc::new(SqliteStorage::connect(":memory:".into()).await.unwrap());
+        let mesh = crate::agent::remote::test_helpers::fixtures::get_test_mesh()
+            .await
+            .clone();
+        let planner = Arc::new(crate::agent::remote::RemoteAgentHandle::new(
+            "fixture-peer".into(),
+            None,
+            mesh,
+        ));
+        let quorum = AgentQuorumBuilder::from_backend(storage)
+            .with_event_fanout(planner.event_fanout().clone())
+            .with_delegation(true)
+            .with_planner(move |_, _, _| planner)
+            .build()
+            .unwrap();
+        assert!(quorum.orchestrator().is_some());
+        // Construction acceptance is unchanged; remote parent clock ownership is not proved here.
+        quorum.shutdown().await;
+    }
 
     #[tokio::test]
     async fn quorum_uses_injected_event_fanout_for_all_local_agents() {

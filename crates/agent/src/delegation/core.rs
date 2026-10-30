@@ -34,6 +34,7 @@ struct ActiveDelegation {
     cancel_token: CancellationToken,
     handle: JoinHandle<()>,
     cancellation: Arc<DelegationCancellation>,
+    activity: WorkflowActivity,
 }
 
 #[derive(Default)]
@@ -335,8 +336,10 @@ impl DelegationOrchestrator {
                 cancel_token,
                 mut handle,
                 cancellation,
+                activity,
                 ..
             } = entry;
+            activity.request_cancel();
             cancel_token.cancel();
             let timed_out = tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle)
                 .await
@@ -360,6 +363,7 @@ impl DelegationOrchestrator {
             let store = self.store.clone();
             // Owner finalization must not extend shutdown's execution grace period.
             tokio::spawn(async move {
+                let _activity = activity;
                 if timed_out {
                     let _ = handle.await;
                 }
@@ -613,6 +617,12 @@ impl DelegationOrchestrator {
                 let delegation_id = delegation.public_id.clone();
                 let cancel_token_clone = cancel_token.clone();
 
+                let activity = WorkflowActivity::new(
+                    event_sink.clone(),
+                    parent_session_id.clone(),
+                    delegation.public_id.clone(),
+                );
+                let activity_for_entry = activity.clone();
                 let handle = tokio::spawn(
                     async move {
                         if start_rx.await.is_err() {
@@ -638,11 +648,19 @@ impl DelegationOrchestrator {
                                     "Delegation queue closed before execution could start",
                                 )
                                 .await;
+                                active_delegations_for_spawn
+                                    .lock()
+                                    .await
+                                    .remove(&delegation.public_id);
                                 return;
                             }
                         };
 
+                        activity.stage(Some(
+                            crate::control::delegation_notifications::DelegationStage::Executing,
+                        ));
                         let ctx = DelegationContext {
+                            activity,
                             delegator,
                             event_sink,
                             store,
@@ -703,6 +721,7 @@ impl DelegationOrchestrator {
                         cancel_token: cancel_token_clone,
                         handle,
                         cancellation,
+                        activity: activity_for_entry,
                     },
                 );
                 drop(active);
@@ -720,12 +739,15 @@ impl DelegationOrchestrator {
                         cancel_token,
                         mut handle,
                         cancellation,
+                        activity,
                         ..
                     } = entry;
                     let store = self.store.clone();
                     let grace_secs = self.config.cancel_grace_secs;
+                    activity.request_cancel();
                     cancel_token.cancel();
                     tokio::spawn(async move {
+                        let _activity = activity;
                         tokio::select! {
                             _ = &mut handle => {
                                 debug!("Delegation {} terminated gracefully after cancel request", delegation_id_owned);
@@ -752,6 +774,7 @@ impl DelegationOrchestrator {
                     .iter_mut()
                     .filter(|(_, entry)| entry.parent_session_id == session_id)
                     .map(|(delegation_id, entry)| {
+                        entry.activity.request_cancel();
                         entry.cancel_token.cancel();
                         let dummy_handle = tokio::spawn(async {});
                         let real_handle = std::mem::replace(&mut entry.handle, dummy_handle);
@@ -759,6 +782,7 @@ impl DelegationOrchestrator {
                             delegation_id.clone(),
                             real_handle,
                             entry.cancellation.clone(),
+                            entry.activity.clone(),
                         )
                     })
                     .collect();
@@ -766,9 +790,11 @@ impl DelegationOrchestrator {
                 drop(active);
 
                 let grace_secs = self.config.cancel_grace_secs;
-                for (delegation_id, mut handle, cancellation) in to_cancel {
+                for (delegation_id, mut handle, cancellation, activity) in to_cancel {
                     let store = self.store.clone();
+                    let active = self.active_delegations.clone();
                     tokio::spawn(async move {
+                        let _activity = activity;
                         tokio::select! {
                             _ = &mut handle => {
                                 debug!("Delegation {} terminated gracefully after cancel", delegation_id);
@@ -782,6 +808,7 @@ impl DelegationOrchestrator {
                         cancellation
                             .resolve_if_cancelled(store.as_ref(), &delegation_id)
                             .await;
+                        active.lock().await.remove(&delegation_id);
                     });
                 }
             }
@@ -790,8 +817,87 @@ impl DelegationOrchestrator {
     }
 }
 
+#[derive(Clone)]
+struct WorkflowActivity(Arc<WorkflowActivityInner>);
+
+struct WorkflowActivityInner {
+    cancelled: parking_lot::Mutex<bool>,
+    sink: Arc<EventSink>,
+    parent: String,
+    delegation: String,
+    epoch: String,
+    #[cfg(test)]
+    before_publish: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl WorkflowActivity {
+    fn new(sink: Arc<EventSink>, parent: String, delegation: String) -> Self {
+        let activity = Self(Arc::new(WorkflowActivityInner {
+            cancelled: parking_lot::Mutex::new(false),
+            sink,
+            parent,
+            delegation,
+            epoch: uuid::Uuid::new_v4().to_string(),
+            #[cfg(test)]
+            before_publish: parking_lot::Mutex::new(None),
+        }));
+        activity.stage(Some(
+            crate::control::delegation_notifications::DelegationStage::Queued,
+        ));
+        activity
+    }
+
+    fn request_cancel(&self) {
+        self.stage(Some(
+            crate::control::delegation_notifications::DelegationStage::CancelRequested,
+        ));
+    }
+
+    fn stage(&self, stage: Option<crate::control::delegation_notifications::DelegationStage>) {
+        // Stage choice and ordered publication must be one operation: an older
+        // normal choice must never publish after a cancellation at a newer seq.
+        let mut cancelled = self.0.cancelled.lock();
+        if stage == Some(crate::control::delegation_notifications::DelegationStage::CancelRequested)
+        {
+            *cancelled = true;
+        }
+        let stage = if stage.is_some() && *cancelled {
+            Some(crate::control::delegation_notifications::DelegationStage::CancelRequested)
+        } else {
+            stage
+        };
+        #[cfg(test)]
+        {
+            let hook = self.0.before_publish.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        self.0.sink.session_stream(&self.0.parent).emit_ephemeral(
+            AgentEventKind::DelegationStageChanged {
+                delegation_id: self.0.delegation.clone(),
+                stage,
+                source_epoch: self.0.epoch.clone(),
+            },
+        );
+    }
+}
+
+impl Drop for WorkflowActivityInner {
+    fn drop(&mut self) {
+        self.sink.session_stream(&self.parent).emit_ephemeral(
+            AgentEventKind::DelegationStageChanged {
+                delegation_id: self.delegation.clone(),
+                stage: None,
+                source_epoch: self.epoch.clone(),
+            },
+        );
+    }
+}
+
 /// Context structure to group delegation handler parameters
 struct DelegationContext {
+    activity: WorkflowActivity,
     delegator: Arc<dyn crate::agent::handle::AgentHandle>,
     event_sink: Arc<EventSink>,
     store: Arc<dyn SessionStore>,
@@ -1757,6 +1863,7 @@ async fn execute_delegation(
     let prompt_result = tokio::select! {
         result = session_ref.prompt(prompt_req) => Some(result),
         _ = cancel_token.cancelled() => {
+            ctx.activity.stage(Some(crate::control::delegation_notifications::DelegationStage::CancelRequested));
             // Cancellation — cancel the child session
             let _ = session_ref.cancel().await;
 
@@ -1851,6 +1958,9 @@ async fn execute_delegation(
             active.remove(&delegation_id);
         }
         Some(Ok(_)) => {
+            ctx.activity.stage(Some(
+                crate::control::delegation_notifications::DelegationStage::Verifying,
+            ));
             // 4. Verification (same as legacy path)
             let verification_passed = async {
                 if ctx.config.run_verification {
@@ -1922,9 +2032,13 @@ async fn execute_delegation(
                     &error_message,
                 )
                 .await;
+                ctx.active_delegations.lock().await.remove(&delegation_id);
                 return;
             }
 
+            ctx.activity.stage(Some(
+                crate::control::delegation_notifications::DelegationStage::Finalizing,
+            ));
             // 5. Get history for summary via kameo (works for local and remote)
             let mut summary = async {
                 let s = match session_ref.get_history().await {
@@ -2671,6 +2785,173 @@ mod tests {
     use crate::test_utils::MockSessionStore;
     use async_trait::async_trait;
 
+    #[tokio::test]
+    async fn workflow_producer_orders_stages_and_keeps_cleanup_visible_with_idle_parent() {
+        use crate::agent::messages::{GetRuntimeStatus, SessionRuntimePhase};
+        use crate::control::delegation_notifications::{DelegationActivity, DelegationStage};
+        use kameo::actor::Spawn;
+        let (plugins, dir) = crate::test_utils::empty_plugin_registry().unwrap();
+        let storage = Arc::new(
+            SqliteStorage::connect(dir.path().join("workflow.db"))
+                .await
+                .unwrap(),
+        );
+        let session = storage
+            .session_store()
+            .create_session(None, None, None, None)
+            .await
+            .unwrap();
+        let config = Arc::new(
+            crate::agent::agent_config_builder::AgentConfigBuilder::new(
+                Arc::new(plugins),
+                storage,
+                querymt::LLMParams::new()
+                    .provider("mock")
+                    .model("mock-model"),
+            )
+            .build(),
+        );
+        let runtime = crate::agent::core::SessionRuntime::new(
+            None,
+            Default::default(),
+            crate::agent::core::McpToolState::empty(),
+        );
+        let actor = crate::agent::session_actor::SessionActor::spawn(
+            crate::agent::session_actor::SessionActor::new(
+                config.clone(),
+                session.public_id.clone(),
+                runtime,
+            ),
+        );
+        let mut rx = config.subscribe_events();
+        let delegation = Delegation {
+            isolation: Default::default(),
+            id: 1,
+            public_id: "workflow-1".into(),
+            session_id: session.id,
+            task_id: None,
+            target_agent_id: "coder".into(),
+            objective: "test workflow observation".into(),
+            objective_hash: crate::hash::RapidHash::default(),
+            context: None,
+            constraints: None,
+            expected_output: None,
+            verification_spec: None,
+            planning_summary: None,
+            status: DelegationStatus::Requested,
+            retry_count: 0,
+            created_at: time::OffsetDateTime::now_utc(),
+            completed_at: None,
+        };
+        config.emit_event(
+            &session.public_id,
+            AgentEventKind::DelegationRequested {
+                delegation,
+                tool_call_id: None,
+                batch_id: None,
+                cycle_id: None,
+            },
+        );
+        let activity = WorkflowActivity::new(
+            config.event_sink.clone(),
+            session.public_id.clone(),
+            "workflow-1".into(),
+        );
+        let cleanup_owner = activity.clone();
+        activity.stage(Some(DelegationStage::Executing));
+        activity.stage(Some(DelegationStage::Verifying));
+        config
+            .event_sink
+            .session_stream(&session.public_id)
+            .flush()
+            .await;
+        let status = actor.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(status.phase, SessionRuntimePhase::Idle);
+        assert!(status.active_run_id.is_none());
+        assert_eq!(status.delegation_activity.len(), 1);
+        assert_eq!(
+            status.delegation_activity[0].stage,
+            Some(DelegationStage::Verifying)
+        );
+        config.emit_event(
+            &session.public_id,
+            AgentEventKind::DelegationCancelled {
+                delegation_id: "workflow-1".into(),
+            },
+        );
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let enter_hook = entered.clone();
+        let release_hook = release.clone();
+        *activity.0.before_publish.lock() = Some(Box::new(move || {
+            enter_hook.wait();
+            release_hook.wait();
+        }));
+        let normal = activity.clone();
+        let normal_thread =
+            std::thread::spawn(move || normal.stage(Some(DelegationStage::Finalizing)));
+        entered.wait();
+        let cancel = activity.clone();
+        let (published, observed) = std::sync::mpsc::channel();
+        let cancel_thread = std::thread::spawn(move || {
+            cancel.request_cancel();
+            let _ = published.send(());
+        });
+        // Old producer can publish cancel while the selected normal stage is paused.
+        // A serialized producer instead keeps cancel waiting for that publication.
+        let _ = observed.recv_timeout(std::time::Duration::from_millis(100));
+        release.wait();
+        normal_thread.join().unwrap();
+        cancel_thread.join().unwrap();
+        config
+            .event_sink
+            .session_stream(&session.public_id)
+            .flush()
+            .await;
+        let status = actor.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(
+            status.delegation_activity[0].activity,
+            DelegationActivity::Live
+        );
+        assert_eq!(
+            status.delegation_activity[0].stage,
+            Some(DelegationStage::CancelRequested)
+        );
+        drop(activity);
+        // Async owner cleanup is still live after the workflow task itself leaves.
+        assert_eq!(
+            config
+                .event_sink
+                .live_delegation_activity(&session.public_id)
+                .len(),
+            1
+        );
+        drop(cleanup_owner);
+        config
+            .event_sink
+            .session_stream(&session.public_id)
+            .flush()
+            .await;
+        assert!(
+            actor
+                .ask(GetRuntimeStatus)
+                .await
+                .unwrap()
+                .delegation_activity
+                .is_empty()
+        );
+        let mut seqs = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event.kind(), AgentEventKind::DelegationStageChanged { .. }) {
+                seqs.push(event.session_seq());
+            }
+        }
+        assert_eq!(seqs.len(), 6);
+        assert!(seqs[0] > 0 && seqs.windows(2).all(|pair| pair[0] < pair[1]));
+        actor.kill();
+        actor.wait_for_shutdown().await;
+    }
+
     #[cfg(feature = "remote")]
     fn random_provider_node_id() -> String {
         crate::agent::remote::NodeId::from_peer_id(
@@ -2990,11 +3271,52 @@ mod tests {
             .wait_until_registered(&delegation.public_id)
             .await;
 
+        orchestrator
+            .event_sink
+            .session_stream(&session.public_id)
+            .flush()
+            .await;
+        assert_eq!(
+            fanout.live_delegation_activity(&session.public_id)[0].stage,
+            Some(crate::control::delegation_notifications::DelegationStage::Queued)
+        );
+        let mut stages = fanout.subscribe();
         orchestrator.begin_shutdown();
         listener.abort();
         listener.await.expect_err("listener should be aborted");
-        orchestrator.cancel_active_delegations().await;
+        let shutdown = orchestrator.cancel_active_delegations();
+        tokio::pin!(shutdown);
+        tokio::select! {
+            _ = &mut shutdown => panic!("queued task still owns its permit wait"),
+            _ = async {
+                loop {
+                    if matches!(stages.recv().await.unwrap().kind(), AgentEventKind::DelegationStageChanged { stage: Some(crate::control::delegation_notifications::DelegationStage::CancelRequested), .. }) { break; }
+                }
+            } => {}
+        }
+        assert_eq!(
+            fanout.live_delegation_activity(&session.public_id)[0].stage,
+            Some(crate::control::delegation_notifications::DelegationStage::CancelRequested)
+        );
+        shutdown.await;
         drop(held_permit);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    stages.recv().await.unwrap().kind(),
+                    AgentEventKind::DelegationStageChanged { stage: None, .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            fanout
+                .live_delegation_activity(&session.public_id)
+                .is_empty()
+        );
 
         assert!(orchestrator.active_delegations.lock().await.is_empty());
         assert_eq!(

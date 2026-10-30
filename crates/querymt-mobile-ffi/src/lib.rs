@@ -307,6 +307,15 @@ async fn inject_session_load_snapshot(
     session_id: &str,
     response: &mut serde_json::Value,
 ) -> Result<(), AcpError> {
+    if let Some(meta) = response.get("_meta")
+        && meta.get("location").and_then(serde_json::Value::as_str) == Some("remote")
+        && meta.get("querymt/sessionLoadSnapshot.v1").is_some()
+    {
+        // The remote producer already read the owner's history and runtime.
+        // Relay-cache backfill is asynchronous, so it is not a replacement source.
+        log::info!("ffi remote session/load owner snapshot preserved: session_id={session_id}");
+        return Ok(());
+    }
     let snapshot = querymt_agent::session::load_session_snapshot(agent, view_store, session_id)
         .await
         .map_err(|e| AcpError::internal_error().data(e.to_string()))?;
@@ -1241,10 +1250,9 @@ mod tests {
 
     #[async_trait]
     impl querymt::chat::ChatProvider for FfiTestProvider {
-        async fn chat_with_tools(
+        async fn chat(
             &self,
-            _messages: &[querymt::chat::ChatMessage],
-            _tools: Option<&[querymt::chat::Tool]>,
+            _call: &querymt::chat::ChatCall<'_>,
         ) -> Result<querymt::chat::ChatOutput, querymt::error::LLMError> {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             Ok(querymt::chat::ChatOutput::from_projections(
@@ -1506,84 +1514,126 @@ mod tests {
     /// `querymt/remote/attachSession` handler builds a snapshot from the
     /// remote actor's event stream; replacing it with the local (empty)
     /// journal loses all history.
-    #[test]
-    fn remote_attach_snapshot_preserves_existing() {
-        let mut result_obj = serde_json::json!({
-            "session_id": "s-remote-1",
-            "node_id": "n-1",
-            "attached": true,
-            "config_options": [],
-            "snapshot": {
-                "audit": {
-                    "session_id": "s-remote-1",
-                    "events": [{ "seq": 1, "kind": "user_message" }],
-                    "tasks": [],
-                    "intent_snapshots": [],
-                    "decisions": [],
-                    "progress_entries": [],
-                    "artifacts": [],
-                    "delegations": [],
-                    "generated_at": "2026-05-16T08:00:00Z"
-                },
-                "cursor": {
-                    "local_seq": 1,
-                    "remote_seq_by_source": {}
-                }
-            }
+    #[tokio::test]
+    async fn remote_attach_snapshot_preserves_existing() {
+        let agent_handle = make_ffi_test_agent().await;
+        let (agent, view) = state::with_agent_read(agent_handle, |record| {
+            Ok((record.agent.handle(), record.view_store.clone().unwrap()))
         })
-        .as_object()
-        .unwrap()
-        .clone();
-
-        let before_snapshot = result_obj.get("snapshot").cloned();
-        assert!(before_snapshot.is_some(), "precondition: snapshot exists");
-
-        // Simulate the guarded branch — must NOT enter the injection path.
-        if !result_obj.contains_key("snapshot") {
-            result_obj.insert(
-                "snapshot".to_string(),
-                serde_json::json!({ "audit": { "events": [] }, "cursor": { "local_seq": 0 } }),
-            );
-        }
-
+        .unwrap();
+        let mut accounting = querymt_agent::accounting::AccountingSnapshot::default();
+        accounting.session.known_subtotal_usd = 0.75;
+        accounting.session.complete_total_usd = Some(0.75);
+        accounting.session.complete = true;
+        accounting.session.priced_attempts = 1;
+        accounting.session.billing = querymt_agent::accounting::AccountingBillingScope::Metered;
+        let snapshot = serde_json::json!({
+            "audit": {"session_id": "remote", "events": [{"owner_history": "preserved"}]},
+            "accounting": accounting,
+            "cursor": {"local_seq": 17, "remote_seq_by_source": {"owner": 9}},
+            "runtimeStatus": {"phase": "idle", "observation": {"availability": "live", "epoch": "owner", "revision": 3},
+                "delegation_activity": [{"delegationId": "verifier", "activity": "live", "stage": "verifying", "sessionSeq": 11, "sourceEpoch": "workflow"}]},
+            "delegationUpdates": [{"delegationId": "verifier", "activity": "live", "stage": "verifying", "sessionSeq": 11, "sourceEpoch": "workflow"}]
+        });
+        let mut response = serde_json::json!({"session_id": "remote", "snapshot": snapshot});
+        // No viewer-local session exists: falling back would fail or lose owner history.
+        let hooks = MobileAcpSessionHooks { view_store: view };
+        querymt_agent::acp::shared::AcpSessionHooks::on_remote_session_attached(
+            &hooks,
+            agent.as_ref(),
+            "remote",
+            &mut response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["snapshot"], snapshot);
+        agent
+            .config
+            .provider
+            .history_store()
+            .save_remote_session_bookmark(&querymt_agent::session::store::RemoteSessionBookmark {
+                session_id: "remote".into(),
+                node_id: "owner".into(),
+                peer_label: "owner".into(),
+                cwd: None,
+                created_at: 0,
+                title: None,
+            })
+            .await
+            .unwrap();
+        // A newly attached viewer may have no relay history yet. The production
+        // remote load response already contains the authoritative owner snapshot.
+        let mut loaded = serde_json::json!({"_meta": {
+            "location": "remote", "nodeId": "owner", "querymt/sessionLoadSnapshot.v1": snapshot,
+        }});
+        querymt_agent::acp::shared::AcpSessionHooks::on_session_loaded(
+            &hooks,
+            agent.as_ref(),
+            "remote",
+            &mut loaded,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            result_obj.get("snapshot").cloned(),
-            before_snapshot,
-            "snapshot must not be overwritten by local fallback"
+            loaded["_meta"]["querymt/sessionLoadSnapshot.v1"], snapshot,
+            "FFI remote load must not replace owner truth with an empty viewer journal"
         );
+        assert_eq!(loaded["_meta"]["nodeId"], "owner");
+        state::remove_agent(agent_handle).unwrap();
     }
 
     /// Inverse: when the server response has no snapshot key, the FFI
     /// injection path must still be able to insert one.
-    #[test]
-    fn remote_attach_snapshot_allows_fallback_when_missing() {
-        let mut result_obj = serde_json::json!({
-            "session_id": "s-remote-2",
-            "node_id": "n-1",
-            "attached": true,
-            "config_options": []
+    #[tokio::test]
+    async fn remote_attach_snapshot_allows_fallback_when_missing() {
+        let agent_handle = make_ffi_test_agent().await;
+        let (agent, view) = state::with_agent_read(agent_handle, |record| {
+            Ok((record.agent.handle(), record.view_store.clone().unwrap()))
         })
-        .as_object()
-        .unwrap()
-        .clone();
-
-        assert!(
-            !result_obj.contains_key("snapshot"),
-            "precondition: no snapshot"
+        .unwrap();
+        let created = agent
+            .new_session(querymt_agent::acp::protocol::NewSessionRequest::new(
+                std::env::temp_dir(),
+            ))
+            .await
+            .unwrap();
+        let id = created.session_id.to_string();
+        let mut attached = serde_json::json!({"session_id": id});
+        let hooks = MobileAcpSessionHooks { view_store: view };
+        querymt_agent::acp::shared::AcpSessionHooks::on_remote_session_attached(
+            &hooks,
+            agent.as_ref(),
+            &id,
+            &mut attached,
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached["snapshot"]["runtimeStatus"]["phase"], "idle");
+        assert_eq!(
+            attached["snapshot"]["runtimeStatus"]["observation"]["availability"],
+            "live"
         );
-
-        // Simulate the guarded branch — must enter the injection path.
-        if !result_obj.contains_key("snapshot") {
-            result_obj.insert(
-                "snapshot".to_string(),
-                serde_json::json!({ "audit": { "events": [] }, "cursor": { "local_seq": 0 } }),
-            );
-        }
-
-        assert!(
-            result_obj.contains_key("snapshot"),
-            "fallback snapshot should be injected"
+        let mut loaded = serde_json::json!({"_meta": {"sentinel": true, "querymt/sessionLoadSnapshot.v1": {"old_incomplete": true}}});
+        querymt_agent::acp::shared::AcpSessionHooks::on_session_loaded(
+            &hooks,
+            agent.as_ref(),
+            &id,
+            &mut loaded,
+        )
+        .await
+        .unwrap();
+        let snapshot = &loaded["_meta"]["querymt/sessionLoadSnapshot.v1"];
+        assert_eq!(
+            snapshot["runtimeStatus"],
+            attached["snapshot"]["runtimeStatus"]
         );
+        assert!(snapshot.get("old_incomplete").is_none());
+        assert!(snapshot["delegationUpdates"].is_array());
+        assert!(snapshot["audit"]["events"].is_array());
+        assert_eq!(snapshot["accounting"], attached["snapshot"]["accounting"]);
+        assert_eq!(snapshot["accounting"]["version"], 1);
+        assert_eq!(loaded["_meta"]["sentinel"], true);
+        state::remove_agent(agent_handle).unwrap();
     }
 
     #[test]

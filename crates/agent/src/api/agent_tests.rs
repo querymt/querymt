@@ -1135,7 +1135,11 @@ async fn acp_session_list_includes_relationship_and_operational_meta() -> Result
         child_meta
             .get("runtimeStatus")
             .and_then(|status| status.get("phase")),
-        Some(&serde_json::json!("idle"))
+        Some(&serde_json::json!("unknown"))
+    );
+    assert_eq!(
+        child_meta["runtimeStatus"]["observation"]["availability"], "unavailable",
+        "unmaterialized in-memory storage has no owner or run-lease evidence"
     );
     assert_eq!(
         child_meta
@@ -1238,15 +1242,6 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
         .await?;
     assert_eq!(first.sessions.len(), 10);
     assert_eq!(first.next_cursor.as_deref(), Some("remote:0:10:bookmarks"));
-    for session in &first.sessions {
-        let fields = session.meta.as_ref().expect("remote metadata");
-        assert_eq!(fields.get("location"), Some(&serde_json::json!("remote")));
-        assert_eq!(fields.get("nodeId"), Some(&serde_json::json!("peer-a")));
-        assert_eq!(
-            fields.get("connectionState"),
-            Some(&serde_json::json!("disconnected"))
-        );
-    }
     let second = agent
         .sessions()
         .list_for_acp(
@@ -1258,6 +1253,26 @@ async fn acp_list_sessions_opt_in_selected_peer_pages_offline_bookmarks() -> Res
         .await?;
     assert_eq!(second.sessions.len(), 2);
     assert_eq!(second.next_cursor, None);
+    for session in first.sessions.iter().chain(&second.sessions) {
+        let fields = session.meta.as_ref().expect("remote metadata");
+        assert_eq!(fields["location"], "remote");
+        assert_eq!(fields["nodeId"], "peer-a");
+        assert_eq!(fields["nodeLabel"], "Remote A");
+        assert_eq!(fields["connectionState"], "disconnected");
+        assert_eq!(session.cwd, PathBuf::from("/remote/work"));
+        assert!(session.title.as_deref().unwrap().starts_with("Remote "));
+        assert_eq!(fields["runtimeStatus"]["phase"], "unknown");
+        assert_eq!(
+            fields["runtimeStatus"]["observation"]["availability"],
+            "unavailable"
+        );
+        for field in ["messageCount", "userMessageCount", "hasErrors"] {
+            assert!(
+                !fields.contains_key(field),
+                "offline bookmark fabricated {field}"
+            );
+        }
+    }
     Ok(())
 }
 

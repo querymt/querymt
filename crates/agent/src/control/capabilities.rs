@@ -168,6 +168,7 @@ pub fn get_capabilities(agent: &crate::LocalAgentHandle) -> CapabilitiesInfo {
         "querymt/schedules/changed".to_string(),
         crate::acp::shared::QMT_NOTIFICATION_DELEGATION_UPDATE.to_string(),
         crate::acp::shared::QMT_NOTIFICATION_INPUT_STATE.to_string(),
+        crate::acp::shared::QMT_NOTIFICATION_RUNTIME_CHANGED.to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_AUTHORITY_NOTIFICATION
             .to_string(),
         crate::control::elicitation_recovery::ELICITATION_RECOVERY_VALIDATION_FAILED_NOTIFICATION

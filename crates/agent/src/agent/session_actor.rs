@@ -180,6 +180,9 @@ pub struct SessionActor {
     // ── Execution tracking ───────────────────────────────────────
     pub(crate) prompt_running: bool,
     pub(crate) active_run: Option<ActiveRun>,
+    runtime_epoch: String,
+    runtime_revision: u64,
+    published_pending_steering: usize,
     /// Cross-process run lease, held from before `RunStarted` until the last
     /// queued run's `RunCompleted` is persisted. Kept outside `ActiveRun` so
     /// no clone of run state can extend it, and so it can be handed over to
@@ -355,6 +358,9 @@ impl SessionActor {
             turn_state: TurnState::new(),
             prompt_running: false,
             active_run: None,
+            runtime_epoch: Uuid::new_v4().to_string(),
+            runtime_revision: 0,
+            published_pending_steering: 0,
             run_lease: None,
             queued_prompts: VecDeque::new(),
             submit_receipts: VecDeque::new(),
@@ -362,6 +368,70 @@ impl SessionActor {
             mesh: None,
             relay_forwarder_handles: HashMap::new(),
         }
+    }
+
+    fn runtime_status(&self, pending_steering_count: usize) -> SessionRuntimeStatus {
+        let phase = if self.turn_state.token.is_cancelled() && self.active_run.is_some() {
+            SessionRuntimePhase::CancelRequested
+        } else {
+            match self.active_run.as_ref().map(|run| run.phase) {
+                None => SessionRuntimePhase::Idle,
+                Some(RunPhase::Starting) => SessionRuntimePhase::Starting,
+                Some(RunPhase::Model) => SessionRuntimePhase::Model,
+                Some(RunPhase::Tools) => SessionRuntimePhase::Tools,
+                Some(RunPhase::Waiting) => SessionRuntimePhase::Waiting,
+                Some(RunPhase::Closing) => SessionRuntimePhase::Closing,
+            }
+        };
+        SessionRuntimeStatus {
+            phase,
+            active_run_id: self.active_run.as_ref().map(|run| run.run_id.clone()),
+            steerable: self
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.phase != RunPhase::Closing)
+                && !self.turn_state.token.is_cancelled(),
+            pending_steering_count: crate::agent::utils::u32_from_usize(
+                pending_steering_count,
+                "pending_steering_count",
+                Some(&self.session_id),
+            ),
+            queued_input_count: crate::agent::utils::u32_from_usize(
+                self.queued_prompts.len(),
+                "queued_input_count",
+                Some(&self.session_id),
+            ),
+            run_started_at_ms: self.active_run.as_ref().map(|run| run.started_at_ms),
+            observation: crate::agent::messages::RuntimeObservation {
+                availability: crate::agent::messages::RuntimeAvailability::Live,
+                epoch: Some(self.runtime_epoch.clone()),
+                revision: Some(self.runtime_revision),
+                reason: None,
+            },
+            delegation_activity: self
+                .config
+                .event_sink
+                .live_delegation_activity(&self.session_id),
+        }
+    }
+
+    fn emit_runtime_changed(&mut self, pending: usize) {
+        self.published_pending_steering = pending;
+        self.runtime_revision = self.runtime_revision.saturating_add(1);
+        self.config.emit_event(
+            &self.session_id,
+            AgentEventKind::RuntimeChanged {
+                runtime: self.runtime_status(pending),
+            },
+        );
+    }
+
+    async fn publish_runtime(&mut self) {
+        let pending = match &self.active_run {
+            Some(run) => run.steering.pending_count().await,
+            None => 0,
+        };
+        self.emit_runtime_changed(pending);
     }
 
     /// Override the reasoning effort restored for this session.
@@ -449,7 +519,7 @@ impl SessionActor {
         req: crate::acp::protocol::PromptRequest,
         run_id: String,
         steering: Arc<crate::agent::turn_control::SteeringInbox>,
-        phase_reporter: tokio::sync::mpsc::UnboundedSender<RunPhase>,
+        phase_reporter: tokio::sync::mpsc::UnboundedSender<Option<RunPhase>>,
     ) -> DetachedPromptExecution {
         DetachedPromptExecution {
             req,
@@ -543,6 +613,7 @@ impl SessionActor {
         let active_run = ActiveRun::new(run_id.clone(), generation, self.turn_state.token.clone());
         let steering = active_run.steering.clone();
         self.active_run = Some(active_run);
+        self.emit_runtime_changed(0);
 
         self.config.emit_event(
             &self.session_id,
@@ -682,6 +753,7 @@ impl Message<Cancel> for SessionActor {
         }
         self.config
             .emit_event(&self.session_id, AgentEventKind::Cancelled);
+        self.publish_runtime().await;
     }
 }
 
@@ -699,7 +771,10 @@ impl Message<RunPhaseChanged> for SessionActor {
             && run.generation == msg.generation
             && run.run_id == msg.run_id
         {
-            run.phase = msg.phase;
+            if let Some(phase) = msg.phase {
+                run.phase = phase;
+            }
+            self.publish_runtime().await;
         }
     }
 }
@@ -798,6 +873,7 @@ impl Message<PromptFinished> for SessionActor {
             );
         } else {
             self.run_lease = None;
+            self.publish_runtime().await;
         }
     }
 }
@@ -1374,37 +1450,10 @@ impl Message<GetRuntimeStatus> for SessionActor {
             Some(run) => run.steering.pending_count().await,
             None => 0,
         };
-        let phase = if self.turn_state.token.is_cancelled() && self.active_run.is_some() {
-            SessionRuntimePhase::CancelRequested
-        } else {
-            match self.active_run.as_ref().map(|run| run.phase) {
-                None => SessionRuntimePhase::Idle,
-                Some(RunPhase::Starting) => SessionRuntimePhase::Starting,
-                Some(RunPhase::Model) => SessionRuntimePhase::Model,
-                Some(RunPhase::Tools) => SessionRuntimePhase::Tools,
-                Some(RunPhase::Waiting) => SessionRuntimePhase::Waiting,
-                Some(RunPhase::Closing) => SessionRuntimePhase::Closing,
-            }
-        };
-        Ok(SessionRuntimeStatus {
-            phase,
-            active_run_id: self.active_run.as_ref().map(|run| run.run_id.clone()),
-            steerable: self
-                .active_run
-                .as_ref()
-                .is_some_and(|run| run.phase != RunPhase::Closing),
-            pending_steering_count: crate::agent::utils::u32_from_usize(
-                pending_steering_count,
-                "pending_steering_count",
-                Some(&self.session_id),
-            ),
-            queued_input_count: crate::agent::utils::u32_from_usize(
-                self.queued_prompts.len(),
-                "queued_input_count",
-                Some(&self.session_id),
-            ),
-            run_started_at_ms: self.active_run.as_ref().map(|run| run.started_at_ms),
-        })
+        if pending_steering_count != self.published_pending_steering {
+            self.emit_runtime_changed(pending_steering_count);
+        }
+        Ok(self.runtime_status(pending_steering_count))
     }
 }
 
@@ -2120,6 +2169,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     position,
                 };
                 self.record_submit_receipt(input.client_input_id, &result);
+                self.publish_runtime().await;
                 Ok(result)
             }
             InputDelivery::Queue => {
@@ -2157,6 +2207,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                         .unwrap_or_default();
                     let result = SubmitInputResult::Started { run_id, input_id };
                     self.record_submit_receipt(input.client_input_id, &result);
+                    self.publish_runtime().await;
                     Ok(result)
                 } else {
                     let position = self.queued_prompts.len() + 1;
@@ -2184,6 +2235,7 @@ impl Message<SubmitSessionInput> for SessionActor {
                     });
                     let result = SubmitInputResult::Queued { input_id, position };
                     self.record_submit_receipt(input.client_input_id, &result);
+                    self.publish_runtime().await;
                     Ok(result)
                 }
             }
@@ -2225,6 +2277,7 @@ impl Message<DiscardQueuedInput> for SessionActor {
         let _ = queued
             .reply
             .send(Ok(PromptResponse::new(StopReason::Cancelled)));
+        self.publish_runtime().await;
         Ok(DiscardQueuedInputResult::Discarded { input_id })
     }
 }
@@ -2271,6 +2324,7 @@ impl Message<Prompt> for SessionActor {
         } else {
             self.launch_prompt(msg.req, reply, ctx.actor_ref().clone(), None);
         }
+        self.publish_runtime().await;
         ctx.spawn(async move {
             receiver.await.unwrap_or_else(|_| {
                 Err(AgentError::Internal("prompt execution dropped".to_string()))
@@ -2342,6 +2396,7 @@ impl Message<ScheduledPrompt> for SessionActor {
         );
         let steering = scheduled_run.steering.clone();
         self.active_run = Some(scheduled_run);
+        self.emit_runtime_changed(0);
 
         // Build a PromptRequest from the schedule's prompt text
         let prompt_request = crate::acp::protocol::PromptRequest::new(
@@ -2475,7 +2530,7 @@ struct DetachedPromptExecution {
     execution_origin: crate::agent::execution_context::ExecutionOrigin,
     run_id: String,
     steering: Arc<crate::agent::turn_control::SteeringInbox>,
-    phase_reporter: tokio::sync::mpsc::UnboundedSender<RunPhase>,
+    phase_reporter: tokio::sync::mpsc::UnboundedSender<Option<RunPhase>>,
 }
 
 enum PermitWaitOutcome {
@@ -3554,6 +3609,7 @@ mod tests {
     struct ActorFixture {
         config: Arc<AgentConfig>,
         actor_ref: kameo::actor::ActorRef<SessionActor>,
+        execution_permit: Arc<tokio::sync::Semaphore>,
         _session_id: String,
         _temp_dir: tempfile::TempDir,
         event_journal: Arc<FailNextAppendJournal>,
@@ -3640,7 +3696,11 @@ mod tests {
         }
 
         async fn with_session_id(session_id: &str) -> Self {
-            let provider = Arc::new(Mutex::new(MockLlmProvider::new()));
+            let mut llm = MockLlmProvider::new();
+            llm.expect_chat().returning(|_| {
+                Ok(crate::test_utils::MockChatResponse::text_only("actor fixture reply").into())
+            });
+            let provider = Arc::new(Mutex::new(llm));
             let shared = SharedLlmProvider {
                 inner: provider.clone(),
                 tools: vec![].into_boxed_slice(),
@@ -3652,6 +3712,22 @@ mod tests {
             let llm_config = mock_llm_config();
             let session = mock_session(session_id);
             let mut store = MockSessionStore::new();
+            store
+                .expect_peek_revert_state()
+                .returning(|_| Ok(None))
+                .times(0..);
+            store
+                .expect_get_history()
+                .returning(|_| Ok(Vec::new()))
+                .times(0..);
+            store
+                .expect_get_effective_history()
+                .returning(|_| Ok(Vec::new()))
+                .times(0..);
+            store
+                .expect_append_progress_entry()
+                .returning(|_| Ok(()))
+                .times(0..);
             let intent_writes = Arc::new(AtomicUsize::new(0));
             let history_writes = Arc::new(AtomicUsize::new(0));
             let current_intent = Arc::new(std::sync::Mutex::new(None));
@@ -3715,6 +3791,10 @@ mod tests {
                 .expect_get_remote_session_bookmark()
                 .returning(|_| Ok(None))
                 .times(0..);
+            store
+                .expect_get_session_runtime_binding()
+                .returning(|_| Ok(None))
+                .times(0..);
             let writes_for_history = history_writes.clone();
             store
                 .expect_add_message()
@@ -3769,12 +3849,14 @@ mod tests {
                 HashMap::new(),
                 crate::agent::core::McpToolState::empty(),
             );
+            let execution_permit = runtime.execution_permit.clone();
             let actor = SessionActor::new(config.clone(), session_id.to_string(), runtime);
             let actor_ref = SessionActor::spawn(actor);
 
             Self {
                 config,
                 actor_ref,
+                execution_permit,
                 _session_id: session_id.to_string(),
                 _temp_dir: temp_dir,
                 event_journal,
@@ -3892,7 +3974,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(f.run_lifecycle().await.is_empty());
         let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
-        assert_eq!(status, SessionRuntimeStatus::Idle);
+        assert_eq!(status.phase, SessionRuntimePhase::Idle);
     }
 
     #[tokio::test]
@@ -3951,6 +4033,8 @@ mod tests {
     #[tokio::test]
     async fn run_lease_is_held_for_the_run_and_released_after_prompt_finished() {
         let f = ActorFixture::new().await;
+        // This actor-only gate drives PromptFinished itself; inference must not race it.
+        let _execution = f.execution_permit.acquire().await.unwrap();
         let started = f
             .actor_ref
             .ask(text_submit(&f._session_id, "hi"))
@@ -3960,6 +4044,23 @@ mod tests {
             panic!("expected Started");
         };
         let root = f.lease_root();
+        let observer = crate::agent::LocalAgentHandle::from_config(f.config.clone());
+        observer
+            .registry
+            .lock()
+            .await
+            .insert(f._session_id.clone(), f.actor_ref.clone());
+        let observed = observer
+            .observe_session_runtimes(std::slice::from_ref(&f._session_id))
+            .await
+            .remove(&f._session_id)
+            .unwrap();
+        assert_eq!(observed.active_run_id.as_deref(), Some(run_id.as_str()));
+        assert_ne!(
+            observed.phase,
+            SessionRuntimePhase::Unknown,
+            "an active actor's own lease is not an external owner"
+        );
         assert!(
             root.try_acquire(&f._session_id).unwrap().is_none(),
             "lease must be held while the run is active"
@@ -3976,7 +4077,7 @@ mod tests {
             .unwrap();
         f.wait_for_completed_runs(1).await;
         let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
-        assert_eq!(status, SessionRuntimeStatus::Idle);
+        assert_eq!(status.phase, SessionRuntimePhase::Idle);
         assert!(
             root.try_acquire(&f._session_id).unwrap().is_some(),
             "lease must be released once the run is closed"
@@ -3987,11 +4088,14 @@ mod tests {
             events[1],
             ("run_completed", run_id, Some("completed".to_string()))
         );
+        f.execution_permit.close();
     }
 
     #[tokio::test]
     async fn run_lease_is_handed_over_to_queued_prompt_without_release() {
         let f = ActorFixture::new().await;
+        let _execution = f.execution_permit.acquire().await.unwrap();
+        let mut runtime_events = f.config.subscribe_events();
         let SubmitInputResult::Started { run_id: first, .. } = f
             .actor_ref
             .ask(text_submit(&f._session_id, "one"))
@@ -4019,18 +4123,56 @@ mod tests {
 
         // The second run started with its own run id, under the lease handed
         // over from the first run (never released in between).
-        let status = loop {
-            let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
-            if status
-                .active_run_id
-                .as_deref()
-                .is_some_and(|id| id != first)
-            {
-                break status;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
+                if status
+                    .active_run_id
+                    .as_deref()
+                    .is_some_and(|id| id != first)
+                {
+                    break status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
-        let second = status.active_run_id.unwrap();
+        })
+        .await
+        .expect("queued run B must start under the same lease");
+        let second = status.active_run_id.clone().unwrap();
+        let revision_b = status.observation.revision.unwrap();
+        f.actor_ref
+            .tell(PromptFinished {
+                generation: 1,
+                run_id: first.clone(),
+                disposition: RunCompletionDisposition::Completed,
+            })
+            .await
+            .unwrap();
+        let after_stale = f.actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(after_stale.active_run_id.as_deref(), Some(second.as_str()));
+        assert_eq!(after_stale.observation.revision, Some(revision_b));
+        f.config
+            .event_sink
+            .session_stream(&f._session_id)
+            .flush()
+            .await;
+        let mut seen_a = false;
+        let mut seen_b = false;
+        let mut previous_revision = 0;
+        while let Ok(event) = runtime_events.try_recv() {
+            if let AgentEventKind::RuntimeChanged { runtime } = event.kind() {
+                assert_ne!(
+                    runtime.phase,
+                    SessionRuntimePhase::Idle,
+                    "A-to-B handoff must not publish Idle"
+                );
+                assert!(runtime.observation.revision.unwrap() > previous_revision);
+                previous_revision = runtime.observation.revision.unwrap();
+                seen_a |= runtime.active_run_id.as_deref() == Some(first.as_str());
+                seen_b |= runtime.active_run_id.as_deref() == Some(second.as_str());
+            }
+        }
+        assert!(seen_a && seen_b);
         assert!(
             f.lease_root()
                 .try_acquire(&f._session_id)
@@ -4065,6 +4207,7 @@ mod tests {
                 1
             );
         }
+        f.execution_permit.close();
     }
 
     #[cfg(feature = "remote")]
@@ -4859,6 +5002,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_consistency_steering_drain_publishes_new_revision_without_phase_change() {
+        let fixture = crate::test_utils::TestAgent::new().await;
+        let mut exec = fixture.execution_context().await.with_turn_id("held-run");
+        let mut actor = SessionActor::new(
+            fixture.config.clone(),
+            exec.session_id.clone(),
+            exec.runtime.clone(),
+        );
+        actor.turn_state.generation = 1;
+        let mut run = ActiveRun::new("held-run".into(), 1, actor.turn_state.token.clone());
+        run.phase = RunPhase::Model;
+        exec = exec.with_steering(run.steering.clone());
+        actor.active_run = Some(run);
+        let actor_ref = SessionActor::spawn(actor);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        exec = exec.with_phase_reporter(tx);
+        let forward_actor = actor_ref.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Some(phase) = rx.recv().await {
+                forward_actor
+                    .tell(RunPhaseChanged {
+                        generation: 1,
+                        run_id: "held-run".into(),
+                        phase,
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut events = fixture.config.subscribe_events();
+        actor_ref
+            .ask(SubmitSessionInput {
+                input: SubmitInput {
+                    session_id: exec.session_id.clone(),
+                    client_input_id: Some("steer-once".into()),
+                    expected_run_id: Some("held-run".into()),
+                    delivery: InputDelivery::Steer,
+                    prompt: vec![crate::acp::protocol::ContentBlock::from("adjust task")],
+                },
+            })
+            .await
+            .unwrap();
+        let before = actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(before.pending_steering_count, 1);
+        let context = Arc::new(crate::middleware::ConversationContext::new(
+            Arc::from(exec.session_id.as_str()),
+            Arc::from([]),
+            Arc::new(crate::middleware::AgentStats::default()),
+            Arc::from("mock"),
+            Arc::from("mock-model"),
+        ));
+        crate::agent::execution::apply_pending_steering(
+            &fixture.config,
+            &mut exec,
+            &context,
+            "test",
+            false,
+        )
+        .await
+        .unwrap();
+        let observation = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                if let AgentEventKind::RuntimeChanged { runtime } =
+                    events.recv().await.unwrap().kind()
+                    && runtime.pending_steering_count == 0
+                {
+                    break runtime.clone();
+                }
+            }
+        })
+        .await
+        .expect("drain publishes runtime without another phase transition or read");
+        assert_eq!(observation.active_run_id, before.active_run_id);
+        assert!(observation.observation.revision > before.observation.revision);
+        let after = actor_ref.ask(GetRuntimeStatus).await.unwrap();
+        assert_eq!(after.pending_steering_count, 0);
+        assert!(after.observation.revision > before.observation.revision);
+        actor_ref.kill();
+        actor_ref.wait_for_shutdown().await;
+        forwarder.abort();
+    }
+
+    #[tokio::test]
     async fn test_get_runtime_status_idle_when_not_running() {
         let f = ActorFixture::new().await;
 
@@ -4868,7 +5094,7 @@ mod tests {
             .await
             .expect("ask GetRuntimeStatus");
 
-        assert_eq!(status, SessionRuntimeStatus::Idle);
+        assert_eq!(status.phase, SessionRuntimePhase::Idle);
     }
 
     #[tokio::test]
@@ -4883,7 +5109,7 @@ mod tests {
             .await
             .expect("ask GetRuntimeStatus");
 
-        assert_eq!(status, SessionRuntimeStatus::Idle);
+        assert_eq!(status.phase, SessionRuntimePhase::Idle);
     }
 
     #[tokio::test]
@@ -4918,7 +5144,7 @@ mod tests {
 
         // prompt_running is false (no prompt was sent), so status is Idle
         // even though the token was cancelled.
-        assert_eq!(status, SessionRuntimeStatus::Idle);
+        assert_eq!(status.phase, SessionRuntimePhase::Idle);
     }
 
     #[tokio::test]
@@ -5569,7 +5795,7 @@ mod tests {
 
         let mut saw_queued_content = false;
         let mut saw_discarded = false;
-        for _ in 0..3 {
+        while !(saw_queued_content && saw_discarded) {
             let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
                 .await
                 .expect("queue lifecycle event")

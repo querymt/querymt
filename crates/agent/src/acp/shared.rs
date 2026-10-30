@@ -623,6 +623,7 @@ pub const QMT_NOTIFICATION_SCHEDULES_CHANGED: &str = "querymt/schedules/changed"
 pub const QMT_NOTIFICATION_DELEGATION_UPDATE: &str = "querymt/session/delegationUpdate";
 pub const QMT_NOTIFICATION_DELEGATE_MODELS_CHANGED: &str = "querymt/session/delegateModelsChanged";
 pub const QMT_NOTIFICATION_INPUT_STATE: &str = "querymt/session/inputState";
+pub const QMT_NOTIFICATION_RUNTIME_CHANGED: &str = "querymt/session/runtimeChanged";
 pub const QMT_NOTIFICATION_SESSION_PINS_CHANGED: &str = "querymt/session/pinsChanged";
 
 fn ext_notification(method: &str, params: serde_json::Value) -> serde_json::Value {
@@ -701,6 +702,27 @@ pub fn delegate_models_changed_notification(
         )
         .expect("serialize delegate models changed notification"),
     )
+}
+
+pub(crate) async fn current_session_observations(
+    agent: &AgentHandle,
+    session_ids: &[String],
+    sources: &[Arc<EventFanout>],
+) -> (Vec<serde_json::Value>, Vec<DelegationUpdateNotification>) {
+    let runtimes = agent.observe_session_runtimes(session_ids).await;
+    let mut notifications = Vec::with_capacity(runtimes.len());
+    for (session_id, runtime) in runtimes {
+        notifications.push(ext_notification(
+            QMT_NOTIFICATION_RUNTIME_CHANGED,
+            serde_json::json!({"version": 1, "session_id": session_id, "runtime": runtime}),
+        ));
+    }
+    // Include historical cleanup tombstones: live-only refresh would leave a lost stage stuck busy.
+    let updates = sources
+        .iter()
+        .flat_map(|source| source.delegation_snapshots(session_ids))
+        .collect();
+    (notifications, updates)
 }
 
 pub fn delegation_update_notification(
@@ -1709,17 +1731,17 @@ impl AcpLiveEventTranslator {
         let usage = self.usage.entry(session_id.to_owned()).or_default();
         for event in events {
             usage.observe(session_id, event.seq, &event.kind);
-            self.delegation_updates.project_event(event);
         }
+        self.delegation_updates.seed_history(session_id, events);
         usage.history_loaded = true;
-        // A queued live completion can become projectable only during seeding.
-        // Return its final enriched snapshot once, not once per historical event.
+        // A queued observation can gain lifecycle or identity only during seeding.
+        // Deliver its enriched snapshot once, including a still-live fork.
         self.delegation_updates
             .snapshots()
             .into_iter()
             .filter(|update| {
                 update.session_id == session_id
-                    && update.finished_at.is_some()
+                    && (update.finished_at.is_some() || update.source_epoch.is_some())
                     && previous.get(&update.delegation_id) != Some(update)
             })
             .collect()
@@ -1797,9 +1819,24 @@ impl AcpLiveEventTranslator {
         self.delegation_updates.project_envelope(event)
     }
 
+    pub(crate) fn restore_delegation_observations(
+        &mut self,
+        updates: &[DelegationUpdateNotification],
+    ) {
+        for update in updates {
+            self.delegation_updates.restore_observation(update.clone());
+        }
+    }
+
     /// Translates one internal event into zero or more ordered JSON-RPC
     /// notifications for the owning connection.
     pub fn translate_notifications(&mut self, event: &EventEnvelope) -> Vec<serde_json::Value> {
+        if let AgentEventKind::RuntimeChanged { runtime } = event.kind() {
+            return vec![serde_json::json!({
+                "jsonrpc": "2.0", "method": QMT_NOTIFICATION_RUNTIME_CHANGED,
+                "params": {"version": 1, "session_id": event.session_id(), "runtime": runtime}
+            })];
+        }
         if let AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
             return vec![delegate_models_changed_notification(
                 event.session_id(),

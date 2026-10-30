@@ -195,6 +195,29 @@ pub trait EventJournal: Send + Sync {
         limit: Option<usize>,
     ) -> SessionResult<Vec<DurableEvent>>;
 
+    /// Recover correlated terminal delegation signals after a lost live wakeup.
+    async fn load_delegation_terminals(
+        &self,
+        session_id: &str,
+        delegation_ids: &[String],
+    ) -> SessionResult<Vec<DurableEvent>> {
+        if delegation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let events = self.load_session_stream(session_id, None, None).await?;
+        Ok(events
+            .into_iter()
+            .filter(|event| match &event.kind {
+                crate::events::AgentEventKind::DelegationCompleted { delegation_id, .. }
+                | crate::events::AgentEventKind::DelegationFailed { delegation_id, .. }
+                | crate::events::AgentEventKind::DelegationCancelled { delegation_id } => {
+                    delegation_ids.contains(delegation_id)
+                }
+                _ => false,
+            })
+            .collect())
+    }
+
     /// Load one page of a session's durable events strictly in `stream_seq`
     /// order, with no production-order restoration.
     ///

@@ -1,6 +1,253 @@
 use super::*;
 
 #[tokio::test]
+async fn status_consistency_idle_actor_does_not_mask_external_lease() {
+    let f = RealStorageHandleFixture::new().await;
+    let sid = seed_session_with_reasoning(&f, None).await;
+    f.handle
+        .load_session(LoadSessionRequest::new(
+            sid.clone(),
+            std::path::PathBuf::new(),
+        ))
+        .await
+        .unwrap();
+    let before = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&sid))
+        .await
+        .remove(&sid)
+        .unwrap();
+    assert_eq!(
+        before.phase,
+        crate::agent::messages::SessionRuntimePhase::Idle
+    );
+    let root = crate::session::run_lease::RunLeaseRoot::new(
+        f.handle.config.storage.run_lease_root().unwrap(),
+    );
+    let lease = root.acquire(&sid).await.unwrap().unwrap();
+    let state = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&sid))
+        .await
+        .remove(&sid)
+        .unwrap();
+    assert_eq!(
+        state.phase,
+        crate::agent::messages::SessionRuntimePhase::Unknown
+    );
+    assert_eq!(
+        state.observation.reason.as_deref(),
+        Some("live_owner_elsewhere")
+    );
+    let response = f
+        .handle
+        .handle_ext_session_runtime_state(ExtRequest::new(
+            "querymt/session/runtimeState",
+            Arc::from(
+                serde_json::value::to_raw_value(&serde_json::json!({"session_id": sid})).unwrap(),
+            ),
+        ))
+        .await
+        .unwrap();
+    let direct: serde_json::Value = serde_json::from_str(response.0.get()).unwrap();
+    assert_eq!(direct, serde_json::to_value(&state).unwrap());
+    let listing = f
+        .handle
+        .list_sessions(ListSessionsRequest::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        listing
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id.to_string() == sid)
+            .unwrap()
+            .meta
+            .as_ref()
+            .unwrap()["runtimeStatus"],
+        direct
+    );
+    let snapshot = crate::session::load_snapshot::load_session_snapshot(
+        &f.handle,
+        f.storage.view_store().unwrap(),
+        &sid,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.runtime_status, state);
+    let sdk_session = crate::api::AgentSession::new(Arc::new(f.handle), sid);
+    assert_eq!(sdk_session.runtime_state().await.unwrap(), state);
+    drop(lease);
+}
+
+#[tokio::test]
+async fn status_observer_probes_do_not_report_each_other_as_execution() {
+    for materialized in [false, true] {
+        let f = RealStorageHandleFixture::new().await;
+        let sid = seed_session_with_reasoning(&f, None).await;
+        if materialized {
+            f.handle
+                .load_session(LoadSessionRequest::new(
+                    sid.clone(),
+                    std::path::PathBuf::new(),
+                ))
+                .await
+                .unwrap();
+        }
+        let root = f.storage.run_lease_root().unwrap();
+        let pause = crate::agent::handle::runtime_observation::pause_next_probe(&root, &sid);
+        let ids = [sid.clone()];
+        let first = f.handle.observe_session_runtimes(&ids);
+        tokio::pin!(first);
+        tokio::select! { _ = pause.entered.notified() => {}, _ = &mut first => panic!("probe did not pause") }
+        let (listed, direct, snapshot) = tokio::join!(
+            f.handle.list_sessions(ListSessionsRequest::new()),
+            f.handle.observe_session_runtimes(&ids),
+            crate::session::load_snapshot::load_session_snapshot(
+                &f.handle,
+                f.storage.view_store().unwrap(),
+                &sid
+            ),
+        );
+        pause.release.notify_one();
+        let first = first.await;
+        assert_eq!(
+            first[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        assert_eq!(
+            direct[&sid].phase,
+            crate::agent::messages::SessionRuntimePhase::Idle,
+            "observer's completed probe must not masquerade as a live run"
+        );
+        assert_eq!(
+            snapshot.unwrap().runtime_status.phase,
+            crate::agent::messages::SessionRuntimePhase::Idle
+        );
+        let row = listed
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|row| row.session_id.to_string() == sid)
+            .unwrap();
+        assert_eq!(row.meta.unwrap()["runtimeStatus"]["phase"], "idle");
+        let lease = crate::session::run_lease::RunLeaseRoot::new(root)
+            .acquire(&sid)
+            .await
+            .unwrap()
+            .unwrap();
+        let external = f.handle.observe_session_runtimes(&ids).await;
+        assert_eq!(
+            external[&sid].observation.reason.as_deref(),
+            Some("live_owner_elsewhere")
+        );
+        drop(lease);
+    }
+}
+
+#[tokio::test]
+async fn status_observation_page_uses_one_deadline_including_owner_locks() {
+    let f = RealStorageHandleFixture::new().await;
+    let ids: Vec<_> = (0..100).map(|id| format!("blocked-page-{id}")).collect();
+    let _registry = f.handle.registry.lock().await;
+    let observed = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        f.handle.observe_session_runtimes(&ids),
+    )
+    .await
+    .expect("page must not spend a fresh timeout on every row");
+    assert_eq!(observed.len(), ids.len());
+    assert!(observed.values().all(|runtime| runtime.phase
+        == crate::agent::messages::SessionRuntimePhase::Unknown
+        && runtime.observation.reason.as_deref() == Some("observation_timeout")));
+}
+
+#[tokio::test]
+async fn status_observation_does_not_materialize_persisted_profile() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountingCatalog(Arc<AtomicUsize>);
+    #[async_trait]
+    impl ProfileCatalog for CountingCatalog {
+        async fn list_profiles(&self) -> anyhow::Result<Vec<crate::profiles::ProfileMetadata>> {
+            Ok(vec![])
+        }
+        async fn load_profile(
+            &self,
+            _id: &str,
+        ) -> anyhow::Result<crate::profiles::ProfileDocument> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("observation must not build this historical profile")
+        }
+    }
+    let f = RealStorageHandleFixture::new().await;
+    let session_id = seed_session_with_reasoning(&f, None).await;
+    f.storage
+        .session_store()
+        .set_profile_binding(&session_id, "unmaterialized")
+        .await
+        .unwrap();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let catalog: Arc<dyn ProfileCatalog> = Arc::new(CountingCatalog(builds.clone()));
+    let (plugins, _dir) = empty_plugin_registry().unwrap();
+    let profiles = Arc::new(ProfileRuntimeManager::with_infra_boxed(
+        catalog,
+        "unmaterialized",
+        AgentInfra {
+            plugin_registry: Arc::new(plugins),
+            storage: Some(f.storage.clone()),
+            session_mcp_attachment_source: None,
+            event_fanout: None,
+        },
+    ));
+    f.handle.set_profiles(profiles.clone());
+    let listing = f
+        .handle
+        .list_sessions(ListSessionsRequest::new())
+        .await
+        .unwrap();
+    let listed = listing
+        .sessions
+        .iter()
+        .find(|s| s.session_id.to_string() == session_id)
+        .unwrap();
+    let direct = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&session_id))
+        .await
+        .remove(&session_id)
+        .unwrap();
+    assert_eq!(
+        listed.meta.as_ref().unwrap()["runtimeStatus"],
+        serde_json::to_value(&direct).unwrap()
+    );
+    assert_eq!(builds.load(Ordering::SeqCst), 0);
+    assert!(profiles.materialized_runtimes().await.is_empty());
+    assert!(f.handle.registry.lock().await.is_empty());
+    let lease = crate::session::run_lease::RunLeaseRoot::new(
+        f.handle.config.storage.run_lease_root().unwrap(),
+    )
+    .acquire(&session_id)
+    .await
+    .unwrap()
+    .unwrap();
+    let other_owner = f
+        .handle
+        .observe_session_runtimes(std::slice::from_ref(&session_id))
+        .await
+        .remove(&session_id)
+        .unwrap();
+    assert_eq!(
+        other_owner.phase,
+        crate::agent::messages::SessionRuntimePhase::Unknown
+    );
+    assert_eq!(
+        other_owner.observation.reason.as_deref(),
+        Some("live_owner_elsewhere")
+    );
+    drop(lease);
+}
+
+#[tokio::test]
 async fn local_load_and_resume_replace_stopped_actors() {
     for resume in [false, true] {
         let f = RealStorageHandleFixture::new().await;
@@ -705,6 +952,80 @@ async fn profile_reopen_preserves_the_owning_actor_and_event_sequence() {
             .set_session_binding(&session_id, binding)
             .await
             .unwrap();
+        let direct = owner
+            .registry
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .unwrap()
+            .get_runtime_status()
+            .await
+            .unwrap();
+        assert!(
+            owner.profiles().is_none(),
+            "direct bound owner must not need a profiles manager"
+        );
+        let own_observation = owner
+            .observe_session_runtimes(std::slice::from_ref(&session_id))
+            .await
+            .remove(&session_id)
+            .unwrap();
+        assert_eq!(
+            own_observation, direct,
+            "direct bound-owner observation must use its own registered actor"
+        );
+        let own_response = owner
+            .handle_ext_session_runtime_state(ExtRequest::new(
+                "querymt/session/runtimeState",
+                Arc::from(
+                    serde_json::value::to_raw_value(&serde_json::json!({"session_id": session_id}))
+                        .unwrap(),
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(own_response.0.get()).unwrap(),
+            serde_json::to_value(&direct).unwrap()
+        );
+        if agent_id.is_none() {
+            let sdk = runtime
+                .agent()
+                .sessions()
+                .load(session_id.clone())
+                .await
+                .unwrap();
+            assert_eq!(sdk.runtime_state().await.unwrap(), direct);
+        }
+        let observed = f
+            .handle
+            .observe_session_runtimes(std::slice::from_ref(&session_id))
+            .await
+            .remove(&session_id)
+            .unwrap();
+        assert_eq!(
+            observed, direct,
+            "bound profile/delegate lookup must use its real actor"
+        );
+        assert_eq!(
+            observed.observation.availability,
+            crate::agent::messages::RuntimeAvailability::Live
+        );
+        let listed = f
+            .handle
+            .list_sessions(ListSessionsRequest::new())
+            .await
+            .unwrap();
+        let entry = listed
+            .sessions
+            .iter()
+            .find(|entry| entry.session_id.to_string() == session_id)
+            .unwrap();
+        assert_eq!(
+            entry.meta.as_ref().unwrap()["runtimeStatus"],
+            serde_json::to_value(&direct).unwrap()
+        );
         let stream = owner.config.event_sink.session_stream(&session_id);
         stream.flush().await;
         let tip = stream.tip();

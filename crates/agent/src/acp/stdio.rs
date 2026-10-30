@@ -720,9 +720,24 @@ async fn forward_stdio_event(
         };
         (delegation_update, session_updates)
     };
-    let result = if let crate::events::AgentEventKind::DelegateModelsChanged { revision } =
-        event.kind()
-    {
+    let result = if let crate::events::AgentEventKind::RuntimeChanged { runtime } = event.kind() {
+        match serde_json::value::RawValue::from_string(
+            serde_json::json!({
+                "version": 1, "session_id": event.session_id(), "runtime": runtime
+            })
+            .to_string(),
+        ) {
+            Ok(params) => {
+                bridge
+                    .notify_ext(crate::acp::protocol::ExtNotification::new(
+                        crate::acp::shared::QMT_NOTIFICATION_RUNTIME_CHANGED,
+                        Arc::from(params),
+                    ))
+                    .await
+            }
+            Err(error) => Err(acp::Error::into_internal_error(error)),
+        }
+    } else if let crate::events::AgentEventKind::DelegateModelsChanged { revision } = event.kind() {
         let notification =
             crate::acp::shared::delegate_models_changed_notification(event.session_id(), *revision);
         let params = serde_json::value::RawValue::from_string(notification["params"].to_string())
@@ -902,6 +917,37 @@ fn spawn_event_bridge_forwarder(
                     .await;
                     delivery.finish_lag_recovery();
                     if !keep_going {
+                        break;
+                    }
+                    let ids = delivery.observed_sessions();
+                    let sources = crate::acp::shared::collect_event_sources(&agent);
+                    let (mut notifications, updates) =
+                        crate::acp::shared::current_session_observations(&agent, &ids, &sources)
+                            .await;
+                    translator
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .restore_delegation_observations(&updates);
+                    notifications.extend(
+                        updates
+                            .into_iter()
+                            .map(crate::acp::shared::delegation_update_notification),
+                    );
+                    let mut closed = false;
+                    for notification in notifications {
+                        let Ok(notification) = serde_json::from_value::<
+                            crate::acp::protocol::ExtNotification,
+                        >(serde_json::json!({
+                            "method": notification["method"], "params": notification["params"]
+                        })) else {
+                            continue;
+                        };
+                        if bridge.notify_ext(notification).await.is_err() {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if closed {
                         break;
                     }
                 }
@@ -1515,6 +1561,25 @@ mod stdio_tests {
         assert_eq!(params["input_id"], "input-1");
         assert_eq!(params["state"], "applied");
         assert_eq!(params["boundary"], "after_tools");
+        fixture.config.event_sink.emit_ephemeral(
+            "parent",
+            crate::events::AgentEventKind::RuntimeChanged {
+                runtime: crate::agent::messages::SessionRuntimeStatus::Waiting,
+            },
+        );
+        let message = timeout(Duration::from_secs(2), bridge_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ClientBridgeMessage::ExtNotification(notification) = message else {
+            panic!("expected runtime extension");
+        };
+        assert_eq!(
+            notification.method.as_ref(),
+            crate::acp::shared::QMT_NOTIFICATION_RUNTIME_CHANGED
+        );
+        let params: serde_json::Value = serde_json::from_str(notification.params.get()).unwrap();
+        assert_eq!(params["runtime"]["phase"], "waiting");
         forwarder.abort();
     }
 

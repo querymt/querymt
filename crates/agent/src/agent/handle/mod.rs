@@ -23,6 +23,7 @@ pub(crate) mod remote_connect;
 mod remote_mesh;
 mod remote_nodes;
 mod remote_sessions;
+mod runtime_observation;
 mod scheduler;
 mod send_agent_config;
 mod send_agent_impl;
