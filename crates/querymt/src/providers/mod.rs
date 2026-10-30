@@ -5,7 +5,7 @@ mod types;
 mod valuation;
 
 #[cfg(feature = "model-registry")]
-pub use registry::{read_providers_from_cache, update_providers_if_stale};
+pub use registry::{providers_registry, read_providers_from_cache, update_providers_if_stale};
 pub use types::{
     DimensionApplicability, Modalities, ModelCapabilities, ModelConstraints, ModelInfo,
     ModelLimits, ModelPricing, PricingDimension, PricingSource, ProviderInfo, ProvidersRegistry,

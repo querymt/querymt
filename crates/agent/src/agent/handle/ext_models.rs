@@ -60,7 +60,7 @@ impl LocalAgentHandle {
         let parsed: ModelInfoRequest = serde_json::from_str(req.params.get())
             .map_err(|e| Error::from(crate::error::AgentError::Serialization(e.to_string())))?;
 
-        let registry = querymt::providers::read_providers_from_cache();
+        let registry = querymt::providers::providers_registry();
         let mut info_map = serde_json::Map::new();
 
         match registry {

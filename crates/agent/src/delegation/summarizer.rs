@@ -340,16 +340,21 @@ impl DelegationSummarizer {
             return Ok((output, true));
         }
         let chat_span = tracing::Span::current();
-        let mut first_chunk = genai::FirstChunk::default();
-        first_chunk.start();
+        let mut timing = genai::StreamTiming::default();
+        timing.start();
         let mut stream = provider
             .chat_stream(&ChatCall::new(messages))
             .await
             .map_err(no_response)?;
+        timing.headers_received(&chat_span);
         let mut accumulator = ChatStreamAccumulator::new();
         let mut response_started = false;
         let mut terminal_seen = false;
-        while let Some(chunk) = stream.next().await {
+        loop {
+            timing.wait_begin();
+            let next = stream.next().await;
+            timing.wait_end();
+            let Some(chunk) = next else { break };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(error) => {
@@ -363,7 +368,7 @@ impl DelegationSummarizer {
                 }
             };
             response_started = true;
-            first_chunk.received(&chat_span);
+            timing.chunk_received(&chat_span, genai::chunk_commits_output(&chunk));
             if accumulator.push(&chunk).is_err() {
                 genai::output(&accumulator.output());
                 return Err(CallFailure {

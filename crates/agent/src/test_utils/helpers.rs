@@ -28,6 +28,46 @@ pub(crate) mod genai_metrics {
         let _ = state();
     }
 
+    /// Number of recorded samples of f64 histogram `name` for `model`. With
+    /// `error = None` only points without an `error.type` attribute count;
+    /// otherwise only points carrying exactly that `error.type`.
+    pub(crate) fn histogram_count(name: &str, model: &str, error: Option<&str>) -> u64 {
+        let (exporter, provider) = state();
+        exporter.reset();
+        provider.force_flush().expect("flush metrics");
+        let mut total = 0;
+        for resource in exporter.get_finished_metrics().expect("finished metrics") {
+            for scope in resource.scope_metrics() {
+                for metric in scope.metrics().filter(|metric| metric.name() == name) {
+                    if let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data()
+                    {
+                        for point in histogram.data_points() {
+                            let attrs: Vec<_> = point.attributes().collect();
+                            let find = |key: &str| {
+                                attrs
+                                    .iter()
+                                    .find(|kv| kv.key.as_str() == key)
+                                    .map(|kv| &kv.value)
+                            };
+                            let model_matches = find("gen_ai.request.model")
+                                == Some(&Value::from(model.to_owned()));
+                            let error_matches = match error {
+                                None => find("error.type").is_none(),
+                                Some(kind) => {
+                                    find("error.type") == Some(&Value::from(kind.to_owned()))
+                                }
+                            };
+                            if model_matches && error_matches {
+                                total += point.count();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+
     /// Current cumulative value of counter `name` summed over every data point
     /// whose attributes include all of `want`.
     pub(crate) fn sum(name: &str, want: &[(&str, Value)]) -> u64 {
