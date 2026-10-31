@@ -139,6 +139,15 @@ pub trait MiddlewareDriver: Send + Sync {
     /// Returns a human-readable name for this driver
     fn name(&self) -> &'static str;
 
+    /// Context threshold enforced by this driver, so compaction can retain less
+    /// than the budget that triggered it. Drivers without a context limit return None.
+    fn compaction_threshold(
+        &self,
+        _context: &crate::middleware::ConversationContext,
+    ) -> Option<usize> {
+        None
+    }
+
     /// Returns session limits if this middleware enforces any.
     /// Default implementation returns None.
     fn get_limits(&self) -> Option<SessionLimits> {

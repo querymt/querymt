@@ -177,7 +177,15 @@ impl HTTPChatProvider for Codex {
         &self,
         _context: serde_json::Value,
     ) -> Result<Box<dyn ChatStreamParser>, LLMError> {
-        Ok(Box::new(CodexStreamParser::default()))
+        let endpoint = self
+            .base_url
+            .join("responses")
+            .map_err(|error| LLMError::HttpError(error.to_string()))?
+            .to_string();
+        Ok(Box::new(CodexStreamParser {
+            endpoint: Some(endpoint),
+            ..Default::default()
+        }))
     }
 
     fn capabilities(&self) -> ChatCapabilities {
@@ -187,6 +195,7 @@ impl HTTPChatProvider for Codex {
 
 #[derive(Default)]
 struct CodexStreamParser {
+    endpoint: Option<String>,
     state: qmt_openai::api::OpenAIResponsesStreamState,
     policy: qmt_openai::api::ResponsesStreamPolicy,
     initialized: bool,
@@ -197,7 +206,11 @@ impl ChatStreamParser for CodexStreamParser {
     fn parse_chunk(&mut self, chunk: &[u8]) -> Result<Vec<StreamChunk>, LLMError> {
         if !self.initialized {
             self.state =
-                qmt_openai::api::OpenAIResponsesStreamState::for_provider(codex_provenance());
+                qmt_openai::api::OpenAIResponsesStreamState::for_provider(codex_provenance(
+                    self.endpoint
+                        .clone()
+                        .unwrap_or_else(api::codex_responses_endpoint),
+                ));
             self.policy.reject_end_turn_false = true;
             self.policy.terminal_usage_log_target = Some("qmt_codex");
             self.initialized = true;
@@ -230,12 +243,8 @@ impl ChatStreamParser for CodexStreamParser {
 }
 
 /// Provenance recorded for Codex-originated structured output.
-fn codex_provenance() -> qmt_openai::api::ResponsesCodecProvider {
-    qmt_openai::api::ResponsesCodecProvider::with_endpoint(
-        "codex",
-        "responses",
-        api::codex_responses_endpoint(),
-    )
+fn codex_provenance(endpoint: String) -> qmt_openai::api::ResponsesCodecProvider {
+    qmt_openai::api::ResponsesCodecProvider::with_endpoint("codex", "responses", endpoint)
 }
 
 impl HTTPEmbeddingProvider for Codex {
