@@ -355,13 +355,12 @@ pub(super) async fn run_ai_compaction(
         match result {
             Ok(result) => result,
             Err(error) => {
-                // The cycle budget gate refused a paid compaction dispatch:
-                // nothing was sent. End the cycle as a price-limit stop, as
-                // the main path does, not as a compaction/accounting error.
-                // The started compaction still gets its terminal event.
+                // The budget gate may refuse either request of a paired
+                // compaction. Earlier attempts are already settled; never
+                // activate a partial checkpoint. End with the normal price stop.
                 if let Some((cap, spent)) = ledger.operation.budget_refusal() {
                     let reason = anyhow::anyhow!(
-                        "compaction not dispatched: price limit reached: ${spent:.4} >= ${cap:.2}"
+                        "compaction dispatch refused: price limit reached: ${spent:.4} >= ${cap:.2}"
                     );
                     emit_compaction_failure(config, session_id, &compaction_id, &reason).await;
                     return Ok(ExecutionState::Stopped {
@@ -605,13 +604,14 @@ mod tests {
         ExecutionState,
         tempfile::TempDir,
     ) {
-        fixture_with_provider(hooks, output, "mock").await
+        fixture_with_provider(hooks, output, "mock", None).await
     }
 
     async fn fixture_with_provider(
         hooks: Hooks,
         output: Option<ChatOutput>,
         provider_name: &str,
+        summary_text: Option<&str>,
     ) -> (
         AgentConfig,
         ExecutionContext,
@@ -622,11 +622,24 @@ mod tests {
         if let Some(output) = output {
             // The configured single retry may call the provider at most twice.
             if provider_name == "codex" {
+                let summary_text = summary_text
+                    .unwrap_or("Portable parser summary with important tool findings.")
+                    .to_owned();
                 mock.expect_chat_with_tools()
-                    .times(1..=2)
+                    .times(2..=3)
                     .returning(move |_, tools| {
-                        assert!(tools.is_some_and(|tools| !tools.is_empty()));
-                        Ok(output.clone())
+                        let tools = tools.expect("both Codex requests specify tools explicitly");
+                        if tools.is_empty() {
+                            Ok(ChatOutput::from_projections(
+                                None,
+                                Some(summary_text.clone()),
+                                None,
+                                None,
+                                Some(FinishReason::Stop),
+                            ))
+                        } else {
+                            Ok(output.clone())
+                        }
                     });
             } else {
                 mock.expect_chat()
@@ -836,7 +849,7 @@ mod tests {
         })
         .unwrap();
         let (config, mut exec_ctx, state, _dir) =
-            fixture_with_provider(hooks, Some(output), "codex").await;
+            fixture_with_provider(hooks, Some(output), "codex", None).await;
         // Real SQLite configs have empty protocol/endpoint fields. Native compaction
         // and normal history replay must both resolve the Codex target correctly.
         assert!(exec_ctx.llm_config().unwrap().protocol.is_empty());
@@ -868,12 +881,81 @@ mod tests {
         assert!(encoded.contains("encrypted-reasoning"));
         assert!(encoded.contains("encrypted-checkpoint"));
         assert!(encoded.contains("keep the hook note"));
+        assert!(!encoded.contains("Portable parser summary"));
+        let checkpoint = history.last().unwrap();
+        let portable = checkpoint
+            .to_chat_message_with_output_target(
+                Some(&crate::model::OutputTarget::new("xai", "grok")),
+                None,
+            )
+            .unwrap();
+        let text = portable.output().unwrap().text().unwrap();
+        assert!(text.contains("Portable parser summary"));
+        assert!(text.contains("visible reasoning summary"));
+        assert_eq!(text.matches("keep the hook note").count(), 1);
+        assert!(
+            !serde_json::to_string(&portable)
+                .unwrap()
+                .contains("encrypted-checkpoint")
+        );
         let encoded = serde_json::to_string(&resumed.context().unwrap().messages).unwrap();
         assert!(encoded.contains("encrypted-checkpoint"));
         let events = take_compaction_events(&mut events);
         assert!(matches!(
             &events.last().unwrap().kind,
             AgentEventKind::CompactionEnd { .. }
+        ));
+        assert_compaction_journal_matches(&config, &exec_ctx.session_id, &events).await;
+    }
+
+    #[tokio::test]
+    async fn codex_plaintext_failure_preserves_the_original_history() {
+        use querymt::chat::{
+            ChatOpaqueItem, ChatOutputItem, ChatOutputProvenance, ChatOutputStatus,
+        };
+        let output = ChatOutput {
+            status: Some(ChatOutputStatus::Completed),
+            finish_reason: Some(FinishReason::Stop),
+            provenance: Some(ChatOutputProvenance {
+                provider: "codex".into(),
+                model: "mock".into(),
+                protocol: "responses".into(),
+                endpoint: "https://chatgpt.com/backend-api/codex/responses".into(),
+            }),
+            items: vec![ChatOutputItem::Opaque(ChatOpaqueItem {
+                original_type: "compaction".into(),
+                payload: serde_json::json!({"type":"compaction", "encrypted_content":"partial-native-state"}),
+            })],
+            ..Default::default()
+        };
+        let (config, mut exec_ctx, state, _dir) =
+            fixture_with_provider(Hooks::disabled(), Some(output), "codex", Some("")).await;
+        let before = config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        let mut events = config.subscribe_events();
+        assert!(
+            run_ai_compaction(&config, &mut exec_ctx, &state)
+                .await
+                .is_err()
+        );
+        let after = config
+            .provider
+            .history_store()
+            .get_history(&exec_ctx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(before).unwrap(),
+            serde_json::to_value(after).unwrap()
+        );
+        let events = take_compaction_events(&mut events);
+        assert!(matches!(
+            &events.last().unwrap().kind,
+            AgentEventKind::CompactionFailed { .. }
         ));
         assert_compaction_journal_matches(&config, &exec_ctx.session_id, &events).await;
     }
@@ -898,7 +980,7 @@ mod tests {
             ..Default::default()
         };
         let (mut config, mut exec_ctx, state, _dir) =
-            fixture_with_provider(Hooks::disabled(), Some(output), "codex").await;
+            fixture_with_provider(Hooks::disabled(), Some(output), "codex", None).await;
         let context_driver = Arc::new(ContextMiddleware::new(ContextConfig::with_manual_limit(
             32_000,
         )));

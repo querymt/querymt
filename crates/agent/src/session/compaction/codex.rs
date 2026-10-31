@@ -11,10 +11,12 @@ use querymt::chat::{
 };
 use querymt::error::LLMError;
 use std::sync::Arc;
+use tracing::Instrument;
 
 // Keep the retained prefix in the checkpoint so reloads and forks are self-contained.
 const RETAINED_MESSAGES: &str = "querymt_codex_retained_messages";
-const COMPACTION_NOTICE: &str = "Earlier context was compacted into encrypted Codex state.";
+const HAS_PORTABLE_SUMMARY: &str = "querymt_codex_has_portable_summary";
+const PORTABLE_SUMMARY_PROMPT: &str = "Write a concise plaintext continuation summary of the conversation represented by the compacted context above for another assistant. Preserve the user's goals, constraints, decisions, important tool findings, files changed, and remaining work. Include concrete facts needed to continue, not just the latest request. Return only the standalone summary. Do not resume the task, call tools, or describe the encryption. Summarize facts and decisions, not private reasoning.";
 pub(crate) const COMPACTION_STRATEGY: &str = "codex_native";
 
 pub(crate) struct CompactionContext<'a> {
@@ -62,7 +64,7 @@ pub(crate) fn has_compaction(output: &ChatOutput) -> bool {
 }
 
 /// None leaves non-Codex output on the runtime's existing portable path.
-pub(crate) fn portable_output(output: &ChatOutput) -> Option<ChatOutput> {
+pub(crate) fn portable_output(output: &ChatOutput, summary: Option<&str>) -> Option<ChatOutput> {
     if !output
         .provenance
         .as_ref()
@@ -70,7 +72,23 @@ pub(crate) fn portable_output(output: &ChatOutput) -> Option<ChatOutput> {
     {
         return None;
     }
+    let paired_summary = summary.filter(|summary| {
+        !summary.trim().is_empty()
+            && has_compaction(output)
+            && output
+                .extensions
+                .get(HAS_PORTABLE_SUMMARY)
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+    });
     let mut portable = output.clone().into_portable();
+    if paired_summary.is_some() {
+        // The paired summary already includes post-hook notes. Retain visible
+        // reasoning, but do not duplicate native-only hook message projections.
+        portable
+            .items
+            .retain(|item| matches!(item, ChatOutputItem::Reasoning(_)));
+    }
     // Some providers ignore unsigned reasoning items. Carry visible summaries
     // as ordinary assistant text rather than losing them on a provider switch.
     portable.items = portable
@@ -84,6 +102,11 @@ pub(crate) fn portable_output(output: &ChatOutput) -> Option<ChatOutput> {
             item => vec![item],
         })
         .collect();
+    if let Some(summary) = paired_summary {
+        portable.items.extend(
+            ChatOutput::from_projections(None, Some(summary.to_owned()), None, None, None).items,
+        );
+    }
     Some(portable)
 }
 
@@ -127,7 +150,7 @@ impl SessionCompaction {
         let mut output = self
             .call_with_retry(
                 &ChatCall::new(&chat_messages).tools(tools),
-                provider,
+                provider.clone(),
                 &target.model,
                 retry_config,
                 messages.first().map(|message| message.session_id.as_str()),
@@ -156,8 +179,41 @@ impl SessionCompaction {
         output
             .extensions
             .insert(RETAINED_MESSAGES.into(), serde_json::to_value(&retained)?);
+
+        // Ask the same Codex configuration to describe the compacted window,
+        // not to compact the original transcript a second time. This auxiliary
+        // request must not execute tools or become another conversation turn.
+        let mut summary_messages = retained
+            .iter()
+            .map(|message| {
+                message.to_chat_message_with_output_target(Some(target), max_prompt_bytes)
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        summary_messages.push(querymt::chat::ChatMessage::from_assistant_output(
+            output.clone(),
+        ));
+        summary_messages.push(
+            querymt::chat::ChatMessage::user()
+                .text(PORTABLE_SUMMARY_PROMPT)
+                .build(),
+        );
+        let summary_output = self
+            .call_with_retry(
+                &ChatCall::new(&summary_messages).tools(&[]),
+                provider,
+                &target.model,
+                retry_config,
+                messages.first().map(|message| message.session_id.as_str()),
+                ledger,
+            )
+            .instrument(tracing::info_span!("codex.compaction.portable_summary"))
+            .await?;
+        let summary = Self::summary_from_output(&summary_output)?;
+        output
+            .extensions
+            .insert(HAS_PORTABLE_SUMMARY.into(), serde_json::Value::Bool(true));
         Ok(CompactionResult {
-            summary: COMPACTION_NOTICE.into(),
+            summary,
             original_token_count: self.estimate_messages_tokens(messages, max_prompt_bytes),
             // Output usage is not a measured replacement-window size. Use the visible
             // retained context estimate until the next normal response reports usage.
@@ -298,7 +354,7 @@ mod tests {
             model: "grok".into(),
             endpoint: "https://example.com/responses".into(),
         });
-        assert!(portable_output(&output).is_none());
+        assert!(portable_output(&output, None).is_none());
         assert!(validate_compaction(&ChatCall::new(&[]), &output).is_none());
     }
 
@@ -323,7 +379,7 @@ mod tests {
             reasoning.encrypted_content = Some("encrypted-state".into());
         }
         let original = output.clone();
-        let portable = portable_output(&output).unwrap();
+        let portable = portable_output(&output, None).unwrap();
         assert_eq!(portable.text().as_deref(), Some("visible reasoning"));
         assert!(
             !serde_json::to_string(&portable)

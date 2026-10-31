@@ -53,11 +53,11 @@ impl Default for RetryConfig {
 /// Result of a compaction operation
 #[derive(Debug, Clone)]
 pub struct CompactionResult {
-    /// The generated summary, or a notice when the native checkpoint is opaque.
+    /// The portable plaintext continuation summary.
     pub summary: String,
     /// Original token count before compaction
     pub original_token_count: usize,
-    /// Estimated visible size of the replacement context.
+    /// Estimated visible size of the active provider's replacement context.
     pub summary_token_count: usize,
     /// Canonical provider-native checkpoint, when available.
     pub native_output: Option<ChatOutput>,
@@ -542,6 +542,15 @@ impl SessionCompaction {
                         }
                         MessagePart::Reasoning { item, .. } => {
                             self.estimator.estimate(&item.visible_text())
+                        }
+                        // A native checkpoint's plaintext sidecar is not sent
+                        // alongside its canonical Output on native replay.
+                        MessagePart::Compaction { .. }
+                            if m.parts
+                                .iter()
+                                .any(|part| matches!(part, MessagePart::Output { .. })) =>
+                        {
+                            0
                         }
                         MessagePart::Compaction { summary, .. } => self.estimator.estimate(summary),
                         MessagePart::Output { output } => {
@@ -1336,6 +1345,49 @@ mod tests {
         assert!(text.contains("visible reasoning summary"));
     }
 
+    #[test]
+    fn legacy_native_checkpoint_keeps_its_notice_and_original_state() {
+        let mut output = codex_compaction_output("legacy-encrypted-state");
+        output.items.remove(0);
+        let mut message = AgentMessage::new("legacy".into(), ChatRole::Assistant);
+        message.parts = vec![
+            MessagePart::Compaction {
+                summary: "Earlier context was compacted into encrypted Codex state.".into(),
+                original_token_count: 100,
+            },
+            MessagePart::Output { output },
+        ];
+        let original = serde_json::to_value(&message).unwrap();
+        let portable = message
+            .to_chat_message_with_output_target(Some(&OutputTarget::new("xai", "grok")), None)
+            .unwrap();
+        assert!(
+            portable
+                .output()
+                .unwrap()
+                .text()
+                .unwrap()
+                .contains("unavailable for this provider")
+        );
+        assert!(
+            !serde_json::to_string(&portable)
+                .unwrap()
+                .contains("legacy-encrypted-state")
+        );
+        let native = message
+            .to_chat_message_with_output_target(Some(&codex_target()), None)
+            .unwrap();
+        assert!(
+            serde_json::to_string(&native)
+                .unwrap()
+                .contains("legacy-encrypted-state")
+        );
+        assert_eq!(serde_json::to_value(&message).unwrap(), original);
+    }
+
+    const CODEX_PORTABLE_SUMMARY: &str =
+        "Tool result: recovery code CODE-42; continue the parser migration.";
+
     fn codex_target() -> OutputTarget {
         OutputTarget::new("codex", "codex-mini-latest")
             .with_protocol("responses")
@@ -1397,7 +1449,9 @@ mod tests {
             call_id: "old-call".into(),
             tool_name: None,
             tool_arguments: None,
-            content: vec![querymt::chat::ToolResultPart::text("old tool result")],
+            content: vec![querymt::chat::ToolResultPart::text(
+                "Recovery code CODE-42. Parser migration is halfway done.",
+            )],
             is_error: false,
             compacted_at: None,
         });
@@ -1431,7 +1485,18 @@ mod tests {
                 detail: None,
             },
         )));
-        let provider = ScriptedProvider::new(true, vec![Attempt::Stream(chunks)]);
+        let provider = ScriptedProvider::new(
+            true,
+            vec![
+                Attempt::Stream(chunks),
+                Attempt::Stream(
+                    structured_summary(CODEX_PORTABLE_SUMMARY, false)
+                        .into_iter()
+                        .map(Ok)
+                        .collect(),
+                ),
+            ],
+        );
         let tools = [querymt::chat::Tool {
             tool_type: "function".into(),
             function: querymt::chat::FunctionTool {
@@ -1461,6 +1526,8 @@ mod tests {
         })
         .await;
         let mut result = result.unwrap();
+        assert_eq!(result.summary, CODEX_PORTABLE_SUMMARY);
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
         let chat = spans
             .iter()
             .find(|span| span.name == "chat codex-mini-latest")
@@ -1483,6 +1550,13 @@ mod tests {
                 "read_tool"
             );
             let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(provider.offered_tools.lock().unwrap()[1].is_empty());
+            let summary_request = serde_json::to_string(&requests[1]).unwrap();
+            assert!(summary_request.contains("checkpoint-state"));
+            assert!(!summary_request.contains("compaction_trigger"));
+            assert!(!summary_request.contains("prior-state"));
+            assert!(!summary_request.contains("halfway done"));
             let request = &requests[0];
             let encoded = serde_json::to_string(request).unwrap();
             assert!(encoded.contains("visible reasoning summary"));
@@ -1520,6 +1594,16 @@ mod tests {
         }));
         let checkpoint = effective.last().unwrap();
         let before = serde_json::to_value(checkpoint).unwrap();
+        let mut native_only = checkpoint.clone();
+        native_only
+            .parts
+            .retain(|part| !matches!(part, MessagePart::Compaction { .. }));
+        assert_eq!(
+            SessionCompaction::new()
+                .estimate_messages_tokens(std::slice::from_ref(checkpoint), None),
+            SessionCompaction::new().estimate_messages_tokens(&[native_only], None),
+            "the plaintext sidecar is not part of the native request token estimate",
+        );
         for other in [
             OutputTarget::new("anthropic", "claude"),
             OutputTarget::new("openai", "codex-mini-latest")
@@ -1537,6 +1621,7 @@ mod tests {
             assert!(!encoded.contains("checkpoint-state"));
             assert!(!encoded.contains("reasoning-state"));
             assert!(encoded.contains("visible reasoning summary"));
+            assert!(encoded.contains(CODEX_PORTABLE_SUMMARY));
             assert!(
                 portable.portable_input_parts().iter().any(|part| part
                     .as_text()
@@ -1551,6 +1636,10 @@ mod tests {
         assert!(encoded.contains("checkpoint-state"));
         assert!(encoded.contains("reasoning-state"));
         assert!(encoded.contains("visible reasoning summary"));
+        assert!(
+            !encoded.contains(CODEX_PORTABLE_SUMMARY),
+            "native replay must not duplicate the plaintext sidecar"
+        );
         assert_eq!(serde_json::to_value(checkpoint).unwrap(), before);
 
         let fork = storage
@@ -1571,7 +1660,19 @@ mod tests {
 
         let mut compact_only = codex_compaction_output("new-checkpoint");
         compact_only.items.remove(0);
-        let provider = ScriptedProvider::new(false, vec![Attempt::output(compact_only)]);
+        let provider = ScriptedProvider::new(
+            false,
+            vec![
+                Attempt::output(compact_only),
+                Attempt::output(ChatOutput::from_projections(
+                    None,
+                    Some(CODEX_PORTABLE_SUMMARY.into()),
+                    None,
+                    None,
+                    Some(FinishReason::Stop),
+                )),
+            ],
+        );
         let mut next = SessionCompaction::new()
             .process_codex(
                 &effective,
@@ -1617,7 +1718,7 @@ mod tests {
                 .unwrap()
                 .text()
                 .unwrap()
-                .contains("unavailable for this provider")
+                .contains(CODEX_PORTABLE_SUMMARY)
         );
         assert!(
             !serde_json::to_string(&portable)
@@ -3227,6 +3328,121 @@ mod tests {
                 )
                 .await;
             (result, accounting)
+        }
+
+        fn native_response() -> ChatOutput {
+            let mut output = codex_compaction_output("paid-checkpoint");
+            output.provenance.as_mut().unwrap().model = "model".into();
+            output.usage = Some(usage());
+            output
+        }
+
+        async fn run_native_pair(
+            provider: Arc<ScriptedProvider>,
+            retries: usize,
+            cap: Option<f64>,
+        ) -> (
+            Result<CompactionResult>,
+            Arc<crate::accounting::SessionAccounting>,
+        ) {
+            let (mut ledger, accounting) =
+                ledger_with(BillingClass::Metered, Some(pricing())).await;
+            if let Some(cap) = cap {
+                ledger.operation = Arc::new(
+                    Arc::try_unwrap(ledger.operation)
+                        .ok()
+                        .unwrap()
+                        .with_budget_cap(Some(cap)),
+                );
+            }
+            let mut target = codex_target();
+            target.model = "model".into();
+            let result = SessionCompaction::new()
+                .process_codex(
+                    &[],
+                    provider,
+                    codex::CompactionContext {
+                        target: &target,
+                        tools: &[],
+                        threshold: None,
+                    },
+                    &retry_config(retries),
+                    None,
+                    &ledger,
+                )
+                .await;
+            (result, accounting)
+        }
+
+        #[tokio::test]
+        async fn native_pair_retries_only_the_plaintext_request_and_accounts_for_every_attempt() {
+            let provider = ScriptedProvider::new(
+                false,
+                vec![
+                    Attempt::output(native_response()),
+                    Attempt::output(response("")),
+                    Attempt::output(response("portable task summary")),
+                ],
+            );
+            let (result, accounting) = run_native_pair(provider.clone(), 1, None).await;
+            assert_eq!(result.unwrap().summary, "portable task summary");
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(
+                serde_json::to_string(&requests[0])
+                    .unwrap()
+                    .contains("compaction_trigger")
+            );
+            for request in &requests[1..] {
+                let encoded = serde_json::to_string(request).unwrap();
+                assert!(encoded.contains("paid-checkpoint"));
+                assert!(!encoded.contains("compaction_trigger"));
+            }
+            let totals = accounting.read(|reducer| reducer.session().clone());
+            assert_eq!(totals.priced_attempts, 3);
+            assert_eq!(totals.unresolved_attempts, 0);
+            assert!((totals.known_subtotal_usd - 3.0 * cost()).abs() < 1e-12);
+        }
+
+        #[tokio::test]
+        async fn native_pair_requires_valid_plaintext_before_returning_a_checkpoint() {
+            let mut incomplete = response("unfinished summary");
+            incomplete.finish_reason = Some(FinishReason::Length);
+            let mut tool_call = response("do not execute this");
+            tool_call.items.push(ChatOutputItem::FunctionCall(
+                querymt::chat::ChatFunctionCallItem {
+                    item_id: None,
+                    call_id: "unexpected".into(),
+                    name: "read_tool".into(),
+                    arguments: "{}".into(),
+                    status: None,
+                    extensions: Default::default(),
+                },
+            ));
+            for summary in [response(" "), incomplete, tool_call, native_response()] {
+                let provider = ScriptedProvider::new(
+                    false,
+                    vec![Attempt::output(native_response()), Attempt::output(summary)],
+                );
+                let (result, accounting) = run_native_pair(provider.clone(), 0, None).await;
+                assert!(result.is_err());
+                assert_eq!(provider.calls.load(Ordering::Relaxed), 2);
+                let totals = accounting.read(|reducer| reducer.session().clone());
+                assert_eq!(totals.priced_attempts, 2);
+                assert_eq!(totals.unresolved_attempts, 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn native_pair_checks_budget_again_before_the_plaintext_request() {
+            let provider = ScriptedProvider::new(false, vec![Attempt::output(native_response())]);
+            let (result, accounting) =
+                run_native_pair(provider.clone(), 0, Some(cost() / 2.0)).await;
+            assert!(result.is_err());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+            let totals = accounting.read(|reducer| reducer.session().clone());
+            assert_eq!(totals.priced_attempts, 1);
+            assert_eq!(totals.unresolved_attempts, 0);
         }
 
         #[tokio::test]
