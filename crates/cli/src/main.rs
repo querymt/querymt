@@ -81,8 +81,11 @@ async fn handle_service_command(
 async fn service_login(manual: bool) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = resolve_service_endpoint()?;
     let flow = build_service_authorization_flow(endpoint.clone())?;
-    let mut store = SecretStoreServiceAuthStore::new()?;
-    store.set_endpoint(&endpoint)?;
+    let stored_endpoint = endpoint.clone();
+    tokio::task::spawn_blocking(move || {
+        SecretStoreServiceAuthStore::new()?.set_endpoint(&stored_endpoint)
+    })
+    .await??;
 
     println!(
         "QueryMT service endpoint: {}",
@@ -127,7 +130,8 @@ async fn service_login(manual: bool) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let tokens = exchange_service_authorization_code(&endpoint, &flow, &callback).await?;
-    store.set_tokens(&tokens)?;
+    tokio::task::spawn_blocking(move || SecretStoreServiceAuthStore::new()?.set_tokens(&tokens))
+        .await??;
 
     println!("{} Logged in to QueryMT service", "✓".bright_green());
     Ok(())
@@ -135,9 +139,14 @@ async fn service_login(manual: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "service")]
 async fn service_logout() -> Result<(), Box<dyn std::error::Error>> {
-    let mut store = SecretStoreServiceAuthStore::new()?;
-    let tokens = store.get_tokens()?;
-    let endpoint = resolve_service_endpoint_for_status(&store).ok();
+    let (tokens, endpoint) = tokio::task::spawn_blocking(|| {
+        let store = SecretStoreServiceAuthStore::new()?;
+        Ok::<_, ServiceClientError>((
+            store.get_tokens()?,
+            resolve_service_endpoint_for_status(&store).ok(),
+        ))
+    })
+    .await??;
     let mut revoke_error = None;
 
     if let (Some(endpoint), Some(tokens)) = (endpoint.as_ref(), tokens.as_ref()) {
@@ -146,8 +155,12 @@ async fn service_logout() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    store.delete_tokens()?;
-    store.delete_endpoint()?;
+    tokio::task::spawn_blocking(|| {
+        let mut store = SecretStoreServiceAuthStore::new()?;
+        store.delete_tokens()?;
+        store.delete_endpoint()
+    })
+    .await??;
 
     if let Some(error) = revoke_error {
         println!(
@@ -165,8 +178,12 @@ async fn service_logout() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "service")]
 async fn service_status() -> Result<(), Box<dyn std::error::Error>> {
-    let mut store = SecretStoreServiceAuthStore::new()?;
-    let endpoint = resolve_service_endpoint_for_status(&store)?;
+    let (mut store, endpoint) = tokio::task::spawn_blocking(|| {
+        let store = SecretStoreServiceAuthStore::new()?;
+        let endpoint = resolve_service_endpoint_for_status(&store)?;
+        Ok::<_, ServiceClientError>((store, endpoint))
+    })
+    .await??;
     let client = ServiceApiClient::new(endpoint.clone())?;
 
     match client.status(&mut store).await {
@@ -212,7 +229,7 @@ fn resolve_service_endpoint_for_status(
         .unwrap_or_else(resolve_service_endpoint)
 }
 
-fn resolve_provider_and_model(
+async fn resolve_provider_and_model(
     global: &CliArgs,
     subcmd_provider: Option<&String>,
     subcmd_model: Option<&String>,
@@ -220,7 +237,7 @@ fn resolve_provider_and_model(
     let mut provider: Option<String> = None;
     let mut model: Option<String> = None;
 
-    if let Some((p, m)) = get_provider_info(global) {
+    if let Some((p, m)) = get_provider_info(global).await {
         provider = Some(p);
         model = m;
     }
@@ -267,6 +284,11 @@ async fn run(
         return Ok(());
     }
 
+    #[cfg(target_os = "linux")]
+    if let Err(error) = SecretStore::new_async().await {
+        log::warn!("Credential storage unavailable: {error}");
+    }
+
     #[cfg(feature = "service")]
     if let Some(Commands::Service { command }) = &args.command {
         handle_service_command(command).await?;
@@ -285,7 +307,7 @@ async fn run(
                         }
                     };
 
-                let mut store = SecretStore::new()?;
+                let mut store = SecretStore::new_async().await?;
                 let console_ui = auth::ConsoleOAuthUI;
                 querymt_utils::oauth::authenticate(
                     oauth_provider.as_ref(),
@@ -306,8 +328,11 @@ async fn run(
                     return Ok(());
                 }
 
-                let mut store = SecretStore::new()?;
-                store.delete_oauth_tokens(provider.as_str())?;
+                let store = SecretStore::new_async().await?;
+                let name = provider.clone();
+                store
+                    .run(move |store| store.delete_oauth_tokens(&name))
+                    .await?;
                 println!(
                     "{} Logged out from {}",
                     "✓".bright_green(),
@@ -319,7 +344,7 @@ async fn run(
                 provider,
                 no_refresh,
             } => {
-                let mut store = SecretStore::new()?;
+                let mut store = SecretStore::new_async().await?;
                 let console_ui = auth::ConsoleOAuthUI;
                 querymt_utils::oauth::show_auth_status(
                     &mut store,
@@ -352,22 +377,25 @@ async fn run(
         match cmd {
             Commands::Secrets { command } => match command {
                 SecretsCommands::Set { key, value } => {
-                    let mut store = SecretStore::new()?;
-                    store.set(key, value)?;
+                    let store = SecretStore::new_async().await?;
+                    let (name, value) = (key.clone(), value.clone());
+                    store.run(move |store| store.set(name, value)).await?;
                     println!("{} Secret '{}' has been set.", "✓".bright_green(), key);
                     return Ok(());
                 }
                 SecretsCommands::Get { key } => {
-                    let store = SecretStore::new()?;
-                    match store.get(key) {
+                    let store = SecretStore::new_async().await?;
+                    let name = key.clone();
+                    match store.run(move |store| store.try_get(&name)).await? {
                         Some(val) => println!("{}: {}", key, val),
                         None => println!("{} Secret '{}' not found", "!".bright_yellow(), key),
                     }
                     return Ok(());
                 }
                 SecretsCommands::Delete { key } => {
-                    let mut store = SecretStore::new()?;
-                    store.delete(key)?;
+                    let store = SecretStore::new_async().await?;
+                    let name = key.clone();
+                    store.run(move |store| store.delete(&name)).await?;
                     println!("{} Secret '{}' has been deleted.", "✓".bright_green(), key);
                     return Ok(());
                 }
@@ -391,7 +419,8 @@ async fn run(
                         ProviderConfigBuilder::from_registry_provider(&registry, factory.name())?;
                     if let Some(http_factory) = factory.as_http()
                         && !cfg.contains_non_empty_str("api_key")
-                        && let Some(api_key) = get_provider_api_key(factory.name(), http_factory)
+                        && let Some(api_key) =
+                            get_provider_api_key(factory.name(), http_factory).await
                     {
                         cfg.set("api_key", api_key.into());
                     }
@@ -424,12 +453,15 @@ async fn run(
             }
             Commands::Default { provider } => {
                 if let Some(p) = provider {
-                    let mut store = SecretStore::new()?;
-                    store.set_default_provider(p)?;
+                    let store = SecretStore::new_async().await?;
+                    let provider = p.clone();
+                    store
+                        .run(move |store| store.set_default_provider(&provider))
+                        .await?;
                     return Ok(());
                 } else if provider.is_none() {
-                    let store = SecretStore::new()?;
-                    match store.get_default_provider() {
+                    let store = SecretStore::new_async().await?;
+                    match store.run(|store| Ok(store.get_default_provider())).await? {
                         Some(p) => println!("Default provider: {}", p),
                         None => println!("{} No default provider set", "!".bright_yellow()),
                     }
@@ -451,7 +483,8 @@ async fn run(
             } => {
                 let _span = ::tracing::info_span!("cli.embed").entered();
                 let (prov_name, opt_model) =
-                    resolve_provider_and_model(&args, sc_provider.as_ref(), sc_model.as_ref())?;
+                    resolve_provider_and_model(&args, sc_provider.as_ref(), sc_model.as_ref())
+                        .await?;
                 let mut builder = registry.builder(prov_name.clone());
                 if let Some(m) = opt_model {
                     builder = builder.model(m);
@@ -567,7 +600,7 @@ async fn run(
     }
 
     // Build provider + LLMBuilder
-    let (prov_name, opt_model) = resolve_provider_and_model(&args, None, None)?;
+    let (prov_name, opt_model) = resolve_provider_and_model(&args, None, None).await?;
     let mut builder = registry.builder(prov_name.clone());
     if let Some(m) = opt_model.or(args.model.clone()) {
         builder = builder.model(m);

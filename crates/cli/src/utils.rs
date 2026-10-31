@@ -43,22 +43,23 @@ fn display_colored_prompt() -> String {
 /// 1. OAuth access token from the keyring (if valid/not expired)
 /// 2. API key stored in the keyring under the env var name
 /// 3. Environment variable (e.g., ANTHROPIC_API_KEY)
-pub fn get_provider_api_key<P: HTTPLLMProviderFactory + ?Sized>(
+pub async fn get_provider_api_key<P: HTTPLLMProviderFactory + ?Sized>(
     provider_name: &str,
     factory: &P,
 ) -> Option<String> {
-    let store = SecretStore::new().ok()?;
-
-    // Try OAuth access token first
-    if let Some(token) = store.get_valid_access_token(provider_name) {
-        return Some(token);
-    }
-
-    // Fall back to API key from keyring or env var
-    let api_key_name = factory.api_key_name()?;
+    let store = SecretStore::new_async().await.ok()?;
+    let provider_name = provider_name.to_owned();
+    let api_key_name = factory.api_key_name();
     store
-        .get(&api_key_name)
-        .or_else(|| std::env::var(api_key_name).ok())
+        .run(move |store| {
+            Ok(store.get_valid_access_token(&provider_name).or_else(|| {
+                let name = api_key_name?;
+                store.get(&name).or_else(|| std::env::var(name).ok())
+            }))
+        })
+        .await
+        .ok()
+        .flatten()
 }
 
 /// parse raw `key=val` into `(String, Value)`

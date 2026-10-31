@@ -179,6 +179,13 @@ $ qmt secrets delete OPENAI_API_KEY
 ✓ Secret 'OPENAI_API_KEY' has been deleted.
 ```
 
+On Linux, `qmt` and `qmtcode` try Secret Service, systemd Credentials, then kernel keyutils.
+Set `QMT_SECRET_STORE=auto|secret-service|systemd|keyutils`, or put the backend name in
+`secret-store` under `QMT_CONFIG_DIR`, `QMT_HOME`, or `~/.qmt` (in that order).
+The environment setting takes precedence; an explicit backend must be available.
+Credentials are not copied between stores. Kernel keyutils is temporary: secrets
+are lost on reboot and may expire earlier.
+
 ### Discovering Providers & Models
 
 List the providers and models that `qmt` has loaded from your configuration.

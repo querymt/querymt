@@ -6,11 +6,14 @@ license.workspace = true
 description = "Shared utilities for querymt workspace"
 
 [features]
-default = []
+default = ["systemd-credentials"]
 serde = ["dep:serde"]
 secret-store = [
     "dep:keyring-core",
     "dep:serde_json",
+    "dep:tokio",
+    "dep:dirs",
+    "zbus-secret-service",
     # Platform-native stores
     "dep:apple-native-keyring-store",
     "dep:windows-native-keyring-store",
@@ -18,8 +21,8 @@ secret-store = [
 ]
 oauth = ["secret-store", "serde", "dep:anthropic-auth", "dep:openai-auth", "dep:kimi-auth", "dep:async-trait", "dep:anyhow", "dep:url", "dep:tokio", "dep:reqwest", "dep:base64", "dep:sha2", "dep:getrandom"]
 providers = ["dep:reqwest", "dep:dirs", "dep:anyhow"]
-# Use DBus Secret Service backend instead of linux-keyutils on Linux.
-dbus-secret-service = ["dep:dbus-secret-service-keyring-store"]
+zbus-secret-service = ["dep:secret-service", "dep:zbus", "dep:async-io", "dep:futures-lite"]
+systemd-credentials = ["dep:base64", "dep:libc", "dep:getrandom", "dep:sha2", "dep:socket2", "dep:rustix"]
 
 [dependencies]
 tracing.workspace = true
@@ -63,8 +66,15 @@ windows-native-keyring-store = { version = "1.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { version = "1.0", optional = true }
-dbus-secret-service-keyring-store = { version = "1.0", features = ["crypto-rust"], optional = true }
+secret-service = { version = "5.2", features = ["crypto-rust"], optional = true }
+zbus = { version = "5", optional = true }
+async-io = { version = "2", optional = true }
+futures-lite = { version = "2", optional = true }
+socket2 = { version = "0.6", optional = true }
+rustix = { version = "1", features = ["net", "process"], optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
-tokio = { version = "1.0", features = ["macros", "rt", "time", "test-util"] }
+tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+tempfile = "3"

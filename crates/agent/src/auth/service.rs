@@ -177,12 +177,8 @@ impl OAuthService {
         provider_filter: Option<&str>,
     ) -> Result<Vec<AuthProviderStatus>, String> {
         let registry = self.config.provider.plugin_registry();
-        let store = crate::auth::SecretStore::new()
-            .map_err(|error| format!("Failed to open secret store: {error}"))?;
-
         let provider_names = auth_provider_names(&registry);
-
-        let mut providers = Vec::new();
+        let mut provider_configs = Vec::new();
         for provider_name in provider_names {
             if provider_filter.is_some_and(|filter| provider_name != filter) {
                 continue;
@@ -193,33 +189,40 @@ impl OAuthService {
                 .as_ref()
                 .and_then(|factory| factory.as_http())
                 .and_then(|factory| factory.api_key_name());
+            provider_configs.push((provider_name, env_var_name));
+        }
 
-            #[cfg(feature = "oauth")]
-            let (supports_oauth, oauth_status, display_name_from_oauth) = {
-                match crate::auth::get_oauth_provider(&provider_name, None) {
-                    Ok(oauth_provider) => {
-                        let status = match store.get_oauth_tokens(&provider_name) {
-                            Some(tokens) if tokens.is_expired() => Some(OAuthStatus::Expired),
-                            Some(_) => Some(OAuthStatus::Connected),
-                            None => Some(OAuthStatus::NotAuthenticated),
-                        };
-                        (
-                            true,
-                            status,
-                            Some(oauth_provider.display_name().to_string()),
-                        )
+        tokio::task::spawn_blocking(move || {
+            let store = crate::auth::SecretStore::new()
+                .map_err(|error| format!("Failed to open secret store: {error}"))?;
+            let mut providers = Vec::new();
+            for (provider_name, env_var_name) in provider_configs {
+                #[cfg(feature = "oauth")]
+                let (supports_oauth, oauth_status, display_name_from_oauth) = {
+                    match crate::auth::get_oauth_provider(&provider_name, None) {
+                        Ok(oauth_provider) => {
+                            let status = match store.get_oauth_tokens(&provider_name) {
+                                Some(tokens) if tokens.is_expired() => Some(OAuthStatus::Expired),
+                                Some(_) => Some(OAuthStatus::Connected),
+                                None => Some(OAuthStatus::NotAuthenticated),
+                            };
+                            (
+                                true,
+                                status,
+                                Some(oauth_provider.display_name().to_string()),
+                            )
+                        }
+                        Err(_) => (false, None, None),
                     }
-                    Err(_) => (false, None, None),
-                }
-            };
-            #[cfg(not(feature = "oauth"))]
-            let (supports_oauth, oauth_status, display_name_from_oauth): (
-                bool,
-                Option<OAuthStatus>,
-                Option<String>,
-            ) = (false, None, None);
+                };
+                #[cfg(not(feature = "oauth"))]
+                let (supports_oauth, oauth_status, display_name_from_oauth): (
+                    bool,
+                    Option<OAuthStatus>,
+                    Option<String>,
+                ) = (false, None, None);
 
-            let has_stored_api_key = match env_var_name.as_deref() {
+                let has_stored_api_key = match env_var_name.as_deref() {
                 Some(name) => store
                     .try_get(name)
                     .map_err(|error| {
@@ -230,36 +233,39 @@ impl OAuthService {
                     .is_some(),
                 None => false,
             };
-            let has_env_api_key = env_var_name
-                .as_ref()
-                .is_some_and(|name| std::env::var(name).is_ok());
-            let preferred_method = store
-                .try_get(&format!("auth_method_{provider_name}"))
-                .map_err(|error| {
-                    format!(
-                        "Failed to read auth preference for provider '{provider_name}': {error}"
-                    )
-                })?;
+                let has_env_api_key = env_var_name
+                    .as_ref()
+                    .is_some_and(|name| std::env::var(name).is_ok());
+                let preferred_method = store
+                    .try_get(&format!("auth_method_{provider_name}"))
+                    .map_err(|error| {
+                        format!(
+                            "Failed to read auth preference for provider '{provider_name}': {error}"
+                        )
+                    })?;
 
-            let display_name = display_name_from_oauth.unwrap_or_else(|| {
-                let mut chars = provider_name.chars();
-                match chars.next() {
-                    None => provider_name.clone(),
-                    Some(character) => character.to_uppercase().to_string() + chars.as_str(),
-                }
-            });
-            providers.push(AuthProviderStatus {
-                provider: provider_name,
-                display_name,
-                oauth_status,
-                has_stored_api_key,
-                has_env_api_key,
-                env_var_name,
-                supports_oauth,
-                preferred_method,
-            });
-        }
-        Ok(providers)
+                let display_name = display_name_from_oauth.unwrap_or_else(|| {
+                    let mut chars = provider_name.chars();
+                    match chars.next() {
+                        None => provider_name.clone(),
+                        Some(character) => character.to_uppercase().to_string() + chars.as_str(),
+                    }
+                });
+                providers.push(AuthProviderStatus {
+                    provider: provider_name,
+                    display_name,
+                    oauth_status,
+                    has_stored_api_key,
+                    has_env_api_key,
+                    env_var_name,
+                    supports_oauth,
+                    preferred_method,
+                });
+            }
+            Ok(providers)
+        })
+        .await
+        .map_err(|error| format!("Secret store task failed: {error}"))?
     }
 
     // ── start_flow ────────────────────────────────────────────────────────
@@ -514,7 +520,7 @@ impl OAuthService {
                 }
             };
 
-            let mut store = match crate::auth::SecretStore::new() {
+            let store = match crate::auth::SecretStore::new_async().await {
                 Ok(s) => s,
                 Err(err) => {
                     return LogoutResult {
@@ -529,26 +535,24 @@ impl OAuthService {
             // the cache or keyring after the credentials are removed.
             let token_guard = crate::auth::lock_provider_tokens(&provider_name).await;
 
-            let delete_result = (|| {
-                if store.get_oauth_tokens(&provider_name).is_some() {
-                    store
-                        .delete_oauth_tokens(&provider_name)
-                        .map_err(|e| format!("Failed to remove OAuth tokens: {}", e))?;
-                }
-                if let Some(api_key_name) = oauth_provider.api_key_name()
-                    && store.get(api_key_name).is_some()
-                {
-                    store.delete(api_key_name).map_err(|e| {
-                        format!("Failed to remove API key '{}': {}", api_key_name, e)
-                    })?;
-                }
-                Ok::<(), String>(())
-            })();
-
-            // Make sure a token cached in this process stops being used, even if
-            // deletion only partially succeeded.
-            crate::auth::invalidate_cached_tokens(&provider_name);
-            drop(token_guard);
+            let name = provider_name.clone();
+            let api_key_name = oauth_provider.api_key_name().map(str::to_owned);
+            let delete_result = store
+                .run(move |store| {
+                    let _guard = token_guard;
+                    let result = (|| {
+                        store.delete_oauth_tokens(&name)?;
+                        if let Some(key) = api_key_name {
+                            store.delete(&key)?;
+                        }
+                        Ok(())
+                    })();
+                    // Also invalidate after partial deletion or caller cancellation.
+                    crate::auth::invalidate_cached_tokens(&name);
+                    result
+                })
+                .await
+                .map_err(|error| format!("Failed to remove credentials: {error}"));
 
             match delete_result {
                 Ok(()) => {
@@ -631,7 +635,7 @@ impl OAuthService {
             };
         };
 
-        let mut store = match crate::auth::SecretStore::new() {
+        let store = match crate::auth::SecretStore::new_async().await {
             Ok(s) => s,
             Err(err) => {
                 return AuthMutationResult {
@@ -642,7 +646,12 @@ impl OAuthService {
             }
         };
 
-        match store.set(&name, api_key) {
+        let stored_name = name.clone();
+        let api_key = api_key.to_owned();
+        match store
+            .run(move |store| store.set(stored_name, api_key))
+            .await
+        {
             Ok(()) => {
                 self.invalidate_auth_caches().await;
                 AuthMutationResult {
@@ -692,7 +701,7 @@ impl OAuthService {
             };
         };
 
-        let mut store = match crate::auth::SecretStore::new() {
+        let store = match crate::auth::SecretStore::new_async().await {
             Ok(s) => s,
             Err(err) => {
                 return AuthMutationResult {
@@ -703,7 +712,8 @@ impl OAuthService {
             }
         };
 
-        match store.delete(&name) {
+        let stored_name = name.clone();
+        match store.run(move |store| store.delete(&stored_name)).await {
             Ok(()) => {
                 self.invalidate_auth_caches().await;
                 AuthMutationResult {
@@ -755,7 +765,7 @@ impl OAuthService {
         };
 
         let key = format!("auth_method_{}", provider_name);
-        let mut store = match crate::auth::SecretStore::new() {
+        let store = match crate::auth::SecretStore::new_async().await {
             Ok(s) => s,
             Err(err) => {
                 return AuthMutationResult {
@@ -766,7 +776,8 @@ impl OAuthService {
             }
         };
 
-        match store.set(&key, parsed.to_string()) {
+        let value = parsed.to_string();
+        match store.run(move |store| store.set(key, value)).await {
             Ok(()) => {
                 // Preferred method changes credential resolution order, so both
                 // the instantiated-provider cache and model inventory must refresh.
@@ -854,7 +865,8 @@ pub(crate) async fn persist_oauth_credentials(
     tokens: &crate::auth::TokenSet,
     api_key_override: Option<&str>,
 ) -> Result<(), String> {
-    let mut store = crate::auth::SecretStore::new()
+    let store = crate::auth::SecretStore::new_async()
+        .await
         .map_err(|e| format!("Failed to access secure storage: {}", e))?;
 
     // Do the network call before taking the lock so it is never held across it.
@@ -871,25 +883,26 @@ pub(crate) async fn persist_oauth_credentials(
     // Serialize with token refresh and logout for *all* credential writes
     // (tokens and API key), so neither can overwrite or resurrect part of a
     // fresh login. Only synchronous keyring calls happen under the guard.
-    let _token_guard = crate::auth::lock_provider_tokens(oauth_provider.name()).await;
+    let token_guard = crate::auth::lock_provider_tokens(oauth_provider.name()).await;
+    let provider_name = oauth_provider.name().to_owned();
+    let key_name = oauth_provider.api_key_name().map(str::to_owned);
+    let tokens = tokens.clone();
     store
-        .set_oauth_tokens(oauth_provider.name(), tokens)
-        .map_err(|e| format!("Failed to save OAuth tokens: {}", e))?;
-    crate::auth::invalidate_cached_tokens(oauth_provider.name());
-
-    if let Some(api_key) = api_key_to_store
-        && let Some(key_name) = oauth_provider.api_key_name()
-        && let Err(err) = store.set(key_name, &api_key)
-    {
-        log::warn!(
-            "Failed to persist API key for provider '{}' ({}): {}",
-            oauth_provider.name(),
-            key_name,
-            err
-        );
-    }
-
-    Ok(())
+        .run(move |store| {
+            let _guard = token_guard;
+            store.set_oauth_tokens(&provider_name, &tokens)?;
+            crate::auth::invalidate_cached_tokens(&provider_name);
+            if let (Some(api_key), Some(key_name)) = (api_key_to_store, key_name)
+                && let Err(error) = store.set(&key_name, api_key)
+            {
+                log::warn!(
+                    "Failed to persist API key for provider '{provider_name}' ({key_name}): {error}"
+                );
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| format!("Failed to save OAuth tokens: {error}"))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
