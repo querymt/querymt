@@ -84,8 +84,8 @@ fn select<T>(
     for backend in [Backend::SecretService, Backend::Systemd, Backend::Keyutils] {
         match probe(backend) {
             Ok(store) => return Ok((backend, store)),
-            // Damaged persistent storage must not be mistaken for an empty store.
-            Err(error) if error.kind() == io::ErrorKind::InvalidData => return Err(error),
+            // Probes do not read persisted credentials. Try the next backend
+            // after every probe failure.
             Err(error) => {
                 if backend == Backend::Systemd {
                     log::warn!("systemd credential storage is unavailable: {error}");
