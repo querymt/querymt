@@ -1043,13 +1043,22 @@ impl SessionHandle {
                     cfg.params.as_ref(),
                 )
             });
-            crate::session::compaction::codex::resolve_target(
-                &mut target,
-                resolved
-                    .as_ref()
-                    .map(|builder| builder.value())
-                    .or(cfg.params.as_ref()),
-            );
+            let has_session_base_url = cfg
+                .params
+                .as_ref()
+                .and_then(|params| params.get("base_url"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|base_url| !base_url.is_empty());
+            // An unknown remote endpoint must not become a guessed local default.
+            if binding.is_some() || has_session_base_url || !target.endpoint.is_empty() {
+                crate::session::compaction::codex::resolve_target(
+                    &mut target,
+                    resolved
+                        .as_ref()
+                        .map(|builder| builder.value())
+                        .or(cfg.params.as_ref()),
+                );
+            }
         }
         Some(target)
     }
@@ -1783,6 +1792,66 @@ pub mod tests {
             handle.output_target().await.unwrap().endpoint,
             "https://example.com/session/responses"
         );
+
+        #[cfg(feature = "remote")]
+        {
+            handle.provider_node_id = Some("remote-peer".into());
+            for params in [
+                None,
+                Some(serde_json::json!({})),
+                Some(serde_json::json!({"reasoning_effort":"high"})),
+                Some(serde_json::json!({"base_url":null})),
+                Some(serde_json::json!({"base_url":""})),
+            ] {
+                handle.llm_config.as_mut().unwrap().params = params;
+                let target = handle.output_target().await.unwrap();
+                assert!(
+                    target.endpoint.is_empty(),
+                    "unknown remote endpoints must not be guessed"
+                );
+                assert!(!crate::session::compaction::codex::supports_compaction(
+                    &target
+                ));
+            }
+
+            handle.llm_config.as_mut().unwrap().params = Some(serde_json::json!({
+                "base_url":"https://example.com/remote/"
+            }));
+            let target = handle.output_target().await.unwrap();
+            assert_eq!(target.endpoint, "https://example.com/remote/responses");
+            assert!(crate::session::compaction::codex::supports_compaction(
+                &target
+            ));
+
+            // An already-known endpoint remains usable without a base_url override.
+            let config = handle.llm_config.as_mut().unwrap();
+            config.params = None;
+            config.endpoint = "https://example.com/known/responses".into();
+            let target = handle.output_target().await.unwrap();
+            assert_eq!(target.endpoint, "https://example.com/known/responses");
+            assert!(crate::session::compaction::codex::supports_compaction(
+                &target
+            ));
+
+            // No explicit node can also mean a mesh fallback when no local binding exists.
+            let mut fallback = handle.clone();
+            fallback.provider_node_id = None;
+            let (registry, _fallback_dir) = empty_plugin_registry().unwrap();
+            fallback.provider = Arc::new(SessionProvider::new(
+                Arc::new(registry),
+                Arc::new(MockSessionStore::new()),
+                LLMParams::new(),
+            ));
+            let config = fallback.llm_config.as_mut().unwrap();
+            config.params = None;
+            config.protocol.clear();
+            config.endpoint.clear();
+            let target = fallback.output_target().await.unwrap();
+            assert!(target.endpoint.is_empty());
+            assert!(!crate::session::compaction::codex::supports_compaction(
+                &target
+            ));
+        }
     }
 
     #[tokio::test]
